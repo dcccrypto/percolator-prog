@@ -1,27 +1,21 @@
 #[cfg(kani)]
 mod verification {
-    use super::*;
-    use percolator::{RiskEngine, RiskParams};
+    use percolator_prog::ix::Instruction;
 
     #[kani::proof]
-    fn verify_engine_init() {
-        let params = RiskParams {
-            warmup_period_slots: kani::any(),
-            maintenance_margin_bps: kani::any(),
-            initial_margin_bps: kani::any(),
-            trading_fee_bps: kani::any(),
-            max_accounts: 8, // Force small
-            new_account_fee: kani::any(),
-            risk_reduction_threshold: kani::any(),
-            maintenance_fee_per_slot: kani::any(),
-            max_crank_staleness_slots: kani::any(),
-            liquidation_fee_bps: kani::any(),
-            liquidation_fee_cap: kani::any(),
-            liquidation_buffer_bps: kani::any(),
-            min_liquidation_abs: kani::any(),
-        };
-
-        let engine = RiskEngine::new(params);
-        assert!(engine.check_conservation());
+    fn verify_instruction_decode_no_panic() {
+        let input_len: usize = kani::any();
+        // Limit length to reasonable instruction size for efficient verification
+        // 256 bytes is enough to cover all instruction variants
+        kani::assume(input_len <= 256); 
+        
+        let mut input = [0u8; 256];
+        for i in 0..256 {
+            if i < input_len {
+                input[i] = kani::any();
+            }
+        }
+        
+        let _ = Instruction::decode(&input[..input_len]);
     }
 }
