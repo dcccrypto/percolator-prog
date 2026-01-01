@@ -3,15 +3,6 @@
 
 //! Percolator: Single-file Solana program with embedded Risk Engine.
 
-use solana_program::{
-    account_info::AccountInfo,
-    entrypoint::ProgramResult,
-    pubkey::Pubkey,
-    program_error::ProgramError,
-    msg,
-    sysvar::{clock::Clock, rent::Rent, Sysvar},
-};
-
 // 1. mod engine (Placeholder)
 
 // 2. mod constants
@@ -73,6 +64,9 @@ pub mod error {
         OracleConfTooWide,
         InvalidVaultAta,
         InvalidMint,
+        ExpectedSigner,
+        ExpectedWritable,
+        OracleInvalid,
         // Engine errors mapped:
         EngineInsufficientBalance,
         EngineUndercollateralized,
@@ -286,14 +280,14 @@ pub mod accounts {
 
     pub fn expect_signer(ai: &AccountInfo) -> Result<(), ProgramError> {
         if !ai.is_signer {
-            return Err(PercolatorError::EngineUnauthorized.into());
+            return Err(PercolatorError::ExpectedSigner.into());
         }
         Ok(())
     }
 
     pub fn expect_writable(ai: &AccountInfo) -> Result<(), ProgramError> {
         if !ai.is_writable {
-            return Err(ProgramError::InvalidAccountData);
+            return Err(PercolatorError::ExpectedWritable.into());
         }
         Ok(())
     }
@@ -324,7 +318,7 @@ pub mod state {
     use core::cell::RefMut;
     use solana_program::account_info::AccountInfo;
     use solana_program::program_error::ProgramError;
-    use crate::constants::*;
+    use crate::constants::{HEADER_LEN, CONFIG_LEN};
     use percolator::RiskEngine;
     use crate::slab_io;
 
@@ -418,7 +412,7 @@ pub mod oracle {
         let pub_slot = u64::from_le_bytes(data[200..208].try_into().unwrap());
 
         if price <= 0 {
-            return Err(PercolatorError::OracleStale.into()); // Using Stale as general invalid here
+            return Err(PercolatorError::OracleInvalid.into()); 
         }
 
         let age = now_slot.saturating_sub(pub_slot);
@@ -435,18 +429,15 @@ pub mod oracle {
         }
 
         // Convert to E6
-        // Price is p * 10^expo. We want p * 10^-6.
-        // We need to multiply by 10^(-6 - expo) if -6 > expo
-        // Or divide by 10^(expo - (-6)) if expo > -6
         let target_expo = -6;
         let delta = target_expo - expo;
 
         let final_price = if delta > 0 {
             let mul = 10u128.pow(delta as u32);
-            price_u.checked_mul(mul).ok_or(PercolatorError::EngineOverflow)?
+            price_u.checked_mul(mul).ok_or(ProgramError::InvalidInstructionData)?
         } else {
             let div = 10u128.pow((-delta) as u32);
-            price_u.checked_div(div).ok_or(PercolatorError::EngineOverflow)?
+            price_u / div
         };
 
         if final_price == 0 {
@@ -507,6 +498,7 @@ pub mod processor {
     use solana_program::{
         account_info::AccountInfo, entrypoint::ProgramResult, msg, pubkey::Pubkey,
         sysvar::{clock::Clock, Sysvar},
+        program_error::ProgramError,
     };
     use crate::{
         ix::Instruction,
@@ -517,7 +509,14 @@ pub mod processor {
         oracle,
         collateral,
     };
-    use percolator::{RiskEngine, NoOpMatcher};
+    use percolator::{RiskEngine, NoOpMatcher, MAX_ACCOUNTS};
+
+    fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
+        if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
+            return Err(PercolatorError::EngineAccountNotFound.into());
+        }
+        Ok(())
+    }
 
     pub fn process_instruction(
         program_id: &Pubkey,
@@ -529,7 +528,7 @@ pub mod processor {
         match instruction {
             Instruction::InitMarket { 
                 admin: _admin, collateral_mint: _collateral_mint, pyth_index, pyth_collateral, 
-                max_staleness_slots, conf_filter_bps, mut risk_params 
+                max_staleness_slots, conf_filter_bps, risk_params 
             } => {
                 accounts::expect_len(accounts, 11)?;
                 let a_admin = &accounts[0];
@@ -580,7 +579,6 @@ pub mod processor {
                 drop(vault_data);
 
                 // Initialize Engine
-                risk_params.max_crank_staleness_slots = max_staleness_slots; // Ensure sync
                 let engine = RiskEngine::new(risk_params);
                 state::store_engine(&mut data, &engine)?;
 
@@ -672,6 +670,8 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 let mut engine = state::load_engine(&data)?;
 
+                check_idx(&engine, user_idx)?;
+
                 // Verify auth
                 let owner = engine.accounts[user_idx as usize].owner;
                 if Pubkey::new_from_array(owner) != *a_user.key {
@@ -689,9 +689,10 @@ pub mod processor {
                 let a_slab = &accounts[1];
                 let a_vault = &accounts[2];
                 let a_user_ata = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-                let a_oracle_idx = &accounts[6];
+                let a_vault_pda = &accounts[4];
+                let a_token = &accounts[5];
+                let a_clock = &accounts[6];
+                let a_oracle_idx = &accounts[7];
                 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -701,50 +702,46 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mut engine = state::load_engine(&data)?;
 
+                check_idx(&engine, user_idx)?;
+
                 let owner = engine.accounts[user_idx as usize].owner;
                 if Pubkey::new_from_array(owner) != *a_user.key {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                // Verify oracle
+                // Verify oracle pubkey matches config
                 accounts::expect_key(a_oracle_idx, &Pubkey::new_from_array(config.index_oracle))?;
 
-                let clock = Clock::from_account_info(a_clock)?;
-                let price = oracle::read_pyth_price_e6(a_oracle_idx, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                // Verify vault authority PDA
+                let (derived_pda, _bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_pda, &derived_pda)?;
 
-                engine.withdraw(user_idx, amount as u128, clock.slot, price).map_err(map_risk_error)?;
+                // Clock + oracle price
+                let clock = Clock::from_account_info(a_clock)?;
+                let price = oracle::read_pyth_price_e6(
+                    a_oracle_idx,
+                    clock.slot,
+                    config.max_staleness_slots,
+                    config.conf_filter_bps,
+                )?;
+
+                // Engine withdrawal (enforces fresh crank itself)
+                engine
+                    .withdraw(user_idx, amount as u128, clock.slot, price)
+                    .map_err(map_risk_error)?;
+
                 state::store_engine(&mut data, &engine)?;
 
-                // PDA seeds
-                let seeds = &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]];
+                // Transfer tokens out of vault using PDA signer
+                let seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]];
 
-                collateral::withdraw(a_token, a_vault, a_user_ata, &accounts[7], amount, &seeds[..])?; // 7 is derived vault authority? 
-                // Ah, account 7 should be the PDA.
-                // Re-check account list from WithdrawCollateral
-                // Plan: "Accounts: [0] user, [1] slab, [2] vault, [3] user_ata, [4] vault_auth_pda, [5] token, [6] clock, [7] oracle" 
-                // My list above was shifted.
-                // Let's adhere to the plan account list order for `handle_withdraw`:
-                // 9.5 handle_withdraw doesn't explicitly list indices, but "Withdraw must derive PDA seeds...".
-                // I used indices 0..6 above. Let's fix.
-                // Accounts:
-                // 0 user
-                // 1 slab
-                // 2 vault_ata
-                // 3 user_ata
-                // 4 vault_pda (for token cpi authority)
-                // 5 token_prog
-                // 6 clock
-                // 7 oracle
-                
-                // Let's assume this order.
-                // collateral::withdraw args: token_prog, source, dest, authority
                 collateral::withdraw(
-                    &accounts[5], // token
-                    a_vault, // source
-                    a_user_ata, // dest
-                    &accounts[4], // authority PDA
+                    a_token,
+                    a_vault,
+                    a_user_ata,
+                    a_vault_pda,
                     amount,
-                    &seeds[..]
+                    seeds,
                 )?;
             },
             Instruction::KeeperCrank { caller_idx, funding_rate_bps_per_slot, allow_panic } => {
@@ -798,6 +795,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mut engine = state::load_engine(&data)?;
 
+                check_idx(&engine, lp_idx)?;
+                check_idx(&engine, user_idx)?;
+
                 // Verify owners
                 let u_owner = engine.accounts[user_idx as usize].owner;
                 if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
@@ -817,6 +817,8 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mut engine = state::load_engine(&data)?;
 
+                check_idx(&engine, target_idx)?;
+
                 let clock = Clock::from_account_info(&accounts[2])?;
                 let price = oracle::read_pyth_price_e6(&accounts[3], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
@@ -833,6 +835,8 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mut engine = state::load_engine(&data)?;
 
+                check_idx(&engine, user_idx)?;
+
                 let u_owner = engine.accounts[user_idx as usize].owner;
                 if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
 
@@ -842,8 +846,10 @@ pub mod processor {
                 let amt = engine.close_account(user_idx, clock.slot, price).map_err(map_risk_error)?;
                 state::store_engine(&mut data, &engine)?;
 
+                let amt_u64: u64 = amt.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
+
                 let seeds = &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]];
-                collateral::withdraw(&accounts[5], &accounts[2], &accounts[3], &accounts[4], amt as u64, &seeds[..])?;
+                collateral::withdraw(&accounts[5], &accounts[2], &accounts[3], &accounts[4], amt_u64, &seeds[..])?;
             },
             Instruction::TopUpInsurance { amount } => {
                 // 0 user, 1 slab, 2 user_ata, 3 vault, 4 token
