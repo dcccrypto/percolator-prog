@@ -85,13 +85,12 @@ pub mod constants {
 /// Compute system risk units: max_concentration + sum_abs/8.
 /// max_concentration = max(abs(LP position_size))
 /// sum_abs = sum(abs(LP position)) - captures distributed OI
-/// Only LP accounts are counted (matcher_program != [0;32]).
+/// Only LP accounts are counted (kind == AccountKind::LP).
 fn compute_system_risk_units(engine: &percolator::RiskEngine) -> u128 {
     let mut sum_abs: u128 = 0;
     let mut max_abs: u128 = 0;
     for i in 0..percolator::MAX_ACCOUNTS {
-        // LP accounts have non-zero matcher_program
-        if engine.is_used(i) && engine.accounts[i].matcher_program != [0u8; 32] {
+        if engine.is_used(i) && engine.accounts[i].is_lp() {
             let pos: i128 = engine.accounts[i].position_size;
             let abs_pos = pos.unsigned_abs();
             sum_abs = sum_abs.saturating_add(abs_pos);
@@ -111,7 +110,7 @@ fn trade_increases_risk(engine: &percolator::RiskEngine, lp_idx: u32, delta: i12
     let mut sum_abs: u128 = 0;
     let mut max_abs: u128 = 0;
     for i in 0..percolator::MAX_ACCOUNTS {
-        if engine.is_used(i) && engine.accounts[i].matcher_program != [0u8; 32] {
+        if engine.is_used(i) && engine.accounts[i].is_lp() {
             let mut pos: i128 = engine.accounts[i].position_size;
             if i == lp_idx as usize {
                 pos = pos.saturating_add(delta);
@@ -1342,7 +1341,15 @@ pub mod processor {
                     let l_owner = engine.accounts[lp_idx as usize].owner;
                     if Pubkey::new_from_array(l_owner) != *a_lp_owner.key { return Err(PercolatorError::EngineUnauthorized.into()); }
 
-                    // Risk gate moved to post-CPI using actual exec_size
+                    // Pre-CPI gate: cheap early reject if insurance is low and trade would increase risk
+                    // Authoritative gate is post-CPI using actual exec_size
+                    let bal = engine.insurance_fund.balance;
+                    let thr = engine.risk_reduction_threshold();
+                    if bal < thr {
+                        if crate::trade_increases_risk(engine, lp_idx as u32, -size) {
+                            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                        }
+                    }
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
                     (lp_acc.account_id, config, req_id, lp_acc.matcher_program, lp_acc.matcher_context)
@@ -1424,7 +1431,7 @@ pub mod processor {
                         }
                     }
 
-                    engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
+                    engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, ret.exec_size).map_err(map_risk_error)?;
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
                 }
