@@ -12,9 +12,8 @@ path = "src/percolator.rs"
 [features]
 no-entrypoint = []
 test-sbf = []
-fuzz = ["percolator/fuzz"]
 devnet = []
-small = ["percolator/small"]  # Use MAX_ACCOUNTS=64 for tests
+test = ["percolator/test"]  # Use MAX_ACCOUNTS=64 for tests
 
 [dependencies]
 solana-program = "1.18"
