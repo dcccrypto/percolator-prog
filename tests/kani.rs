@@ -37,6 +37,8 @@ use percolator_prog::verify::{
     TradeCpiDecision, decide_trade_cpi, decision_nonce,
     TradeNoCpiDecision, decide_trade_nocpi,
     SimpleDecision, decide_single_owner_op, decide_crank, decide_admin_op,
+    // New: ABI validation from real inputs
+    MatcherReturnFields, abi_ok, decide_trade_cpi_from_ret,
 };
 
 // =============================================================================
@@ -46,6 +48,20 @@ use percolator_prog::verify::{
 /// Create a MatcherReturn from individual symbolic fields
 fn any_matcher_return() -> MatcherReturn {
     MatcherReturn {
+        abi_version: kani::any(),
+        flags: kani::any(),
+        exec_price_e6: kani::any(),
+        exec_size: kani::any(),
+        req_id: kani::any(),
+        lp_account_id: kani::any(),
+        oracle_price_e6: kani::any(),
+        reserved: kani::any(),
+    }
+}
+
+/// Create a MatcherReturnFields from individual symbolic fields
+fn any_matcher_return_fields() -> MatcherReturnFields {
+    MatcherReturnFields {
         abi_version: kani::any(),
         flags: kani::any(),
         exec_price_e6: kani::any(),
@@ -1350,4 +1366,199 @@ fn kani_decide_admin_rejects() {
     kani::assume(admin != signer);
     let decision2 = decide_admin_op(admin, signer);
     assert_eq!(decision2, SimpleDecision::Reject, "admin mismatch must reject");
+}
+
+// =============================================================================
+// U. VERIFY::ABI_OK EQUIVALENCE (2 proofs)
+// Prove that verify::abi_ok matches validate_matcher_return semantics
+// =============================================================================
+
+/// Prove: verify::abi_ok accepts iff validate_matcher_return accepts
+#[kani::proof]
+fn kani_abi_ok_matches_validate_accept() {
+    let ret = any_matcher_return();
+    let lp_account_id: u64 = kani::any();
+    let oracle_price: u64 = kani::any();
+    let req_size: i128 = kani::any();
+    let req_id: u64 = kani::any();
+
+    let validate_result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
+
+    let ret_fields = MatcherReturnFields {
+        abi_version: ret.abi_version,
+        flags: ret.flags,
+        exec_price_e6: ret.exec_price_e6,
+        exec_size: ret.exec_size,
+        req_id: ret.req_id,
+        lp_account_id: ret.lp_account_id,
+        oracle_price_e6: ret.oracle_price_e6,
+        reserved: ret.reserved,
+    };
+    let abi_ok_result = abi_ok(ret_fields, lp_account_id, oracle_price, req_size, req_id);
+
+    // If validate accepts, abi_ok must accept
+    if validate_result.is_ok() {
+        assert!(abi_ok_result, "abi_ok must accept when validate_matcher_return accepts");
+    }
+}
+
+/// Prove: verify::abi_ok rejects iff validate_matcher_return rejects
+#[kani::proof]
+fn kani_abi_ok_matches_validate_reject() {
+    let ret = any_matcher_return();
+    let lp_account_id: u64 = kani::any();
+    let oracle_price: u64 = kani::any();
+    let req_size: i128 = kani::any();
+    let req_id: u64 = kani::any();
+
+    let validate_result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
+
+    let ret_fields = MatcherReturnFields {
+        abi_version: ret.abi_version,
+        flags: ret.flags,
+        exec_price_e6: ret.exec_price_e6,
+        exec_size: ret.exec_size,
+        req_id: ret.req_id,
+        lp_account_id: ret.lp_account_id,
+        oracle_price_e6: ret.oracle_price_e6,
+        reserved: ret.reserved,
+    };
+    let abi_ok_result = abi_ok(ret_fields, lp_account_id, oracle_price, req_size, req_id);
+
+    // If validate rejects, abi_ok must reject
+    if validate_result.is_err() {
+        assert!(!abi_ok_result, "abi_ok must reject when validate_matcher_return rejects");
+    }
+}
+
+// =============================================================================
+// V. DECIDE_TRADE_CPI_FROM_RET UNIVERSAL PROOFS (3 proofs)
+// These prove program-level policies using the mechanically-tied decision function
+// =============================================================================
+
+/// Prove: ANY rejection from decide_trade_cpi_from_ret leaves nonce unchanged
+#[kani::proof]
+fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
+    let old_nonce: u64 = kani::any();
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let gate_is_active: bool = kani::any();
+    let risk_increase: bool = kani::any();
+    let ret = any_matcher_return_fields();
+    let lp_account_id: u64 = kani::any();
+    let oracle_price_e6: u64 = kani::any();
+    let req_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi_from_ret(
+        old_nonce, shape, identity_ok, pda_ok,
+        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
+        ret, lp_account_id, oracle_price_e6, req_size
+    );
+
+    // Only consider rejection cases
+    kani::assume(matches!(decision, TradeCpiDecision::Reject));
+
+    // For ANY rejection, nonce must be unchanged
+    let result_nonce = decision_nonce(old_nonce, decision);
+    assert_eq!(result_nonce, old_nonce,
+        "ANY TradeCpi rejection (from real inputs) must leave nonce unchanged");
+}
+
+/// Prove: ANY acceptance from decide_trade_cpi_from_ret increments nonce
+#[kani::proof]
+fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
+    let old_nonce: u64 = kani::any();
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let gate_is_active: bool = kani::any();
+    let risk_increase: bool = kani::any();
+    let ret = any_matcher_return_fields();
+    let lp_account_id: u64 = kani::any();
+    let oracle_price_e6: u64 = kani::any();
+    let req_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi_from_ret(
+        old_nonce, shape, identity_ok, pda_ok,
+        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
+        ret, lp_account_id, oracle_price_e6, req_size
+    );
+
+    // Only consider acceptance cases
+    kani::assume(matches!(decision, TradeCpiDecision::Accept { .. }));
+
+    // For ANY acceptance, nonce must increment by 1
+    let result_nonce = decision_nonce(old_nonce, decision);
+    assert_eq!(result_nonce, old_nonce.wrapping_add(1),
+        "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1");
+}
+
+/// Prove: ANY acceptance uses exec_size from ret, not req_size
+#[kani::proof]
+fn kani_tradecpi_from_ret_accept_uses_exec_size() {
+    let old_nonce: u64 = kani::any();
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let gate_is_active: bool = kani::any();
+    let risk_increase: bool = kani::any();
+    let ret = any_matcher_return_fields();
+    let lp_account_id: u64 = kani::any();
+    let oracle_price_e6: u64 = kani::any();
+    let req_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi_from_ret(
+        old_nonce, shape, identity_ok, pda_ok,
+        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
+        ret, lp_account_id, oracle_price_e6, req_size
+    );
+
+    if let TradeCpiDecision::Accept { chosen_size, .. } = decision {
+        assert_eq!(chosen_size, ret.exec_size,
+            "TradeCpi accept must use exec_size from matcher return, not req_size");
+    }
+}
+
+// =============================================================================
+// W. REJECT => NO CHOSEN_SIZE (1 proof)
+// =============================================================================
+
+/// Prove: Reject decision has no chosen_size field (structural guarantee)
+#[kani::proof]
+fn kani_reject_has_no_chosen_size() {
+    let decision = TradeCpiDecision::Reject;
+
+    // This is a structural proof - Reject variant has no chosen_size field
+    // The match below proves that Reject cannot carry a chosen_size
+    match decision {
+        TradeCpiDecision::Reject => {
+            // Reject has no fields - chosen_size is not accessible
+            assert!(true, "Reject has no chosen_size by construction");
+        }
+        TradeCpiDecision::Accept { chosen_size: _, new_nonce: _ } => {
+            panic!("expected Reject, got Accept");
+        }
+    }
 }

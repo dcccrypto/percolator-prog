@@ -418,6 +418,132 @@ pub mod verify {
     }
 
     // =========================================================================
+    // ABI validation from real MatcherReturn inputs
+    // =========================================================================
+
+    /// Pure matcher return fields for Kani verification.
+    /// Mirrors constants::MatcherReturn but lives in verify module.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MatcherReturnFields {
+        pub abi_version: u32,
+        pub flags: u32,
+        pub exec_price_e6: u64,
+        pub exec_size: i128,
+        pub req_id: u64,
+        pub lp_account_id: u64,
+        pub oracle_price_e6: u64,
+        pub reserved: u64,
+    }
+
+    // ABI constants (must match constants module)
+    const MATCHER_ABI_VERSION: u32 = 1;
+    const FLAG_VALID: u32 = 1;
+    const FLAG_PARTIAL_OK: u32 = 2;
+    const FLAG_REJECTED: u32 = 4;
+
+    /// Pure ABI validation of matcher return.
+    /// Returns true iff the matcher return passes all ABI checks.
+    #[inline]
+    pub fn abi_ok(
+        ret: MatcherReturnFields,
+        expected_lp_account_id: u64,
+        expected_oracle_price_e6: u64,
+        req_size: i128,
+        expected_req_id: u64,
+    ) -> bool {
+        // Check ABI version
+        if ret.abi_version != MATCHER_ABI_VERSION { return false; }
+        // Must have VALID flag set
+        if (ret.flags & FLAG_VALID) == 0 { return false; }
+        // Must not have REJECTED flag set
+        if (ret.flags & FLAG_REJECTED) != 0 { return false; }
+        // Validate echoed fields match request
+        if ret.lp_account_id != expected_lp_account_id { return false; }
+        if ret.oracle_price_e6 != expected_oracle_price_e6 { return false; }
+        if ret.reserved != 0 { return false; }
+        if ret.req_id != expected_req_id { return false; }
+        // Require exec_price_e6 != 0 always
+        if ret.exec_price_e6 == 0 { return false; }
+        // Zero exec_size requires PARTIAL_OK flag
+        if ret.exec_size == 0 {
+            if (ret.flags & FLAG_PARTIAL_OK) == 0 {
+                return false;
+            }
+            return true; // Zero fill with PARTIAL_OK is allowed
+        }
+        // Size constraints (use saturating_abs to handle i128::MIN)
+        if ret.exec_size.saturating_abs() > req_size.saturating_abs() { return false; }
+        if req_size != 0 {
+            if ret.exec_size.signum() != req_size.signum() { return false; }
+        }
+        true
+    }
+
+    /// Decision function for TradeCpi that computes ABI validity from real inputs.
+    /// This is the mechanically-tied version that proves program-level policies.
+    ///
+    /// # Arguments
+    /// * `old_nonce` - Current nonce before this trade
+    /// * `shape` - Matcher account shape validation inputs
+    /// * `identity_ok` - Whether matcher identity matches LP registration
+    /// * `pda_ok` - Whether LP PDA matches expected derivation
+    /// * `user_auth_ok` - Whether user signer matches user owner
+    /// * `lp_auth_ok` - Whether LP signer matches LP owner
+    /// * `gate_active` - Whether the risk-reduction gate is active
+    /// * `risk_increase` - Whether this trade would increase system risk
+    /// * `ret` - The matcher return fields (from CPI)
+    /// * `lp_account_id` - Expected LP account ID from request
+    /// * `oracle_price_e6` - Expected oracle price from request
+    /// * `req_size` - Requested trade size
+    #[inline]
+    pub fn decide_trade_cpi_from_ret(
+        old_nonce: u64,
+        shape: MatcherAccountsShape,
+        identity_ok: bool,
+        pda_ok: bool,
+        user_auth_ok: bool,
+        lp_auth_ok: bool,
+        gate_is_active: bool,
+        risk_increase: bool,
+        ret: MatcherReturnFields,
+        lp_account_id: u64,
+        oracle_price_e6: u64,
+        req_size: i128,
+    ) -> TradeCpiDecision {
+        // Check in order of actual program execution:
+        // 1. Matcher shape validation
+        if !matcher_shape_ok(shape) {
+            return TradeCpiDecision::Reject;
+        }
+        // 2. PDA validation
+        if !pda_ok {
+            return TradeCpiDecision::Reject;
+        }
+        // 3. Owner authorization (user and LP)
+        if !user_auth_ok || !lp_auth_ok {
+            return TradeCpiDecision::Reject;
+        }
+        // 4. Matcher identity binding
+        if !identity_ok {
+            return TradeCpiDecision::Reject;
+        }
+        // 5. Compute req_id from nonce and validate ABI
+        let req_id = nonce_on_success(old_nonce);
+        if !abi_ok(ret, lp_account_id, oracle_price_e6, req_size, req_id) {
+            return TradeCpiDecision::Reject;
+        }
+        // 6. Risk gate check
+        if gate_is_active && risk_increase {
+            return TradeCpiDecision::Reject;
+        }
+        // All checks passed - accept the trade
+        TradeCpiDecision::Accept {
+            new_nonce: req_id,
+            chosen_size: cpi_trade_size(ret.exec_size, req_size),
+        }
+    }
+
+    // =========================================================================
     // TradeNoCpi decision logic
     // =========================================================================
 
@@ -629,8 +755,8 @@ pub mod matcher_abi {
             return Ok(());
         }
 
-        // Size constraints
-        if ret.exec_size.abs() > req_size.abs() { return Err(ProgramError::InvalidAccountData); }
+        // Size constraints (use saturating_abs to handle i128::MIN)
+        if ret.exec_size.saturating_abs() > req_size.saturating_abs() { return Err(ProgramError::InvalidAccountData); }
         if req_size != 0 {
             if ret.exec_size.signum() != req_size.signum() { return Err(ProgramError::InvalidAccountData); }
         }
@@ -912,7 +1038,8 @@ pub mod accounts {
     }
 
     pub fn expect_key(ai: &AccountInfo, expected: &Pubkey) -> Result<(), ProgramError> {
-        if ai.key != expected {
+        // Key check via verify helper (Kani-provable)
+        if !crate::verify::pda_key_matches(expected.to_bytes(), ai.key.to_bytes()) {
             return Err(ProgramError::InvalidArgument);
         }
         Ok(())
@@ -1812,7 +1939,20 @@ pub mod processor {
 
                 let ctx_data = a_matcher_ctx.try_borrow_data()?;
                 let ret = crate::matcher_abi::read_matcher_return(&ctx_data)?;
-                crate::matcher_abi::validate_matcher_return(&ret, lp_account_id, price, size, req_id)?;
+                // ABI validation via verify helper (Kani-provable)
+                let ret_fields = crate::verify::MatcherReturnFields {
+                    abi_version: ret.abi_version,
+                    flags: ret.flags,
+                    exec_price_e6: ret.exec_price_e6,
+                    exec_size: ret.exec_size,
+                    req_id: ret.req_id,
+                    lp_account_id: ret.lp_account_id,
+                    oracle_price_e6: ret.oracle_price_e6,
+                    reserved: ret.reserved,
+                };
+                if !crate::verify::abi_ok(ret_fields, lp_account_id, price, size, req_id) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 drop(ctx_data);
 
                 let matcher = CpiMatcher { exec_price: ret.exec_price_e6, exec_size: ret.exec_size };

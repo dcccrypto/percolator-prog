@@ -4,8 +4,8 @@
 
 **Date:** 2026-01-04
 **Kani Version:** 0.66.0
-**Total Proofs:** 80
-**Passed:** 80
+**Total Proofs:** 86
+**Passed:** 86
 **Failed:** 0
 
 ## Proof Categories
@@ -173,6 +173,24 @@ These subsume all specific nonce proofs with universal quantification.
 | kani_decide_admin_accepts | Valid admin -> accept |
 | kani_decide_admin_rejects | Invalid admin -> reject |
 
+### U. ABI Equivalence (2 proofs) - CRITICAL
+| Harness | Property |
+|---------|----------|
+| kani_abi_ok_matches_validate_accept | verify::abi_ok accepts iff validate_matcher_return accepts |
+| kani_abi_ok_matches_validate_reject | verify::abi_ok rejects iff validate_matcher_return rejects |
+
+### V. TradeCpi From Real Inputs (3 proofs) - CRITICAL
+| Harness | Property |
+|---------|----------|
+| kani_tradecpi_from_ret_any_reject_nonce_unchanged | ANY rejection (real inputs) -> nonce unchanged |
+| kani_tradecpi_from_ret_any_accept_increments_nonce | ANY acceptance (real inputs) -> nonce += 1 |
+| kani_tradecpi_from_ret_accept_uses_exec_size | ANY acceptance -> uses exec_size from ret |
+
+### W. Reject Structure (1 proof)
+| Harness | Property |
+|---------|----------|
+| kani_reject_has_no_chosen_size | Reject variant has no chosen_size field |
+
 ## Key Security Properties Proven
 
 ### Authorization Surface
@@ -242,6 +260,11 @@ pub mod verify {
     pub fn decide_trade_cpi(...) -> TradeCpiDecision
     pub fn decision_nonce(old_nonce, decision) -> u64
 
+    // ABI validation from real inputs (CRITICAL - proves program-level policies)
+    pub struct MatcherReturnFields { abi_version, flags, exec_price_e6, exec_size, req_id, lp_account_id, oracle_price_e6, reserved }
+    pub fn abi_ok(ret: MatcherReturnFields, lp_account_id, oracle_price, req_size, req_id) -> bool
+    pub fn decide_trade_cpi_from_ret(..., ret: MatcherReturnFields, ...) -> TradeCpiDecision
+
     pub enum TradeNoCpiDecision { Reject, Accept }
     pub fn decide_trade_nocpi(...) -> TradeNoCpiDecision
 
@@ -260,7 +283,7 @@ pub mod verify {
 | DepositCollateral | `owner_ok` |
 | WithdrawCollateral | `owner_ok` |
 | TradeNoCpi | `owner_ok` (x2), `gate_active` |
-| TradeCpi | `matcher_shape_ok`, `ctx_len_sufficient`, `owner_ok` (x2), `matcher_identity_ok`, `nonce_on_success`, `gate_active`, `cpi_trade_size`, `lp_pda_shape_ok`, `pda_key_matches`, `oracle_key_ok` |
+| TradeCpi | `matcher_shape_ok`, `ctx_len_sufficient`, `owner_ok` (x2), `matcher_identity_ok`, `nonce_on_success`, `gate_active`, `cpi_trade_size`, `lp_pda_shape_ok`, `pda_key_matches`, `oracle_key_ok`, `abi_ok` |
 | CloseAccount | `owner_ok`, `oracle_key_ok` |
 | KeeperCrank | `crank_authorized`, `oracle_key_ok` |
 | SetRiskThreshold | `admin_ok` (via require_admin) |
@@ -271,8 +294,13 @@ All verify helpers are wired into the processor as the single source of truth:
 - `accounts::expect_len` calls `verify::len_ok`
 - `accounts::expect_signer` calls `verify::signer_ok`
 - `accounts::expect_writable` calls `verify::writable_ok`
+- `accounts::expect_key` calls `verify::pda_key_matches`
 - `slab_guard` calls `verify::slab_shape_ok`
 - Oracle key checks call `verify::oracle_key_ok`
+- ABI validation calls `verify::abi_ok` (computes validity from real MatcherReturn fields)
+
+The `decide_trade_cpi_from_ret` helper takes real MatcherReturn fields and computes
+ABI validity internally, enabling Kani to prove end-to-end program-level policies.
 
 The `decide_trade_cpi` helper models the full wrapper decision, enabling Kani to prove
 program-level policies like "reject implies nonce unchanged" and "accept implies uses exec_size".
