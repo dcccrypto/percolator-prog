@@ -1909,15 +1909,9 @@ pub mod processor {
                 let clock = Clock::from_account_info(a_clock)?;
                 let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
-                // Zero context prefix before CPI to prevent stale data attacks
-                // Note: In solana-program-test, this causes ExternalAccountDataModified because
-                // the test harness doesn't allow modifying an account before passing it to CPI.
-                // In production, this zeroing is critical for security.
-                #[cfg(not(any(test, feature = "test-sbf")))]
-                {
-                    let mut ctx = a_matcher_ctx.try_borrow_mut_data()?;
-                    ctx[..MATCHER_CONTEXT_PREFIX_LEN].fill(0);
-                }
+                // Note: We don't zero the matcher_ctx before CPI because we don't own it.
+                // Security is maintained by ABI validation which checks req_id (nonce),
+                // lp_account_id, and oracle_price_e6 all match the request parameters.
 
                 let mut cpi_data = alloc::vec::Vec::with_capacity(MATCHER_CALL_LEN);
                 cpi_data.push(MATCHER_CALL_TAG);
