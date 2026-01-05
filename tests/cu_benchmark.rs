@@ -30,7 +30,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 17696;  // MAX_ACCOUNTS=64
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1094744;  // MAX_ACCOUNTS=4096
+const SLAB_LEN: usize = 1102944;  // MAX_ACCOUNTS=4096 (0x10d460)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -73,7 +73,14 @@ fn make_pyth_data(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
 }
 
 // Instruction encoders
-fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_col: &Pubkey) -> Vec<u8> {
+fn encode_init_market_with_params(
+    admin: &Pubkey,
+    mint: &Pubkey,
+    pyth_index: &Pubkey,
+    pyth_col: &Pubkey,
+    risk_reduction_threshold: u128,
+    warmup_period_slots: u64,
+) -> Vec<u8> {
     let mut data = vec![0u8];
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
@@ -82,13 +89,13 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_c
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_slots
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes());   // warmup_period_slots
+    data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
     data.extend_from_slice(&0u64.to_le_bytes());   // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes());  // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes());  // risk_reduction_threshold
+    data.extend_from_slice(&risk_reduction_threshold.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes());  // maintenance_fee_per_slot
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes());  // liquidation_fee_bps
@@ -96,6 +103,10 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_c
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes());  // min_liquidation_abs
     data
+}
+
+fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_col: &Pubkey) -> Vec<u8> {
+    encode_init_market_with_params(admin, mint, pyth_index, pyth_col, 0, 0)
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
@@ -213,6 +224,10 @@ impl TestEnv {
     }
 
     fn init_market(&mut self) {
+        self.init_market_with_params(0, 0);
+    }
+
+    fn init_market_with_params(&mut self, risk_reduction_threshold: u128, warmup_period_slots: u64) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
         self.svm.set_account(dummy_ata, Account {
@@ -238,7 +253,14 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.pyth_col, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
-            data: encode_init_market(&admin.pubkey(), &self.mint, &self.pyth_index, &self.pyth_col),
+            data: encode_init_market_with_params(
+                &admin.pubkey(),
+                &self.mint,
+                &self.pyth_index,
+                &self.pyth_col,
+                risk_reduction_threshold,
+                warmup_period_slots,
+            ),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -666,7 +688,7 @@ fn benchmark_worst_case_scenarios() {
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Scenario 5: 🟠 Deeply underwater accounts (liquidations)");
     {
-        let test_sizes = [10, 25, 50, 100, 200];
+        let test_sizes = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000];
 
         for &num_users in &test_sizes {
             if num_users >= MAX_ACCOUNTS {
@@ -748,10 +770,124 @@ fn benchmark_worst_case_scenarios() {
         }
     }
 
+    // Scenario 7: 🔥 Worst-case ADL (force_realize_losses with unpaid losses)
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 7: 🔥 Worst-case ADL");
+    println!("  (half long/half short with varying sizes, 50% crash)");
+    println!("  Losers have minimal capital → unpaid losses → apply_adl");
+    {
+        // Test sizes for ADL scenario
+        let test_sizes = [200, 400, 600, 800, 1000, 1100, 1200, 1300, 1400, 1500];
+
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                break;
+            }
+
+            let mut env = TestEnv::new();
+
+            // Use normal threshold - insurance starts at 0 which is <= 0 threshold
+            // This should trigger force_realize_losses path when there are unpaid losses
+            // warmup_period > 0 so winners' PnL stays unwrapped
+            env.init_market_with_params(0, 100); // threshold=0, warmup=100 slots
+
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            // LP needs huge capital to take the other side of all trades
+            env.deposit(&lp, 0, 1_000_000_000_000_000);
+
+            // Create users: half will be winners, half losers
+            // Winners (shorts): deposit minimal capital, will have positive PnL after crash
+            // Losers (longs): deposit zero/minimal capital, will have unpaid losses
+            let half = num_users / 2;
+
+            // Create all users first (without deposits for losers)
+            let mut users = Vec::with_capacity(num_users);
+            for i in 0..num_users {
+                let user = Keypair::new();
+                env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+                let ata = env.create_ata(&user.pubkey(), 0);
+
+                let ix = Instruction {
+                    program_id: env.program_id,
+                    accounts: vec![
+                        AccountMeta::new(user.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(ata, false),
+                        AccountMeta::new(env.vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(sysvar::clock::ID, false),
+                        AccountMeta::new_readonly(env.pyth_col, false),
+                    ],
+                    data: encode_init_user(0),
+                };
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                );
+                env.svm.send_transaction(tx).unwrap();
+
+                let user_idx = (i + 1) as u16;
+
+                // All users need enough margin to open positions
+                // But losers will have capital wiped out by the crash
+                // Size varies: (i%100+1)*10, so max size ~1000 contracts
+                // At $100 price, position value = size * 100 = up to $100,000
+                // With 10% initial margin, need ~$10,000 margin
+                // Deposit slightly more than minimum so trade succeeds
+                let deposit = if i < half {
+                    // Losers (longs): just enough margin, will be wiped out
+                    100_000 // minimal to pass margin check
+                } else {
+                    // Winners (shorts): more capital
+                    10_000_000
+                };
+                env.deposit(&user, user_idx, deposit);
+
+                users.push(user);
+            }
+
+            // Open positions with varying sizes (for dense remainders in ADL)
+            // Longs: will lose on 50% price crash
+            // Shorts: will win on 50% price crash
+            for (i, user) in users.iter().enumerate() {
+                let user_idx = (i + 1) as u16;
+                // Size varies by index to create different unwrapped PnL values
+                let base_size = ((i % 100) + 1) as i128 * 10;
+                let size = if i < half {
+                    base_size  // longs (losers after crash)
+                } else {
+                    -base_size // shorts (winners after crash)
+                };
+                env.trade(user, &lp, 0, user_idx, size);
+            }
+
+            // Price crashes 50% - longs lose massively, shorts win massively
+            // force_realize_losses will be triggered because insurance < threshold
+            // Losers have insufficient capital → unpaid losses → apply_adl
+            env.set_price(50_000_000, 200); // $100 -> $50
+
+            match env.try_crank() {
+                Ok(cu) => {
+                    let cu_per_account = cu / (num_users + 1) as u64;
+                    println!("  {:>4} ADL accounts: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                }
+                Err(e) => {
+                    if e.contains("exceeded CUs") || e.contains("ProgramFailedToComplete") {
+                        println!("  {:>4} ADL accounts: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
+                    } else {
+                        println!("  {:>4} ADL accounts: ❌ {}", num_users, e);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("=== SUMMARY ===");
     println!("• CU scales O(n) with MAX_ACCOUNTS due to bitmap scan");
     println!("• With MAX_ACCOUNTS={}, baseline scan alone is ~178K CU", MAX_ACCOUNTS);
     println!("• Solana 1.4M CU limit constrains practical users per crank");
     println!("• Liquidation processing adds CU overhead per account");
+    println!("• ADL worst-case: force_realize with unpaid losses triggers apply_adl");
 }
