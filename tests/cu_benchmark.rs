@@ -30,7 +30,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 17696;  // MAX_ACCOUNTS=64
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1102944;  // MAX_ACCOUNTS=4096 (0x10d460)
+const SLAB_LEN: usize = 1102968;  // MAX_ACCOUNTS=4096 (0x10d478)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -883,11 +883,209 @@ fn benchmark_worst_case_scenarios() {
         }
     }
 
+    // Scenario 8: 🔥🔥 Full 4096 sweep - worst single crank across 8 calls
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 8: 🔥🔥 Full sweep worst-case (8 cranks, 512 each)");
+    println!("  Testing worst single crank CU across 8-crank full sweep");
+    println!("  8a: Healthy accounts with positions (no liquidations)");
+    {
+        // Test with increasing account counts - find threshold
+        let test_sizes = [100, 200, 256, 300, 350, 400, 450, 512];
+
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                continue;
+            }
+
+            let mut env = TestEnv::new();
+            env.init_market_with_params(0, 100); // warmup=100 slots
+
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            env.deposit(&lp, 0, 1_000_000_000_000_000);
+
+            // Create all users with positions (worst case = all have positions)
+            let half = num_users / 2;
+            let mut users = Vec::with_capacity(num_users);
+
+            print!("  Creating {} users...", num_users);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            for i in 0..num_users {
+                let user = Keypair::new();
+                env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+                let ata = env.create_ata(&user.pubkey(), 0);
+
+                let ix = Instruction {
+                    program_id: env.program_id,
+                    accounts: vec![
+                        AccountMeta::new(user.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(ata, false),
+                        AccountMeta::new(env.vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(sysvar::clock::ID, false),
+                        AccountMeta::new_readonly(env.pyth_col, false),
+                    ],
+                    data: encode_init_user(0),
+                };
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                );
+                env.svm.send_transaction(tx).unwrap();
+
+                let user_idx = (i + 1) as u16;
+                // All users get enough margin for positions
+                let deposit = if i < half { 100_000 } else { 10_000_000 };
+                env.deposit(&user, user_idx, deposit);
+                users.push(user);
+            }
+            println!(" done");
+
+            // Open positions - half long, half short (creates liquidation scenario)
+            for (i, user) in users.iter().enumerate() {
+                let user_idx = (i + 1) as u16;
+                let base_size = ((i % 100) + 1) as i128 * 10;
+                let size = if i < half { base_size } else { -base_size };
+                env.trade(user, &lp, 0, user_idx, size);
+            }
+
+            // No price crash - healthy accounts
+            env.set_price(100_000_000, 200);
+
+            // Call crank 8 times and track worst CU
+            let mut worst_cu: u64 = 0;
+            let mut total_cu: u64 = 0;
+            let mut any_failed = false;
+
+            for crank_num in 0..8 {
+                match env.try_crank() {
+                    Ok(cu) => {
+                        if cu > worst_cu {
+                            worst_cu = cu;
+                        }
+                        total_cu += cu;
+                    }
+                    Err(e) => {
+                        if e.contains("exceeded CUs") || e.contains("ProgramFailedToComplete") {
+                            println!("\n    Crank {} EXCEEDED 1.4M CU!", crank_num + 1);
+                            any_failed = true;
+                            break;
+                        }
+                        // Other errors might be OK (no work to do)
+                    }
+                }
+            }
+
+            if any_failed {
+                println!("  {:>4} users: ❌ Single crank exceeded 1.4M CU limit", num_users);
+            } else {
+                let pct = (worst_cu as f64 / 1_400_000.0) * 100.0;
+                println!("  {:>4} users: worst={:>10} CU ({:.1}% of limit), total={} CU across 8 cranks",
+                    num_users, worst_cu, pct, total_cu);
+            }
+        }
+    }
+
+    // Scenario 8b: Full sweep with liquidations - find threshold
+    println!("\n  8b: With 50% crash (liquidations/ADL)");
+    {
+        let test_sizes = [100, 200, 256, 300, 350, 400, 450, 512];
+
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                continue;
+            }
+
+            let mut env = TestEnv::new();
+            env.init_market_with_params(0, 100);
+
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            env.deposit(&lp, 0, 1_000_000_000_000_000);
+
+            let half = num_users / 2;
+            let mut users = Vec::with_capacity(num_users);
+
+            print!("  Creating {} users...", num_users);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            for i in 0..num_users {
+                let user = Keypair::new();
+                env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+                let ata = env.create_ata(&user.pubkey(), 0);
+
+                let ix = Instruction {
+                    program_id: env.program_id,
+                    accounts: vec![
+                        AccountMeta::new(user.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(ata, false),
+                        AccountMeta::new(env.vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(sysvar::clock::ID, false),
+                        AccountMeta::new_readonly(env.pyth_col, false),
+                    ],
+                    data: encode_init_user(0),
+                };
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                );
+                env.svm.send_transaction(tx).unwrap();
+
+                let user_idx = (i + 1) as u16;
+                let deposit = if i < half { 100_000 } else { 10_000_000 };
+                env.deposit(&user, user_idx, deposit);
+                users.push(user);
+            }
+            println!(" done");
+
+            for (i, user) in users.iter().enumerate() {
+                let user_idx = (i + 1) as u16;
+                let base_size = ((i % 100) + 1) as i128 * 10;
+                let size = if i < half { base_size } else { -base_size };
+                env.trade(user, &lp, 0, user_idx, size);
+            }
+
+            // 50% price crash - triggers liquidations
+            env.set_price(50_000_000, 200);
+
+            let mut worst_cu: u64 = 0;
+            let mut total_cu: u64 = 0;
+            let mut any_failed = false;
+
+            for crank_num in 0..8 {
+                match env.try_crank() {
+                    Ok(cu) => {
+                        if cu > worst_cu {
+                            worst_cu = cu;
+                        }
+                        total_cu += cu;
+                    }
+                    Err(e) => {
+                        if e.contains("exceeded CUs") || e.contains("ProgramFailedToComplete") {
+                            println!("\n    Crank {} EXCEEDED 1.4M CU!", crank_num + 1);
+                            any_failed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if any_failed {
+                println!("  {:>4} users: ❌ Single crank exceeded 1.4M CU limit", num_users);
+            } else {
+                let pct = (worst_cu as f64 / 1_400_000.0) * 100.0;
+                println!("  {:>4} users: worst={:>10} CU ({:.1}% of limit), total={} CU across 8 cranks",
+                    num_users, worst_cu, pct, total_cu);
+            }
+        }
+    }
+
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("=== SUMMARY ===");
-    println!("• CU scales O(n) with MAX_ACCOUNTS due to bitmap scan");
-    println!("• With MAX_ACCOUNTS={}, baseline scan alone is ~178K CU", MAX_ACCOUNTS);
-    println!("• Solana 1.4M CU limit constrains practical users per crank");
-    println!("• Liquidation processing adds CU overhead per account");
-    println!("• ADL worst-case: force_realize with unpaid losses triggers apply_adl");
+    println!("• Crank sweeps 512 accounts max per call (8 cranks for full 4096)");
+    println!("• With MAX_ACCOUNTS={}, baseline scan alone is ~194K CU", MAX_ACCOUNTS);
+    println!("• Key metric: worst single crank must stay under 1.4M CU");
+    println!("• ADL/liquidation processing adds CU overhead per affected account");
 }

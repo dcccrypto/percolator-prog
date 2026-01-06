@@ -94,25 +94,43 @@ pub mod constants {
 
 // 1b. Risk metric helpers (pure functions for anti-DoS threshold calculation)
 
+/// Iterate only over used LP accounts using bitmap (O(num_used) instead of O(MAX_ACCOUNTS)).
+#[inline]
+fn for_each_used_lp<F: FnMut(&percolator::Account)>(engine: &percolator::RiskEngine, mut f: F) {
+    for (block, word) in engine.used.iter().copied().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let bit = w.trailing_zeros() as usize;
+            let idx = block * 64 + bit;
+            w &= w - 1; // Clear lowest bit
+            if idx >= percolator::MAX_ACCOUNTS {
+                continue; // Guard against stray high bits in bitmap
+            }
+            let acc = &engine.accounts[idx];
+            if acc.is_lp() {
+                f(acc);
+            }
+        }
+    }
+}
+
 /// LP risk state: (sum_abs, max_abs) over all LP positions.
-/// O(n) scan, but called once per instruction then used for O(1) delta checks.
+/// O(num_used) scan via bitmap, called once per instruction then used for O(1) delta checks.
 pub struct LpRiskState {
     pub sum_abs: u128,
     pub max_abs: u128,
 }
 
 impl LpRiskState {
-    /// Scan all LP accounts to compute aggregate risk state. O(n).
+    /// Scan all used LP accounts to compute aggregate risk state. O(num_used) via bitmap.
     pub fn compute(engine: &percolator::RiskEngine) -> Self {
         let mut sum_abs: u128 = 0;
         let mut max_abs: u128 = 0;
-        for i in 0..engine.accounts.len() {
-            if engine.is_used(i) && engine.accounts[i].is_lp() {
-                let abs_pos = engine.accounts[i].position_size.unsigned_abs();
-                sum_abs = sum_abs.saturating_add(abs_pos);
-                max_abs = max_abs.max(abs_pos);
-            }
-        }
+        for_each_used_lp(engine, |acc| {
+            let abs_pos = acc.position_size.unsigned_abs();
+            sum_abs = sum_abs.saturating_add(abs_pos);
+            max_abs = max_abs.max(abs_pos);
+        });
         Self { sum_abs, max_abs }
     }
 
@@ -166,14 +184,12 @@ fn compute_system_risk_units(engine: &percolator::RiskEngine) -> u128 {
 }
 
 /// Compute net LP position for inventory-based funding.
-/// Sums position_size across all used LP accounts.
+/// Sums position_size across all used LP accounts. O(num_used) via bitmap.
 fn compute_net_lp_pos(engine: &percolator::RiskEngine) -> i128 {
     let mut net: i128 = 0;
-    for i in 0..engine.accounts.len() {
-        if engine.is_used(i) && engine.accounts[i].is_lp() {
-            net = net.saturating_add(engine.accounts[i].position_size);
-        }
-    }
+    for_each_used_lp(engine, |acc| {
+        net = net.saturating_add(acc.position_size);
+    });
     net
 }
 
