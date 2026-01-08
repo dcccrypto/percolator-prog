@@ -664,6 +664,124 @@ pub mod verify {
             SimpleDecision::Reject
         }
     }
+
+    // =========================================================================
+    // KeeperCrank with allow_panic decision logic
+    // =========================================================================
+
+    /// Decision for KeeperCrank with allow_panic support.
+    /// - If allow_panic != 0: requires admin authorization
+    /// - If allow_panic == 0 and permissionless: always accept
+    /// - If allow_panic == 0 and self-crank: requires idx exists and owner match
+    #[inline]
+    pub fn decide_keeper_crank_with_panic(
+        allow_panic: u8,
+        admin: [u8; 32],
+        signer: [u8; 32],
+        permissionless: bool,
+        idx_exists: bool,
+        stored_owner: [u8; 32],
+    ) -> SimpleDecision {
+        // If allow_panic is requested, must have admin authorization
+        if allow_panic != 0 {
+            if !admin_ok(admin, signer) {
+                return SimpleDecision::Reject;
+            }
+        }
+        // Normal crank logic
+        decide_crank(permissionless, idx_exists, stored_owner, signer)
+    }
+
+    // =========================================================================
+    // Oracle inversion math (pure logic)
+    // =========================================================================
+
+    /// Inversion constant: 1e12 for price_e6 * inverted_e6 = 1e12
+    pub const INVERSION_CONSTANT: u128 = 1_000_000_000_000;
+
+    /// Invert oracle price: SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6
+    /// Returns None if raw == 0 or result overflows u64.
+    #[inline]
+    pub fn invert_price_e6(raw: u64, invert: u8) -> Option<u64> {
+        if invert == 0 {
+            return Some(raw);
+        }
+        if raw == 0 {
+            return None;
+        }
+        let inverted = INVERSION_CONSTANT / (raw as u128);
+        if inverted == 0 {
+            return None;
+        }
+        if inverted > u64::MAX as u128 {
+            return None;
+        }
+        Some(inverted as u64)
+    }
+
+    // =========================================================================
+    // Unit scale conversion math (pure logic)
+    // =========================================================================
+
+    /// Convert base amount to (units, dust).
+    /// If scale == 0: returns (base, 0).
+    /// Otherwise: units = base / scale, dust = base % scale.
+    #[inline]
+    pub fn base_to_units(base: u64, scale: u32) -> (u64, u64) {
+        if scale == 0 {
+            return (base, 0);
+        }
+        let s = scale as u64;
+        (base / s, base % s)
+    }
+
+    /// Convert units to base amount (saturating).
+    /// If scale == 0: returns units.
+    /// Otherwise: returns units * scale (saturating).
+    #[inline]
+    pub fn units_to_base(units: u64, scale: u32) -> u64 {
+        if scale == 0 {
+            return units;
+        }
+        units.saturating_mul(scale as u64)
+    }
+
+    // =========================================================================
+    // Withdraw alignment check (pure logic)
+    // =========================================================================
+
+    /// Check if withdraw amount is properly aligned to unit_scale.
+    /// If scale == 0: always aligned.
+    /// Otherwise: amount must be divisible by scale.
+    #[inline]
+    pub fn withdraw_amount_aligned(amount: u64, scale: u32) -> bool {
+        if scale == 0 {
+            return true;
+        }
+        amount % (scale as u64) == 0
+    }
+
+    // =========================================================================
+    // Dust bookkeeping math (pure logic)
+    // =========================================================================
+
+    /// Accumulate dust: old_dust + added_dust (saturating).
+    #[inline]
+    pub fn accumulate_dust(old_dust: u64, added_dust: u64) -> u64 {
+        old_dust.saturating_add(added_dust)
+    }
+
+    /// Sweep dust into units: returns (units_swept, remaining_dust).
+    /// If scale == 0: returns (dust, 0) - all dust becomes units.
+    /// Otherwise: units_swept = dust / scale, remaining = dust % scale.
+    #[inline]
+    pub fn sweep_dust(dust: u64, scale: u32) -> (u64, u64) {
+        if scale == 0 {
+            return (dust, 0);
+        }
+        let s = scale as u64;
+        (dust / s, dust % s)
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
