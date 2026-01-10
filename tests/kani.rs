@@ -1776,10 +1776,9 @@ fn kani_invert_zero_returns_raw() {
 #[kani::proof]
 fn kani_invert_nonzero_computes_correctly() {
     let raw: u64 = kani::any();
-    // Constrain to valid range where inversion must succeed
-    // Use u128 cast for future-proofing if INVERSION_CONSTANT type changes
+    // Constrain to valid range where inversion must succeed, capped for SAT solver
     kani::assume(raw > 0);
-    kani::assume((raw as u128) <= INVERSION_CONSTANT); // ensures result >= 1
+    kani::assume(raw <= KANI_MAX_QUOTIENT); // also ensures result >= 1 since 1e12/4096 >> 1
 
     let result = invert_price_e6(raw, 1);
 
