@@ -29,10 +29,10 @@ use std::path::PathBuf;
 
 // SLAB_LEN for SBF - differs between test and production
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 17696;  // MAX_ACCOUNTS=64
+const SLAB_LEN: usize = 18144;  // MAX_ACCOUNTS=64 (0x46e0)
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1107176;  // MAX_ACCOUNTS=4096 (0x10e4e8)
+const SLAB_LEN: usize = 1107288;  // MAX_ACCOUNTS=4096 (0x10e558)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
