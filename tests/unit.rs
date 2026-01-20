@@ -20,7 +20,7 @@ use percolator_prog::{
     oracle,
     units,
 };
-use percolator::MAX_ACCOUNTS;
+use percolator::{MAX_ACCOUNTS, U128, I128};
 
 // --- Harness ---
 
@@ -40,6 +40,7 @@ impl TestAccount {
     }
     fn signer(mut self) -> Self { self.is_signer = true; self }
     fn writable(mut self) -> Self { self.is_writable = true; self }
+    fn executable(mut self) -> Self { self.executable = true; self }
     
     fn to_info<'a>(&'a mut self) -> AccountInfo<'a> {
         AccountInfo::new(
@@ -65,6 +66,20 @@ fn make_token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
     account.amount = amount;
     account.state = AccountState::Initialized;
     TokenAccount::pack(account, &mut data).unwrap();
+    data
+}
+
+fn make_mint_account() -> Vec<u8> {
+    use spl_token::state::Mint;
+    let mut data = vec![0u8; Mint::LEN];
+    let mint = Mint {
+        mint_authority: solana_program::program_option::COption::None,
+        supply: 0,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: solana_program::program_option::COption::None,
+    };
+    Mint::pack(mint, &mut data).unwrap();
     data
 }
 
@@ -131,9 +146,9 @@ fn setup_market() -> MarketFixture {
         program_id,
         admin: TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer(),
         slab: TestAccount::new(slab_key, program_id, 0, vec![0u8; percolator_prog::constants::SLAB_LEN]).writable(),
-        mint: TestAccount::new(mint_key, solana_program::system_program::id(), 0, vec![]),
+        mint: TestAccount::new(mint_key, spl_token::ID, 0, make_mint_account()),
         vault: TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(mint_key, vault_pda, 0)).writable(),
-        token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]),
+        token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]).executable(),
         pyth_index: TestAccount::new(Pubkey::new_unique(), pyth_receiver_id, 0, pyth_data),
         index_feed_id: TEST_FEED_ID,
         clock: TestAccount::new(solana_program::sysvar::clock::id(), solana_program::sysvar::id(), 0, make_clock(100, 100)),
@@ -464,7 +479,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         }
         let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
         {
-            let accounts = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accounts = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 1000)).unwrap();
         }
 
@@ -482,7 +497,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         }
         let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
         {
-            let accounts = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accounts = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accounts, &encode_deposit(lp_idx, 1000)).unwrap();
         }
 
@@ -583,11 +598,11 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
 
         {
-            let accs = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accs = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accs, &encode_deposit(user_idx, 1000)).unwrap();
         }
         {
-            let accs = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accs = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accs, &encode_deposit(lp_idx, 1000)).unwrap();
         }
         {
@@ -885,7 +900,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         {
             let engine = zc::engine_ref(&f.slab.data).unwrap();
             assert_eq!(engine.risk_reduction_threshold(), 0);
-            assert_eq!(engine.total_open_interest, 0);
+            assert!(engine.total_open_interest.is_zero());
         }
 
         // Create user
@@ -916,11 +931,11 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
 
         // Deposit for both user and LP
         {
-            let accs = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accs = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accs, &encode_deposit(user_idx, 1_000_000)).unwrap();
         }
         {
-            let accs = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accs = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accs, &encode_deposit(lp_idx, 1_000_000)).unwrap();
         }
 
@@ -938,8 +953,8 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
             let engine = zc::engine_ref(&f.slab.data).unwrap();
             let lp_pos = engine.accounts[lp_idx as usize].position_size;
             let user_pos = engine.accounts[user_idx as usize].position_size;
-            assert_ne!(lp_pos, 0, "LP should have non-zero position after trade");
-            assert_ne!(user_pos, 0, "User should have non-zero position after trade");
+            assert!(!lp_pos.is_zero(), "LP should have non-zero position after trade");
+            assert!(!user_pos.is_zero(), "User should have non-zero position after trade");
             // Verify LP is marked as LP
             assert!(engine.accounts[lp_idx as usize].is_lp(), "LP account should be marked as LP");
             assert!(engine.is_used(lp_idx as usize), "LP should be marked as used");
@@ -964,7 +979,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         {
             let mut funder = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
             let mut funder_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, funder.key, 1_000_000_000)).writable();
-            let accs = vec![funder.to_info(), f.slab.to_info(), funder_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            let accs = vec![funder.to_info(), f.slab.to_info(), funder_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), f.clock.to_info()];
             process_instruction(&f.program_id, &accs, &encode_topup_insurance(1_000_000_000)).unwrap();
         }
 
@@ -1051,7 +1066,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         // Verify crank was executed (we can check that the engine is still valid)
         {
             let engine = zc::engine_ref(&f.slab.data).unwrap();
-            assert_eq!(engine.vault, 0); // No deposits yet, vault should be 0
+            assert!(engine.vault.is_zero()); // No deposits yet, vault should be 0
         }
     }
 
@@ -1101,10 +1116,10 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
             let funding_idx = engine.funding_index_qpb_e6;
             let current_slot = engine.current_slot;
             let account = &mut engine.accounts[user_idx as usize];
-            account.capital = 0;
-            account.pnl = -1;
+            account.capital = U128::ZERO;
+            account.pnl = I128::new(-1);
             account.funding_index = funding_idx;
-            account.fee_credits = 0;
+            account.fee_credits = I128::ZERO;
             account.last_fee_slot = current_slot;
         }
 
@@ -1112,9 +1127,9 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         {
             let engine = zc::engine_ref(&f.slab.data).unwrap();
             let account = &engine.accounts[user_idx as usize];
-            assert_eq!(account.capital, 0, "capital should be 0");
-            assert_eq!(account.pnl, -1, "pnl should be -1");
-            assert_eq!(account.position_size, 0, "position_size should be 0");
+            assert!(account.capital.is_zero(), "capital should be 0");
+            assert_eq!(account.pnl.get(), -1, "pnl should be -1");
+            assert!(account.position_size.is_zero(), "position_size should be 0");
             assert_eq!(account.reserved_pnl, 0, "reserved_pnl should be 0");
             assert_eq!(account.funding_index, engine.funding_index_qpb_e6, "funding should match");
         }
@@ -1618,7 +1633,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         let mut total = 0u128;
         for idx in 0..percolator::MAX_ACCOUNTS {
             if engine.is_used(idx) {
-                total = total.saturating_add(engine.accounts[idx].capital);
+                total = total.saturating_add(engine.accounts[idx].capital.get());
             }
         }
         total
@@ -1679,7 +1694,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
 
         // Compute deltas
         let delta_vault_base = vault_base - vault_base_start;
-        let delta_engine_units = engine_vault_units - engine_vault_start;
+        let delta_engine_units = engine_vault_units.get() - engine_vault_start.get();
         let delta_dust = dust_base - dust_start;
 
         // Assert expected deltas
@@ -1691,7 +1706,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
             "Dust should equal deposit mod scale: got {}, expected {}", delta_dust, deposit_amount % unit_scale as u64);
 
         // Assert INVARIANT #1: vault_base = engine_vault * unit_scale + dust_base
-        let computed_base = engine_vault_units as u64 * unit_scale as u64 + dust_base;
+        let computed_base = engine_vault_units.get() as u64 * unit_scale as u64 + dust_base;
         assert_eq!(vault_base, computed_base,
             "INVARIANT #1 FAILED: vault_base({}) != engine_vault({}) * scale({}) + dust({}) = {}",
             vault_base, engine_vault_units, unit_scale, dust_base, computed_base);
@@ -1836,8 +1851,8 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         let dust_after = state::read_dust_base(&f.slab.data);
 
         // Verify engine vault decreased by expected units
-        assert_eq!(engine_vault_before - engine_vault_after, 5,
-            "Engine vault should decrease by 5 units: before={}, after={}", engine_vault_before, engine_vault_after);
+        assert_eq!(engine_vault_before.get() - engine_vault_after.get(), 5,
+            "Engine vault should decrease by 5 units: before={:?}, after={:?}", engine_vault_before, engine_vault_after);
 
         // Verify dust unchanged (withdrawal was aligned)
         assert_eq!(dust_before, dust_after,
@@ -1927,15 +1942,15 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
             "Remaining dust should be old_dust mod scale: got {}, expected {}", dust_after_crank, expected_remaining_dust);
 
         // Verify insurance increased by swept units (assuming no loss_accum)
-        assert_eq!(insurance_after - insurance_before, units_swept as u128,
-            "Insurance should increase by swept units: delta={}, expected={}", insurance_after - insurance_before, units_swept);
+        assert_eq!(insurance_after.get() - insurance_before.get(), units_swept as u128,
+            "Insurance should increase by swept units: delta={}, expected={}", insurance_after.get() - insurance_before.get(), units_swept);
 
         // Verify engine.vault also increased by swept units
-        assert_eq!(engine_vault_after - engine_vault_before, units_swept as u128,
-            "Engine vault should increase by swept units: delta={}, expected={}", engine_vault_after - engine_vault_before, units_swept);
+        assert_eq!(engine_vault_after.get() - engine_vault_before.get(), units_swept as u128,
+            "Engine vault should increase by swept units: delta={}, expected={}", engine_vault_after.get() - engine_vault_before.get(), units_swept);
 
         // Verify INVARIANT #1 still holds after sweep
-        let computed_base = engine_vault_after as u64 * unit_scale as u64 + dust_after_crank;
+        let computed_base = engine_vault_after.get() as u64 * unit_scale as u64 + dust_after_crank;
         assert_eq!(vault_base, computed_base,
             "INVARIANT #1 FAILED after sweep: vault_base({}) != engine_vault({}) * scale({}) + dust({}) = {}",
             vault_base, engine_vault_after, unit_scale, dust_after_crank, computed_base);
@@ -1985,8 +2000,8 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         // Verify INVARIANT #1: vault_base = engine_vault (scale=1) + dust (0)
         let vault_base = TokenAccount::unpack(&f.vault.data).unwrap().amount;
         let engine_vault = zc::engine_ref(&f.slab.data).unwrap().vault;
-        assert_eq!(vault_base, engine_vault as u64,
-            "With scale=0: vault_base({}) should equal engine_vault({})", vault_base, engine_vault);
+        assert_eq!(vault_base, engine_vault.get() as u64,
+            "With scale=0: vault_base({}) should equal engine_vault({:?})", vault_base, engine_vault);
 
         // Verify INVARIANT #2
         let engine = zc::engine_ref(&f.slab.data).unwrap();

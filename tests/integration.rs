@@ -27,8 +27,8 @@ use std::path::PathBuf;
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
-// Bug #7 fix increased pending_exclude_epoch from [u8; 4096] to [u16; 4096]
-const SLAB_LEN: usize = 1111384;  // MAX_ACCOUNTS=4096 (0x10f558)
+// Includes oracle_authority fields (32 + 8 + 8 = 48 bytes + alignment)
+const SLAB_LEN: usize = 1111440;  // MAX_ACCOUNTS=4096 (0x10f590)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

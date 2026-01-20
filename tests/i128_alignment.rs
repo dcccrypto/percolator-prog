@@ -23,8 +23,8 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
-// SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1111384;
+// SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - includes oracle_authority fields
+const SLAB_LEN: usize = 1111440;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -197,11 +197,11 @@ fn test_account_struct_alignment() {
 
     // Create an account with known values
     let account = Account {
-        kind: AccountKind::User,
         account_id: 12345,
         capital: U128::new(0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210),
+        kind: AccountKind::User,
         pnl: I128::new(-0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        reserved_pnl: U128::new(0xDEAD_BEEF_CAFE_BABE_0000_0000_0000_0001),
+        reserved_pnl: 0xDEAD_BEEF_CAFE_BABE,  // u64, not U128
         warmup_started_at_slot: 999999,
         warmup_slope_per_step: U128::new(42),
         position_size: I128::new(-1_000_000_000_000i128),
@@ -212,12 +212,13 @@ fn test_account_struct_alignment() {
         owner: [0xCC; 32],
         fee_credits: I128::new(-999),
         last_fee_slot: 888888,
+        _padding: [0; 8],
     };
 
     // Verify all fields round-trip correctly
     assert_eq!(account.capital.get(), 0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210);
     assert_eq!(account.pnl.get(), -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10);
-    assert_eq!(account.reserved_pnl.get(), 0xDEAD_BEEF_CAFE_BABE_0000_0000_0000_0001);
+    assert_eq!(account.reserved_pnl, 0xDEAD_BEEF_CAFE_BABE);  // u64 comparison
     assert_eq!(account.position_size.get(), -1_000_000_000_000i128);
     assert_eq!(account.funding_index.get(), 12345678901234i128);
     assert_eq!(account.fee_credits.get(), -999);
@@ -225,7 +226,7 @@ fn test_account_struct_alignment() {
     println!("Account fields verified:");
     println!("  capital: 0x{:032X}", account.capital.get());
     println!("  pnl: {}", account.pnl.get());
-    println!("  reserved_pnl: 0x{:032X}", account.reserved_pnl.get());
+    println!("  reserved_pnl: 0x{:016X}", account.reserved_pnl);  // u64 format
     println!("  position_size: {}", account.position_size.get());
     println!("  funding_index: {}", account.funding_index.get());
     println!("  fee_credits: {}", account.fee_credits.get());
@@ -559,6 +560,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(lp_fund_ata, false),
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data: encode_deposit(0, deposit_amount),
     };
@@ -588,6 +590,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(user_fund_ata, false),
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data: encode_deposit(1, user_deposit),
     };
