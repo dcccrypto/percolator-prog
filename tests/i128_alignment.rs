@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - haircut-ratio engine
-const SLAB_LEN: usize = 1025320;
+const SLAB_LEN: usize = 1025336;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

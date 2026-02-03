@@ -1083,6 +1083,9 @@ pub mod ix {
         /// Push oracle price (oracle authority only).
         /// Stores the price for use by crank/trade operations.
         PushOraclePrice { price_e6: u64, timestamp: i64 },
+        /// Set oracle price circuit breaker cap (admin only).
+        /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
+        SetOraclePriceCap { max_change_e2bps: u64 },
     }
 
     impl Instruction {
@@ -1197,6 +1200,10 @@ pub mod ix {
                     let price_e6 = read_u64(&mut rest)?;
                     let timestamp = read_i64(&mut rest)?;
                     Ok(Instruction::PushOraclePrice { price_e6, timestamp })
+                },
+                18 => { // SetOraclePriceCap
+                    let max_change_e2bps = read_u64(&mut rest)?;
+                    Ok(Instruction::SetOraclePriceCap { max_change_e2bps })
                 },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -1420,6 +1427,16 @@ pub mod state {
         pub authority_price_e6: u64,
         /// Unix timestamp when authority last pushed the price
         pub authority_timestamp: i64,
+
+        // ========================================
+        // Oracle Price Circuit Breaker
+        // ========================================
+        /// Max oracle price change per update in 0.01 bps (e2bps).
+        /// 0 = disabled (no cap). 1_000_000 = 100%.
+        pub oracle_price_cap_e2bps: u64,
+        /// Last effective oracle price (after clamping), in e6 format.
+        /// 0 = no history (first price accepted as-is).
+        pub last_effective_price_e6: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(ai: &'b AccountInfo<'a>) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
@@ -1867,6 +1884,32 @@ pub mod oracle {
             config.unit_scale,
         )
     }
+
+    /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
+    /// Units: 1_000_000 e2bps = 100%. 0 = disabled (no cap). last_price == 0 = first-time.
+    pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_e2bps: u64) -> u64 {
+        if max_change_e2bps == 0 || last_price == 0 {
+            return raw_price;
+        }
+        let max_delta = ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000) as u64;
+        let lower = last_price.saturating_sub(max_delta);
+        let upper = last_price.saturating_add(max_delta);
+        raw_price.clamp(lower, upper)
+    }
+
+    /// Read oracle price with circuit-breaker clamping.
+    /// Reads raw price via `read_price_with_authority`, clamps it against
+    /// `config.last_effective_price_e6`, and updates that field to the post-clamped value.
+    pub fn read_price_clamped(
+        config: &mut super::state::MarketConfig,
+        price_ai: &AccountInfo,
+        now_unix_ts: i64,
+    ) -> Result<u64, ProgramError> {
+        let raw = read_price_with_authority(config, price_ai, now_unix_ts)?;
+        let clamped = clamp_oracle_price(config.last_effective_price_e6, raw, config.oracle_price_cap_e2bps);
+        config.last_effective_price_e6 = clamped;
+        Ok(clamped)
+    }
 }
 
 // 9. mod collateral
@@ -2223,6 +2266,9 @@ pub mod processor {
                     oracle_authority: [0u8; 32],
                     authority_price_e6: 0,
                     authority_timestamp: 0,
+                    // Oracle price circuit breaker (disabled by default)
+                    oracle_price_cap_e2bps: 0,
+                    last_effective_price_e6: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -2377,8 +2423,23 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_pda, &derived_pda)?;
+
+                verify_vault(a_vault, &derived_pda, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+                let clock = Clock::from_account_info(a_clock)?;
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(
+                    &mut config,
+                    a_oracle_idx,
+                    clock.unix_timestamp,
+                )?;
+                state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -2389,20 +2450,6 @@ pub mod processor {
                 if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
-
-                let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                accounts::expect_key(a_vault_pda, &derived_pda)?;
-
-                verify_vault(a_vault, &derived_pda, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                let clock = Clock::from_account_info(a_clock)?;
-                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
-                let price = oracle::read_price_with_authority(
-                    &config,
-                    a_oracle_idx,
-                    clock.unix_timestamp,
-                )?;
 
                 // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
                 if config.unit_scale != 0 && amount % config.unit_scale as u64 != 0 {
@@ -2456,7 +2503,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 let header = state::read_header(&data);
                 // Read last threshold update slot BEFORE mutable engine borrow
                 let last_thr_slot = state::read_last_thr_update_slot(&data);
@@ -2474,6 +2521,15 @@ pub mod processor {
                 let dust_before = state::read_dust_base(&data);
                 let unit_scale = config.unit_scale;
 
+                let clock = Clock::from_account_info(a_clock)?;
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(
+                    &mut config,
+                    a_oracle,
+                    clock.unix_timestamp,
+                )?;
+                state::write_config(&mut data, &config);
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 // Crank authorization:
@@ -2486,14 +2542,6 @@ pub mod processor {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
                 }
-
-                let clock = Clock::from_account_info(a_clock)?;
-                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
-                let price = oracle::read_price_with_authority(
-                    &config,
-                    a_oracle,
-                    clock.unix_timestamp,
-                )?;
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
                 let effective_caller_idx = if permissionless { CRANK_NO_CALLER } else { caller_idx };
@@ -2606,7 +2654,18 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
+
+                let clock = Clock::from_account_info(&accounts[3])?;
+                let a_oracle = &accounts[4];
+
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(
+                    &mut config,
+                    a_oracle,
+                    clock.unix_timestamp,
+                )?;
+                state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -2623,16 +2682,6 @@ pub mod processor {
                 if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
-
-                let clock = Clock::from_account_info(&accounts[3])?;
-                let a_oracle = &accounts[4];
-
-                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
-                let price = oracle::read_price_with_authority(
-                    &config,
-                    a_oracle,
-                    clock.unix_timestamp,
-                )?;
 
                 // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                 // LP delta is -size (LP takes opposite side of user's trade)
@@ -2721,7 +2770,7 @@ pub mod processor {
                 // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
                 // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
                 // Nonce write is deferred until after execute_trade
-                let (lp_account_id, config, req_id, lp_matcher_prog, lp_matcher_ctx) = {
+                let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx) = {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &*data)?;
                     require_initialized(&*data)?;
@@ -2762,9 +2811,9 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
-                let price = oracle::read_price_with_authority(
-                    &config,
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(
+                    &mut config,
                     a_oracle,
                     clock.unix_timestamp,
                 )?;
@@ -2827,6 +2876,7 @@ pub mod processor {
                 let matcher = CpiMatcher { exec_price: ret.exec_price_e6, exec_size: ret.exec_size };
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
+                    state::write_config(&mut data, &config);
                     let engine = zc::engine_mut(&mut data)?;
 
                     // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
@@ -2879,19 +2929,20 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
+
+                let clock = Clock::from_account_info(&accounts[2])?;
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(
+                    &mut config,
+                    a_oracle,
+                    clock.unix_timestamp,
+                )?;
+                state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, target_idx)?;
-
-                let clock = Clock::from_account_info(&accounts[2])?;
-                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
-                let price = oracle::read_price_with_authority(
-                    &config,
-                    a_oracle,
-                    clock.unix_timestamp,
-                )?;
 
                 // Debug logging for liquidation (using sol_log_64 for no_std)
                 sol_log_64(target_idx as u64, price, 0, 0, 0);  // idx, price
@@ -2939,13 +2990,22 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
                 accounts::expect_key(a_pda, &auth)?;
+
+                let clock = Clock::from_account_info(&accounts[6])?;
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(
+                    &mut config,
+                    a_oracle,
+                    clock.unix_timestamp,
+                )?;
+                state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -2956,14 +3016,6 @@ pub mod processor {
                 if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
-
-                let clock = Clock::from_account_info(&accounts[6])?;
-                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
-                let price = oracle::read_price_with_authority(
-                    &config,
-                    a_oracle,
-                    clock.unix_timestamp,
-                )?;
 
                 #[cfg(feature = "cu-audit")]
                 {
@@ -3235,9 +3287,33 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
-                // Store the new price
-                config.authority_price_e6 = price_e6;
+                // Clamp the incoming price against circuit breaker
+                let clamped = oracle::clamp_oracle_price(
+                    config.last_effective_price_e6, price_e6, config.oracle_price_cap_e2bps
+                );
+                config.authority_price_e6 = clamped;
                 config.authority_timestamp = timestamp;
+                config.last_effective_price_e6 = clamped;
+                state::write_config(&mut data, &config);
+            }
+
+            Instruction::SetOraclePriceCap { max_change_e2bps } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let mut config = state::read_config(&data);
+                config.oracle_price_cap_e2bps = max_change_e2bps;
                 state::write_config(&mut data, &config);
             }
         }

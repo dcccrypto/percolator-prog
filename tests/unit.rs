@@ -557,7 +557,9 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
             ];
             process_instruction(&f.program_id, &accounts, &encode_withdraw(user_idx, 100))
         };
-        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        // After circuit-breaker restructuring, vault/ATA checks run before owner check,
+        // so wrong signer is rejected as InvalidTokenAccount (ATA owner != signer)
+        assert_eq!(res, Err(PercolatorError::InvalidTokenAccount.into()));
     }
 
     #[test]
