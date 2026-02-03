@@ -429,6 +429,59 @@ impl TestEnv {
             rent_epoch: 0,
         }).unwrap();
     }
+
+    /// Set slot and update oracle to a specific price
+    fn set_slot_and_price(&mut self, slot: u64, price_e6: i64) {
+        self.svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+        // Update oracle with new price and publish_time
+        let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6, -6, 1, slot as i64);
+        self.svm.set_account(self.pyth_index, Account {
+            lamports: 1_000_000,
+            data: pyth_data.clone(),
+            owner: PYTH_RECEIVER_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+        self.svm.set_account(self.pyth_col, Account {
+            lamports: 1_000_000,
+            data: pyth_data,
+            owner: PYTH_RECEIVER_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+    }
+
+    /// Try to close account, returns result
+    fn try_close_account(&mut self, owner: &Keypair, user_idx: u16) -> Result<(), String> {
+        let ata = self.create_ata(&owner.pubkey(), 0);
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_close_account(user_idx),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
 }
 
 /// Test that an inverted market can successfully run crank operations.
@@ -572,6 +625,39 @@ fn encode_init_market_full(
     data
 }
 
+/// Encode InitMarket with configurable warmup_period_slots
+fn encode_init_market_with_warmup(
+    admin: &Pubkey,
+    mint: &Pubkey,
+    feed_id: &[u8; 32],
+    invert: u8,
+    warmup_period_slots: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.as_ref());
+    data.extend_from_slice(mint.as_ref());
+    data.extend_from_slice(feed_id);
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    data.push(invert);
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale = 0 (no scaling)
+    // RiskParams
+    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // warmup_period_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
+    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
+    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data
+}
+
 impl TestEnv {
     /// Initialize market with full parameter control
     fn init_market_full(&mut self, invert: u8, unit_scale: u32, new_account_fee: u128) {
@@ -612,6 +698,46 @@ impl TestEnv {
             &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
+    }
+
+    /// Initialize market with configurable warmup period
+    fn init_market_with_warmup(&mut self, invert: u8, warmup_period_slots: u64) {
+        let admin = &self.payer;
+        let dummy_ata = Pubkey::new_unique();
+        self.svm.set_account(dummy_ata, Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
+                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: encode_init_market_with_warmup(
+                &admin.pubkey(),
+                &self.mint,
+                &TEST_FEED_ID,
+                invert,
+                warmup_period_slots,
+            ),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("init_market_with_warmup failed");
     }
 
     /// Initialize user with specific fee payment
@@ -1061,4 +1187,155 @@ fn test_bug_finding_l_margin_check_uses_maintenance_instead_of_initial() {
     println!("Position notional: ~10 SOL, Equity: 0.6 SOL");
     println!("Maintenance margin required: 0.5 SOL (passes)");
     println!("Initial margin required: 1.0 SOL (should fail but doesn't)");
+}
+
+// ============================================================================
+// Zombie PnL Bug: Crank-driven warmup conversion for idle accounts
+// ============================================================================
+
+/// Test that crank-driven warmup conversion works for idle accounts.
+///
+/// Per spec §10.5 and §12.6 (Zombie poisoning regression):
+/// - Idle accounts with positive PnL should have their PnL converted to capital
+///   via crank-driven warmup settlement
+/// - This prevents "zombie" accounts from indefinitely keeping pnl_pos_tot high
+///   and collapsing the haircut ratio
+///
+/// Test scenario:
+/// 1. Create market with warmup_period_slots = 100
+/// 2. User opens position and gains positive PnL via favorable price move
+/// 3. User becomes idle (doesn't call any ops)
+/// 4. Run cranks over time (advancing past warmup period)
+/// 5. Verify PnL was converted to capital (user can close account)
+///
+/// Without the fix: User's PnL would never convert, close_account fails
+/// With the fix: Crank converts PnL to capital, close_account succeeds
+#[test]
+fn test_zombie_pnl_crank_driven_warmup_conversion() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+
+    // Initialize market with warmup_period_slots = 100
+    // This means positive PnL takes 100 slots to fully convert to capital
+    env.init_market_with_warmup(1, 100); // invert=1 for SOL/USD style
+
+    // Create LP with sufficient capital
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    // Create user with capital
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    // Execute trade: user goes long at current price ($138)
+    // Position size chosen to be safe within margin requirements
+    let size: i128 = 10_000_000; // Small position
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+
+    println!("Step 1: User opened long position at $138");
+
+    // Advance slot and move oracle price UP (favorable for long user)
+    // Oracle: $138 -> $150 (user profits)
+    env.set_slot_and_price(10, 150_000_000);
+
+    // Run crank to settle mark-to-market (converts unrealized to realized PnL)
+    env.crank();
+
+    println!("Step 2: Oracle moved to $150, crank settled mark-to-market");
+    println!("        User should now have positive realized PnL");
+
+    // Close user's position at new price (realizes the profit)
+    // Trade opposite direction to close
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+
+    println!("Step 3: User closed position, PnL is now fully realized");
+
+    // At this point, user has:
+    // - No position (closed)
+    // - Positive PnL from the profitable trade
+    // - The PnL needs to warm up before it can be withdrawn/account closed
+
+    // Try to close account immediately - should fail (PnL not warmed up yet)
+    let early_close_result = env.try_close_account(&user, user_idx);
+    println!("Step 4: Early close attempt (before warmup): {:?}",
+             if early_close_result.is_err() { "Failed as expected" } else { "Unexpected success" });
+
+    // Now simulate the zombie scenario:
+    // User becomes idle and doesn't call any ops
+    // But cranks continue to run...
+
+    // Advance past warmup period (100 slots) with periodic cranks
+    // Each crank should call settle_warmup_to_capital_for_crank
+    for i in 0..12 {
+        let slot = 20 + i * 10; // slots: 20, 30, 40, ... 130
+        env.set_slot_and_price(slot, 150_000_000);
+        env.crank();
+    }
+
+    println!("Step 5: Ran 12 cranks over 120 slots (past warmup period of 100)");
+    println!("        Crank should have converted idle user's PnL to capital");
+
+    // Now try to close account - should succeed if warmup conversion worked
+    let final_close_result = env.try_close_account(&user, user_idx);
+
+    if final_close_result.is_ok() {
+        println!("ZOMBIE PNL FIX VERIFIED: Crank-driven warmup conversion works!");
+        println!("Idle user's positive PnL was converted to capital via crank.");
+        println!("Account closed successfully after warmup period.");
+    } else {
+        println!("ZOMBIE PNL BUG: Crank-driven warmup conversion FAILED!");
+        println!("Idle user's PnL was not converted, account cannot close.");
+        println!("Error: {:?}", final_close_result);
+    }
+
+    assert!(
+        final_close_result.is_ok(),
+        "ZOMBIE PNL FIX: Account should close after crank-driven warmup conversion. \
+         Got: {:?}", final_close_result
+    );
+}
+
+/// Test that zombie accounts don't indefinitely poison the haircut ratio.
+///
+/// This is a simpler test that verifies the basic mechanism:
+/// - Idle account with capital and no position can be closed
+/// - Even without PnL, crank processes the account correctly
+#[test]
+fn test_idle_account_can_close_after_crank() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_warmup(1, 100);
+
+    // Create and fund user
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000); // 1 SOL
+
+    // User is idle (no trades, no ops)
+
+    // Advance slot and run crank
+    env.set_slot(200);
+    env.crank();
+
+    // User should be able to close account (no position, no PnL)
+    let result = env.try_close_account(&user, user_idx);
+
+    assert!(
+        result.is_ok(),
+        "Idle account with only capital should be closeable. Got: {:?}", result
+    );
+
+    println!("Idle account closed successfully - basic zombie prevention works");
 }

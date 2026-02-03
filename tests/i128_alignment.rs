@@ -23,8 +23,8 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
-// SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - haircut-ratio engine
-const SLAB_LEN: usize = 1025336;
+// SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - haircut-ratio engine (no padding)
+const SLAB_LEN: usize = 992560;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -212,7 +212,6 @@ fn test_account_struct_alignment() {
         owner: [0xCC; 32],
         fee_credits: I128::new(-999),
         last_fee_slot: 888888,
-        _padding: [0; 8],
     };
 
     // Verify all fields round-trip correctly

@@ -29,10 +29,10 @@ use std::path::PathBuf;
 
 // SLAB_LEN for SBF - differs between test and production
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 16832;  // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker
+const SLAB_LEN: usize = 16312;  // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1025336;  // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker
+const SLAB_LEN: usize = 992560;  // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -553,7 +553,7 @@ fn benchmark_worst_case_scenarios() {
 
     // Assert we're testing with production config (4096 accounts)
     assert_eq!(MAX_ACCOUNTS, 4096, "Expected MAX_ACCOUNTS=4096 for production benchmark");
-    assert!(SLAB_LEN > 1_000_000, "Expected SLAB_LEN > 1M for production benchmark, got {}", SLAB_LEN);
+    assert!(SLAB_LEN > 900_000, "Expected SLAB_LEN > 900K for production benchmark, got {}", SLAB_LEN);
 
     let path = program_path();
     if !path.exists() {
