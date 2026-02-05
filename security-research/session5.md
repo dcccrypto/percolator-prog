@@ -1021,3 +1021,50 @@ The Percolator codebase demonstrates excellent security practices across all rev
 - Ceiling division for conservative fee capture
 - liquidation_fee_cap applied to limit fees
 - No parameter validation needed - saturating ops prevent overflow
+
+#### 76. Force-Realize Mode ✓
+**Location**: `percolator/src/percolator.rs:1609-1628`
+**Status**: SECURE
+
+- Budget limited (FORCE_REALIZE_BUDGET_PER_CRANK = 32)
+- Uses saturating_add for lifetime counters
+- Proper error handling (counts errors but continues)
+- Index masking for wrap-around
+- Triggers when insurance_fund.balance <= risk_reduction_threshold
+
+#### 77. Position/Price Bounds ✓
+**Location**: `percolator/src/percolator.rs:61-68`
+**Status**: SECURE
+
+- MAX_ORACLE_PRICE = 10^15 (allows $1B with 6 decimals)
+- MAX_POSITION_ABS = 10^20 (allows 100B units)
+- i128::MIN handled specially (saturating_abs, neg_i128_to_u128)
+- u128 > i128::MAX clamped to i128::MAX
+- All entry points validate oracle_price and size against bounds
+
+#### 78. Account Kind Handling ✓
+**Location**: `percolator/src/percolator.rs:80-178`
+**Status**: SECURE
+
+- AccountKind enum: User = 0, LP = 1
+- is_lp() and is_user() use pattern matching
+- Kind properly initialized at account creation
+- GC never closes LPs (critical for market operation)
+
+#### 79. Position Flip Detection ✓
+**Location**: `percolator/src/percolator.rs:2953-3008`
+**Status**: SECURE
+
+- crosses_zero detects sign change in position
+- risk_increasing triggers initial_margin for flips
+- Uses initial_margin_bps for opening/expanding/flipping
+- Uses maintenance_margin_bps for reducing only
+
+#### 80. Inverted Price Handling ✓
+**Location**: `percolator-prog/src/percolator.rs:699-720`
+**Status**: SECURE
+
+- invert_price_e6 returns None if raw == 0 (divide by zero protection)
+- Returns None if inverted == 0 (underflow protection)
+- Returns None if inverted > u64::MAX (overflow protection)
+- Inversion constant = 10^12 for e6 * e6 = e12
