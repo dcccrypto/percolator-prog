@@ -499,10 +499,90 @@ Margin checks:
 - Calls settle_warmup_to_capital
 - Calls pay_fee_debt_from_capital
 
+## Continued Session 5 Exploration (Part 7)
+
+#### 42. haircut_ratio ✓
+**Location**: `percolator/src/percolator.rs:816-828`
+**Status**: SECURE
+
+- Returns (1, 1) when pnl_pos_tot == 0 (no haircut)
+- residual = vault - c_tot - insurance (saturating_sub)
+- h_num = min(residual, pnl_pos_tot)
+- Returns (h_num, pnl_pos_tot) for ratio calculation
+
+#### 43. effective_pos_pnl ✓
+**Location**: `percolator/src/percolator.rs:833-844`
+**Status**: SECURE
+
+- Returns 0 for negative or zero PnL
+- Calls haircut_ratio
+- Returns full pos_pnl if h_den == 0
+- Otherwise: floor(pos_pnl × h_num / h_den)
+
+#### 44. effective_equity ✓
+**Location**: `percolator/src/percolator.rs:849-861`
+**Status**: SECURE
+
+Implements: Eq_real_i = max(0, C_i + min(PNL_i, 0) + PNL_eff_pos_i)
+- cap_i = capital (as signed for math)
+- neg_pnl = min(pnl, 0) - only negative PnL counts against equity
+- eff_pos = effective_pos_pnl(pnl) - haircutted positive PnL
+- Returns max(0, cap_i + neg_pnl + eff_pos)
+
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 41
+**Total Areas Verified This Session**: 44
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
-The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 41 additional areas reviewed.
+The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 44 additional areas reviewed.
+
+## Session 5 Complete Inventory
+
+### Wrapper Program Areas (percolator-prog/src/percolator.rs)
+1. SetRiskThreshold ✓
+2. LiquidateAtOracle ✓
+3. TopUpInsurance ✓
+4. UpdateAdmin ✓
+5. CloseSlab ✓
+6. UpdateConfig ✓
+7. SetMaintenanceFee ✓
+8. check_idx validation ✓
+9. verify module helpers ✓
+10. WithdrawCollateral ✓
+11. Unsafe code containment ✓
+12. Pyth/Chainlink/Admin oracle ✓
+
+### Engine Areas (percolator/src/percolator.rs)
+1. Force-realize mode ✓
+2. Partial position close ✓
+3. Entry price updates ✓
+4. Dust sweeping ✓
+5. Unit scale handling ✓
+6. Warmup reset ✓
+7. Funding index overflow ✓
+8. Fee credits ✓
+9. Reserved PnL ✓
+10. CloseAccount ✓
+11. keeper_crank ✓
+12. check_conservation ✓
+13. Liquidation logic ✓
+14. oracle_close_position_core ✓
+15. execute_trade ✓
+16. settle_warmup_to_capital ✓
+17. set_pnl/set_capital ✓
+18. touch_account ✓
+19. settle_account_funding ✓
+20. settle_mark_to_oracle ✓
+21. accrue_funding ✓
+22. touch_account_full ✓
+23. engine.withdraw ✓
+24. engine.deposit ✓
+25. haircut_ratio ✓
+26. effective_pos_pnl ✓
+27. effective_equity ✓
+28. add_user/add_lp ✓
+29. InitUser/InitLP ✓
+30. Position flip margin selection ✓
+31. Risk reduction mode ✓
+32. Two-pass settlement (Finding G fix) ✓
