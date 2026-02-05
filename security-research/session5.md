@@ -938,6 +938,29 @@ The codebase demonstrates excellent security practices:
 
 **Only known issue**: Bug #9 (Hyperp index smoothing bypass when dt=0)
 
+## Additional Verifications (Final Pass)
+
+#### 67. Type Cast Safety ✓
+- All `as u128`/`as i128` from smaller types: safe widening
+- `as u16` casts bounded by MAX_ACCOUNTS (4096)
+- Index masking with ACCOUNT_IDX_MASK ensures bounds
+
+#### 68. Division Safety ✓
+- `div_u128`: Explicit zero check
+- `haircut_ratio`: Returns (1,1) when pnl_pos_tot == 0
+- `effective_pos_pnl`: Returns full pnl when h_den == 0
+
+#### 69. Timing Guards ✓
+- `require_fresh_crank`: saturating_sub, max_crank_staleness_slots
+- `require_recent_full_sweep`: saturating_sub, max_crank_staleness_slots
+- Both called before risk-changing operations (withdraw, trade)
+
+#### 70. No Remaining Issues Found
+- Type casts: all safe
+- Division: all protected
+- Timing: all guarded
+- Arithmetic: all saturating/checked
+
 ## Known Open Issue
 
 **Bug #9**: Hyperp index smoothing bypass (clamp_toward_with_dt returns mark when dt=0)
