@@ -1932,9 +1932,14 @@ pub mod oracle {
     /// Move `index` toward `mark`, but clamp movement by cap_e2bps * dt_slots.
     /// cap_e2bps units: 1_000_000 = 100.00%
     /// Returns the new index value.
+    ///
+    /// Security: When dt_slots == 0 (same slot) or cap_e2bps == 0 (cap disabled),
+    /// returns index unchanged to prevent bypassing rate limits.
     pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
         if index == 0 { return mark; }
-        if cap_e2bps == 0 || dt_slots == 0 { return mark; }
+        // Bug #9 fix: return index (no movement) when dt=0 or cap=0,
+        // rather than mark (bypass rate limiting)
+        if cap_e2bps == 0 || dt_slots == 0 { return index; }
 
         let max_delta_u128 =
             (index as u128)
