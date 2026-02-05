@@ -345,10 +345,59 @@ compute_liquidation_close_amount:
 - Updates OI and LP aggregates correctly
 - Entry price unchanged (correct for partial reduction)
 
+## Continued Session 5 Exploration (Part 4)
+
+#### 31. execute_trade ✓
+**Location**: `percolator/src/percolator.rs:2686-3088`
+**Status**: SECURE
+
+Comprehensive security:
+- Timing guards: require_fresh_crank, require_recent_full_sweep
+- Input validation: indices, oracle bounds, size bounds
+- Account kind validation (LP vs User)
+- Matcher output validation: price/size bounds, direction, partial fill
+- Touch accounts BEFORE position changes
+- Mark settlement (settle_mark_to_oracle) before trade
+- Maintenance fee settlement
+- Fee calculation with ceiling division (prevents micro-trade evasion)
+- Position calculation with checked_add/checked_sub
+- Trade PnL with checked_mul/checked_div
+- **Projected haircut** for margin checks (post-trade pnl_pos_tot)
+- Margin checks: initial for risk-increasing (incl. flips), maintenance otherwise
+- State commit: fee to insurance, aggregates (c_tot, pnl_pos_tot, OI, LP aggregates)
+- **Two-pass settlement** (Finding G fix): losses first, then profits
+
+#### 32. settle_warmup_to_capital ✓
+**Location**: `percolator/src/percolator.rs:3125-3200`
+**Status**: SECURE
+
+§6.1 Loss settlement:
+- Negative PnL pays from capital (min of need, capital)
+- Uses set_capital/set_pnl to maintain aggregates
+- Remaining negative PnL written off (spec §6.1 step 4)
+
+§6.2 Profit conversion:
+- Computes avail_gross = positive_pnl - reserved
+- Warmable cap = slope × elapsed
+- x = min(avail_gross, cap)
+- **Haircut computed BEFORE modifying state**
+- y = floor(x × h_num / h_den)
+- Reduce PnL by x, increase capital by y
+- Advance warmup time base, recompute slope (min=1 when avail>0)
+
+#### 33. set_pnl / set_capital ✓
+**Location**: `percolator/src/percolator.rs:772-795`
+**Status**: SECURE
+
+O(1) aggregate maintenance:
+- set_pnl: Updates pnl_pos_tot (only positive PnL counts)
+- set_capital: Updates c_tot (delta-based update)
+- All code paths modifying PnL/capital MUST use these helpers
+
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 30
+**Total Areas Verified This Session**: 33
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
-The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 30 additional areas reviewed.
+The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 33 additional areas reviewed.
