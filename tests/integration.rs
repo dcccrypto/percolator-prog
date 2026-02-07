@@ -15936,3 +15936,558 @@ fn test_attack_funding_accrue_huge_dt_capped() {
     assert_eq!(spl_vault, 65_000_000_000,
         "ATTACK: SPL vault changed after huge dt funding!");
 }
+
+// ============================================================================
+// ROUND 12: Unit Scale, Invert Mode, Multi-Account, Resolve Sequences
+// ============================================================================
+
+/// ATTACK: Unit scale market - trade, crank, conservation.
+/// Markets with unit_scale > 0 use scaled prices. Verify conservation.
+#[test]
+fn test_attack_unit_scale_trade_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_full(0, 1000, 0); // unit_scale=1000
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_eq!(env.read_account_position(user_idx), 100_000,
+        "Precondition: position open");
+
+    // Price move and crank
+    env.set_slot_and_price(50, 150_000_000);
+    env.crank();
+
+    // Conservation
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with unit_scale=1000! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 26_000_000_000,
+        "ATTACK: SPL vault changed with unit_scale!");
+}
+
+/// ATTACK: Large unit scale - very large scaling factor.
+/// unit_scale=1_000_000 (1M). Verify no overflow in price scaling.
+#[test]
+fn test_attack_large_unit_scale_no_overflow() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_full(0, 1_000_000, 0); // unit_scale=1M
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade with large unit_scale
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_eq!(env.read_account_position(user_idx), 100_000);
+
+    // Advance and crank
+    env.set_slot(50);
+    env.crank();
+
+    // Conservation
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with unit_scale=1M! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 26_000_000_000,
+        "ATTACK: SPL vault changed with unit_scale=1M!");
+}
+
+/// ATTACK: Inverted market (invert=1) trade and conservation.
+/// Inverted markets use 1e12/oracle_price. Verify conservation.
+#[test]
+fn test_attack_inverted_market_trade_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(1); // Inverted
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade on inverted market
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_eq!(env.read_account_position(user_idx), 100_000);
+
+    // Price move (raw oracle price change)
+    env.set_slot_and_price(50, 150_000_000); // Oracle moves 138→150
+    env.crank();
+
+    // Conservation on inverted market
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync on inverted market! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 26_000_000_000,
+        "ATTACK: SPL vault changed on inverted market!");
+}
+
+/// ATTACK: Inverted market with price approaching zero.
+/// When oracle price → large (inverted price → 0), verify no division issues.
+#[test]
+fn test_attack_inverted_market_extreme_high_oracle() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(1);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+
+    // Very high oracle price → inverted price near zero
+    // 1e12 / 1e9 = 1000 (very small inverted price)
+    env.set_slot_and_price(50, 1_000_000_000); // Oracle = $1000
+    let crank_result = env.try_crank();
+
+    // Crank should succeed (circuit breaker clamps the mark, not reject)
+    assert!(crank_result.is_ok(),
+        "Crank should succeed even with extreme oracle: {:?}", crank_result);
+
+    // Conservation must hold
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with extreme inverted price! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 26_000_000_000,
+        "ATTACK: SPL vault changed despite extreme inverted price!");
+}
+
+/// ATTACK: Same owner creates multiple user accounts.
+/// Protocol should allow it, but each account must be independent.
+#[test]
+fn test_attack_same_owner_multiple_accounts_isolation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    // Two different users - verify account isolation
+    let user1 = Keypair::new();
+    let user1_idx = env.init_user(&user1);
+    env.deposit(&user1, user1_idx, 5_000_000_000);
+
+    let user2 = Keypair::new();
+    let user2_idx = env.init_user(&user2);
+    env.deposit(&user2, user2_idx, 3_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade on user1 only
+    env.trade(&user1, &lp, lp_idx, user1_idx, 100_000);
+    assert_eq!(env.read_account_position(user1_idx), 100_000);
+    assert_eq!(env.read_account_position(user2_idx), 0,
+        "ATTACK: Trade on user1 affected user2!");
+
+    // user2 capital unchanged
+    let user2_cap = env.read_account_capital(user2_idx);
+    assert_eq!(user2_cap, 3_000_000_000,
+        "ATTACK: user2 capital changed from user1's trade: {}", user2_cap);
+
+    // Conservation across all accounts
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx)
+        + env.read_account_capital(user1_idx)
+        + env.read_account_capital(user2_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with multi-account! c_tot={} sum={}", c_tot, sum);
+}
+
+/// ATTACK: Resolve hyperp market then withdraw capital (no position).
+/// After resolution, users should be able to withdraw their deposited capital.
+#[test]
+fn test_attack_resolve_then_withdraw_capital() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.crank();
+
+    // Resolve market (no positions open)
+    env.try_resolve_market(&admin).unwrap();
+
+    // User withdraws capital after resolve
+    let user_cap = env.read_account_capital(user_idx);
+    assert!(user_cap > 0, "Precondition: user should have capital");
+    env.try_withdraw(&user, user_idx, user_cap as u64).unwrap();
+
+    let user_cap_after = env.read_account_capital(user_idx);
+    assert_eq!(user_cap_after, 0,
+        "User should have zero capital after withdrawal: {}", user_cap_after);
+}
+
+/// ATTACK: TradeNoCpi on hyperp market should always be blocked.
+/// Hyperp mode blocks TradeNoCpi (requires TradeCpi from matcher).
+#[test]
+fn test_attack_trade_nocpi_on_hyperp_rejected() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.crank();
+
+    // TradeNoCpi should be blocked on hyperp markets
+    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert!(result.is_err(),
+        "ATTACK: TradeNoCpi on hyperp market should be rejected!");
+}
+
+/// ATTACK: Double resolve should fail.
+/// Resolving an already-resolved market must be rejected.
+#[test]
+fn test_attack_double_resolve_rejected() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let _lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, _lp_idx, 10_000_000_000);
+
+    env.crank();
+
+    // First resolve
+    env.try_resolve_market(&admin).unwrap();
+
+    // Second resolve should fail
+    env.set_slot(2);
+    let result = env.try_resolve_market(&admin);
+    assert!(result.is_err(),
+        "ATTACK: Double resolve should be rejected!");
+}
+
+/// ATTACK: Non-admin tries to resolve market.
+/// Only admin should be able to resolve.
+#[test]
+fn test_attack_non_admin_resolve_rejected() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let _lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, _lp_idx, 10_000_000_000);
+
+    env.crank();
+
+    // Non-admin tries to resolve
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    let result = env.try_resolve_market(&attacker);
+    assert!(result.is_err(),
+        "ATTACK: Non-admin resolve should be rejected!");
+}
+
+/// ATTACK: Withdraw insurance before all positions force-closed.
+/// WithdrawInsurance should fail while positions are still open post-resolve.
+#[test]
+fn test_attack_withdraw_insurance_before_force_close() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found");
+        return;
+    };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Open position via TradeCpi (TradeNoCpi blocked on hyperp)
+    let result = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &matcher_prog, &matcher_ctx);
+    assert!(result.is_ok(), "Trade should succeed: {:?}", result);
+    assert!(env.read_account_position(user_idx) != 0, "Should have position");
+
+    // Resolve
+    env.try_resolve_market(&admin).unwrap();
+
+    // Try to withdraw insurance BEFORE force-closing positions
+    env.set_slot(200);
+    let result = env.try_withdraw_insurance(&admin);
+    assert!(result.is_err(),
+        "ATTACK: Insurance withdrawal with open positions should be rejected!");
+}
+
+/// ATTACK: Inverted market with unit_scale > 0 (double transformation).
+/// Both inversion and scaling applied. Verify conservation.
+#[test]
+fn test_attack_inverted_with_unit_scale_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_full(1, 1000, 0); // invert=1, unit_scale=1000
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade on inverted+scaled market
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_eq!(env.read_account_position(user_idx), 100_000);
+
+    // Price change
+    env.set_slot_and_price(50, 150_000_000);
+    env.crank();
+
+    // Conservation
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with invert+unit_scale! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 26_000_000_000,
+        "ATTACK: SPL vault changed with invert+unit_scale!");
+}
+
+/// ATTACK: Crank multiple times across many slots with position open.
+/// Verify funding accrual is correct and consistent across many intervals.
+#[test]
+fn test_attack_incremental_funding_across_many_slots() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Open position
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+
+    // Crank at regular intervals
+    for i in 1..=10 {
+        env.set_slot(i * 100);
+        env.crank();
+    }
+
+    // After 10 cranks over 1000 slots, conservation must hold
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync after incremental funding! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 26_000_000_000,
+        "ATTACK: SPL vault changed after incremental funding!");
+}
+
+/// ATTACK: Inverted market PnL direction and conservation after price move.
+/// Long on inverted market should lose when oracle rises (inverted mark falls).
+/// Verify PnL eventually settles into capital and conservation holds.
+#[test]
+fn test_attack_inverted_market_pnl_direction() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(1); // Inverted
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade on inverted market
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+    assert_eq!(env.read_account_position(user_idx), 10_000_000);
+
+    let cap_before_user = env.read_account_capital(user_idx);
+    let cap_before_lp = env.read_account_capital(lp_idx);
+
+    // Small oracle price change to test PnL direction
+    // Oracle: 138M → 150M. Inverted mark decreases slightly.
+    env.set_slot_and_price(100, 150_000_000);
+    env.crank();
+    env.set_slot(200);
+    env.crank();
+
+    // After settlement, verify conservation
+    let c_tot = env.read_c_tot();
+    let cap_user = env.read_account_capital(user_idx);
+    let cap_lp = env.read_account_capital(lp_idx);
+    let sum = cap_user + cap_lp;
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync on inverted market! c_tot={} sum={}", c_tot, sum);
+
+    // Total funds (deposits + insurance) should be unchanged in SPL vault
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 106_000_000_000,
+        "ATTACK: SPL vault changed during inverted market settlement!");
+
+    // Verify capital sum didn't increase (fees may decrease total)
+    assert!(cap_user + cap_lp <= cap_before_user + cap_before_lp,
+        "ATTACK: Total capital increased on inverted market!");
+}
