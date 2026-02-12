@@ -571,6 +571,8 @@ fn kani_nonce_advances_on_success() {
 }
 
 /// Prove: nonce wraps correctly at u64::MAX
+/// Note: Subsumed by kani_nonce_advances_on_success (universal over all u64).
+/// Kept as explicit boundary documentation.
 #[kani::proof]
 fn kani_nonce_wraps_at_max() {
     let old_nonce = u64::MAX;
@@ -939,6 +941,8 @@ fn kani_tradecpi_allows_gate_risk_decrease() {
 }
 
 /// Prove: TradeCpi reject leaves nonce unchanged
+/// Note: Subsumed by kani_tradecpi_any_reject_nonce_unchanged (universal proof).
+/// Kept as a concrete regression test and documentation anchor.
 #[kani::proof]
 fn kani_tradecpi_reject_nonce_unchanged() {
     let old_nonce: u64 = kani::any();
@@ -965,6 +969,8 @@ fn kani_tradecpi_reject_nonce_unchanged() {
 }
 
 /// Prove: TradeCpi accept increments nonce
+/// Note: Subsumed by kani_tradecpi_any_accept_increments_nonce (universal proof).
+/// Kept as a concrete regression test and documentation anchor.
 #[kani::proof]
 fn kani_tradecpi_accept_increments_nonce() {
     let old_nonce: u64 = kani::any();
@@ -1155,8 +1161,24 @@ fn kani_tradecpi_rejects_ctx_len_short() {
 // =============================================================================
 
 /// Prove: ANY TradeCpi rejection leaves nonce unchanged (universal quantification)
+/// Non-vacuity: concrete witness proves at least one Reject path exists.
 #[kani::proof]
 fn kani_tradecpi_any_reject_nonce_unchanged() {
+    // Non-vacuity witness: bad shape always produces Reject
+    {
+        let bad = MatcherAccountsShape {
+            prog_executable: false,
+            ctx_executable: false,
+            ctx_owner_is_prog: true,
+            ctx_len_ok: true,
+        };
+        let d = decide_trade_cpi(0, bad, true, true, true, true, true, false, false, 0);
+        assert!(
+            matches!(d, TradeCpiDecision::Reject),
+            "non-vacuity: bad shape must reject"
+        );
+    }
+
     let old_nonce: u64 = kani::any();
 
     // Build shape from symbolic bools (MatcherAccountsShape doesn't impl kani::Arbitrary)
@@ -1201,8 +1223,18 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
 }
 
 /// Prove: ANY TradeCpi acceptance increments nonce (universal quantification)
+/// Non-vacuity: concrete witness proves at least one Accept path exists.
 #[kani::proof]
 fn kani_tradecpi_any_accept_increments_nonce() {
+    // Non-vacuity witness: all-valid inputs produce Accept
+    {
+        let d = decide_trade_cpi(0, valid_shape(), true, true, true, true, true, false, false, 0);
+        assert!(
+            matches!(d, TradeCpiDecision::Accept { .. }),
+            "non-vacuity: all-valid inputs must accept"
+        );
+    }
+
     let old_nonce: u64 = kani::any();
 
     // Build shape from symbolic bools
@@ -1535,8 +1567,34 @@ fn kani_abi_ok_equals_validate() {
 // =============================================================================
 
 /// Prove: ANY rejection from decide_trade_cpi_from_ret leaves nonce unchanged
+/// Non-vacuity: concrete witness proves at least one Reject path exists.
 #[kani::proof]
 fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
+    // Non-vacuity witness: bad shape always produces Reject
+    {
+        let bad = MatcherAccountsShape {
+            prog_executable: false,
+            ctx_executable: false,
+            ctx_owner_is_prog: true,
+            ctx_len_ok: true,
+        };
+        let dummy_ret = MatcherReturnFields {
+            abi_version: 0,
+            flags: 0,
+            exec_price_e6: 0,
+            exec_size: 0,
+            req_id: 0,
+            lp_account_id: 0,
+            oracle_price_e6: 0,
+            reserved: 0,
+        };
+        let d = decide_trade_cpi_from_ret(0, bad, true, true, true, true, false, false, dummy_ret, 0, 0, 0);
+        assert!(
+            matches!(d, TradeCpiDecision::Reject),
+            "non-vacuity: bad shape must reject"
+        );
+    }
+
     let old_nonce: u64 = kani::any();
     let shape = MatcherAccountsShape {
         prog_executable: kani::any(),
@@ -1582,8 +1640,31 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
 }
 
 /// Prove: ANY acceptance from decide_trade_cpi_from_ret increments nonce
+/// Non-vacuity: concrete witness proves at least one Accept path exists.
 #[kani::proof]
 fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
+    // Non-vacuity witness: construct valid ABI inputs that produce Accept
+    {
+        let req_id = nonce_on_success(42);
+        let valid_ret = MatcherReturnFields {
+            abi_version: MATCHER_ABI_VERSION,
+            flags: FLAG_VALID | FLAG_PARTIAL_OK,
+            exec_price_e6: 1_000_000,
+            exec_size: 0,
+            req_id,
+            lp_account_id: 1,
+            oracle_price_e6: 50_000_000,
+            reserved: 0,
+        };
+        let d = decide_trade_cpi_from_ret(
+            42, valid_shape(), true, true, true, true, false, false, valid_ret, 1, 50_000_000, 100,
+        );
+        assert!(
+            matches!(d, TradeCpiDecision::Accept { .. }),
+            "non-vacuity: valid ABI inputs must accept"
+        );
+    }
+
     let old_nonce: u64 = kani::any();
     let shape = MatcherAccountsShape {
         prog_executable: kani::any(),
@@ -2837,6 +2918,15 @@ fn kani_universal_gate_risk_increase_rejects() {
 // AH. ADDITIONAL STRENGTHENING PROOFS
 // =============================================================================
 
+// Note: Removed kani_unit_conversion_deterministic (purity test).
+// Rust pure functions are deterministic by language guarantee —
+// calling base_to_units twice with the same inputs cannot differ.
+// No Kani proof needed for a compile-time structural property.
+
+// Note: Removed kani_scale_validation_pure (purity test).
+// Same reasoning: init_market_scale_ok is a pure function.
+// Purity is enforced by Rust's type system (no &mut, no globals).
+
 /// Unit conversion: if dust==0 after base_to_units, roundtrip is exact
 /// Constructs base = q * scale directly to avoid expensive % in SAT solver
 #[kani::proof]
@@ -3053,39 +3143,7 @@ fn kani_init_market_scale_valid_range() {
 // and don't reference unit_scale at all. Independence is structural (no shared
 // state), not a runtime property that needs formal verification.
 
-/// Prove: unit conversion is deterministic - same inputs always give same outputs
-/// Calls the function twice with the same inputs to verify identical results.
-#[kani::proof]
-fn kani_unit_conversion_deterministic() {
-    let scale: u32 = kani::any();
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap base to keep quotient small
-    let base: u64 = kani::any();
-    kani::assume(base <= (scale.max(1) as u64) * KANI_MAX_QUOTIENT);
-
-    // Call the function twice with identical inputs
-    let (units1, dust1) = base_to_units(base, scale);
-    let (units2, dust2) = base_to_units(base, scale);
-
-    // For a deterministic function, results must be identical
-    assert_eq!(units1, units2, "base_to_units must be deterministic");
-    assert_eq!(dust1, dust2, "base_to_units dust must be deterministic");
-}
-
-/// Prove: unit scale validation is pure - no side effects
-#[kani::proof]
-fn kani_scale_validation_pure() {
-    let scale: u32 = kani::any();
-
-    // Call multiple times - same result
-    let result1 = init_market_scale_ok(scale);
-    let result2 = init_market_scale_ok(scale);
-    let result3 = init_market_scale_ok(scale);
-
-    assert_eq!(result1, result2, "init_market_scale_ok must be pure (1)");
-    assert_eq!(result2, result3, "init_market_scale_ok must be pure (2)");
-}
+// Purity proofs removed — see note in section AH above.
 
 // =============================================================================
 // BUG DETECTION: Unit Scale Margin Inconsistency
