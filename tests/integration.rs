@@ -194,12 +194,6 @@ struct TestEnv {
 impl TestEnv {
     fn new() -> Self {
         let path = program_path();
-        if !path.exists() {
-            panic!(
-                "BPF not found at {:?}. Run: cargo build-sbf --features test",
-                path
-            );
-        }
 
         let mut svm = LiteSVM::new();
         let program_id = Pubkey::new_unique();
@@ -729,11 +723,7 @@ impl TestEnv {
 /// 4. If funding used raw price instead of market price, it would overflow or produce wrong values
 #[test]
 fn test_inverted_market_crank_succeeds() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -779,11 +769,7 @@ fn test_inverted_market_crank_succeeds() {
 /// (where oracle price is used directly as market price) still work.
 #[test]
 fn test_non_inverted_market_crank_succeeds() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -1273,11 +1259,7 @@ impl TestEnv {
 /// but not dust_base which can hold residual base tokens.
 #[test]
 fn test_bug3_close_slab_with_dust_should_fail() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -1336,11 +1318,7 @@ fn test_bug3_close_slab_with_dust_should_fail() {
 /// Test that withdrawals with amounts not divisible by unit_scale are rejected.
 #[test]
 fn test_misaligned_withdrawal_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -1379,11 +1357,7 @@ fn test_misaligned_withdrawal_rejected() {
 /// but only new_account_fee is accounted in engine.vault/insurance.
 #[test]
 fn test_bug4_fee_overpayment_should_be_handled() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -1453,11 +1427,7 @@ fn test_bug4_fee_overpayment_should_be_handled() {
 /// that initial_margin_bps is correctly enforced for risk-increasing trades.
 #[test]
 fn test_verify_finding_l_fixed_with_invert_zero() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     // This test uses invert=0 so oracle price is $138 directly (not inverted)
     // Position size for ~10 SOL notional at $138:
@@ -1524,11 +1494,7 @@ fn test_verify_finding_l_fixed_with_invert_zero() {
 /// With the fix: Crank converts PnL to capital, close_account succeeds
 #[test]
 fn test_zombie_pnl_crank_driven_warmup_conversion() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -1625,11 +1591,7 @@ fn test_zombie_pnl_crank_driven_warmup_conversion() {
 /// - Even without PnL, crank processes the account correctly
 #[test]
 fn test_idle_account_can_close_after_crank() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(1, 100);
@@ -1669,10 +1631,6 @@ fn test_idle_account_can_close_after_crank() {
 #[test]
 fn test_hyperp_rejects_zero_initial_mark_price() {
     let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
@@ -1794,10 +1752,6 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
 #[test]
 fn test_hyperp_init_market_with_valid_price() {
     let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
@@ -1924,10 +1878,6 @@ fn test_hyperp_init_market_with_valid_price() {
 #[test]
 fn test_hyperp_init_market_with_inverted_price() {
     let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
@@ -2145,13 +2095,6 @@ fn read_matcher_return(data: &[u8]) -> (u32, u32, u64, i128, u64) {
 #[test]
 fn test_matcher_init_vamm_passive_mode() {
     let path = matcher_program_path();
-    if !path.exists() {
-        println!(
-            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
-            path
-        );
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -2221,13 +2164,6 @@ fn test_matcher_init_vamm_passive_mode() {
 #[test]
 fn test_matcher_call_after_init() {
     let path = matcher_program_path();
-    if !path.exists() {
-        println!(
-            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
-            path
-        );
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -2333,13 +2269,6 @@ fn test_matcher_call_after_init() {
 #[test]
 fn test_matcher_rejects_double_init() {
     let path = matcher_program_path();
-    if !path.exists() {
-        println!(
-            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
-            path
-        );
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -2412,13 +2341,6 @@ fn test_matcher_rejects_double_init() {
 #[test]
 fn test_matcher_vamm_mode_with_impact() {
     let path = matcher_program_path();
-    if !path.exists() {
-        println!(
-            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
-            path
-        );
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -2692,11 +2614,7 @@ impl TestEnv {
 /// Verifies: deposit, trade open, crank with price change, trade close
 #[test]
 fn test_comprehensive_trading_lifecycle_with_pnl() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2735,11 +2653,7 @@ fn test_comprehensive_trading_lifecycle_with_pnl() {
 /// Test 2: Liquidation attempt when user position goes underwater
 #[test]
 fn test_comprehensive_liquidation_underwater_user() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2772,11 +2686,7 @@ fn test_comprehensive_liquidation_underwater_user() {
 /// Test 3: Withdrawal limits - can't withdraw beyond margin requirements
 #[test]
 fn test_comprehensive_withdrawal_limits() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2814,11 +2724,7 @@ fn test_comprehensive_withdrawal_limits() {
 /// Test 4: Unauthorized access - wrong signer can't operate on account
 #[test]
 fn test_comprehensive_unauthorized_access_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2856,11 +2762,7 @@ fn test_comprehensive_unauthorized_access_rejected() {
 /// Test 5: Position flip - user goes from long to short
 #[test]
 fn test_comprehensive_position_flip_long_to_short() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2894,11 +2796,7 @@ fn test_comprehensive_position_flip_long_to_short() {
 /// Test 6: Multiple participants - all trades succeed with single LP
 #[test]
 fn test_comprehensive_multiple_participants() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2945,11 +2843,7 @@ fn test_comprehensive_multiple_participants() {
 /// Test 7: Oracle price impact - crank succeeds at different prices
 #[test]
 fn test_comprehensive_oracle_price_impact_on_pnl() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2999,11 +2893,7 @@ fn test_comprehensive_oracle_price_impact_on_pnl() {
 /// Test 8: Insurance fund top-up succeeds
 #[test]
 fn test_comprehensive_insurance_fund_topup() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3025,17 +2915,20 @@ fn test_comprehensive_insurance_fund_topup() {
         "Vault should have insurance funds"
     );
 
-    println!("INSURANCE FUND VERIFIED: Top-up transferred to vault");
+    // Engine insurance counter should also reflect the top-up
+    let insurance = env.read_insurance_balance();
+    assert_eq!(
+        insurance, 5_000_000_000,
+        "Engine insurance balance should match top-up amount"
+    );
+
+    println!("INSURANCE FUND VERIFIED: Top-up transferred to vault and engine counter updated");
 }
 
 /// Test 9: Trading at margin limits
 #[test]
 fn test_comprehensive_margin_limit_enforcement() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3069,11 +2962,7 @@ fn test_comprehensive_margin_limit_enforcement() {
 /// Test 10: Funding accrual - multiple cranks succeed over time
 #[test]
 fn test_comprehensive_funding_accrual() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3122,11 +3011,7 @@ fn test_comprehensive_funding_accrual() {
 /// Test 11: Close account returns correct capital
 #[test]
 fn test_comprehensive_close_account_returns_capital() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3531,11 +3416,7 @@ impl TestEnv {
 /// CRITICAL: UpdateAdmin only callable by current admin
 #[test]
 fn test_critical_update_admin_authorization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3577,11 +3458,7 @@ fn test_critical_update_admin_authorization() {
 /// CRITICAL: SetRiskThreshold admin-only
 #[test]
 fn test_critical_set_risk_threshold_authorization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3617,11 +3494,7 @@ fn test_critical_set_risk_threshold_authorization() {
 /// CRITICAL: Admin oracle mechanism for Hyperp mode
 #[test]
 fn test_critical_admin_oracle_authority() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3678,11 +3551,7 @@ fn test_critical_admin_oracle_authority() {
 /// CRITICAL: SetOraclePriceCap admin-only
 #[test]
 fn test_critical_set_oracle_price_cap_authorization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3718,11 +3587,7 @@ fn test_critical_set_oracle_price_cap_authorization() {
 /// CRITICAL: SetMaintenanceFee admin-only
 #[test]
 fn test_critical_set_maintenance_fee_authorization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3758,11 +3623,7 @@ fn test_critical_set_maintenance_fee_authorization() {
 /// CRITICAL: UpdateConfig admin-only with all parameters
 #[test]
 fn test_critical_update_config_authorization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3794,11 +3655,7 @@ fn test_critical_update_config_authorization() {
 /// CRITICAL: Liquidation rejected when account is solvent
 #[test]
 fn test_critical_liquidation_rejected_when_solvent() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3859,11 +3716,7 @@ fn test_critical_liquidation_rejected_when_solvent() {
 /// CRITICAL: CloseSlab only by admin, requires zero vault/insurance
 #[test]
 fn test_critical_close_slab_authorization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3913,11 +3766,7 @@ fn test_critical_close_slab_authorization() {
 /// CRITICAL: InitMarket rejects already initialized slab
 #[test]
 fn test_critical_init_market_rejects_double_init() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
 
@@ -3981,11 +3830,7 @@ fn test_critical_init_market_rejects_double_init() {
 /// CRITICAL: Invalid user_idx/lp_idx are rejected
 #[test]
 fn test_critical_invalid_account_indices_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -4024,11 +3869,7 @@ fn test_critical_invalid_account_indices_rejected() {
 /// Test that sell trades (negative size) work correctly
 #[test]
 fn test_sell_trade_negative_size() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -4103,10 +3944,6 @@ impl TradeCpiTestEnv {
     fn new() -> Option<Self> {
         let percolator_path = program_path();
         let matcher_path = matcher_program_path();
-
-        if !percolator_path.exists() || !matcher_path.exists() {
-            return None;
-        }
 
         let mut svm = LiteSVM::new();
         let program_id = Pubkey::new_unique();
@@ -5655,11 +5492,7 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
 /// even after all users have closed their accounts.
 #[test]
 fn test_insurance_fund_traps_funds_preventing_closeslab() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -5727,11 +5560,7 @@ fn test_insurance_fund_traps_funds_preventing_closeslab() {
 /// 4. No overflow or underflow with extreme values
 #[test]
 fn test_extreme_price_movement_with_large_position() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -5767,7 +5596,12 @@ fn test_extreme_price_movement_with_large_position() {
 
     // User should be underwater - liquidation may fail if force-realize already
     // closed the position during crank (insurance=0 triggers force-realize mode)
-    let _liq_result = env.try_liquidate(user_idx);
+    let liq_result = env.try_liquidate(user_idx);
+    // Either liquidation succeeds (reduces position) or was already force-realized
+    let pos_after_liq = env.read_account_position(user_idx);
+    if liq_result.is_ok() {
+        assert!(pos_after_liq.unsigned_abs() < 100_000_000, "Liquidation should reduce position");
+    }
 
     // If liquidation succeeded or failed, verify accounting
     env.set_slot_and_price(300, 117_300_000);
@@ -5790,7 +5624,8 @@ fn test_extreme_price_movement_with_large_position() {
 
     // Small trade to verify market still functions (may fail if force-realize
     // mode closed LP's position since insurance=0)
-    let _result = env.try_trade(&user2, &lp, lp_idx, user2_idx, 1_000_000);
+    let trade2_result = env.try_trade(&user2, &lp, lp_idx, user2_idx, 1_000_000);
+    println!("Post-crash trade result: {}", if trade2_result.is_ok() { "ok" } else { "rejected" });
 
     // Vault conservation: engine.vault must match SPL vault balance
     let engine_vault = env.read_engine_vault();
@@ -5812,11 +5647,7 @@ fn test_extreme_price_movement_with_large_position() {
 /// and that trades just below the boundary are rejected.
 #[test]
 fn test_minimum_margin_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -5885,11 +5716,7 @@ fn test_minimum_margin_boundary() {
 /// This verifies that margin checks are applied correctly on each flip.
 #[test]
 fn test_rapid_position_flips_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -5952,11 +5779,7 @@ fn test_rapid_position_flips_same_slot() {
 /// Test position flip with minimal equity (edge case at liquidation boundary).
 #[test]
 fn test_position_flip_minimal_equity() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6042,10 +5865,6 @@ fn test_position_flip_minimal_equity() {
 #[test]
 fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
@@ -6242,11 +6061,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
 /// Without this mechanism, attackers could permanently fill all account slots.
 #[test]
 fn test_maintenance_fees_drain_dead_accounts_for_gc() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     println!("=== MAINTENANCE FEE DRAIN & GC TEST ===");
     println!("Verifying anti-DoS mechanism: fee drain -> dust -> GC");
@@ -6549,11 +6364,7 @@ fn test_premarket_resolution_full_lifecycle() {
 /// Test that resolved markets block new activity
 #[test]
 fn test_resolved_market_blocks_new_activity() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     println!("=== RESOLVED MARKET BLOCKS NEW ACTIVITY TEST ===");
     println!();
@@ -6609,11 +6420,7 @@ fn test_resolved_market_blocks_new_activity() {
 /// Test that users can withdraw after resolution
 #[test]
 fn test_resolved_market_allows_user_withdrawal() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf");
-        return;
-    }
+    program_path();
 
     println!("=== RESOLVED MARKET ALLOWS USER WITHDRAWAL TEST ===");
     println!();
@@ -7487,11 +7294,7 @@ impl TestEnv {
 /// Expected: Transaction fails due to margin/balance check.
 #[test]
 fn test_attack_withdraw_more_than_capital() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7516,11 +7319,7 @@ fn test_attack_withdraw_more_than_capital() {
 /// Expected: Fails because MTM equity is reduced by loss, margin check rejects.
 #[test]
 fn test_attack_withdraw_after_loss_exceeds_equity() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7552,11 +7351,7 @@ fn test_attack_withdraw_after_loss_exceeds_equity() {
 /// Expected: Transaction rejected for misaligned amount.
 #[test]
 fn test_attack_withdraw_misaligned_amount() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
@@ -7580,11 +7375,7 @@ fn test_attack_withdraw_misaligned_amount() {
 /// return reduced equity, not allow full withdrawal that exceeds the haircutted equity.
 #[test]
 fn test_attack_withdraw_during_undercollateralization() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7617,11 +7408,7 @@ fn test_attack_withdraw_during_undercollateralization() {
 /// Expected: Withdraw checks include fee debt in equity calculation.
 #[test]
 fn test_attack_withdraw_bypasses_fee_debt() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // Initialize with maintenance fee to accrue fee debt
@@ -7663,11 +7450,7 @@ fn test_attack_withdraw_bypasses_fee_debt() {
 /// Expected: Owner check fails - signer must match account's registered owner.
 #[test]
 fn test_attack_deposit_wrong_owner() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7691,11 +7474,7 @@ fn test_attack_deposit_wrong_owner() {
 /// Expected: Owner check rejects - signer must match account's registered owner.
 #[test]
 fn test_attack_withdraw_wrong_owner() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7719,11 +7498,7 @@ fn test_attack_withdraw_wrong_owner() {
 /// Expected: Owner check rejects.
 #[test]
 fn test_attack_close_account_wrong_owner() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7746,11 +7521,7 @@ fn test_attack_close_account_wrong_owner() {
 /// Expected: All admin operations fail for non-admin.
 #[test]
 fn test_attack_admin_op_as_user() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7809,11 +7580,7 @@ fn test_attack_admin_op_as_user() {
 /// Expected: All admin ops fail since nobody can sign as the zero address.
 #[test]
 fn test_attack_burned_admin_cannot_act() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7846,11 +7613,7 @@ fn test_attack_burned_admin_cannot_act() {
 /// Expected: Transaction fails with authorization error.
 #[test]
 fn test_attack_oracle_authority_wrong_signer() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7890,11 +7653,7 @@ fn test_attack_oracle_authority_wrong_signer() {
 /// Expected: Margin check rejects the trade.
 #[test]
 fn test_attack_trade_without_margin() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7921,11 +7680,7 @@ fn test_attack_trade_without_margin() {
 /// Expected: Risk-increasing trade gated when insurance gone.
 #[test]
 fn test_attack_trade_risk_increase_when_gated() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7956,11 +7711,7 @@ fn test_attack_trade_risk_increase_when_gated() {
 /// Expected: Program rejects TradeNoCpi for Hyperp markets.
 #[test]
 fn test_attack_trade_nocpi_in_hyperp_mode() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000); // Hyperp mode
@@ -7985,11 +7736,7 @@ fn test_attack_trade_nocpi_in_hyperp_mode() {
 /// Expected: No new trades on resolved markets.
 #[test]
 fn test_attack_trade_after_market_resolved() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8030,11 +7777,7 @@ fn test_attack_trade_after_market_resolved() {
 /// maintenance_margin_bps. This is Finding L regression test.
 #[test]
 fn test_attack_position_flip_requires_initial_margin() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0); // initial=10%, maintenance=5%
@@ -8294,11 +8037,7 @@ fn test_attack_tradecpi_cross_lp_matcher_binding() {
 /// Expected: Liquidation rejected for healthy accounts.
 #[test]
 fn test_attack_liquidate_solvent_account() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8340,11 +8079,7 @@ fn test_attack_liquidate_solvent_account() {
 /// Expected: Self-liquidation doesn't create profit for the attacker.
 #[test]
 fn test_attack_self_liquidation_no_profit() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8387,10 +8122,16 @@ fn test_attack_self_liquidation_no_profit() {
             "ATTACK: Insurance should not decrease from liquidation"
         );
     } else {
+        // Failed liquidation should be a complete no-op
         assert_eq!(
             insurance_after, insurance_before,
             "Failed liquidation should not change insurance: before={} after={}",
             insurance_before, insurance_after
+        );
+        assert_eq!(
+            capital_after, capital_before,
+            "Failed liquidation should not change capital: before={} after={}",
+            capital_before, capital_after
         );
     }
 
@@ -8414,11 +8155,7 @@ fn test_attack_self_liquidation_no_profit() {
 /// Expected: Liquidation rejected when account recovers above maintenance margin.
 #[test]
 fn test_attack_liquidate_after_price_recovery() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8466,11 +8203,7 @@ fn test_attack_liquidate_after_price_recovery() {
 /// Expected: WithdrawInsurance only works on resolved markets.
 #[test]
 fn test_attack_withdraw_insurance_before_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8494,11 +8227,7 @@ fn test_attack_withdraw_insurance_before_resolution() {
 /// Expected: WithdrawInsurance requires all positions closed.
 #[test]
 fn test_attack_withdraw_insurance_with_open_positions() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8538,11 +8267,7 @@ fn test_attack_withdraw_insurance_with_open_positions() {
 /// Expected: CloseSlab requires insurance_fund.balance == 0.
 #[test]
 fn test_attack_close_slab_with_insurance_remaining() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8571,11 +8296,7 @@ fn test_attack_close_slab_with_insurance_remaining() {
 /// Expected: Price cannot jump more than allowed by circuit breaker.
 #[test]
 fn test_attack_oracle_price_cap_circuit_breaker() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8621,11 +8342,7 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
 /// Expected: Stale oracle rejected by staleness check.
 #[test]
 fn test_attack_stale_oracle_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     // Test that PushOraclePrice rejects stale (backward) timestamps.
     // The engine enforces monotonic authority_timestamp for non-Hyperp markets:
@@ -8676,11 +8393,7 @@ fn test_attack_stale_oracle_rejected() {
 /// Expected: Zero price rejected.
 #[test]
 fn test_attack_push_oracle_zero_price() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8705,11 +8418,7 @@ fn test_attack_push_oracle_zero_price() {
 /// Expected: Fails because default authority is [0;32] (unset).
 #[test]
 fn test_attack_push_oracle_without_authority_set() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8732,11 +8441,7 @@ fn test_attack_push_oracle_without_authority_set() {
 /// Expected: Resolution requires authority price to be set first.
 #[test]
 fn test_attack_resolve_market_without_oracle_price() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8759,11 +8464,7 @@ fn test_attack_resolve_market_without_oracle_price() {
 /// Expected: No new deposits on resolved markets.
 #[test]
 fn test_attack_deposit_after_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8794,11 +8495,7 @@ fn test_attack_deposit_after_resolution() {
 /// Expected: No new accounts on resolved markets.
 #[test]
 fn test_attack_init_user_after_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8826,11 +8523,7 @@ fn test_attack_init_user_after_resolution() {
 /// Expected: Double resolution rejected.
 #[test]
 fn test_attack_double_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8859,11 +8552,7 @@ fn test_attack_double_resolution() {
 /// Expected: CloseAccount rejects when position_size != 0.
 #[test]
 fn test_attack_close_account_with_position() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8895,11 +8584,7 @@ fn test_attack_close_account_with_position() {
 /// Expected: CloseAccount requires PnL == 0.
 #[test]
 fn test_attack_close_account_with_pnl() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -8920,39 +8605,26 @@ fn test_attack_close_account_with_pnl() {
     env.set_slot_and_price(300, 150_000_000);
     env.crank();
 
-    // Position is closed but PnL might be non-zero (needs warmup conversion)
+    // After full cycle, position is closed and warmup settles PnL to capital
     let pnl = env.read_account_pnl(user_idx);
     let pos = env.read_account_position(user_idx);
     assert_eq!(pos, 0, "Position should be closed after closing trade");
+    assert_eq!(pnl, 0, "PnL should be zero after crank settles warmup");
 
-    if pnl != 0 {
-        // PnL outstanding - close should fail
-        let result = env.try_close_account(&user, user_idx);
-        assert!(
-            result.is_err(),
-            "ATTACK: Close with outstanding PnL should fail"
-        );
-    } else {
-        // PnL settled to zero - close should work
-        let result = env.try_close_account(&user, user_idx);
-        assert!(
-            result.is_ok(),
-            "Close with zero PnL should succeed: {:?}",
-            result
-        );
-    }
-    // Either branch has an assertion - test is never vacuous
+    // With PnL=0 and position=0, close should succeed
+    let result = env.try_close_account(&user, user_idx);
+    assert!(
+        result.is_ok(),
+        "Close with zero PnL and position should succeed: {:?}",
+        result
+    );
 }
 
 /// ATTACK: Initialize a market twice on the same slab.
 /// Expected: Second InitMarket fails because slab already initialized.
 #[test]
 fn test_attack_double_init_market() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9007,11 +8679,7 @@ fn test_attack_double_init_market() {
 /// Expected: Dust is tracked and cannot be extracted (swept to insurance).
 #[test]
 fn test_attack_dust_accumulation_theft() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
@@ -9051,11 +8719,7 @@ fn test_attack_dust_accumulation_theft() {
 /// not fee ceiling division. Fee ceiling division is tested at the engine level.
 #[test]
 fn test_attack_fee_evasion_micro_trades() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9107,11 +8771,7 @@ fn test_attack_fee_evasion_micro_trades() {
 /// Expected: Vault token balance is always consistent - no tokens created from nothing.
 #[test]
 fn test_attack_haircut_manipulation_via_deposit_withdraw() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9155,11 +8815,7 @@ fn test_attack_haircut_manipulation_via_deposit_withdraw() {
 /// Expected: Total vault token balance equals total deposits minus total withdrawals.
 #[test]
 fn test_attack_conservation_invariant() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9366,11 +9022,7 @@ impl TestEnv {
 /// Expected: Rejected because allow_panic requires admin authorization.
 #[test]
 fn test_attack_permissionless_crank_with_panic_flag() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9409,11 +9061,7 @@ fn test_attack_permissionless_crank_with_panic_flag() {
 /// Expected: Second crank is a no-op (require_fresh_crank gate).
 #[test]
 fn test_attack_same_slot_double_crank() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9459,11 +9107,7 @@ fn test_attack_same_slot_double_crank() {
 /// Expected: Owner check rejects because signer doesn't match account owner.
 #[test]
 fn test_attack_self_crank_wrong_owner() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9501,11 +9145,7 @@ fn test_attack_self_crank_wrong_owner() {
 /// Expected: Funding rate is capped at max_bps_per_slot; no runaway drain.
 #[test]
 fn test_attack_funding_max_rate_sustained_drain() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9557,11 +9197,7 @@ fn test_attack_funding_max_rate_sustained_drain() {
 /// Expected: dt=0 returns no index movement (fix verified).
 #[test]
 fn test_attack_funding_same_slot_three_cranks_dt_zero() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9608,11 +9244,7 @@ fn test_attack_funding_same_slot_three_cranks_dt_zero() {
 /// Expected: dt is capped and funding doesn't overflow.
 #[test]
 fn test_attack_funding_large_dt_gap() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9667,11 +9299,7 @@ fn test_attack_funding_large_dt_gap() {
 /// Expected: Profit converts to capital immediately.
 #[test]
 fn test_attack_warmup_zero_period_instant() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 0); // warmup = 0 slots
@@ -9704,11 +9332,7 @@ fn test_attack_warmup_zero_period_instant() {
 /// Expected: Unrealized PnL in warmup cannot be withdrawn as capital.
 #[test]
 fn test_attack_warmup_long_period_withdraw_attempt() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 1_000_000); // warmup = 1M slots
@@ -9755,11 +9379,7 @@ fn test_attack_warmup_long_period_withdraw_attempt() {
 /// Expected: With unit_scale=0, no dust accumulation, clean behavior.
 #[test]
 fn test_attack_unit_scale_zero_no_dust() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 0, 0); // unit_scale = 0
@@ -9784,11 +9404,7 @@ fn test_attack_unit_scale_zero_no_dust() {
 /// Expected: Dust correctly tracked and not exploitable.
 #[test]
 fn test_attack_high_unit_scale_dust_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1_000_000, 0); // 1M base per unit
@@ -9819,11 +9435,7 @@ fn test_attack_high_unit_scale_dust_boundary() {
 /// Expected: Fee is charged on every trade, goes to insurance.
 #[test]
 fn test_attack_trading_fee_accrual_to_insurance() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_trading_fee(100); // 1% fee
@@ -9852,8 +9464,10 @@ fn test_attack_trading_fee_accrual_to_insurance() {
         insurance_before, insurance_after
     );
     assert!(
-        insurance_after >= insurance_before,
-        "Insurance fund should increase from trading fees"
+        insurance_after > insurance_before,
+        "Insurance fund should increase from trading fees: before={} after={}",
+        insurance_before,
+        insurance_after
     );
 }
 
@@ -9861,11 +9475,7 @@ fn test_attack_trading_fee_accrual_to_insurance() {
 /// Expected: Trading fee charged on both legs, not profitable to churn.
 #[test]
 fn test_attack_open_close_same_slot_fee_evasion() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_trading_fee(100); // 1% fee
@@ -9909,11 +9519,7 @@ fn test_attack_open_close_same_slot_fee_evasion() {
 /// Expected: User can still withdraw capital from resolved market.
 #[test]
 fn test_attack_withdraw_between_resolution_and_force_close() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -9937,25 +9543,18 @@ fn test_attack_withdraw_between_resolution_and_force_close() {
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "Should resolve: {:?}", result);
 
-    // User with no position should be able to withdraw capital from resolved market
-    // or the resolved market may block withdrawals requiring force-close path
+    // User with no position should be able to withdraw from resolved market
+    // (WithdrawCollateral does not check is_resolved flag)
     let vault_before = env.vault_balance();
     let result = env.try_withdraw(&user, user_idx, 5_000_000_000);
+    assert!(result.is_ok(), "Withdrawal should succeed on resolved market (no position): {:?}", result);
 
-    if result.is_ok() {
-        // Withdrawal succeeded - verify vault decreased by the exact amount
+    {
         let vault_after = env.vault_balance();
         assert_eq!(
             vault_before - vault_after,
             5_000_000_000,
             "ATTACK: Withdrawal amount should match vault decrease"
-        );
-    } else {
-        // Withdrawal blocked by resolution - verify vault unchanged (no partial extraction)
-        let vault_after = env.vault_balance();
-        assert_eq!(
-            vault_before, vault_after,
-            "ATTACK: Failed withdrawal should not change vault balance"
         );
     }
 }
@@ -10035,11 +9634,7 @@ fn test_attack_trade_after_force_close() {
 /// Expected: CloseAccount forgives remaining fee debt after paying what's possible.
 #[test]
 fn test_attack_gc_close_account_with_fee_debt() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 0);
@@ -10082,11 +9677,7 @@ fn test_attack_gc_close_account_with_fee_debt() {
 /// Expected: After GC, slot is marked unused and can be reused.
 #[test]
 fn test_attack_gc_slot_reuse_after_close() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10130,11 +9721,7 @@ fn test_attack_gc_slot_reuse_after_close() {
 /// Expected: Deposit is available immediately for trading (no crank needed).
 #[test]
 fn test_attack_deposit_then_trade_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10160,11 +9747,7 @@ fn test_attack_deposit_then_trade_same_slot() {
 /// Expected: Margin check accounts for newly opened position.
 #[test]
 fn test_attack_trade_then_withdraw_max_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10201,11 +9784,7 @@ fn test_attack_trade_then_withdraw_max_same_slot() {
 /// Expected: All deposits correctly credited, no accounting errors.
 #[test]
 fn test_attack_rapid_deposits_accounting() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10240,11 +9819,7 @@ fn test_attack_rapid_deposits_accounting() {
 /// Expected: Engine-level guards prevent dangerous configurations.
 #[test]
 fn test_attack_update_config_extreme_values() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10306,11 +9881,7 @@ fn test_attack_update_config_extreme_values() {
 /// Expected: Threshold changes take effect but don't corrupt state.
 #[test]
 fn test_attack_risk_threshold_rapid_toggle() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10365,11 +9936,7 @@ fn test_attack_risk_threshold_rapid_toggle() {
 /// Expected: Rejected by token program (insufficient funds).
 #[test]
 fn test_attack_deposit_u64_max() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10411,11 +9978,7 @@ fn test_attack_deposit_u64_max() {
 /// Expected: Rejected by margin check (impossible notional value).
 #[test]
 fn test_attack_trade_size_i128_max() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10447,11 +10010,7 @@ fn test_attack_trade_size_i128_max() {
 /// Expected: Zero-size trade is rejected or is a safe no-op.
 #[test]
 fn test_attack_trade_size_zero() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10482,11 +10041,7 @@ fn test_attack_trade_size_zero() {
 /// Expected: Zero withdrawal is rejected or safe no-op.
 #[test]
 fn test_attack_withdraw_zero_amount() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10512,11 +10067,7 @@ fn test_attack_withdraw_zero_amount() {
 /// Expected: Zero deposit is rejected or safe no-op.
 #[test]
 fn test_attack_deposit_zero_amount() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10625,11 +10176,7 @@ impl TestEnv {
 /// Expected: Rejected with InvalidConfigParam.
 #[test]
 fn test_attack_config_zero_funding_horizon() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10653,11 +10200,7 @@ fn test_attack_config_zero_funding_horizon() {
 /// Expected: Rejected with InvalidConfigParam.
 #[test]
 fn test_attack_config_zero_inv_scale() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10681,11 +10224,7 @@ fn test_attack_config_zero_inv_scale() {
 /// Expected: Rejected with InvalidConfigParam.
 #[test]
 fn test_attack_config_alpha_over_100_percent() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10709,11 +10248,7 @@ fn test_attack_config_alpha_over_100_percent() {
 /// Expected: Rejected with InvalidConfigParam.
 #[test]
 fn test_attack_config_inverted_threshold_bounds() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10741,11 +10276,7 @@ fn test_attack_config_inverted_threshold_bounds() {
 /// Expected: Rejected (InvalidAccountData).
 #[test]
 fn test_attack_topup_insurance_after_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10772,11 +10303,7 @@ fn test_attack_topup_insurance_after_resolution() {
 /// Expected: Token program rejects transfer.
 #[test]
 fn test_attack_topup_insurance_insufficient_balance() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10818,11 +10345,7 @@ fn test_attack_topup_insurance_insufficient_balance() {
 /// Expected: Insurance balance increases by correct amount, vault has the tokens.
 #[test]
 fn test_attack_topup_insurance_correct_accounting() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10856,11 +10379,7 @@ fn test_attack_topup_insurance_correct_accounting() {
 /// Expected: After setting to zero, PushOraclePrice fails, authority_price_e6 is cleared.
 #[test]
 fn test_attack_oracle_authority_disable_clears_price() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10908,11 +10427,7 @@ fn test_attack_oracle_authority_disable_clears_price() {
 /// Expected: Changing authority doesn't affect existing positions, just future price pushing.
 #[test]
 fn test_attack_oracle_authority_change_with_positions() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -10970,11 +10485,7 @@ fn test_attack_oracle_authority_change_with_positions() {
 /// Expected: With cap=0, any price jump is accepted.
 #[test]
 fn test_attack_oracle_cap_zero_disables_clamping() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11005,11 +10516,7 @@ fn test_attack_oracle_cap_zero_disables_clamping() {
 /// Expected: Price clamped to essentially no movement (1 e2bps = 0.01%).
 #[test]
 fn test_attack_oracle_cap_ultra_restrictive() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11051,11 +10558,7 @@ fn test_attack_oracle_cap_ultra_restrictive() {
 /// Expected: GC skips LP accounts (they have is_lp = true).
 #[test]
 fn test_attack_lp_immune_to_gc() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11082,11 +10585,7 @@ fn test_attack_lp_immune_to_gc() {
 /// Expected: GC reclaims user accounts with zero position/capital/pnl.
 #[test]
 fn test_attack_user_gc_when_empty() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11110,11 +10609,7 @@ fn test_attack_user_gc_when_empty() {
 /// Expected: LP account cannot be closed via CloseAccount (only users can close).
 #[test]
 fn test_attack_close_lp_account() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11124,24 +10619,15 @@ fn test_attack_close_lp_account() {
     env.deposit(&lp, lp_idx, 10_000_000_000);
 
     // Try to close LP account via CloseAccount instruction
+    // CloseAccount does not check account kind — LP with no position can close
     let result = env.try_close_account(&lp, lp_idx);
-    // LP accounts should either be rejected or treated differently
-    // The key security property: LP capital should not be extractable via CloseAccount
-    // if the LP is expected to remain for the market's lifetime
+    assert!(result.is_ok(), "LP with no position should be closeable: {:?}", result);
     let vault_after = env.vault_balance();
-    if result.is_ok() {
-        // If close succeeded, vault should have decreased (capital returned)
-        assert!(
-            vault_after < 10_000_000_000,
-            "If LP close succeeded, capital should be returned"
-        );
-    } else {
-        // If close was rejected, vault should be unchanged
-        assert_eq!(
-            vault_after, 10_000_000_000,
-            "If LP close rejected, vault should be unchanged"
-        );
-    }
+    assert!(
+        vault_after < 10_000_000_000,
+        "LP close should return capital: vault={}",
+        vault_after
+    );
 }
 
 // ============================================================================
@@ -11152,11 +10638,7 @@ fn test_attack_close_lp_account() {
 /// Expected: Rejected (vault must be empty).
 #[test]
 fn test_attack_close_slab_with_vault_tokens() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11178,11 +10660,7 @@ fn test_attack_close_slab_with_vault_tokens() {
 /// Expected: Rejected (not initialized).
 #[test]
 fn test_attack_close_slab_uninitialized() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // Don't call init_market - slab is uninitialized
@@ -11202,11 +10680,7 @@ fn test_attack_close_slab_uninitialized() {
 /// Expected: Fee is accepted but capital should drain predictably (not corrupt state).
 #[test]
 fn test_attack_maintenance_fee_u128_max() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 0);
@@ -11240,11 +10714,7 @@ fn test_attack_maintenance_fee_u128_max() {
 /// Expected: Rejected (admin auth check).
 #[test]
 fn test_attack_set_maintenance_fee_non_admin() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11266,11 +10736,7 @@ fn test_attack_set_maintenance_fee_non_admin() {
 /// Expected: Haircut ratio = (1,1), no division by zero.
 #[test]
 fn test_attack_haircut_all_users_in_loss() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11309,11 +10775,7 @@ fn test_attack_haircut_all_users_in_loss() {
 /// Expected: Conservation holds: vault = total deposits always.
 #[test]
 fn test_attack_multi_user_settlement_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11369,11 +10831,7 @@ fn test_attack_multi_user_settlement_conservation() {
 /// Expected: Rejected with InvalidInstructionData.
 #[test]
 fn test_attack_truncated_instruction_data() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11415,11 +10873,7 @@ fn test_attack_truncated_instruction_data() {
 /// Expected: Rejected with InvalidInstructionData.
 #[test]
 fn test_attack_unknown_instruction_tag() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11453,11 +10907,7 @@ fn test_attack_unknown_instruction_tag() {
 /// Expected: Rejected with InvalidInstructionData.
 #[test]
 fn test_attack_empty_instruction_data() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11495,11 +10945,7 @@ fn test_attack_empty_instruction_data() {
 /// Expected: Can't deposit after resolve, but can withdraw existing capital.
 #[test]
 fn test_attack_deposit_resolve_withdraw_sequence() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11572,11 +11018,7 @@ fn test_attack_deposit_resolve_withdraw_sequence() {
 /// Expected: Conservation holds through the entire sequence.
 #[test]
 fn test_attack_trade_crash_reverse_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11739,11 +11181,7 @@ impl TestEnv {
 /// Expected: Rejected because the account is not an LP (EngineAccountKindMismatch).
 #[test]
 fn test_attack_trade_user_as_lp() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11773,11 +11211,7 @@ fn test_attack_trade_user_as_lp() {
 /// Expected: Should succeed (LP accounts can receive deposits like users).
 #[test]
 fn test_attack_deposit_to_lp_account() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11802,11 +11236,7 @@ fn test_attack_deposit_to_lp_account() {
 /// Expected: LP liquidation may be handled differently (LP has position from trading).
 #[test]
 fn test_attack_liquidate_lp_account() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11854,11 +11284,7 @@ fn test_attack_liquidate_lp_account() {
 /// Expected: Rejected by check_idx (index >= max_accounts).
 #[test]
 fn test_attack_deposit_out_of_bounds_index() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11885,11 +11311,7 @@ fn test_attack_deposit_out_of_bounds_index() {
 /// Expected: Rejected by check_idx.
 #[test]
 fn test_attack_trade_out_of_bounds_index() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11913,11 +11335,7 @@ fn test_attack_trade_out_of_bounds_index() {
 /// Expected: Rejected by check_idx.
 #[test]
 fn test_attack_withdraw_out_of_bounds_index() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11936,11 +11354,7 @@ fn test_attack_withdraw_out_of_bounds_index() {
 /// Expected: Rejected by check_idx.
 #[test]
 fn test_attack_liquidate_out_of_bounds_index() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11960,11 +11374,7 @@ fn test_attack_liquidate_out_of_bounds_index() {
 /// Expected: Rejected (no new LPs on resolved markets).
 #[test]
 fn test_attack_init_lp_after_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -11990,11 +11400,7 @@ fn test_attack_init_lp_after_resolution() {
 /// Expected: Account created with zero capital (fee_payment=0 is valid).
 #[test]
 fn test_attack_init_user_zero_fee() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -12023,11 +11429,7 @@ fn test_attack_init_user_zero_fee() {
 /// Expected: Both succeed (vault has enough), conservation holds.
 #[test]
 fn test_attack_multi_user_withdraw_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -12072,11 +11474,7 @@ fn test_attack_multi_user_withdraw_same_slot() {
 /// Expected: Second withdrawal fails (insufficient capital).
 #[test]
 fn test_attack_double_withdraw_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -12109,11 +11507,7 @@ fn test_attack_double_withdraw_same_slot() {
 /// Expected: Each market has independent state and vault.
 #[test]
 fn test_attack_cross_market_isolation() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     // Create first market
     let mut env1 = TestEnv::new();
@@ -12154,11 +11548,7 @@ fn test_attack_cross_market_isolation() {
 /// Expected: Slab guard rejects (program_id embedded in slab header).
 #[test]
 fn test_attack_wrong_slab_program_id() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -12196,11 +11586,7 @@ fn test_attack_wrong_slab_program_id() {
 /// Expected: No-op (nothing to liquidate).
 #[test]
 fn test_attack_liquidate_account_no_position() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -12228,11 +11614,7 @@ fn test_attack_liquidate_account_no_position() {
 /// Expected: Rejected or no-op (can't trade against yourself).
 #[test]
 fn test_attack_self_trade_same_index() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -12262,11 +11644,7 @@ fn test_attack_self_trade_same_index() {
 /// Expected: After all accounts closed, vault should have only insurance fees.
 #[test]
 fn test_attack_full_lifecycle_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -13584,10 +12962,7 @@ fn test_attack_close_slab_before_insurance_withdrawal() {
 /// unbounded debt or break equity calculations. Fee debt is saturating.
 #[test]
 fn test_attack_fee_debt_accumulation_large_maintenance_fee() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -13643,10 +13018,7 @@ fn test_attack_fee_debt_accumulation_large_maintenance_fee() {
 /// ATTACK: Maintenance fee set to u128::MAX should not panic or corrupt state.
 #[test]
 fn test_attack_extreme_maintenance_fee() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -13691,10 +13063,7 @@ fn test_attack_extreme_maintenance_fee() {
 /// User with positive PnL should not be able to withdraw profit before warmup completes.
 #[test]
 fn test_attack_warmup_prevents_immediate_profit_withdrawal() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // Init market with 1000-slot warmup period
@@ -14090,10 +13459,7 @@ fn test_attack_nonce_replay_same_trade() {
 /// Total capital should equal total deposited amount.
 #[test]
 fn test_attack_multiple_deposits_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14134,10 +13500,7 @@ fn test_attack_multiple_deposits_conservation() {
 /// Should fail with insufficient balance.
 #[test]
 fn test_attack_withdraw_exceeds_capital() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14172,10 +13535,7 @@ fn test_attack_withdraw_exceeds_capital() {
 /// Account owner verification should prevent this.
 #[test]
 fn test_attack_withdraw_from_others_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14211,10 +13571,7 @@ fn test_attack_withdraw_from_others_account() {
 /// Account owner verification should prevent this.
 #[test]
 fn test_attack_deposit_to_others_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14261,10 +13618,7 @@ fn test_attack_deposit_to_others_account() {
 /// Must verify account ownership.
 #[test]
 fn test_attack_close_others_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14296,10 +13650,7 @@ fn test_attack_close_others_account() {
 /// Healthy accounts must not be liquidated.
 #[test]
 fn test_attack_liquidate_healthy_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14320,9 +13671,9 @@ fn test_attack_liquidate_healthy_account() {
     let capital_before = env.read_account_capital(user_idx);
     let pos_before = env.read_account_position(user_idx);
 
-    // Try to liquidate healthy account
+    // Try to liquidate healthy account - should be a no-op
     let result = env.try_liquidate_target(user_idx);
-    // LiquidateAtOracle returns Ok (no-op) for healthy accounts
+    assert!(result.is_ok(), "Liquidation of healthy account should return Ok (no-op): {:?}", result);
 
     // Position and capital should be unchanged
     let capital_after = env.read_account_capital(user_idx);
@@ -14457,10 +13808,7 @@ fn test_attack_rounding_extraction_rapid_trades() {
 /// Verify that zero-admin prevents all admin operations.
 #[test]
 fn test_attack_update_admin_to_zero_locks_out() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14520,10 +13868,7 @@ fn test_attack_update_admin_to_zero_locks_out() {
 /// Non-vacuous: asserts insurance increases by swept dust units.
 #[test]
 fn test_attack_dust_sweep_to_insurance_on_crank() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // Use unit_scale=1000 so deposits create dust
@@ -14573,10 +13918,7 @@ fn test_attack_dust_sweep_to_insurance_on_crank() {
 /// Verify that risk-increasing trades are correctly blocked when gate is active.
 #[test]
 fn test_attack_lp_risk_conservative_after_shrink() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14640,10 +13982,7 @@ fn test_attack_lp_risk_conservative_after_shrink() {
 /// Verify PnL calculation is correct after flip.
 #[test]
 fn test_attack_entry_price_across_position_flip() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14696,10 +14035,7 @@ fn test_attack_entry_price_across_position_flip() {
 /// Test: crank twice at same slot (sets rate), then crank at later slot.
 #[test]
 fn test_attack_funding_anti_retroactivity_zero_dt() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14760,10 +14096,7 @@ fn test_attack_funding_anti_retroactivity_zero_dt() {
 /// If user has unwarmed PnL, withdrawal should still respect margin after settlement.
 #[test]
 fn test_attack_withdrawal_with_warmup_settlement() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 1000); // 1000 slot warmup
@@ -14789,11 +14122,13 @@ fn test_attack_withdrawal_with_warmup_settlement() {
     // Try to withdraw nearly all capital. With a tiny position (1000 contracts),
     // margin is minimal, so this may succeed or fail depending on warmup settlement.
     let withdraw_result = env.try_withdraw(&user, user_idx, 9_999_000_000);
-    // Log the result for debugging; conservation must hold regardless
-    println!(
-        "Large withdrawal result: {}",
-        if withdraw_result.is_ok() { "accepted" } else { "rejected (margin check)" }
-    );
+    // With 1000-slot warmup at slot 500, only 50% of profit (if any) is vested.
+    // The withdrawal may succeed (small position → small margin requirement)
+    // or fail (warmup restricts available equity). Either way, conservation must hold.
+    if withdraw_result.is_ok() {
+        let vault_decreased = env.vault_balance() < 20_000_000_000;
+        assert!(vault_decreased, "Successful withdrawal should decrease vault");
+    }
 
     let spl_vault = {
         let vault_data = env.svm.get_account(&env.vault).unwrap().data;
@@ -14825,10 +14160,7 @@ fn test_attack_withdrawal_with_warmup_settlement() {
 /// Verify that value doesn't leak when GC removes accounts with zero capital.
 #[test]
 fn test_attack_gc_after_force_realize_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14873,10 +14205,7 @@ fn test_attack_gc_after_force_realize_conservation() {
 /// residual position/PnL state. Also verifies freelist integrity.
 #[test]
 fn test_attack_slot_reuse_clean_state_after_gc() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14928,10 +14257,7 @@ fn test_attack_slot_reuse_clean_state_after_gc() {
 /// total value (vault) is conserved (funding is zero-sum between accounts).
 #[test]
 fn test_attack_multi_crank_funding_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -14990,10 +14316,7 @@ fn test_attack_multi_crank_funding_conservation() {
 /// Verify insurance fund receives correct fee payment.
 #[test]
 fn test_attack_lp_deposit_with_fee_debt_settlement() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15044,10 +14367,7 @@ fn test_attack_lp_deposit_with_fee_debt_settlement() {
 /// Changing risk parameters should not alter vault/capital/insurance totals.
 #[test]
 fn test_attack_updateconfig_preserves_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15118,10 +14438,7 @@ fn test_attack_updateconfig_preserves_conservation() {
 /// Stale-crank rejection is not tested here (would need finite staleness config).
 #[test]
 fn test_attack_crank_freshness_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0); // max_crank_staleness_slots = u64::MAX
@@ -15169,10 +14486,7 @@ fn test_attack_crank_freshness_boundary() {
 /// Verify both sources of insurance top-up are correctly accounted for.
 #[test]
 fn test_attack_insurance_dust_plus_fee_consistency() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // unit_scale=1000 for dust generation
@@ -15205,6 +14519,8 @@ fn test_attack_insurance_dust_plus_fee_consistency() {
     let insurance_after_second_crank = env.read_insurance_balance();
 
     // Insurance should have increased from fees (and possibly more dust)
+    // Note: With no open positions, maintenance fees don't accrue.
+    // Insurance may only increase from dust sweeps (if more dust accumulated).
     assert!(
         insurance_after_second_crank >= insurance_after_first_crank,
         "ATTACK: Insurance decreased between cranks! Before={} After={}",
@@ -15228,10 +14544,7 @@ fn test_attack_insurance_dust_plus_fee_consistency() {
 /// Verify capital is correctly returned and no value is left behind.
 #[test]
 fn test_attack_full_close_cycle_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15289,10 +14602,7 @@ fn test_attack_full_close_cycle_conservation() {
 /// An attacker tries to liquidate an account that already has no position.
 #[test]
 fn test_attack_liquidate_zero_position_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15310,7 +14620,8 @@ fn test_attack_liquidate_zero_position_account() {
     // User has no position - try to liquidate
     // Liquidation returns Ok (no-op) for zero-position accounts
     let capital_before = env.read_account_capital(user_idx);
-    let _result = env.try_liquidate_target(user_idx);
+    let result = env.try_liquidate_target(user_idx);
+    assert!(result.is_ok(), "Liquidation of zero-position should return Ok (no-op): {:?}", result);
 
     // Key assertion: capital should not change after liquidation attempt
     let capital_after = env.read_account_capital(user_idx);
@@ -15333,10 +14644,7 @@ fn test_attack_liquidate_zero_position_account() {
 /// see test_attack_new_account_fee_goes_to_insurance which tests fee→insurance.
 #[test]
 fn test_attack_trading_fee_insurance_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15454,10 +14762,7 @@ fn test_attack_premarket_paginated_force_close() {
 /// accept any raw price unclamped. Verify no panic/overflow on extreme price.
 #[test]
 fn test_attack_circuit_breaker_first_price_extreme() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15504,10 +14809,7 @@ fn test_attack_circuit_breaker_first_price_extreme() {
 /// Verify clamping prevents exploitation via price manipulation.
 #[test]
 fn test_attack_circuit_breaker_clamping_second_price() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15550,10 +14852,7 @@ fn test_attack_circuit_breaker_clamping_second_price() {
 /// Verify equity calculation remains correct and no underflow occurs.
 #[test]
 fn test_attack_fee_debt_exceeds_capital_crank() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15608,10 +14907,7 @@ fn test_attack_fee_debt_exceeds_capital_crank() {
 /// Verify total value is conserved across repeated operations.
 #[test]
 fn test_attack_price_oscillation_precision_loss() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15679,10 +14975,7 @@ fn test_attack_price_oscillation_precision_loss() {
 /// Verify insurance fund is not double-counted.
 #[test]
 fn test_attack_multiple_liquidations_insurance_drain() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15741,59 +15034,13 @@ fn test_attack_multiple_liquidations_insurance_drain() {
     );
 }
 
-/// ATTACK: Deposit zero amount should be a no-op.
-/// Verify depositing 0 tokens doesn't affect state.
-#[test]
-fn test_attack_deposit_zero_amount_noop() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.crank();
-
-    let cap_before = env.read_account_capital(user_idx);
-
-    // Deposit 0 should succeed as no-op
-    env.deposit(&user, user_idx, 0);
-
-    let cap_after = env.read_account_capital(user_idx);
-    assert_eq!(
-        cap_before, cap_after,
-        "ATTACK: Zero deposit changed capital! before={} after={}",
-        cap_before, cap_after
-    );
-
-    // SPL vault unchanged
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault, 15_000_000_000,
-        "ATTACK: SPL vault changed after zero deposit!"
-    );
-}
+// test_attack_deposit_zero_amount_noop: removed (duplicate of test_attack_deposit_zero_amount_no_state_change which uses try_deposit)
 
 /// ATTACK: Withdraw exactly all capital (no position).
 /// Verify withdrawing exact capital amount works and leaves account with 0.
 #[test]
 fn test_attack_withdraw_exact_capital_no_position() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15837,10 +15084,7 @@ fn test_attack_withdraw_exact_capital_no_position() {
 /// rather than allowing wild oscillations that could be exploited.
 #[test]
 fn test_attack_threshold_ewma_convergence() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15896,10 +15140,7 @@ fn test_attack_threshold_ewma_convergence() {
 /// Then try to open slightly more - should fail margin check.
 #[test]
 fn test_attack_trade_exact_initial_margin_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15938,10 +15179,7 @@ fn test_attack_trade_exact_initial_margin_boundary() {
 /// Verify conservation across many small deposits then one withdrawal.
 #[test]
 fn test_attack_many_deposits_one_withdrawal_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -15995,10 +15233,7 @@ fn test_attack_many_deposits_one_withdrawal_conservation() {
 /// Verify behavior when insurance_fund.balance == risk_reduction_threshold exactly.
 #[test]
 fn test_attack_risk_gate_exact_threshold_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16056,10 +15291,7 @@ fn test_attack_risk_gate_exact_threshold_boundary() {
 /// Verify that operations work correctly at the maximum unit scale.
 #[test]
 fn test_attack_max_unit_scale_operations() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // Init with moderate unit scale (1000) - still tests alignment
@@ -16103,10 +15335,7 @@ fn test_attack_max_unit_scale_operations() {
 /// Note: Despite the name, this test creates zero PnL (no price change).
 #[test]
 fn test_attack_close_account_with_positive_pnl() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16162,10 +15391,7 @@ fn test_attack_close_account_with_positive_pnl() {
 /// but doesn't allow exploiting stale prices or settlement.
 #[test]
 fn test_attack_same_slot_open_close_timing() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16356,10 +15582,7 @@ fn test_attack_hyperp_mark_price_clamp_defense() {
 /// Multiple users deposit and trade, then verify c_tot == sum of individual capitals.
 #[test]
 fn test_attack_c_tot_sync_after_deposits_and_trades() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16411,10 +15634,7 @@ fn test_attack_c_tot_sync_after_deposits_and_trades() {
 /// After trades and cranks, pnl_pos_tot should be sum of max(0, pnl) for each account.
 #[test]
 fn test_attack_pnl_pos_tot_only_positive() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16463,10 +15683,7 @@ fn test_attack_pnl_pos_tot_only_positive() {
 /// Init market with warmup_period_slots=0, verify profit converts immediately.
 #[test]
 fn test_attack_warmup_zero_period_instant_conversion() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 0); // warmup_period_slots = 0
@@ -16516,10 +15733,7 @@ fn test_attack_warmup_zero_period_instant_conversion() {
 /// Trade long, close, trade short, close - c_tot == sum of capitals at each step.
 #[test]
 fn test_attack_position_flip_warmup_reset() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16599,10 +15813,7 @@ fn test_attack_position_flip_warmup_reset() {
 /// Then trade with one and verify the others are not affected.
 #[test]
 fn test_attack_account_reinit_after_gc_clean_state() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16693,10 +15904,7 @@ fn test_attack_account_reinit_after_gc_clean_state() {
 /// Insurance growing from fees reduces residual, which REDUCES haircut (safer).
 #[test]
 fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16783,10 +15991,7 @@ fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
 /// Also verify that withdrawal with position leaves at least margin.
 #[test]
 fn test_attack_withdraw_margin_boundary_consistency() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16845,10 +16050,7 @@ fn test_attack_withdraw_margin_boundary_consistency() {
 /// Any user can call crank with caller_idx=u16::MAX. Verify no value extraction.
 #[test]
 fn test_attack_permissionless_crank_no_value_extraction() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16902,10 +16104,7 @@ fn test_attack_permissionless_crank_no_value_extraction() {
 /// After closing once, the slot is freed. Closing again should error.
 #[test]
 fn test_attack_double_close_account_same_index() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16946,10 +16145,7 @@ fn test_attack_double_close_account_same_index() {
 /// After closing an account, depositing to that index should fail.
 #[test]
 fn test_attack_deposit_to_closed_account_index() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -16989,10 +16185,7 @@ fn test_attack_deposit_to_closed_account_index() {
 /// After closing, trying to use the freed slot as counterparty should error.
 #[test]
 fn test_attack_trade_with_closed_account_index() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17022,10 +16215,7 @@ fn test_attack_trade_with_closed_account_index() {
 /// After deposits, trades, withdrawals, and cranks, engine vault should match SPL vault.
 #[test]
 fn test_attack_engine_vault_spl_vault_consistency() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17083,10 +16273,7 @@ fn test_attack_engine_vault_spl_vault_consistency() {
 /// After admin transfer, old admin should be unable to perform admin operations.
 #[test]
 fn test_attack_old_admin_blocked_after_transfer() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17126,10 +16313,7 @@ fn test_attack_old_admin_blocked_after_transfer() {
 /// Total withdrawn should equal total deposited.
 #[test]
 fn test_attack_multi_user_lifecycle_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17217,10 +16401,7 @@ fn test_attack_multi_user_lifecycle_conservation() {
 /// Set funding_max_bps_per_slot to max i64, verify crank doesn't overflow.
 #[test]
 fn test_attack_config_extreme_funding_max_bps() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17293,10 +16474,7 @@ fn test_attack_config_extreme_funding_max_bps() {
 /// Crank multiple times at the same slot - funding should accrue only once.
 #[test]
 fn test_attack_same_slot_crank_no_double_funding() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17347,10 +16525,7 @@ fn test_attack_same_slot_crank_no_double_funding() {
 /// Each LP independently takes opposite side of user trades.
 #[test]
 fn test_attack_multi_lp_position_tracking() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17429,10 +16604,7 @@ fn test_attack_multi_lp_position_tracking() {
 /// LP accounts can only be in lp_idx position, users in user_idx.
 #[test]
 fn test_attack_lp_as_user_kind_swap() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17464,61 +16636,13 @@ fn test_attack_lp_as_user_kind_swap() {
     );
 }
 
-/// ATTACK: Withdraw exactly all capital with zero position.
-/// Should succeed and leave account with zero capital.
-#[test]
-fn test_attack_withdraw_exact_capital_zero_position() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.crank();
-
-    // No position - withdraw exact capital should succeed
-    let cap = env.read_account_capital(user_idx);
-    assert_eq!(cap, 5_000_000_000, "Capital should be 5B");
-
-    env.try_withdraw(&user, user_idx, cap as u64).unwrap();
-
-    // Capital should be zero
-    let cap_after = env.read_account_capital(user_idx);
-    assert_eq!(
-        cap_after, 0,
-        "ATTACK: Capital not zero after full withdrawal! cap={}",
-        cap_after
-    );
-
-    // SPL vault reduced by withdrawal
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault, 10_000_000_000,
-        "SPL vault should be LP deposit only"
-    );
-}
+// test_attack_withdraw_exact_capital_zero_position: removed (duplicate of test_attack_withdraw_exact_capital_no_position)
 
 /// ATTACK: Deposit zero amount should be harmless.
 /// Depositing 0 tokens should either fail or be a no-op.
 #[test]
 fn test_attack_deposit_zero_amount_no_state_change() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17562,10 +16686,7 @@ fn test_attack_deposit_zero_amount_no_state_change() {
 /// Withdrawing 0 tokens should either fail or be a no-op.
 #[test]
 fn test_attack_withdraw_zero_amount_no_state_change() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17615,10 +16736,7 @@ fn test_attack_withdraw_zero_amount_no_state_change() {
 /// Trading 0 contracts should either fail or be a no-op.
 #[test]
 fn test_attack_trade_zero_size() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17671,10 +16789,7 @@ fn test_attack_trade_zero_size() {
 /// Verify it correctly closes positions without creating value.
 #[test]
 fn test_attack_force_realize_closes_positions_safely() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17729,10 +16844,7 @@ fn test_attack_force_realize_closes_positions_safely() {
 /// Verify config update result and conservation after crank with zero-alpha.
 #[test]
 fn test_attack_threshold_ewma_alpha_zero_freezes() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17794,10 +16906,7 @@ fn test_attack_threshold_ewma_alpha_zero_freezes() {
 /// Verify fee settlement during deposit doesn't extract extra value.
 #[test]
 fn test_attack_deposit_with_pending_fee_debt() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17861,10 +16970,7 @@ fn test_attack_deposit_with_pending_fee_debt() {
 /// CloseAccount pays what it can from capital, forgives the rest.
 #[test]
 fn test_attack_close_account_fee_debt_forgiveness() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17932,10 +17038,7 @@ fn test_attack_close_account_fee_debt_forgiveness() {
 /// After price crash, undercollateralized account should be liquidatable.
 #[test]
 fn test_attack_liquidation_after_price_crash() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -17998,10 +17101,7 @@ fn test_attack_liquidation_after_price_crash() {
 /// InitUser/InitLP pays a new_account_fee that goes to insurance.
 #[test]
 fn test_attack_new_account_fee_goes_to_insurance() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     let fee: u64 = 1_000_000;
@@ -18112,10 +17212,7 @@ fn test_attack_new_account_fee_goes_to_insurance() {
 /// Advance many slots, verify conservation holds despite funding/fee accrual.
 #[test]
 fn test_attack_conservation_large_slot_jump() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18186,10 +17283,7 @@ fn test_attack_conservation_large_slot_jump() {
 /// With warmup_period > 0, PnL profit should vest gradually, not instantly.
 #[test]
 fn test_attack_warmup_profit_vests_gradually() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 100); // 100-slot warmup period
@@ -18228,7 +17322,9 @@ fn test_attack_warmup_profit_vests_gradually() {
 
     let user_cap_late = env.read_account_capital(user_idx);
 
-    // Capital should be >= early capital (more profit vested)
+    // Capital should not decrease as warmup vests more profit over time.
+    // Note: Capital may stay equal if warmup conversion is still pending or
+    // PnL haircut absorbs the gain.
     assert!(
         user_cap_late >= user_cap_early,
         "ATTACK: Capital decreased after more warmup! early={} late={}",
@@ -18250,10 +17346,7 @@ fn test_attack_warmup_profit_vests_gradually() {
 /// With warmup=0, all PnL should vest immediately.
 #[test]
 fn test_attack_warmup_period_zero_instant_settlement() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0); // warmup_period=0
@@ -18310,10 +17403,7 @@ fn test_attack_warmup_period_zero_instant_settlement() {
 /// Second crank may settle fees, but third should be fully idempotent.
 #[test]
 fn test_attack_same_slot_triple_crank_convergence() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18379,10 +17469,7 @@ fn test_attack_same_slot_triple_crank_convergence() {
 /// Set funding_k_bps to maximum, verify funding rate is capped at ±10,000 bps/slot.
 #[test]
 fn test_attack_funding_extreme_k_bps_capped() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18460,10 +17547,7 @@ fn test_attack_funding_extreme_k_bps_capped() {
 /// Set funding_max_premium_bps to extreme negative, verify capping works.
 #[test]
 fn test_attack_funding_extreme_max_premium_capped() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18540,10 +17624,7 @@ fn test_attack_funding_extreme_max_premium_capped() {
 /// Set funding_max_bps_per_slot to extreme value, verify engine caps at ±10,000.
 #[test]
 fn test_attack_funding_extreme_max_bps_per_slot() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18618,10 +17699,7 @@ fn test_attack_funding_extreme_max_bps_per_slot() {
 /// Attempt to deposit from an ATA with a different mint.
 #[test]
 fn test_attack_deposit_wrong_mint_token_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18694,10 +17772,7 @@ fn test_attack_deposit_wrong_mint_token_account() {
 /// Attempt to withdraw to an ATA owned by a different user.
 #[test]
 fn test_attack_withdraw_to_different_users_ata() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18776,10 +17851,7 @@ fn test_attack_withdraw_to_different_users_ata() {
 /// Push oracle price multiple times before cranking, verify only latest applies.
 #[test]
 fn test_attack_multiple_oracle_updates_between_cranks() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18832,10 +17904,7 @@ fn test_attack_multiple_oracle_updates_between_cranks() {
 /// Deposit and trade in rapid succession without crank between.
 #[test]
 fn test_attack_trade_immediately_after_deposit_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18877,10 +17946,7 @@ fn test_attack_trade_immediately_after_deposit_same_slot() {
 /// Multiple position flips in succession to test aggregate tracking.
 #[test]
 fn test_attack_rapid_position_reversals() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18951,10 +18017,7 @@ fn test_attack_rapid_position_reversals() {
 /// KeeperCrank on a market with no users/LPs should be a no-op.
 #[test]
 fn test_attack_crank_empty_market() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -18983,10 +18046,7 @@ fn test_attack_crank_empty_market() {
 /// Fee ceiling division is enforced at the engine level and tested in unit proofs.
 #[test]
 fn test_attack_trading_fee_ceiling_division() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // Use init_market_full to set nonzero trading_fee_bps
@@ -19033,10 +18093,7 @@ fn test_attack_trading_fee_ceiling_division() {
 /// Rapid withdrawals in same slot should correctly update capital each time.
 #[test]
 fn test_attack_multiple_withdrawals_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19084,10 +18141,7 @@ fn test_attack_multiple_withdrawals_same_slot() {
 /// Rapid deposit+withdraw cycle shouldn't create or destroy value.
 #[test]
 fn test_attack_deposit_withdraw_same_slot_atomicity() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19135,10 +18189,7 @@ fn test_attack_deposit_withdraw_same_slot_atomicity() {
 /// Funding accrual caps dt at ~1 year. Verify no overflow.
 #[test]
 fn test_attack_funding_accrue_huge_dt_capped() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19169,18 +18220,12 @@ fn test_attack_funding_accrue_huge_dt_capped() {
     env.set_slot(31_000_000);
     let crank_result = env.try_crank();
     // Whether crank succeeds or fails, protocol shouldn't corrupt state
-    if crank_result.is_err() {
-        // If overflow detected, protocol correctly rejected the operation
-        // This IS the expected security behavior for extreme dt
-        return;
-    }
-
-    // Conservation must hold after extreme time jump
+    // Conservation must hold regardless of crank result
     let c_tot = env.read_c_tot();
     let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
     assert_eq!(
         c_tot, sum,
-        "ATTACK: c_tot desync after 10-year slot jump! c_tot={} sum={}",
+        "ATTACK: c_tot desync after huge slot jump! c_tot={} sum={}",
         c_tot, sum
     );
 
@@ -19192,6 +18237,12 @@ fn test_attack_funding_accrue_huge_dt_capped() {
         spl_vault, 65_000_000_000,
         "ATTACK: SPL vault changed after huge dt funding!"
     );
+
+    if crank_result.is_err() {
+        // If overflow detected, protocol correctly rejected the operation
+        // This IS the expected security behavior for extreme dt
+        println!("Crank correctly rejected extreme dt - conservation verified");
+    }
 }
 
 // ============================================================================
@@ -19202,10 +18253,7 @@ fn test_attack_funding_accrue_huge_dt_capped() {
 /// Markets with unit_scale > 0 use scaled prices. Verify conservation.
 #[test]
 fn test_attack_unit_scale_trade_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale=1000
@@ -19258,10 +18306,7 @@ fn test_attack_unit_scale_trade_conservation() {
 /// unit_scale=1_000_000 (1M). Verify no overflow in price scaling.
 #[test]
 fn test_attack_large_unit_scale_no_overflow() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1_000_000, 0); // unit_scale=1M
@@ -19310,10 +18355,7 @@ fn test_attack_large_unit_scale_no_overflow() {
 /// Inverted markets use 1e12/oracle_price. Verify conservation.
 #[test]
 fn test_attack_inverted_market_trade_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1); // Inverted
@@ -19362,10 +18404,7 @@ fn test_attack_inverted_market_trade_conservation() {
 /// When oracle price → large (inverted price → 0), verify no division issues.
 #[test]
 fn test_attack_inverted_market_extreme_high_oracle() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1);
@@ -19420,10 +18459,7 @@ fn test_attack_inverted_market_extreme_high_oracle() {
 /// Protocol should allow it, but each account must be independent.
 #[test]
 fn test_attack_same_owner_multiple_accounts_isolation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19479,10 +18515,7 @@ fn test_attack_same_owner_multiple_accounts_isolation() {
 /// After resolution, users should be able to withdraw their deposited capital.
 #[test]
 fn test_attack_resolve_then_withdraw_capital() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(1_000_000);
@@ -19522,10 +18555,7 @@ fn test_attack_resolve_then_withdraw_capital() {
 /// Hyperp mode blocks TradeNoCpi (requires TradeCpi from matcher).
 #[test]
 fn test_attack_trade_nocpi_on_hyperp_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(1_000_000);
@@ -19553,49 +18583,13 @@ fn test_attack_trade_nocpi_on_hyperp_rejected() {
     );
 }
 
-/// ATTACK: Double resolve should fail.
-/// Resolving an already-resolved market must be rejected.
-#[test]
-fn test_attack_double_resolve_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
-
-    let mut env = TestEnv::new();
-    env.init_market_hyperp(1_000_000);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .unwrap();
-    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
-
-    let lp = Keypair::new();
-    let _lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, _lp_idx, 10_000_000_000);
-
-    env.crank();
-
-    // First resolve
-    env.try_resolve_market(&admin).unwrap();
-
-    // Second resolve should fail
-    env.set_slot(2);
-    let result = env.try_resolve_market(&admin);
-    assert!(
-        result.is_err(),
-        "ATTACK: Double resolve should be rejected!"
-    );
-}
+// test_attack_double_resolve_rejected: removed (duplicate of test_attack_double_resolve_market)
 
 /// ATTACK: Non-admin tries to resolve market.
 /// Only admin should be able to resolve.
 #[test]
 fn test_attack_non_admin_resolve_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(1_000_000);
@@ -19683,10 +18677,7 @@ fn test_attack_withdraw_insurance_before_force_close() {
 /// Both inversion and scaling applied. Verify conservation.
 #[test]
 fn test_attack_inverted_with_unit_scale_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(1, 1000, 0); // invert=1, unit_scale=1000
@@ -19735,10 +18726,7 @@ fn test_attack_inverted_with_unit_scale_conservation() {
 /// Verify funding accrual is correct and consistent across many intervals.
 #[test]
 fn test_attack_incremental_funding_across_many_slots() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19789,10 +18777,7 @@ fn test_attack_incremental_funding_across_many_slots() {
 /// Verify PnL eventually settles into capital and conservation holds.
 #[test]
 fn test_attack_inverted_market_pnl_direction() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1); // Inverted
@@ -19862,10 +18847,7 @@ fn test_attack_inverted_market_pnl_direction() {
 /// Verify returned capital = capital - min(fee_debt, capital).
 #[test]
 fn test_attack_close_account_returns_capital_minus_fees() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19911,10 +18893,7 @@ fn test_attack_close_account_returns_capital_minus_fees() {
 /// CloseSlab requires num_used_accounts == 0, so dormant accounts block it.
 #[test]
 fn test_attack_close_slab_blocked_by_dormant_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19954,10 +18933,7 @@ fn test_attack_close_slab_blocked_by_dormant_account() {
 /// After UpdateAdmin, the old admin should be unauthorized.
 #[test]
 fn test_attack_update_admin_old_admin_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -19991,10 +18967,7 @@ fn test_attack_update_admin_old_admin_rejected() {
 /// Verify fee debt accumulates but doesn't cause overflow or negative capital.
 #[test]
 fn test_attack_extreme_maintenance_fee_no_overflow() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20051,10 +19024,7 @@ fn test_attack_extreme_maintenance_fee_no_overflow() {
 /// Oracle authority cleared means stored price is cleared and push fails.
 #[test]
 fn test_attack_set_oracle_authority_to_zero_disables_push() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(1_000_000);
@@ -20084,10 +19054,7 @@ fn test_attack_set_oracle_authority_to_zero_disables_push() {
 /// Verify each LP's position is tracked independently and conservation holds.
 #[test]
 fn test_attack_multi_lp_independent_positions() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20142,10 +19109,7 @@ fn test_attack_multi_lp_independent_positions() {
 /// High threshold blocks risk-increasing trades, lowering re-enables them.
 #[test]
 fn test_attack_set_risk_threshold_enables_trades() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20193,10 +19157,7 @@ fn test_attack_set_risk_threshold_enables_trades() {
 /// Protocol requires position=0 and PnL=0 for close.
 #[test]
 fn test_attack_close_account_after_roundtrip_pnl() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20254,10 +19215,7 @@ fn test_attack_close_account_after_roundtrip_pnl() {
 /// Should succeed without side effects.
 #[test]
 fn test_attack_update_admin_same_address_noop() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20281,10 +19239,7 @@ fn test_attack_update_admin_same_address_noop() {
 /// Verify deposits accumulate correctly and full withdrawal returns sum.
 #[test]
 fn test_attack_double_deposit_accumulation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20326,10 +19281,7 @@ fn test_attack_double_deposit_accumulation() {
 /// Edge case: withdraw == capital leaves zero, should succeed.
 #[test]
 fn test_attack_withdraw_exact_capital() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20370,10 +19322,7 @@ fn test_attack_withdraw_exact_capital() {
 /// LP positions should be independently bounded by their own limits.
 #[test]
 fn test_attack_multi_lp_max_position_tracking() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20423,10 +19372,7 @@ fn test_attack_multi_lp_max_position_tracking() {
 /// Verify that with fee=0, capital is unchanged after many cranks.
 #[test]
 fn test_attack_zero_maintenance_fee_no_drain() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20466,10 +19412,7 @@ fn test_attack_zero_maintenance_fee_no_drain() {
 /// Verify that stale timestamps are handled correctly.
 #[test]
 fn test_attack_push_oracle_stale_timestamp() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20501,10 +19444,7 @@ fn test_attack_push_oracle_stale_timestamp() {
 /// LiquidateAtOracle should reject attempts on solvent accounts.
 #[test]
 fn test_attack_liquidate_solvent_account_after_settlement() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20548,10 +19488,7 @@ fn test_attack_liquidate_solvent_account_after_settlement() {
 /// Full lifecycle: init → deposit → close → crank(GC) → verify count.
 #[test]
 fn test_attack_close_then_gc_decrements_used_count() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20596,10 +19533,7 @@ fn test_attack_close_then_gc_decrements_used_count() {
 /// Verify conservation holds even with minimal position.
 #[test]
 fn test_attack_trade_size_one_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20649,10 +19583,7 @@ fn test_attack_trade_size_one_conservation() {
 /// Verify negative position of size 1 conserves.
 #[test]
 fn test_attack_trade_size_negative_one_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20701,10 +19632,7 @@ fn test_attack_trade_size_negative_one_conservation() {
 /// When crossing zero, the margin check uses the stricter initial margin.
 #[test]
 fn test_attack_position_reversal_margin_check() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20749,10 +19677,7 @@ fn test_attack_position_reversal_margin_check() {
 /// Compare: crank(settle fees) → close vs. close(settles fees internally).
 #[test]
 fn test_attack_close_account_settles_fees_correctly() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20808,10 +19733,7 @@ fn test_attack_close_account_settles_fees_correctly() {
 /// Verify funding uses stored index (anti-retroactivity).
 #[test]
 fn test_attack_funding_across_position_size_change() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20830,8 +19752,10 @@ fn test_attack_funding_across_position_size_change() {
     env.crank();
 
     // Open initial position
+    let cap_before_trade = env.read_account_capital(user_idx);
     env.trade(&user, &lp, lp_idx, user_idx, 500_000);
     let cap_after_trade = env.read_account_capital(user_idx);
+    assert_eq!(cap_after_trade, cap_before_trade, "Capital should not change from trade alone (no fee)");
 
     // Crank to accrue some funding
     env.set_slot(100);
@@ -20870,10 +19794,7 @@ fn test_attack_funding_across_position_size_change() {
 /// Full lifecycle: open → partial close → full close → account close.
 #[test]
 fn test_attack_partial_close_full_lifecycle() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20927,10 +19848,7 @@ fn test_attack_partial_close_full_lifecycle() {
 /// Verify LP capital accumulates correctly and trades work.
 #[test]
 fn test_attack_lp_multiple_deposits_then_trade() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -20975,10 +19893,7 @@ fn test_attack_lp_multiple_deposits_then_trade() {
 /// Verify no value created or lost in the cycle.
 #[test]
 fn test_attack_withdraw_redeposit_cycle_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21032,10 +19947,7 @@ fn test_attack_withdraw_redeposit_cycle_conservation() {
 /// Verify conservation through the vesting process.
 #[test]
 fn test_attack_warmup_vesting_conservation_with_profit() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 100); // 100-slot warmup
@@ -21093,10 +20005,7 @@ fn test_attack_warmup_vesting_conservation_with_profit() {
 /// Top up insurance to disable force-realize, verify positions persist.
 #[test]
 fn test_attack_insurance_topup_disables_force_realize() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21134,10 +20043,7 @@ fn test_attack_insurance_topup_disables_force_realize() {
 /// Full account lifecycle with all operations in sequence.
 #[test]
 fn test_attack_full_account_lifecycle_sequence() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21198,10 +20104,7 @@ fn test_attack_full_account_lifecycle_sequence() {
 /// Close position → crank → crank again → verify GC happens.
 #[test]
 fn test_attack_gc_after_position_close_and_settlement() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21259,10 +20162,7 @@ fn test_attack_gc_after_position_close_and_settlement() {
 /// Even in liquidation, c_tot must equal sum of capitals.
 #[test]
 fn test_attack_liquidation_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21314,10 +20214,7 @@ fn test_attack_liquidation_conservation() {
 /// Oracle at extreme high price, crank, verify no overflow.
 #[test]
 fn test_attack_trade_at_extreme_high_price() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21368,10 +20265,7 @@ fn test_attack_trade_at_extreme_high_price() {
 /// Verify no division by zero or overflow.
 #[test]
 fn test_attack_trade_at_extreme_low_price() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21422,10 +20316,7 @@ fn test_attack_trade_at_extreme_low_price() {
 /// Tests that entry_price resets correctly on each open.
 #[test]
 fn test_attack_rapid_open_close_open_cycle() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21484,10 +20375,7 @@ fn test_attack_rapid_open_close_open_cycle() {
 /// Should fail gracefully.
 #[test]
 fn test_attack_instruction_tag_just_above_max() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21522,10 +20410,7 @@ fn test_attack_instruction_tag_just_above_max() {
 /// Slab owned by wrong program should be rejected by slab_guard.
 #[test]
 fn test_attack_deposit_wrong_slab_owner() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21581,10 +20466,7 @@ fn test_attack_deposit_wrong_slab_owner() {
 /// All operations require the user to sign.
 #[test]
 fn test_attack_deposit_without_signer() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21627,10 +20509,7 @@ fn test_attack_deposit_without_signer() {
 /// Verify conservation holds across many accounts.
 #[test]
 fn test_attack_four_users_one_lp_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21684,10 +20563,7 @@ fn test_attack_four_users_one_lp_conservation() {
 /// Verify LP withdraw works the same as user withdraw.
 #[test]
 fn test_attack_lp_withdraw_capital() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21720,10 +20596,7 @@ fn test_attack_lp_withdraw_capital() {
 /// Open a position that uses nearly all margin, then try adding more.
 #[test]
 fn test_attack_trade_exceeds_margin_capacity() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -21768,9 +20641,6 @@ fn test_attack_trade_exceeds_margin_capacity() {
 #[test]
 fn test_attack_init_market_admin_mismatch() {
     let path = program_path();
-    if !path.exists() {
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
@@ -21870,9 +20740,6 @@ fn test_attack_init_market_admin_mismatch() {
 #[test]
 fn test_attack_init_market_mint_mismatch() {
     let path = program_path();
-    if !path.exists() {
-        return;
-    }
 
     let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
@@ -21972,10 +20839,7 @@ fn test_attack_init_market_mint_mismatch() {
 /// Code checks vault PDA derivation matches slab.
 #[test]
 fn test_attack_withdraw_wrong_vault_pda() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22026,10 +20890,7 @@ fn test_attack_withdraw_wrong_vault_pda() {
 /// Code checks vault PDA derivation matches slab in CloseAccount path.
 #[test]
 fn test_attack_close_account_wrong_vault_pda() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22083,10 +20944,7 @@ fn test_attack_close_account_wrong_vault_pda() {
 /// Code validates vault matches stored vault_pubkey.
 #[test]
 fn test_attack_topup_insurance_wrong_vault() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22141,10 +20999,7 @@ fn test_attack_topup_insurance_wrong_vault() {
 /// Verify liquidation requires a valid signer even though it's permissionless.
 #[test]
 fn test_attack_liquidate_caller_not_signer() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22223,10 +21078,7 @@ fn test_attack_liquidate_caller_not_signer() {
 /// Verifies oracle account validation rejects wrong price feed.
 #[test]
 fn test_attack_deposit_wrong_oracle_account() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22292,10 +21144,7 @@ fn test_attack_deposit_wrong_oracle_account() {
 /// Verify fee goes to insurance fund and conservation holds.
 #[test]
 fn test_attack_init_user_fee_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     let new_account_fee: u128 = 1_000_000_000;
@@ -22354,10 +21203,7 @@ fn test_attack_init_user_fee_conservation() {
 /// Trade/crank oracle validation should reject mismatched feed.
 #[test]
 fn test_attack_crank_wrong_oracle() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22428,10 +21274,7 @@ fn test_attack_crank_wrong_oracle() {
 /// Substituting a fake token program should be rejected.
 #[test]
 fn test_attack_withdraw_wrong_token_program() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22486,10 +21329,7 @@ fn test_attack_withdraw_wrong_token_program() {
 /// Must reject duplicate-role account substitution.
 #[test]
 fn test_attack_withdraw_alias_user_ata_is_vault() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22546,10 +21386,7 @@ fn test_attack_withdraw_alias_user_ata_is_vault() {
 /// Must reject duplicate-role account substitution.
 #[test]
 fn test_attack_close_account_alias_user_ata_is_vault() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22609,10 +21446,7 @@ fn test_attack_close_account_alias_user_ata_is_vault() {
 /// scale_price_e6(138M, 200M) = 0 → None → trade should be rejected.
 #[test]
 fn test_attack_scale_price_zero_rejects_trade() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     // unit_scale = 200M, so 138M / 200M = 0 → None
@@ -22642,10 +21476,7 @@ fn test_attack_scale_price_zero_rejects_trade() {
 /// INVERSION_CONSTANT = 10^12, so raw > 10^12 gives inverted < 1 → 0 → None.
 #[test]
 fn test_attack_invert_price_zero_result() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1); // Inverted
@@ -22664,12 +21495,16 @@ fn test_attack_invert_price_zero_result() {
     // Set oracle to extremely high price: 10^13 (> INVERSION_CONSTANT=10^12)
     // inverted = 10^12 / 10^13 = 0 → None
     env.set_slot_and_price(200, 10_000_000_000_000);
-    let _crank_result = env.try_crank(); // May fail or clamp; key test is conservation below
+    let crank_result = env.try_crank();
+    // Crank may fail (zero inverted price) or clamp via circuit breaker
+    println!("Crank with zero-invert price: {}", if crank_result.is_ok() { "ok (clamped)" } else { "rejected" });
+    // Conservation must hold regardless
     let vault = env.vault_balance();
-    assert!(
-        vault >= 55_000_000_000,
-        "Vault must not decrease: vault={}",
-        vault
+    let engine_vault = env.read_engine_vault();
+    assert_eq!(
+        engine_vault as u64, vault,
+        "Conservation after zero-invert: engine={} vault={}",
+        engine_vault, vault
     );
 }
 
@@ -22678,10 +21513,7 @@ fn test_attack_invert_price_zero_result() {
 /// Verify the market handles extreme inverted prices.
 #[test]
 fn test_attack_invert_price_extreme_small_raw() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1);
@@ -22701,7 +21533,8 @@ fn test_attack_invert_price_extreme_small_raw() {
     // Set raw price = 1 → inverted = 10^12
     // Circuit breaker will cap the movement, but the inverted price is valid
     env.set_slot_and_price(200, 1);
-    let _crank_result = env.try_crank(); // May fail or clamp; key test is conservation below
+    let crank_result = env.try_crank();
+    println!("Crank with extreme-small raw: {}", if crank_result.is_ok() { "ok (clamped)" } else { "rejected" });
 
     // Conservation must hold regardless
     let vault = env.vault_balance();
@@ -22717,10 +21550,7 @@ fn test_attack_invert_price_extreme_small_raw() {
 /// Verify protocol handles multiple instructions in single transaction correctly.
 #[test]
 fn test_attack_multi_instruction_deposit_trade_atomic() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22798,10 +21628,7 @@ fn test_attack_multi_instruction_deposit_trade_atomic() {
 /// Should be rejected by alignment check when unit_scale > 1.
 #[test]
 fn test_attack_withdraw_scale_minus_one_misaligned() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
@@ -22829,10 +21656,7 @@ fn test_attack_withdraw_scale_minus_one_misaligned() {
 /// Tests the clean shutdown path: LP deposits, withdraws, closes, then slab closes.
 #[test]
 fn test_attack_close_slab_clean_shutdown() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22866,10 +21690,7 @@ fn test_attack_close_slab_clean_shutdown() {
 /// Position PnL + capital = 0 exactly. Should be liquidatable.
 #[test]
 fn test_attack_liquidation_equity_exactly_zero() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22921,10 +21742,7 @@ fn test_attack_liquidation_equity_exactly_zero() {
 /// Tests that deposit + crank in same slot doesn't create exploitable state.
 #[test]
 fn test_attack_deposit_and_crank_same_slot_no_exploit() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -22972,10 +21790,7 @@ fn test_attack_deposit_and_crank_same_slot_no_exploit() {
 /// Tests state consistency across rapid operation sequence.
 #[test]
 fn test_attack_trade_crank_withdraw_rapid_sequence() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23032,10 +21847,7 @@ fn test_attack_trade_crank_withdraw_rapid_sequence() {
 /// Only the price at crank time should matter, not intermediate prices.
 #[test]
 fn test_attack_price_whipsaw_between_cranks() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23085,10 +21897,7 @@ fn test_attack_price_whipsaw_between_cranks() {
 /// Verify capital is correct after multiple deposits with position open.
 #[test]
 fn test_attack_incremental_deposits_with_position() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23139,10 +21948,7 @@ fn test_attack_incremental_deposits_with_position() {
 /// Both should settle correctly without double-counting.
 #[test]
 fn test_attack_warmup_funding_interaction_no_double_count() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 100); // 100 slot warmup
@@ -23192,10 +21998,7 @@ fn test_attack_warmup_funding_interaction_no_double_count() {
 /// Verify LP position aggregates are correct after complex trading.
 #[test]
 fn test_attack_lp_position_aggregate_after_many_trades() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23264,10 +22067,7 @@ fn test_attack_lp_position_aggregate_after_many_trades() {
 /// Verify mark tracks correctly at the boundary.
 #[test]
 fn test_attack_circuit_breaker_exact_cap_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23316,10 +22116,7 @@ fn test_attack_circuit_breaker_exact_cap_boundary() {
 /// At the exact margin boundary, the trade should just barely succeed.
 #[test]
 fn test_attack_trade_exact_margin_boundary_succeeds() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23358,10 +22155,7 @@ fn test_attack_trade_exact_margin_boundary_succeeds() {
 /// With large maintenance_fee_per_slot and small capital, fee should not go negative.
 #[test]
 fn test_attack_maintenance_fee_depletes_small_capital() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23409,10 +22203,7 @@ fn test_attack_maintenance_fee_depletes_small_capital() {
 /// Multiple tiny price changes and cranks should maintain conservation.
 #[test]
 fn test_attack_mark_precision_small_increments() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23465,10 +22256,7 @@ fn test_attack_mark_precision_small_increments() {
 /// Changing funding parameters mid-flight should not cause retroactive errors.
 #[test]
 fn test_attack_update_config_during_active_trades() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23523,10 +22311,7 @@ fn test_attack_update_config_during_active_trades() {
 /// When price doesn't change, circuit breaker should produce stable state.
 #[test]
 fn test_attack_push_oracle_same_as_last_price() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -23557,10 +22342,7 @@ fn test_attack_push_oracle_same_as_last_price() {
 /// Should not confuse liquidation with permissionless crank sentinel.
 #[test]
 fn test_attack_liquidate_target_u16_max() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23581,10 +22363,7 @@ fn test_attack_liquidate_target_u16_max() {
 /// User gets liquidated, then immediately deposits. Conservation must hold.
 #[test]
 fn test_attack_deposit_after_liquidation_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23674,10 +22453,7 @@ fn test_attack_deposit_after_liquidation_same_slot() {
 /// Verify no value extraction and conservation holds regardless of outcome.
 #[test]
 fn test_attack_init_lp_matcher_is_self_program() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23735,10 +22511,7 @@ fn test_attack_init_lp_matcher_is_self_program() {
 /// LP net position goes from short to long in a single trade.
 #[test]
 fn test_attack_funding_rate_sign_flip_lp_position_cross() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -23805,10 +22578,7 @@ fn test_attack_funding_rate_sign_flip_lp_position_cross() {
 /// Insurance topup amount that doesn't align with unit_scale.
 #[test]
 fn test_attack_topup_insurance_unit_scale_dust() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
@@ -23861,10 +22631,7 @@ fn test_attack_topup_insurance_unit_scale_dust() {
 /// Admin config changes should be blocked after market resolution.
 #[test]
 fn test_attack_update_config_after_resolution() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -23896,10 +22663,7 @@ fn test_attack_update_config_after_resolution() {
 /// Settlement parameters must be frozen once market is resolved.
 #[test]
 fn test_attack_push_oracle_after_resolution_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -23941,10 +22705,7 @@ fn test_attack_push_oracle_after_resolution_rejected() {
 /// Oracle authority must remain frozen once market is resolved.
 #[test]
 fn test_attack_set_oracle_authority_after_resolution_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -23981,10 +22742,7 @@ fn test_attack_set_oracle_authority_after_resolution_rejected() {
 /// Price-cap settings must be frozen after market resolution.
 #[test]
 fn test_attack_set_oracle_price_cap_after_resolution_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -24018,10 +22776,7 @@ fn test_attack_set_oracle_price_cap_after_resolution_rejected() {
 /// Fee parameters should not be mutable once market enters resolved mode.
 #[test]
 fn test_attack_set_maintenance_fee_after_resolution_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -24043,10 +22798,7 @@ fn test_attack_set_maintenance_fee_after_resolution_rejected() {
 /// Risk-gating parameters should be immutable in resolved mode.
 #[test]
 fn test_attack_set_risk_threshold_after_resolution_rejected() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -24069,10 +22821,7 @@ fn test_attack_set_risk_threshold_after_resolution_rejected() {
 /// Verify LP position tracking remains accurate through oscillations.
 #[test]
 fn test_attack_lp_position_oscillation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24129,10 +22878,7 @@ fn test_attack_lp_position_oscillation() {
 /// Effectively disables circuit breaker. Verify large price moves are accepted.
 #[test]
 fn test_attack_oracle_price_cap_u64_max() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24176,10 +22922,7 @@ fn test_attack_oracle_price_cap_u64_max() {
 /// Fee set then close in rapid sequence should settle fees correctly.
 #[test]
 fn test_attack_set_fee_then_immediate_close() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24232,10 +22975,7 @@ fn test_attack_set_fee_then_immediate_close() {
 /// Tests that withdrawal doesn't cause double-counting in settlement.
 #[test]
 fn test_attack_withdraw_between_two_cranks() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24289,10 +23029,7 @@ fn test_attack_withdraw_between_two_cranks() {
 /// Tests slot reuse and state cleanliness after GC in multi-user scenario.
 #[test]
 fn test_attack_slot_reuse_multi_user_gc_reinit() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24356,10 +23093,7 @@ fn test_attack_slot_reuse_multi_user_gc_reinit() {
 /// When threshold == insurance, risk gate should be on the boundary.
 #[test]
 fn test_attack_risk_threshold_exact_insurance_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24382,8 +23116,18 @@ fn test_attack_risk_threshold_exact_insurance_boundary() {
     let insurance = env.read_insurance_balance();
     env.try_set_risk_threshold(&admin, insurance).unwrap();
 
-    // Trade should still work (insurance >= threshold)
+    // gate_active(threshold, balance) = threshold > 0 && balance <= threshold
+    // When insurance == threshold, gate IS active (balance <= threshold is true)
+    // Risk-increasing trade should be rejected
     let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    assert!(
+        trade_result.is_err(),
+        "ATTACK: Trade should be rejected when insurance == threshold (gate active at boundary)"
+    );
+
+    // Position should not have been opened
+    let pos = env.read_account_position(user_idx);
+    assert_eq!(pos, 0, "No position should be opened when gate is active: got {}", pos);
 
     // Conservation must hold
     let vault = env.vault_balance();
@@ -24393,20 +23137,6 @@ fn test_attack_risk_threshold_exact_insurance_boundary() {
         "Conservation at threshold boundary: engine={} vault={}",
         engine_vault, vault
     );
-
-    // If trade succeeded, verify position was opened
-    if trade_result.is_ok() {
-        let pos = env.read_account_position(user_idx);
-        assert_eq!(
-            pos, 1_000_000,
-            "Trade succeeded so position must be 1M: got {}",
-            pos
-        );
-    } else {
-        // Trade rejected at boundary - verify no position opened
-        let pos = env.read_account_position(user_idx);
-        assert_eq!(pos, 0, "Trade rejected so position must be 0: got {}", pos);
-    }
 }
 
 /// ATTACK: LP tries to withdraw when haircut is active (vault < c_tot + insurance).
@@ -24414,10 +23144,7 @@ fn test_attack_risk_threshold_exact_insurance_boundary() {
 /// withdraw more than their haircutted equity?
 #[test]
 fn test_attack_lp_withdraw_during_haircut() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24496,10 +23223,7 @@ fn test_attack_lp_withdraw_during_haircut() {
 /// Profit from partial close must be subject to warmup vesting.
 #[test]
 fn test_attack_warmup_partial_close_vesting() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 1000); // warmup = 1000 slots
@@ -24574,10 +23298,7 @@ fn test_attack_warmup_partial_close_vesting() {
 /// Tests mark_pnl truncation at the smallest meaningful scale.
 #[test]
 fn test_attack_mark_pnl_one_unit_position() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24630,10 +23351,7 @@ fn test_attack_mark_pnl_one_unit_position() {
 /// When denominator is 0, haircut should be harmless (no division by zero).
 #[test]
 fn test_attack_haircut_zero_pnl_pos_tot() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24710,10 +23428,7 @@ fn test_attack_haircut_zero_pnl_pos_tot() {
 /// Tests that crank handles many accounts efficiently and conserves funds.
 #[test]
 fn test_attack_many_users_single_lp_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24784,10 +23499,7 @@ fn test_attack_many_users_single_lp_conservation() {
 /// Verify initial_margin_bps is used (not maintenance) for the flip.
 #[test]
 fn test_attack_position_flip_margin_requirement_switch() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24845,10 +23557,7 @@ fn test_attack_position_flip_margin_requirement_switch() {
 /// Tests saturating arithmetic in fee accrual over long periods.
 #[test]
 fn test_attack_maintenance_fee_huge_dt_saturation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24897,10 +23606,7 @@ fn test_attack_maintenance_fee_huge_dt_saturation() {
 /// Position accumulation should be correct across rapid trades.
 #[test]
 fn test_attack_rapid_successive_trades_accumulation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -24947,10 +23653,7 @@ fn test_attack_rapid_successive_trades_accumulation() {
 /// Tests LP aggregate tracking with multiple LPs.
 #[test]
 fn test_attack_three_lps_aggregate_tracking() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25026,10 +23729,7 @@ fn test_attack_three_lps_aggregate_tracking() {
 /// Verify consistency between margin check haircut and settlement haircut.
 #[test]
 fn test_attack_projected_vs_realized_haircut_consistency() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25092,10 +23792,7 @@ fn test_attack_projected_vs_realized_haircut_consistency() {
 /// Multiple trades that flip PnL sign should maintain pnl_pos_tot correctly.
 #[test]
 fn test_attack_set_pnl_aggregate_rapid_flips() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25171,10 +23868,7 @@ fn test_attack_set_pnl_aggregate_rapid_flips() {
 /// Trade that reduces LP's exposure should update net_lp_pos correctly.
 #[test]
 fn test_attack_lp_partial_close_aggregate_update() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25245,10 +23939,7 @@ fn test_attack_lp_partial_close_aggregate_update() {
 /// Create scenario where ordering matters and verify correctness.
 #[test]
 fn test_attack_settlement_ordering_mark_funding_fees() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25311,10 +24002,7 @@ fn test_attack_settlement_ordering_mark_funding_fees() {
 /// Tests conservation in inverted market with significant movement.
 #[test]
 fn test_attack_inverted_market_large_swing_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1); // Inverted market
@@ -25366,10 +24054,7 @@ fn test_attack_inverted_market_large_swing_conservation() {
 /// Both users should have approximately zero PnL (minus fees).
 #[test]
 fn test_attack_opposing_positions_price_roundtrip() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25427,10 +24112,7 @@ fn test_attack_opposing_positions_price_roundtrip() {
 /// Should fail because margin check requires capital > 0 for positions.
 #[test]
 fn test_attack_withdraw_all_with_open_position() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25479,10 +24161,7 @@ fn test_attack_withdraw_all_with_open_position() {
 /// Anyone can top up insurance (it's a deposit, not withdrawal).
 #[test]
 fn test_attack_insurance_topup_from_non_admin() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25494,11 +24173,10 @@ fn test_attack_insurance_topup_from_non_admin() {
     env.create_ata(&random_user.pubkey(), 2_000_000_000);
     let insurance_before = env.read_insurance_balance();
 
-    // Non-admin tops up insurance
+    // Non-admin tops up insurance — TopUpInsurance does not require admin
     let result = env.try_top_up_insurance(&random_user, 1_000_000_000);
+    assert!(result.is_ok(), "Anyone should be able to top up insurance: {:?}", result);
 
-    // Top-up from non-admin should work (anyone can contribute to insurance)
-    // OR it should be restricted to admin - either way, no funds lost
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
     assert_eq!(
@@ -25508,30 +24186,19 @@ fn test_attack_insurance_topup_from_non_admin() {
     );
 
     let insurance_after = env.read_insurance_balance();
-    if result.is_ok() {
-        assert!(
-            insurance_after > insurance_before,
-            "Successful topup should increase insurance: before={} after={}",
-            insurance_before,
-            insurance_after
-        );
-    } else {
-        assert_eq!(
-            insurance_after, insurance_before,
-            "Failed topup should not change insurance: before={} after={}",
-            insurance_before, insurance_after
-        );
-    }
+    assert!(
+        insurance_after > insurance_before,
+        "Topup should increase insurance: before={} after={}",
+        insurance_before,
+        insurance_after
+    );
 }
 
 /// ATTACK: Price moves 50% down then liquidation followed by conservation check.
 /// Tests that large price movements + liquidation maintain fund conservation.
 #[test]
 fn test_attack_large_price_drop_liquidation_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25595,10 +24262,7 @@ fn test_attack_large_price_drop_liquidation_conservation() {
 /// Tests that decoder rejects or ignores trailing garbage after valid data.
 #[test]
 fn test_attack_instruction_data_extra_trailing_bytes() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25656,10 +24320,7 @@ fn test_attack_instruction_data_extra_trailing_bytes() {
 /// Tests that extreme negative trade sizes are handled safely.
 #[test]
 fn test_attack_trade_size_i128_min_boundary() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25697,10 +24358,7 @@ fn test_attack_trade_size_i128_min_boundary() {
 /// Tests that withdraw+deposit cycle doesn't corrupt state.
 #[test]
 fn test_attack_withdraw_all_redeposit_same_slot() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25747,10 +24405,7 @@ fn test_attack_withdraw_all_redeposit_same_slot() {
 /// LP with outstanding position should not be closeable.
 #[test]
 fn test_attack_lp_close_with_matched_positions() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25794,10 +24449,7 @@ fn test_attack_lp_close_with_matched_positions() {
 /// Position should cancel out to zero, conservation must hold.
 #[test]
 fn test_attack_trade_long_then_short_net_zero() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25853,10 +24505,7 @@ fn test_attack_trade_long_then_short_net_zero() {
 /// Tests LP position aggregate correctness under rapid multi-user trading.
 #[test]
 fn test_attack_lp_rapid_multi_user_matching() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25915,10 +24564,7 @@ fn test_attack_lp_rapid_multi_user_matching() {
 /// Tests that rapid deposit-withdraw-deposit cycles don't corrupt aggregates.
 #[test]
 fn test_attack_deposit_withdraw_deposit_cycle_aggregates() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -25962,10 +24608,7 @@ fn test_attack_deposit_withdraw_deposit_cycle_aggregates() {
 /// Tests that liquidation trigger is precise and doesn't miss by 1.
 #[test]
 fn test_attack_liquidation_boundary_precision() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26020,10 +24663,7 @@ fn test_attack_liquidation_boundary_precision() {
 /// Tests that extreme timestamp doesn't corrupt oracle state or cause panic.
 #[test]
 fn test_attack_oracle_timestamp_zero_then_crank() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -26072,10 +24712,7 @@ fn test_attack_oracle_timestamp_zero_then_crank() {
 /// Tests that far-future timestamps don't cause overflow or panic.
 #[test]
 fn test_attack_oracle_timestamp_i64_max_no_overflow() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000);
@@ -26130,10 +24767,7 @@ fn test_attack_oracle_timestamp_i64_max_no_overflow() {
 /// LP depositing should settle fees first, then add remaining to capital.
 #[test]
 fn test_attack_lp_deposit_settles_fee_debt_first() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26190,10 +24824,7 @@ fn test_attack_lp_deposit_settles_fee_debt_first() {
 /// After SetMaintenanceFee, immediate deposit should use new fee rate.
 #[test]
 fn test_attack_config_change_applied_to_next_instruction() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26239,10 +24870,7 @@ fn test_attack_config_change_applied_to_next_instruction() {
 /// Tests that admin state is correctly updated through multiple transfers.
 #[test]
 fn test_attack_rapid_admin_transfers() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26272,10 +24900,7 @@ fn test_attack_rapid_admin_transfers() {
 /// Tests authorization on LP deposits.
 #[test]
 fn test_attack_deposit_to_lp_wrong_owner() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26308,10 +24933,7 @@ fn test_attack_deposit_to_lp_wrong_owner() {
 /// Vault should never go below total obligations.
 #[test]
 fn test_attack_concurrent_max_withdrawals_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26373,10 +24995,7 @@ fn test_attack_concurrent_max_withdrawals_conservation() {
 /// Tests that PnL redistribution between longs/shorts conserves total value.
 #[test]
 fn test_attack_opposing_users_pnl_conservation() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -26846,10 +25465,7 @@ impl IntegrationFuzzer {
 /// 50 seeds × 100 steps = 5,000 operations with invariant checks after each.
 #[test]
 fn test_property_state_machine_invariants() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     for seed in 1..=50 {
         let mut fuzzer = IntegrationFuzzer::new(seed);
@@ -26868,10 +25484,7 @@ fn test_property_state_machine_invariants() {
 #[test]
 #[ignore = "long-running exhaustive state machine (40k ops)"]
 fn test_property_state_machine_extended() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     for seed in 1..=200 {
         let mut fuzzer = IntegrationFuzzer::new(seed);
@@ -26899,10 +25512,7 @@ fn test_property_state_machine_extended() {
 ///   A3. State is unchanged after rejection
 #[test]
 fn test_property_authorization_exhaustive() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -27004,10 +25614,7 @@ fn test_property_authorization_exhaustive() {
 ///   L4. Close requires zero position and zero PnL
 #[test]
 fn test_property_account_lifecycle_invariants() {
-    let path = program_path();
-    if !path.exists() {
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -28239,11 +26846,7 @@ fn test_honest_participants_full_lifecycle() {
 /// warmup_period_slots=0 so PnL converts instantly.
 #[test]
 fn test_honest_user_standard_market_profitable_close() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -28315,11 +26918,7 @@ fn test_honest_user_standard_market_profitable_close() {
 /// User loses money but can still close and get remaining capital.
 #[test]
 fn test_honest_user_standard_market_losing_close() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -28382,11 +26981,7 @@ fn test_honest_user_standard_market_losing_close() {
 /// Uses a larger position (1M) to generate meaningful PnL that takes time to vest.
 #[test]
 fn test_honest_user_standard_market_warmup_close() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_warmup(0, 1000); // warmup_period_slots = 1000
@@ -28446,11 +27041,7 @@ fn test_honest_user_standard_market_warmup_close() {
 /// Inverted Pyth market: user can close account after trading.
 #[test]
 fn test_honest_user_inverted_market_close() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(1);
@@ -28596,11 +27187,7 @@ fn test_honest_user_hyperp_trade_flatten_close() {
 /// No insurance is topped up, and no crank runs between trades (avoiding force-realize mode).
 #[test]
 fn test_honest_participants_standard_market_full_lifecycle() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -28646,11 +27233,7 @@ fn test_honest_participants_standard_market_full_lifecycle() {
 /// (it requires engine.vault.is_zero()).
 #[test]
 fn test_withdraw_insurance_decrements_engine_vault() {
-    let path = program_path();
-    if !path.exists() {
-        println!("SKIP: BPF not found");
-        return;
-    }
+    program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
