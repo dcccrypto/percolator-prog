@@ -1727,13 +1727,10 @@ fn test_zombie_pnl_crank_driven_warmup_conversion() {
 
     // Try to close account immediately - should fail (PnL not warmed up yet)
     let early_close_result = env.try_close_account(&user, user_idx);
-    println!(
-        "Step 4: Early close attempt (before warmup): {:?}",
-        if early_close_result.is_err() {
-            "Failed as expected"
-        } else {
-            "Unexpected success"
-        }
+    assert!(
+        early_close_result.is_err(),
+        "Close should fail before warmup completes: {:?}",
+        early_close_result
     );
 
     // Now simulate the zombie scenario:
@@ -3043,11 +3040,9 @@ fn test_comprehensive_liquidation_underwater_user() {
     env.crank();
     println!("Step 2: Price dropped from $138 to $100");
 
-    // Try to liquidate - result depends on margin state
-    let result = env.try_liquidate(user_idx);
-    println!("Liquidation result: {:?}", result);
-
-    println!("LIQUIDATION TEST COMPLETE: Liquidation instruction processed");
+    // Try to liquidate - may fail if force-realize already closed position during crank
+    // (insurance=0 triggers force-realize mode which zeroes all positions)
+    let _result = env.try_liquidate(user_idx);
 }
 
 /// Test 3: Withdrawal limits - can't withdraw beyond margin requirements
@@ -3083,11 +3078,13 @@ fn test_comprehensive_withdrawal_limits() {
         "Should not be able to withdraw all capital with open position"
     );
 
-    // Partial withdrawal may work
+    // Partial withdrawal (1 SOL of 10 SOL with 50M position) - margin allows it
     let result2 = env.try_withdraw(&user, user_idx, 1_000_000_000);
-    println!("Partial withdrawal (1 SOL): {:?}", result2);
-
-    println!("WITHDRAWAL LIMITS VERIFIED: Full withdrawal rejected with open position");
+    assert!(
+        result2.is_ok(),
+        "Partial withdrawal within margin should succeed: {:?}",
+        result2
+    );
 }
 
 /// Test 4: Unauthorized access - wrong signer can't operate on account
@@ -3325,11 +3322,11 @@ fn test_comprehensive_margin_limit_enforcement() {
     // Massive trade should fail (exceeds margin)
     let huge_size: i128 = 1_000_000_000; // Huge - way over margin
     let result2 = env.try_trade(&user, &lp, lp_idx, user_idx, huge_size);
-    println!("Huge trade result: {:?}", result2);
-    // This should fail due to margin requirements
-    // Note: Actual behavior depends on engine margin checks
-
-    println!("MARGIN LIMIT VERIFIED: Engine enforces margin requirements");
+    assert!(
+        result2.is_err(),
+        "Huge trade exceeding margin should be rejected: {:?}",
+        result2
+    );
 }
 
 /// Test 10: Funding accrual - multiple cranks succeed over time
@@ -5948,31 +5945,19 @@ fn test_insurance_fund_traps_funds_preventing_closeslab() {
     env.set_slot(200);
     env.crank(); // Settle any pending funding
 
-    // Users try to close their accounts
+    // Users close their accounts
     let user_close = env.try_close_account(&user, user_idx);
-    println!("User close result: {:?}", user_close);
+    assert!(user_close.is_ok(), "User close should succeed: {:?}", user_close);
 
     let lp_close = env.try_close_account(&lp, lp_idx);
-    println!("LP close result: {:?}", lp_close);
+    assert!(lp_close.is_ok(), "LP close should succeed: {:?}", lp_close);
 
-    // Even if accounts closed, try to close slab
+    // CloseSlab should fail because insurance_fund.balance > 0
     let close_result = env.try_close_slab();
-    println!("CloseSlab result: {:?}", close_result);
-
-    // If insurance_fund.balance > 0, CloseSlab should fail
-    // This demonstrates that insurance fund deposits can trap funds
-    if close_result.is_err() {
-        println!("INSURANCE FUND TRAP CONFIRMED:");
-        println!("  - TopUpInsurance deposited 0.5 SOL");
-        println!("  - No WithdrawInsurance instruction exists");
-        println!("  - CloseSlab failed because insurance_fund.balance > 0");
-        println!("  - Admin cannot reclaim these funds");
-        println!("");
-        println!("Note: This may be intentional design (insurance is a donation)");
-        println!("or a missing feature (need WithdrawInsurance instruction)");
-    } else {
-        println!("CloseSlab succeeded - need to investigate insurance fund handling");
-    }
+    assert!(
+        close_result.is_err(),
+        "CloseSlab must fail when insurance_fund.balance > 0"
+    );
 }
 
 // ============================================================================
@@ -6026,9 +6011,9 @@ fn test_extreme_price_movement_with_large_position() {
     env.crank();
     println!("Step 2: Price dropped 15% to $117.30");
 
-    // User should be underwater now
-    let liq_result = env.try_liquidate(user_idx);
-    println!("Step 3: Liquidation attempt: {:?}", liq_result);
+    // User should be underwater - liquidation may fail if force-realize already
+    // closed the position during crank (insurance=0 triggers force-realize mode)
+    let _liq_result = env.try_liquidate(user_idx);
 
     // If liquidation succeeded or failed, verify accounting
     env.set_slot_and_price(300, 117_300_000);
@@ -6049,17 +6034,9 @@ fn test_extreme_price_movement_with_large_position() {
     let user2_idx = env.init_user(&user2);
     env.deposit(&user2, user2_idx, 50_000_000_000); // 50 SOL
 
-    // Small trade to verify market still functions
-    let result = env.try_trade(&user2, &lp, lp_idx, user2_idx, 1_000_000);
-    println!(
-        "Step 6: New user trade after extreme movement: {:?}",
-        result
-    );
-
-    println!("EXTREME PRICE MOVEMENT TEST COMPLETE:");
-    println!("  - Verified large position handling during adverse price movement");
-    println!("  - Liquidation and PnL write-off mechanisms tested");
-    println!("  - Market remains functional after extreme loss event");
+    // Small trade to verify market still functions (may fail if force-realize
+    // mode closed LP's position since insurance=0)
+    let _result = env.try_trade(&user2, &lp, lp_idx, user2_idx, 1_000_000);
 }
 
 // ============================================================================
@@ -10449,9 +10426,14 @@ fn test_attack_trade_then_withdraw_max_same_slot() {
         "ATTACK: Withdrawing all capital right after opening position should fail"
     );
 
-    // Even partial withdrawal should be limited by margin
+    // Partial withdrawal (9 SOL) succeeds because 20M position notional is small
+    // relative to remaining capital after withdrawal
     let result2 = env.try_withdraw(&user, user_idx, 9_000_000_000);
-    println!("Large withdrawal after trade: {:?}", result2);
+    assert!(
+        result2.is_ok(),
+        "ATTACK: Partial withdrawal within margin should succeed: {:?}",
+        result2
+    );
 }
 
 /// ATTACK: Multiple deposits in rapid succession.
@@ -14978,10 +14960,12 @@ fn test_attack_funding_anti_retroactivity_zero_dt() {
         vault_account.amount
     };
 
-    // Crank at same slot (dt=0, no funding accrued)
+    // Crank at same slot (dt=0, no funding accrued) - should still succeed
     let same_slot_crank_1 = env.try_crank();
+    assert!(same_slot_crank_1.is_ok(), "Same-slot crank should succeed: {:?}", same_slot_crank_1);
     // Crank again same slot (dt=0 again)
     let same_slot_crank_2 = env.try_crank();
+    assert!(same_slot_crank_2.is_ok(), "Repeated same-slot crank should succeed: {:?}", same_slot_crank_2);
 
     // Advance slot and crank (now dt > 0, funding accrues)
     env.set_slot(100);
@@ -22861,7 +22845,7 @@ fn test_attack_scale_price_zero_rejects_trade() {
 
     // Crank should fail or be a no-op because oracle price scales to zero
     env.set_slot(200);
-    let result = env.try_crank();
+    let _crank_result = env.try_crank(); // May fail or no-op; key test is trade rejection below
     // Trade should fail because scaled price is None
     let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 100);
     assert!(
@@ -22897,9 +22881,7 @@ fn test_attack_invert_price_zero_result() {
     // Set oracle to extremely high price: 10^13 (> INVERSION_CONSTANT=10^12)
     // inverted = 10^12 / 10^13 = 0 → None
     env.set_slot_and_price(200, 10_000_000_000_000);
-    let crank_result = env.try_crank();
-    // Crank with zero-inverted price should fail (can't compute mark)
-    // Whether crank fails or clamps, the key is no value extraction
+    let _crank_result = env.try_crank(); // May fail or clamp; key test is conservation below
     let vault = env.vault_balance();
     assert!(
         vault >= 55_000_000_000,
@@ -22936,7 +22918,7 @@ fn test_attack_invert_price_extreme_small_raw() {
     // Set raw price = 1 → inverted = 10^12
     // Circuit breaker will cap the movement, but the inverted price is valid
     env.set_slot_and_price(200, 1);
-    let crank_result = env.try_crank();
+    let _crank_result = env.try_crank(); // May fail or clamp; key test is conservation below
 
     // Conservation must hold regardless
     let vault = env.vault_balance();
@@ -27469,17 +27451,17 @@ fn test_binary_market_complete_lifecycle_conservation() {
         "insurance should be zero after withdrawal"
     );
 
-    // Close all user accounts (with warmup=0, PnL converts instantly)
-    let close_a = env.try_close_account(&user_a, user_a_idx);
-    let close_b = env.try_close_account(&user_b, user_b_idx);
-    let close_lp = env.try_close_account(&lp, lp_idx);
+    // Crank to settle warmup (with warmup_period=0, one crank converts PnL to capital)
+    env.set_slot(300);
+    env.crank();
 
-    // At least the losing user and LP should be closeable
-    // Winner might need warmup if PnL is positive
-    println!(
-        "close_a: {:?}, close_b: {:?}, close_lp: {:?}",
-        close_a, close_b, close_lp
-    );
+    // Close all user accounts (with warmup=0, PnL converts after crank)
+    let close_a = env.try_close_account(&user_a, user_a_idx);
+    assert!(close_a.is_ok(), "User A close should succeed: {:?}", close_a);
+    let close_b = env.try_close_account(&user_b, user_b_idx);
+    assert!(close_b.is_ok(), "User B close should succeed: {:?}", close_b);
+    let close_lp = env.try_close_account(&lp, lp_idx);
+    assert!(close_lp.is_ok(), "LP close should succeed: {:?}", close_lp);
 
     // Final vault balance should be >= 0 (all tokens accounted for)
     let final_vault = env.vault_balance();
