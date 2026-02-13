@@ -7884,11 +7884,48 @@ fn test_attack_withdraw_bypasses_fee_debt() {
     env.set_slot(10_000);
     env.crank();
 
+    let user_pos_before = env.read_account_position(user_idx);
+    let lp_pos_before = env.read_account_position(lp_idx);
+    let user_cap_before = env.read_account_capital(user_idx);
+    let lp_cap_before = env.read_account_capital(lp_idx);
+    let spl_vault_before = env.vault_balance();
+    let engine_vault_before = env.read_engine_vault();
+
     // Try to withdraw full deposit - fee debt should reduce available equity
     let result = env.try_withdraw(&user, user_idx, 10_000_000_000);
     assert!(
         result.is_err(),
         "ATTACK: Full withdrawal should fail because fee debt reduces equity"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_before,
+        "Rejected fee-debt bypass withdraw must preserve user position"
+    );
+    assert_eq!(
+        env.read_account_position(lp_idx),
+        lp_pos_before,
+        "Rejected fee-debt bypass withdraw must preserve LP position"
+    );
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        user_cap_before,
+        "Rejected fee-debt bypass withdraw must preserve user capital"
+    );
+    assert_eq!(
+        env.read_account_capital(lp_idx),
+        lp_cap_before,
+        "Rejected fee-debt bypass withdraw must preserve LP capital"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_before,
+        "Rejected fee-debt bypass withdraw must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_engine_vault(),
+        engine_vault_before,
+        "Rejected fee-debt bypass withdraw must preserve engine vault"
     );
 }
 
