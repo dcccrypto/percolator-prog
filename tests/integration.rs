@@ -24454,10 +24454,35 @@ fn test_attack_set_risk_threshold_after_resolution_rejected() {
     env.try_push_oracle_price(&admin, 140_000_000, 100).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
+    let insurance_before = env.read_insurance_balance();
+    let spl_vault_before = env.vault_balance();
+    let engine_vault_before = env.read_engine_vault();
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
+
     let result = env.try_set_risk_threshold(&admin, 1_000_000_000);
     assert!(
         result.is_err(),
         "SECURITY: SetRiskThreshold must be rejected after resolution"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "Rejected post-resolution SetRiskThreshold must preserve insurance"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_before,
+        "Rejected post-resolution SetRiskThreshold must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_engine_vault(),
+        engine_vault_before,
+        "Rejected post-resolution SetRiskThreshold must preserve engine vault"
+    );
+    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
+    assert_eq!(
+        slab_after, slab_before,
+        "Rejected post-resolution SetRiskThreshold must preserve slab bytes"
     );
 }
 
