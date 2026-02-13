@@ -3582,21 +3582,35 @@ fn kani_withdraw_insurance_vault_reaches_zero() {
     assert_eq!(result.unwrap(), 0, "vault must be zero after withdrawing all insurance");
 }
 
-/// Negative proof: Demonstrate that NOT decrementing vault breaks the invariant.
-/// This models the pre-fix bug where WithdrawInsurance zeroed insurance_fund.balance
-/// but did NOT decrement engine.vault.
+/// Prove complete result characterization for withdraw_insurance_vault:
+/// - `Some(vault_after)` iff insurance <= vault_before, with exact subtraction
+/// - `None` iff insurance > vault_before
 #[kani::proof]
-fn kani_withdraw_insurance_vault_skip_decrement_breaks_invariant() {
+fn kani_withdraw_insurance_vault_result_characterization() {
+    let vault_before: u128 = kani::any();
     let insurance: u128 = kani::any();
-    kani::assume(insurance > 0); // Non-trivial withdrawal
 
-    let vault_before = insurance; // Only insurance remains in vault
-
-    // Correct behavior: use withdraw_insurance_vault
-    let correct_vault = withdraw_insurance_vault(vault_before, insurance).unwrap();
-    assert_eq!(correct_vault, 0, "correct path reaches zero");
-
-    // Buggy behavior: vault unchanged (the pre-fix bug)
-    let buggy_vault = vault_before; // No decrement!
-    assert_ne!(buggy_vault, 0, "buggy path leaves vault non-zero, blocking CloseSlab");
+    match withdraw_insurance_vault(vault_before, insurance) {
+        Some(vault_after) => {
+            assert!(
+                insurance <= vault_before,
+                "success requires insurance <= vault_before"
+            );
+            assert_eq!(
+                vault_after,
+                vault_before - insurance,
+                "success path must perform exact subtraction"
+            );
+            assert!(
+                vault_after <= vault_before,
+                "withdrawal must not increase vault balance"
+            );
+        }
+        None => {
+            assert!(
+                insurance > vault_before,
+                "failure is only possible when insurance exceeds vault"
+            );
+        }
+    }
 }
