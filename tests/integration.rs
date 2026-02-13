@@ -22658,11 +22658,27 @@ fn test_attack_init_lp_matcher_is_self_program() {
     let result = env.svm.send_transaction(tx);
     // InitLP with self-program as matcher: may succeed at init time
     // (no CPI happens during init), but state must remain consistent.
-    // Assert the result so it's not dead code.
-    println!(
-        "InitLP with self-as-matcher result: {}",
-        if result.is_ok() { "accepted (init only, no CPI)" } else { "rejected" }
-    );
+    let num_used = env.read_num_used_accounts();
+    if result.is_ok() {
+        assert_eq!(
+            num_used, 1,
+            "Accepted self-matcher InitLP should allocate exactly one account"
+        );
+        assert!(
+            env.is_slot_used(0),
+            "Accepted self-matcher InitLP should mark slot 0 as used"
+        );
+        assert_eq!(
+            env.read_account_capital(0),
+            0,
+            "Accepted self-matcher InitLP should not mint capital at init"
+        );
+    } else {
+        assert_eq!(
+            num_used, 0,
+            "Rejected self-matcher InitLP should not allocate accounts"
+        );
+    }
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
     assert_eq!(
