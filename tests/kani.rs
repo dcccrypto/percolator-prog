@@ -3103,23 +3103,16 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
 /// Prove: scale > MAX_UNIT_SCALE is rejected
 #[kani::proof]
 fn kani_init_market_scale_rejects_overflow() {
-    // Non-vacuity witness: overflow value must be constructible.
+    // Ensure out-of-range values are constructible (avoid vacuous assumptions).
     assert!(
         MAX_UNIT_SCALE < u32::MAX,
-        "MAX_UNIT_SCALE must allow an out-of-range witness"
+        "MAX_UNIT_SCALE must allow at least one out-of-range value"
     );
-    let witness = MAX_UNIT_SCALE + 1;
-    assert!(
-        !init_market_scale_ok(witness),
-        "non-vacuity: MAX_UNIT_SCALE+1 must be rejected"
-    );
-
-    // Universal property: whenever scale is out of range, it must be rejected.
     let scale: u32 = kani::any();
-    if scale > MAX_UNIT_SCALE {
-        let result = init_market_scale_ok(scale);
-        assert!(!result, "scale > MAX_UNIT_SCALE must be rejected");
-    }
+    kani::assume(scale > MAX_UNIT_SCALE);
+
+    let result = init_market_scale_ok(scale);
+    assert!(!result, "scale > MAX_UNIT_SCALE must be rejected");
 }
 
 /// Prove: scale=0 is accepted (disables scaling)
