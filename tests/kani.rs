@@ -1237,14 +1237,13 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
         exec_size,
     );
 
-    // Conditional universal: whenever decision is Reject, nonce must be unchanged.
-    if matches!(decision, TradeCpiDecision::Reject) {
-        let result_nonce = decision_nonce(old_nonce, decision);
-        assert_eq!(
-            result_nonce, old_nonce,
-            "ANY TradeCpi rejection must leave nonce unchanged"
-        );
-    }
+    // Directly reason over the Reject subspace (with explicit non-vacuity witness above).
+    kani::assume(matches!(&decision, TradeCpiDecision::Reject));
+    let result_nonce = decision_nonce(old_nonce, decision);
+    assert_eq!(
+        result_nonce, old_nonce,
+        "ANY TradeCpi rejection must leave nonce unchanged"
+    );
 }
 
 /// Prove: ANY TradeCpi acceptance increments nonce (universal quantification)
