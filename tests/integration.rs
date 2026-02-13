@@ -11790,11 +11790,48 @@ fn test_attack_close_slab_with_vault_tokens() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
+    let user_cap_before = env.read_account_capital(user_idx);
+    let user_pos_before = env.read_account_position(user_idx);
+    let insurance_before = env.read_insurance_balance();
+    let spl_vault_before = env.vault_balance();
+    let engine_vault_before = env.read_engine_vault();
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
+
     // Try CloseSlab with vault containing tokens
     let result = env.try_close_slab();
     assert!(
         result.is_err(),
         "ATTACK: CloseSlab with vault tokens should be rejected"
+    );
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        user_cap_before,
+        "Rejected CloseSlab with vault tokens must preserve user capital"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_before,
+        "Rejected CloseSlab with vault tokens must preserve user position"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "Rejected CloseSlab with vault tokens must preserve insurance"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_before,
+        "Rejected CloseSlab with vault tokens must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_engine_vault(),
+        engine_vault_before,
+        "Rejected CloseSlab with vault tokens must preserve engine vault"
+    );
+    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
+    assert_eq!(
+        slab_after, slab_before,
+        "Rejected CloseSlab with vault tokens must preserve slab bytes"
     );
 }
 
