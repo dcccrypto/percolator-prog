@@ -1718,15 +1718,14 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
         req_size,
     );
 
-    // Conditional universal: whenever decision is Accept, nonce must increment by 1.
-    if matches!(decision, TradeCpiDecision::Accept { .. }) {
-        let result_nonce = decision_nonce(old_nonce, decision);
-        assert_eq!(
-            result_nonce,
-            old_nonce.wrapping_add(1),
-            "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1"
-        );
-    }
+    // Directly reason over the Accept subspace (with explicit non-vacuity witness above).
+    kani::assume(matches!(&decision, TradeCpiDecision::Accept { .. }));
+    let result_nonce = decision_nonce(old_nonce, decision);
+    assert_eq!(
+        result_nonce,
+        old_nonce.wrapping_add(1),
+        "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1"
+    );
 }
 
 /// Prove: ANY acceptance uses exec_size from ret, not req_size
