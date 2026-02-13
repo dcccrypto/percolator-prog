@@ -5595,6 +5595,10 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
+    let trade_size = 500_000i128;
+    let user_pos_before = env.read_account_position(user_idx);
+    let lp1_pos_before = env.read_account_position(lp1_idx);
+    let lp2_pos_before = env.read_account_position(lp2_idx);
 
     // Trade with LP1 using LP1's context - should succeed
     let result1 = env.try_trade_cpi(
@@ -5602,7 +5606,7 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
         &lp1.pubkey(),
         lp1_idx,
         user_idx,
-        500_000,
+        trade_size,
         &matcher_prog,
         &lp1_ctx,
     );
@@ -5610,6 +5614,21 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
         result1.is_ok(),
         "Trade with LP1 using LP1's context should succeed: {:?}",
         result1
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_before + trade_size,
+        "LP1-valid TradeCpi should add requested user position delta"
+    );
+    assert_eq!(
+        env.read_account_position(lp1_idx),
+        lp1_pos_before - trade_size,
+        "LP1-valid TradeCpi should apply opposite LP1 position delta"
+    );
+    assert_eq!(
+        env.read_account_position(lp2_idx),
+        lp2_pos_before,
+        "LP1-valid TradeCpi must not mutate LP2 position"
     );
     println!("LP1 trade with LP1's context: SUCCESS");
 
@@ -5619,7 +5638,7 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
         &lp2.pubkey(),
         lp2_idx,
         user_idx,
-        500_000,
+        trade_size,
         &matcher_prog,
         &lp2_ctx,
     );
@@ -5628,6 +5647,29 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
         "Trade with LP2 using LP2's context should succeed: {:?}",
         result2
     );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_before + (trade_size * 2),
+        "Two valid TradeCpi calls should accumulate user position deltas"
+    );
+    assert_eq!(
+        env.read_account_position(lp1_idx),
+        lp1_pos_before - trade_size,
+        "LP2-valid TradeCpi must preserve LP1 position from first fill"
+    );
+    assert_eq!(
+        env.read_account_position(lp2_idx),
+        lp2_pos_before - trade_size,
+        "LP2-valid TradeCpi should apply opposite LP2 position delta"
+    );
+    let user_pos_after_valid = env.read_account_position(user_idx);
+    let lp1_pos_after_valid = env.read_account_position(lp1_idx);
+    let lp2_pos_after_valid = env.read_account_position(lp2_idx);
+    let user_cap_after_valid = env.read_account_capital(user_idx);
+    let lp1_cap_after_valid = env.read_account_capital(lp1_idx);
+    let lp2_cap_after_valid = env.read_account_capital(lp2_idx);
+    let spl_vault_after_valid = env.vault_balance();
+    let engine_vault_after_valid = env.read_vault();
     println!("LP2 trade with LP2's context: SUCCESS");
 
     // Try to trade with LP1 using LP2's context - should FAIL
@@ -5636,13 +5678,53 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
         &lp1.pubkey(),
         lp1_idx,
         user_idx,
-        500_000,
+        trade_size,
         &matcher_prog,
         &lp2_ctx, // WRONG context for LP1!
     );
     assert!(
         result3.is_err(),
         "SECURITY: LP1 trade with LP2's context should fail"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_after_valid,
+        "Rejected LP1/LP2-context swap must preserve user position"
+    );
+    assert_eq!(
+        env.read_account_position(lp1_idx),
+        lp1_pos_after_valid,
+        "Rejected LP1/LP2-context swap must preserve LP1 position"
+    );
+    assert_eq!(
+        env.read_account_position(lp2_idx),
+        lp2_pos_after_valid,
+        "Rejected LP1/LP2-context swap must preserve LP2 position"
+    );
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        user_cap_after_valid,
+        "Rejected LP1/LP2-context swap must preserve user capital"
+    );
+    assert_eq!(
+        env.read_account_capital(lp1_idx),
+        lp1_cap_after_valid,
+        "Rejected LP1/LP2-context swap must preserve LP1 capital"
+    );
+    assert_eq!(
+        env.read_account_capital(lp2_idx),
+        lp2_cap_after_valid,
+        "Rejected LP1/LP2-context swap must preserve LP2 capital"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_after_valid,
+        "Rejected LP1/LP2-context swap must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_vault(),
+        engine_vault_after_valid,
+        "Rejected LP1/LP2-context swap must preserve engine vault"
     );
     println!("LP1 trade with LP2's context: REJECTED (correct)");
 
@@ -5652,13 +5734,53 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
         &lp2.pubkey(),
         lp2_idx,
         user_idx,
-        500_000,
+        trade_size,
         &matcher_prog,
         &lp1_ctx, // WRONG context for LP2!
     );
     assert!(
         result4.is_err(),
         "SECURITY: LP2 trade with LP1's context should fail"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_after_valid,
+        "Rejected LP2/LP1-context swap must preserve user position"
+    );
+    assert_eq!(
+        env.read_account_position(lp1_idx),
+        lp1_pos_after_valid,
+        "Rejected LP2/LP1-context swap must preserve LP1 position"
+    );
+    assert_eq!(
+        env.read_account_position(lp2_idx),
+        lp2_pos_after_valid,
+        "Rejected LP2/LP1-context swap must preserve LP2 position"
+    );
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        user_cap_after_valid,
+        "Rejected LP2/LP1-context swap must preserve user capital"
+    );
+    assert_eq!(
+        env.read_account_capital(lp1_idx),
+        lp1_cap_after_valid,
+        "Rejected LP2/LP1-context swap must preserve LP1 capital"
+    );
+    assert_eq!(
+        env.read_account_capital(lp2_idx),
+        lp2_cap_after_valid,
+        "Rejected LP2/LP1-context swap must preserve LP2 capital"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_after_valid,
+        "Rejected LP2/LP1-context swap must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_vault(),
+        engine_vault_after_valid,
+        "Rejected LP2/LP1-context swap must preserve engine vault"
     );
     println!("LP2 trade with LP1's context: REJECTED (correct)");
 
