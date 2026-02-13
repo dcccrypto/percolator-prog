@@ -21666,8 +21666,9 @@ fn test_attack_scale_price_zero_rejects_trade() {
     program_path();
 
     let mut env = TestEnv::new();
+    let unit_scale = 200_000_000u32;
     // unit_scale = 200M, so 138M / 200M = 0 → None
-    env.init_market_full(0, 200_000_000, 0);
+    env.init_market_full(0, unit_scale, 0);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -21676,15 +21677,85 @@ fn test_attack_scale_price_zero_rejects_trade() {
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
+    let lp_cap_before = env.read_account_capital(lp_idx);
+    let user_cap_before = env.read_account_capital(user_idx);
+    let lp_pos_before = env.read_account_position(lp_idx);
+    let user_pos_before = env.read_account_position(user_idx);
+    let vault_before = env.vault_balance();
 
     // Crank should fail or be a no-op because oracle price scales to zero
     env.set_slot(200);
-    let _crank_result = env.try_crank(); // May fail or no-op; key test is trade rejection below
+    let crank_result = env.try_crank();
+    let lp_cap_after_crank = env.read_account_capital(lp_idx);
+    let user_cap_after_crank = env.read_account_capital(user_idx);
+    let lp_pos_after_crank = env.read_account_position(lp_idx);
+    let user_pos_after_crank = env.read_account_position(user_idx);
+
+    assert_eq!(
+        lp_pos_after_crank, lp_pos_before,
+        "Scale-zero crank path must not mutate LP position: before={} after={}",
+        lp_pos_before, lp_pos_after_crank
+    );
+    assert_eq!(
+        user_pos_after_crank, user_pos_before,
+        "Scale-zero crank path must not mutate user position: before={} after={}",
+        user_pos_before, user_pos_after_crank
+    );
+    if crank_result.is_ok() {
+        assert!(
+            lp_cap_after_crank <= lp_cap_before,
+            "Accepted scale-zero crank must not mint LP capital: before={} after={}",
+            lp_cap_before,
+            lp_cap_after_crank
+        );
+        assert!(
+            user_cap_after_crank <= user_cap_before,
+            "Accepted scale-zero crank must not mint user capital: before={} after={}",
+            user_cap_before,
+            user_cap_after_crank
+        );
+    } else {
+        assert_eq!(
+            lp_cap_after_crank, lp_cap_before,
+            "Rejected scale-zero crank must preserve LP capital: before={} after={}",
+            lp_cap_before, lp_cap_after_crank
+        );
+        assert_eq!(
+            user_cap_after_crank, user_cap_before,
+            "Rejected scale-zero crank must preserve user capital: before={} after={}",
+            user_cap_before, user_cap_after_crank
+        );
+    }
+
     // Trade should fail because scaled price is None
     let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 100);
     assert!(
         trade_result.is_err(),
         "ATTACK: Trade with zero scaled price should be rejected!"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_after_crank,
+        "Rejected scale-zero trade must preserve user position"
+    );
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        user_cap_after_crank,
+        "Rejected scale-zero trade must preserve user capital"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        vault_before,
+        "Scale-zero edge path must preserve vault balance"
+    );
+    let engine_vault_scaled = env.read_engine_vault() as u128;
+    assert_eq!(
+        engine_vault_scaled * unit_scale as u128,
+        vault_before as u128,
+        "Scale-zero edge path must preserve scaled engine/SPL vault consistency: engine_scaled={} unit_scale={} spl={}",
+        engine_vault_scaled,
+        unit_scale,
+        vault_before
     );
 }
 
