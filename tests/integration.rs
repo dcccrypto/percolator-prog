@@ -8312,14 +8312,44 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
     // Push initial price
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
-    env.set_slot(200);
+    env.set_slot(101);
 
-    // Push a 50% price jump - circuit breaker should clamp or reject
-    let result = env.try_push_oracle_price(&admin, 207_000_000, 200); // +50%
-                                                                      // Whether it succeeds or fails, verify the protocol doesn't accept
-                                                                      // an unclamped 50% jump. If it succeeds, the internal price is clamped.
-                                                                      // If it fails, the push was rejected entirely.
-                                                                      // Either way, vault should be intact.
+    // Config offset for authority_price_e6
+    const AUTH_PRICE_OFF: usize = 360;
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
+    let auth_price_before = u64::from_le_bytes(
+        slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+
+    // Push a 50% price jump one slot later - should be clamped or rejected.
+    let result = env.try_push_oracle_price(&admin, 207_000_000, 101); // +50%
+    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
+    let auth_price_after = u64::from_le_bytes(
+        slab_after[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_ne!(
+        auth_price_after, 207_000_000,
+        "Circuit breaker must not accept unclamped +50% move in one slot"
+    );
+    if result.is_ok() {
+        assert!(
+            auth_price_after >= auth_price_before,
+            "Accepted push should not move authority price backwards (before={} after={})",
+            auth_price_before,
+            auth_price_after
+        );
+    } else {
+        assert_eq!(
+            auth_price_after, auth_price_before,
+            "Rejected push must leave authority price unchanged"
+        );
+    }
+
+    // Either way, vault should be intact.
     let vault = env.vault_balance();
     assert_eq!(
         vault, 0,
