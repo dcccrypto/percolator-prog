@@ -12589,18 +12589,19 @@ fn test_attack_sandwich_deposit_withdraw() {
     // Step 3: Attacker tries to withdraw everything (sandwich back-run)
     // Attacker has no position and no PnL, so withdrawal should work for their capital
     let result = env.try_withdraw(&attacker, attacker_idx, 20_000_000_000);
-
-    // Whether withdrawal succeeds or fails, vault must not lose original funds
-    let vault_after = env.read_vault();
-    // Vault should still have at least the pre-attack amount
-    // (attacker can only take back their own deposit, not extract from others)
     assert!(
-        vault_after >= vault_before_attack,
-        "ATTACK: Sandwich attack extracted value from vault! before_attack={}, after={}, \
-         withdraw_result={:?}",
-        vault_before_attack,
-        vault_after,
+        result.is_ok(),
+        "Attacker with zero position/PnL should be able to withdraw own deposit: {:?}",
         result
+    );
+
+    let vault_after = env.read_vault();
+    // Front-run deposit + back-run withdrawal should net out exactly.
+    assert_eq!(
+        vault_after, vault_before_attack,
+        "ATTACK: Sandwich flow changed vault unexpectedly! before_attack={} after={}",
+        vault_before_attack,
+        vault_after
     );
 }
 
