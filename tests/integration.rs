@@ -14211,7 +14211,18 @@ fn test_attack_gc_after_force_realize_conservation() {
 
     // Open position - user's equity will be wiped by fees/movement
     let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 1);
-    // Trade may fail with tiny capital - that's OK
+    let user_pos_after_trade = env.read_account_position(user_idx);
+    if trade_result.is_ok() {
+        assert_ne!(
+            user_pos_after_trade, 0,
+            "Successful tiny trade must create a non-zero user position"
+        );
+    } else {
+        assert_eq!(
+            user_pos_after_trade, 0,
+            "Failed tiny trade must not mutate user position"
+        );
+    }
 
     // Advance time to trigger maintenance fees (if set)
     env.set_slot(1000);
@@ -17409,6 +17420,13 @@ fn test_attack_warmup_period_zero_instant_settlement() {
 
     let user_cap_after = env.read_account_capital(user_idx);
     let user_pnl = env.read_account_pnl(user_idx);
+    assert!(
+        user_cap_after >= user_cap_before || user_pnl > 0,
+        "With warmup=0 and favorable price move, user must realize positive effect: cap_before={} cap_after={} pnl={}",
+        user_cap_before,
+        user_cap_after,
+        user_pnl
+    );
 
     // With warmup=0, PnL should be fully settled into capital after crank
     // (user_cap should have changed - either from PnL settlement or warmup conversion)
