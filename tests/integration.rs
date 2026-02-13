@@ -10547,6 +10547,13 @@ fn test_attack_oracle_cap_zero_disables_clamping() {
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
     env.set_slot(200);
+    const AUTH_PRICE_OFF: usize = 360;
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
+    let auth_price_before = u64::from_le_bytes(
+        slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
 
     // Push 10x price jump - should be accepted with cap=0
     let result = env.try_push_oracle_price(&admin, 1_380_000_000, 200);
@@ -10554,6 +10561,20 @@ fn test_attack_oracle_cap_zero_disables_clamping() {
         result.is_ok(),
         "With cap=0, large price jump should be accepted: {:?}",
         result
+    );
+    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
+    let auth_price_after = u64::from_le_bytes(
+        slab_after[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        auth_price_before, 138_000_000,
+        "Initial authority price should match initial push in cap=0 test"
+    );
+    assert_eq!(
+        auth_price_after, 1_380_000_000,
+        "Cap=0 should accept full uncapped authority price jump"
     );
 }
 
