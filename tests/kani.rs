@@ -2149,10 +2149,12 @@ fn kani_invert_monotonic() {
     let inv1 = invert_price_e6(raw1, 1);
     let inv2 = invert_price_e6(raw2, 1);
 
-    // If both succeed, inv1 <= inv2 (inverse is monotonically decreasing)
-    if let (Some(i1), Some(i2)) = (inv1, inv2) {
-        assert!(i1 <= i2, "inversion must be monotonically decreasing");
-    }
+    // Bounded domain guarantees successful inversion for both values.
+    assert!(inv1.is_some(), "raw1 in bounded domain must invert successfully");
+    assert!(inv2.is_some(), "raw2 in bounded domain must invert successfully");
+    let i1 = inv1.unwrap();
+    let i2 = inv2.unwrap();
+    assert!(i1 <= i2, "inversion must be monotonically decreasing");
 }
 
 // =============================================================================
