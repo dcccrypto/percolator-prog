@@ -16583,9 +16583,11 @@ fn test_attack_config_extreme_funding_max_bps() {
         0,                 // thresh_min
         u128::MAX / 2,     // thresh_max (huge)
     );
-
-    // Verify config was either accepted or rejected (not silently ignored)
-    let config_accepted = result.is_ok();
+    assert!(
+        result.is_ok(),
+        "Extreme-but-valid thresh_max update should be accepted: {:?}",
+        result
+    );
 
     // Regardless of acceptance, advance and crank - must not panic/overflow
     env.set_slot(100);
@@ -16598,8 +16600,8 @@ fn test_attack_config_extreme_funding_max_bps() {
     };
     assert_eq!(
         spl_vault, 26_000_000_000,
-        "ATTACK: SPL vault changed after extreme config (accepted={})! vault={}",
-        config_accepted, spl_vault
+        "ATTACK: SPL vault changed after extreme config! vault={}",
+        spl_vault
     );
 
     // c_tot should still be consistent
@@ -16607,18 +16609,9 @@ fn test_attack_config_extreme_funding_max_bps() {
     let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
     assert_eq!(
         c_tot, sum,
-        "ATTACK: c_tot desync after extreme config (accepted={})! c_tot={} sum={}",
-        config_accepted, c_tot, sum
+        "ATTACK: c_tot desync after extreme config! c_tot={} sum={}",
+        c_tot, sum
     );
-
-    // Verify the extreme value was either accepted (protocol handles it) or rejected
-    // (protocol validates it). Either way, conservation holds above.
-    // Log the outcome for audit trail
-    if config_accepted {
-        // If accepted, crank above proved no overflow with extreme thresh_max
-    } else {
-        // If rejected, protocol correctly validates extreme inputs
-    }
 }
 
 /// ATTACK: Zero-slot crank loops shouldn't compound funding.
