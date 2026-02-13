@@ -21708,6 +21708,10 @@ fn test_attack_invert_price_zero_result() {
 
     // Initial setup at normal price
     env.crank();
+    let lp_pos_before = env.read_account_position(lp_idx);
+    let user_pos_before = env.read_account_position(user_idx);
+    let lp_cap_before = env.read_account_capital(lp_idx);
+    let user_cap_before = env.read_account_capital(user_idx);
 
     // Set oracle to extremely high price: 10^13 (> INVERSION_CONSTANT=10^12)
     // inverted = 10^12 / 10^13 = 0 → None
@@ -21718,6 +21722,46 @@ fn test_attack_invert_price_zero_result() {
     // Conservation must hold regardless
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
+    let lp_pos_after = env.read_account_position(lp_idx);
+    let user_pos_after = env.read_account_position(user_idx);
+    let lp_cap_after = env.read_account_capital(lp_idx);
+    let user_cap_after = env.read_account_capital(user_idx);
+
+    assert_eq!(
+        lp_pos_after, lp_pos_before,
+        "Zero-invert crank path must not mutate LP position: before={} after={}",
+        lp_pos_before, lp_pos_after
+    );
+    assert_eq!(
+        user_pos_after, user_pos_before,
+        "Zero-invert crank path must not mutate user position: before={} after={}",
+        user_pos_before, user_pos_after
+    );
+    if crank_result.is_ok() {
+        assert!(
+            lp_cap_after <= lp_cap_before,
+            "Accepted zero-invert crank must not mint LP capital: before={} after={}",
+            lp_cap_before,
+            lp_cap_after
+        );
+        assert!(
+            user_cap_after <= user_cap_before,
+            "Accepted zero-invert crank must not mint user capital: before={} after={}",
+            user_cap_before,
+            user_cap_after
+        );
+    } else {
+        assert_eq!(
+            lp_cap_after, lp_cap_before,
+            "Rejected zero-invert crank must preserve LP capital: before={} after={}",
+            lp_cap_before, lp_cap_after
+        );
+        assert_eq!(
+            user_cap_after, user_cap_before,
+            "Rejected zero-invert crank must preserve user capital: before={} after={}",
+            user_cap_before, user_cap_after
+        );
+    }
     assert_eq!(
         engine_vault as u64, vault,
         "Conservation after zero-invert: engine={} vault={}",
