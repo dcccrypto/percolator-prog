@@ -8312,12 +8312,49 @@ fn test_attack_trade_risk_increase_when_gated() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
+    let user_pos_before = env.read_account_position(user_idx);
+    let lp_pos_before = env.read_account_position(lp_idx);
+    let user_cap_before = env.read_account_capital(user_idx);
+    let lp_cap_before = env.read_account_capital(lp_idx);
+    let spl_vault_before = env.vault_balance();
+    let engine_vault_before = env.read_engine_vault();
+
     // Threshold set to u128::MAX means insurance must exceed an impossible amount
     // to allow risk-increasing trades. With no insurance funded, this should gate.
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 5_000_000);
     assert!(
         result.is_err(),
         "ATTACK: Risk-increasing trade should be gated when threshold exceeds insurance"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        user_pos_before,
+        "Rejected gated trade must preserve user position"
+    );
+    assert_eq!(
+        env.read_account_position(lp_idx),
+        lp_pos_before,
+        "Rejected gated trade must preserve LP position"
+    );
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        user_cap_before,
+        "Rejected gated trade must preserve user capital"
+    );
+    assert_eq!(
+        env.read_account_capital(lp_idx),
+        lp_cap_before,
+        "Rejected gated trade must preserve LP capital"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_before,
+        "Rejected gated trade must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_engine_vault(),
+        engine_vault_before,
+        "Rejected gated trade must preserve engine vault"
     );
 }
 
