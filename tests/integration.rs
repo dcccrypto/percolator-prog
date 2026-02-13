@@ -9311,11 +9311,36 @@ fn test_attack_close_slab_with_insurance_remaining() {
     let insurance_bal = env.read_insurance_balance();
     assert_eq!(insurance_bal, 1_000_000_000, "Insurance should equal topped-up amount");
 
+    let insurance_before = env.read_insurance_balance();
+    let spl_vault_before = env.vault_balance();
+    let engine_vault_before = env.read_engine_vault();
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
+
     // Try to close slab - should fail because insurance > 0
     let result = env.try_close_slab();
     assert!(
         result.is_err(),
         "ATTACK: CloseSlab with non-zero insurance should fail"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "Rejected CloseSlab with non-zero insurance must preserve insurance balance"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_before,
+        "Rejected CloseSlab with non-zero insurance must preserve SPL vault"
+    );
+    assert_eq!(
+        env.read_engine_vault(),
+        engine_vault_before,
+        "Rejected CloseSlab with non-zero insurance must preserve engine vault"
+    );
+    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
+    assert_eq!(
+        slab_after, slab_before,
+        "Rejected CloseSlab with non-zero insurance must preserve slab bytes"
     );
 }
 
