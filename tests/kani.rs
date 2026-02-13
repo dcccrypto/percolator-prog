@@ -3114,11 +3114,10 @@ fn kani_init_market_scale_boundary_ok() {
 /// Prove: scale=MAX_UNIT_SCALE+1 is rejected (boundary)
 #[kani::proof]
 fn kani_init_market_scale_boundary_reject() {
-    // Note: if MAX_UNIT_SCALE is u32::MAX, this proof is vacuous (which is fine)
-    if MAX_UNIT_SCALE < u32::MAX {
-        let result = init_market_scale_ok(MAX_UNIT_SCALE + 1);
-        assert!(!result, "scale=MAX_UNIT_SCALE+1 must be rejected");
-    }
+    // Keep this proof non-vacuous: boundary+1 must be constructible.
+    assert!(MAX_UNIT_SCALE < u32::MAX, "MAX_UNIT_SCALE must allow +1 boundary test");
+    let result = init_market_scale_ok(MAX_UNIT_SCALE + 1);
+    assert!(!result, "scale=MAX_UNIT_SCALE+1 must be rejected");
 }
 
 /// Prove: any scale in valid range [0, MAX_UNIT_SCALE] is accepted
