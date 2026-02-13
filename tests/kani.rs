@@ -1211,15 +1211,14 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
         exec_size,
     );
 
-    // Only consider rejection cases
-    kani::assume(matches!(decision, TradeCpiDecision::Reject));
-
-    // For ANY rejection, nonce must be unchanged
-    let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(
-        result_nonce, old_nonce,
-        "ANY TradeCpi rejection must leave nonce unchanged"
-    );
+    // Conditional universal: whenever decision is Reject, nonce must be unchanged.
+    if matches!(decision, TradeCpiDecision::Reject) {
+        let result_nonce = decision_nonce(old_nonce, decision);
+        assert_eq!(
+            result_nonce, old_nonce,
+            "ANY TradeCpi rejection must leave nonce unchanged"
+        );
+    }
 }
 
 /// Prove: ANY TradeCpi acceptance increments nonce (universal quantification)
@@ -1267,16 +1266,15 @@ fn kani_tradecpi_any_accept_increments_nonce() {
         exec_size,
     );
 
-    // Only consider acceptance cases
-    kani::assume(matches!(decision, TradeCpiDecision::Accept { .. }));
-
-    // For ANY acceptance, nonce must increment by 1
-    let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(
-        result_nonce,
-        old_nonce.wrapping_add(1),
-        "ANY TradeCpi acceptance must increment nonce by 1"
-    );
+    // Conditional universal: whenever decision is Accept, nonce must increment by 1.
+    if matches!(decision, TradeCpiDecision::Accept { .. }) {
+        let result_nonce = decision_nonce(old_nonce, decision);
+        assert_eq!(
+            result_nonce,
+            old_nonce.wrapping_add(1),
+            "ANY TradeCpi acceptance must increment nonce by 1"
+        );
+    }
 }
 
 // =============================================================================
@@ -1628,15 +1626,14 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
         req_size,
     );
 
-    // Only consider rejection cases
-    kani::assume(matches!(decision, TradeCpiDecision::Reject));
-
-    // For ANY rejection, nonce must be unchanged
-    let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(
-        result_nonce, old_nonce,
-        "ANY TradeCpi rejection (from real inputs) must leave nonce unchanged"
-    );
+    // Conditional universal: whenever decision is Reject, nonce must be unchanged.
+    if matches!(decision, TradeCpiDecision::Reject) {
+        let result_nonce = decision_nonce(old_nonce, decision);
+        assert_eq!(
+            result_nonce, old_nonce,
+            "ANY TradeCpi rejection (from real inputs) must leave nonce unchanged"
+        );
+    }
 }
 
 /// Prove: ANY acceptance from decide_trade_cpi_from_ret increments nonce
@@ -1698,16 +1695,15 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
         req_size,
     );
 
-    // Only consider acceptance cases
-    kani::assume(matches!(decision, TradeCpiDecision::Accept { .. }));
-
-    // For ANY acceptance, nonce must increment by 1
-    let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(
-        result_nonce,
-        old_nonce.wrapping_add(1),
-        "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1"
-    );
+    // Conditional universal: whenever decision is Accept, nonce must increment by 1.
+    if matches!(decision, TradeCpiDecision::Accept { .. }) {
+        let result_nonce = decision_nonce(old_nonce, decision);
+        assert_eq!(
+            result_nonce,
+            old_nonce.wrapping_add(1),
+            "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1"
+        );
+    }
 }
 
 /// Prove: ANY acceptance uses exec_size from ret, not req_size
