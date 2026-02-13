@@ -1024,10 +1024,17 @@ fn kani_tradecpi_accept_increments_nonce() {
 fn kani_tradecpi_accept_uses_exec_size() {
     let old_nonce: u64 = kani::any();
     let exec_size: i128 = kani::any();
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+    kani::assume(matcher_shape_ok(shape));
 
     let decision = decide_trade_cpi(
         old_nonce,
-        valid_shape(),
+        shape,
         true,
         true,
         true,
@@ -1038,11 +1045,14 @@ fn kani_tradecpi_accept_uses_exec_size() {
         exec_size,
     );
 
-    if let TradeCpiDecision::Accept { chosen_size, .. } = decision {
-        assert_eq!(chosen_size, exec_size, "TradeCpi accept must use exec_size");
-    } else {
-        panic!("expected Accept");
-    }
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Accept {
+            new_nonce: old_nonce.wrapping_add(1),
+            chosen_size: exec_size,
+        },
+        "TradeCpi accept must preserve exec_size for any valid matcher shape"
+    );
 }
 
 // =============================================================================
