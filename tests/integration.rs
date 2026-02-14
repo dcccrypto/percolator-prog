@@ -6109,42 +6109,31 @@ fn test_position_flip_minimal_equity() {
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, size);
     println!("Small long position (1M units): {:?}", result.is_ok());
     let pos_after_open = env.read_account_position(user_idx);
+    assert!(
+        result.is_ok(),
+        "Precondition failed: opening minimal-equity long should succeed: {:?}",
+        result
+    );
+    assert_eq!(
+        pos_after_open, size,
+        "Accepted open should create 1M position: got={}",
+        pos_after_open
+    );
 
-    if result.is_ok() {
-        assert_eq!(
-            pos_after_open, size,
-            "Accepted open should create 1M position: got={}",
-            pos_after_open
-        );
-
-        // Now try to flip - this should require initial margin on the new position
-        let flip_size: i128 = -2_000_000; // Net: -1M (short)
-        let flip_result = env.try_trade(&user, &lp, lp_idx, user_idx, flip_size);
-        let pos_after_flip = env.read_account_position(user_idx);
-
-        // After flip, position is -1M (short), same notional
-        // Initial margin still 0.1 SOL, but we've paid trading fee on 1M + 2M = 3M
-        // This tests whether the accumulated fees deplete equity
-        if flip_result.is_ok() {
-            assert_eq!(
-                pos_after_flip, -1_000_000,
-                "Successful flip should end at -1M position: got={}",
-                pos_after_flip
-            );
-        } else {
-            assert_eq!(
-                pos_after_flip, size,
-                "Rejected flip should preserve initial +1M position: got={}",
-                pos_after_flip
-            );
-        }
-    } else {
-        assert_eq!(
-            pos_after_open, 0,
-            "Rejected open should keep zero position: got={}",
-            pos_after_open
-        );
-    }
+    // Now try to flip - this should require initial margin on the new position
+    let flip_size: i128 = -2_000_000; // Net: -1M (short)
+    let flip_result = env.try_trade(&user, &lp, lp_idx, user_idx, flip_size);
+    let pos_after_flip = env.read_account_position(user_idx);
+    assert!(
+        flip_result.is_ok(),
+        "Minimal-equity flip should succeed in this setup: {:?}",
+        flip_result
+    );
+    assert_eq!(
+        pos_after_flip, -1_000_000,
+        "Successful flip should end at -1M position: got={}",
+        pos_after_flip
+    );
 
     assert_eq!(
         env.vault_balance(),
