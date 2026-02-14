@@ -5860,6 +5860,7 @@ fn test_extreme_price_movement_with_large_position() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // LP with substantial capital
     let lp = Keypair::new();
@@ -5872,6 +5873,7 @@ fn test_extreme_price_movement_with_large_position() {
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 15_000_000_000); // 15 SOL margin
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
 
     // Open large long position
     let size: i128 = 100_000_000; // 100 SOL position
@@ -5890,26 +5892,21 @@ fn test_extreme_price_movement_with_large_position() {
     env.crank();
     println!("Step 2: Price dropped 15% to $117.30");
 
-    // User should be underwater - liquidation may fail if force-realize already
-    // closed the position during crank (insurance=0 triggers force-realize mode)
+    // User should be underwater and liquidatable after this move.
     let pos_before_liq = env.read_account_position(user_idx);
-    let liq_result = env.try_liquidate(user_idx);
-    // Either liquidation succeeds (reduces position) or was already force-realized
+    let liq_result = env.try_liquidate_target(user_idx);
+    assert!(
+        liq_result.is_ok(),
+        "Underwater account should be liquidatable: {:?}",
+        liq_result
+    );
     let pos_after_liq = env.read_account_position(user_idx);
-    if liq_result.is_ok() {
-        assert!(
-            pos_after_liq.unsigned_abs() <= pos_before_liq.unsigned_abs(),
-            "Successful liquidation should not increase exposure: before={} after={}",
-            pos_before_liq,
-            pos_after_liq
-        );
-    } else {
-        assert_eq!(
-            pos_after_liq, pos_before_liq,
-            "Failed liquidation must preserve position: before={} after={}",
-            pos_before_liq, pos_after_liq
-        );
-    }
+    assert!(
+        pos_after_liq.unsigned_abs() <= pos_before_liq.unsigned_abs(),
+        "Successful liquidation should not increase exposure: before={} after={}",
+        pos_before_liq,
+        pos_after_liq
+    );
 
     // If liquidation succeeded or failed, verify accounting
     env.set_slot_and_price(300, 117_300_000);
@@ -5930,10 +5927,18 @@ fn test_extreme_price_movement_with_large_position() {
     let user2_idx = env.init_user(&user2);
     env.deposit(&user2, user2_idx, 50_000_000_000); // 50 SOL
 
-    // Small trade to verify market still functions (may fail if force-realize
-    // mode closed LP's position since insurance=0)
+    // Small trade to verify market still functions after crash + liquidation.
     let trade2_result = env.try_trade(&user2, &lp, lp_idx, user2_idx, 1_000_000);
-    println!("Post-crash trade result: {}", if trade2_result.is_ok() { "ok" } else { "rejected" });
+    assert!(
+        trade2_result.is_ok(),
+        "Post-crash trade should still execute: {:?}",
+        trade2_result
+    );
+    assert_eq!(
+        env.read_account_position(user2_idx),
+        1_000_000,
+        "Successful post-crash trade should create requested position"
+    );
 
     // Vault conservation: engine.vault must match SPL vault balance
     let engine_vault = env.read_engine_vault();
