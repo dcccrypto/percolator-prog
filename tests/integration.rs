@@ -17947,34 +17947,28 @@ fn test_attack_withdraw_zero_amount_no_state_change() {
     env.crank();
 
     let cap_before = env.read_account_capital(user_idx);
+    let vault_before = env.vault_balance();
 
-    // Withdraw 0 - should be rejected or accepted as no-op
+    // Withdraw 0 should be accepted as a no-op.
     let result = env.try_withdraw(&user, user_idx, 0);
 
     let cap_after = env.read_account_capital(user_idx);
-    if result.is_ok() {
-        // If accepted, must be a no-op
-        assert_eq!(
-            cap_before, cap_after,
-            "ATTACK: Zero withdrawal accepted but changed capital! before={} after={}",
-            cap_before, cap_after
-        );
-        // SPL vault must also be unchanged
-        let spl_vault = {
-            let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-            TokenAccount::unpack(&vault_data).unwrap().amount
-        };
-        assert_eq!(
-            spl_vault, 15_000_000_000,
-            "ATTACK: SPL vault changed after accepted zero withdrawal!"
-        );
-    } else {
-        // If rejected, protocol correctly prevents zero withdrawals
-        assert_eq!(
-            cap_before, cap_after,
-            "State changed despite failed zero withdrawal!"
-        );
-    }
+    let vault_after = env.vault_balance();
+    assert!(
+        result.is_ok(),
+        "Zero-value withdrawal should be accepted as no-op: {:?}",
+        result
+    );
+    assert_eq!(
+        cap_before, cap_after,
+        "ATTACK: Zero withdrawal accepted but changed capital! before={} after={}",
+        cap_before, cap_after
+    );
+    assert_eq!(
+        vault_before, vault_after,
+        "ATTACK: Zero withdrawal accepted but changed vault! before={} after={}",
+        vault_before, vault_after
+    );
 }
 
 /// ATTACK: Trade with zero size should be harmless.
