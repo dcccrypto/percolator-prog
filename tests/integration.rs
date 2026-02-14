@@ -25156,22 +25156,20 @@ fn test_attack_position_flip_margin_requirement_switch() {
 
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    // Small deposit to test margin limits
-    env.deposit(&user, user_idx, 2_000_000_000);
+    // Tight deposit to make initial-vs-maintenance margin distinction observable.
+    env.deposit(&user, user_idx, 20_000_000); // 0.02 SOL
 
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
     env.crank();
 
-    // Open moderate long position
+    // Open long position near initial-margin boundary.
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     assert!(result.is_ok(), "Initial long trade should succeed");
 
-    // Now flip to short (position goes from +1M to -1M, crosses zero)
-    // This requires initial_margin_bps for the new direction
-    let flip_result = env.try_trade(&user, &lp, lp_idx, user_idx, -2_000_000);
+    // Flip to a larger short (position +1M -> -2M): this requires initial margin
+    // for the new 2M short side and should be rejected in this tight-equity setup.
+    let flip_result = env.try_trade(&user, &lp, lp_idx, user_idx, -3_000_000);
 
-    // Either succeeds (enough margin) or fails (initial margin too high)
-    // But must not panic and conservation holds
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
     assert_eq!(
@@ -25180,21 +25178,18 @@ fn test_attack_position_flip_margin_requirement_switch() {
         engine_vault, vault
     );
 
-    // Verify position is consistent
+    // Flip must fail and preserve the original long if initial margin is enforced.
     let pos = env.read_account_position(user_idx);
-    if flip_result.is_ok() {
-        assert_eq!(
-            pos, -1_000_000,
-            "Flip succeeded so position should be -1M: got {}",
-            pos
-        );
-    } else {
-        assert_eq!(
-            pos, 1_000_000,
-            "Flip failed so position should remain +1M: got {}",
-            pos
-        );
-    }
+    assert!(
+        flip_result.is_err(),
+        "Flip should be rejected when new-side initial margin exceeds available equity: {:?}",
+        flip_result
+    );
+    assert_eq!(
+        pos, 1_000_000,
+        "Rejected flip should preserve +1M position: got {}",
+        pos
+    );
 }
 
 /// ATTACK: Large maintenance fee with huge dt gap (thousands of slots).
