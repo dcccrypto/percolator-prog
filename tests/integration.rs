@@ -12860,7 +12860,7 @@ fn test_attack_full_lifecycle_conservation() {
 fn test_attack_hyperp_mark_manipulation_via_trade() {
     let mut env = TradeCpiTestEnv::new();
 
-    env.init_market_hyperp(1_000_000); // mark = 1.0
+    env.init_market_hyperp_with_warmup(1_000_000, 100); // mark = 1.0, warmup > 0
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
@@ -28298,21 +28298,23 @@ fn test_honest_user_close_after_force_close_positive_pnl() {
         "User should have positive PnL from price increase"
     );
 
-    // CloseAccount immediately — may fail if warmup period > 0
+    // CloseAccount immediately: must fail while warmup is active.
     let result = env.try_close_account(&user, user_idx);
-    if result.is_err() {
-        // Wait for warmup period to elapse and retry
-        env.set_slot(10_000);
-        let result2 = env.try_close_account(&user, user_idx);
-        assert!(
-            result2.is_ok(),
-            "User should close after warmup elapses: {:?}",
-            result2
-        );
-        println!("User closed after warmup period");
-    } else {
-        println!("User closed immediately (warmup period = 0 or instant)");
-    }
+    assert!(
+        result.is_err(),
+        "CloseAccount must be blocked until warmup elapses: {:?}",
+        result
+    );
+
+    // Wait for warmup period to elapse and retry.
+    env.set_slot(400); // > 100 slots after close-at-200
+    let result2 = env.try_close_account(&user, user_idx);
+    assert!(
+        result2.is_ok(),
+        "User should close after warmup elapses: {:?}",
+        result2
+    );
+    println!("User closed after warmup period");
 
     println!("HONEST USER CLOSE AFTER FORCE-CLOSE POSITIVE PNL: PASSED");
 }
