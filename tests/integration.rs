@@ -12710,23 +12710,40 @@ fn test_attack_wrong_slab_program_id() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    // The slab header has the program_id baked in during InitMarket.
-    // If someone tried to invoke a different program with this slab,
-    // slab_guard would reject because program_id wouldn't match.
-    // We can't easily test cross-program in LiteSVM, but we can verify
-    // the slab_guard check exists by testing with the valid program.
+    // Tamper slab owner to simulate "slab belongs to wrong program".
+    let original_slab = env
+        .svm
+        .get_account(&env.slab)
+        .expect("slab must exist before owner tamper");
+    let mut tampered_slab = original_slab.clone();
+    tampered_slab.owner = Pubkey::new_unique();
+    env.svm
+        .set_account(env.slab, tampered_slab)
+        .expect("must be able to set tampered slab owner");
 
-    // Verify market is working correctly with the right program
+    let vault_before = env.vault_balance();
     let result = env.try_withdraw(&user, user_idx, 500_000_000);
     assert!(
-        result.is_ok(),
-        "Same-program operation should work: {:?}",
+        result.is_err(),
+        "SECURITY: Withdraw should fail when slab owner != program_id: {:?}",
         result
     );
     assert_eq!(
         env.vault_balance(),
+        vault_before,
+        "Rejected withdraw with wrong slab owner must not change vault"
+    );
+
+    // Restore slab owner and show same operation now succeeds.
+    env.svm
+        .set_account(env.slab, original_slab)
+        .expect("must restore original slab owner");
+    let result = env.try_withdraw(&user, user_idx, 500_000_000);
+    assert!(result.is_ok(), "Withdraw should succeed after restoring slab owner: {:?}", result);
+    assert_eq!(
+        env.vault_balance(),
         500_000_000,
-        "Vault should reflect withdrawal"
+        "Vault should reflect a single successful withdrawal after restore"
     );
 }
 
