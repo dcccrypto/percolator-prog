@@ -3682,14 +3682,20 @@ fn test_critical_liquidation_rejected_when_solvent() {
     let position_before = env.read_account_position(user_idx);
     let insurance_before = env.read_insurance_balance();
 
-    // Try to liquidate the well-capitalized user - should fail
+    // Try to liquidate the well-capitalized user.
+    // Instruction execution succeeds, but engine liquidation should be a no-op.
     let result = env.try_liquidate_target(user_idx);
+    assert!(
+        result.is_ok(),
+        "Liquidation instruction should execute for solvency checks: {:?}",
+        result
+    );
 
     let capital_after = env.read_account_capital(user_idx);
     let position_after = env.read_account_position(user_idx);
     let insurance_after = env.read_insurance_balance();
 
-    // Whether liquidation returns Ok(no-op) or Err, a solvent account must remain untouched.
+    // Rejected liquidation must leave a solvent account untouched.
     assert_eq!(
         position_after, position_before,
         "Solvent account liquidation attempt changed position: before={} after={} result={:?}",
