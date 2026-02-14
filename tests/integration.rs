@@ -3941,7 +3941,7 @@ struct TradeCpiTestEnv {
 }
 
 impl TradeCpiTestEnv {
-    fn new() -> Option<Self> {
+    fn new() -> Self {
         let percolator_path = program_path();
         let matcher_path = matcher_program_path();
 
@@ -4031,7 +4031,7 @@ impl TradeCpiTestEnv {
             ..Clock::default()
         });
 
-        Some(TradeCpiTestEnv {
+        TradeCpiTestEnv {
             svm,
             program_id,
             matcher_program_id,
@@ -4042,7 +4042,7 @@ impl TradeCpiTestEnv {
             pyth_index,
             pyth_col,
             account_count: 0,
-        })
+        }
     }
 
     fn init_market(&mut self) {
@@ -4920,10 +4920,7 @@ impl TradeCpiTestEnv {
 /// - LP PDA signature proves the CPI comes from percolator for this LP
 #[test]
 fn test_tradecpi_permissionless_lp_no_signature_required() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -5022,10 +5019,7 @@ fn test_tradecpi_permissionless_lp_no_signature_required() {
 /// at InitLP. This prevents attackers from bypassing the registered matcher.
 #[test]
 fn test_tradecpi_rejects_wrong_matcher_program() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -5113,10 +5107,7 @@ fn test_tradecpi_rejects_wrong_matcher_program() {
 /// at InitLP. Each LP has a specific context (with its own parameters).
 #[test]
 fn test_tradecpi_rejects_wrong_matcher_context() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -5240,10 +5231,7 @@ fn test_tradecpi_rejects_wrong_matcher_context() {
 /// This prevents attackers from substituting a different PDA.
 #[test]
 fn test_tradecpi_rejects_wrong_lp_pda() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -5335,10 +5323,7 @@ fn test_tradecpi_rejects_wrong_lp_pda() {
 /// This prevents an attacker from creating an account at the PDA address.
 #[test]
 fn test_tradecpi_rejects_pda_with_wrong_shape() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -5436,10 +5421,7 @@ fn test_tradecpi_rejects_pda_with_wrong_shape() {
 /// TradeCpi must reject and leave accounting unchanged.
 #[test]
 fn test_attack_tradecpi_self_program_matcher_rejected() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
     let self_prog = env.program_id;
@@ -5509,10 +5491,7 @@ fn test_attack_tradecpi_self_program_matcher_rejected() {
 /// Must be rejected (shape/ownership mismatch) with no state mutation.
 #[test]
 fn test_attack_tradecpi_alias_slab_as_matcher_context_rejected() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -5572,10 +5551,7 @@ fn test_attack_tradecpi_alias_slab_as_matcher_context_rejected() {
 /// This ensures LP isolation.
 #[test]
 fn test_tradecpi_lp_matcher_binding_isolation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
@@ -6580,10 +6556,7 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
 #[test]
 fn test_premarket_resolution_full_lifecycle() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET RESOLUTION FULL LIFECYCLE TEST ===");
     println!();
@@ -6820,10 +6793,7 @@ fn test_resolved_market_allows_user_withdrawal() {
 #[test]
 fn test_withdraw_insurance_requires_positions_closed() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     println!("=== WITHDRAW INSURANCE REQUIRES POSITIONS CLOSED TEST ===");
     println!();
@@ -6895,10 +6865,7 @@ fn test_withdraw_insurance_requires_positions_closed() {
 #[test]
 fn test_premarket_paginated_force_close() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET PAGINATED FORCE-CLOSE TEST ===");
     println!("Simulating multiple accounts requiring multiple cranks to close");
@@ -7029,10 +6996,7 @@ fn test_premarket_paginated_force_close() {
 #[test]
 fn test_premarket_binary_outcome_price_zero() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET BINARY OUTCOME PRICE=1e-6 (NO) TEST ===");
     println!();
@@ -7111,10 +7075,7 @@ fn test_premarket_binary_outcome_price_zero() {
 #[test]
 fn test_premarket_binary_outcome_price_one() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET BINARY OUTCOME PRICE=1 TEST ===");
     println!();
@@ -7203,10 +7164,7 @@ fn test_premarket_binary_outcome_price_one() {
 #[test]
 fn test_premarket_force_close_cu_benchmark() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET FORCE-CLOSE CU BENCHMARK ===");
     println!("Testing compute unit consumption for paginated force-close");
@@ -7390,10 +7348,7 @@ fn test_premarket_force_close_cu_benchmark() {
 /// force-close settles positions to a price that generates positive PnL.
 #[test]
 fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -8587,10 +8542,7 @@ fn test_attack_position_flip_requires_initial_margin() {
 /// Expected: Matcher program must match what was registered at InitLP.
 #[test]
 fn test_attack_tradecpi_wrong_matcher_program() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
     env.init_market();
 
     let matcher_prog = env.matcher_program_id;
@@ -8660,10 +8612,7 @@ fn test_attack_tradecpi_wrong_matcher_program() {
 /// Expected: Context must be owned by registered matcher program.
 #[test]
 fn test_attack_tradecpi_wrong_matcher_context() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
     env.init_market();
 
     let matcher_prog = env.matcher_program_id;
@@ -8746,10 +8695,7 @@ fn test_attack_tradecpi_wrong_matcher_context() {
 /// Expected: PDA derivation check fails.
 #[test]
 fn test_attack_tradecpi_wrong_lp_pda() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
     env.init_market();
 
     let matcher_prog = env.matcher_program_id;
@@ -8817,10 +8763,7 @@ fn test_attack_tradecpi_wrong_lp_pda() {
 /// Expected: PDA shape validation rejects accounts with lamports/data.
 #[test]
 fn test_attack_tradecpi_pda_with_lamports() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
     env.init_market();
 
     let matcher_prog = env.matcher_program_id;
@@ -8907,10 +8850,7 @@ fn test_attack_tradecpi_pda_with_lamports() {
 /// Expected: Matcher context must match the LP's registered context.
 #[test]
 fn test_attack_tradecpi_cross_lp_matcher_binding() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
     env.init_market();
 
     let matcher_prog = env.matcher_program_id;
@@ -10649,10 +10589,7 @@ fn test_attack_withdraw_between_resolution_and_force_close() {
 /// Expected: No new trades after resolution.
 #[test]
 fn test_attack_trade_after_force_close() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
     env.init_market_hyperp(1_000_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -12902,9 +12839,7 @@ fn test_attack_full_lifecycle_conservation() {
 /// value via favorable PnL. Circuit breaker should limit mark movement.
 #[test]
 fn test_attack_hyperp_mark_manipulation_via_trade() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000); // mark = 1.0
 
@@ -12973,9 +12908,7 @@ fn test_attack_hyperp_mark_manipulation_via_trade() {
 /// then cranking to move index toward mark. This test verifies conservation.
 #[test]
 fn test_attack_hyperp_index_lag_exploitation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13047,9 +12980,7 @@ fn test_attack_hyperp_index_lag_exploitation() {
 /// Sum of all PnL changes after force-close should be zero (zero-sum).
 #[test]
 fn test_attack_premarket_force_close_pnl_conservation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13146,9 +13077,7 @@ fn test_attack_premarket_force_close_pnl_conservation() {
 /// User might try to extract capital while still having an open position.
 #[test]
 fn test_attack_premarket_withdraw_before_force_close() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13199,9 +13128,7 @@ fn test_attack_premarket_withdraw_before_force_close() {
 /// No state corruption from redundant resolution cranks.
 #[test]
 fn test_attack_premarket_extra_cranks_idempotent() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13285,9 +13212,7 @@ fn test_attack_premarket_extra_cranks_idempotent() {
 /// Test that force-close handles extreme PnL without overflow.
 #[test]
 fn test_attack_premarket_resolve_extreme_high_price() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13357,9 +13282,7 @@ fn test_attack_premarket_resolve_extreme_high_price() {
 /// Only admin should be able to withdraw insurance funds.
 #[test]
 fn test_attack_withdraw_insurance_non_admin() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13391,9 +13314,7 @@ fn test_attack_withdraw_insurance_non_admin() {
 /// Second withdrawal should find zero insurance and be a no-op.
 #[test]
 fn test_attack_double_withdraw_insurance() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13463,9 +13384,7 @@ fn test_attack_double_withdraw_insurance() {
 /// After resolution, no new trades should be possible.
 #[test]
 fn test_attack_tradecpi_after_resolution() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13509,9 +13428,7 @@ fn test_attack_tradecpi_after_resolution() {
 /// Deposits should be blocked on resolved markets.
 #[test]
 fn test_attack_hyperp_deposit_after_resolution() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13558,9 +13475,7 @@ fn test_attack_hyperp_deposit_after_resolution() {
 /// no value is created or destroyed. Total vault must remain constant.
 #[test]
 fn test_attack_multi_lp_conservation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13656,9 +13571,7 @@ fn test_attack_multi_lp_conservation() {
 /// Attacker can only withdraw at most what they deposited.
 #[test]
 fn test_attack_sandwich_deposit_withdraw() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13728,9 +13641,7 @@ fn test_attack_sandwich_deposit_withdraw() {
 /// Zero price should be rejected since it would break all calculations.
 #[test]
 fn test_attack_hyperp_push_zero_mark_price() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13823,9 +13734,7 @@ fn test_attack_resolve_market_non_admin() {
 /// After force-close, LP may have PnL that prevents account closure.
 #[test]
 fn test_attack_lp_close_account_with_pnl_after_force_close() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -13965,9 +13874,7 @@ fn test_attack_hyperp_push_extreme_price() {
 /// to accumulate premium funding, then check that funding doesn't create value.
 #[test]
 fn test_attack_hyperp_funding_rate_no_value_creation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14039,9 +13946,7 @@ fn test_attack_hyperp_funding_rate_no_value_creation() {
 /// Old authority must be rejected, new authority must be accepted.
 #[test]
 fn test_attack_hyperp_oracle_authority_swap_with_positions() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14112,9 +14017,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
 /// CloseSlab requires insurance_fund.balance == 0.
 #[test]
 fn test_attack_close_slab_before_insurance_withdrawal() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14412,9 +14315,7 @@ fn test_attack_warmup_prevents_immediate_profit_withdrawal() {
 /// Saturating arithmetic should prevent overflow without panicking.
 #[test]
 fn test_attack_extreme_position_size() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14455,9 +14356,7 @@ fn test_attack_extreme_position_size() {
 /// ATTACK: Try to trade with i128::MIN position size (negative extreme).
 #[test]
 fn test_attack_extreme_negative_position_size() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14497,9 +14396,7 @@ fn test_attack_extreme_negative_position_size() {
 /// vault_balance must equal internal vault tracking at every step.
 #[test]
 fn test_attack_conservation_through_price_movement() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14591,9 +14488,7 @@ fn test_attack_conservation_through_price_movement() {
 /// After force-closing only some accounts, internal state must still be consistent.
 #[test]
 fn test_attack_premarket_partial_force_close_conservation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -14668,9 +14563,7 @@ fn test_attack_premarket_partial_force_close_conservation() {
 /// Verifies vault conservation after multiple trades.
 #[test]
 fn test_attack_nonce_replay_same_trade() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -15009,9 +14902,7 @@ fn test_attack_double_resolve_market() {
 /// Many tiny trades should not accumulate rounding profit.
 #[test]
 fn test_attack_rounding_extraction_rapid_trades() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -16016,9 +15907,7 @@ fn test_attack_trading_fee_insurance_conservation() {
 /// correctly settles all positions and maintains conservation.
 #[test]
 fn test_attack_premarket_paginated_force_close() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -16770,9 +16659,7 @@ fn test_attack_same_slot_open_close_timing() {
 /// Verify PnL is calculated correctly when resolution price differs from entry.
 #[test]
 fn test_attack_force_close_pnl_accuracy() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -16845,9 +16732,7 @@ fn test_attack_force_close_pnl_accuracy() {
 /// Verify attacker can't push mark price arbitrarily far from index.
 #[test]
 fn test_attack_hyperp_mark_price_clamp_defense() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -20008,10 +19893,7 @@ fn test_attack_non_admin_resolve_rejected() {
 #[test]
 fn test_attack_withdraw_insurance_before_force_close() {
     // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -27490,10 +27372,7 @@ fn test_property_account_lifecycle_invariants() {
 /// Checks that vault SPL balance accounts for all user capital at every step.
 #[test]
 fn test_binary_market_complete_lifecycle_conservation() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000); // $1.00
 
@@ -27627,10 +27506,7 @@ fn test_binary_market_complete_lifecycle_conservation() {
 /// First call updates warmup slope; second call converts PnL to capital.
 #[test]
 fn test_binary_market_close_account_warmup_delay() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     // Create hyperp market with warmup_period = 100 slots
     env.init_market_hyperp_with_warmup(1_000_000, 100);
@@ -27737,10 +27613,7 @@ fn test_binary_market_close_account_warmup_delay() {
 /// Losses are settled to capital immediately (no warmup delay).
 #[test]
 fn test_binary_market_negative_pnl_close_immediate() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     // Create hyperp market with warmup_period = 100 slots (to test warmup doesn't block losers)
     env.init_market_hyperp_with_warmup(1_000_000, 100);
@@ -27812,10 +27685,7 @@ fn test_binary_market_negative_pnl_close_immediate() {
 /// expected PnL from position * (settlement - entry) / 1e6 with actual PnL.
 #[test]
 fn test_binary_market_force_close_pnl_correctness() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -27905,10 +27775,7 @@ fn test_binary_market_force_close_pnl_correctness() {
 /// (skips them without modifying state).
 #[test]
 fn test_binary_market_force_close_zero_position_noop() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
 
@@ -27961,10 +27828,7 @@ fn test_binary_market_force_close_zero_position_noop() {
 /// Happy path: resolve → force-close positions → admin force-close account
 #[test]
 fn test_admin_force_close_account_happy_path() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28034,10 +27898,7 @@ fn test_admin_force_close_account_happy_path() {
 /// AdminForceCloseAccount requires RESOLVED flag
 #[test]
 fn test_admin_force_close_account_requires_resolved() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28063,10 +27924,7 @@ fn test_admin_force_close_account_requires_resolved() {
 /// AdminForceCloseAccount requires admin signer
 #[test]
 fn test_admin_force_close_account_requires_admin() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28098,10 +27956,7 @@ fn test_admin_force_close_account_requires_admin() {
 /// AdminForceCloseAccount requires zero position
 #[test]
 fn test_admin_force_close_account_requires_zero_position() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28149,10 +28004,7 @@ fn test_admin_force_close_account_requires_zero_position() {
 /// AdminForceCloseAccount with positive PnL applies haircut
 #[test]
 fn test_admin_force_close_account_with_positive_pnl() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28219,10 +28071,7 @@ fn test_admin_force_close_account_with_positive_pnl() {
 /// AdminForceCloseAccount with negative PnL reduces capital
 #[test]
 fn test_admin_force_close_account_with_negative_pnl() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28281,10 +28130,7 @@ fn test_admin_force_close_account_with_negative_pnl() {
 /// Full lifecycle: resolve → force-close positions → admin force-close all accounts → withdraw insurance → close slab
 #[test]
 fn test_admin_force_close_account_enables_close_slab() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28376,10 +28222,7 @@ fn test_admin_force_close_account_enables_close_slab() {
 /// PnL to capital over the warmup period.
 #[test]
 fn test_honest_user_close_after_force_close_positive_pnl() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000); // mark = 1.0
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28455,10 +28298,7 @@ fn test_honest_user_close_after_force_close_positive_pnl() {
 /// Negative PnL is settled immediately (deducted from capital), no warmup needed.
 #[test]
 fn test_honest_user_close_after_force_close_negative_pnl() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28516,10 +28356,7 @@ fn test_honest_user_close_after_force_close_negative_pnl() {
 /// Test: Both LP and user can close after force-close (full lifecycle for honest participants)
 #[test]
 fn test_honest_participants_full_lifecycle() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -28846,10 +28683,7 @@ fn test_honest_user_inverted_market_close() {
 /// TradeCpi hyperp market (non-resolution): user trades via CPI, flattens, closes.
 #[test]
 fn test_honest_user_hyperp_trade_flatten_close() {
-    let Some(mut env) = TradeCpiTestEnv::new() else {
-        println!("SKIP: Programs not found");
-        return;
-    };
+    let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000); // mark = 1.0
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
