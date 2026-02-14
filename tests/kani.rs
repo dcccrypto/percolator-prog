@@ -1237,12 +1237,15 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
         exec_size,
     );
 
-    // Directly reason over the Reject subspace (with explicit non-vacuity witness above).
-    kani::assume(matches!(&decision, TradeCpiDecision::Reject));
+    // Strengthened: prove nonce transition relation for both outcome variants.
+    let expected_nonce = match &decision {
+        TradeCpiDecision::Reject => old_nonce,
+        TradeCpiDecision::Accept { .. } => old_nonce.wrapping_add(1),
+    };
     let result_nonce = decision_nonce(old_nonce, decision);
     assert_eq!(
-        result_nonce, old_nonce,
-        "ANY TradeCpi rejection must leave nonce unchanged"
+        result_nonce, expected_nonce,
+        "decision_nonce must agree with TradeCpiDecision outcome"
     );
 }
 
@@ -1291,13 +1294,15 @@ fn kani_tradecpi_any_accept_increments_nonce() {
         exec_size,
     );
 
-    // Directly reason over the Accept subspace (with explicit non-vacuity witness above).
-    kani::assume(matches!(&decision, TradeCpiDecision::Accept { .. }));
+    // Strengthened: prove nonce transition relation for both outcome variants.
+    let expected_nonce = match &decision {
+        TradeCpiDecision::Reject => old_nonce,
+        TradeCpiDecision::Accept { .. } => old_nonce.wrapping_add(1),
+    };
     let result_nonce = decision_nonce(old_nonce, decision);
     assert_eq!(
-        result_nonce,
-        old_nonce.wrapping_add(1),
-        "ANY TradeCpi acceptance must increment nonce by 1"
+        result_nonce, expected_nonce,
+        "decision_nonce must agree with TradeCpiDecision outcome"
     );
 }
 
@@ -1650,12 +1655,15 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
         req_size,
     );
 
-    // Directly reason over the Reject subspace (with explicit non-vacuity witness above).
-    kani::assume(matches!(&decision, TradeCpiDecision::Reject));
+    // Strengthened: prove nonce transition relation for both outcome variants.
+    let expected_nonce = match &decision {
+        TradeCpiDecision::Reject => old_nonce,
+        TradeCpiDecision::Accept { .. } => old_nonce.wrapping_add(1),
+    };
     let result_nonce = decision_nonce(old_nonce, decision);
     assert_eq!(
-        result_nonce, old_nonce,
-        "ANY TradeCpi rejection (from real inputs) must leave nonce unchanged"
+        result_nonce, expected_nonce,
+        "decision_nonce must agree with TradeCpiDecision outcome (from_ret)"
     );
 }
 
@@ -1718,13 +1726,15 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
         req_size,
     );
 
-    // Directly reason over the Accept subspace (with explicit non-vacuity witness above).
-    kani::assume(matches!(&decision, TradeCpiDecision::Accept { .. }));
+    // Strengthened: prove nonce transition relation for both outcome variants.
+    let expected_nonce = match &decision {
+        TradeCpiDecision::Reject => old_nonce,
+        TradeCpiDecision::Accept { .. } => old_nonce.wrapping_add(1),
+    };
     let result_nonce = decision_nonce(old_nonce, decision);
     assert_eq!(
-        result_nonce,
-        old_nonce.wrapping_add(1),
-        "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1"
+        result_nonce, expected_nonce,
+        "decision_nonce must agree with TradeCpiDecision outcome (from_ret)"
     );
 }
 
