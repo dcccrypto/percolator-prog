@@ -18837,7 +18837,12 @@ fn test_attack_funding_extreme_max_premium_capped() {
         &[&admin],
         env.svm.latest_blockhash(),
     );
-    let config_accepted = env.svm.send_transaction(tx).is_ok();
+    let config_result = env.svm.send_transaction(tx);
+    assert!(
+        config_result.is_ok(),
+        "Extreme funding_max_premium_bps config update should be accepted: {:?}",
+        config_result
+    );
 
     // Trade and crank
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
@@ -18849,8 +18854,8 @@ fn test_attack_funding_extreme_max_premium_capped() {
     let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
     assert_eq!(
         c_tot, sum,
-        "ATTACK: c_tot desync with extreme max_premium (accepted={})! c_tot={} sum={}",
-        config_accepted, c_tot, sum
+        "ATTACK: c_tot desync with extreme max_premium! c_tot={} sum={}",
+        c_tot, sum
     );
 
     let spl_vault = {
