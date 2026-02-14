@@ -25028,25 +25028,34 @@ fn test_attack_haircut_zero_pnl_pos_tot() {
     );
 
     let vault_before = env.vault_balance();
+    let capital_before = env.read_account_capital(user_idx);
     let withdraw_result = env.try_withdraw(&user, user_idx, 1);
     let vault_after = env.vault_balance();
-
-    // Verify either withdrawal happened or margin check blocked it
-    if withdraw_result.is_ok() {
-        assert_eq!(
-            vault_after,
-            vault_before - 1,
-            "Withdrawal of 1 should decrease vault by 1: before={} after={}",
-            vault_before,
-            vault_after
-        );
-    } else {
-        assert_eq!(
-            vault_after, vault_before,
-            "Failed 1-lamport withdrawal should not change vault: before={} after={}",
-            vault_before, vault_after
-        );
-    }
+    let capital_after = env.read_account_capital(user_idx);
+    assert!(
+        withdraw_result.is_ok(),
+        "1-unit withdrawal should succeed under haircut conditions in this setup: {:?}",
+        withdraw_result
+    );
+    assert_eq!(
+        vault_after,
+        vault_before - 1,
+        "Withdrawal of 1 should decrease vault by 1: before={} after={}",
+        vault_before,
+        vault_after
+    );
+    assert!(
+        capital_after < capital_before,
+        "Successful withdrawal must decrease capital: before={} after={}",
+        capital_before,
+        capital_after
+    );
+    assert!(
+        capital_before - capital_after >= 1,
+        "Successful 1-unit withdrawal must reduce capital by at least 1: before={} after={}",
+        capital_before,
+        capital_after
+    );
 
     let engine_vault = env.read_engine_vault();
     assert_eq!(
