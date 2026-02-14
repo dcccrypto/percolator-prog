@@ -15427,17 +15427,15 @@ fn test_attack_gc_after_force_realize_conservation() {
     // Open position - user's equity will be wiped by fees/movement
     let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 1);
     let user_pos_after_trade = env.read_account_position(user_idx);
-    if trade_result.is_ok() {
-        assert_ne!(
-            user_pos_after_trade, 0,
-            "Successful tiny trade must create a non-zero user position"
-        );
-    } else {
-        assert_eq!(
-            user_pos_after_trade, 0,
-            "Failed tiny trade must not mutate user position"
-        );
-    }
+    assert!(
+        trade_result.is_ok(),
+        "Precondition failed: tiny trade should open a position: {:?}",
+        trade_result
+    );
+    assert_ne!(
+        user_pos_after_trade, 0,
+        "Successful tiny trade must create a non-zero user position"
+    );
 
     // Advance time to trigger maintenance fees (if set)
     env.set_slot(1000);
