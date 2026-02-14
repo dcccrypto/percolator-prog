@@ -11900,20 +11900,25 @@ fn test_attack_haircut_all_users_in_loss() {
 
     // User should still be able to partially withdraw (reduced equity, but not zero)
     let vault_before = env.vault_balance();
+    let capital_before = env.read_account_capital(user_idx);
     let result = env.try_withdraw(&user, user_idx, 1_000_000_000);
     let vault_after = env.vault_balance();
-    if result.is_ok() {
-        assert_eq!(
-            vault_after,
-            vault_before - 1_000_000_000,
-            "Successful withdraw must decrement vault by requested amount"
-        );
-    } else {
-        assert_eq!(
-            vault_after, vault_before,
-            "Failed withdraw must leave vault unchanged"
-        );
-    }
+    let capital_after = env.read_account_capital(user_idx);
+    assert!(
+        result.is_ok(),
+        "User should be able to partially withdraw in this loss scenario: {:?}",
+        result
+    );
+    assert_eq!(
+        vault_after,
+        vault_before - 1_000_000_000,
+        "Successful withdraw must decrement vault by requested amount"
+    );
+    assert_eq!(
+        capital_after,
+        capital_before - 1_000_000_000u128,
+        "Successful withdraw must decrement capital by requested amount"
+    );
     assert!(vault_after > 0, "Vault should never go to zero");
 }
 
