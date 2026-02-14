@@ -17995,32 +17995,20 @@ fn test_attack_trade_zero_size() {
 
     let cap_before = env.read_account_capital(user_idx);
 
-    // Trade zero size - should be explicitly rejected or be a no-op
+    // Trade zero size must be rejected.
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 0);
 
     let cap_after = env.read_account_capital(user_idx);
     let pos_after = env.read_account_position(user_idx);
-
-    if result.is_ok() {
-        // If accepted, must be a no-op
-        assert_eq!(
-            cap_before, cap_after,
-            "ATTACK: Zero trade accepted but changed capital! before={} after={}",
-            cap_before, cap_after
-        );
-        assert_eq!(
-            pos_after, 0,
-            "ATTACK: Zero trade accepted but created position! pos={}",
-            pos_after
-        );
-    } else {
-        // Protocol correctly rejects zero-size trades
-        assert_eq!(
-            cap_before, cap_after,
-            "State changed despite failed zero trade!"
-        );
-        assert_eq!(pos_after, 0, "Position changed despite failed zero trade!");
-    }
+    assert!(
+        result.is_err(),
+        "ATTACK: Zero-size trade unexpectedly succeeded"
+    );
+    assert_eq!(
+        cap_before, cap_after,
+        "State changed despite failed zero trade!"
+    );
+    assert_eq!(pos_after, 0, "Position changed despite failed zero trade!");
 }
 
 /// ATTACK: Force-realize mode closes positions during crank.
