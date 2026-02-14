@@ -12860,7 +12860,7 @@ fn test_attack_full_lifecycle_conservation() {
 fn test_attack_hyperp_mark_manipulation_via_trade() {
     let mut env = TradeCpiTestEnv::new();
 
-    env.init_market_hyperp_with_warmup(1_000_000, 100); // mark = 1.0, warmup > 0
+    env.init_market_hyperp(1_000_000); // mark = 1.0
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
@@ -28247,7 +28247,7 @@ fn test_admin_force_close_account_enables_close_slab() {
 fn test_honest_user_close_after_force_close_positive_pnl() {
     let mut env = TradeCpiTestEnv::new();
 
-    env.init_market_hyperp(1_000_000); // mark = 1.0
+    env.init_market_hyperp_with_warmup(1_000_000, 100); // mark = 1.0, warmup > 0
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let mp = env.matcher_program_id;
     env.try_set_oracle_authority(&admin, &admin.pubkey())
