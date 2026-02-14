@@ -18919,7 +18919,12 @@ fn test_attack_funding_extreme_max_bps_per_slot() {
         &[&admin],
         env.svm.latest_blockhash(),
     );
-    let config_accepted = env.svm.send_transaction(tx).is_ok();
+    let config_result = env.svm.send_transaction(tx);
+    assert!(
+        config_result.is_ok(),
+        "Extreme funding_max_bps_per_slot config update should be accepted: {:?}",
+        config_result
+    );
 
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
     env.set_slot(100);
@@ -18929,8 +18934,8 @@ fn test_attack_funding_extreme_max_bps_per_slot() {
     let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
     assert_eq!(
         c_tot, sum,
-        "ATTACK: c_tot desync with extreme max_bps_per_slot (accepted={})! c_tot={} sum={}",
-        config_accepted, c_tot, sum
+        "ATTACK: c_tot desync with extreme max_bps_per_slot! c_tot={} sum={}",
+        c_tot, sum
     );
 
     let spl_vault = {
