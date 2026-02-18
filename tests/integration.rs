@@ -31764,27 +31764,61 @@ fn test_crank_threshold_ewma_bounded_by_limit() {
         .send_transaction(tx)
         .expect("UpdateConfig failed");
 
+    // Helper: read engine's risk_reduction_threshold directly from slab bytes
+    // ENGINE_OFF(440) + vault(16) + InsuranceFund(32) + RiskParams offset to
+    // risk_reduction_threshold(56) = 544
+    const RISK_THRESHOLD_OFF: usize = 440 + 16 + 32 + 5 * 8 + 16; // 544
+    let read_engine_threshold = |env: &TestEnv| -> u128 {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        u128::from_le_bytes(
+            slab.data[RISK_THRESHOLD_OFF..RISK_THRESHOLD_OFF + 16]
+                .try_into()
+                .unwrap(),
+        )
+    };
+
+    // Also verify config.thresh_max was correctly clamped at init
+    const THRESH_MAX_OFF: usize = 296; // header(72) + config offset 224
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let config_thresh_max = u128::from_le_bytes(
+        slab.data[THRESH_MAX_OFF..THRESH_MAX_OFF + 16]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        config_thresh_max, 50_000,
+        "config.thresh_max should be min(DEFAULT_THRESH_MAX, max_risk_threshold) = 50_000, got {}",
+        config_thresh_max
+    );
+
+    // Threshold starts at 0 (risk_params default)
+    assert_eq!(read_engine_threshold(&env), 0, "Initial threshold should be 0");
+
     // Set oracle price and advance slot so crank can run
     env.set_slot_and_price(10, 100_000_000); // $100
     env.crank();
-    // Crank again after interval to trigger threshold EWMA update
-    env.set_slot_and_price(12, 100_000_000);
-    env.crank();
 
-    // After crank, threshold should be at most 50_000
-    // Verify by trying SetRiskThreshold to 50_000 (at limit, should succeed)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let result = env.try_set_risk_threshold(&admin, 50_000);
-    assert!(
-        result.is_ok(),
-        "SetRiskThreshold at limit should still succeed after crank: {:?}",
-        result
+    // Crank multiple times — EWMA target is thresh_floor=1_000_000 but clamped to 50_000
+    for slot in (12..30).step_by(2) {
+        env.set_slot_and_price(slot, 100_000_000);
+        env.crank();
+        let thr = read_engine_threshold(&env);
+        assert!(
+            thr <= 50_000,
+            "Engine threshold {} exceeded max_risk_threshold 50_000 at slot {}",
+            thr,
+            slot,
+        );
+    }
+
+    // After many cranks, threshold should have converged to exactly 50_000
+    // (alpha=100%, step=100%, floor=1M clamped to 50K, from zero with full jump)
+    let final_thr = read_engine_threshold(&env);
+    assert_eq!(
+        final_thr, 50_000,
+        "Threshold should converge to thresh_max=50_000 (clamped target), got {}",
+        final_thr
     );
-
-    // Also verify the crank didn't push it above by trying to read config snapshot
-    // The fact that SetRiskThreshold(50_000) succeeded means the limit is still enforced
-    // If the crank had somehow bypassed it, the engine threshold would be > 50_000
-    // but the limit check is on the new value, not the current value
 
     println!("CRANK THRESHOLD EWMA BOUNDED BY LIMIT: PASSED");
 }
@@ -31939,4 +31973,201 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     );
 
     println!("INIT MARKET RISK PARAMS EXCEED LIMITS REJECTED: PASSED");
+}
+
+/// Verify InitMarket accepts risk_params at exact boundary (equality with limits).
+#[test]
+fn test_init_market_risk_params_at_boundary_accepted() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Build InitMarket with risk_reduction_threshold == max_risk_threshold
+    // and maintenance_fee_per_slot == max_maintenance_fee_per_slot
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.pubkey().as_ref());
+    data.extend_from_slice(env.mint.as_ref());
+    data.extend_from_slice(&TEST_FEED_ID);
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    data.push(0u8); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    // Per-market admin limits
+    data.extend_from_slice(&1000u128.to_le_bytes()); // max_maintenance_fee = 1000
+    data.extend_from_slice(&50_000u128.to_le_bytes()); // max_risk_threshold = 50_000
+    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // RiskParams with values AT the limits (equality)
+    data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&50_000u128.to_le_bytes()); // risk_reduction_threshold == limit
+    data.extend_from_slice(&1000u128.to_le_bytes()); // maintenance_fee == limit
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_ok(),
+        "InitMarket with risk_params at exact limits should succeed"
+    );
+
+    println!("INIT MARKET RISK PARAMS AT BOUNDARY ACCEPTED: PASSED");
+}
+
+/// Full lifecycle test: init with limits -> Set* ops -> UpdateConfig -> crank -> Set* again.
+/// Verifies limits survive across all operation types.
+#[test]
+fn test_admin_limits_lifecycle() {
+    program_path();
+
+    let mut env = TestEnv::new();
+
+    // Init market with specific limits
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            1000,   // max_maintenance_fee
+            50_000, // max_risk_threshold
+            5000,   // min_oracle_price_cap_e2bps
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init_market failed");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Step 1: Set* ops within limits
+    env.try_set_risk_threshold(&admin, 25_000).unwrap();
+    env.try_set_maintenance_fee(&admin, 500).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
+
+    // Step 2: UpdateConfig with thresh_max at limit
+    env.try_update_config_with_params(&admin, 3600, 1_000_000_000_000u128, 1000, 0, 50_000)
+        .unwrap();
+
+    // Step 3: Crank
+    env.set_slot_and_price(10, 100_000_000);
+    env.crank();
+    env.set_slot_and_price(12, 100_000_000);
+    env.crank();
+
+    // Step 4: Limits still enforced after UpdateConfig + crank
+    let result = env.try_set_risk_threshold(&admin, 50_001);
+    assert!(result.is_err(), "Limit still enforced after lifecycle: SetRiskThreshold");
+
+    let result = env.try_set_maintenance_fee(&admin, 1001);
+    assert!(result.is_err(), "Limit still enforced after lifecycle: SetMaintenanceFee");
+
+    let result = env.try_set_oracle_price_cap(&admin, 4999);
+    assert!(result.is_err(), "Limit still enforced after lifecycle: SetOraclePriceCap");
+
+    // Step 5: At-limit values still work
+    env.try_set_risk_threshold(&admin, 50_000).unwrap();
+    env.try_set_maintenance_fee(&admin, 1000).unwrap();
+    env.try_set_oracle_price_cap(&admin, 5000).unwrap();
+
+    // Step 6: Verify limit fields in config haven't been corrupted
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    // max_risk_threshold is at HEADER_LEN(72) + offset within MarketConfig
+    // New fields are at the end of MarketConfig: after last_effective_price_e6
+    // MarketConfig field offsets (repr(C), u128 align 16 on x86_64):
+    // max_maintenance_fee_per_slot: u128 @ config offset 320
+    // max_risk_threshold: u128 @ config offset 336
+    // min_oracle_price_cap_e2bps: u64 @ config offset 352
+    const MAX_MAINT_FEE_OFF: usize = 72 + 320;
+    const MAX_RISK_THR_OFF: usize = 72 + 336;
+    const MIN_OPC_OFF: usize = 72 + 352;
+
+    let max_maint = u128::from_le_bytes(
+        slab.data[MAX_MAINT_FEE_OFF..MAX_MAINT_FEE_OFF + 16].try_into().unwrap(),
+    );
+    let max_risk = u128::from_le_bytes(
+        slab.data[MAX_RISK_THR_OFF..MAX_RISK_THR_OFF + 16].try_into().unwrap(),
+    );
+    let min_opc = u64::from_le_bytes(
+        slab.data[MIN_OPC_OFF..MIN_OPC_OFF + 8].try_into().unwrap(),
+    );
+
+    assert_eq!(max_maint, 1000, "max_maintenance_fee_per_slot should be preserved");
+    assert_eq!(max_risk, 50_000, "max_risk_threshold should be preserved");
+    assert_eq!(min_opc, 5000, "min_oracle_price_cap_e2bps should be preserved");
+
+    println!("ADMIN LIMITS LIFECYCLE: PASSED");
 }
