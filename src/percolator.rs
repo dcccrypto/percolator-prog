@@ -179,6 +179,25 @@ const INS_WITHDRAW_LAST_SLOT_MASK: u64 = (1u64 << 48) - 1;
 // Sentinel in the 48-bit slot field meaning "no successful limited withdraw yet".
 const INS_WITHDRAW_LAST_SLOT_NONE: u64 = INS_WITHDRAW_LAST_SLOT_MASK;
 
+// ═══════════════════════════════════════════════════════════════
+// Admin Foot Gun Limits — Wrapper Hardening (cobra/feat/wrapper-hardening)
+// "It's good to limit the admin key to remove any obvious foot guns
+//  that an external program that is controlling it would accidentally
+//  set off" — Toly
+// ═══════════════════════════════════════════════════════════════
+
+/// SetRiskThreshold: min bound — too low = cascading liquidations
+const ADMIN_MIN_RISK_THRESHOLD: u128 = 100;
+/// SetRiskThreshold: max bound — too high = risk reduction never triggers
+const ADMIN_MAX_RISK_THRESHOLD: u128 = 1_000_000_000_000;
+/// SetMaintenanceFee: max fee/slot — prevents user drain via excessive fees
+/// At 400ms slots: 100 units/slot ≈ safe for any reasonable collateral scale
+const ADMIN_MAX_MAINTENANCE_FEE: u128 = 100;
+/// SetOraclePriceCap: min cap when non-zero — prevents disabling circuit breaker
+/// 10_000 e2bps = 1% per price update
+const ADMIN_MIN_ORACLE_PRICE_CAP: u64 = 10_000;
+
+
 #[inline]
 fn pack_ins_withdraw_meta(max_bps: u16, last_slot: u64) -> Option<i64> {
     if max_bps == 0 || max_bps > 10_000 || last_slot > INS_WITHDRAW_LAST_SLOT_MASK {
@@ -3952,6 +3971,11 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
+                // Hardening: bound risk threshold to prevent cascading liquidations
+                if new_threshold < super::ADMIN_MIN_RISK_THRESHOLD || new_threshold > super::ADMIN_MAX_RISK_THRESHOLD {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
                 let engine = zc::engine_mut(&mut data)?;
                 engine.set_risk_reduction_threshold(new_threshold);
             }
@@ -3970,6 +3994,11 @@ pub mod processor {
 
                 let mut header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
+
+                // Hardening: prevent admin self-burn (setting to zero address = permanent lockout)
+                if new_admin == Pubkey::default() {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 header.admin = new_admin.to_bytes();
                 state::write_header(&mut data, &header);
@@ -4108,6 +4137,11 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
+                // Hardening: cap maintenance fee to prevent user drain via excessive fees
+                if new_fee > super::ADMIN_MAX_MAINTENANCE_FEE {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
                 let engine = zc::engine_mut(&mut data)?;
                 engine.params.maintenance_fee_per_slot = percolator::U128::new(new_fee);
             }
@@ -4214,6 +4248,12 @@ pub mod processor {
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
+
+                // Hardening: if setting a non-zero cap, enforce minimum (prevents disabling circuit breaker)
+                // Zero = disabled (allowed). Non-zero must be >= 1% (10_000 e2bps).
+                if max_change_e2bps != 0 && max_change_e2bps < super::ADMIN_MIN_ORACLE_PRICE_CAP {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 let mut config = state::read_config(&data);
                 config.oracle_price_cap_e2bps = max_change_e2bps;
