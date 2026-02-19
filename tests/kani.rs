@@ -3185,10 +3185,22 @@ fn kani_universal_panic_requires_admin() {
 
 /// Universal: gate_active && risk_increase => Reject in from_ret path
 /// Proves the kill-switch works in the mechanically-tied path too
+/// Strengthened: symbolic shape + symbolic auth bools
 #[kani::proof]
 fn kani_universal_gate_risk_increase_rejects_from_ret() {
     let old_nonce: u64 = kani::any();
-    let shape = valid_shape();
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+    kani::assume(matcher_shape_ok(shape));
+
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
 
     // Construct ABI-valid ret (so we get past ABI checks to the gate)
     let expected_req_id = nonce_on_success(old_nonce);
@@ -3204,14 +3216,13 @@ fn kani_universal_gate_risk_increase_rejects_from_ret() {
     let oracle_price_e6: u64 = ret.oracle_price_e6;
     let req_size: i128 = kani::any();
 
-    // All pre-gate checks pass
     let decision = decide_trade_cpi_from_ret(
         old_nonce,
         shape,
-        true, // identity_ok
-        true, // pda_ok
-        true, // user_auth_ok
-        true, // lp_auth_ok
+        identity_ok,
+        pda_ok,
+        user_auth_ok,
+        lp_auth_ok,
         true, // gate_active - ACTIVE
         true, // risk_increase - INCREASING
         ret,
@@ -3220,20 +3231,28 @@ fn kani_universal_gate_risk_increase_rejects_from_ret() {
         req_size,
     );
 
+    // Reject whether prior gates fail OR gate+risk triggers
     assert_eq!(
         decision,
         TradeCpiDecision::Reject,
-        "gate_active && risk_increase must reject even with valid ABI"
+        "gate_active && risk_increase must reject (prior gate fail also rejects)"
     );
 }
 
 /// Prove: gate_active=true + risk_increase=false => Accept in from_ret path
 /// Missing companion to kani_universal_gate_risk_increase_rejects_from_ret:
 /// proves risk-neutral/reducing trades pass the kill-switch gate.
+/// Strengthened: symbolic shape + symbolic auth bools (all must be true for Accept)
 #[kani::proof]
 fn kani_tradecpi_from_ret_gate_active_risk_neutral_accepts() {
     let old_nonce: u64 = kani::any();
-    let shape = valid_shape();
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+    kani::assume(matcher_shape_ok(shape));
 
     // Construct ABI-valid ret to pass all pre-gate checks
     let expected_req_id = nonce_on_success(old_nonce);
@@ -3252,10 +3271,10 @@ fn kani_tradecpi_from_ret_gate_active_risk_neutral_accepts() {
     let decision = decide_trade_cpi_from_ret(
         old_nonce,
         shape,
-        true,  // identity_ok
-        true,  // pda_ok
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
+        true,  // identity_ok — must be true for Accept
+        true,  // pda_ok — must be true for Accept
+        true,  // user_auth_ok — must be true for Accept
+        true,  // lp_auth_ok — must be true for Accept
         true,  // gate_active — ACTIVE
         false, // risk_increase — NOT increasing
         ret,
@@ -3851,6 +3870,62 @@ fn kani_clamp_toward_formula_above_hi() {
 
     let result = clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots);
     assert_eq!(result, hi, "mark above hi must clamp to hi");
+}
+
+/// Prove: clamp_toward_with_dt exercises saturation paths with large u64 inputs.
+/// Tests: saturating_mul overflow in max_delta_u128, min(max_delta_u128, u64::MAX)
+/// clamp, and saturating_sub/add hitting 0 or u64::MAX.
+#[kani::proof]
+fn kani_clamp_toward_saturation_paths() {
+    // Non-vacuity witness 1: max_delta saturates to u64::MAX, lo=0, hi=u64::MAX
+    {
+        let index = u64::MAX / 2;
+        let cap_e2bps = 1_000_000; // 100%
+        let dt_slots = 100;
+        let result = clamp_toward_with_dt(index, 0, cap_e2bps, dt_slots);
+        // max_delta_u128 = (MAX/2) * 1_000_000 * 100 / 1_000_000 = (MAX/2)*100 >> u64::MAX
+        // so max_delta = u64::MAX, lo = saturating_sub = 0
+        assert_eq!(result, 0, "witness: mark=0 with saturated max_delta clamps to lo=0");
+    }
+
+    // Non-vacuity witness 2: hi saturates to u64::MAX
+    {
+        let index = u64::MAX - 10;
+        let cap_e2bps = 10_000; // 1%
+        let dt_slots = 1;
+        let result = clamp_toward_with_dt(index, u64::MAX, cap_e2bps, dt_slots);
+        // max_delta = (MAX-10) * 10_000 / 1_000_000 ≈ MAX/100, hi = saturating_add = u64::MAX
+        assert_eq!(result, u64::MAX, "witness: mark=MAX with hi=MAX clamps to MAX");
+    }
+
+    // Symbolic proof: large index with symbolic mark exercises saturation
+    let index_offset: u8 = kani::any();
+    let mark: u64 = kani::any();
+    let cap_steps: u8 = kani::any();
+    let dt_raw: u8 = kani::any();
+
+    kani::assume(cap_steps >= 1);
+    kani::assume(dt_raw >= 1);
+
+    let index = (u64::MAX / 2).saturating_add(index_offset as u64);
+    let cap_e2bps = (cap_steps as u64) * 100_000; // 10%..2550% (forces large delta)
+    let dt_slots = dt_raw as u64;
+
+    let result = clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots);
+
+    // Recompute expected bounds (mirrors production code)
+    let max_delta_u128 = (index as u128)
+        .saturating_mul(cap_e2bps as u128)
+        .saturating_mul(dt_slots as u128)
+        / 1_000_000u128;
+    let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
+    let lo = index.saturating_sub(max_delta);
+    let hi = index.saturating_add(max_delta);
+
+    assert!(result >= lo && result <= hi,
+        "result must stay within saturated bounds");
+    assert_eq!(result, mark.clamp(lo, hi),
+        "result must equal mark.clamp(lo, hi)");
 }
 
 // =========================================================================
