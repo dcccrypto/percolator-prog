@@ -89,7 +89,7 @@ use percolator_prog::verify::{
 // The actual MAX_UNIT_SCALE bound is proven separately in init_market_scale_* proofs.
 const KANI_MAX_SCALE: u32 = 64;
 // Cap quotients to keep division/mod tractable
-const KANI_MAX_QUOTIENT: u64 = 4096;
+const KANI_MAX_QUOTIENT: u64 = 16384;
 
 // =============================================================================
 // Test Fixtures
