@@ -1,23 +1,18 @@
 //! Comprehensive tests for Insurance LP instructions (Tags 24, 25, 26)
 
+use percolator::{I128, MAX_ACCOUNTS, U128};
+use percolator_prog::{
+    accounts,
+    constants::{MAGIC, VERSION},
+    error::PercolatorError,
+    processor::process_instruction,
+    state, units, zc,
+};
 use solana_program::{
-    account_info::AccountInfo,
+    account_info::AccountInfo, clock::Clock, program_error::ProgramError, program_pack::Pack,
     pubkey::Pubkey,
-    clock::Clock,
-    program_pack::Pack,
-    program_error::ProgramError,
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
-use percolator_prog::{
-    processor::process_instruction,
-    constants::{MAGIC, VERSION},
-    zc,
-    error::PercolatorError,
-    state,
-    accounts,
-    units,
-};
-use percolator::{MAX_ACCOUNTS, U128, I128};
 
 // --- Harness (duplicated from unit.rs) ---
 
@@ -33,11 +28,28 @@ struct TestAccount {
 
 impl TestAccount {
     fn new(key: Pubkey, owner: Pubkey, lamports: u64, data: Vec<u8>) -> Self {
-        Self { key, owner, lamports, data, is_signer: false, is_writable: false, executable: false }
+        Self {
+            key,
+            owner,
+            lamports,
+            data,
+            is_signer: false,
+            is_writable: false,
+            executable: false,
+        }
     }
-    fn signer(mut self) -> Self { self.is_signer = true; self }
-    fn writable(mut self) -> Self { self.is_writable = true; self }
-    fn executable(mut self) -> Self { self.executable = true; self }
+    fn signer(mut self) -> Self {
+        self.is_signer = true;
+        self
+    }
+    fn writable(mut self) -> Self {
+        self.is_writable = true;
+        self
+    }
+    fn executable(mut self) -> Self {
+        self.executable = true;
+        self
+    }
 
     fn to_info<'a>(&'a mut self) -> AccountInfo<'a> {
         AccountInfo::new(
@@ -91,15 +103,17 @@ fn make_pyth(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time:
 }
 
 fn make_clock(slot: u64, unix_timestamp: i64) -> Vec<u8> {
-    let clock = Clock { slot, unix_timestamp, ..Clock::default() };
+    let clock = Clock {
+        slot,
+        unix_timestamp,
+        ..Clock::default()
+    };
     bincode::serialize(&clock).unwrap()
 }
 
 const PYTH_RECEIVER_BYTES: [u8; 32] = [
-    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
-    0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
-    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
-    0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ];
 
 const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
@@ -129,28 +143,73 @@ fn setup_market() -> MarketFixture {
 
     MarketFixture {
         program_id,
-        admin: TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer(),
-        slab: TestAccount::new(slab_key, program_id, 0, vec![0u8; percolator_prog::constants::SLAB_LEN]).writable(),
+        admin: TestAccount::new(
+            Pubkey::new_unique(),
+            solana_program::system_program::id(),
+            0,
+            vec![],
+        )
+        .signer(),
+        slab: TestAccount::new(
+            slab_key,
+            program_id,
+            0,
+            vec![0u8; percolator_prog::constants::SLAB_LEN],
+        )
+        .writable(),
         mint: TestAccount::new(mint_key, spl_token::ID, 0, make_mint_account()),
-        vault: TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(mint_key, vault_pda, 0)).writable(),
+        vault: TestAccount::new(
+            Pubkey::new_unique(),
+            spl_token::ID,
+            0,
+            make_token_account(mint_key, vault_pda, 0),
+        )
+        .writable(),
         token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]).executable(),
         pyth_index: TestAccount::new(Pubkey::new_unique(), pyth_receiver_id, 0, pyth_data),
         index_feed_id: TEST_FEED_ID,
-        clock: TestAccount::new(solana_program::sysvar::clock::id(), solana_program::sysvar::id(), 0, make_clock(100, 100)),
-        rent: TestAccount::new(solana_program::sysvar::rent::id(), solana_program::sysvar::id(), 0, vec![]),
-        system: TestAccount::new(solana_program::system_program::id(), Pubkey::default(), 0, vec![]),
+        clock: TestAccount::new(
+            solana_program::sysvar::clock::id(),
+            solana_program::sysvar::id(),
+            0,
+            make_clock(100, 100),
+        ),
+        rent: TestAccount::new(
+            solana_program::sysvar::rent::id(),
+            solana_program::sysvar::id(),
+            0,
+            vec![],
+        ),
+        system: TestAccount::new(
+            solana_program::system_program::id(),
+            Pubkey::default(),
+            0,
+            vec![],
+        ),
         vault_pda,
     }
 }
 
 // --- Encoders ---
 
-fn encode_u64(val: u64, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-fn encode_u32(val: u32, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-fn encode_u16(val: u16, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-fn encode_u128(val: u128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-fn encode_pubkey(val: &Pubkey, buf: &mut Vec<u8>) { buf.extend_from_slice(val.as_ref()); }
-fn encode_bytes32(val: &[u8; 32], buf: &mut Vec<u8>) { buf.extend_from_slice(val); }
+fn encode_u64(val: u64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&val.to_le_bytes());
+}
+fn encode_u32(val: u32, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&val.to_le_bytes());
+}
+fn encode_u16(val: u16, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&val.to_le_bytes());
+}
+fn encode_u128(val: u128, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&val.to_le_bytes());
+}
+fn encode_pubkey(val: &Pubkey, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(val.as_ref());
+}
+fn encode_bytes32(val: &[u8; 32], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(val);
+}
 
 fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> {
     let mut data = vec![0u8];
@@ -208,8 +267,14 @@ fn init_market(f: &mut MarketFixture) {
     let data = encode_init_market(f, 100);
     let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
     let accounts = vec![
-        f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-        f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(),
+        f.admin.to_info(),
+        f.slab.to_info(),
+        f.mint.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        f.clock.to_info(),
+        f.rent.to_info(),
+        dummy_ata.to_info(),
         f.system.to_info(),
     ];
     process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -224,7 +289,11 @@ fn make_ins_lp_mint_account(program_id: &Pubkey, slab_key: &Pubkey) -> (TestAcco
 }
 
 /// Create an insurance LP mint PDA account with initialized mint data (already created)
-fn make_ins_lp_mint_account_initialized(program_id: &Pubkey, slab_key: &Pubkey, vault_authority: &Pubkey) -> (TestAccount, Pubkey) {
+fn make_ins_lp_mint_account_initialized(
+    program_id: &Pubkey,
+    slab_key: &Pubkey,
+    vault_authority: &Pubkey,
+) -> (TestAccount, Pubkey) {
     let (mint_pda, _) = accounts::derive_insurance_lp_mint(program_id, slab_key);
     use spl_token::state::Mint;
     let mut data = vec![0u8; Mint::LEN];
@@ -266,8 +335,16 @@ fn test_create_insurance_mint_success() {
 
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (mut ins_mint, _) = make_ins_lp_mint_account(&f.program_id, &f.slab.key);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
-    let mut payer = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer().writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut payer = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer()
+    .writable();
 
     // Need to give the mint account space so the test-mode create_mint can write to it
     ins_mint.data = vec![0u8; spl_token::state::Mint::LEN];
@@ -325,9 +402,15 @@ fn test_create_insurance_mint_success() {
     ins_mint.data = vec![]; // empty - data_len() == 0
     let data = encode_create_insurance_mint();
     let accounts = vec![
-        f.admin.to_info(), f.slab.to_info(), ins_mint.to_info(),
-        vault_auth_acct.to_info(), f.mint.to_info(), f.system.to_info(),
-        f.token_prog.to_info(), f.rent.to_info(), payer.to_info(),
+        f.admin.to_info(),
+        f.slab.to_info(),
+        ins_mint.to_info(),
+        vault_auth_acct.to_info(),
+        f.mint.to_info(),
+        f.system.to_info(),
+        f.token_prog.to_info(),
+        f.rent.to_info(),
+        payer.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
     // This will likely fail because test-mode create_mint can't pack into empty data.
@@ -346,15 +429,30 @@ fn test_create_insurance_mint_already_exists() {
     init_market(&mut f);
 
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
-    let (mut ins_mint, _) = make_ins_lp_mint_account_initialized(&f.program_id, &f.slab.key, &vault_auth);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
-    let mut payer = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer().writable();
+    let (mut ins_mint, _) =
+        make_ins_lp_mint_account_initialized(&f.program_id, &f.slab.key, &vault_auth);
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut payer = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer()
+    .writable();
 
     let data = encode_create_insurance_mint();
     let accounts = vec![
-        f.admin.to_info(), f.slab.to_info(), ins_mint.to_info(),
-        vault_auth_acct.to_info(), f.mint.to_info(), f.system.to_info(),
-        f.token_prog.to_info(), f.rent.to_info(), payer.to_info(),
+        f.admin.to_info(),
+        f.slab.to_info(),
+        ins_mint.to_info(),
+        vault_auth_acct.to_info(),
+        f.mint.to_info(),
+        f.system.to_info(),
+        f.token_prog.to_info(),
+        f.rent.to_info(),
+        payer.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
     assert!(result.is_err());
@@ -373,15 +471,35 @@ fn test_create_insurance_mint_non_admin_fails() {
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (mut ins_mint, _) = make_ins_lp_mint_account(&f.program_id, &f.slab.key);
     ins_mint.data = vec![];
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
-    let mut non_admin = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
-    let mut payer = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer().writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut non_admin = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut payer = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer()
+    .writable();
 
     let data = encode_create_insurance_mint();
     let accounts = vec![
-        non_admin.to_info(), f.slab.to_info(), ins_mint.to_info(),
-        vault_auth_acct.to_info(), f.mint.to_info(), f.system.to_info(),
-        f.token_prog.to_info(), f.rent.to_info(), payer.to_info(),
+        non_admin.to_info(),
+        f.slab.to_info(),
+        ins_mint.to_info(),
+        vault_auth_acct.to_info(),
+        f.mint.to_info(),
+        f.system.to_info(),
+        f.token_prog.to_info(),
+        f.rent.to_info(),
+        payer.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
     assert!(result.is_err()); // Should fail with admin check
@@ -396,7 +514,8 @@ fn setup_market_with_ins_mint() -> (MarketFixture, TestAccount) {
     let mut f = setup_market();
     init_market(&mut f);
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
-    let (ins_mint, _) = make_ins_lp_mint_account_initialized(&f.program_id, &f.slab.key, &vault_auth);
+    let (ins_mint, _) =
+        make_ins_lp_mint_account_initialized(&f.program_id, &f.slab.key, &vault_auth);
     (f, ins_mint)
 }
 
@@ -407,20 +526,42 @@ fn test_deposit_first_deposit_1_to_1() {
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let deposit_amount = 500_000u64;
     let data = encode_deposit_insurance_lp(deposit_amount);
     let accounts = vec![
-        depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+        depositor.to_info(),
+        f.slab.to_info(),
+        depositor_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        depositor_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     process_instruction(&f.program_id, &accounts, &data).unwrap();
 
@@ -431,7 +572,10 @@ fn test_deposit_first_deposit_1_to_1() {
     // Vault should have received the deposit
     assert_eq!(read_token_balance(&f.vault.data), deposit_amount);
     // Depositor should have deposit_amount deducted
-    assert_eq!(read_token_balance(&depositor_ata.data), 1_000_000 - deposit_amount);
+    assert_eq!(
+        read_token_balance(&depositor_ata.data),
+        1_000_000 - deposit_amount
+    );
 }
 
 #[test]
@@ -441,22 +585,47 @@ fn test_deposit_zero_amount_rejected() {
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let data = encode_deposit_insurance_lp(0);
     let accounts = vec![
-        depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+        depositor.to_info(),
+        f.slab.to_info(),
+        depositor_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        depositor_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
-    assert_eq!(result.unwrap_err(), PercolatorError::InsuranceZeroAmount.into());
+    assert_eq!(
+        result.unwrap_err(),
+        PercolatorError::InsuranceZeroAmount.into()
+    );
 }
 
 #[test]
@@ -469,19 +638,41 @@ fn test_deposit_resolved_market_blocked() {
     state::set_resolved(&mut f.slab.data);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let data = encode_deposit_insurance_lp(100_000);
     let accounts = vec![
-        depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+        depositor.to_info(),
+        f.slab.to_info(),
+        depositor_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        depositor_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
     assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
@@ -499,21 +690,46 @@ fn test_deposit_mint_not_created_fails() {
     ins_mint.data = vec![]; // data_len == 0
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let data = encode_deposit_insurance_lp(100_000);
     let accounts = vec![
-        depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+        depositor.to_info(),
+        f.slab.to_info(),
+        depositor_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        depositor_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
-    assert_eq!(result.unwrap_err(), PercolatorError::InsuranceMintNotCreated.into());
+    assert_eq!(
+        result.unwrap_err(),
+        PercolatorError::InsuranceMintNotCreated.into()
+    );
 }
 
 #[test]
@@ -526,18 +742,34 @@ fn test_deposit_second_deposit_proportional() {
     // First depositor: 1_000_000
     let d1_key = Pubkey::new_unique();
     let mut d1 = TestAccount::new(d1_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut d1_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, d1_key, 2_000_000)).writable();
-    let mut d1_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, d1_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut d1_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, d1_key, 2_000_000),
+    )
+    .writable();
+    let mut d1_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, d1_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            d1.to_info(), f.slab.to_info(), d1_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            d1_lp_ata.to_info(), vault_auth_acct.to_info(),
+            d1.to_info(),
+            f.slab.to_info(),
+            d1_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            d1_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -549,17 +781,32 @@ fn test_deposit_second_deposit_proportional() {
     // Second depositor: 500_000 → should get 500_000 * 1_000_000 / 1_000_000 = 500_000 LP
     let d2_key = Pubkey::new_unique();
     let mut d2 = TestAccount::new(d2_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut d2_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, d2_key, 2_000_000)).writable();
-    let mut d2_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, d2_key, 0)).writable();
+    let mut d2_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, d2_key, 2_000_000),
+    )
+    .writable();
+    let mut d2_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, d2_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(500_000);
         let accounts = vec![
-            d2.to_info(), f.slab.to_info(), d2_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            d2_lp_ata.to_info(), vault_auth_acct.to_info(),
+            d2.to_info(),
+            f.slab.to_info(),
+            d2_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            d2_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -581,20 +828,42 @@ fn test_withdraw_proportional_redemption() {
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     // Deposit 1_000_000
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -603,9 +872,14 @@ fn test_withdraw_proportional_redemption() {
     {
         let data = encode_withdraw_insurance_lp(1_000_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -626,21 +900,46 @@ fn test_withdraw_zero_amount_rejected() {
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let data = encode_withdraw_insurance_lp(0);
     let accounts = vec![
-        depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+        depositor.to_info(),
+        f.slab.to_info(),
+        depositor_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        depositor_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
-    assert_eq!(result.unwrap_err(), PercolatorError::InsuranceZeroAmount.into());
+    assert_eq!(
+        result.unwrap_err(),
+        PercolatorError::InsuranceZeroAmount.into()
+    );
 }
 
 #[test]
@@ -652,21 +951,46 @@ fn test_withdraw_supply_mismatch_no_supply() {
 
     // No deposits made — supply=0, balance=0
     let withdrawer_key = Pubkey::new_unique();
-    let mut withdrawer = TestAccount::new(withdrawer_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut withdrawer_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, withdrawer_key, 0)).writable();
-    let mut withdrawer_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, withdrawer_key, 100)).writable(); // fake LP tokens
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut withdrawer = TestAccount::new(
+        withdrawer_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut withdrawer_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, withdrawer_key, 0),
+    )
+    .writable();
+    let mut withdrawer_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, withdrawer_key, 100),
+    )
+    .writable(); // fake LP tokens
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let data = encode_withdraw_insurance_lp(100);
     let accounts = vec![
-        withdrawer.to_info(), f.slab.to_info(), withdrawer_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        withdrawer_lp_ata.to_info(), vault_auth_acct.to_info(),
+        withdrawer.to_info(),
+        f.slab.to_info(),
+        withdrawer_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        withdrawer_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
-    assert_eq!(result.unwrap_err(), PercolatorError::InsuranceSupplyMismatch.into());
+    assert_eq!(
+        result.unwrap_err(),
+        PercolatorError::InsuranceSupplyMismatch.into()
+    );
 }
 
 #[test]
@@ -679,21 +1003,46 @@ fn test_withdraw_mint_not_created() {
     ins_mint.data = vec![]; // not created
 
     let withdrawer_key = Pubkey::new_unique();
-    let mut withdrawer = TestAccount::new(withdrawer_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut withdrawer_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, withdrawer_key, 0)).writable();
-    let mut withdrawer_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, withdrawer_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut withdrawer = TestAccount::new(
+        withdrawer_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut withdrawer_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, withdrawer_key, 0),
+    )
+    .writable();
+    let mut withdrawer_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, withdrawer_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let data = encode_withdraw_insurance_lp(100);
     let accounts = vec![
-        withdrawer.to_info(), f.slab.to_info(), withdrawer_ata.to_info(),
-        f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-        withdrawer_lp_ata.to_info(), vault_auth_acct.to_info(),
+        withdrawer.to_info(),
+        f.slab.to_info(),
+        withdrawer_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        ins_mint.to_info(),
+        withdrawer_lp_ata.to_info(),
+        vault_auth_acct.to_info(),
     ];
     let result = process_instruction(&f.program_id, &accounts, &data);
-    assert_eq!(result.unwrap_err(), PercolatorError::InsuranceMintNotCreated.into());
+    assert_eq!(
+        result.unwrap_err(),
+        PercolatorError::InsuranceMintNotCreated.into()
+    );
 }
 
 // ============================================================
@@ -709,19 +1058,41 @@ fn test_withdraw_below_threshold_rejected() {
 
     // Deposit
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 1_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -736,21 +1107,34 @@ fn test_withdraw_below_threshold_rejected() {
     {
         let data = encode_withdraw_insurance_lp(200_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         let result = process_instruction(&f.program_id, &accounts, &data);
-        assert_eq!(result.unwrap_err(), PercolatorError::InsuranceBelowThreshold.into());
+        assert_eq!(
+            result.unwrap_err(),
+            PercolatorError::InsuranceBelowThreshold.into()
+        );
     }
 
     // Withdraw 50_000 LP → leaves 950_000 >= 900_000 → should succeed
     {
         let data = encode_withdraw_insurance_lp(50_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -773,18 +1157,34 @@ fn test_multi_user_proportional_shares() {
     // User A deposits 1_000_000
     let a_key = Pubkey::new_unique();
     let mut a = TestAccount::new(a_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut a_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, a_key, 5_000_000)).writable();
-    let mut a_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, a_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut a_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, a_key, 5_000_000),
+    )
+    .writable();
+    let mut a_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, a_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            a.to_info(), f.slab.to_info(), a_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            a_lp_ata.to_info(), vault_auth_acct.to_info(),
+            a.to_info(),
+            f.slab.to_info(),
+            a_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            a_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -793,17 +1193,32 @@ fn test_multi_user_proportional_shares() {
     // User B deposits 1_000_000
     let b_key = Pubkey::new_unique();
     let mut b = TestAccount::new(b_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut b_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, b_key, 5_000_000)).writable();
-    let mut b_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, b_key, 0)).writable();
+    let mut b_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, b_key, 5_000_000),
+    )
+    .writable();
+    let mut b_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, b_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -817,9 +1232,14 @@ fn test_multi_user_proportional_shares() {
     {
         let data = encode_withdraw_insurance_lp(1_000_000);
         let accounts = vec![
-            a.to_info(), f.slab.to_info(), a_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            a_lp_ata.to_info(), vault_auth_acct.to_info(),
+            a.to_info(),
+            f.slab.to_info(),
+            a_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            a_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -828,9 +1248,14 @@ fn test_multi_user_proportional_shares() {
     {
         let data = encode_withdraw_insurance_lp(1_000_000);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -847,20 +1272,42 @@ fn test_yield_accrual_withdraw_more_than_deposited() {
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 2_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 2_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     // Deposit 1_000_000
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -869,13 +1316,27 @@ fn test_yield_accrual_withdraw_more_than_deposited() {
 
     // Simulate fee accrual: top up insurance fund by 500_000 via TopUpInsurance instruction
     {
-        let mut funder = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
-        let mut funder_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-            make_token_account(f.mint.key, funder.key, 1_000_000)).writable();
+        let mut funder = TestAccount::new(
+            Pubkey::new_unique(),
+            solana_program::system_program::id(),
+            0,
+            vec![],
+        )
+        .signer();
+        let mut funder_ata = TestAccount::new(
+            Pubkey::new_unique(),
+            spl_token::ID,
+            0,
+            make_token_account(f.mint.key, funder.key, 1_000_000),
+        )
+        .writable();
         let data = encode_topup_insurance(500_000);
         let accounts = vec![
-            funder.to_info(), f.slab.to_info(), funder_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(),
+            funder.to_info(),
+            f.slab.to_info(),
+            funder_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -888,9 +1349,14 @@ fn test_yield_accrual_withdraw_more_than_deposited() {
     {
         let data = encode_withdraw_insurance_lp(1_000_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -911,35 +1377,65 @@ fn test_rounding_favors_pool() {
     let (mut f, mut ins_mint) = setup_market_with_ins_mint();
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     // User A deposits 1_000_000
     let a_key = Pubkey::new_unique();
     let mut a = TestAccount::new(a_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut a_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, a_key, 5_000_000)).writable();
-    let mut a_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, a_key, 0)).writable();
+    let mut a_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, a_key, 5_000_000),
+    )
+    .writable();
+    let mut a_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, a_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            a.to_info(), f.slab.to_info(), a_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            a_lp_ata.to_info(), vault_auth_acct.to_info(),
+            a.to_info(),
+            f.slab.to_info(),
+            a_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            a_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
 
     // Top up by 1 unit to create rounding scenario (balance=1_000_001, supply=1_000_000)
     {
-        let mut funder = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
-        let mut funder_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-            make_token_account(f.mint.key, funder.key, 1_000_000)).writable();
+        let mut funder = TestAccount::new(
+            Pubkey::new_unique(),
+            solana_program::system_program::id(),
+            0,
+            vec![],
+        )
+        .signer();
+        let mut funder_ata = TestAccount::new(
+            Pubkey::new_unique(),
+            spl_token::ID,
+            0,
+            make_token_account(f.mint.key, funder.key, 1_000_000),
+        )
+        .writable();
         let data = encode_topup_insurance(1);
         let accounts = vec![
-            funder.to_info(), f.slab.to_info(), funder_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(),
+            funder.to_info(),
+            f.slab.to_info(),
+            funder_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -948,17 +1444,32 @@ fn test_rounding_favors_pool() {
     // User B deposits 3 tokens → LP = 3 * 1_000_000 / 1_000_001 = 2 (rounded DOWN)
     let b_key = Pubkey::new_unique();
     let mut b = TestAccount::new(b_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut b_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, b_key, 5_000_000)).writable();
-    let mut b_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, b_key, 0)).writable();
+    let mut b_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, b_key, 5_000_000),
+    )
+    .writable();
+    let mut b_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, b_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(3);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -977,20 +1488,31 @@ fn test_rounding_favors_pool() {
     {
         let data = encode_withdraw_insurance_lp(2);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
 
     let b_returned = read_token_balance(&b_ata.data) - (5_000_000 - 3); // B deposited 3, now check how much extra
-    // B started with 5_000_000, deposited 3 (had 4_999_997), now got some back
+                                                                        // B started with 5_000_000, deposited 3 (had 4_999_997), now got some back
     let b_final = read_token_balance(&b_ata.data);
     // B deposited 3, got back 2 → net loss of 1 (rounding favors pool)
-    assert!(b_final <= 5_000_000 - 3 + 3, "B should not get more than deposited + yield");
+    assert!(
+        b_final <= 5_000_000 - 3 + 3,
+        "B should not get more than deposited + yield"
+    );
     // The pool should not be underfunded: remaining balance >= 0
-    assert!(read_insurance_balance(&f.slab.data) > 0, "Pool should retain rounding dust");
+    assert!(
+        read_insurance_balance(&f.slab.data) > 0,
+        "Pool should retain rounding dust"
+    );
 }
 
 #[test]
@@ -999,24 +1521,46 @@ fn test_large_amounts() {
     let (mut f, mut ins_mint) = setup_market_with_ins_mint();
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     // Very large deposit (near u64::MAX / 2 to avoid overflow in vault)
     let large_amount = u64::MAX / 4;
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, large_amount)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, large_amount),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(large_amount);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1028,9 +1572,14 @@ fn test_large_amounts() {
     {
         let data = encode_withdraw_insurance_lp(large_amount);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1046,22 +1595,38 @@ fn test_yield_accrual_multi_user() {
     let (mut f, mut ins_mint) = setup_market_with_ins_mint();
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     // A deposits 1_000_000
     let a_key = Pubkey::new_unique();
     let mut a = TestAccount::new(a_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut a_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, a_key, 10_000_000)).writable();
-    let mut a_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, a_key, 0)).writable();
+    let mut a_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, a_key, 10_000_000),
+    )
+    .writable();
+    let mut a_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, a_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            a.to_info(), f.slab.to_info(), a_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            a_lp_ata.to_info(), vault_auth_acct.to_info(),
+            a.to_info(),
+            f.slab.to_info(),
+            a_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            a_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1070,17 +1635,32 @@ fn test_yield_accrual_multi_user() {
     // B deposits 1_000_000 → gets 1_000_000 LP (same ratio)
     let b_key = Pubkey::new_unique();
     let mut b = TestAccount::new(b_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut b_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, b_key, 10_000_000)).writable();
-    let mut b_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, b_key, 0)).writable();
+    let mut b_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, b_key, 10_000_000),
+    )
+    .writable();
+    let mut b_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, b_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1088,13 +1668,27 @@ fn test_yield_accrual_multi_user() {
 
     // Fee accrual: top up 1_000_000 (simulating trading fees flowing to insurance)
     {
-        let mut funder = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
-        let mut funder_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-            make_token_account(f.mint.key, funder.key, 2_000_000)).writable();
+        let mut funder = TestAccount::new(
+            Pubkey::new_unique(),
+            solana_program::system_program::id(),
+            0,
+            vec![],
+        )
+        .signer();
+        let mut funder_ata = TestAccount::new(
+            Pubkey::new_unique(),
+            spl_token::ID,
+            0,
+            make_token_account(f.mint.key, funder.key, 2_000_000),
+        )
+        .writable();
         let data = encode_topup_insurance(1_000_000);
         let accounts = vec![
-            funder.to_info(), f.slab.to_info(), funder_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(),
+            funder.to_info(),
+            f.slab.to_info(),
+            funder_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1104,27 +1698,43 @@ fn test_yield_accrual_multi_user() {
     {
         let data = encode_withdraw_insurance_lp(1_000_000);
         let accounts = vec![
-            a.to_info(), f.slab.to_info(), a_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            a_lp_ata.to_info(), vault_auth_acct.to_info(),
+            a.to_info(),
+            f.slab.to_info(),
+            a_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            a_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
     // A deposited 1_000_000, withdrew 1_500_000 → profit of 500_000
-    assert_eq!(read_token_balance(&a_ata.data), 10_000_000 - 1_000_000 + 1_500_000);
+    assert_eq!(
+        read_token_balance(&a_ata.data),
+        10_000_000 - 1_000_000 + 1_500_000
+    );
     // balance=1_500_000, supply=1_000_000
 
     // B withdraws 1_000_000 LP → gets 1_000_000 * 1_500_000 / 1_000_000 = 1_500_000
     {
         let data = encode_withdraw_insurance_lp(1_000_000);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
-    assert_eq!(read_token_balance(&b_ata.data), 10_000_000 - 1_000_000 + 1_500_000);
+    assert_eq!(
+        read_token_balance(&b_ata.data),
+        10_000_000 - 1_000_000 + 1_500_000
+    );
     assert_eq!(read_insurance_balance(&f.slab.data), 0u128);
 }
 
@@ -1135,22 +1745,38 @@ fn test_deposit_with_supply_but_zero_balance_fails() {
     let (mut f, mut ins_mint) = setup_market_with_ins_mint();
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     // Deposit first
     let a_key = Pubkey::new_unique();
     let mut a = TestAccount::new(a_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut a_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, a_key, 5_000_000)).writable();
-    let mut a_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, a_key, 0)).writable();
+    let mut a_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, a_key, 5_000_000),
+    )
+    .writable();
+    let mut a_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, a_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            a.to_info(), f.slab.to_info(), a_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            a_lp_ata.to_info(), vault_auth_acct.to_info(),
+            a.to_info(),
+            f.slab.to_info(),
+            a_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            a_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1164,20 +1790,38 @@ fn test_deposit_with_supply_but_zero_balance_fails() {
     // Try second deposit — should fail with InsuranceSupplyMismatch
     let b_key = Pubkey::new_unique();
     let mut b = TestAccount::new(b_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut b_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, b_key, 5_000_000)).writable();
-    let mut b_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, b_key, 0)).writable();
+    let mut b_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, b_key, 5_000_000),
+    )
+    .writable();
+    let mut b_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, b_key, 0),
+    )
+    .writable();
 
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            b.to_info(), f.slab.to_info(), b_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            b_lp_ata.to_info(), vault_auth_acct.to_info(),
+            b.to_info(),
+            f.slab.to_info(),
+            b_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            b_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         let result = process_instruction(&f.program_id, &accounts, &data);
-        assert_eq!(result.unwrap_err(), PercolatorError::InsuranceSupplyMismatch.into());
+        assert_eq!(
+            result.unwrap_err(),
+            PercolatorError::InsuranceSupplyMismatch.into()
+        );
     }
 }
 
@@ -1187,22 +1831,44 @@ fn test_partial_withdraw() {
     let (mut f, mut ins_mint) = setup_market_with_ins_mint();
     let (vault_auth, _) = accounts::derive_vault_authority(&f.program_id, &f.slab.key);
     let (ins_lp_mint_key, _) = accounts::derive_insurance_lp_mint(&f.program_id, &f.slab.key);
-    let mut vault_auth_acct = TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut vault_auth_acct =
+        TestAccount::new(vault_auth, solana_program::system_program::id(), 0, vec![]);
 
     let depositor_key = Pubkey::new_unique();
-    let mut depositor = TestAccount::new(depositor_key, solana_program::system_program::id(), 0, vec![]).signer();
-    let mut depositor_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(f.mint.key, depositor_key, 2_000_000)).writable();
-    let mut depositor_lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
-        make_token_account(ins_lp_mint_key, depositor_key, 0)).writable();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 2_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(ins_lp_mint_key, depositor_key, 0),
+    )
+    .writable();
 
     // Deposit 1_000_000
     {
         let data = encode_deposit_insurance_lp(1_000_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1211,9 +1877,14 @@ fn test_partial_withdraw() {
     {
         let data = encode_withdraw_insurance_lp(500_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -1227,9 +1898,14 @@ fn test_partial_withdraw() {
     {
         let data = encode_withdraw_insurance_lp(500_000);
         let accounts = vec![
-            depositor.to_info(), f.slab.to_info(), depositor_ata.to_info(),
-            f.vault.to_info(), f.token_prog.to_info(), ins_mint.to_info(),
-            depositor_lp_ata.to_info(), vault_auth_acct.to_info(),
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            ins_mint.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth_acct.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }

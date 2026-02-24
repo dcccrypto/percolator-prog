@@ -16,11 +16,11 @@ use solana_sdk::{
     clock::Clock,
     compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
+    program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     sysvar,
     transaction::Transaction,
-    program_pack::Pack,
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
@@ -29,10 +29,10 @@ use std::path::PathBuf;
 
 // SLAB_LEN for SBF - differs between test and production
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 16312;  // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 16312; // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 992560;  // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 992560; // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -42,10 +42,8 @@ const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
-    0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
-    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
-    0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ]);
 
 /// Default feed_id for CU benchmarks
@@ -85,7 +83,13 @@ fn make_mint_data() -> Vec<u8> {
 /// Create PriceUpdateV2 mock data (Pyth Pull format)
 /// Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) +
 ///         price(8) + conf(8) + expo(4) + publish_time(8) + ...
-fn make_pyth_data(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
+fn make_pyth_data(
+    feed_id: &[u8; 32],
+    price: i64,
+    expo: i32,
+    conf: u64,
+    publish_time: i64,
+) -> Vec<u8> {
     let mut data = vec![0u8; 134];
     // feed_id at offset 42
     data[42..74].copy_from_slice(feed_id);
@@ -116,24 +120,24 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
-    // RiskParams
+                                                 // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
-    data.extend_from_slice(&0u64.to_le_bytes());   // trading_fee_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes());  // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&risk_reduction_threshold.to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes());  // maintenance_fee_per_slot
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
-    data.extend_from_slice(&50u64.to_le_bytes());  // liquidation_fee_bps
+    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
-    data.extend_from_slice(&0u128.to_le_bytes());  // min_liquidation_abs
-    data.extend_from_slice(&0u64.to_le_bytes());   // funding_premium_weight_bps
-    data.extend_from_slice(&0u64.to_le_bytes());   // funding_settlement_interval_slots
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data.extend_from_slice(&0u64.to_le_bytes()); // funding_premium_weight_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // funding_settlement_interval_slots
     data.extend_from_slice(&1_000_000u64.to_le_bytes()); // funding_premium_dampening_e6
-    data.extend_from_slice(&5i64.to_le_bytes());   // funding_premium_max_bps_per_slot
+    data.extend_from_slice(&5i64.to_le_bytes()); // funding_premium_max_bps_per_slot
     data
 }
 
@@ -210,65 +214,107 @@ impl TestEnv {
 
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-        svm.set_account(slab, Account {
-            lamports: 1_000_000_000,
-            data: vec![0u8; SLAB_LEN],
-            owner: program_id,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            slab,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; SLAB_LEN],
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_account(mint, Account {
-            lamports: 1_000_000,
-            data: make_mint_data(),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 1_000_000,
+                data: make_mint_data(),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_account(vault, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            vault,
+            Account {
+                lamports: 1_000_000,
+                data: make_token_account_data(&mint, &vault_pda, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
         let pyth_data = make_pyth_data(&BENCHMARK_FEED_ID, 100_000_000, -6, 1, 100); // $100
-        svm.set_account(pyth_index, Account {
-            lamports: 1_000_000,
-            data: pyth_data.clone(),
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        svm.set_account(pyth_col, Account {
-            lamports: 1_000_000,
-            data: pyth_data,
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data.clone(),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            pyth_col,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+        svm.set_sysvar(&Clock {
+            slot: 100,
+            unix_timestamp: 100,
+            ..Clock::default()
+        });
 
-        TestEnv { svm, program_id, payer, slab, mint, vault, pyth_index, pyth_col }
+        TestEnv {
+            svm,
+            program_id,
+            payer,
+            slab,
+            mint,
+            vault,
+            pyth_index,
+            pyth_col,
+        }
     }
 
     fn init_market(&mut self) {
         self.init_market_with_params(0, 0);
     }
 
-    fn init_market_with_params(&mut self, risk_reduction_threshold: u128, warmup_period_slots: u64) {
+    fn init_market_with_params(
+        &mut self,
+        risk_reduction_threshold: u128,
+        warmup_period_slots: u64,
+    ) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         // InitMarket now expects 9 accounts (removed pyth_index and pyth_col)
         let ix = Instruction {
@@ -294,20 +340,28 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
     }
 
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
         let ata = Pubkey::new_unique();
-        self.svm.set_account(ata, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&self.mint, owner, amount),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: make_token_account_data(&self.mint, owner, amount),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
         ata
     }
 
@@ -316,13 +370,18 @@ impl TestEnv {
         let ata = self.create_ata(&owner.pubkey(), 0);
         let matcher = spl_token::ID;
         let ctx = Pubkey::new_unique();
-        self.svm.set_account(ctx, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; 320],
-            owner: matcher,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; 320],
+                    owner: matcher,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -339,7 +398,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
         0
@@ -364,7 +426,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
         1 // LP is 0
@@ -387,7 +452,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("deposit failed");
     }
@@ -406,7 +474,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[user, lp], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[user, lp],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("trade failed");
     }
@@ -433,7 +504,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[budget_ix, crank_ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+            &[budget_ix, crank_ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
         );
         let result = self.svm.send_transaction(tx).expect("crank failed");
         result.compute_units_consumed
@@ -441,23 +515,37 @@ impl TestEnv {
 
     fn set_price(&mut self, price_e6: i64, slot: u64) {
         // Set both slot and unix_timestamp (using slot value as unix_timestamp for simplicity)
-        self.svm.set_sysvar(&Clock { slot, unix_timestamp: slot as i64, ..Clock::default() });
+        self.svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
         let pyth_data = make_pyth_data(&BENCHMARK_FEED_ID, price_e6, -6, 1, slot as i64);
 
-        self.svm.set_account(self.pyth_index, Account {
-            lamports: 1_000_000,
-            data: pyth_data.clone(),
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        self.svm.set_account(self.pyth_col, Account {
-            lamports: 1_000_000,
-            data: pyth_data,
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                self.pyth_index,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data.clone(),
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.svm
+            .set_account(
+                self.pyth_col,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data,
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
     }
 
     fn try_crank(&mut self) -> Result<(u64, Vec<String>), String> {
@@ -478,7 +566,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[budget_ix, crank_ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+            &[budget_ix, crank_ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
         );
         match self.svm.send_transaction(tx) {
             Ok(result) => Ok((result.compute_units_consumed, result.logs)),
@@ -505,9 +596,14 @@ impl TestEnv {
             data,
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&funder.pubkey()), &[funder], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&funder.pubkey()),
+            &[funder],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx).expect("top_up_insurance failed");
+        self.svm
+            .send_transaction(tx)
+            .expect("top_up_insurance failed");
     }
 }
 
@@ -532,7 +628,10 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
             data: encode_init_user(0),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[&user],
+            env.svm.latest_blockhash(),
         );
         env.svm.send_transaction(tx).unwrap();
 
@@ -556,8 +655,15 @@ fn benchmark_worst_case_scenarios() {
     println!("Solana max CU per tx: 1,400,000\n");
 
     // Assert we're testing with production config (4096 accounts)
-    assert_eq!(MAX_ACCOUNTS, 4096, "Expected MAX_ACCOUNTS=4096 for production benchmark");
-    assert!(SLAB_LEN > 900_000, "Expected SLAB_LEN > 900K for production benchmark, got {}", SLAB_LEN);
+    assert_eq!(
+        MAX_ACCOUNTS, 4096,
+        "Expected MAX_ACCOUNTS=4096 for production benchmark"
+    );
+    assert!(
+        SLAB_LEN > 900_000,
+        "Expected SLAB_LEN > 900K for production benchmark, got {}",
+        SLAB_LEN
+    );
 
     let path = program_path();
     if !path.exists() {
@@ -578,7 +684,10 @@ fn benchmark_worst_case_scenarios() {
 
         env.set_price(100_000_000, 200);
         let cu = env.crank();
-        println!("  CU: {:>10} (baseline scan overhead for {} slots)", cu, MAX_ACCOUNTS);
+        println!(
+            "  CU: {:>10} (baseline scan overhead for {} slots)",
+            cu, MAX_ACCOUNTS
+        );
         let cu_per_slot = cu / MAX_ACCOUNTS as u64;
         println!("  CU/slot: ~{}", cu_per_slot);
     }
@@ -615,7 +724,10 @@ fn benchmark_worst_case_scenarios() {
                 data: encode_init_user(0),
             };
             let tx = Transaction::new_signed_with_payer(
-                &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                &[ix],
+                Some(&user.pubkey()),
+                &[&user],
+                env.svm.latest_blockhash(),
             );
             env.svm.send_transaction(tx).unwrap();
             env.deposit(&user, (i + 1) as u16, 1);
@@ -679,7 +791,10 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                    &[ix],
+                    Some(&user.pubkey()),
+                    &[&user],
+                    env.svm.latest_blockhash(),
                 );
                 env.svm.send_transaction(tx).unwrap();
                 env.deposit(&user, (i + 1) as u16, 1);
@@ -689,7 +804,10 @@ fn benchmark_worst_case_scenarios() {
             match env.try_crank() {
                 Ok((cu, _logs)) => {
                     let cu_per_account = cu / (num_users + 1) as u64;
-                    println!("  {:>4} users: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                    println!(
+                        "  {:>4} users: {:>10} CU (~{} CU/user)",
+                        num_users, cu, cu_per_account
+                    );
                     last_success = cu;
                     last_success_users = num_users;
                 }
@@ -700,7 +818,10 @@ fn benchmark_worst_case_scenarios() {
             }
         }
         if last_success_users > 0 {
-            println!("  → Max practical limit: ~{} users in single tx", last_success_users);
+            println!(
+                "  → Max practical limit: ~{} users in single tx",
+                last_success_users
+            );
         }
     }
 
@@ -736,7 +857,10 @@ fn benchmark_worst_case_scenarios() {
             match env.try_crank() {
                 Ok((cu, _logs)) => {
                     let cu_per_account = cu / (num_users + 1) as u64;
-                    println!("  {:>4} users: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                    println!(
+                        "  {:>4} users: {:>10} CU (~{} CU/user)",
+                        num_users, cu, cu_per_account
+                    );
                 }
                 Err(_) => {
                     println!("  {:>4} users: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
@@ -778,7 +902,10 @@ fn benchmark_worst_case_scenarios() {
             match env.try_crank() {
                 Ok((cu, _logs)) => {
                     let cu_per_account = cu / (num_users + 1) as u64;
-                    println!("  {:>4} liquidations: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                    println!(
+                        "  {:>4} liquidations: {:>10} CU (~{} CU/user)",
+                        num_users, cu, cu_per_account
+                    );
                 }
                 Err(_) => {
                     println!("  {:>4} liquidations: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
@@ -822,7 +949,10 @@ fn benchmark_worst_case_scenarios() {
             match env.try_crank() {
                 Ok((cu, _logs)) => {
                     let cu_per_account = cu / (num_users + 1) as u64;
-                    println!("  {:>4} users at edge: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                    println!(
+                        "  {:>4} users at edge: {:>10} CU (~{} CU/user)",
+                        num_users, cu, cu_per_account
+                    );
                 }
                 Err(_) => {
                     println!("  {:>4} users at edge: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
@@ -884,7 +1014,10 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                    &[ix],
+                    Some(&user.pubkey()),
+                    &[&user],
+                    env.svm.latest_blockhash(),
                 );
                 env.svm.send_transaction(tx).unwrap();
 
@@ -916,7 +1049,7 @@ fn benchmark_worst_case_scenarios() {
                 // Size varies by index to create different unwrapped PnL values
                 let base_size = ((i % 100) + 1) as i128 * 10;
                 let size = if i < half {
-                    base_size  // longs (losers after crash)
+                    base_size // longs (losers after crash)
                 } else {
                     -base_size // shorts (winners after crash)
                 };
@@ -931,7 +1064,10 @@ fn benchmark_worst_case_scenarios() {
             match env.try_crank() {
                 Ok((cu, _logs)) => {
                     let cu_per_account = cu / (num_users + 1) as u64;
-                    println!("  {:>4} ADL accounts: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                    println!(
+                        "  {:>4} ADL accounts: {:>10} CU (~{} CU/user)",
+                        num_users, cu, cu_per_account
+                    );
                 }
                 Err(e) => {
                     if e.contains("exceeded CUs") || e.contains("ProgramFailedToComplete") {
@@ -992,7 +1128,10 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                    &[ix],
+                    Some(&user.pubkey()),
+                    &[&user],
+                    env.svm.latest_blockhash(),
                 );
                 env.svm.send_transaction(tx).unwrap();
 
@@ -1040,7 +1179,10 @@ fn benchmark_worst_case_scenarios() {
             }
 
             if any_failed {
-                println!("  {:>4} users: ❌ Single crank exceeded 1.4M CU limit", num_users);
+                println!(
+                    "  {:>4} users: ❌ Single crank exceeded 1.4M CU limit",
+                    num_users
+                );
             } else {
                 let pct = (worst_cu as f64 / 1_400_000.0) * 100.0;
                 println!("  {:>4} users: worst={:>10} CU ({:.1}% of limit), total={} CU across 16 cranks",
@@ -1091,7 +1233,10 @@ fn benchmark_worst_case_scenarios() {
                     data: encode_init_user(0),
                 };
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                    &[ix],
+                    Some(&user.pubkey()),
+                    &[&user],
+                    env.svm.latest_blockhash(),
                 );
                 env.svm.send_transaction(tx).unwrap();
 
@@ -1137,7 +1282,10 @@ fn benchmark_worst_case_scenarios() {
             }
 
             if any_failed {
-                println!("  {:>4} users: ❌ Single crank exceeded 1.4M CU limit", num_users);
+                println!(
+                    "  {:>4} users: ❌ Single crank exceeded 1.4M CU limit",
+                    num_users
+                );
             } else {
                 let pct = (worst_cu as f64 / 1_400_000.0) * 100.0;
                 // Extract CRANK_STATS from logs - sol_log_64 format: "Program log: 0xtag, 0xliqs, 0xforce, 0xmax_accounts, 0x0"
@@ -1200,7 +1348,9 @@ fn benchmark_worst_case_scenarios() {
 
         // Top up insurance so force_realize is OFF and liquidation path runs
         let insurance_funder = Keypair::new();
-        env.svm.airdrop(&insurance_funder.pubkey(), 1_000_000_000).unwrap();
+        env.svm
+            .airdrop(&insurance_funder.pubkey(), 1_000_000_000)
+            .unwrap();
         env.top_up_insurance(&insurance_funder, 1_000_000_000); // 1B tokens
 
         let lp = Keypair::new();
@@ -1236,7 +1386,10 @@ fn benchmark_worst_case_scenarios() {
                 data: encode_init_user(0),
             };
             let tx = Transaction::new_signed_with_payer(
-                &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                &[ix],
+                Some(&user.pubkey()),
+                &[&user],
+                env.svm.latest_blockhash(),
             );
             env.svm.send_transaction(tx).unwrap();
 
@@ -1327,11 +1480,16 @@ fn benchmark_worst_case_scenarios() {
                                         let force = parse_hex_or_dec(parts[2]);
                                         last_max_acc = parse_hex_or_dec(parts[3]);
                                         last_insurance = parse_hex_or_dec(parts[4]);
-                                        total_liqs = liqs;  // cumulative from engine
+                                        total_liqs = liqs; // cumulative from engine
                                         total_force = force;
 
-                                        println!("    Crank {:>2}: {:>7} CU | liqs={} force={}",
-                                            crank_num + 1, cu, liqs, force);
+                                        println!(
+                                            "    Crank {:>2}: {:>7} CU | liqs={} force={}",
+                                            crank_num + 1,
+                                            cu,
+                                            liqs,
+                                            force
+                                        );
                                     }
                                 }
                             }
@@ -1355,8 +1513,14 @@ fn benchmark_worst_case_scenarios() {
             println!("  ❌ FAILED: Single crank exceeded 1.4M CU limit");
         } else {
             let pct = (worst_cu as f64 / 1_400_000.0) * 100.0;
-            println!("  ✓ RESULT: worst={} CU ({:.1}%), total={} CU", worst_cu, pct, total_cu);
-            println!("    Liquidations: {}, Force-realize: {}", total_liqs, total_force);
+            println!(
+                "  ✓ RESULT: worst={} CU ({:.1}%), total={} CU",
+                worst_cu, pct, total_cu
+            );
+            println!(
+                "    Liquidations: {}, Force-realize: {}",
+                total_liqs, total_force
+            );
             println!("    MAX_ACCOUNTS: {}", last_max_acc);
             if total_liqs == 0 && total_force == 0 {
                 println!("    ⚠️  WARNING: No liquidations or force-realize - check params");
@@ -1364,7 +1528,10 @@ fn benchmark_worst_case_scenarios() {
             // Expected: ~2048 liquidations (half of 4095 users are liq users)
             let expected_liq = num_users / 2;
             if total_liqs > 0 {
-                println!("    ✓ MTM margin check working - {} liquidations triggered", total_liqs);
+                println!(
+                    "    ✓ MTM margin check working - {} liquidations triggered",
+                    total_liqs
+                );
             }
         }
     }
@@ -1372,7 +1539,10 @@ fn benchmark_worst_case_scenarios() {
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("=== SUMMARY ===");
     println!("• Crank sweeps 256 accounts max per call (16 cranks for full 4096)");
-    println!("• With MAX_ACCOUNTS={}, baseline scan alone is ~194K CU", MAX_ACCOUNTS);
+    println!(
+        "• With MAX_ACCOUNTS={}, baseline scan alone is ~194K CU",
+        MAX_ACCOUNTS
+    );
     println!("• Key metric: worst single crank must stay under 1.4M CU");
     println!("• ADL/liquidation processing adds CU overhead per affected account");
 }

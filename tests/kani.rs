@@ -20,43 +20,70 @@
 extern crate kani;
 
 // Import real types and helpers from the program crate
-use percolator_prog::matcher_abi::{
-    MatcherReturn, validate_matcher_return, FLAG_VALID, FLAG_PARTIAL_OK, FLAG_REJECTED,
-};
 use percolator_prog::constants::MATCHER_ABI_VERSION;
+use percolator_prog::constants::MAX_UNIT_SCALE;
+use percolator_prog::matcher_abi::{
+    validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
+};
+use percolator_prog::oracle::{clamp_toward_with_dt, compute_ema_mark_price};
 use percolator_prog::verify::{
-    owner_ok, admin_ok, matcher_identity_ok, matcher_shape_ok, MatcherAccountsShape,
-    gate_active, nonce_on_success, nonce_on_failure, pda_key_matches, cpi_trade_size,
-    // Account validation helpers
-    signer_ok, writable_ok, len_ok,
-    LpPdaShape, lp_pda_shape_ok, oracle_feed_id_ok,
-    SlabShape, slab_shape_ok,
-    // Decision helpers for program-level coupling proofs
-    single_owner_authorized, trade_authorized,
-    TradeCpiDecision, decide_trade_cpi, decision_nonce,
-    TradeNoCpiDecision, decide_trade_nocpi,
-    SimpleDecision, decide_single_owner_op, decide_crank, decide_admin_op,
-    // ABI validation from real inputs
-    MatcherReturnFields, abi_ok, decide_trade_cpi_from_ret,
+    abi_ok,
+    // New: Dust math
+    accumulate_dust,
+    admin_ok,
+    // New: Unit scale conversion math
+    base_to_units,
+    cpi_trade_size,
+    decide_admin_op,
+    decide_crank,
     // New: allow_panic crank decision
     decide_keeper_crank_with_panic,
-    // New: Oracle inversion math
-    invert_price_e6, INVERSION_CONSTANT,
-    // New: Oracle unit scale math
-    scale_price_e6,
-    // New: Unit scale conversion math
-    base_to_units, units_to_base,
-    // New: Withdraw alignment
-    withdraw_amount_aligned,
-    // New: Dust math
-    accumulate_dust, sweep_dust,
+    decide_single_owner_op,
+    decide_trade_cpi,
+    decide_trade_cpi_from_ret,
+    decide_trade_nocpi,
+    decision_nonce,
+    gate_active,
     // New: InitMarket scale validation
     init_market_scale_ok,
+    // New: Oracle inversion math
+    invert_price_e6,
+    is_hyperp_mode_verify,
     // PERC-117: Pyth oracle verification helpers
-    is_pyth_pinned_mode, is_hyperp_mode_verify, pyth_price_is_fresh,
+    is_pyth_pinned_mode,
+    len_ok,
+    lp_pda_shape_ok,
+    matcher_identity_ok,
+    matcher_shape_ok,
+    nonce_on_failure,
+    nonce_on_success,
+    oracle_feed_id_ok,
+    owner_ok,
+    pda_key_matches,
+    pyth_price_is_fresh,
+    // New: Oracle unit scale math
+    scale_price_e6,
+    // Account validation helpers
+    signer_ok,
+    // Decision helpers for program-level coupling proofs
+    single_owner_authorized,
+    slab_shape_ok,
+    sweep_dust,
+    trade_authorized,
+    units_to_base,
+    // New: Withdraw alignment
+    withdraw_amount_aligned,
+    writable_ok,
+    LpPdaShape,
+    MatcherAccountsShape,
+    // ABI validation from real inputs
+    MatcherReturnFields,
+    SimpleDecision,
+    SlabShape,
+    TradeCpiDecision,
+    TradeNoCpiDecision,
+    INVERSION_CONSTANT,
 };
-use percolator_prog::constants::MAX_UNIT_SCALE;
-use percolator_prog::oracle::{clamp_toward_with_dt, compute_ema_mark_price};
 
 // Kani-specific bounds to avoid SAT explosion on division/modulo.
 // MAX_UNIT_SCALE (1 billion) is too large for bit-precise SAT solving.
@@ -276,7 +303,10 @@ fn kani_matcher_zero_size_requires_partial_ok() {
     let req_id: u64 = ret.req_id;
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_err(), "zero exec_size without PARTIAL_OK must be rejected");
+    assert!(
+        result.is_err(),
+        "zero exec_size without PARTIAL_OK must be rejected"
+    );
 }
 
 /// Prove: exec_size exceeding req_size is rejected
@@ -297,7 +327,10 @@ fn kani_matcher_rejects_exec_size_exceeds_req() {
     kani::assume(ret.exec_size.unsigned_abs() > req_size.unsigned_abs());
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_err(), "exec_size exceeding req_size must be rejected");
+    assert!(
+        result.is_err(),
+        "exec_size exceeding req_size must be rejected"
+    );
 }
 
 /// Prove: sign mismatch between exec_size and req_size is rejected
@@ -334,10 +367,7 @@ fn kani_owner_mismatch_rejected() {
     let signer: [u8; 32] = kani::any();
     kani::assume(stored != signer);
 
-    assert!(
-        !owner_ok(stored, signer),
-        "owner mismatch must be rejected"
-    );
+    assert!(!owner_ok(stored, signer), "owner mismatch must be rejected");
 }
 
 /// Prove: owner match is accepted
@@ -345,10 +375,7 @@ fn kani_owner_mismatch_rejected() {
 fn kani_owner_match_accepted() {
     let owner: [u8; 32] = kani::any();
 
-    assert!(
-        owner_ok(owner, owner),
-        "owner match must be accepted"
-    );
+    assert!(owner_ok(owner, owner), "owner match must be accepted");
 }
 
 // =============================================================================
@@ -363,10 +390,7 @@ fn kani_admin_mismatch_rejected() {
     kani::assume(admin != [0u8; 32]); // Not burned
     kani::assume(admin != signer);
 
-    assert!(
-        !admin_ok(admin, signer),
-        "admin mismatch must be rejected"
-    );
+    assert!(!admin_ok(admin, signer), "admin mismatch must be rejected");
 }
 
 /// Prove: admin match is accepted (when not burned)
@@ -375,10 +399,7 @@ fn kani_admin_match_accepted() {
     let admin: [u8; 32] = kani::any();
     kani::assume(admin != [0u8; 32]); // Not burned
 
-    assert!(
-        admin_ok(admin, admin),
-        "admin match must be accepted"
-    );
+    assert!(admin_ok(admin, admin), "admin match must be accepted");
 }
 
 /// Prove: burned admin (all zeros) disables all admin ops
@@ -532,10 +553,7 @@ fn kani_pda_mismatch_rejected() {
 fn kani_pda_match_accepted() {
     let key: [u8; 32] = kani::any();
 
-    assert!(
-        pda_key_matches(key, key),
-        "PDA key match must be accepted"
-    );
+    assert!(pda_key_matches(key, key), "PDA key match must be accepted");
 }
 
 // =============================================================================
@@ -548,10 +566,7 @@ fn kani_nonce_unchanged_on_failure() {
     let old_nonce: u64 = kani::any();
     let new_nonce = nonce_on_failure(old_nonce);
 
-    assert_eq!(
-        new_nonce, old_nonce,
-        "nonce must be unchanged on failure"
-    );
+    assert_eq!(new_nonce, old_nonce, "nonce must be unchanged on failure");
 }
 
 /// Prove: nonce advances by exactly 1 on success
@@ -573,10 +588,7 @@ fn kani_nonce_wraps_at_max() {
     let old_nonce = u64::MAX;
     let new_nonce = nonce_on_success(old_nonce);
 
-    assert_eq!(
-        new_nonce, 0,
-        "nonce must wrap to 0 at u64::MAX"
-    );
+    assert_eq!(new_nonce, 0, "nonce must wrap to 0 at u64::MAX");
 }
 
 // =============================================================================
@@ -724,11 +736,14 @@ fn kani_tradecpi_rejects_non_executable_prog() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size
+        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject non-executable matcher program");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject non-executable matcher program"
+    );
 }
 
 /// Prove: TradeCpi rejects on bad matcher shape (executable ctx)
@@ -744,11 +759,14 @@ fn kani_tradecpi_rejects_executable_ctx() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size
+        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject executable matcher context");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject executable matcher context"
+    );
 }
 
 /// Prove: TradeCpi rejects on PDA mismatch (even if everything else valid)
@@ -758,7 +776,8 @@ fn kani_tradecpi_rejects_pda_mismatch() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
+        old_nonce,
+        valid_shape(),
         true,  // identity_ok
         false, // pda_ok - BAD
         true,  // abi_ok
@@ -766,11 +785,14 @@ fn kani_tradecpi_rejects_pda_mismatch() {
         true,  // lp_auth_ok
         false, // gate_active
         false, // risk_increase
-        exec_size
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject PDA mismatch");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject PDA mismatch"
+    );
 }
 
 /// Prove: TradeCpi rejects on user auth failure
@@ -780,7 +802,8 @@ fn kani_tradecpi_rejects_user_auth_failure() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
+        old_nonce,
+        valid_shape(),
         true,  // identity_ok
         true,  // pda_ok
         true,  // abi_ok
@@ -788,11 +811,14 @@ fn kani_tradecpi_rejects_user_auth_failure() {
         true,  // lp_auth_ok
         false, // gate_active
         false, // risk_increase
-        exec_size
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject user auth failure");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject user auth failure"
+    );
 }
 
 /// Prove: TradeCpi rejects on LP auth failure
@@ -802,7 +828,8 @@ fn kani_tradecpi_rejects_lp_auth_failure() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
+        old_nonce,
+        valid_shape(),
         true,  // identity_ok
         true,  // pda_ok
         true,  // abi_ok
@@ -810,11 +837,14 @@ fn kani_tradecpi_rejects_lp_auth_failure() {
         false, // lp_auth_ok - BAD
         false, // gate_active
         false, // risk_increase
-        exec_size
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject LP auth failure");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject LP auth failure"
+    );
 }
 
 /// Prove: TradeCpi rejects on identity mismatch (even if ABI valid)
@@ -824,7 +854,8 @@ fn kani_tradecpi_rejects_identity_mismatch() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
+        old_nonce,
+        valid_shape(),
         false, // identity_ok - BAD
         true,  // pda_ok
         true,  // abi_ok (strong adversary: valid ABI but wrong identity)
@@ -832,11 +863,14 @@ fn kani_tradecpi_rejects_identity_mismatch() {
         true,  // lp_auth_ok
         false, // gate_active
         false, // risk_increase
-        exec_size
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject identity mismatch even if ABI valid");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject identity mismatch even if ABI valid"
+    );
 }
 
 /// Prove: TradeCpi rejects on ABI validation failure
@@ -846,7 +880,8 @@ fn kani_tradecpi_rejects_abi_failure() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
+        old_nonce,
+        valid_shape(),
         true,  // identity_ok
         true,  // pda_ok
         false, // abi_ok - BAD
@@ -854,11 +889,14 @@ fn kani_tradecpi_rejects_abi_failure() {
         true,  // lp_auth_ok
         false, // gate_active
         false, // risk_increase
-        exec_size
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject ABI validation failure");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject ABI validation failure"
+    );
 }
 
 /// Prove: TradeCpi rejects on gate active + risk increase
@@ -868,19 +906,23 @@ fn kani_tradecpi_rejects_gate_risk_increase() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
-        true,  // identity_ok
-        true,  // pda_ok
-        true,  // abi_ok
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
-        true,  // gate_active - ACTIVE
-        true,  // risk_increase - INCREASING
-        exec_size
+        old_nonce,
+        valid_shape(),
+        true, // identity_ok
+        true, // pda_ok
+        true, // abi_ok
+        true, // user_auth_ok
+        true, // lp_auth_ok
+        true, // gate_active - ACTIVE
+        true, // risk_increase - INCREASING
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject when gate active and risk increasing");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject when gate active and risk increasing"
+    );
 }
 
 /// Prove: TradeCpi allows risk-reducing trade when gate active
@@ -890,7 +932,8 @@ fn kani_tradecpi_allows_gate_risk_decrease() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
+        old_nonce,
+        valid_shape(),
         true,  // identity_ok
         true,  // pda_ok
         true,  // abi_ok
@@ -898,11 +941,13 @@ fn kani_tradecpi_allows_gate_risk_decrease() {
         true,  // lp_auth_ok
         true,  // gate_active
         false, // risk_increase - NOT increasing (reducing or neutral)
-        exec_size
+        exec_size,
     );
 
-    assert!(matches!(decision, TradeCpiDecision::Accept { .. }),
-        "TradeCpi must allow risk-reducing trade when gate active");
+    assert!(
+        matches!(decision, TradeCpiDecision::Accept { .. }),
+        "TradeCpi must allow risk-reducing trade when gate active"
+    );
 }
 
 /// Prove: TradeCpi reject leaves nonce unchanged
@@ -920,13 +965,15 @@ fn kani_tradecpi_reject_nonce_unchanged() {
     };
 
     let decision = decide_trade_cpi(
-        old_nonce, bad_shape, true, true, true, true, true, false, false, exec_size
+        old_nonce, bad_shape, true, true, true, true, true, false, false, exec_size,
     );
 
     let result_nonce = decision_nonce(old_nonce, decision);
 
-    assert_eq!(result_nonce, old_nonce,
-        "TradeCpi reject must leave nonce unchanged");
+    assert_eq!(
+        result_nonce, old_nonce,
+        "TradeCpi reject must leave nonce unchanged"
+    );
 }
 
 /// Prove: TradeCpi accept increments nonce
@@ -936,17 +983,30 @@ fn kani_tradecpi_accept_increments_nonce() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
-        true, true, true, true, true, false, false, exec_size
+        old_nonce,
+        valid_shape(),
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        exec_size,
     );
 
-    assert!(matches!(decision, TradeCpiDecision::Accept { .. }),
-        "should accept with all valid inputs");
+    assert!(
+        matches!(decision, TradeCpiDecision::Accept { .. }),
+        "should accept with all valid inputs"
+    );
 
     let result_nonce = decision_nonce(old_nonce, decision);
 
-    assert_eq!(result_nonce, old_nonce.wrapping_add(1),
-        "TradeCpi accept must increment nonce by 1");
+    assert_eq!(
+        result_nonce,
+        old_nonce.wrapping_add(1),
+        "TradeCpi accept must increment nonce by 1"
+    );
 }
 
 /// Prove: TradeCpi accept uses exec_size
@@ -956,13 +1016,20 @@ fn kani_tradecpi_accept_uses_exec_size() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, valid_shape(),
-        true, true, true, true, true, false, false, exec_size
+        old_nonce,
+        valid_shape(),
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        exec_size,
     );
 
     if let TradeCpiDecision::Accept { chosen_size, .. } = decision {
-        assert_eq!(chosen_size, exec_size,
-            "TradeCpi accept must use exec_size");
+        assert_eq!(chosen_size, exec_size, "TradeCpi accept must use exec_size");
     } else {
         panic!("expected Accept");
     }
@@ -976,32 +1043,44 @@ fn kani_tradecpi_accept_uses_exec_size() {
 #[kani::proof]
 fn kani_tradenocpi_rejects_user_auth_failure() {
     let decision = decide_trade_nocpi(false, true, false, false);
-    assert_eq!(decision, TradeNoCpiDecision::Reject,
-        "TradeNoCpi must reject user auth failure");
+    assert_eq!(
+        decision,
+        TradeNoCpiDecision::Reject,
+        "TradeNoCpi must reject user auth failure"
+    );
 }
 
 /// Prove: TradeNoCpi rejects on LP auth failure
 #[kani::proof]
 fn kani_tradenocpi_rejects_lp_auth_failure() {
     let decision = decide_trade_nocpi(true, false, false, false);
-    assert_eq!(decision, TradeNoCpiDecision::Reject,
-        "TradeNoCpi must reject LP auth failure");
+    assert_eq!(
+        decision,
+        TradeNoCpiDecision::Reject,
+        "TradeNoCpi must reject LP auth failure"
+    );
 }
 
 /// Prove: TradeNoCpi rejects on gate active + risk increase
 #[kani::proof]
 fn kani_tradenocpi_rejects_gate_risk_increase() {
     let decision = decide_trade_nocpi(true, true, true, true);
-    assert_eq!(decision, TradeNoCpiDecision::Reject,
-        "TradeNoCpi must reject when gate active and risk increasing");
+    assert_eq!(
+        decision,
+        TradeNoCpiDecision::Reject,
+        "TradeNoCpi must reject when gate active and risk increasing"
+    );
 }
 
 /// Prove: TradeNoCpi accepts when all checks pass
 #[kani::proof]
 fn kani_tradenocpi_accepts_valid() {
     let decision = decide_trade_nocpi(true, true, false, false);
-    assert_eq!(decision, TradeNoCpiDecision::Accept,
-        "TradeNoCpi must accept when all checks pass");
+    assert_eq!(
+        decision,
+        TradeNoCpiDecision::Accept,
+        "TradeNoCpi must accept when all checks pass"
+    );
 }
 
 // =============================================================================
@@ -1026,7 +1105,10 @@ fn kani_matcher_zero_size_with_partial_ok_accepted() {
     let req_id: u64 = ret.req_id;
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_ok(), "zero exec_size with PARTIAL_OK must be accepted");
+    assert!(
+        result.is_ok(),
+        "zero exec_size with PARTIAL_OK must be accepted"
+    );
 }
 
 // =============================================================================
@@ -1046,11 +1128,14 @@ fn kani_tradecpi_rejects_ctx_owner_mismatch() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size
+        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject when context not owned by matcher program");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject when context not owned by matcher program"
+    );
 }
 
 /// Prove: TradeCpi rejects on bad matcher shape (ctx too short)
@@ -1066,11 +1151,14 @@ fn kani_tradecpi_rejects_ctx_len_short() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size
+        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "TradeCpi must reject when context length insufficient");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "TradeCpi must reject when context length insufficient"
+    );
 }
 
 // =============================================================================
@@ -1101,8 +1189,16 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
     // Only consider rejection cases
@@ -1110,8 +1206,10 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
 
     // For ANY rejection, nonce must be unchanged
     let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(result_nonce, old_nonce,
-        "ANY TradeCpi rejection must leave nonce unchanged");
+    assert_eq!(
+        result_nonce, old_nonce,
+        "ANY TradeCpi rejection must leave nonce unchanged"
+    );
 }
 
 /// Prove: ANY TradeCpi acceptance increments nonce (universal quantification)
@@ -1137,8 +1235,16 @@ fn kani_tradecpi_any_accept_increments_nonce() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
     // Only consider acceptance cases
@@ -1146,8 +1252,11 @@ fn kani_tradecpi_any_accept_increments_nonce() {
 
     // For ANY acceptance, nonce must increment by 1
     let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(result_nonce, old_nonce.wrapping_add(1),
-        "ANY TradeCpi acceptance must increment nonce by 1");
+    assert_eq!(
+        result_nonce,
+        old_nonce.wrapping_add(1),
+        "ANY TradeCpi acceptance must increment nonce by 1"
+    );
 }
 
 // =============================================================================
@@ -1163,8 +1272,11 @@ fn kani_len_ok_universal() {
     let need: usize = kani::any();
 
     // Universal proof: len_ok returns true iff actual >= need
-    assert_eq!(len_ok(actual, need), actual >= need,
-        "len_ok must return (actual >= need)");
+    assert_eq!(
+        len_ok(actual, need),
+        actual >= need,
+        "len_ok must return (actual >= need)"
+    );
 }
 
 // =============================================================================
@@ -1179,7 +1291,10 @@ fn kani_lp_pda_shape_valid() {
         data_len_zero: true,
         lamports_zero: true,
     };
-    assert!(lp_pda_shape_ok(shape), "valid LP PDA shape must be accepted");
+    assert!(
+        lp_pda_shape_ok(shape),
+        "valid LP PDA shape must be accepted"
+    );
 }
 
 /// Prove: non-system-owned LP PDA is rejected
@@ -1190,7 +1305,10 @@ fn kani_lp_pda_rejects_wrong_owner() {
         data_len_zero: true,
         lamports_zero: true,
     };
-    assert!(!lp_pda_shape_ok(shape), "non-system-owned LP PDA must be rejected");
+    assert!(
+        !lp_pda_shape_ok(shape),
+        "non-system-owned LP PDA must be rejected"
+    );
 }
 
 /// Prove: LP PDA with data is rejected
@@ -1223,7 +1341,10 @@ fn kani_lp_pda_rejects_funded() {
 #[kani::proof]
 fn kani_oracle_feed_id_match() {
     let feed_id: [u8; 32] = kani::any();
-    assert!(oracle_feed_id_ok(feed_id, feed_id), "matching oracle feed_ids must be accepted");
+    assert!(
+        oracle_feed_id_ok(feed_id, feed_id),
+        "matching oracle feed_ids must be accepted"
+    );
 }
 
 /// Prove: oracle_feed_id_ok rejects mismatched feed_ids
@@ -1232,7 +1353,10 @@ fn kani_oracle_feed_id_mismatch() {
     let expected: [u8; 32] = kani::any();
     let provided: [u8; 32] = kani::any();
     kani::assume(expected != provided);
-    assert!(!oracle_feed_id_ok(expected, provided), "mismatched oracle feed_ids must be rejected");
+    assert!(
+        !oracle_feed_id_ok(expected, provided),
+        "mismatched oracle feed_ids must be rejected"
+    );
 }
 
 /// Prove: valid slab shape is accepted
@@ -1266,16 +1390,22 @@ fn kani_slab_shape_invalid() {
 #[kani::proof]
 fn kani_decide_single_owner_accepts() {
     let decision = decide_single_owner_op(true);
-    assert_eq!(decision, SimpleDecision::Accept,
-        "decide_single_owner_op must accept when auth ok");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "decide_single_owner_op must accept when auth ok"
+    );
 }
 
 /// Prove: decide_single_owner_op rejects when auth fails
 #[kani::proof]
 fn kani_decide_single_owner_rejects() {
     let decision = decide_single_owner_op(false);
-    assert_eq!(decision, SimpleDecision::Reject,
-        "decide_single_owner_op must reject when auth fails");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "decide_single_owner_op must reject when auth fails"
+    );
 }
 
 /// Prove: decide_crank accepts in permissionless mode
@@ -1286,7 +1416,11 @@ fn kani_decide_crank_permissionless_accepts() {
     let signer: [u8; 32] = kani::any();
     // Permissionless mode always accepts regardless of idx/owner
     let decision = decide_crank(true, idx_exists, stored, signer);
-    assert_eq!(decision, SimpleDecision::Accept, "permissionless crank must always accept");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "permissionless crank must always accept"
+    );
 }
 
 /// Prove: decide_crank accepts self-crank when idx exists and owner matches
@@ -1295,7 +1429,11 @@ fn kani_decide_crank_self_accepts() {
     let owner: [u8; 32] = kani::any();
     // Self-crank mode with valid idx and matching owner
     let decision = decide_crank(false, true, owner, owner);
-    assert_eq!(decision, SimpleDecision::Accept, "self-crank must accept when idx exists and owner matches");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "self-crank must accept when idx exists and owner matches"
+    );
 }
 
 /// Prove: decide_crank rejects self-crank when idx doesn't exist
@@ -1305,8 +1443,11 @@ fn kani_decide_crank_rejects_no_idx() {
     let signer: [u8; 32] = kani::any();
     // Self-crank mode with non-existent idx must reject
     let decision = decide_crank(false, false, stored, signer);
-    assert_eq!(decision, SimpleDecision::Reject,
-        "self-crank must reject when idx doesn't exist");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "self-crank must reject when idx doesn't exist"
+    );
 }
 
 /// Prove: decide_crank rejects self-crank when owner doesn't match
@@ -1317,8 +1458,11 @@ fn kani_decide_crank_rejects_wrong_owner() {
     kani::assume(stored != signer);
     // Self-crank mode with existing idx but wrong owner must reject
     let decision = decide_crank(false, true, stored, signer);
-    assert_eq!(decision, SimpleDecision::Reject,
-        "self-crank must reject when owner doesn't match");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "self-crank must reject when owner doesn't match"
+    );
 }
 
 /// Prove: decide_admin_op accepts valid admin
@@ -1328,8 +1472,11 @@ fn kani_decide_admin_accepts() {
     kani::assume(admin != [0u8; 32]);
 
     let decision = decide_admin_op(admin, admin);
-    assert_eq!(decision, SimpleDecision::Accept,
-        "admin op must accept matching non-burned admin");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "admin op must accept matching non-burned admin"
+    );
 }
 
 /// Prove: decide_admin_op rejects invalid admin
@@ -1338,14 +1485,22 @@ fn kani_decide_admin_rejects() {
     // Case 1: burned admin
     let signer: [u8; 32] = kani::any();
     let decision1 = decide_admin_op([0u8; 32], signer);
-    assert_eq!(decision1, SimpleDecision::Reject, "burned admin must reject");
+    assert_eq!(
+        decision1,
+        SimpleDecision::Reject,
+        "burned admin must reject"
+    );
 
     // Case 2: admin mismatch
     let admin: [u8; 32] = kani::any();
     kani::assume(admin != [0u8; 32]);
     kani::assume(admin != signer);
     let decision2 = decide_admin_op(admin, signer);
-    assert_eq!(decision2, SimpleDecision::Reject, "admin mismatch must reject");
+    assert_eq!(
+        decision2,
+        SimpleDecision::Reject,
+        "admin mismatch must reject"
+    );
 }
 
 // =============================================================================
@@ -1363,7 +1518,8 @@ fn kani_abi_ok_equals_validate() {
     let req_size: i128 = kani::any();
     let req_id: u64 = kani::any();
 
-    let validate_result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
+    let validate_result =
+        validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
 
     let ret_fields = MatcherReturnFields {
         abi_version: ret.abi_version,
@@ -1378,8 +1534,11 @@ fn kani_abi_ok_equals_validate() {
     let abi_ok_result = abi_ok(ret_fields, lp_account_id, oracle_price, req_size, req_id);
 
     // Strong equivalence: abi_ok == validate.is_ok() for all inputs
-    assert_eq!(abi_ok_result, validate_result.is_ok(),
-        "abi_ok must be equivalent to validate_matcher_return.is_ok()");
+    assert_eq!(
+        abi_ok_result,
+        validate_result.is_ok(),
+        "abi_ok must be equivalent to validate_matcher_return.is_ok()"
+    );
 }
 
 // =============================================================================
@@ -1409,9 +1568,18 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
     let req_size: i128 = kani::any();
 
     let decision = decide_trade_cpi_from_ret(
-        old_nonce, shape, identity_ok, pda_ok,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
-        ret, lp_account_id, oracle_price_e6, req_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // Only consider rejection cases
@@ -1419,8 +1587,10 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
 
     // For ANY rejection, nonce must be unchanged
     let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(result_nonce, old_nonce,
-        "ANY TradeCpi rejection (from real inputs) must leave nonce unchanged");
+    assert_eq!(
+        result_nonce, old_nonce,
+        "ANY TradeCpi rejection (from real inputs) must leave nonce unchanged"
+    );
 }
 
 /// Prove: ANY acceptance from decide_trade_cpi_from_ret increments nonce
@@ -1445,9 +1615,18 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
     let req_size: i128 = kani::any();
 
     let decision = decide_trade_cpi_from_ret(
-        old_nonce, shape, identity_ok, pda_ok,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
-        ret, lp_account_id, oracle_price_e6, req_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // Only consider acceptance cases
@@ -1455,8 +1634,11 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
 
     // For ANY acceptance, nonce must increment by 1
     let result_nonce = decision_nonce(old_nonce, decision);
-    assert_eq!(result_nonce, old_nonce.wrapping_add(1),
-        "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1");
+    assert_eq!(
+        result_nonce,
+        old_nonce.wrapping_add(1),
+        "ANY TradeCpi acceptance (from real inputs) must increment nonce by 1"
+    );
 }
 
 /// Prove: ANY acceptance uses exec_size from ret, not req_size
@@ -1476,8 +1658,8 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
     let pda_ok: bool = true;
     let user_auth_ok: bool = true;
     let lp_auth_ok: bool = true;
-    let gate_is_active: bool = false;  // Gate inactive = no risk check
-    let risk_increase: bool = kani::any();  // Doesn't matter when gate inactive
+    let gate_is_active: bool = false; // Gate inactive = no risk check
+    let risk_increase: bool = kani::any(); // Doesn't matter when gate inactive
 
     // Force valid matcher return
     let exec_size: i128 = kani::any();
@@ -1498,28 +1680,41 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
     let ret = MatcherReturnFields {
         abi_version: MATCHER_ABI_VERSION,
         flags: FLAG_VALID,
-        exec_price_e6: kani::any::<u64>().max(1),  // Non-zero price
+        exec_price_e6: kani::any::<u64>().max(1), // Non-zero price
         exec_size,
-        req_id: expected_req_id,  // Must match nonce_on_success(old_nonce)
-        lp_account_id,  // Must match
-        oracle_price_e6,  // Must match
+        req_id: expected_req_id, // Must match nonce_on_success(old_nonce)
+        lp_account_id,           // Must match
+        oracle_price_e6,         // Must match
         reserved: 0,
     };
 
     let decision = decide_trade_cpi_from_ret(
-        old_nonce, shape, identity_ok, pda_ok,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
-        ret, lp_account_id, oracle_price_e6, req_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // MUST be Accept with these inputs - panic if not (catches regression)
     match decision {
         TradeCpiDecision::Accept { chosen_size, .. } => {
-            assert_eq!(chosen_size, ret.exec_size,
-                "TradeCpi accept must use exec_size from matcher return, not req_size");
+            assert_eq!(
+                chosen_size, ret.exec_size,
+                "TradeCpi accept must use exec_size from matcher return, not req_size"
+            );
         }
         TradeCpiDecision::Reject => {
-            panic!("Expected Accept with valid inputs - function may have regressed to always-reject");
+            panic!(
+                "Expected Accept with valid inputs - function may have regressed to always-reject"
+            );
         }
     }
 }
@@ -1564,8 +1759,10 @@ fn kani_min_abs_boundary_rejected() {
         ret.req_id,
     );
 
-    assert!(result.is_err(),
-        "i128::MIN exec_size with req_size=i128::MIN+1 must be rejected (|exec| > |req|)");
+    assert!(
+        result.is_err(),
+        "i128::MIN exec_size with req_size=i128::MIN+1 must be rejected (|exec| > |req|)"
+    );
 }
 
 // =============================================================================
@@ -1637,7 +1834,10 @@ fn kani_matcher_accepts_partial_fill_with_flag() {
     kani::assume(req_size.unsigned_abs() >= ret.exec_size.unsigned_abs());
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_ok(), "partial fill with PARTIAL_OK must be accepted");
+    assert!(
+        result.is_ok(),
+        "partial fill with PARTIAL_OK must be accepted"
+    );
 }
 
 // =============================================================================
@@ -1650,7 +1850,7 @@ fn kani_crank_panic_requires_admin() {
     let admin: [u8; 32] = kani::any();
     let signer: [u8; 32] = kani::any();
     kani::assume(admin != [0u8; 32]); // Not burned
-    kani::assume(admin != signer);     // Signer is NOT admin
+    kani::assume(admin != signer); // Signer is NOT admin
 
     let stored_owner: [u8; 32] = kani::any();
     let permissionless: bool = kani::any();
@@ -1659,11 +1859,18 @@ fn kani_crank_panic_requires_admin() {
     // allow_panic != 0 but signer != admin => reject
     let decision = decide_keeper_crank_with_panic(
         1, // allow_panic != 0
-        admin, signer, permissionless, idx_exists, stored_owner
+        admin,
+        signer,
+        permissionless,
+        idx_exists,
+        stored_owner,
     );
 
-    assert_eq!(decision, SimpleDecision::Reject,
-        "allow_panic without admin auth must reject");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "allow_panic without admin auth must reject"
+    );
 }
 
 /// Prove: allow_panic with valid admin auth proceeds to crank logic
@@ -1678,13 +1885,18 @@ fn kani_crank_panic_with_admin_permissionless_accepts() {
     // allow_panic != 0, signer == admin, permissionless mode
     let decision = decide_keeper_crank_with_panic(
         1, // allow_panic != 0
-        admin, admin, // signer == admin
-        true, // permissionless
-        idx_exists, stored_owner
+        admin,
+        admin, // signer == admin
+        true,  // permissionless
+        idx_exists,
+        stored_owner,
     );
 
-    assert_eq!(decision, SimpleDecision::Accept,
-        "allow_panic with admin + permissionless must accept");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "allow_panic with admin + permissionless must accept"
+    );
 }
 
 /// Prove: allow_panic with burned admin always rejects
@@ -1697,13 +1909,19 @@ fn kani_crank_panic_burned_admin_rejects() {
 
     // allow_panic != 0, admin is burned
     let decision = decide_keeper_crank_with_panic(
-        1, // allow_panic != 0
+        1,         // allow_panic != 0
         [0u8; 32], // burned admin
-        signer, permissionless, idx_exists, stored_owner
+        signer,
+        permissionless,
+        idx_exists,
+        stored_owner,
     );
 
-    assert_eq!(decision, SimpleDecision::Reject,
-        "allow_panic with burned admin must reject");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "allow_panic with burned admin must reject"
+    );
 }
 
 /// Prove: without allow_panic, permissionless crank accepts without admin
@@ -1717,11 +1935,18 @@ fn kani_crank_no_panic_permissionless_accepts() {
     // allow_panic == 0, permissionless mode - accepts regardless of admin
     let decision = decide_keeper_crank_with_panic(
         0, // allow_panic == 0
-        admin, signer, true, idx_exists, stored_owner
+        admin,
+        signer,
+        true,
+        idx_exists,
+        stored_owner,
     );
 
-    assert_eq!(decision, SimpleDecision::Accept,
-        "no allow_panic + permissionless must accept");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "no allow_panic + permissionless must accept"
+    );
 }
 
 /// Prove: without allow_panic, self-crank needs idx + owner match
@@ -1735,14 +1960,18 @@ fn kani_crank_no_panic_self_crank_rejects_wrong_owner() {
     // allow_panic == 0, self-crank mode, idx exists, but owner mismatch
     let decision = decide_keeper_crank_with_panic(
         0, // allow_panic == 0
-        admin, signer,
+        admin,
+        signer,
         false, // self-crank
         true,  // idx exists
-        stored_owner
+        stored_owner,
     );
 
-    assert_eq!(decision, SimpleDecision::Reject,
-        "self-crank with owner mismatch must reject");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "self-crank with owner mismatch must reject"
+    );
 }
 
 /// Prove: without allow_panic, self-crank with owner match accepts
@@ -1757,11 +1986,14 @@ fn kani_crank_no_panic_self_crank_accepts_owner_match() {
         admin, owner, // signer == owner
         false, // self-crank
         true,  // idx exists
-        owner  // stored_owner == signer
+        owner, // stored_owner == signer
     );
 
-    assert_eq!(decision, SimpleDecision::Accept,
-        "self-crank with owner match must accept");
+    assert_eq!(
+        decision,
+        SimpleDecision::Accept,
+        "self-crank with owner match must accept"
+    );
 }
 
 // =============================================================================
@@ -1793,7 +2025,10 @@ fn kani_invert_nonzero_computes_correctly() {
 
     // Verify correctness
     let expected = INVERSION_CONSTANT / (raw as u128);
-    assert_eq!(inverted as u128, expected, "inversion must be floor(1e12/raw)");
+    assert_eq!(
+        inverted as u128, expected,
+        "inversion must be floor(1e12/raw)"
+    );
 }
 
 /// Prove: raw==0 always returns None (div by zero protection)
@@ -1813,7 +2048,10 @@ fn kani_invert_result_zero_returns_none() {
     let raw = 1_000_000_000_001u64.saturating_add(offset);
 
     let result = invert_price_e6(raw, 1);
-    assert!(result.is_none(), "inversion resulting in 0 must return None");
+    assert!(
+        result.is_none(),
+        "inversion resulting in 0 must return None"
+    );
 }
 
 /// Prove: monotonicity - if raw1 > raw2 > 0 then inv1 <= inv2
@@ -1855,7 +2093,10 @@ fn kani_base_to_units_conservation() {
 
     // Conservation: units * scale + dust == base
     let reconstructed = (units as u128) * (scale as u128) + (dust as u128);
-    assert_eq!(reconstructed, base as u128, "units*scale + dust must equal base");
+    assert_eq!(
+        reconstructed, base as u128,
+        "units*scale + dust must equal base"
+    );
 }
 
 /// Prove: dust < scale when scale > 0
@@ -1953,7 +2194,10 @@ fn kani_units_to_base_monotonic_bounded() {
     let base1 = units_to_base(units1, scale);
     let base2 = units_to_base(units2, scale);
 
-    assert!(base1 < base2, "units_to_base is strictly monotonic when not saturating");
+    assert!(
+        base1 < base2,
+        "units_to_base is strictly monotonic when not saturating"
+    );
 }
 
 /// Prove: scale==0 preserves monotonicity for base_to_units
@@ -1966,7 +2210,10 @@ fn kani_base_to_units_monotonic_scale_zero() {
     let (units1, _) = base_to_units(base1, 0);
     let (units2, _) = base_to_units(base2, 0);
 
-    assert!(units1 < units2, "scale==0 must preserve strict monotonicity");
+    assert!(
+        units1 < units2,
+        "scale==0 must preserve strict monotonicity"
+    );
 }
 
 // =============================================================================
@@ -2039,7 +2286,10 @@ fn kani_sweep_dust_conservation() {
     let (units, rem) = sweep_dust(dust, scale);
 
     let reconstructed = (units as u128) * (scale as u128) + (rem as u128);
-    assert_eq!(reconstructed, dust as u128, "units*scale + rem must equal dust");
+    assert_eq!(
+        reconstructed, dust as u128,
+        "units*scale + rem must equal dust"
+    );
 }
 
 /// Prove: sweep_dust rem < scale (scale > 0)
@@ -2171,12 +2421,23 @@ fn kani_universal_shape_fail_rejects() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "invalid shape must always reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "invalid shape must always reject"
+    );
 }
 
 /// Universal: pda_ok==false => Reject
@@ -2194,12 +2455,23 @@ fn kani_universal_pda_fail_rejects() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "pda_ok==false must always reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "pda_ok==false must always reject"
+    );
 }
 
 /// Universal: user_auth_ok==false => Reject
@@ -2217,12 +2489,23 @@ fn kani_universal_user_auth_fail_rejects() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "user_auth_ok==false must always reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "user_auth_ok==false must always reject"
+    );
 }
 
 /// Universal: lp_auth_ok==false => Reject
@@ -2240,12 +2523,23 @@ fn kani_universal_lp_auth_fail_rejects() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "lp_auth_ok==false must always reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "lp_auth_ok==false must always reject"
+    );
 }
 
 /// Universal: identity_ok==false => Reject
@@ -2263,12 +2557,23 @@ fn kani_universal_identity_fail_rejects() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "identity_ok==false must always reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "identity_ok==false must always reject"
+    );
 }
 
 /// Universal: abi_ok==false => Reject
@@ -2286,12 +2591,23 @@ fn kani_universal_abi_fail_rejects() {
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "abi_ok==false must always reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "abi_ok==false must always reject"
+    );
 }
 
 // =============================================================================
@@ -2326,21 +2642,46 @@ fn kani_tradecpi_variants_consistent_valid_shape() {
 
     // Get decisions from both variants
     let decision1 = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_passes,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase, ret.exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_passes,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret.exec_size,
     );
 
     let decision2 = decide_trade_cpi_from_ret(
-        old_nonce, shape, identity_ok, pda_ok,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
-        ret, lp_account_id, oracle_price_e6, req_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // Both must give same outcome
     match (&decision1, &decision2) {
         (TradeCpiDecision::Reject, TradeCpiDecision::Reject) => {}
-        (TradeCpiDecision::Accept { new_nonce: n1, chosen_size: s1 },
-         TradeCpiDecision::Accept { new_nonce: n2, chosen_size: s2 }) => {
+        (
+            TradeCpiDecision::Accept {
+                new_nonce: n1,
+                chosen_size: s1,
+            },
+            TradeCpiDecision::Accept {
+                new_nonce: n2,
+                chosen_size: s2,
+            },
+        ) => {
             assert_eq!(*n1, *n2, "nonces must match");
             assert_eq!(*s1, *s2, "chosen_sizes must match");
         }
@@ -2377,19 +2718,44 @@ fn kani_tradecpi_variants_consistent_invalid_shape() {
     let abi_passes = abi_ok(ret, lp_account_id, oracle_price_e6, req_size, req_id);
 
     let decision1 = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_passes,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase, ret.exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_passes,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret.exec_size,
     );
 
     let decision2 = decide_trade_cpi_from_ret(
-        old_nonce, shape, identity_ok, pda_ok,
-        user_auth_ok, lp_auth_ok, gate_is_active, risk_increase,
-        ret, lp_account_id, oracle_price_e6, req_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_is_active,
+        risk_increase,
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // Both must reject on invalid shape
-    assert_eq!(decision1, TradeCpiDecision::Reject, "invalid shape must reject (variant 1)");
-    assert_eq!(decision2, TradeCpiDecision::Reject, "invalid shape must reject (variant 2)");
+    assert_eq!(
+        decision1,
+        TradeCpiDecision::Reject,
+        "invalid shape must reject (variant 1)"
+    );
+    assert_eq!(
+        decision2,
+        TradeCpiDecision::Reject,
+        "invalid shape must reject (variant 2)"
+    );
 }
 
 /// Prove: decide_trade_cpi_from_ret computes req_id as nonce_on_success(old_nonce)
@@ -2417,21 +2783,27 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
 
     // All other checks pass
     let decision = decide_trade_cpi_from_ret(
-        old_nonce, shape,
+        old_nonce,
+        shape,
         true,  // identity_ok
         true,  // pda_ok
         true,  // user_auth_ok
         true,  // lp_auth_ok
         false, // gate_active (inactive)
         false, // risk_increase
-        ret, lp_account_id, oracle_price_e6, req_size
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // FORCE acceptance - with valid ABI inputs, must accept
     match decision {
         TradeCpiDecision::Accept { new_nonce, .. } => {
-            assert_eq!(new_nonce, expected_req_id,
-                "new_nonce must equal nonce_on_success(old_nonce)");
+            assert_eq!(
+                new_nonce, expected_req_id,
+                "new_nonce must equal nonce_on_success(old_nonce)"
+            );
         }
         TradeCpiDecision::Reject => {
             panic!("must accept with valid ABI inputs");
@@ -2454,17 +2826,28 @@ fn kani_universal_gate_risk_increase_rejects() {
     let abi_ok = true;
     let user_auth_ok = true;
     let lp_auth_ok = true;
-    let gate_active = true;     // Gate IS active
-    let risk_increase = true;   // Trade WOULD increase risk
+    let gate_active = true; // Gate IS active
+    let risk_increase = true; // Trade WOULD increase risk
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "gate_active && risk_increase must ALWAYS reject");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "gate_active && risk_increase must ALWAYS reject"
+    );
 }
 
 // =============================================================================
@@ -2509,11 +2892,19 @@ fn kani_universal_panic_requires_admin() {
     let stored_owner: [u8; 32] = kani::any();
 
     let decision = decide_keeper_crank_with_panic(
-        allow_panic, admin, signer, permissionless, idx_exists, stored_owner
+        allow_panic,
+        admin,
+        signer,
+        permissionless,
+        idx_exists,
+        stored_owner,
     );
 
-    assert_eq!(decision, SimpleDecision::Reject,
-        "allow_panic without admin auth must ALWAYS reject");
+    assert_eq!(
+        decision,
+        SimpleDecision::Reject,
+        "allow_panic without admin auth must ALWAYS reject"
+    );
 }
 
 // =============================================================================
@@ -2543,18 +2934,25 @@ fn kani_universal_gate_risk_increase_rejects_from_ret() {
 
     // All pre-gate checks pass
     let decision = decide_trade_cpi_from_ret(
-        old_nonce, shape,
-        true,  // identity_ok
-        true,  // pda_ok
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
-        true,  // gate_active - ACTIVE
-        true,  // risk_increase - INCREASING
-        ret, lp_account_id, oracle_price_e6, req_size
+        old_nonce,
+        shape,
+        true, // identity_ok
+        true, // pda_ok
+        true, // user_auth_ok
+        true, // lp_auth_ok
+        true, // gate_active - ACTIVE
+        true, // risk_increase - INCREASING
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
-    assert_eq!(decision, TradeCpiDecision::Reject,
-        "gate_active && risk_increase must reject even with valid ABI");
+    assert_eq!(
+        decision,
+        TradeCpiDecision::Reject,
+        "gate_active && risk_increase must reject even with valid ABI"
+    );
 }
 
 // =============================================================================
@@ -2584,19 +2982,26 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
 
     // All checks pass, gate inactive or risk not increasing
     let decision = decide_trade_cpi_from_ret(
-        old_nonce, shape,
+        old_nonce,
+        shape,
         true,  // identity_ok
         true,  // pda_ok
         true,  // user_auth_ok
         true,  // lp_auth_ok
         false, // gate_active (inactive)
         false, // risk_increase (not increasing)
-        ret, lp_account_id, oracle_price_e6, req_size
+        ret,
+        lp_account_id,
+        oracle_price_e6,
+        req_size,
     );
 
     // MUST accept
     match decision {
-        TradeCpiDecision::Accept { new_nonce, chosen_size } => {
+        TradeCpiDecision::Accept {
+            new_nonce,
+            chosen_size,
+        } => {
             assert_eq!(new_nonce, expected_req_id, "new_nonce must be nonce+1");
             assert_eq!(chosen_size, ret.exec_size, "chosen_size must be exec_size");
         }
@@ -2763,9 +3168,17 @@ fn production_mark_pnl(position_size: i128, entry_price: u64, oracle_price: u64)
 #[inline]
 fn production_equity(capital: u128, pnl: i128, mark_pnl: i128) -> u128 {
     // Exact formula from production: max(0, capital + pnl + mark_pnl)
-    let cap_i = if capital > i128::MAX as u128 { i128::MAX } else { capital as i128 };
+    let cap_i = if capital > i128::MAX as u128 {
+        i128::MAX
+    } else {
+        capital as i128
+    };
     let eq_i = cap_i.saturating_add(pnl).saturating_add(mark_pnl);
-    if eq_i > 0 { eq_i as u128 } else { 0 }
+    if eq_i > 0 {
+        eq_i as u128
+    } else {
+        0
+    }
 }
 
 // =============================================================================
@@ -2782,11 +3195,14 @@ fn kani_scale_price_e6_zero_result_rejected() {
     // Constrain to avoid trivial cases
     kani::assume(unit_scale > 1);
     kani::assume(price > 0);
-    kani::assume(price < unit_scale as u64);  // Result would be zero
+    kani::assume(price < unit_scale as u64); // Result would be zero
 
     // PRODUCTION function should reject (return None)
     let result = scale_price_e6(price, unit_scale);
-    assert!(result.is_none(), "scale_price_e6 must reject when scaled price would be zero");
+    assert!(
+        result.is_none(),
+        "scale_price_e6 must reject when scaled price would be zero"
+    );
 }
 
 /// Prove scale_price_e6 returns Some when result is non-zero.
@@ -2798,17 +3214,24 @@ fn kani_scale_price_e6_valid_result() {
 
     // Constrain to valid inputs that produce non-zero result
     kani::assume(unit_scale > 1);
-    kani::assume(unit_scale <= KANI_MAX_SCALE);  // Keep SAT tractable
-    kani::assume(price >= unit_scale as u64);    // Ensures result >= 1
+    kani::assume(unit_scale <= KANI_MAX_SCALE); // Keep SAT tractable
+    kani::assume(price >= unit_scale as u64); // Ensures result >= 1
     kani::assume(price <= KANI_MAX_QUOTIENT as u64 * unit_scale as u64); // Tight bound for SAT
 
     // PRODUCTION function should succeed
     let result = scale_price_e6(price, unit_scale);
-    assert!(result.is_some(), "scale_price_e6 must succeed for valid inputs");
+    assert!(
+        result.is_some(),
+        "scale_price_e6 must succeed for valid inputs"
+    );
 
     // Verify the formula: scaled = price / unit_scale
     let scaled = result.unwrap();
-    assert_eq!(scaled, price / unit_scale as u64, "scale_price_e6 must compute price / unit_scale");
+    assert_eq!(
+        scaled,
+        price / unit_scale as u64,
+        "scale_price_e6 must compute price / unit_scale"
+    );
 }
 
 /// Prove scale_price_e6 is identity when unit_scale <= 1.
@@ -2822,8 +3245,15 @@ fn kani_scale_price_e6_identity_for_scale_leq_1() {
 
     // PRODUCTION function should return price unchanged
     let result = scale_price_e6(price, unit_scale);
-    assert!(result.is_some(), "scale_price_e6 must succeed when unit_scale <= 1");
-    assert_eq!(result.unwrap(), price, "scale_price_e6 must be identity when unit_scale <= 1");
+    assert!(
+        result.is_some(),
+        "scale_price_e6 must succeed when unit_scale <= 1"
+    );
+    assert_eq!(
+        result.unwrap(),
+        price,
+        "scale_price_e6 must be identity when unit_scale <= 1"
+    );
 }
 
 /// Prove that production base_to_units and scale_price_e6 use the SAME divisor.
@@ -2853,10 +3283,16 @@ fn kani_scale_price_and_base_to_units_use_same_divisor() {
     let oracle_scaled = scale_price_e6(oracle_price, unit_scale).unwrap();
 
     // Both should divide by unit_scale
-    assert_eq!(capital_units, base_tokens / unit_scale as u64,
-        "base_to_units must compute base / unit_scale");
-    assert_eq!(oracle_scaled, oracle_price / unit_scale as u64,
-        "scale_price_e6 must compute price / unit_scale");
+    assert_eq!(
+        capital_units,
+        base_tokens / unit_scale as u64,
+        "base_to_units must compute base / unit_scale"
+    );
+    assert_eq!(
+        oracle_scaled,
+        oracle_price / unit_scale as u64,
+        "scale_price_e6 must compute price / unit_scale"
+    );
 
     // Key invariant: same divisor means margin ratio is preserved
     // margin_ratio = capital / position_value
@@ -2868,7 +3304,7 @@ fn kani_scale_price_and_base_to_units_use_same_divisor() {
 /// Verifies the fix works for a typical scenario.
 #[kani::proof]
 fn kani_scale_price_e6_concrete_example() {
-    let oracle_price: u64 = 138_000_000;  // $138 in e6
+    let oracle_price: u64 = 138_000_000; // $138 in e6
     let unit_scale: u32 = 1000;
 
     // Call PRODUCTION function
@@ -2878,7 +3314,7 @@ fn kani_scale_price_e6_concrete_example() {
     assert_eq!(scaled.unwrap(), 138_000, "138_000_000 / 1000 = 138_000");
 
     // Also test with production base_to_units
-    let base_tokens: u64 = 1_000_000_000;  // 1 SOL
+    let base_tokens: u64 = 1_000_000_000; // 1 SOL
     let (capital_units, dust) = base_to_units(base_tokens, unit_scale);
 
     assert_eq!(capital_units, 1_000_000, "1B / 1000 = 1M");
@@ -2887,15 +3323,17 @@ fn kani_scale_price_e6_concrete_example() {
     // Verify margin calculation uses consistent units:
     // position_value = pos_size * oracle_scaled / 1e6
     // margin_required = position_value * margin_bps / 10_000
-    let position_size: u128 = 1_000_000;  // 1M contracts
-    let margin_bps: u128 = 500;           // 5%
+    let position_size: u128 = 1_000_000; // 1M contracts
+    let margin_bps: u128 = 500; // 5%
 
     let position_value_scaled = position_size * scaled.unwrap() as u128 / 1_000_000;
     let margin_required = position_value_scaled * margin_bps / 10_000;
 
     // capital_units (1M) > margin_required (6.9K) → PASSES
-    assert!(capital_units as u128 > margin_required,
-        "With fix: capital and position_value are both in units scale, margin check passes");
+    assert!(
+        capital_units as u128 > margin_required,
+        "With fix: capital and position_value are both in units scale, margin check passes"
+    );
 }
 // Integer truncation can cause < 1 unit differences that flip results at exact
 // boundaries, but this is unavoidable with integer arithmetic and economically
@@ -2918,15 +3356,17 @@ fn kani_clamp_toward_no_movement_when_dt_zero() {
     let cap_e2bps: u64 = kani::any();
 
     // Constrain to valid inputs
-    kani::assume(index > 0);  // index=0 is special case (returns mark)
-    kani::assume(cap_e2bps > 0);  // cap=0 also returns index unchanged
+    kani::assume(index > 0); // index=0 is special case (returns mark)
+    kani::assume(cap_e2bps > 0); // cap=0 also returns index unchanged
 
     // dt_slots = 0 (same slot)
     let result = clamp_toward_with_dt(index, mark, cap_e2bps, 0);
 
     // Bug #9 fix: must return index, NOT mark
-    assert_eq!(result, index,
-        "clamp_toward_with_dt must return index unchanged when dt_slots=0");
+    assert_eq!(
+        result, index,
+        "clamp_toward_with_dt must return index unchanged when dt_slots=0"
+    );
 }
 
 /// Prove: When cap_e2bps == 0, index is returned unchanged (rate limiting disabled).
@@ -2937,14 +3377,16 @@ fn kani_clamp_toward_no_movement_when_cap_zero() {
     let dt_slots: u64 = kani::any();
 
     // Constrain to valid inputs
-    kani::assume(index > 0);  // index=0 is special case
-    kani::assume(dt_slots > 0);  // dt=0 also returns index unchanged
+    kani::assume(index > 0); // index=0 is special case
+    kani::assume(dt_slots > 0); // dt=0 also returns index unchanged
 
     // cap_e2bps = 0 (rate limiting disabled)
     let result = clamp_toward_with_dt(index, mark, 0, dt_slots);
 
-    assert_eq!(result, index,
-        "clamp_toward_with_dt must return index unchanged when cap_e2bps=0");
+    assert_eq!(
+        result, index,
+        "clamp_toward_with_dt must return index unchanged when cap_e2bps=0"
+    );
 }
 
 /// Prove: When index == 0 (uninitialized), mark is returned (bootstrap case).
@@ -2957,8 +3399,10 @@ fn kani_clamp_toward_bootstrap_when_index_zero() {
     // index = 0 is the bootstrap/initialization case
     let result = clamp_toward_with_dt(0, mark, cap_e2bps, dt_slots);
 
-    assert_eq!(result, mark,
-        "clamp_toward_with_dt must return mark when index=0 (bootstrap)");
+    assert_eq!(
+        result, mark,
+        "clamp_toward_with_dt must return mark when index=0 (bootstrap)"
+    );
 }
 
 /// Prove: Index movement is bounded - concrete example.
@@ -2968,18 +3412,20 @@ fn kani_clamp_toward_movement_bounded_concrete() {
     // Concrete example: index=1_000_000, cap=10_000 (1%), dt=1
     // max_delta = 1_000_000 * 10_000 * 1 / 1_000_000 = 10_000
     let index: u64 = 1_000_000;
-    let cap_e2bps: u64 = 10_000;  // 1%
+    let cap_e2bps: u64 = 10_000; // 1%
     let dt_slots: u64 = 1;
     let mark: u64 = kani::any();
 
     let result = clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots);
 
     // max_delta = 10_000
-    let lo = index - 10_000;  // 990_000
-    let hi = index + 10_000;  // 1_010_000
+    let lo = index - 10_000; // 990_000
+    let hi = index + 10_000; // 1_010_000
 
-    assert!(result >= lo && result <= hi,
-        "result must be within 1% of index");
+    assert!(
+        result >= lo && result <= hi,
+        "result must be within 1% of index"
+    );
 }
 
 /// Prove: Formula correctness - concrete example.
@@ -2988,15 +3434,17 @@ fn kani_clamp_toward_movement_bounded_concrete() {
 fn kani_clamp_toward_formula_concrete() {
     // Same concrete setup
     let index: u64 = 1_000_000;
-    let cap_e2bps: u64 = 10_000;  // 1%
+    let cap_e2bps: u64 = 10_000; // 1%
     let dt_slots: u64 = 1;
     let mark: u64 = kani::any();
 
     let result = clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots);
     let expected = mark.clamp(990_000, 1_010_000);
 
-    assert_eq!(result, expected,
-        "result must equal mark.clamp(990_000, 1_010_000)");
+    assert_eq!(
+        result, expected,
+        "result must equal mark.clamp(990_000, 1_010_000)"
+    );
 }
 
 // =========================================================================
@@ -3014,8 +3462,14 @@ fn kani_pyth_pinned_mode_detection() {
 
     // If Pyth-pinned: authority is zero, feed is non-zero
     if is_pyth_pinned {
-        assert_eq!(oracle_authority, [0u8; 32], "Pyth-pinned requires zero authority");
-        assert!(!is_hyperp_mode_verify(index_feed_id), "Pyth-pinned cannot be Hyperp");
+        assert_eq!(
+            oracle_authority, [0u8; 32],
+            "Pyth-pinned requires zero authority"
+        );
+        assert!(
+            !is_hyperp_mode_verify(index_feed_id),
+            "Pyth-pinned cannot be Hyperp"
+        );
     }
 
     // If NOT Pyth-pinned: either authority is set OR in Hyperp mode (feed_id==0)
@@ -3049,7 +3503,7 @@ fn kani_pyth_feed_id_symmetric() {
 #[kani::proof]
 fn kani_pyth_staleness_reject_when_stale() {
     let publish_time: i64 = kani::any();
-    let now_unix_ts: i64  = kani::any();
+    let now_unix_ts: i64 = kani::any();
     let max_staleness_secs: u64 = kani::any();
 
     kani::assume(now_unix_ts >= 0 && publish_time >= 0);
@@ -3060,12 +3514,16 @@ fn kani_pyth_staleness_reject_when_stale() {
 
     // Freshness and staleness are mutually exclusive and exhaustive
     if fresh {
-        assert!(age >= 0 && age as u64 <= max_staleness_secs,
-            "fresh price: age must be within bounds");
+        assert!(
+            age >= 0 && age as u64 <= max_staleness_secs,
+            "fresh price: age must be within bounds"
+        );
     } else {
         // Stale: age is negative or exceeds max_staleness_secs
-        assert!(age < 0 || age as u64 > max_staleness_secs,
-            "stale price: age must be out of bounds");
+        assert!(
+            age < 0 || age as u64 > max_staleness_secs,
+            "stale price: age must be out of bounds"
+        );
     }
 }
 
@@ -3101,7 +3559,10 @@ fn kani_set_pyth_oracle_rejects_zero_feed_id() {
     assert_eq!(feed_id, [0u8; 32], "zero feed_id detected");
     // Instruction handler returns InvalidInstructionData for this case — property:
     let should_reject = feed_id == [0u8; 32];
-    assert!(should_reject, "zero feed_id must be rejected by SetPythOracle");
+    assert!(
+        should_reject,
+        "zero feed_id must be rejected by SetPythOracle"
+    );
 }
 
 /// Prove: SetPythOracle staleness validation — zero is rejected.
@@ -3193,14 +3654,15 @@ fn kani_hyperp_ema_converges_full_alpha() {
     // With alpha=1_000_000 (100%), one step converges fully to oracle
     // (no cap, so oracle passes through unmodified)
     let mark_new = compute_ema_mark_price(
-        mark_prev,
-        oracle,
-        1,           // dt=1 slot
-        1_000_000,   // alpha=1.0 (full convergence in one step)
-        0,           // no cap
+        mark_prev, oracle, 1,         // dt=1 slot
+        1_000_000, // alpha=1.0 (full convergence in one step)
+        0,         // no cap
     );
 
-    assert_eq!(mark_new, oracle, "full-alpha EMA must converge to oracle in one step");
+    assert_eq!(
+        mark_new, oracle,
+        "full-alpha EMA must converge to oracle in one step"
+    );
 }
 
 /// EMA monotone convergence: if oracle > mark, each step increases mark.
@@ -3222,10 +3684,7 @@ fn kani_hyperp_ema_monotone_up() {
         "EMA must move toward oracle (upward direction)"
     );
     // And mark_new must not overshoot oracle
-    assert!(
-        mark_new <= oracle,
-        "EMA must not overshoot oracle"
-    );
+    assert!(mark_new <= oracle, "EMA must not overshoot oracle");
 }
 
 /// EMA monotone convergence: if oracle < mark, each step decreases mark.
@@ -3245,10 +3704,7 @@ fn kani_hyperp_ema_monotone_down() {
         mark_new <= mark_prev,
         "EMA must move toward oracle (downward direction)"
     );
-    assert!(
-        mark_new >= oracle,
-        "EMA must not undershoot oracle"
-    );
+    assert!(mark_new >= oracle, "EMA must not undershoot oracle");
 }
 
 /// EMA identity: when oracle == mark_prev, mark stays unchanged.
@@ -3306,7 +3762,8 @@ fn kani_ema_mark_bootstrap() {
     kani::assume(alpha_e6 <= 1_000_000);
     kani::assume(dt_slots > 0 && dt_slots <= 10_000);
 
-    let mark_new = compute_ema_mark_price(0 /* mark_prev=0 */, oracle, dt_slots, alpha_e6, 1_000);
+    let mark_new =
+        compute_ema_mark_price(0 /* mark_prev=0 */, oracle, dt_slots, alpha_e6, 1_000);
 
     assert_eq!(
         mark_new, oracle,
@@ -3327,7 +3784,10 @@ fn kani_ema_mark_no_cap_full_oracle() {
     let mark_new = compute_ema_mark_price(mark_prev, oracle, 1, 1_000_000, 0);
 
     // With cap disabled and alpha=100%, result is exactly the oracle
-    assert_eq!(mark_new, oracle, "no-cap + full-alpha must return oracle unchanged");
+    assert_eq!(
+        mark_new, oracle,
+        "no-cap + full-alpha must return oracle unchanged"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -15,11 +15,11 @@ use solana_sdk::{
     account::Account,
     clock::Clock,
     instruction::{AccountMeta, Instruction},
+    program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     sysvar,
     transaction::Transaction,
-    program_pack::Pack,
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
@@ -28,15 +28,13 @@ use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-const SLAB_LEN: usize = 992560;  // MAX_ACCOUNTS=4096 + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 992560; // MAX_ACCOUNTS=4096 + oracle circuit breaker (no padding)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
-    0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
-    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
-    0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ]);
 
 const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
@@ -73,7 +71,13 @@ fn make_mint_data() -> Vec<u8> {
 }
 
 /// Create PriceUpdateV2 mock data (Pyth Pull format)
-fn make_pyth_data(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
+fn make_pyth_data(
+    feed_id: &[u8; 32],
+    price: i64,
+    expo: i32,
+    conf: u64,
+    publish_time: i64,
+) -> Vec<u8> {
     let mut data = vec![0u8; 134];
     data[42..74].copy_from_slice(feed_id);
     data[74..82].copy_from_slice(&price.to_le_bytes());
@@ -94,11 +98,7 @@ fn encode_init_market_with_invert(
 }
 
 /// Encode InitMarket with initial_mark_price_e6 for Hyperp mode
-fn encode_init_market_hyperp(
-    admin: &Pubkey,
-    mint: &Pubkey,
-    initial_mark_price_e6: u64,
-) -> Vec<u8> {
+fn encode_init_market_hyperp(admin: &Pubkey, mint: &Pubkey, initial_mark_price_e6: u64) -> Vec<u8> {
     // Hyperp mode: feed_id = [0; 32], invert = 0 (not inverted internally)
     encode_init_market_full_v2(admin, mint, &[0u8; 32], 0, initial_mark_price_e6, 0)
 }
@@ -121,7 +121,7 @@ fn encode_init_market_full_v2(
     data.push(invert); // invert flag
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&initial_mark_price_e6.to_le_bytes()); // initial_mark_price_e6 (NEW)
-    // RiskParams
+                                                                  // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
@@ -194,7 +194,10 @@ impl TestEnv {
     fn new() -> Self {
         let path = program_path();
         if !path.exists() {
-            panic!("BPF not found at {:?}. Run: cargo build-sbf --features test", path);
+            panic!(
+                "BPF not found at {:?}. Run: cargo build-sbf --features test",
+                path
+            );
         }
 
         let mut svm = LiteSVM::new();
@@ -212,62 +215,101 @@ impl TestEnv {
 
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-        svm.set_account(slab, Account {
-            lamports: 1_000_000_000,
-            data: vec![0u8; SLAB_LEN],
-            owner: program_id,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            slab,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; SLAB_LEN],
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_account(mint, Account {
-            lamports: 1_000_000,
-            data: make_mint_data(),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 1_000_000,
+                data: make_mint_data(),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_account(vault, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            vault,
+            Account {
+                lamports: 1_000_000,
+                data: make_token_account_data(&mint, &vault_pda, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
         // $138 price (high enough to show difference when inverted)
         let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, 100);
-        svm.set_account(pyth_index, Account {
-            lamports: 1_000_000,
-            data: pyth_data.clone(),
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        svm.set_account(pyth_col, Account {
-            lamports: 1_000_000,
-            data: pyth_data,
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data.clone(),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            pyth_col,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+        svm.set_sysvar(&Clock {
+            slot: 100,
+            unix_timestamp: 100,
+            ..Clock::default()
+        });
 
-        TestEnv { svm, program_id, payer, slab, mint, vault, pyth_index, pyth_col, account_count: 0 }
+        TestEnv {
+            svm,
+            program_id,
+            payer,
+            slab,
+            mint,
+            vault,
+            pyth_index,
+            pyth_col,
+            account_count: 0,
+        }
     }
 
     fn init_market_with_invert(&mut self, invert: u8) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -291,7 +333,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
     }
@@ -300,13 +345,18 @@ impl TestEnv {
     fn init_market_hyperp(&mut self, initial_mark_price_e6: u64) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -325,20 +375,30 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx).expect("init_market_hyperp failed");
+        self.svm
+            .send_transaction(tx)
+            .expect("init_market_hyperp failed");
     }
 
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
         let ata = Pubkey::new_unique();
-        self.svm.set_account(ata, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&self.mint, owner, amount),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: make_token_account_data(&self.mint, owner, amount),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
         ata
     }
 
@@ -348,13 +408,18 @@ impl TestEnv {
         let ata = self.create_ata(&owner.pubkey(), 0);
         let matcher = spl_token::ID;
         let ctx = Pubkey::new_unique();
-        self.svm.set_account(ctx, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; 320],
-            owner: matcher,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; 320],
+                    owner: matcher,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -371,7 +436,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
         self.account_count += 1;
@@ -398,7 +466,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
         self.account_count += 1;
@@ -422,7 +493,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("deposit failed");
     }
@@ -441,7 +515,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[user, lp], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[user, lp],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("trade failed");
     }
@@ -462,7 +539,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("crank failed");
     }
@@ -475,20 +555,30 @@ impl TestEnv {
         });
         // Update oracle publish_time to match
         let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, slot as i64);
-        self.svm.set_account(self.pyth_index, Account {
-            lamports: 1_000_000,
-            data: pyth_data.clone(),
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        self.svm.set_account(self.pyth_col, Account {
-            lamports: 1_000_000,
-            data: pyth_data,
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                self.pyth_index,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data.clone(),
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.svm
+            .set_account(
+                self.pyth_col,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data,
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
     }
 
     /// Set slot and update oracle to a specific price
@@ -500,26 +590,37 @@ impl TestEnv {
         });
         // Update oracle with new price and publish_time
         let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6, -6, 1, slot as i64);
-        self.svm.set_account(self.pyth_index, Account {
-            lamports: 1_000_000,
-            data: pyth_data.clone(),
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        self.svm.set_account(self.pyth_col, Account {
-            lamports: 1_000_000,
-            data: pyth_data,
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                self.pyth_index,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data.clone(),
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.svm
+            .set_account(
+                self.pyth_col,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data,
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
     }
 
     /// Try to close account, returns result
     fn try_close_account(&mut self, owner: &Keypair, user_idx: u16) -> Result<(), String> {
         let ata = self.create_ata(&owner.pubkey(), 0);
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -537,9 +638,13 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -678,7 +783,7 @@ fn encode_init_market_full(
     data.push(invert);
     data.extend_from_slice(&unit_scale.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
-    // RiskParams
+                                                 // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
@@ -716,7 +821,7 @@ fn encode_init_market_with_warmup(
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale = 0 (no scaling)
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
-    // RiskParams
+                                                 // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
@@ -742,13 +847,18 @@ impl TestEnv {
     fn init_market_full(&mut self, invert: u8, unit_scale: u32, new_account_fee: u128) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -774,7 +884,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
     }
@@ -783,13 +896,18 @@ impl TestEnv {
     fn init_market_with_warmup(&mut self, invert: u8, warmup_period_slots: u64) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -814,9 +932,14 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx).expect("init_market_with_warmup failed");
+        self.svm
+            .send_transaction(tx)
+            .expect("init_market_with_warmup failed");
     }
 
     /// Initialize user with specific fee payment
@@ -841,7 +964,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
         self.account_count += 1;
@@ -856,11 +982,14 @@ impl TestEnv {
         // used is [u64; 64] = 512 bytes
         // num_used_accounts follows used at offset 408 + 512 = 920 within RiskEngine
         // Total offset = 392 + 920 = 1312
-        const NUM_USED_OFFSET: usize = 392 + 920;  // 1312
+        const NUM_USED_OFFSET: usize = 392 + 920; // 1312
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
-        let bytes = [slab_account.data[NUM_USED_OFFSET], slab_account.data[NUM_USED_OFFSET + 1]];
+        let bytes = [
+            slab_account.data[NUM_USED_OFFSET],
+            slab_account.data[NUM_USED_OFFSET + 1],
+        ];
         u16::from_le_bytes(bytes)
     }
 
@@ -870,13 +999,17 @@ impl TestEnv {
         // ENGINE_OFF = 392, offset of RiskEngine.used = 408
         // Bitmap is [u64; 64] at offset 392 + 408 = 800
         const BITMAP_OFFSET: usize = 392 + 408;
-        let word_idx = (idx as usize) >> 6;  // idx / 64
-        let bit_idx = (idx as usize) & 63;   // idx % 64
+        let word_idx = (idx as usize) >> 6; // idx / 64
+        let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
         if slab_account.data.len() < word_offset + 8 {
             return false;
         }
-        let word = u64::from_le_bytes(slab_account.data[word_offset..word_offset+8].try_into().unwrap());
+        let word = u64::from_le_bytes(
+            slab_account.data[word_offset..word_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
         (word >> bit_idx) & 1 == 1
     }
 
@@ -887,12 +1020,17 @@ impl TestEnv {
         // Account size = 240 bytes, capital at offset 8 within Account (after account_id u64)
         const ACCOUNTS_OFFSET: usize = 392 + 9136;
         const ACCOUNT_SIZE: usize = 240;
-        const CAPITAL_OFFSET_IN_ACCOUNT: usize = 8;  // After account_id (u64)
-        let account_offset = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
+        const CAPITAL_OFFSET_IN_ACCOUNT: usize = 8; // After account_id (u64)
+        let account_offset =
+            ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
         if slab_account.data.len() < account_offset + 16 {
             return 0;
         }
-        u128::from_le_bytes(slab_account.data[account_offset..account_offset+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_account.data[account_offset..account_offset + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read account position_size for a slot
@@ -906,11 +1044,16 @@ impl TestEnv {
         const ACCOUNTS_OFFSET: usize = 392 + 9136;
         const ACCOUNT_SIZE: usize = 240;
         const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
-        let account_offset = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
+        let account_offset =
+            ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
         if slab_account.data.len() < account_offset + 16 {
             return 0;
         }
-        i128::from_le_bytes(slab_account.data[account_offset..account_offset+16].try_into().unwrap())
+        i128::from_le_bytes(
+            slab_account.data[account_offset..account_offset + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Try to close slab, returns Ok or error
@@ -927,9 +1070,13 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[&admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[&admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -937,31 +1084,42 @@ impl TestEnv {
     /// Withdraw collateral (requires 8 accounts)
     fn withdraw(&mut self, owner: &Keypair, user_idx: u16, amount: u64) {
         let ata = self.create_ata(&owner.pubkey(), 0);
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
-                AccountMeta::new(owner.pubkey(), true),      // 0: user (signer)
-                AccountMeta::new(self.slab, false),          // 1: slab
-                AccountMeta::new(self.vault, false),         // 2: vault
-                AccountMeta::new(ata, false),                // 3: user_ata
+                AccountMeta::new(owner.pubkey(), true), // 0: user (signer)
+                AccountMeta::new(self.slab, false),     // 1: slab
+                AccountMeta::new(self.vault, false),    // 2: vault
+                AccountMeta::new(ata, false),           // 3: user_ata
                 AccountMeta::new_readonly(vault_pda, false), // 4: vault_pda
                 AccountMeta::new_readonly(spl_token::ID, false), // 5: token program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // 6: clock
-                AccountMeta::new_readonly(self.pyth_index, false),   // 7: oracle
+                AccountMeta::new_readonly(self.pyth_index, false), // 7: oracle
             ],
             data: encode_withdraw(user_idx, amount),
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("withdraw failed");
     }
 
     /// Try to execute trade, returns result
-    fn try_trade(&mut self, user: &Keypair, lp: &Keypair, lp_idx: u16, user_idx: u16, size: i128) -> Result<(), String> {
+    fn try_trade(
+        &mut self,
+        user: &Keypair,
+        lp: &Keypair,
+        lp_idx: u16,
+        user_idx: u16,
+        size: i128,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -975,9 +1133,13 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[user, lp], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[user, lp],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -992,25 +1154,29 @@ impl TestEnv {
     /// Close account - returns remaining capital to user (8 accounts needed)
     fn close_account(&mut self, owner: &Keypair, user_idx: u16) {
         let ata = self.create_ata(&owner.pubkey(), 0);
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
-                AccountMeta::new(owner.pubkey(), true),      // 0: user (signer)
-                AccountMeta::new(self.slab, false),          // 1: slab
-                AccountMeta::new(self.vault, false),         // 2: vault
-                AccountMeta::new(ata, false),                // 3: user_ata
+                AccountMeta::new(owner.pubkey(), true), // 0: user (signer)
+                AccountMeta::new(self.slab, false),     // 1: slab
+                AccountMeta::new(self.vault, false),    // 2: vault
+                AccountMeta::new(ata, false),           // 3: user_ata
                 AccountMeta::new_readonly(vault_pda, false), // 4: vault_pda
                 AccountMeta::new_readonly(spl_token::ID, false), // 5: token program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // 6: clock
-                AccountMeta::new_readonly(self.pyth_index, false),   // 7: oracle
+                AccountMeta::new_readonly(self.pyth_index, false), // 7: oracle
             ],
             data: encode_close_account(user_idx),
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("close_account failed");
     }
@@ -1061,7 +1227,10 @@ fn test_bug3_close_slab_with_dust_should_fail() {
 
     // Check vault still has 500 dust
     let vault_after = env.vault_balance();
-    println!("Bug #3: Vault balance after close_account = {}", vault_after);
+    println!(
+        "Bug #3: Vault balance after close_account = {}",
+        vault_after
+    );
 
     // Vault should have dust remaining (500 base tokens)
     assert!(vault_after > 0, "Vault should have dust remaining");
@@ -1070,7 +1239,10 @@ fn test_bug3_close_slab_with_dust_should_fail() {
     let result = env.try_close_slab();
 
     println!("Bug #3 test: CloseSlab with dust result = {:?}", result);
-    println!("Bug #3: Vault still has {} tokens - CloseSlab correctly rejects", vault_after);
+    println!(
+        "Bug #3: Vault still has {} tokens - CloseSlab correctly rejects",
+        vault_after
+    );
 
     // FIXED: CloseSlab now returns error when dust_base > 0
     assert!(result.is_err(), "CloseSlab should fail when dust_base > 0");
@@ -1154,7 +1326,11 @@ fn test_bug4_fee_overpayment_should_be_handled() {
     // BUG: The excess 4000 is trapped - not credited to user capital,
     // not tracked in engine.vault (only 1000 is tracked)
     // After fix: excess should either be rejected or credited to user
-    println!("Bug #4 test: Deposited {} (required: 1000, excess: {})", deposited, deposited - 1000);
+    println!(
+        "Bug #4 test: Deposited {} (required: 1000, excess: {})",
+        deposited,
+        deposited - 1000
+    );
 }
 
 // ============================================================================
@@ -1347,7 +1523,8 @@ fn test_bug_finding_l_margin_check_uses_maintenance_instead_of_initial() {
         result.is_ok(),
         "FINDING L REPRODUCED: Trade at ~16.7x leverage accepted. \
          Should require 10% initial margin but only checks 5% maintenance. \
-         Expected: Ok (bug), Got: {:?}", result
+         Expected: Ok (bug), Got: {:?}",
+        result
     );
 
     println!("FINDING L CONFIRMED: execute_trade() checks maintenance_margin_bps (5%)");
@@ -1486,8 +1663,14 @@ fn test_zombie_pnl_crank_driven_warmup_conversion() {
 
     // Try to close account immediately - should fail (PnL not warmed up yet)
     let early_close_result = env.try_close_account(&user, user_idx);
-    println!("Step 4: Early close attempt (before warmup): {:?}",
-             if early_close_result.is_err() { "Failed as expected" } else { "Unexpected success" });
+    println!(
+        "Step 4: Early close attempt (before warmup): {:?}",
+        if early_close_result.is_err() {
+            "Failed as expected"
+        } else {
+            "Unexpected success"
+        }
+    );
 
     // Now simulate the zombie scenario:
     // User becomes idle and doesn't call any ops
@@ -1520,7 +1703,8 @@ fn test_zombie_pnl_crank_driven_warmup_conversion() {
     assert!(
         final_close_result.is_ok(),
         "ZOMBIE PNL FIX: Account should close after crank-driven warmup conversion. \
-         Got: {:?}", final_close_result
+         Got: {:?}",
+        final_close_result
     );
 }
 
@@ -1556,7 +1740,8 @@ fn test_idle_account_can_close_after_crank() {
 
     assert!(
         result.is_ok(),
-        "Idle account with only capital should be closeable. Got: {:?}", result
+        "Idle account with only capital should be closeable. Got: {:?}",
+        result
     );
 
     println!("Idle account closed successfully - basic zombie prevention works");
@@ -1592,40 +1777,60 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
 
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-    svm.set_account(slab, Account {
-        lamports: 1_000_000_000,
-        data: vec![0u8; SLAB_LEN],
-        owner: program_id,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; SLAB_LEN],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(mint, Account {
-        lamports: 1_000_000,
-        data: make_mint_data(),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        mint,
+        Account {
+            lamports: 1_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(vault, Account {
-        lamports: 1_000_000,
-        data: make_token_account_data(&mint, &vault_pda, 0),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        vault,
+        Account {
+            lamports: 1_000_000,
+            data: make_token_account_data(&mint, &vault_pda, 0),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     let dummy_ata = Pubkey::new_unique();
-    svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        dummy_ata,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
 
     // Try to init market with Hyperp mode (feed_id = 0) but initial_mark_price = 0
     // This should FAIL because Hyperp mode requires a non-zero initial price
@@ -1645,15 +1850,18 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
         data: encode_init_market_full_v2(
             &payer.pubkey(),
             &mint,
-            &[0u8; 32],  // Hyperp mode: feed_id = 0
-            0,           // invert
-            0,           // initial_mark_price_e6 = 0 (INVALID for Hyperp!)
-            0,           // warmup
+            &[0u8; 32], // Hyperp mode: feed_id = 0
+            0,          // invert
+            0,          // initial_mark_price_e6 = 0 (INVALID for Hyperp!)
+            0,          // warmup
         ),
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash(),
+        &[ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
     );
 
     let result = svm.send_transaction(tx);
@@ -1661,7 +1869,8 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     assert!(
         result.is_err(),
         "SECURITY: InitMarket should reject Hyperp mode with zero initial_mark_price_e6. \
-         Got: {:?}", result
+         Got: {:?}",
+        result
     );
 
     println!("HYPERP VALIDATION VERIFIED: Rejects zero initial_mark_price_e6 in Hyperp mode");
@@ -1817,40 +2026,60 @@ fn test_hyperp_init_market_with_valid_price() {
 
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-    svm.set_account(slab, Account {
-        lamports: 1_000_000_000,
-        data: vec![0u8; SLAB_LEN],
-        owner: program_id,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; SLAB_LEN],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(mint, Account {
-        lamports: 1_000_000,
-        data: make_mint_data(),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        mint,
+        Account {
+            lamports: 1_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(vault, Account {
-        lamports: 1_000_000,
-        data: make_token_account_data(&mint, &vault_pda, 0),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        vault,
+        Account {
+            lamports: 1_000_000,
+            data: make_token_account_data(&mint, &vault_pda, 0),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     let dummy_ata = Pubkey::new_unique();
-    svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        dummy_ata,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
 
     // Init market with Hyperp mode and valid initial_mark_price
     let initial_price_e6 = 100_000_000u64; // $100 in e6 format
@@ -1879,14 +2108,18 @@ fn test_hyperp_init_market_with_valid_price() {
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash(),
+        &[ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
     );
 
     let result = svm.send_transaction(tx);
 
     assert!(
         result.is_ok(),
-        "Hyperp InitMarket with valid initial_mark_price should succeed. Got: {:?}", result
+        "Hyperp InitMarket with valid initial_mark_price should succeed. Got: {:?}",
+        result
     );
 
     println!("HYPERP INIT VERIFIED: Market initialized with $100 initial mark/index price");
@@ -1923,40 +2156,60 @@ fn test_hyperp_init_market_with_inverted_price() {
 
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-    svm.set_account(slab, Account {
-        lamports: 1_000_000_000,
-        data: vec![0u8; SLAB_LEN],
-        owner: program_id,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; SLAB_LEN],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(mint, Account {
-        lamports: 1_000_000,
-        data: make_mint_data(),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        mint,
+        Account {
+            lamports: 1_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(vault, Account {
-        lamports: 1_000_000,
-        data: make_token_account_data(&mint, &vault_pda, 0),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        vault,
+        Account {
+            lamports: 1_000_000,
+            data: make_token_account_data(&mint, &vault_pda, 0),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     let dummy_ata = Pubkey::new_unique();
-    svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        dummy_ata,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
 
     // Hyperp mode with inverted market
     // Raw price: $138 (SOL/USD) = 138_000_000 in e6
@@ -1980,27 +2233,39 @@ fn test_hyperp_init_market_with_inverted_price() {
         data: encode_init_market_full_v2(
             &payer.pubkey(),
             &mint,
-            &[0u8; 32],       // Hyperp mode: feed_id = 0
-            1,                // invert = 1 (inverted market)
-            raw_price_e6,     // Raw price, will be inverted internally
-            0,                // warmup
+            &[0u8; 32],   // Hyperp mode: feed_id = 0
+            1,            // invert = 1 (inverted market)
+            raw_price_e6, // Raw price, will be inverted internally
+            0,            // warmup
         ),
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash(),
+        &[ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
     );
 
     let result = svm.send_transaction(tx);
 
     assert!(
         result.is_ok(),
-        "Hyperp InitMarket with inverted price should succeed. Got: {:?}", result
+        "Hyperp InitMarket with inverted price should succeed. Got: {:?}",
+        result
     );
 
     println!("HYPERP INVERTED MARKET VERIFIED:");
-    println!("  Raw price: {} (${:.2})", raw_price_e6, raw_price_e6 as f64 / 1_000_000.0);
-    println!("  Expected inverted: {} (~{:.4} SOL/USD)", expected_inverted, expected_inverted as f64 / 1_000_000.0);
+    println!(
+        "  Raw price: {} (${:.2})",
+        raw_price_e6,
+        raw_price_e6 as f64 / 1_000_000.0
+    );
+    println!(
+        "  Expected inverted: {} (~{:.4} SOL/USD)",
+        expected_inverted,
+        expected_inverted as f64 / 1_000_000.0
+    );
     println!("  Mark/Index stored in inverted form for SOL-denominated perp");
 }
 
@@ -2090,7 +2355,10 @@ fn read_matcher_return(data: &[u8]) -> (u32, u32, u64, i128, u64) {
 fn test_matcher_init_vamm_passive_mode() {
     let path = matcher_program_path();
     if !path.exists() {
-        println!("SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf", path);
+        println!(
+            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
+            path
+        );
         return;
     }
 
@@ -2121,18 +2389,18 @@ fn test_matcher_init_vamm_passive_mode() {
     let ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, false),  // LP PDA
-            AccountMeta::new(ctx_pubkey, false),       // Context account
+            AccountMeta::new_readonly(lp_pda, false), // LP PDA
+            AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(
             MatcherMode::Passive,
-            5,      // 0.05% trading fee
-            10,     // 0.10% base spread
-            200,    // 2% max total
-            0,      // impact_k not used in Passive
-            0,      // liquidity not needed for Passive
+            5,                 // 0.05% trading fee
+            10,                // 0.10% base spread
+            200,               // 2% max total
+            0,                 // impact_k not used in Passive
+            0,                 // liquidity not needed for Passive
             1_000_000_000_000, // max fill
-            0,      // no inventory limit
+            0,                 // no inventory limit
         ),
     };
 
@@ -2148,7 +2416,11 @@ fn test_matcher_init_vamm_passive_mode() {
 
     // Verify context was written
     let ctx_data = svm.get_account(&ctx_pubkey).unwrap().data;
-    let magic = u64::from_le_bytes(ctx_data[CTX_VAMM_OFFSET..CTX_VAMM_OFFSET+8].try_into().unwrap());
+    let magic = u64::from_le_bytes(
+        ctx_data[CTX_VAMM_OFFSET..CTX_VAMM_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(magic, VAMM_MAGIC, "Magic mismatch");
 
     println!("MATCHER INIT VERIFIED: Passive mode initialized successfully");
@@ -2159,7 +2431,10 @@ fn test_matcher_init_vamm_passive_mode() {
 fn test_matcher_call_after_init() {
     let path = matcher_program_path();
     if !path.exists() {
-        println!("SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf", path);
+        println!(
+            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
+            path
+        );
         return;
     }
 
@@ -2190,12 +2465,16 @@ fn test_matcher_call_after_init() {
     let init_ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp.pubkey(), false),  // LP PDA
-            AccountMeta::new(ctx_pubkey, false),             // Context account
+            AccountMeta::new_readonly(lp.pubkey(), false), // LP PDA
+            AccountMeta::new(ctx_pubkey, false),           // Context account
         ],
         data: encode_init_vamm(
             MatcherMode::Passive,
-            5, 10, 200, 0, 0,
+            5,
+            10,
+            200,
+            0,
+            0,
             1_000_000_000_000, // max fill
             0,
         ),
@@ -2250,7 +2529,11 @@ fn test_matcher_call_after_init() {
 
     // Price = oracle * (10000 + spread + fee) / 10000 = 100M * 10015 / 10000 = 100_150_000
     let expected_price = 100_150_000u64;
-    assert_eq!(exec_price, expected_price, "exec_price mismatch: expected {} got {}", expected_price, exec_price);
+    assert_eq!(
+        exec_price, expected_price,
+        "exec_price mismatch: expected {} got {}",
+        expected_price, exec_price
+    );
 
     println!("MATCHER CALL VERIFIED: Correct pricing with 15 bps (10 spread + 5 fee)");
 }
@@ -2260,7 +2543,10 @@ fn test_matcher_call_after_init() {
 fn test_matcher_rejects_double_init() {
     let path = matcher_program_path();
     if !path.exists() {
-        println!("SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf", path);
+        println!(
+            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
+            path
+        );
         return;
     }
 
@@ -2291,8 +2577,8 @@ fn test_matcher_rejects_double_init() {
     let ix1 = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, false),  // LP PDA
-            AccountMeta::new(ctx_pubkey, false),       // Context account
+            AccountMeta::new_readonly(lp_pda, false), // LP PDA
+            AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
     };
@@ -2310,8 +2596,8 @@ fn test_matcher_rejects_double_init() {
     let ix2 = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, false),  // LP PDA
-            AccountMeta::new(ctx_pubkey, false),       // Context account
+            AccountMeta::new_readonly(lp_pda, false), // LP PDA
+            AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
     };
@@ -2323,7 +2609,10 @@ fn test_matcher_rejects_double_init() {
         svm.latest_blockhash(),
     );
     let result2 = svm.send_transaction(tx2);
-    assert!(result2.is_err(), "Second init should fail (already initialized)");
+    assert!(
+        result2.is_err(),
+        "Second init should fail (already initialized)"
+    );
 
     println!("MATCHER DOUBLE INIT REJECTED: AccountAlreadyInitialized");
 }
@@ -2333,7 +2622,10 @@ fn test_matcher_rejects_double_init() {
 fn test_matcher_vamm_mode_with_impact() {
     let path = matcher_program_path();
     if !path.exists() {
-        println!("SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf", path);
+        println!(
+            "SKIP: Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
+            path
+        );
         return;
     }
 
@@ -2368,16 +2660,16 @@ fn test_matcher_vamm_mode_with_impact() {
     let init_ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp.pubkey(), false),  // LP PDA
-            AccountMeta::new(ctx_pubkey, false),             // Context account
+            AccountMeta::new_readonly(lp.pubkey(), false), // LP PDA
+            AccountMeta::new(ctx_pubkey, false),           // Context account
         ],
         data: encode_init_vamm(
             MatcherMode::Vamm,
-            5,      // 0.05% trading fee
-            10,     // 0.10% base spread
-            200,    // 2% max total
-            50,     // 0.50% impact at full liquidity
-            10_000_000_000, // 10B notional_e6 liquidity
+            5,                 // 0.05% trading fee
+            10,                // 0.10% base spread
+            200,               // 2% max total
+            50,                // 0.50% impact at full liquidity
+            10_000_000_000,    // 10B notional_e6 liquidity
             1_000_000_000_000, // max fill
             0,
         ),
@@ -2430,7 +2722,11 @@ fn test_matcher_vamm_mode_with_impact() {
     // Total = spread (10) + fee (5) + impact (5) = 20 bps
     // exec_price = 100M * 10020 / 10000 = 100_200_000
     let expected_price = 100_200_000u64;
-    assert_eq!(exec_price, expected_price, "vAMM exec_price mismatch: expected {} got {}", expected_price, exec_price);
+    assert_eq!(
+        exec_price, expected_price,
+        "vAMM exec_price mismatch: expected {} got {}",
+        expected_price, exec_price
+    );
 
     println!("VAMM MODE VERIFIED: Correct pricing with 20 bps (10 spread + 5 fee + 5 impact)");
 }
@@ -2443,7 +2739,8 @@ impl TestEnv {
     /// Try to withdraw, returns result
     fn try_withdraw(&mut self, owner: &Keypair, user_idx: u16, amount: u64) -> Result<(), String> {
         let ata = self.create_ata(&owner.pubkey(), 0);
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -2461,15 +2758,24 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     /// Try to deposit to wrong user (unauthorized)
-    fn try_deposit_unauthorized(&mut self, attacker: &Keypair, victim_idx: u16, amount: u64) -> Result<(), String> {
+    fn try_deposit_unauthorized(
+        &mut self,
+        attacker: &Keypair,
+        victim_idx: u16,
+        amount: u64,
+    ) -> Result<(), String> {
         let ata = self.create_ata(&attacker.pubkey(), amount);
 
         let ix = Instruction {
@@ -2486,15 +2792,25 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&attacker.pubkey()), &[attacker], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&attacker.pubkey()),
+            &[attacker],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     /// Try to trade without LP signature
-    fn try_trade_without_lp_sig(&mut self, user: &Keypair, lp_idx: u16, user_idx: u16, size: i128) -> Result<(), String> {
+    fn try_trade_without_lp_sig(
+        &mut self,
+        user: &Keypair,
+        lp_idx: u16,
+        user_idx: u16,
+        size: i128,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -2508,9 +2824,13 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[user], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[user],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -2535,9 +2855,14 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&payer.pubkey()), &[payer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx).expect("top_up_insurance failed");
+        self.svm
+            .send_transaction(tx)
+            .expect("top_up_insurance failed");
     }
 
     /// Try liquidation
@@ -2560,9 +2885,13 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -2680,7 +3009,10 @@ fn test_comprehensive_withdrawal_limits() {
     // Try to withdraw everything - should fail
     let result = env.try_withdraw(&user, user_idx, 10_000_000_000);
     println!("Full withdrawal attempt: {:?}", result);
-    assert!(result.is_err(), "Should not be able to withdraw all capital with open position");
+    assert!(
+        result.is_err(),
+        "Should not be able to withdraw all capital with open position"
+    );
 
     // Partial withdrawal may work
     let result2 = env.try_withdraw(&user, user_idx, 1_000_000_000);
@@ -2884,7 +3216,11 @@ fn test_comprehensive_insurance_fund_topup() {
     // Vault should have the funds
     let vault_after = env.vault_balance();
     println!("Vault after top-up: {}", vault_after);
-    assert_eq!(vault_after, vault_before + 5_000_000_000, "Vault should have insurance funds");
+    assert_eq!(
+        vault_after,
+        vault_before + 5_000_000_000,
+        "Vault should have insurance funds"
+    );
 
     println!("INSURANCE FUND VERIFIED: Top-up transferred to vault");
 }
@@ -3051,9 +3387,9 @@ fn encode_liquidate(target_idx: u16) -> Vec<u8> {
 fn encode_update_config(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
-    funding_inv_scale_notional_e6: u128,  // u128!
-    funding_max_premium_bps: i64,          // i64!
-    funding_max_bps_per_slot: i64,         // i64!
+    funding_inv_scale_notional_e6: u128, // u128!
+    funding_max_premium_bps: i64,        // i64!
+    funding_max_bps_per_slot: i64,       // i64!
     thresh_floor: u128,
     thresh_risk_bps: u64,
     thresh_update_interval_slots: u64,
@@ -3067,8 +3403,8 @@ fn encode_update_config(
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_inv_scale_notional_e6.to_le_bytes()); // u128
-    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());       // i64
-    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());      // i64
+    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes()); // i64
+    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes()); // i64
     data.extend_from_slice(&thresh_floor.to_le_bytes());
     data.extend_from_slice(&thresh_risk_bps.to_le_bytes());
     data.extend_from_slice(&thresh_update_interval_slots.to_le_bytes());
@@ -3092,15 +3428,23 @@ impl TestEnv {
             data: encode_update_admin(new_admin),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     /// Try SetRiskThreshold instruction
-    fn try_set_risk_threshold(&mut self, signer: &Keypair, new_threshold: u128) -> Result<(), String> {
+    fn try_set_risk_threshold(
+        &mut self,
+        signer: &Keypair,
+        new_threshold: u128,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3110,15 +3454,23 @@ impl TestEnv {
             data: encode_set_risk_threshold(new_threshold),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     /// Try SetOracleAuthority instruction
-    fn try_set_oracle_authority(&mut self, signer: &Keypair, new_authority: &Pubkey) -> Result<(), String> {
+    fn try_set_oracle_authority(
+        &mut self,
+        signer: &Keypair,
+        new_authority: &Pubkey,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3128,15 +3480,24 @@ impl TestEnv {
             data: encode_set_oracle_authority(new_authority),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     /// Try PushOraclePrice instruction
-    fn try_push_oracle_price(&mut self, signer: &Keypair, price_e6: u64, timestamp: i64) -> Result<(), String> {
+    fn try_push_oracle_price(
+        &mut self,
+        signer: &Keypair,
+        price_e6: u64,
+        timestamp: i64,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3146,15 +3507,23 @@ impl TestEnv {
             data: encode_push_oracle_price(price_e6, timestamp),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     /// Try SetOraclePriceCap instruction
-    fn try_set_oracle_price_cap(&mut self, signer: &Keypair, max_change_e2bps: u64) -> Result<(), String> {
+    fn try_set_oracle_price_cap(
+        &mut self,
+        signer: &Keypair,
+        max_change_e2bps: u64,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3164,9 +3533,13 @@ impl TestEnv {
             data: encode_set_oracle_price_cap(max_change_e2bps),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3182,9 +3555,13 @@ impl TestEnv {
             data: encode_set_maintenance_fee(new_fee),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3200,9 +3577,13 @@ impl TestEnv {
             data: encode_resolve_market(),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3210,10 +3591,8 @@ impl TestEnv {
     /// Try WithdrawInsurance instruction (admin only, requires resolved + all positions closed)
     fn try_withdraw_insurance(&mut self, admin: &Keypair) -> Result<(), String> {
         let admin_ata = self.create_ata(&admin.pubkey(), 0);
-        let (vault_pda, _) = Pubkey::find_program_address(
-            &[b"vault", self.slab.as_ref()],
-            &self.program_id,
-        );
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3227,9 +3606,13 @@ impl TestEnv {
             data: encode_withdraw_insurance(),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3250,7 +3633,11 @@ impl TestEnv {
         // (vault is 16 bytes at 0, insurance_fund starts at 16)
         // InsuranceFund { balance: U128, ... } - balance is first field
         const INSURANCE_OFFSET: usize = 392 + 16;
-        u128::from_le_bytes(slab_account.data[INSURANCE_OFFSET..INSURANCE_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_account.data[INSURANCE_OFFSET..INSURANCE_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Try LiquidateAtOracle instruction
@@ -3269,9 +3656,13 @@ impl TestEnv {
             data: encode_liquidate(target_idx),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3285,25 +3676,29 @@ impl TestEnv {
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_config(
-                3600,  // funding_horizon_slots
-                100,   // funding_k_bps
-                1_000_000_000_000u128, // funding_inv_scale_notional_e6 (u128)
-                100i64,   // funding_max_premium_bps (i64)
-                10i64,    // funding_max_bps_per_slot (i64)
-                0u128,    // thresh_floor (u128)
-                100,      // thresh_risk_bps
-                100,      // thresh_update_interval_slots
-                100,      // thresh_step_bps
-                1000,     // thresh_alpha_bps
-                0u128,    // thresh_min
+                3600,                      // funding_horizon_slots
+                100,                       // funding_k_bps
+                1_000_000_000_000u128,     // funding_inv_scale_notional_e6 (u128)
+                100i64,                    // funding_max_premium_bps (i64)
+                10i64,                     // funding_max_bps_per_slot (i64)
+                0u128,                     // thresh_floor (u128)
+                100,                       // thresh_risk_bps
+                100,                       // thresh_update_interval_slots
+                100,                       // thresh_step_bps
+                1000,                      // thresh_alpha_bps
+                0u128,                     // thresh_min
                 1_000_000_000_000_000u128, // thresh_max
-                1u128,    // thresh_min_step
+                1u128,                     // thresh_min_step
             ),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3332,12 +3727,19 @@ fn test_critical_update_admin_authorization() {
 
     // Attacker tries to change admin - should fail
     let result = env.try_update_admin(&attacker, &attacker.pubkey());
-    assert!(result.is_err(), "SECURITY: Non-admin should not be able to change admin");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not be able to change admin"
+    );
     println!("UpdateAdmin by non-admin: REJECTED (correct)");
 
     // Real admin changes admin - should succeed
     let result = env.try_update_admin(&admin, &new_admin.pubkey());
-    assert!(result.is_ok(), "Admin should be able to change admin: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should be able to change admin: {:?}",
+        result
+    );
     println!("UpdateAdmin by admin: ACCEPTED (correct)");
 
     // Old admin tries again - should now fail
@@ -3370,12 +3772,19 @@ fn test_critical_set_risk_threshold_authorization() {
 
     // Attacker tries to set threshold - should fail
     let result = env.try_set_risk_threshold(&attacker, 1_000_000_000);
-    assert!(result.is_err(), "SECURITY: Non-admin should not set risk threshold");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not set risk threshold"
+    );
     println!("SetRiskThreshold by non-admin: REJECTED (correct)");
 
     // Admin sets threshold - should succeed
     let result = env.try_set_risk_threshold(&admin, 1_000_000_000_000);
-    assert!(result.is_ok(), "Admin should set risk threshold: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should set risk threshold: {:?}",
+        result
+    );
     println!("SetRiskThreshold by admin: ACCEPTED (correct)");
 
     println!("CRITICAL TEST PASSED: SetRiskThreshold authorization enforced");
@@ -3400,27 +3809,43 @@ fn test_critical_admin_oracle_authority() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let oracle_authority = Keypair::new();
     let attacker = Keypair::new();
-    env.svm.airdrop(&oracle_authority.pubkey(), 1_000_000_000).unwrap();
+    env.svm
+        .airdrop(&oracle_authority.pubkey(), 1_000_000_000)
+        .unwrap();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
 
     // Attacker tries to set oracle authority - should fail
     let result = env.try_set_oracle_authority(&attacker, &attacker.pubkey());
-    assert!(result.is_err(), "SECURITY: Non-admin should not set oracle authority");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not set oracle authority"
+    );
     println!("SetOracleAuthority by non-admin: REJECTED (correct)");
 
     // Admin sets oracle authority - should succeed
     let result = env.try_set_oracle_authority(&admin, &oracle_authority.pubkey());
-    assert!(result.is_ok(), "Admin should set oracle authority: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should set oracle authority: {:?}",
+        result
+    );
     println!("SetOracleAuthority by admin: ACCEPTED (correct)");
 
     // Attacker tries to push price - should fail
     let result = env.try_push_oracle_price(&attacker, 150_000_000, 200);
-    assert!(result.is_err(), "SECURITY: Non-authority should not push oracle price");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-authority should not push oracle price"
+    );
     println!("PushOraclePrice by non-authority: REJECTED (correct)");
 
     // Oracle authority pushes price - should succeed
     let result = env.try_push_oracle_price(&oracle_authority, 150_000_000, 200);
-    assert!(result.is_ok(), "Oracle authority should push price: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Oracle authority should push price: {:?}",
+        result
+    );
     println!("PushOraclePrice by authority: ACCEPTED (correct)");
 
     println!("CRITICAL TEST PASSED: Admin oracle mechanism verified");
@@ -3448,12 +3873,19 @@ fn test_critical_set_oracle_price_cap_authorization() {
 
     // Attacker tries to set price cap - should fail
     let result = env.try_set_oracle_price_cap(&attacker, 10000);
-    assert!(result.is_err(), "SECURITY: Non-admin should not set oracle price cap");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not set oracle price cap"
+    );
     println!("SetOraclePriceCap by non-admin: REJECTED (correct)");
 
     // Admin sets price cap - should succeed
     let result = env.try_set_oracle_price_cap(&admin, 10000);
-    assert!(result.is_ok(), "Admin should set oracle price cap: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should set oracle price cap: {:?}",
+        result
+    );
     println!("SetOraclePriceCap by admin: ACCEPTED (correct)");
 
     println!("CRITICAL TEST PASSED: SetOraclePriceCap authorization enforced");
@@ -3481,12 +3913,19 @@ fn test_critical_set_maintenance_fee_authorization() {
 
     // Attacker tries to set maintenance fee - should fail
     let result = env.try_set_maintenance_fee(&attacker, 1000);
-    assert!(result.is_err(), "SECURITY: Non-admin should not set maintenance fee");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not set maintenance fee"
+    );
     println!("SetMaintenanceFee by non-admin: REJECTED (correct)");
 
     // Admin sets maintenance fee - should succeed
     let result = env.try_set_maintenance_fee(&admin, 1000);
-    assert!(result.is_ok(), "Admin should set maintenance fee: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should set maintenance fee: {:?}",
+        result
+    );
     println!("SetMaintenanceFee by admin: ACCEPTED (correct)");
 
     println!("CRITICAL TEST PASSED: SetMaintenanceFee authorization enforced");
@@ -3514,7 +3953,10 @@ fn test_critical_update_config_authorization() {
 
     // Attacker tries to update config - should fail
     let result = env.try_update_config(&attacker);
-    assert!(result.is_err(), "SECURITY: Non-admin should not update config");
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not update config"
+    );
     println!("UpdateConfig by non-admin: REJECTED (correct)");
 
     // Admin updates config - should succeed
@@ -3567,7 +4009,9 @@ fn test_critical_liquidation_rejected_when_solvent() {
     // should not be liquidated.
     if result.is_ok() {
         println!("WARN: Liquidation instruction succeeded (may return no-op code)");
-        println!("      This is acceptable if engine returns LiquidationResult::NoLiquidationNeeded");
+        println!(
+            "      This is acceptable if engine returns LiquidationResult::NoLiquidationNeeded"
+        );
     } else {
         println!("Liquidate solvent account: REJECTED (correct)");
     }
@@ -3609,7 +4053,10 @@ fn test_critical_close_slab_authorization() {
         data: encode_close_slab(),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[attacker_ix], Some(&attacker.pubkey()), &[&attacker], env.svm.latest_blockhash(),
+        &[attacker_ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "SECURITY: Non-admin should not close slab");
@@ -3617,7 +4064,10 @@ fn test_critical_close_slab_authorization() {
 
     // Admin tries to close slab with non-zero balance - should fail
     let result = env.try_close_slab();
-    assert!(result.is_err(), "SECURITY: Should not close slab with non-zero vault");
+    assert!(
+        result.is_err(),
+        "SECURITY: Should not close slab with non-zero vault"
+    );
     println!("CloseSlab with active funds: REJECTED (correct)");
 
     println!("CRITICAL TEST PASSED: CloseSlab authorization verified");
@@ -3645,13 +4095,18 @@ fn test_critical_init_market_rejects_double_init() {
     // Try second init - should fail
     let admin = &env.payer;
     let dummy_ata = Pubkey::new_unique();
-    env.svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -3670,11 +4125,17 @@ fn test_critical_init_market_rejects_double_init() {
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&admin.pubkey()), &[admin], env.svm.latest_blockhash(),
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
 
-    assert!(result.is_err(), "SECURITY: Double initialization should be rejected");
+    assert!(
+        result.is_err(),
+        "SECURITY: Double initialization should be rejected"
+    );
     println!("Second InitMarket: REJECTED (correct)");
 
     println!("CRITICAL TEST PASSED: Double initialization rejection verified");
@@ -3706,12 +4167,18 @@ fn test_critical_invalid_account_indices_rejected() {
 
     // Try trade with invalid user_idx (999 - not initialized)
     let result = env.try_trade(&user, &lp, lp_idx, 999, 1_000_000);
-    assert!(result.is_err(), "SECURITY: Invalid user_idx should be rejected");
+    assert!(
+        result.is_err(),
+        "SECURITY: Invalid user_idx should be rejected"
+    );
     println!("Trade with invalid user_idx: REJECTED (correct)");
 
     // Try trade with invalid lp_idx (999 - not initialized)
     let result = env.try_trade(&user, &lp, 999, user_idx, 1_000_000);
-    assert!(result.is_err(), "SECURITY: Invalid lp_idx should be rejected");
+    assert!(
+        result.is_err(),
+        "SECURITY: Invalid lp_idx should be rejected"
+    );
     println!("Trade with invalid lp_idx: REJECTED (correct)");
 
     println!("CRITICAL TEST PASSED: Invalid account indices rejection verified");
@@ -3743,12 +4210,20 @@ fn test_sell_trade_negative_size() {
 
     // User opens SHORT position (negative size)
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, -10_000_000);
-    assert!(result.is_ok(), "Sell/short trade should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Sell/short trade should succeed: {:?}",
+        result
+    );
     println!("Short position opened (negative size): SUCCESS");
 
     // User closes by buying (positive size)
     let result2 = env.try_trade(&user, &lp, lp_idx, user_idx, 10_000_000);
-    assert!(result2.is_ok(), "Close short trade should succeed: {:?}", result2);
+    assert!(
+        result2.is_ok(),
+        "Close short trade should succeed: {:?}",
+        result2
+    );
     println!("Short position closed: SUCCESS");
 
     println!("SELL TRADES VERIFIED: Negative size trades work correctly");
@@ -3820,50 +4295,82 @@ impl TradeCpiTestEnv {
 
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-        svm.set_account(slab, Account {
-            lamports: 1_000_000_000,
-            data: vec![0u8; SLAB_LEN],
-            owner: program_id,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            slab,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; SLAB_LEN],
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_account(mint, Account {
-            lamports: 1_000_000,
-            data: make_mint_data(),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 1_000_000,
+                data: make_mint_data(),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_account(vault, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            vault,
+            Account {
+                lamports: 1_000_000,
+                data: make_token_account_data(&mint, &vault_pda, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
         let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, 100);
-        svm.set_account(pyth_index, Account {
-            lamports: 1_000_000,
-            data: pyth_data.clone(),
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        svm.set_account(pyth_col, Account {
-            lamports: 1_000_000,
-            data: pyth_data,
-            owner: PYTH_RECEIVER_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        svm.set_account(
+            pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data.clone(),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            pyth_col,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+        svm.set_sysvar(&Clock {
+            slot: 100,
+            unix_timestamp: 100,
+            ..Clock::default()
+        });
 
         Some(TradeCpiTestEnv {
-            svm, program_id, matcher_program_id, payer, slab, mint, vault, pyth_index, pyth_col,
+            svm,
+            program_id,
+            matcher_program_id,
+            payer,
+            slab,
+            mint,
+            vault,
+            pyth_index,
+            pyth_col,
             account_count: 0,
         })
     }
@@ -3871,13 +4378,18 @@ impl TradeCpiTestEnv {
     fn init_market(&mut self) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -3896,20 +4408,28 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
     }
 
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
         let ata = Pubkey::new_unique();
-        self.svm.set_account(ata, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&self.mint, owner, amount),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: make_token_account_data(&self.mint, owner, amount),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
         ata
     }
 
@@ -3922,31 +4442,38 @@ impl TradeCpiTestEnv {
 
         // Derive the LP PDA that will be used later (must match percolator derivation)
         let lp_bytes = idx.to_le_bytes();
-        let (lp_pda, _) = Pubkey::find_program_address(
-            &[b"lp", self.slab.as_ref(), &lp_bytes],
-            &self.program_id
-        );
+        let (lp_pda, _) =
+            Pubkey::find_program_address(&[b"lp", self.slab.as_ref(), &lp_bytes], &self.program_id);
 
         // Create matcher context owned by matcher program
         let ctx = Pubkey::new_unique();
-        self.svm.set_account(ctx, Account {
-            lamports: 10_000_000,
-            data: vec![0u8; MATCHER_CONTEXT_LEN],
-            owner: *matcher_prog,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 10_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: *matcher_prog,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         // Initialize the matcher context with LP PDA
         let init_ix = Instruction {
             program_id: *matcher_prog,
             accounts: vec![
-                AccountMeta::new_readonly(lp_pda, false),  // LP PDA (stored for signature verification)
-                AccountMeta::new(ctx, false),              // Context account
+                AccountMeta::new_readonly(lp_pda, false), // LP PDA (stored for signature verification)
+                AccountMeta::new(ctx, false),             // Context account
             ],
             data: encode_init_vamm(
                 MatcherMode::Passive,
-                5, 10, 200, 0, 0,
+                5,
+                10,
+                200,
+                0,
+                0,
                 1_000_000_000_000, // max fill
                 0,
             ),
@@ -3958,7 +4485,9 @@ impl TradeCpiTestEnv {
             &[owner],
             self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx).expect("init matcher context failed");
+        self.svm
+            .send_transaction(tx)
+            .expect("init matcher context failed");
 
         // Now init LP in percolator with this matcher
         let ix = Instruction {
@@ -3976,7 +4505,10 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
         self.account_count += 1;
@@ -4003,7 +4535,10 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
         self.account_count += 1;
@@ -4027,7 +4562,10 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("deposit failed");
     }
@@ -4037,7 +4575,7 @@ impl TradeCpiTestEnv {
     fn try_trade_cpi(
         &mut self,
         user: &Keypair,
-        lp_owner: &Pubkey,  // NOT a signer!
+        lp_owner: &Pubkey, // NOT a signer!
         lp_idx: u16,
         user_idx: u16,
         size: i128,
@@ -4046,10 +4584,8 @@ impl TradeCpiTestEnv {
     ) -> Result<(), String> {
         // Derive the LP PDA
         let lp_bytes = lp_idx.to_le_bytes();
-        let (lp_pda, _) = Pubkey::find_program_address(
-            &[b"lp", self.slab.as_ref(), &lp_bytes],
-            &self.program_id
-        );
+        let (lp_pda, _) =
+            Pubkey::find_program_address(&[b"lp", self.slab.as_ref(), &lp_bytes], &self.program_id);
 
         // LP PDA must be system-owned, zero data, zero lamports
         // We don't need to set it up - it should not exist (system program owns uninitialized PDAs)
@@ -4057,13 +4593,13 @@ impl TradeCpiTestEnv {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
-                AccountMeta::new(user.pubkey(), true),    // 0: user (signer)
-                AccountMeta::new(*lp_owner, false),       // 1: lp_owner (NOT signer!)
-                AccountMeta::new(self.slab, false),       // 2: slab
+                AccountMeta::new(user.pubkey(), true), // 0: user (signer)
+                AccountMeta::new(*lp_owner, false),    // 1: lp_owner (NOT signer!)
+                AccountMeta::new(self.slab, false),    // 2: slab
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // 3: clock
-                AccountMeta::new_readonly(self.pyth_index, false),   // 4: oracle
-                AccountMeta::new_readonly(*matcher_prog, false),     // 5: matcher program
-                AccountMeta::new(*matcher_ctx, false),    // 6: matcher context (writable)
+                AccountMeta::new_readonly(self.pyth_index, false), // 4: oracle
+                AccountMeta::new_readonly(*matcher_prog, false), // 5: matcher program
+                AccountMeta::new(*matcher_ctx, false), // 6: matcher context (writable)
                 AccountMeta::new_readonly(lp_pda, false), // 7: lp_pda
             ],
             data: encode_trade_cpi(lp_idx, user_idx, size),
@@ -4071,9 +4607,13 @@ impl TradeCpiTestEnv {
 
         // Only user signs - LP owner does NOT sign
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[user], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[user],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -4106,9 +4646,13 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()), &[user], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&user.pubkey()),
+            &[user],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -4116,13 +4660,18 @@ impl TradeCpiTestEnv {
     fn init_market_hyperp(&mut self, initial_mark_price_e6: u64) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -4141,13 +4690,22 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx).expect("init_market_hyperp failed");
+        self.svm
+            .send_transaction(tx)
+            .expect("init_market_hyperp failed");
     }
 
     fn set_slot(&mut self, slot: u64) {
-        self.svm.set_sysvar(&Clock { slot, unix_timestamp: slot as i64, ..Clock::default() });
+        self.svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
     }
 
     fn crank(&mut self) {
@@ -4166,12 +4724,19 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("crank failed");
     }
 
-    fn try_set_oracle_authority(&mut self, admin: &Keypair, new_authority: &Pubkey) -> Result<(), String> {
+    fn try_set_oracle_authority(
+        &mut self,
+        admin: &Keypair,
+        new_authority: &Pubkey,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -4182,14 +4747,23 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
-    fn try_push_oracle_price(&mut self, authority: &Keypair, price_e6: u64, timestamp: i64) -> Result<(), String> {
+    fn try_push_oracle_price(
+        &mut self,
+        authority: &Keypair,
+        price_e6: u64,
+        timestamp: i64,
+    ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -4201,9 +4775,13 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&authority.pubkey()), &[authority], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&authority.pubkey()),
+            &[authority],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -4219,16 +4797,21 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
 
     fn try_withdraw_insurance(&mut self, admin: &Keypair) -> Result<(), String> {
         let admin_ata = self.create_ata(&admin.pubkey(), 0);
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
         // Account order: admin, slab, admin_ata, vault, token_program, vault_pda
         let ix = Instruction {
@@ -4245,9 +4828,13 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -4264,7 +4851,11 @@ impl TradeCpiTestEnv {
         // RiskEngine layout: vault(U128=16) + insurance_fund(balance(U128=16) + fee_revenue(16))
         // So insurance_fund.balance is at ENGINE_OFF + 16 = 408
         const INSURANCE_BALANCE_OFFSET: usize = 392 + 16;
-        u128::from_le_bytes(slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     fn read_account_position(&self, idx: u16) -> i128 {
@@ -4274,11 +4865,12 @@ impl TradeCpiTestEnv {
         const ACCOUNTS_OFFSET: usize = 392 + 9136;
         const ACCOUNT_SIZE: usize = 240;
         const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
-        let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
+        let account_off =
+            ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
             return 0;
         }
-        i128::from_le_bytes(slab_data[account_off..account_off+16].try_into().unwrap())
+        i128::from_le_bytes(slab_data[account_off..account_off + 16].try_into().unwrap())
     }
 
     fn try_withdraw(&mut self, owner: &Keypair, user_idx: u16, amount: u64) -> Result<(), String> {
@@ -4298,7 +4890,8 @@ impl TradeCpiTestEnv {
             data: encode_withdraw(user_idx, amount),
         };
 
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
         let ix2 = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -4315,9 +4908,13 @@ impl TradeCpiTestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix2], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix2],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -4339,7 +4936,11 @@ impl TradeCpiTestEnv {
         //   total_open_interest(16) + c_tot(16) + pnl_pos_tot(16)
         // Offset: 16+32+136+8+16+8+8+8+8+16+16 = 272
         const PNL_POS_TOT_OFFSET: usize = 392 + 272;
-        u128::from_le_bytes(slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read c_tot aggregate from slab
@@ -4347,7 +4948,11 @@ impl TradeCpiTestEnv {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // c_tot is at offset 256 within RiskEngine (16 bytes before pnl_pos_tot)
         const C_TOT_OFFSET: usize = 392 + 256;
-        u128::from_le_bytes(slab_data[C_TOT_OFFSET..C_TOT_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read vault balance from slab
@@ -4355,7 +4960,11 @@ impl TradeCpiTestEnv {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // vault is at offset 0 within RiskEngine
         const VAULT_OFFSET: usize = 392;
-        u128::from_le_bytes(slab_data[VAULT_OFFSET..VAULT_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read account PnL
@@ -4377,7 +4986,7 @@ impl TradeCpiTestEnv {
         if slab_data.len() < account_off + 16 {
             return 0;
         }
-        i128::from_le_bytes(slab_data[account_off..account_off+16].try_into().unwrap())
+        i128::from_le_bytes(slab_data[account_off..account_off + 16].try_into().unwrap())
     }
 }
 
@@ -4431,8 +5040,11 @@ fn test_tradecpi_permissionless_lp_no_signature_required() {
         &matcher_ctx,
     );
 
-    assert!(result.is_ok(),
-        "TradeCpi should succeed without LP signature (permissionless). Error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "TradeCpi should succeed without LP signature (permissionless). Error: {:?}",
+        result
+    );
 
     println!("TRADECPI PERMISSIONLESS VERIFIED: LP owner did NOT sign, trade succeeded");
     println!("  - LP delegates trade authorization to matcher program");
@@ -4484,8 +5096,10 @@ fn test_tradecpi_rejects_wrong_matcher_program() {
         &matcher_ctx,
     );
 
-    assert!(result.is_err(),
-        "SECURITY: TradeCpi should reject wrong matcher program");
+    assert!(
+        result.is_err(),
+        "SECURITY: TradeCpi should reject wrong matcher program"
+    );
 
     println!("TRADECPI MATCHER VALIDATION VERIFIED: Wrong matcher program REJECTED");
     println!("  - Passed matcher: {} (wrong)", wrong_matcher_prog);
@@ -4524,13 +5138,18 @@ fn test_tradecpi_rejects_wrong_matcher_context() {
 
     // Create a DIFFERENT matcher context (belongs to a different LP)
     let wrong_ctx = Pubkey::new_unique();
-    env.svm.set_account(wrong_ctx, Account {
-        lamports: 10_000_000,
-        data: vec![0u8; MATCHER_CONTEXT_LEN],
-        owner: matcher_prog,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            wrong_ctx,
+            Account {
+                lamports: 10_000_000,
+                data: vec![0u8; MATCHER_CONTEXT_LEN],
+                owner: matcher_prog,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     // Use a different LP PDA for the wrong context
     let wrong_lp_pda = Pubkey::new_unique();
@@ -4539,13 +5158,16 @@ fn test_tradecpi_rejects_wrong_matcher_context() {
     let init_ix = Instruction {
         program_id: matcher_prog,
         accounts: vec![
-            AccountMeta::new_readonly(wrong_lp_pda, false),  // Different LP PDA
+            AccountMeta::new_readonly(wrong_lp_pda, false), // Different LP PDA
             AccountMeta::new(wrong_ctx, false),
         ],
         data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[init_ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+        &[init_ix],
+        Some(&user.pubkey()),
+        &[&user],
+        env.svm.latest_blockhash(),
     );
     env.svm.send_transaction(tx).expect("init wrong ctx failed");
 
@@ -4560,8 +5182,10 @@ fn test_tradecpi_rejects_wrong_matcher_context() {
         &wrong_ctx, // WRONG!
     );
 
-    assert!(result.is_err(),
-        "SECURITY: TradeCpi should reject wrong matcher context");
+    assert!(
+        result.is_err(),
+        "SECURITY: TradeCpi should reject wrong matcher context"
+    );
 
     println!("TRADECPI CONTEXT VALIDATION VERIFIED: Wrong matcher context REJECTED");
     println!("  - Passed context: {} (wrong)", wrong_ctx);
@@ -4618,8 +5242,10 @@ fn test_tradecpi_rejects_wrong_lp_pda() {
         &wrong_pda, // WRONG!
     );
 
-    assert!(result.is_err(),
-        "SECURITY: TradeCpi should reject wrong LP PDA");
+    assert!(
+        result.is_err(),
+        "SECURITY: TradeCpi should reject wrong LP PDA"
+    );
 
     println!("TRADECPI PDA VALIDATION VERIFIED: Wrong LP PDA REJECTED");
     println!("  - Passed PDA: {} (wrong)", wrong_pda);
@@ -4662,20 +5288,23 @@ fn test_tradecpi_rejects_pda_with_wrong_shape() {
 
     // Derive the CORRECT LP PDA
     let lp_bytes = lp_idx.to_le_bytes();
-    let (correct_lp_pda, _) = Pubkey::find_program_address(
-        &[b"lp", env.slab.as_ref(), &lp_bytes],
-        &env.program_id
-    );
+    let (correct_lp_pda, _) =
+        Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
 
     // Create an account at the PDA address with wrong shape
     // (has lamports - not zero)
-    env.svm.set_account(correct_lp_pda, Account {
-        lamports: 1_000_000, // Non-zero lamports - INVALID
-        data: vec![],
-        owner: solana_sdk::system_program::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            correct_lp_pda,
+            Account {
+                lamports: 1_000_000, // Non-zero lamports - INVALID
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     // Try TradeCpi - should fail because PDA shape is wrong
     let result = env.try_trade_cpi(
@@ -4688,8 +5317,10 @@ fn test_tradecpi_rejects_pda_with_wrong_shape() {
         &matcher_ctx,
     );
 
-    assert!(result.is_err(),
-        "SECURITY: TradeCpi should reject PDA with non-zero lamports");
+    assert!(
+        result.is_err(),
+        "SECURITY: TradeCpi should reject PDA with non-zero lamports"
+    );
 
     println!("TRADECPI PDA SHAPE VALIDATION VERIFIED: PDA with wrong shape REJECTED");
     println!("  - PDA address is correct but has non-zero lamports");
@@ -4733,34 +5364,68 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
 
     // Trade with LP1 using LP1's context - should succeed
     let result1 = env.try_trade_cpi(
-        &user, &lp1.pubkey(), lp1_idx, user_idx, 500_000,
-        &matcher_prog, &lp1_ctx,
+        &user,
+        &lp1.pubkey(),
+        lp1_idx,
+        user_idx,
+        500_000,
+        &matcher_prog,
+        &lp1_ctx,
     );
-    assert!(result1.is_ok(), "Trade with LP1 using LP1's context should succeed: {:?}", result1);
+    assert!(
+        result1.is_ok(),
+        "Trade with LP1 using LP1's context should succeed: {:?}",
+        result1
+    );
     println!("LP1 trade with LP1's context: SUCCESS");
 
     // Trade with LP2 using LP2's context - should succeed
     let result2 = env.try_trade_cpi(
-        &user, &lp2.pubkey(), lp2_idx, user_idx, 500_000,
-        &matcher_prog, &lp2_ctx,
+        &user,
+        &lp2.pubkey(),
+        lp2_idx,
+        user_idx,
+        500_000,
+        &matcher_prog,
+        &lp2_ctx,
     );
-    assert!(result2.is_ok(), "Trade with LP2 using LP2's context should succeed: {:?}", result2);
+    assert!(
+        result2.is_ok(),
+        "Trade with LP2 using LP2's context should succeed: {:?}",
+        result2
+    );
     println!("LP2 trade with LP2's context: SUCCESS");
 
     // Try to trade with LP1 using LP2's context - should FAIL
     let result3 = env.try_trade_cpi(
-        &user, &lp1.pubkey(), lp1_idx, user_idx, 500_000,
-        &matcher_prog, &lp2_ctx, // WRONG context for LP1!
+        &user,
+        &lp1.pubkey(),
+        lp1_idx,
+        user_idx,
+        500_000,
+        &matcher_prog,
+        &lp2_ctx, // WRONG context for LP1!
     );
-    assert!(result3.is_err(), "SECURITY: LP1 trade with LP2's context should fail");
+    assert!(
+        result3.is_err(),
+        "SECURITY: LP1 trade with LP2's context should fail"
+    );
     println!("LP1 trade with LP2's context: REJECTED (correct)");
 
     // Try to trade with LP2 using LP1's context - should FAIL
     let result4 = env.try_trade_cpi(
-        &user, &lp2.pubkey(), lp2_idx, user_idx, 500_000,
-        &matcher_prog, &lp1_ctx, // WRONG context for LP2!
+        &user,
+        &lp2.pubkey(),
+        lp2_idx,
+        user_idx,
+        500_000,
+        &matcher_prog,
+        &lp1_ctx, // WRONG context for LP2!
     );
-    assert!(result4.is_err(), "SECURITY: LP2 trade with LP1's context should fail");
+    assert!(
+        result4.is_err(),
+        "SECURITY: LP2 trade with LP1's context should fail"
+    );
     println!("LP2 trade with LP1's context: REJECTED (correct)");
 
     println!("LP MATCHER BINDING ISOLATION VERIFIED:");
@@ -4814,11 +5479,16 @@ fn test_insurance_fund_traps_funds_preventing_closeslab() {
 
     // Top up insurance fund - this is the key operation
     let insurance_payer = Keypair::new();
-    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
     env.top_up_insurance(&insurance_payer, 500_000_000); // 0.5 SOL to insurance
 
     let vault_after_insurance = env.vault_balance();
-    println!("Vault balance after insurance top-up: {}", vault_after_insurance);
+    println!(
+        "Vault balance after insurance top-up: {}",
+        vault_after_insurance
+    );
 
     // Withdraw all user capital
     env.set_slot(200);
@@ -4888,7 +5558,11 @@ fn test_extreme_price_movement_with_large_position() {
     // Open large long position
     let size: i128 = 100_000_000; // 100 SOL position
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, size);
-    assert!(result.is_ok(), "Opening position should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Opening position should succeed: {:?}",
+        result
+    );
     println!("Step 1: Opened 100 SOL long at $138");
 
     // Move price down by 15% (more than maintenance margin can handle)
@@ -4923,7 +5597,10 @@ fn test_extreme_price_movement_with_large_position() {
 
     // Small trade to verify market still functions
     let result = env.try_trade(&user2, &lp, lp_idx, user2_idx, 1_000_000);
-    println!("Step 6: New user trade after extreme movement: {:?}", result);
+    println!(
+        "Step 6: New user trade after extreme movement: {:?}",
+        result
+    );
 
     println!("EXTREME PRICE MOVEMENT TEST COMPLETE:");
     println!("  - Verified large position handling during adverse price movement");
@@ -4972,7 +5649,10 @@ fn test_minimum_margin_boundary() {
     // This should succeed - 1.5 SOL > 1 SOL required margin
     let size: i128 = 10_000_000;
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, size);
-    println!("Trade with 1.5 SOL margin for 10 SOL position: {:?}", result);
+    println!(
+        "Trade with 1.5 SOL margin for 10 SOL position: {:?}",
+        result
+    );
     assert!(result.is_ok(), "Trade at margin boundary should succeed");
 
     // Close the position
@@ -4990,7 +5670,10 @@ fn test_minimum_margin_boundary() {
 
     // This should fail - 0.5 SOL < 1 SOL required margin
     let result2 = env.try_trade(&user2, &lp, lp_idx, user2_idx, size);
-    println!("Trade with 0.5 SOL margin for 10 SOL position: {:?}", result2);
+    println!(
+        "Trade with 0.5 SOL margin for 10 SOL position: {:?}",
+        result2
+    );
 
     // Note: Due to Finding L (margin check uses maintenance instead of initial),
     // this trade might succeed when it shouldn't. This test documents the behavior.
@@ -5100,7 +5783,10 @@ fn test_position_flip_minimal_equity() {
         if flip_result.is_ok() {
             println!("Position flip succeeded with minimal equity");
         } else {
-            println!("Position flip rejected (likely due to fees depleting equity): {:?}", flip_result);
+            println!(
+                "Position flip rejected (likely due to fees depleting equity): {:?}",
+                flip_result
+            );
         }
     }
 
@@ -5144,50 +5830,74 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
 
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-    svm.set_account(slab, Account {
-        lamports: 1_000_000_000,
-        data: vec![0u8; SLAB_LEN],
-        owner: program_id,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; SLAB_LEN],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(mint, Account {
-        lamports: 1_000_000,
-        data: make_mint_data(),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        mint,
+        Account {
+            lamports: 1_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    svm.set_account(vault, Account {
-        lamports: 1_000_000,
-        data: make_token_account_data(&mint, &vault_pda, 0),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        vault,
+        Account {
+            lamports: 1_000_000,
+            data: make_token_account_data(&mint, &vault_pda, 0),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     // Dummy oracle (not used in Hyperp mode, but account must exist)
-    svm.set_account(dummy_oracle, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; 100],
-        owner: Pubkey::new_unique(),
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        dummy_oracle,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 100],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     let dummy_ata = Pubkey::new_unique();
-    svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    svm.set_account(
+        dummy_ata,
+        Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     // Start at slot 100
-    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
 
     // Init market with Hyperp mode (feed_id = 0)
     let initial_price_e6 = 100_000_000u64; // $100
@@ -5209,13 +5919,20 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash(),
+        &[ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
     );
     svm.send_transaction(tx).expect("InitMarket failed");
     println!("Hyperp market initialized with mark=index=$100");
 
     // Advance to slot 200 and crank
-    svm.set_sysvar(&Clock { slot: 200, unix_timestamp: 200, ..Clock::default() });
+    svm.set_sysvar(&Clock {
+        slot: 200,
+        unix_timestamp: 200,
+        ..Clock::default()
+    });
 
     let crank_ix = Instruction {
         program_id,
@@ -5229,7 +5946,10 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[crank_ix.clone()], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash(),
+        &[crank_ix.clone()],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
     );
     let result1 = svm.send_transaction(tx);
     println!("First crank in slot 200: {:?}", result1.is_ok());
@@ -5240,7 +5960,10 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     svm.expire_blockhash();
     let new_blockhash = svm.latest_blockhash();
     let tx = Transaction::new_signed_with_payer(
-        &[crank_ix.clone()], Some(&payer.pubkey()), &[&payer], new_blockhash,
+        &[crank_ix.clone()],
+        Some(&payer.pubkey()),
+        &[&payer],
+        new_blockhash,
     );
     let result2 = svm.send_transaction(tx);
     println!("Second crank in slot 200: {:?}", result2);
@@ -5266,7 +5989,11 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     // (for valid maintenance reasons), but the index will not move on subsequent
     // cranks in the same slot.
 
-    assert!(result2.is_ok(), "Second crank should succeed in same slot: {:?}", result2);
+    assert!(
+        result2.is_ok(),
+        "Second crank should succeed in same slot: {:?}",
+        result2
+    );
     println!("CONFIRMED: Multiple cranks in same slot allowed");
     println!("SECURITY: Bug #9 FIXED - dt=0 now returns index (no movement) instead of mark");
 
@@ -5309,8 +6036,15 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let maintenance_fee: u128 = 1_000_000;
     let result = env.try_set_maintenance_fee(&admin, maintenance_fee);
-    assert!(result.is_ok(), "SetMaintenanceFee should succeed: {:?}", result);
-    println!("Set maintenance_fee_per_slot = {} (0.001 SOL/slot)", maintenance_fee);
+    assert!(
+        result.is_ok(),
+        "SetMaintenanceFee should succeed: {:?}",
+        result
+    );
+    println!(
+        "Set maintenance_fee_per_slot = {} (0.001 SOL/slot)",
+        maintenance_fee
+    );
 
     // Create a user with small deposit
     let user = Keypair::new();
@@ -5328,8 +6062,12 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
     // Advance 600 slots to ensure complete drain
     env.set_slot(700);
     println!("Advanced to slot 700 (600 slots elapsed)");
-    println!("Expected fee drain: {} slots * {} = {} lamports (~0.6 SOL)",
-             600, maintenance_fee, 600u128 * maintenance_fee);
+    println!(
+        "Expected fee drain: {} slots * {} = {} lamports (~0.6 SOL)",
+        600,
+        maintenance_fee,
+        600u128 * maintenance_fee
+    );
 
     // Run crank - this will:
     // 1. Settle maintenance fees (draining capital)
@@ -5348,7 +6086,15 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
 
         // 1. Verify bitmap bit is cleared
         let is_used = env.is_slot_used(freed_slot);
-        println!("Bitmap bit for slot {}: {}", freed_slot, if is_used { "SET (BAD!)" } else { "CLEARED (good)" });
+        println!(
+            "Bitmap bit for slot {}: {}",
+            freed_slot,
+            if is_used {
+                "SET (BAD!)"
+            } else {
+                "CLEARED (good)"
+            }
+        );
         assert!(!is_used, "Bitmap bit should be cleared after GC");
 
         // 2. Verify account capital is zeroed
@@ -5366,26 +6112,45 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
         println!("num_used_accounts before new user: {}", num_used_before);
 
         let new_user = Keypair::new();
-        let _helper_idx = env.init_user(&new_user);  // Helper returns wrong idx, ignore it
+        let _helper_idx = env.init_user(&new_user); // Helper returns wrong idx, ignore it
 
         // The program's freelist is LIFO - freed slot 0 should be reused
         // Verify by checking that the bitmap bit for slot 0 is now SET
         let slot_0_used = env.is_slot_used(freed_slot);
-        println!("After init_user, bitmap bit for slot {}: {}", freed_slot,
-                 if slot_0_used { "SET (slot reused!)" } else { "still cleared" });
-        assert!(slot_0_used, "Freed slot should be reused by new user (LIFO freelist)");
+        println!(
+            "After init_user, bitmap bit for slot {}: {}",
+            freed_slot,
+            if slot_0_used {
+                "SET (slot reused!)"
+            } else {
+                "still cleared"
+            }
+        );
+        assert!(
+            slot_0_used,
+            "Freed slot should be reused by new user (LIFO freelist)"
+        );
 
         // 4. Verify num_used_accounts incremented (not doubled - slot was reused)
         let num_used_after = env.read_num_used_accounts();
         println!("num_used_accounts after new user: {}", num_used_after);
-        assert_eq!(num_used_after, 1, "Should have exactly 1 account (slot reused, not new slot)");
+        assert_eq!(
+            num_used_after, 1,
+            "Should have exactly 1 account (slot reused, not new slot)"
+        );
 
         // 5. Verify new account has fresh state by checking it can receive deposits
         // The actual slot is 0 (the freed slot), deposit using that
         env.deposit(&new_user, freed_slot, 100_000_000); // 0.1 SOL
         let new_capital = env.read_account_capital(freed_slot);
-        println!("Account capital at slot {} after deposit: {}", freed_slot, new_capital);
-        assert!(new_capital > 0, "Reused slot should accept deposits (fresh state)");
+        println!(
+            "Account capital at slot {} after deposit: {}",
+            freed_slot, new_capital
+        );
+        assert!(
+            new_capital > 0,
+            "Reused slot should accept deposits (fresh state)"
+        );
 
         println!();
         println!("ACCOUNT REUSE VERIFIED SAFE:");
@@ -5481,7 +6246,15 @@ fn test_premarket_resolution_full_lifecycle() {
     env.crank();
 
     // Execute a trade via TradeCpi to create positions
-    let result = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    let result = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
     assert!(result.is_ok(), "Trade should succeed: {:?}", result);
 
     println!("Market created with LP and User positions");
@@ -5526,11 +6299,18 @@ fn test_premarket_resolution_full_lifecycle() {
 
     if insurance_before > 0 {
         let result = env.try_withdraw_insurance(&admin);
-        assert!(result.is_ok(), "WithdrawInsurance should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "WithdrawInsurance should succeed: {:?}",
+            result
+        );
         println!("Admin withdrew insurance");
 
         let insurance_after = env.read_insurance_balance();
-        assert_eq!(insurance_after, 0, "Insurance should be zero after withdrawal");
+        assert_eq!(
+            insurance_after, 0,
+            "Insurance should be zero after withdrawal"
+        );
     }
 
     println!();
@@ -5580,7 +6360,10 @@ fn test_resolved_market_blocks_new_activity() {
         data: encode_init_user(0),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&new_user.pubkey()), &[&new_user], env.svm.latest_blockhash(),
+        &[ix],
+        Some(&new_user.pubkey()),
+        &[&new_user],
+        env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "InitUser should fail on resolved market");
@@ -5630,10 +6413,8 @@ fn test_resolved_market_allows_user_withdrawal() {
 
     // User should still be able to withdraw
     let user_ata = env.create_ata(&user.pubkey(), 0);
-    let (vault_pda, _) = Pubkey::find_program_address(
-        &[b"vault", env.slab.as_ref()],
-        &env.program_id,
-    );
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
 
     // Correct account order for WithdrawCollateral:
     // 0: user (signer), 1: slab, 2: vault, 3: user_ata, 4: vault_pda, 5: token_program, 6: clock, 7: oracle
@@ -5652,10 +6433,17 @@ fn test_resolved_market_allows_user_withdrawal() {
         data: encode_withdraw(user_idx, 100_000_000), // Withdraw 0.1 SOL
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+        &[ix],
+        Some(&user.pubkey()),
+        &[&user],
+        env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_ok(), "Withdraw should succeed on resolved market: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Withdraw should succeed on resolved market: {:?}",
+        result
+    );
     println!("User withdrawal on resolved market: OK");
 
     println!();
@@ -5692,7 +6480,15 @@ fn test_withdraw_insurance_requires_positions_closed() {
 
     env.set_slot(50);
     env.crank();
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    let _ = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
 
     // Resolve market WITHOUT cranking to close positions
     let _ = env.try_push_oracle_price(&admin, 500_000, 2000); // Price = 0.5
@@ -5701,7 +6497,10 @@ fn test_withdraw_insurance_requires_positions_closed() {
 
     // Try to withdraw insurance - should fail (positions still open)
     let result = env.try_withdraw_insurance(&admin);
-    assert!(result.is_err(), "WithdrawInsurance should fail with open positions");
+    assert!(
+        result.is_err(),
+        "WithdrawInsurance should fail with open positions"
+    );
     println!("WithdrawInsurance blocked with open positions: OK");
 
     // Now crank to close positions
@@ -5711,7 +6510,11 @@ fn test_withdraw_insurance_requires_positions_closed() {
 
     // Now withdrawal should succeed
     let result = env.try_withdraw_insurance(&admin);
-    assert!(result.is_ok(), "WithdrawInsurance should succeed after positions closed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "WithdrawInsurance should succeed after positions closed: {:?}",
+        result
+    );
     println!("WithdrawInsurance succeeded after positions closed: OK");
 
     println!();
@@ -5758,7 +6561,15 @@ fn test_premarket_paginated_force_close() {
         env.deposit(&user, user_idx, 100_000_000); // 0.1 SOL each
 
         // Execute small trade via TradeCpi to create position
-        let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx);
+        let _ = env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            1_000_000,
+            &matcher_prog,
+            &matcher_ctx,
+        );
         users.push((user, user_idx));
 
         if (i + 1) % 20 == 0 {
@@ -5802,7 +6613,10 @@ fn test_premarket_paginated_force_close() {
             remaining_positions += 1;
         }
 
-        println!("After crank {}: {} positions remaining", crank_count, remaining_positions);
+        println!(
+            "After crank {}: {} positions remaining",
+            crank_count, remaining_positions
+        );
 
         if remaining_positions == 0 {
             break;
@@ -5814,11 +6628,19 @@ fn test_premarket_paginated_force_close() {
 
     println!();
     println!("All positions closed after {} cranks", crank_count);
-    println!("Expected cranks for {} accounts: ~{}", NUM_USERS + 1, (NUM_USERS + 1 + 63) / 64);
+    println!(
+        "Expected cranks for {} accounts: ~{}",
+        NUM_USERS + 1,
+        (NUM_USERS + 1 + 63) / 64
+    );
 
     // Verify insurance can now be withdrawn
     let result = env.try_withdraw_insurance(&admin);
-    assert!(result.is_ok(), "WithdrawInsurance should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "WithdrawInsurance should succeed: {:?}",
+        result
+    );
     println!("Insurance withdrawn successfully");
 
     println!();
@@ -5856,7 +6678,15 @@ fn test_premarket_binary_outcome_price_zero() {
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    let _ = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
     println!("User went LONG (YES bet) at price 0.5");
 
     // Outcome: NO wins (price = 1e-6, essentially zero but nonzero for force-close)
@@ -5909,7 +6739,15 @@ fn test_premarket_binary_outcome_price_one() {
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    let _ = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
     println!("User went LONG (YES bet) at price 0.5");
 
     // Outcome: YES wins (price = 1.0 = 1_000_000 in e6)
@@ -5978,7 +6816,15 @@ fn test_premarket_force_close_cu_benchmark() {
         let user = Keypair::new();
         let user_idx = env.init_user(&user);
         env.deposit(&user, user_idx, 100_000_000); // 0.1 SOL each
-        let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx);
+        let _ = env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            1_000_000,
+            &matcher_prog,
+            &matcher_ctx,
+        );
         users.push((user, user_idx));
     }
     println!("Created {} users with positions", NUM_USERS);
@@ -6009,14 +6855,20 @@ fn test_premarket_force_close_cu_benchmark() {
         accounts: vec![
             solana_sdk::instruction::AccountMeta::new(caller.pubkey(), true),
             solana_sdk::instruction::AccountMeta::new(env.slab, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                solana_sdk::sysvar::clock::ID,
+                false,
+            ),
             solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
         ],
         data: encode_crank_permissionless(),
     };
 
     let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[ix], Some(&caller.pubkey()), &[&caller], env.svm.latest_blockhash(),
+        &[ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
     );
 
     let result = env.svm.send_transaction(tx);
@@ -6033,9 +6885,12 @@ fn test_premarket_force_close_cu_benchmark() {
             // Key constraint: Each crank must fit in a single transaction (<200k CU)
             // Debug mode is ~3-5x slower than BPF. We see ~30k in debug, expect ~5-10k in BPF.
             let max_cu_per_crank = 100_000; // Conservative limit per crank
-            assert!(cu_consumed < max_cu_per_crank,
+            assert!(
+                cu_consumed < max_cu_per_crank,
                 "Force-close CU {} exceeds per-crank limit {}. Each crank must fit in single tx.",
-                cu_consumed, max_cu_per_crank);
+                cu_consumed,
+                max_cu_per_crank
+            );
 
             // Calculate projected total for 4096 accounts
             let projected_total = cu_consumed * 64;
@@ -6046,14 +6901,23 @@ fn test_premarket_force_close_cu_benchmark() {
             println!("  Debug mode: {} CU total", projected_total);
             println!("  BPF estimate: {} CU total (3x faster)", bpf_projected);
             println!();
-            println!("Per-crank CU: {} (debug), ~{} (BPF estimate)", cu_consumed, bpf_estimate);
+            println!(
+                "Per-crank CU: {} (debug), ~{} (BPF estimate)",
+                cu_consumed, bpf_estimate
+            );
             println!("Per-crank limit: 200,000 CU (Solana default)");
-            println!("Per-crank utilization: {:.1}% (debug)", (cu_consumed as f64 / 200_000.0) * 100.0);
+            println!(
+                "Per-crank utilization: {:.1}% (debug)",
+                (cu_consumed as f64 / 200_000.0) * 100.0
+            );
 
             // BPF estimate should be well under 1.4M
             // Each crank can also be submitted in separate blocks if needed
-            assert!(bpf_projected < 1_400_000,
-                "BPF projected total CU {} may exceed 1.4M budget", bpf_projected);
+            assert!(
+                bpf_projected < 1_400_000,
+                "BPF projected total CU {} may exceed 1.4M budget",
+                bpf_projected
+            );
 
             println!();
             println!("BENCHMARK PASSED: Force-close CU is bounded");
@@ -6072,7 +6936,10 @@ fn test_premarket_force_close_cu_benchmark() {
             remaining += 1;
         }
     }
-    assert_eq!(remaining, 0, "All positions should be closed after two cranks");
+    assert_eq!(
+        remaining, 0,
+        "All positions should be closed after two cranks"
+    );
 
     println!();
     println!("PREMARKET FORCE-CLOSE CU BENCHMARK COMPLETE");
@@ -6173,7 +7040,10 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
     } else {
         pnl_pos_tot_before
     };
-    println!("Expected pnl_pos_tot (including user positive PnL): {}", expected_pnl_pos_tot);
+    println!(
+        "Expected pnl_pos_tot (including user positive PnL): {}",
+        expected_pnl_pos_tot
+    );
 
     // BUG DEMONSTRATION:
     // If user has positive PnL but pnl_pos_tot wasn't updated, the haircut
@@ -6201,13 +7071,19 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
             println!("BUG STILL EXISTS: pnl_pos_tot is stale!");
             println!("  Actual pnl_pos_tot:   {}", pnl_pos_tot_after);
             println!("  Expected pnl_pos_tot: {}", expected_pnl_pos_tot);
-            println!("  Missing positive PnL: {}", expected_pnl_pos_tot - pnl_pos_tot_after);
+            println!(
+                "  Missing positive PnL: {}",
+                expected_pnl_pos_tot - pnl_pos_tot_after
+            );
         }
 
         // Assert the fix is working - pnl_pos_tot should include user's positive PnL
-        assert!(is_correct,
+        assert!(
+            is_correct,
             "Bug #10 not fixed! pnl_pos_tot should be updated by force-close. \
-             Expected >= {}, got {}", expected_pnl_pos_tot, pnl_pos_tot_after);
+             Expected >= {}, got {}",
+            expected_pnl_pos_tot, pnl_pos_tot_after
+        );
     }
 
     println!();
@@ -6226,21 +7102,33 @@ impl TestEnv {
     fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const C_TOT_OFFSET: usize = 392 + 256;
-        u128::from_le_bytes(slab_data[C_TOT_OFFSET..C_TOT_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read vault balance from engine state
     fn read_engine_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const VAULT_OFFSET: usize = 392;
-        u128::from_le_bytes(slab_data[VAULT_OFFSET..VAULT_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read pnl_pos_tot aggregate from slab
     fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const PNL_POS_TOT_OFFSET: usize = 392 + 272;
-        u128::from_le_bytes(slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET+16].try_into().unwrap())
+        u128::from_le_bytes(
+            slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read account PnL for a slot
@@ -6253,7 +7141,7 @@ impl TestEnv {
         if slab_data.len() < account_off + 16 {
             return 0;
         }
-        i128::from_le_bytes(slab_data[account_off..account_off+16].try_into().unwrap())
+        i128::from_le_bytes(slab_data[account_off..account_off + 16].try_into().unwrap())
     }
 
     /// Try to init user with a specific signer (for auth tests)
@@ -6277,7 +7165,10 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
         match self.svm.send_transaction(tx) {
             Ok(_) => {
@@ -6306,9 +7197,13 @@ impl TestEnv {
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+            &[ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
         );
-        self.svm.send_transaction(tx)
+        self.svm
+            .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
@@ -6323,7 +7218,10 @@ impl TestEnv {
 #[test]
 fn test_attack_withdraw_more_than_capital() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6338,7 +7236,10 @@ fn test_attack_withdraw_more_than_capital() {
 
     // Try to withdraw 2x the deposit
     let result = env.try_withdraw(&user, user_idx, 2_000_000_000);
-    assert!(result.is_err(), "ATTACK: Should not withdraw more than capital");
+    assert!(
+        result.is_err(),
+        "ATTACK: Should not withdraw more than capital"
+    );
 }
 
 /// ATTACK: After incurring a PnL loss, try to withdraw the full original deposit.
@@ -6346,7 +7247,10 @@ fn test_attack_withdraw_more_than_capital() {
 #[test]
 fn test_attack_withdraw_after_loss_exceeds_equity() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6368,7 +7272,10 @@ fn test_attack_withdraw_after_loss_exceeds_equity() {
 
     // Try to withdraw full deposit - should fail due to reduced equity
     let result = env.try_withdraw(&user, user_idx, 2_000_000_000);
-    assert!(result.is_err(), "ATTACK: Should not withdraw full capital after PnL loss");
+    assert!(
+        result.is_err(),
+        "ATTACK: Should not withdraw full capital after PnL loss"
+    );
 }
 
 /// ATTACK: Withdraw an amount not aligned to unit_scale.
@@ -6376,7 +7283,10 @@ fn test_attack_withdraw_after_loss_exceeds_equity() {
 #[test]
 fn test_attack_withdraw_misaligned_amount() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
@@ -6390,7 +7300,10 @@ fn test_attack_withdraw_misaligned_amount() {
 
     // 1500 % 1000 != 0 => misaligned
     let result = env.try_withdraw(&user, user_idx, 1_500);
-    assert!(result.is_err(), "ATTACK: Misaligned withdrawal should be rejected");
+    assert!(
+        result.is_err(),
+        "ATTACK: Misaligned withdrawal should be rejected"
+    );
 }
 
 /// ATTACK: When vault is undercollateralized (haircut < 1.0), withdraw should
@@ -6398,7 +7311,10 @@ fn test_attack_withdraw_misaligned_amount() {
 #[test]
 fn test_attack_withdraw_during_undercollateralization() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6421,7 +7337,10 @@ fn test_attack_withdraw_during_undercollateralization() {
     // Try to withdraw all original deposit + more (inflated equity)
     // The system should cap withdrawal at haircutted equity minus margin
     let result = env.try_withdraw(&user, user_idx, 50_000_000_000);
-    assert!(result.is_err(), "ATTACK: Withdraw exceeding haircutted equity should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Withdraw exceeding haircutted equity should fail"
+    );
 }
 
 /// ATTACK: Withdraw without settling accrued fee debt.
@@ -6429,7 +7348,10 @@ fn test_attack_withdraw_during_undercollateralization() {
 #[test]
 fn test_attack_withdraw_bypasses_fee_debt() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     // Initialize with maintenance fee to accrue fee debt
@@ -6471,7 +7393,10 @@ fn test_attack_withdraw_bypasses_fee_debt() {
 #[test]
 fn test_attack_deposit_wrong_owner() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6485,7 +7410,10 @@ fn test_attack_deposit_wrong_owner() {
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
     let result = env.try_deposit_unauthorized(&attacker, victim_idx, 1_000_000_000);
-    assert!(result.is_err(), "ATTACK: Deposit to wrong owner's account should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Deposit to wrong owner's account should fail"
+    );
 }
 
 /// ATTACK: Attacker withdraws from an account they don't own.
@@ -6493,7 +7421,10 @@ fn test_attack_deposit_wrong_owner() {
 #[test]
 fn test_attack_withdraw_wrong_owner() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6507,7 +7438,10 @@ fn test_attack_withdraw_wrong_owner() {
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_withdraw(&attacker, victim_idx, 1_000_000_000);
-    assert!(result.is_err(), "ATTACK: Withdraw from wrong owner's account should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Withdraw from wrong owner's account should fail"
+    );
 }
 
 /// ATTACK: Close someone else's account to steal their capital.
@@ -6515,7 +7449,10 @@ fn test_attack_withdraw_wrong_owner() {
 #[test]
 fn test_attack_close_account_wrong_owner() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6527,7 +7464,10 @@ fn test_attack_close_account_wrong_owner() {
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_close_account(&attacker, victim_idx);
-    assert!(result.is_err(), "ATTACK: Closing someone else's account should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Closing someone else's account should fail"
+    );
 }
 
 /// ATTACK: Non-admin tries admin operations (UpdateAdmin, SetRiskThreshold,
@@ -6536,7 +7476,10 @@ fn test_attack_close_account_wrong_owner() {
 #[test]
 fn test_attack_admin_op_as_user() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6550,27 +7493,45 @@ fn test_attack_admin_op_as_user() {
 
     // SetRiskThreshold
     let result = env.try_set_risk_threshold(&attacker, 0);
-    assert!(result.is_err(), "ATTACK: Non-admin SetRiskThreshold should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin SetRiskThreshold should fail"
+    );
 
     // UpdateConfig
     let result = env.try_update_config(&attacker);
-    assert!(result.is_err(), "ATTACK: Non-admin UpdateConfig should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin UpdateConfig should fail"
+    );
 
     // SetMaintenanceFee
     let result = env.try_set_maintenance_fee(&attacker, 0);
-    assert!(result.is_err(), "ATTACK: Non-admin SetMaintenanceFee should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin SetMaintenanceFee should fail"
+    );
 
     // ResolveMarket
     let result = env.try_resolve_market(&attacker);
-    assert!(result.is_err(), "ATTACK: Non-admin ResolveMarket should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin ResolveMarket should fail"
+    );
 
     // SetOracleAuthority
     let result = env.try_set_oracle_authority(&attacker, &attacker.pubkey());
-    assert!(result.is_err(), "ATTACK: Non-admin SetOracleAuthority should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin SetOracleAuthority should fail"
+    );
 
     // SetOraclePriceCap
     let result = env.try_set_oracle_price_cap(&attacker, 100);
-    assert!(result.is_err(), "ATTACK: Non-admin SetOraclePriceCap should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin SetOraclePriceCap should fail"
+    );
 }
 
 /// ATTACK: After admin is burned (set to [0;32]), verify no one can act as admin.
@@ -6578,7 +7539,10 @@ fn test_attack_admin_op_as_user() {
 #[test]
 fn test_attack_burned_admin_cannot_act() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6592,13 +7556,19 @@ fn test_attack_burned_admin_cannot_act() {
 
     // Now old admin can no longer act
     let result = env.try_set_risk_threshold(&admin, 999);
-    assert!(result.is_err(), "ATTACK: Burned admin - old admin should not work");
+    assert!(
+        result.is_err(),
+        "ATTACK: Burned admin - old admin should not work"
+    );
 
     // Random attacker also can't act (no one can sign as [0;32])
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_set_risk_threshold(&attacker, 999);
-    assert!(result.is_err(), "ATTACK: Burned admin - attacker should not work");
+    assert!(
+        result.is_err(),
+        "ATTACK: Burned admin - attacker should not work"
+    );
 }
 
 /// ATTACK: Push oracle price with wrong signer (not the oracle authority).
@@ -6606,7 +7576,10 @@ fn test_attack_burned_admin_cannot_act() {
 #[test]
 fn test_attack_oracle_authority_wrong_signer() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6620,13 +7593,22 @@ fn test_attack_oracle_authority_wrong_signer() {
 
     // Wrong signer tries to push price
     let wrong_signer = Keypair::new();
-    env.svm.airdrop(&wrong_signer.pubkey(), 1_000_000_000).unwrap();
+    env.svm
+        .airdrop(&wrong_signer.pubkey(), 1_000_000_000)
+        .unwrap();
     let result = env.try_push_oracle_price(&wrong_signer, 200_000_000, 200);
-    assert!(result.is_err(), "ATTACK: Wrong signer pushing oracle price should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Wrong signer pushing oracle price should fail"
+    );
 
     // Correct authority should succeed
     let result = env.try_push_oracle_price(&authority, 200_000_000, 200);
-    assert!(result.is_ok(), "Correct oracle authority should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Correct oracle authority should succeed: {:?}",
+        result
+    );
 }
 
 // ============================================================================
@@ -6638,7 +7620,10 @@ fn test_attack_oracle_authority_wrong_signer() {
 #[test]
 fn test_attack_trade_without_margin() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6654,7 +7639,10 @@ fn test_attack_trade_without_margin() {
     // Try to open an enormous position relative to capital
     // At $138, 1B position = $138B notional, requiring $13.8B margin (10%)
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000_000);
-    assert!(result.is_err(), "ATTACK: Trade without sufficient margin should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Trade without sufficient margin should fail"
+    );
 }
 
 /// ATTACK: Open a risk-increasing trade when insurance is depleted and
@@ -6663,7 +7651,10 @@ fn test_attack_trade_without_margin() {
 #[test]
 fn test_attack_trade_risk_increase_when_gated() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6692,7 +7683,10 @@ fn test_attack_trade_risk_increase_when_gated() {
 #[test]
 fn test_attack_trade_nocpi_in_hyperp_mode() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_hyperp(138_000_000); // Hyperp mode
@@ -6707,7 +7701,10 @@ fn test_attack_trade_nocpi_in_hyperp_mode() {
 
     // Try TradeNoCpi (tag 6) - should be blocked in Hyperp mode
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    assert!(result.is_err(), "ATTACK: TradeNoCpi in Hyperp mode should be blocked");
+    assert!(
+        result.is_err(),
+        "ATTACK: TradeNoCpi in Hyperp mode should be blocked"
+    );
 }
 
 /// ATTACK: Trade after market is resolved.
@@ -6715,7 +7712,10 @@ fn test_attack_trade_nocpi_in_hyperp_mode() {
 #[test]
 fn test_attack_trade_after_market_resolved() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6736,11 +7736,18 @@ fn test_attack_trade_after_market_resolved() {
 
     // Resolve the market
     let result = env.try_resolve_market(&admin);
-    assert!(result.is_ok(), "Admin should be able to resolve market: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should be able to resolve market: {:?}",
+        result
+    );
 
     // Try to trade on resolved market
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    assert!(result.is_err(), "ATTACK: Trade on resolved market should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Trade on resolved market should fail"
+    );
 }
 
 /// ATTACK: Position flip (long->short) should use initial_margin_bps, not
@@ -6748,7 +7755,10 @@ fn test_attack_trade_after_market_resolved() {
 #[test]
 fn test_attack_position_flip_requires_initial_margin() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0); // initial=10%, maintenance=5%
@@ -6772,7 +7782,10 @@ fn test_attack_position_flip_requires_initial_margin() {
     // The new short side notional = 100M * 138 = 13.8B, requiring 1.38B initial margin
     // User only has ~1 SOL = 1e9, so this should fail
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, -105_000_000);
-    assert!(result.is_err(), "ATTACK: Position flip to oversized short should require initial margin");
+    assert!(
+        result.is_err(),
+        "ATTACK: Position flip to oversized short should require initial margin"
+    );
 }
 
 // ============================================================================
@@ -6802,10 +7815,18 @@ fn test_attack_tradecpi_wrong_matcher_program() {
     // Use wrong matcher program (spl_token as fake matcher)
     let wrong_prog = spl_token::ID;
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx, 1_000_000,
-        &wrong_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &wrong_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_err(), "ATTACK: Wrong matcher program should be rejected");
+    assert!(
+        result.is_err(),
+        "ATTACK: Wrong matcher program should be rejected"
+    );
 }
 
 /// ATTACK: Provide wrong matcher context account.
@@ -6830,19 +7851,32 @@ fn test_attack_tradecpi_wrong_matcher_context() {
 
     // Create a fake context
     let fake_ctx = Pubkey::new_unique();
-    env.svm.set_account(fake_ctx, Account {
-        lamports: 10_000_000,
-        data: vec![0u8; MATCHER_CONTEXT_LEN],
-        owner: matcher_prog,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            fake_ctx,
+            Account {
+                lamports: 10_000_000,
+                data: vec![0u8; MATCHER_CONTEXT_LEN],
+                owner: matcher_prog,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx, 1_000_000,
-        &matcher_prog, &fake_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &fake_ctx,
     );
-    assert!(result.is_err(), "ATTACK: Wrong matcher context should be rejected");
+    assert!(
+        result.is_err(),
+        "ATTACK: Wrong matcher context should be rejected"
+    );
 }
 
 /// ATTACK: Supply a fabricated LP PDA that doesn't match the derivation.
@@ -6868,8 +7902,14 @@ fn test_attack_tradecpi_wrong_lp_pda() {
     // Use a random pubkey as the PDA
     let wrong_pda = Pubkey::new_unique();
     let result = env.try_trade_cpi_with_wrong_pda(
-        &user, &lp.pubkey(), lp_idx, user_idx, 1_000_000,
-        &matcher_prog, &matcher_ctx, &wrong_pda,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+        &wrong_pda,
     );
     assert!(result.is_err(), "ATTACK: Wrong LP PDA should be rejected");
 }
@@ -6896,25 +7936,36 @@ fn test_attack_tradecpi_pda_with_lamports() {
 
     // Derive the correct PDA but fund it with lamports to break shape check
     let lp_bytes = lp_idx.to_le_bytes();
-    let (lp_pda, _) = Pubkey::find_program_address(
-        &[b"lp", env.slab.as_ref(), &lp_bytes],
-        &env.program_id,
-    );
+    let (lp_pda, _) =
+        Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
 
     // Give the PDA lamports (makes it non-system shape)
-    env.svm.set_account(lp_pda, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; 32],
-        owner: solana_sdk::system_program::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            lp_pda,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; 32],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx, 1_000_000,
-        &matcher_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_err(), "ATTACK: PDA with lamports/data should be rejected");
+    assert!(
+        result.is_err(),
+        "ATTACK: PDA with lamports/data should be rejected"
+    );
 }
 
 /// ATTACK: LP A's matcher tries to trade for LP B.
@@ -6945,10 +7996,18 @@ fn test_attack_tradecpi_cross_lp_matcher_binding() {
 
     // Try to use LP A's context for LP B's trade
     let result = env.try_trade_cpi(
-        &user, &lp_b.pubkey(), lp_b_idx, user_idx, 1_000_000,
-        &matcher_prog, &ctx_a, // Wrong: LP A's context for LP B
+        &user,
+        &lp_b.pubkey(),
+        lp_b_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &ctx_a, // Wrong: LP A's context for LP B
     );
-    assert!(result.is_err(), "ATTACK: Cross-LP matcher binding should be rejected");
+    assert!(
+        result.is_err(),
+        "ATTACK: Cross-LP matcher binding should be rejected"
+    );
 }
 
 // ============================================================================
@@ -6960,7 +8019,10 @@ fn test_attack_tradecpi_cross_lp_matcher_binding() {
 #[test]
 fn test_attack_liquidate_solvent_account() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -6990,10 +8052,14 @@ fn test_attack_liquidate_solvent_account() {
     // Verify: solvent account's position and capital should be unchanged
     let capital_after = env.read_account_capital(user_idx);
     let position_after = env.read_account_position(user_idx);
-    assert_eq!(capital_before, capital_after,
-        "ATTACK: Solvent account capital should not change from liquidation attempt");
-    assert_eq!(position_before, position_after,
-        "ATTACK: Solvent account position should not change from liquidation attempt");
+    assert_eq!(
+        capital_before, capital_after,
+        "ATTACK: Solvent account capital should not change from liquidation attempt"
+    );
+    assert_eq!(
+        position_before, position_after,
+        "ATTACK: Solvent account position should not change from liquidation attempt"
+    );
 }
 
 /// ATTACK: Self-liquidation to extract value (liquidation fee goes to insurance).
@@ -7001,7 +8067,10 @@ fn test_attack_liquidate_solvent_account() {
 #[test]
 fn test_attack_self_liquidation_no_profit() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7031,8 +8100,10 @@ fn test_attack_self_liquidation_no_profit() {
     if result.is_ok() {
         let insurance_after = env.read_insurance_balance();
         // Liquidation fee goes to insurance, user doesn't profit
-        assert!(insurance_after >= insurance_before,
-            "Insurance should not decrease from liquidation");
+        assert!(
+            insurance_after >= insurance_before,
+            "Insurance should not decrease from liquidation"
+        );
     }
 }
 
@@ -7041,7 +8112,10 @@ fn test_attack_self_liquidation_no_profit() {
 #[test]
 fn test_attack_liquidate_after_price_recovery() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7071,10 +8145,14 @@ fn test_attack_liquidate_after_price_recovery() {
     // Verify: account state should be unchanged (no liquidation occurred)
     let position_after = env.read_account_position(user_idx);
     let capital_after = env.read_account_capital(user_idx);
-    assert_eq!(position_before, position_after,
-        "ATTACK: Healthy account position should not change from liquidation");
-    assert_eq!(capital_before, capital_after,
-        "ATTACK: Healthy account capital should not change from liquidation");
+    assert_eq!(
+        position_before, position_after,
+        "ATTACK: Healthy account position should not change from liquidation"
+    );
+    assert_eq!(
+        capital_before, capital_after,
+        "ATTACK: Healthy account capital should not change from liquidation"
+    );
 }
 
 // ============================================================================
@@ -7086,7 +8164,10 @@ fn test_attack_liquidate_after_price_recovery() {
 #[test]
 fn test_attack_withdraw_insurance_before_resolution() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7100,7 +8181,10 @@ fn test_attack_withdraw_insurance_before_resolution() {
 
     // Try to withdraw insurance without resolving market
     let result = env.try_withdraw_insurance(&admin);
-    assert!(result.is_err(), "ATTACK: Withdraw insurance on active market should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Withdraw insurance on active market should fail"
+    );
 }
 
 /// ATTACK: Withdraw insurance when positions are still open.
@@ -7108,7 +8192,10 @@ fn test_attack_withdraw_insurance_before_resolution() {
 #[test]
 fn test_attack_withdraw_insurance_with_open_positions() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7136,7 +8223,10 @@ fn test_attack_withdraw_insurance_with_open_positions() {
 
     // Try to withdraw insurance while position still open
     let result = env.try_withdraw_insurance(&admin);
-    assert!(result.is_err(), "ATTACK: Withdraw insurance with open positions should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Withdraw insurance with open positions should fail"
+    );
 }
 
 /// ATTACK: Close slab while insurance fund has remaining balance.
@@ -7144,7 +8234,10 @@ fn test_attack_withdraw_insurance_with_open_positions() {
 #[test]
 fn test_attack_close_slab_with_insurance_remaining() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7159,7 +8252,10 @@ fn test_attack_close_slab_with_insurance_remaining() {
 
     // Try to close slab - should fail because insurance > 0
     let result = env.try_close_slab();
-    assert!(result.is_err(), "ATTACK: CloseSlab with non-zero insurance should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: CloseSlab with non-zero insurance should fail"
+    );
 }
 
 // ============================================================================
@@ -7171,7 +8267,10 @@ fn test_attack_close_slab_with_insurance_remaining() {
 #[test]
 fn test_attack_oracle_price_cap_circuit_breaker() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7188,7 +8287,7 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
 
     // Push a 50% price jump - should be clamped by circuit breaker
     let result = env.try_push_oracle_price(&admin, 207_000_000, 200); // +50%
-    // The instruction succeeds, but price gets clamped internally
+                                                                      // The instruction succeeds, but price gets clamped internally
     println!("Large price jump result: {:?}", result);
     // Circuit breaker limits the effective price movement
 }
@@ -7198,7 +8297,10 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
 #[test]
 fn test_attack_stale_oracle_rejected() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     // Initialize with strict staleness (note: default uses u64::MAX staleness)
@@ -7235,7 +8337,10 @@ fn test_attack_stale_oracle_rejected() {
 #[test]
 fn test_attack_push_oracle_zero_price() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7248,7 +8353,10 @@ fn test_attack_push_oracle_zero_price() {
 
     // Try to push zero price
     let result = env.try_push_oracle_price(&admin, 0, 200);
-    assert!(result.is_err(), "ATTACK: Zero oracle price should be rejected");
+    assert!(
+        result.is_err(),
+        "ATTACK: Zero oracle price should be rejected"
+    );
 }
 
 /// ATTACK: Push oracle price when no oracle authority is configured.
@@ -7256,7 +8364,10 @@ fn test_attack_push_oracle_zero_price() {
 #[test]
 fn test_attack_push_oracle_without_authority_set() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7265,7 +8376,10 @@ fn test_attack_push_oracle_without_authority_set() {
     let random = Keypair::new();
     env.svm.airdrop(&random.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_push_oracle_price(&random, 138_000_000, 100);
-    assert!(result.is_err(), "ATTACK: Push price without authority set should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Push price without authority set should fail"
+    );
 }
 
 // ============================================================================
@@ -7277,7 +8391,10 @@ fn test_attack_push_oracle_without_authority_set() {
 #[test]
 fn test_attack_resolve_market_without_oracle_price() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7289,7 +8406,10 @@ fn test_attack_resolve_market_without_oracle_price() {
 
     // Try to resolve without pushing price
     let result = env.try_resolve_market(&admin);
-    assert!(result.is_err(), "ATTACK: Resolve without oracle price should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Resolve without oracle price should fail"
+    );
 }
 
 /// ATTACK: Deposit after market is resolved.
@@ -7297,7 +8417,10 @@ fn test_attack_resolve_market_without_oracle_price() {
 #[test]
 fn test_attack_deposit_after_resolution() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7316,7 +8439,10 @@ fn test_attack_deposit_after_resolution() {
 
     // Try to deposit after resolution
     let result = env.try_deposit(&user, user_idx, 1_000_000_000);
-    assert!(result.is_err(), "ATTACK: Deposit after resolution should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Deposit after resolution should fail"
+    );
 }
 
 /// ATTACK: Init new user after market is resolved.
@@ -7324,7 +8450,10 @@ fn test_attack_deposit_after_resolution() {
 #[test]
 fn test_attack_init_user_after_resolution() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7340,7 +8469,10 @@ fn test_attack_init_user_after_resolution() {
     // Try to create new user after resolution
     let new_user = Keypair::new();
     let result = env.try_init_user(&new_user);
-    assert!(result.is_err(), "ATTACK: Init user after resolution should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Init user after resolution should fail"
+    );
 }
 
 /// ATTACK: Resolve an already-resolved market.
@@ -7348,7 +8480,10 @@ fn test_attack_init_user_after_resolution() {
 #[test]
 fn test_attack_double_resolution() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7376,7 +8511,10 @@ fn test_attack_double_resolution() {
 #[test]
 fn test_attack_close_account_with_position() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7398,7 +8536,10 @@ fn test_attack_close_account_with_position() {
 
     // Try to close account with position
     let result = env.try_close_account(&user, user_idx);
-    assert!(result.is_err(), "ATTACK: Close account with open position should fail");
+    assert!(
+        result.is_err(),
+        "ATTACK: Close account with open position should fail"
+    );
 }
 
 /// ATTACK: Close account when PnL is outstanding (non-zero).
@@ -7406,7 +8547,10 @@ fn test_attack_close_account_with_position() {
 #[test]
 fn test_attack_close_account_with_pnl() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7436,7 +8580,10 @@ fn test_attack_close_account_with_pnl() {
 
     if pnl != 0 {
         let result = env.try_close_account(&user, user_idx);
-        assert!(result.is_err(), "ATTACK: Close with outstanding PnL should fail");
+        assert!(
+            result.is_err(),
+            "ATTACK: Close with outstanding PnL should fail"
+        );
     } else {
         // PnL settled to zero - close should work (this is correct behavior)
         println!("PnL settled to zero, close would succeed (correct)");
@@ -7448,7 +8595,10 @@ fn test_attack_close_account_with_pnl() {
 #[test]
 fn test_attack_double_init_market() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7456,13 +8606,18 @@ fn test_attack_double_init_market() {
     // Try to init again on the same slab
     let admin = &env.payer;
     let dummy_ata = Pubkey::new_unique();
-    env.svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -7477,13 +8632,14 @@ fn test_attack_double_init_market() {
             AccountMeta::new_readonly(dummy_ata, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: encode_init_market_with_invert(
-            &admin.pubkey(), &env.mint, &TEST_FEED_ID, 0,
-        ),
+        data: encode_init_market_with_invert(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 0),
     };
 
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&admin.pubkey()), &[admin], env.svm.latest_blockhash(),
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "ATTACK: Double InitMarket should fail");
@@ -7498,7 +8654,10 @@ fn test_attack_double_init_market() {
 #[test]
 fn test_attack_dust_accumulation_theft() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
@@ -7519,12 +8678,18 @@ fn test_attack_dust_accumulation_theft() {
     // User should only be credited for full units (5 * 1 unit = 5000 base)
     // Remaining 500 * 5 = 2500 dust is tracked separately
     let capital = env.read_account_capital(user_idx);
-    println!("Capital credited: {} (total deposited: {})", capital, total_deposited);
+    println!(
+        "Capital credited: {} (total deposited: {})",
+        capital, total_deposited
+    );
 
     // Capital should be less than total deposited (dust not credited)
     // With unit_scale=1000, capital is in units, so 5 * 1500 / 1000 = 7 units
     // Dust cannot be extracted by the user
-    assert!(total_deposited == 7_500, "Vault should have all 7500 deposited");
+    assert!(
+        total_deposited == 7_500,
+        "Vault should have all 7500 deposited"
+    );
 }
 
 /// ATTACK: Make micro-trades to evade fees (zero-fee from rounding).
@@ -7532,7 +8697,10 @@ fn test_attack_dust_accumulation_theft() {
 #[test]
 fn test_attack_fee_evasion_micro_trades() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     // Initialize with trading_fee_bps > 0
@@ -7560,7 +8728,10 @@ fn test_attack_fee_evasion_micro_trades() {
 #[test]
 fn test_attack_haircut_manipulation_via_deposit_withdraw() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7584,13 +8755,19 @@ fn test_attack_haircut_manipulation_via_deposit_withdraw() {
     // After 5 cycles: deposited 50 SOL total, withdrew 25 SOL total
     // Vault should have gained 25 SOL net
     let expected_vault = vault_before + 25_000_000_000;
-    assert_eq!(vault_after, expected_vault,
+    assert_eq!(
+        vault_after, expected_vault,
         "ATTACK: Vault balance mismatch after deposit/withdraw cycles. \
-         Expected {}, got {}", expected_vault, vault_after);
+         Expected {}, got {}",
+        expected_vault, vault_after
+    );
 
     // User should not be able to withdraw more than what's left
     let result = env.try_withdraw(&user, user_idx, 50_000_000_000);
-    assert!(result.is_err(), "ATTACK: Should not withdraw more than remaining capital");
+    assert!(
+        result.is_err(),
+        "ATTACK: Should not withdraw more than remaining capital"
+    );
 }
 
 /// ATTACK: Verify no value is created or destroyed through trading operations.
@@ -7598,7 +8775,10 @@ fn test_attack_haircut_manipulation_via_deposit_withdraw() {
 #[test]
 fn test_attack_conservation_invariant() {
     let path = program_path();
-    if !path.exists() { println!("SKIP: BPF not found"); return; }
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -7619,8 +8799,10 @@ fn test_attack_conservation_invariant() {
 
     // Vault should have all deposited funds
     let vault_after_deposits = env.vault_balance();
-    assert_eq!(vault_after_deposits, total_deposited,
-        "Vault should have exactly the deposited amount");
+    assert_eq!(
+        vault_after_deposits, total_deposited,
+        "Vault should have exactly the deposited amount"
+    );
 
     // User1 goes long, user2 goes short
     env.trade(&user1, &lp, lp_idx, user1_idx, 5_000_000);
@@ -7628,25 +8810,33 @@ fn test_attack_conservation_invariant() {
 
     // Trading doesn't move tokens in/out of vault
     let vault_after_trades = env.vault_balance();
-    assert_eq!(vault_after_trades, total_deposited,
-        "Trading should not change vault token balance");
+    assert_eq!(
+        vault_after_trades, total_deposited,
+        "Trading should not change vault token balance"
+    );
 
     // Price changes and crank (internal PnL settlement, no token transfers)
     env.set_slot_and_price(200, 150_000_000);
     env.crank();
 
     let vault_after_crank = env.vault_balance();
-    assert_eq!(vault_after_crank, total_deposited,
-        "Crank should not change vault token balance");
+    assert_eq!(
+        vault_after_crank, total_deposited,
+        "Crank should not change vault token balance"
+    );
 
     // Price reversal and another crank
     env.set_slot_and_price(300, 120_000_000);
     env.crank();
 
     let vault_after_reversal = env.vault_balance();
-    assert_eq!(vault_after_reversal, total_deposited,
-        "Price reversal+crank should not change vault token balance");
+    assert_eq!(
+        vault_after_reversal, total_deposited,
+        "Price reversal+crank should not change vault token balance"
+    );
 
-    println!("CONSERVATION VERIFIED: Vault balance {} unchanged through all operations",
-        vault_after_reversal);
+    println!(
+        "CONSERVATION VERIFIED: Vault balance {} unchanged through all operations",
+        vault_after_reversal
+    );
 }
