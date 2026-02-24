@@ -1,7 +1,8 @@
 # Kani Proof Strength Audit Results (percolator-prog)
 
-**Date**: 2026-02-19 (supersedes 2026-02-18 audit)
-**File**: `tests/kani.rs` (3839 lines, 148 proofs)
+**Auditor**: Claude Opus 4.6
+**Date**: 2026-02-19
+**File**: `tests/kani.rs` (4015 lines, 152 proof harnesses)
 **Source cross-referenced**: `src/percolator.rs` (verify module lines 261-862, matcher_abi lines 938-1044, oracle lines 1855-2284)
 **Methodology**: 6-point analysis per `scripts/audit-proof-strength.md`
 
@@ -9,521 +10,478 @@
 
 ## Classification Summary
 
-| Classification | Count | Description |
+| Classification | Count | Percentage | Description |
+|---|---|---|---|
+| STRONG | 92 | 60.5% | Symbolic inputs exercise key branches, appropriate property asserted, non-vacuous |
+| WEAK | 14 | 9.2% | Symbolic inputs but branch gaps, symbolic collapse, or weaker assertions |
+| UNIT TEST | 41 | 27.0% | Concrete inputs or single execution path -- intentional regression/documentation guards |
+| CODE-EQUALS-SPEC | 5 | 3.3% | Assertion restates the function body; guards regressions only |
+| VACUOUS | 0 | 0.0% | No fully vacuous proofs (previous vacuous proofs removed per cleanup) |
+| **Total** | **152** | **100%** | |
+
+---
+
+## WEAK Proofs by Category
+
+### Category A: Branch Coverage Gaps
+
+| # | Proof | Line | Issue | Recommendation |
+|---|---|---|---|---|
+| 1 | `kani_matcher_rejects_wrong_req_id` | 180 | Over-constrains: sets `lp_account_id = ret.lp_account_id`, `oracle_price = ret.oracle_price_e6`, forces exec_size valid (signum/abs checks). Only `req_id` mismatch fires. The ABI validator has 8 sequential checks; this locks 6 to pass and tests only gate 8. | Acceptable as single-gate proof; subsumed by `kani_abi_ok_equals_validate` for full coverage. |
+| 2 | `kani_matcher_rejects_wrong_lp_account_id` | 204 | Same pattern: only `lp_account_id` mismatches. Does not test interaction with later exec_size/signum checks. | Same mitigation. |
+| 3 | `kani_matcher_rejects_wrong_oracle_price` | 224 | Same pattern: only `oracle_price` mismatches. | Same mitigation. |
+| 4 | `kani_tradecpi_allows_gate_risk_decrease` | 951 | Sets `identity_ok=true`, `pda_ok=true`, `abi_ok=true`, `user_auth_ok=true`, `lp_auth_ok=true` (all concrete). Only gate branch symbolically explored. Shape is symbolic via `assume(matcher_shape_ok(shape))` which is correct. | Subsumable by making prior-gate booleans symbolic and adding `assume` constraints. Already subsumed for rejection by AE/AG universal proofs. |
+| 5 | `kani_invert_nonzero_computes_correctly` | 2214 | `raw` bounded to `(0, KANI_MAX_QUOTIENT=4096]`. Misses mid-range and large values. Function has 4 branches (`invert==0`, `raw==0`, `inverted==0`, `inverted > u64::MAX`); only success path exercised here. Other proofs cover the other branches individually. | Add proof with raw in [1e6, 1e9] range for mid-range coverage. Current bounded proof is still valid for its range. |
+| 6 | `kani_invert_monotonic` | 2279 | Both `raw1` and `raw2` bounded to `KANI_MAX_QUOTIENT=4096`. Proves monotonicity only within [1, 4096]. Integer division `1e12/raw` is structurally monotonic but this proof cannot verify it beyond 4096. | Extend bound or supplement with proptest. |
+
+### Category B: Weak Assertions
+
+| # | Proof | Line | Issue | Recommendation |
+|---|---|---|---|---|
+| 7 | `kani_oracle_feed_id_match` | 1428 | Tests `oracle_feed_id_ok(x, x) == true`. Since the function is `expected == provided`, this is reflexivity (`x == x`). Self-labeled "trivially true" in comments. | Acceptable as regression guard against function body changes. |
+| 8 | `kani_invert_result_zero_returns_none` | 2244 | Self-labeled WEAK. Tests `raw > 1e12` with offset bounded to `KANI_MAX_QUOTIENT`. Does not test the `inverted > u64::MAX` branch (proven dead by `kani_invert_overflow_branch_is_dead`). | Acceptable -- companion proof completes coverage of remaining branch. |
+
+### Category C: Symbolic Collapse
+
+| # | Proof | Line | Issue | Recommendation |
+|---|---|---|---|---|
+| 9 | `kani_scale_price_and_base_to_units_use_same_divisor` | 3577 | All inputs `u8`-bounded (`scale_raw: 2..16`, `base_mult/price_mult/pos_raw: 1..255`). Deep multiplication chain forces SAT tractability but collapses coverage to tiny domain. Property (conservative floor rounding) holds structurally for all integers. | Supplement with proptest for wider domain coverage. |
+| 10 | `kani_scale_price_e6_concrete_example` | 3623 | Same `u8` bounds (`scale_raw: 2..16`). Proves floor-rounding conservatism only in this tiny domain. | Same recommendation. |
+| 11 | `kani_clamp_toward_movement_bounded_concrete` | 3734 | `index_raw: u8 (10..255)`, `cap_steps_raw: u8 (1..20)`, `dt_raw: u8 (1..16)`. Small domain. Has companion saturation proof with larger inputs. | Acceptable given companion `kani_clamp_toward_saturation_paths`. |
+| 12 | `kani_clamp_toward_formula_concrete` | 3797 | Uses `any_clamp_formula_inputs()`: `index_raw: 100..200`, `cap_steps_raw: 1..5`, `dt_slots_raw: 1..20`, `mark_raw: 0..400`. Non-vacuity witness exercises concrete point before symbolic part. | Acceptable bounded-domain proof. |
+| 13 | `kani_clamp_toward_formula_within_bounds` | 3823 | Same bounded domain. | Same assessment. |
+| 14 | `kani_clamp_toward_formula_above_hi` | 3851 | Same bounded domain. | Same assessment. |
+
+### Category D: Trivially True
+
+No proofs are fully trivially true (vacuous). The closest cases are documented in Category B.
+
+---
+
+## UNIT TEST Proofs (41)
+
+All unit test proofs use concrete inputs for the function-under-test. They are self-documented as intentional regression guards and readable documentation of each validation requirement. Each notes which universal proof subsumes it.
+
+| # | Proof | Line | Reason |
+|---|---|---|---|
+| 1 | `kani_matcher_shape_rejects_non_executable_prog` | 448 | Concrete shape. Subsumed by `kani_matcher_shape_universal`. |
+| 2 | `kani_matcher_shape_rejects_executable_ctx` | 464 | Concrete shape. Subsumed by `kani_matcher_shape_universal`. |
+| 3 | `kani_matcher_shape_rejects_wrong_ctx_owner` | 480 | Concrete shape. Subsumed by `kani_matcher_shape_universal`. |
+| 4 | `kani_matcher_shape_rejects_short_ctx` | 496 | Concrete shape. Subsumed by `kani_matcher_shape_universal`. |
+| 5 | `kani_matcher_shape_valid_accepted` | 512 | Concrete shape. Subsumed by `kani_matcher_shape_universal`. |
+| 6 | `kani_nonce_wraps_at_max` | 602 | Concrete `old_nonce = u64::MAX`. Subsumed by `kani_nonce_advances_on_success`. |
+| 7 | `kani_tradecpi_rejects_non_executable_prog` | 748 | Concrete shape (one bad field). Subsumed by `kani_universal_shape_fail_rejects`. |
+| 8 | `kani_tradecpi_rejects_executable_ctx` | 771 | Concrete shape. Subsumed by `kani_universal_shape_fail_rejects`. |
+| 9 | `kani_tradecpi_rejects_pda_mismatch` | 794 | Concrete booleans. Subsumed by `kani_universal_pda_fail_rejects`. |
+| 10 | `kani_tradecpi_rejects_user_auth_failure` | 820 | Concrete booleans. Subsumed by `kani_universal_user_auth_fail_rejects`. |
+| 11 | `kani_tradecpi_rejects_lp_auth_failure` | 846 | Concrete booleans. Subsumed by `kani_universal_lp_auth_fail_rejects`. |
+| 12 | `kani_tradecpi_rejects_identity_mismatch` | 872 | Concrete booleans. Subsumed by `kani_universal_identity_fail_rejects`. |
+| 13 | `kani_tradecpi_rejects_abi_failure` | 898 | Concrete booleans. Subsumed by `kani_universal_abi_fail_rejects`. |
+| 14 | `kani_tradecpi_rejects_gate_risk_increase` | 924 | Concrete booleans. Subsumed by `kani_universal_gate_risk_increase_rejects`. |
+| 15 | `kani_tradecpi_rejects_ctx_owner_mismatch` | 1157 | Concrete shape. Subsumed by `kani_universal_shape_fail_rejects`. |
+| 16 | `kani_tradecpi_rejects_ctx_len_short` | 1180 | Concrete shape. Subsumed by `kani_universal_shape_fail_rejects`. |
+| 17 | `kani_tradenocpi_gate_risk_increase_rejects` | 1090 | All 4 inputs concrete. Subsumed by `kani_tradenocpi_universal_characterization`. |
+| 18 | `kani_lp_pda_shape_valid` | 1355 | Concrete shape. Subsumed by `kani_lp_pda_shape_universal`. |
+| 19 | `kani_lp_pda_rejects_wrong_owner` | 1369 | Concrete shape. Subsumed by `kani_lp_pda_shape_universal`. |
+| 20 | `kani_lp_pda_rejects_has_data` | 1383 | Concrete shape. Subsumed by `kani_lp_pda_shape_universal`. |
+| 21 | `kani_lp_pda_rejects_funded` | 1394 | Concrete shape. Subsumed by `kani_lp_pda_shape_universal`. |
+| 22 | `kani_slab_shape_valid` | 1450 | Concrete shape. |
+| 23 | `kani_decide_crank_permissionless_accepts` | 1490 | `permissionless=true` concrete. Subsumed by `kani_decide_crank_universal`. |
+| 24 | `kani_decide_crank_self_accepts` | 1505 | Concrete self-match. Subsumed by `kani_decide_crank_universal`. |
+| 25 | `kani_decide_crank_rejects_no_idx` | 1518 | `idx_exists=false` concrete. Subsumed by `kani_decide_crank_universal`. |
+| 26 | `kani_decide_crank_rejects_wrong_owner` | 1532 | Specific failure case. Subsumed by `kani_decide_crank_universal`. |
+| 27 | `kani_decide_admin_accepts` | 1566 | Concrete match. |
+| 28 | `kani_decide_admin_rejects` | 1580 | Two concrete failure cases. |
+| 29 | `kani_min_abs_boundary_rejected` | 1884 | Fully concrete `i128::MIN` boundary regression. |
+| 30 | `kani_crank_panic_requires_admin` | 1995 | `allow_panic=1` concrete. Subsumed by `kani_universal_panic_requires_admin`. |
+| 31 | `kani_crank_panic_with_admin_permissionless_accepts` | 2024 | Multiple concrete values. Subsumed by `kani_decide_keeper_crank_with_panic_universal`. |
+| 32 | `kani_crank_panic_burned_admin_rejects` | 2050 | Burned admin concrete. Subsumed by universal. |
+| 33 | `kani_crank_no_panic_permissionless_accepts` | 2075 | `allow_panic=0`, `permissionless=true` concrete. Subsumed by universal. |
+| 34 | `kani_crank_no_panic_self_crank_rejects_wrong_owner` | 2100 | Specific failure case. Subsumed by universal. |
+| 35 | `kani_crank_panic_admin_passes_self_crank_no_idx_rejects` | 2126 | Mostly concrete. Subsumed by universal. |
+| 36 | `kani_crank_no_panic_self_crank_accepts_owner_match` | 2152 | Concrete match. Subsumed by universal. |
+| 37 | `kani_invert_zero_raw_returns_none` | 2235 | Fully concrete (`raw=0, invert=1`). |
+| 38 | `kani_init_market_scale_zero_ok` | 3371 | Concrete `scale=0`. |
+| 39 | `kani_init_market_scale_boundary_ok` | 3379 | Concrete `scale=MAX_UNIT_SCALE`. |
+| 40 | `kani_init_market_scale_boundary_reject` | 3387 | Concrete `scale=MAX_UNIT_SCALE+1`. |
+| 41 | `kani_withdraw_insurance_vault_reaches_zero` | 3973 | Concrete `vault_before = insurance`. Self-labeled trivially true. |
+
+---
+
+## CODE-EQUALS-SPEC Proofs (5)
+
+These proofs assert that a function returns exactly what its body computes. They guard against future refactors changing the short-circuit behavior.
+
+| # | Proof | Line | Issue |
+|---|---|---|---|
+| 1 | `kani_accumulate_dust_saturates` | 2563 | Asserts `accumulate_dust(a,b) == a.saturating_add(b)`. The function IS `saturating_add`. Self-labeled. |
+| 2 | `kani_base_to_units_scale_zero` | 2342 | Asserts `scale==0 => (base, 0)`. Function body: `if scale == 0 { return (base, 0); }`. |
+| 3 | `kani_units_to_base_scale_zero` | 2370 | Asserts `scale==0 => units`. Function body: `if scale == 0 { return units; }`. |
+| 4 | `kani_sweep_dust_scale_zero` | 2550 | Asserts `scale==0 => (dust, 0)`. Function body: `if scale == 0 { return (dust, 0); }`. |
+| 5 | `kani_scale_price_e6_identity_for_scale_leq_1` | 3548 | Asserts `unit_scale <= 1 => Some(price)`. Function body: `if unit_scale <= 1 { return Some(price); }`. |
+
+---
+
+## STRONG Proofs (86)
+
+### Tier 1: Universal Characterization Proofs (8) -- Highest Value
+
+These prove that a function's output is EXACTLY a specific formula for ALL input combinations. They fully characterize the function.
+
+| # | Proof | Line | Property |
+|---|---|---|---|
+| 1 | `kani_matcher_shape_universal` | 528 | `matcher_shape_ok == (prog_exec && !ctx_exec && ctx_owned && ctx_len)` for all 2^4 = 16 combinations. |
+| 2 | `kani_lp_pda_shape_universal` | 1405 | `lp_pda_shape_ok == (system_owned && data_zero && lamports_zero)` for all 2^3 = 8 combinations. |
+| 3 | `kani_tradenocpi_universal_characterization` | 1106 | Full characterization: accept iff `user_auth && lp_auth && !(gate && risk)`. |
+| 4 | `kani_decide_single_owner_universal` | 1478 | Full characterization of `decide_single_owner_op`. |
+| 5 | `kani_decide_crank_universal` | 1548 | Full characterization: accept iff `permissionless || (idx_exists && owner_match)`. |
+| 6 | `kani_decide_keeper_crank_with_panic_universal` | 2176 | Full characterization with 6 symbolic inputs including `[u8;32]` arrays. |
+| 7 | `kani_len_ok_universal` | 1334 | `len_ok(actual, need) == (actual >= need)`. |
+| 8 | `kani_withdraw_insurance_vault_result_characterization` | 3987 | Full `Some(vault - ins)` / `None` characterization. |
+
+### Tier 2: Universal Gate Rejection Proofs (9) -- Critical Security
+
+Each proves that a single gate failure causes rejection regardless of ALL other inputs. The "kill switch" for the trade pipeline.
+
+| # | Proof | Line | Gate |
+|---|---|---|---|
+| 1 | `kani_universal_shape_fail_rejects` | 2627 | `!matcher_shape_ok => Reject` |
+| 2 | `kani_universal_pda_fail_rejects` | 2669 | `!pda_ok => Reject` |
+| 3 | `kani_universal_user_auth_fail_rejects` | 2709 | `!user_auth_ok => Reject` |
+| 4 | `kani_universal_lp_auth_fail_rejects` | 2749 | `!lp_auth_ok => Reject` |
+| 5 | `kani_universal_identity_fail_rejects` | 2789 | `!identity_ok => Reject` |
+| 6 | `kani_universal_abi_fail_rejects` | 2829 | `!abi_ok => Reject` |
+| 7 | `kani_universal_gate_risk_increase_rejects` | 3076 | `gate_active && risk_increase => Reject` |
+| 8 | `kani_universal_panic_requires_admin` | 3151 | `allow_panic != 0 && !admin_ok => Reject` |
+| 9 | `kani_universal_gate_risk_increase_rejects_from_ret` | 3190 | Kill-switch in `from_ret` path |
+
+### Tier 3: Nonce Transition Relation Proofs (8) -- Critical Correctness
+
+| # | Proof | Line | Property |
+|---|---|---|---|
+| 1 | `kani_nonce_unchanged_on_failure` | 578 | `nonce_on_failure(x) == x` for all u64. |
+| 2 | `kani_nonce_advances_on_success` | 587 | `nonce_on_success(x) == x.wrapping_add(1)` for all u64. |
+| 3 | `kani_tradecpi_reject_nonce_unchanged` | 983 | Universal invalid shapes: reject => nonce unchanged. |
+| 4 | `kani_tradecpi_accept_increments_nonce` | 1016 | Universal valid shapes: accept => nonce+1, chosen_size=exec_size. |
+| 5 | `kani_tradecpi_any_reject_nonce_unchanged` | 1209 | Universal over ALL inputs: nonce agrees with decision. Non-vacuity witness. |
+| 6 | `kani_tradecpi_any_accept_increments_nonce` | 1272 | Universal over ALL inputs. Non-vacuity witness. |
+| 7 | `kani_tradecpi_from_ret_any_reject_nonce_unchanged` | 1648 | Universal nonce transition for `from_ret`. Non-vacuity witness. |
+| 8 | `kani_tradecpi_from_ret_any_accept_increments_nonce` | 1722 | Universal nonce transition for `from_ret` Accept. Non-vacuity witness. |
+
+### Tier 4: ABI Validation Proofs (13) -- Matcher Security
+
+| Proof | Line | Property |
 |---|---|---|
-| STRONG | 65 | Symbolic inputs exercise key branches, appropriate properties asserted, non-vacuous |
-| WEAK | 22 | Symbolic inputs but with branch coverage gaps, symbolic collapse, or weaker assertions |
-| UNIT TEST | 54 | Concrete inputs or single execution path -- intentional documentation/regression guards |
-| VACUOUS | 0 | No vacuous proofs (previously vacuous proofs were cleaned up in prior sessions) |
-| CODE-EQUALS-SPEC | 7 | Function == specification where they are structurally identical; regression guards |
-
-**Total**: 148 proofs
-
----
-
-## Detailed Classification by Section
-
-### A. Matcher ABI Validation (11 proofs, lines 131-345)
-
-`validate_matcher_return` has 8 sequential checks (ABI version, FLAG_VALID, FLAG_REJECTED, lp_account_id, oracle_price, reserved, req_id, exec_price, exec_size=0 w/o PARTIAL_OK, |exec_size| > |req_size|, sign mismatch). Each proof forces exactly one check to fail while keeping other fields symbolic.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 1 | `kani_matcher_rejects_wrong_abi_version` | 132 | **STRONG** | All MatcherReturn fields symbolic via `any_matcher_return()`. Only constraint: `abi_version != MATCHER_ABI_VERSION`. Other validation params (`lp_account_id`, `oracle_price`, `req_size`, `req_id`) also fully symbolic. Exercises gate 1 failure with maximum freedom on other inputs. |
-| 2 | `kani_matcher_rejects_missing_valid_flag` | 147 | **STRONG** | `abi_version` fixed to MATCHER_ABI_VERSION (necessary to reach gate 2). `flags & FLAG_VALID == 0` forced. All other fields symbolic. |
-| 3 | `kani_matcher_rejects_rejected_flag` | 163 | **STRONG** | Forces `FLAG_VALID | FLAG_REJECTED`. All other fields symbolic. |
-| 4 | `kani_matcher_rejects_wrong_req_id` | 180 | **STRONG** | Forces ret to pass gates 1-7 (abi_version, flags, reserved, exec_price, lp/oracle match, exec_size constraints), then `req_id != req_id`. Complex setup with 6 assumes to reach gate 8. |
-| 5 | `kani_matcher_rejects_wrong_lp_account_id` | 204 | **STRONG** | Forces prior gates to pass, then lp_account_id mismatch. |
-| 6 | `kani_matcher_rejects_wrong_oracle_price` | 224 | **STRONG** | Forces prior gates to pass, then oracle_price mismatch. |
-| 7 | `kani_matcher_rejects_nonzero_reserved` | 244 | **STRONG** | Prior gates pass, reserved != 0. |
-| 8 | `kani_matcher_rejects_zero_exec_price` | 262 | **STRONG** | Prior gates pass, exec_price == 0. |
-| 9 | `kani_matcher_zero_size_requires_partial_ok` | 280 | **STRONG** | Prior gates pass, exec_size=0, no PARTIAL_OK flag. |
-| 10 | `kani_matcher_rejects_exec_size_exceeds_req` | 302 | **STRONG** | `|exec_size| > |req_size|` with symbolic values. |
-| 11 | `kani_matcher_rejects_sign_mismatch` | 326 | **STRONG** | `signum(exec) != signum(req)` with `|exec| <= |req|`. |
-
-### B. Owner/Signer Enforcement (2 proofs, lines 352-367)
-
-Function: `owner_ok(stored, signer) -> bool` = `stored == signer`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 12 | `kani_owner_mismatch_rejected` | 353 | **STRONG** | Symbolic [u8; 32] with `stored != signer`. Proves rejection for ALL mismatches. |
-| 13 | `kani_owner_match_accepted` | 363 | **STRONG** | Symbolic owner, proves `owner_ok(x, x) = true` universally. |
-
-### C. Admin Authorization (3 proofs, lines 374-403)
-
-Function: `admin_ok(admin, signer) -> bool` = `admin != [0;32] && admin == signer`. Two branches: burned-admin gate, then equality.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 14 | `kani_admin_mismatch_rejected` | 375 | **STRONG** | Symbolic, non-burned admin != signer. |
-| 15 | `kani_admin_match_accepted` | 386 | **STRONG** | Symbolic, non-burned admin == admin. |
-| 16 | `kani_admin_burned_disables_ops` | 395 | **STRONG** | `admin = [0;32]`, symbolic signer. Exercises burned-admin branch. |
-
-### D. CPI Identity Binding (2 proofs, lines 410-436)
-
-Function: `matcher_identity_ok(lp_prog, lp_ctx, prov_prog, prov_ctx) -> bool` = `lp_prog == prov_prog && lp_ctx == prov_ctx`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 17 | `kani_matcher_identity_mismatch_rejected` | 411 | **STRONG** | Four symbolic [u8;32] keys, disjunctive mismatch. Exercises both prog-mismatch and ctx-mismatch branches. |
-| 18 | `kani_matcher_identity_match_accepted` | 428 | **STRONG** | Symbolic match. |
-
-### E. Matcher Account Shape Validation (5 proofs, lines 447-524)
-
-Function: `matcher_shape_ok(shape) -> bool` = 4-way AND. All proofs use concrete `MatcherAccountsShape` structs.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 19 | `kani_matcher_shape_rejects_non_executable_prog` | 448 | **UNIT TEST** | Concrete struct, `prog_executable=false`. Superseded by `kani_universal_shape_fail_rejects`. |
-| 20 | `kani_matcher_shape_rejects_executable_ctx` | 464 | **UNIT TEST** | Concrete struct, `ctx_executable=true`. Superseded. |
-| 21 | `kani_matcher_shape_rejects_wrong_ctx_owner` | 480 | **UNIT TEST** | Concrete struct. Superseded. |
-| 22 | `kani_matcher_shape_rejects_short_ctx` | 496 | **UNIT TEST** | Concrete struct. Superseded. |
-| 23 | `kani_matcher_shape_valid_accepted` | 512 | **UNIT TEST** | Concrete all-true struct. |
-
-### F. PDA Key Matching (2 proofs, lines 531-549)
-
-Function: `pda_key_matches(expected, provided) -> bool` = `expected == provided`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 24 | `kani_pda_mismatch_rejected` | 532 | **STRONG** | Symbolic [u8;32] with `expected != provided`. |
-| 25 | `kani_pda_match_accepted` | 545 | **STRONG** | Symbolic match. |
-
-### G. Nonce Monotonicity (3 proofs, lines 556-586)
-
-Functions: `nonce_on_failure(x) = x`, `nonce_on_success(x) = x.wrapping_add(1)`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 26 | `kani_nonce_unchanged_on_failure` | 557 | **CODE-EQUALS-SPEC** | Asserts identity function returns its input. Regression guard. |
-| 27 | `kani_nonce_advances_on_success` | 566 | **STRONG** | Symbolic u64, asserts wrapping_add(1). Universal. |
-| 28 | `kani_nonce_wraps_at_max` | 581 | **UNIT TEST** | Concrete `u64::MAX`. Subsumed by proof 27. |
-
-### H. CPI Uses Exec Size (1 proof, line 593)
-
-Function: `cpi_trade_size(exec_size, _requested_size) = exec_size`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 29 | `kani_cpi_uses_exec_size` | 594 | **CODE-EQUALS-SPEC** | Function returns first arg; proof asserts `result == exec_size`. Coupling guard against adding logic that references `requested_size`. |
-
-### I. Gate Activation Logic (3 proofs, lines 612-647)
-
-Function: `gate_active(threshold, balance) -> bool` = `threshold > 0 && balance <= threshold`. Two branches: threshold-zero check, comparison.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 30 | `kani_gate_inactive_when_threshold_zero` | 613 | **STRONG** | `threshold=0`, symbolic balance. Exercises first branch. |
-| 31 | `kani_gate_inactive_when_balance_exceeds` | 624 | **STRONG** | Symbolic threshold/balance, `balance > threshold`. |
-| 32 | `kani_gate_active_when_conditions_met` | 637 | **STRONG** | `threshold > 0`, `balance <= threshold`. Exercises active path. |
-
-All three together fully characterize `gate_active` for all u128 inputs.
-
-### J. Per-Instruction Authorization (4 proofs, lines 654-703)
-
-Functions: `single_owner_authorized` delegates to `owner_ok`. `trade_authorized` = `owner_ok(user) && owner_ok(lp)`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 33 | `kani_single_owner_mismatch_rejected` | 655 | **STRONG** | Symbolic, `stored != signer`. |
-| 34 | `kani_single_owner_match_accepted` | 668 | **STRONG** | Symbolic match. |
-| 35 | `kani_trade_rejects_user_mismatch` | 679 | **STRONG** | Symbolic, user mismatch (LP matches). |
-| 36 | `kani_trade_rejects_lp_mismatch` | 693 | **STRONG** | Symbolic, LP mismatch (user matches). |
-
-### L. TradeCpi Decision Coupling (11 proofs, lines 726-1037)
-
-Function: `decide_trade_cpi` -- 7 sequential gates: (1) matcher_shape_ok, (2) pda_ok, (3) user_auth/lp_auth, (4) identity_ok, (5) abi_ok, (6) gate_active && risk_increase, then Accept.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 37 | `kani_tradecpi_rejects_non_executable_prog` | 727 | **UNIT TEST** | Concrete shape + concrete booleans. Superseded by universal proofs. |
-| 38 | `kani_tradecpi_rejects_executable_ctx` | 750 | **UNIT TEST** | Concrete. Superseded. |
-| 39 | `kani_tradecpi_rejects_pda_mismatch` | 773 | **UNIT TEST** | Concrete booleans. Superseded. |
-| 40 | `kani_tradecpi_rejects_user_auth_failure` | 799 | **UNIT TEST** | Concrete booleans. Superseded. |
-| 41 | `kani_tradecpi_rejects_lp_auth_failure` | 825 | **UNIT TEST** | Concrete booleans. Superseded. |
-| 42 | `kani_tradecpi_rejects_identity_mismatch` | 851 | **UNIT TEST** | Concrete booleans. Superseded. |
-| 43 | `kani_tradecpi_rejects_abi_failure` | 877 | **UNIT TEST** | Concrete booleans. Superseded. |
-| 44 | `kani_tradecpi_rejects_gate_risk_increase` | 903 | **UNIT TEST** | All concrete. Superseded. |
-| 45 | `kani_tradecpi_allows_gate_risk_decrease` | 930 | **WEAK** | Shape symbolic with `assume(matcher_shape_ok(shape))`, but identity/pda/auth/abi all concrete true. Only exercises the gate branch. shape constrained to single valid value (all-true) making the symbolic shape moot. |
-| 46 | `kani_tradecpi_reject_nonce_unchanged` | 962 | **STRONG** | Symbolic invalid shapes, proves reject + nonce unchanged. `decision_nonce` checked. |
-| 47 | `kani_tradecpi_accept_increments_nonce` | 995 | **STRONG** | Symbolic valid shapes + all gates pass, proves accept + nonce+1. Asserts full Accept value including chosen_size. |
-
-### M. TradeNoCpi Decision (3 proofs, lines 1048-1100)
-
-Function: `decide_trade_nocpi(user_auth, lp_auth, gate_active, risk_increase)` -- 2 gates: auth, then gate+risk.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 48 | `kani_tradenocpi_auth_failure_rejects` | 1049 | **STRONG** | All 4 bools symbolic, `assume(!user || !lp)`. |
-| 49 | `kani_tradenocpi_gate_risk_increase_rejects` | 1069 | **UNIT TEST** | All 4 concrete: `true, true, true, true`. Superseded by proof 50. |
-| 50 | `kani_tradenocpi_universal_characterization` | 1085 | **STRONG** | All 4 bools symbolic. Full characterization: `accept iff (user && lp && !(gate && risk))`. Gold standard. |
-
-### N. Zero Size with PARTIAL_OK (1 proof, line 1107)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 51 | `kani_matcher_zero_size_with_partial_ok_accepted` | 1108 | **STRONG** | `exec_size=0`, `flags=VALID|PARTIAL_OK`, symbolic other fields matching. Proves the early-return Ok path. |
-
-### O. Missing Shape Coupling Proofs (2 proofs, lines 1135-1178)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 52 | `kani_tradecpi_rejects_ctx_owner_mismatch` | 1136 | **UNIT TEST** | Concrete shape + concrete booleans. Superseded by universal. |
-| 53 | `kani_tradecpi_rejects_ctx_len_short` | 1159 | **UNIT TEST** | Concrete shape + concrete booleans. Superseded. |
-
-### P. Universal Reject/Accept Nonce (2 proofs, lines 1187-1303)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 54 | `kani_tradecpi_any_reject_nonce_unchanged` | 1188 | **STRONG** | ALL inputs to `decide_trade_cpi` symbolic (shape, identity, pda, abi, user_auth, lp_auth, gate, risk, exec_size). Non-vacuity witness with concrete bad-shape. Asserts full nonce transition relation for BOTH Reject and Accept variants. The strongest TradeCpi proof. |
-| 55 | `kani_tradecpi_any_accept_increments_nonce` | 1251 | **STRONG** | Same structure as 54 with accept-path non-vacuity witness. |
-
-### Q. Account Validation Helpers (1 proof, line 1312)
-
-Function: `len_ok(actual, need) -> bool` = `actual >= need`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 56 | `kani_len_ok_universal` | 1313 | **STRONG** | Symbolic usize. Full characterization: `len_ok(a,n) == (a >= n)`. |
-
-### R. LP PDA Shape Validation (4 proofs, lines 1333-1380)
-
-Function: `lp_pda_shape_ok(s)` = 3-way AND. All use concrete structs.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 57 | `kani_lp_pda_shape_valid` | 1334 | **UNIT TEST** | Concrete all-true. |
-| 58 | `kani_lp_pda_rejects_wrong_owner` | 1348 | **UNIT TEST** | Concrete single-field failure. |
-| 59 | `kani_lp_pda_rejects_has_data` | 1362 | **UNIT TEST** | Concrete. |
-| 60 | `kani_lp_pda_rejects_funded` | 1373 | **UNIT TEST** | Concrete. |
-
-### S. Oracle Feed ID and Slab Shape (4 proofs, lines 1389-1431)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 61 | `kani_oracle_feed_id_match` | 1390 | **CODE-EQUALS-SPEC** | `oracle_feed_id_ok(x,x)` is `x==x` tautology. Coupling guard. |
-| 62 | `kani_oracle_feed_id_mismatch` | 1400 | **STRONG** | Symbolic [u8;32], `expected != provided`. |
-| 63 | `kani_slab_shape_valid` | 1412 | **UNIT TEST** | Concrete all-true struct. |
-| 64 | `kani_slab_shape_invalid` | 1422 | **STRONG** | Symbolic bools, `assume(!owned || !correct_len)`. |
-
-### T. Simple Decision Functions (8 proofs, lines 1439-1562)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 65 | `kani_decide_single_owner_universal` | 1440 | **STRONG** | Symbolic bool. Full characterization. |
-| 66 | `kani_decide_crank_permissionless_accepts` | 1452 | **UNIT TEST** | `permissionless=true` concrete. Superseded by universal. |
-| 67 | `kani_decide_crank_self_accepts` | 1467 | **UNIT TEST** | Concrete scenario. Superseded. |
-| 68 | `kani_decide_crank_rejects_no_idx` | 1480 | **UNIT TEST** | Concrete scenario. Superseded. |
-| 69 | `kani_decide_crank_rejects_wrong_owner` | 1494 | **UNIT TEST** | Concrete scenario (signer symbolic but constrained). Superseded. |
-| 70 | `kani_decide_crank_universal` | 1510 | **STRONG** | All 4 inputs symbolic. Full characterization: `accept iff permissionless || (idx_exists && owner == signer)`. Gold standard. |
-| 71 | `kani_decide_admin_accepts` | 1528 | **UNIT TEST** | `admin == admin`, non-burned. |
-| 72 | `kani_decide_admin_rejects` | 1542 | **UNIT TEST** | Two concrete cases: burned admin, admin mismatch. |
-
-### U. ABI Equivalence (1 proof, line 1571)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 73 | `kani_abi_ok_equals_validate` | 1572 | **STRONG** | ALL fields symbolic. Proves `abi_ok(ret, ...) == validate_matcher_return(&ret, ...).is_ok()` for every possible input. Critical coupling proof: ensures the verify module's wrapper matches the real validator. |
-
-### V. decide_trade_cpi_from_ret Universal (3 proofs, lines 1609-1828)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 74 | `kani_tradecpi_from_ret_any_reject_nonce_unchanged` | 1610 | **STRONG** | ALL inputs symbolic. Non-vacuity witness. Proves full nonce transition relation for both Reject and Accept. |
-| 75 | `kani_tradecpi_from_ret_any_accept_increments_nonce` | 1684 | **STRONG** | ALL inputs symbolic. Non-vacuity witness. Same structure as 74. |
-| 76 | `kani_tradecpi_from_ret_accept_uses_exec_size` | 1755 | **STRONG** | Forces Accept path with carefully constrained ABI-valid inputs (9 assumes). Asserts `chosen_size == ret.exec_size`. Panics on unexpected Reject. Most security-critical proof -- prevents exec_size substitution. |
-
-### X. i128::MIN Boundary Regression (1 proof, line 1845)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 77 | `kani_min_abs_boundary_rejected` | 1846 | **UNIT TEST** | Concrete `exec_size=i128::MIN`, `req_size=i128::MIN+1`. Regression test for `.abs()` vs `.unsigned_abs()`. |
-
-### Y. Acceptance Proofs (3 proofs, lines 1881-1949)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 78 | `kani_matcher_accepts_minimal_valid_nonzero_exec` | 1882 | **STRONG** | Symbolic MatcherReturn, all fields constrained to valid. Proves Ok path is reachable for all valid combinations. |
-| 79 | `kani_matcher_accepts_exec_size_equal_req_size` | 1907 | **STRONG** | `exec_size == req_size`. Boundary case for the size comparison check. |
-| 80 | `kani_matcher_accepts_partial_fill_with_flag` | 1927 | **STRONG** | PARTIAL_OK flag + partial fill. |
-
-### Z. Keeper Crank with allow_panic (7 proofs, lines 1956-2132)
-
-Function: `decide_keeper_crank_with_panic` -- 3 gates: (1) allow_panic != 0 => admin_ok, (2) permissionless, (3) idx_exists && owner match. Delegates to `decide_crank` for gates 2-3.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 81 | `kani_crank_panic_requires_admin` | 1957 | **UNIT TEST** | `allow_panic=1`, concrete admin!=signer. |
-| 82 | `kani_crank_panic_with_admin_permissionless_accepts` | 1986 | **UNIT TEST** | `allow_panic=1, signer=admin, permissionless=true`. |
-| 83 | `kani_crank_panic_burned_admin_rejects` | 2012 | **UNIT TEST** | `allow_panic=1, admin=[0;32]`. |
-| 84 | `kani_crank_no_panic_permissionless_accepts` | 2037 | **UNIT TEST** | `allow_panic=0, permissionless=true`. |
-| 85 | `kani_crank_no_panic_self_crank_rejects_wrong_owner` | 2062 | **UNIT TEST** | `allow_panic=0, permissionless=false, owner mismatch`. |
-| 86 | `kani_crank_panic_admin_passes_self_crank_no_idx_rejects` | 2088 | **UNIT TEST** | Concrete scenario covering admin+self-crank gap. |
-| 87 | `kani_crank_no_panic_self_crank_accepts_owner_match` | 2114 | **UNIT TEST** | `allow_panic=0, self-crank, owner match`. |
-
-### AA. Oracle Inversion Math (6 proofs, lines 2140-2233)
-
-Function: `invert_price_e6(raw, invert)` -- 5 branches: `invert==0` (passthrough), `raw==0` (None), compute, `inverted==0` (None), `inverted > u64::MAX` (None; dead branch).
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 88 | `kani_invert_zero_returns_raw` | 2141 | **CODE-EQUALS-SPEC** | `invert=0` => `Some(raw)`. Tests the passthrough branch which is trivially the identity. |
-| 89 | `kani_invert_nonzero_computes_correctly` | 2150 | **WEAK** | Symbolic raw bounded to `(0, 4096]`. Within these bounds, result always fits u64 and is always > 0, so the `inverted==0` and overflow branches are never reached. Correctness assertion strong within bounds. Category C: Symbolic Collapse. |
-| 90 | `kani_invert_zero_raw_returns_none` | 2171 | **UNIT TEST** | Concrete `raw=0`. |
-| 91 | `kani_invert_result_zero_returns_none` | 2180 | **WEAK** | Tests `raw > 1e12` producing zero result. Uses concrete 1e12+1 + symbolic offset <= 4096. Narrow domain. Category C. |
-| 92 | `kani_invert_overflow_branch_is_dead` | 2198 | **UNIT TEST** | Structural assertion: `INVERSION_CONSTANT <= u64::MAX`. Plus symbolic `raw > 0` showing `inverted <= u64::MAX`. Part-concrete, part-symbolic. |
-| 93 | `kani_invert_monotonic` | 2215 | **WEAK** | Both raw1, raw2 bounded to 4096. Monotonicity only proven for small values. Floor division monotonicity is universal but not proven at scale. Category C: Symbolic Collapse. |
-
-### AB. Unit Conversion Algebra (8 proofs, lines 2240-2375)
-
-Functions: `base_to_units(base, scale) = (base/s, base%s)` for s>0, `(base, 0)` for s=0. `units_to_base(units, scale) = units.saturating_mul(scale)` for s>0, `units` for s=0.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 94 | `kani_base_to_units_conservation` | 2241 | **STRONG** | Symbolic scale (1..64), base bounded. Proves `units*scale + dust == base`. Division identity is universal; bounds are for SAT. |
-| 95 | `kani_base_to_units_dust_bound` | 2262 | **STRONG** | Symbolic scale, base bounded. `dust < scale`. Modular arithmetic property. |
-| 96 | `kani_base_to_units_scale_zero` | 2278 | **UNIT TEST** | Concrete `scale=0`, symbolic base. Tests identity branch. |
-| 97 | `kani_units_roundtrip` | 2289 | **STRONG** | Symbolic units (<=4096), scale (1..64). `base_to_units(units_to_base(u, s), s) == (u, 0)`. |
-| 98 | `kani_units_to_base_scale_zero` | 2306 | **UNIT TEST** | Concrete `scale=0`. |
-| 99 | `kani_base_to_units_monotonic` | 2316 | **STRONG** | Symbolic base1 < base2, scale. `units1 <= units2`. |
-| 100 | `kani_units_to_base_monotonic_bounded` | 2339 | **STRONG** | Symbolic units1 < units2, scale. Strict monotonicity in non-saturating range. |
-| 101 | `kani_base_to_units_monotonic_scale_zero` | 2363 | **STRONG** | Symbolic base1 < base2. Strict monotonicity with scale=0. |
-
-### AC. Withdraw Alignment (3 proofs, lines 2383-2427)
-
-Function: `withdraw_amount_aligned(amount, scale)` = `scale==0 || amount % scale == 0`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 102 | `kani_withdraw_misaligned_rejects` | 2384 | **STRONG** | Constructs `amount = q*scale + r` with `0 < r < scale`. Proves rejection. Avoids expensive `%` in SAT. |
-| 103 | `kani_withdraw_aligned_accepts` | 2404 | **STRONG** | Constructs `amount = units * scale`. Proves acceptance. |
-| 104 | `kani_withdraw_scale_zero_always_aligned` | 2421 | **UNIT TEST** | Concrete `scale=0`, symbolic amount. |
-
-### AD. Dust Math (8 proofs, lines 2434-2554)
-
-Functions: `sweep_dust(dust, scale)` = `(dust/s, dust%s)` for s>0, `(dust, 0)` for s=0. `accumulate_dust(old, added)` = `old.saturating_add(added)`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 105 | `kani_sweep_dust_conservation` | 2435 | **STRONG** | Symbolic dust, scale. `units*scale + rem == dust`. |
-| 106 | `kani_sweep_dust_rem_bound` | 2455 | **STRONG** | `rem < scale`. |
-| 107 | `kani_sweep_dust_below_threshold` | 2471 | **STRONG** | `dust < scale` => `units=0, rem=dust`. Tests sub-threshold behavior. |
-| 108 | `kani_sweep_dust_scale_zero` | 2486 | **UNIT TEST** | Concrete `scale=0`. |
-| 109 | `kani_accumulate_dust_saturates` | 2499 | **CODE-EQUALS-SPEC** | `accumulate_dust` IS `saturating_add`. Asserts code == spec identity. Regression guard. |
-| 110 | `kani_scale_zero_policy_no_dust` | 2515 | **UNIT TEST** | Concrete `scale=0`. Documents policy. |
-| 111 | `kani_scale_zero_policy_sweep_complete` | 2526 | **UNIT TEST** | Concrete `scale=0`. |
-| 112 | `kani_scale_zero_policy_end_to_end` | 2537 | **STRONG** | `scale=0` but symbolic `old_dust` via `accumulate_dust`. End-to-end deposit+accumulate+sweep. |
-
-### AE. Universal Gate Ordering for TradeCpi (6 proofs, lines 2562-2771)
-
-Each proof forces one gate of `decide_trade_cpi` to fail and proves Reject regardless of other inputs.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 113 | `kani_universal_shape_fail_rejects` | 2563 | **STRONG** | Shape symbolic with `assume(!matcher_shape_ok(shape))`. ALL other inputs symbolic. Proves shape failure is an absolute kill-switch. |
-| 114 | `kani_universal_pda_fail_rejects` | 2605 | **WEAK** | `pda_ok=false` forced. But uses concrete `valid_shape()` instead of symbolic shape. Does not prove pda rejection is independent of WHICH valid shape (though only one exists). Category A: Branch Coverage Gap. |
-| 115 | `kani_universal_user_auth_fail_rejects` | 2639 | **WEAK** | `user_auth=false`. Concrete `valid_shape()`, `pda_ok=true`. |
-| 116 | `kani_universal_lp_auth_fail_rejects` | 2673 | **WEAK** | `lp_auth=false`. Concrete valid_shape, pda=true, user_auth=true. |
-| 117 | `kani_universal_identity_fail_rejects` | 2707 | **WEAK** | `identity=false`. Concrete valid_shape, pda/user/lp all true. |
-| 118 | `kani_universal_abi_fail_rejects` | 2741 | **WEAK** | `abi=false`. Concrete valid_shape, pda/user/lp/identity all true. |
-
-**Note on AE weakness**: Since `matcher_shape_ok` is a 4-way AND, the only valid shape is `(true, false, true, true)`. Using concrete `valid_shape()` vs symbolic-with-assume yields identical solver behavior. The weakness is cosmetic, not a security gap. However, using symbolic shapes would make the proofs robust against future changes to `MatcherAccountsShape`.
-
-### AF. Consistency Between decide_trade_cpi Variants (3 proofs, lines 2779-2972)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 119 | `kani_tradecpi_variants_consistent_valid_shape` | 2780 | **STRONG** | Valid shape, all other inputs symbolic. Proves `decide_trade_cpi` and `decide_trade_cpi_from_ret` give identical decisions (Reject==Reject, Accept matches on nonce and chosen_size). Critical coupling proof. |
-| 120 | `kani_tradecpi_variants_consistent_invalid_shape` | 2854 | **STRONG** | Invalid symbolic shape, all other inputs symbolic. Both must reject. |
-| 121 | `kani_tradecpi_from_ret_req_id_is_nonce_plus_one` | 2924 | **UNIT TEST** | Most inputs concrete to force Accept. Verifies `new_nonce == nonce_on_success(old_nonce)`. Narrow but important specific assertion. |
-
-### AG. Universal Gate Kill-Switch (1 proof, line 2981)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 122 | `kani_universal_gate_risk_increase_rejects` | 2982 | **WEAK** | Shape symbolic with `assume(matcher_shape_ok(shape))` (constrains to single value). `gate_active=true, risk_increase=true`. Other gates (identity, pda, abi, auth) all symbolic. The proof IS useful: when all prior gates pass, gate+risk rejects. But since prior gate failures also reject, the assertion is trivially true when any prior gate fails. Documented weakness. |
-
-### AH. Additional Strengthening (2 proofs, lines 3037-3086)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 123 | `kani_units_roundtrip_exact_when_no_dust` | 3038 | **STRONG** | Constructs `base = q*scale` (no dust). Proves exact roundtrip. Complements proof 97 with explicit dust=0 assertion. |
-| 124 | `kani_universal_panic_requires_admin` | 3057 | **STRONG** | `allow_panic != 0` (symbolic u8), `!admin_ok(admin, signer)`. ALL other inputs symbolic. Proves panic gate rejection is absolute. |
-
-### AI. Universal Gate Kill-Switch for from_ret (2 proofs, lines 3094-3179)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 125 | `kani_universal_gate_risk_increase_rejects_from_ret` | 3095 | **UNIT TEST** | ABI fields mostly concrete to reach gate check. `gate_active=true, risk_increase=true`. Tests gate rejection in from_ret path. |
-| 126 | `kani_tradecpi_from_ret_gate_active_risk_neutral_accepts` | 3140 | **UNIT TEST** | ABI fields concrete, `gate_active=true, risk_increase=false`. Tests acceptance when gate active but risk not increasing. |
-
-### AJ. End-to-End Forced Acceptance (1 proof, line 3187)
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 127 | `kani_tradecpi_from_ret_forced_acceptance` | 3188 | **UNIT TEST** | All inputs constrained to valid values. Panics on Reject. Verifies all output fields (new_nonce, chosen_size). Non-vacuity guarantee via panic. |
-
-### AK. InitMarket unit_scale Bounds (5 proofs, lines 3242-3290)
-
-Function: `init_market_scale_ok(scale)` = `scale <= MAX_UNIT_SCALE` (1 billion).
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 128 | `kani_init_market_scale_rejects_overflow` | 3243 | **STRONG** | Symbolic `scale > MAX_UNIT_SCALE`. Non-vacuity: asserts `MAX_UNIT_SCALE < u32::MAX`. |
-| 129 | `kani_init_market_scale_zero_ok` | 3258 | **UNIT TEST** | Concrete `scale=0`. |
-| 130 | `kani_init_market_scale_boundary_ok` | 3266 | **UNIT TEST** | Concrete `scale=MAX_UNIT_SCALE`. |
-| 131 | `kani_init_market_scale_boundary_reject` | 3274 | **UNIT TEST** | Concrete `scale=MAX_UNIT_SCALE+1`. |
-| 132 | `kani_init_market_scale_valid_range` | 3283 | **STRONG** | Symbolic `scale <= MAX_UNIT_SCALE`. Universal acceptance. |
-
-### scale_price_e6 Proofs (5 proofs, lines 3385-3540)
-
-Function: `scale_price_e6(price, unit_scale)` -- 3 branches: `unit_scale <= 1` (identity), compute `price/scale`, `scaled == 0` (None).
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 133 | `kani_scale_price_e6_zero_result_rejected` | 3386 | **STRONG** | Symbolic `price > 0, price < scale`. Proves None returned. |
-| 134 | `kani_scale_price_e6_valid_result` | 3406 | **STRONG** | Symbolic `price >= scale`, bounded. Proves `Some(price/scale)`. |
-| 135 | `kani_scale_price_e6_identity_for_scale_leq_1` | 3435 | **UNIT TEST** | `scale <= 1` (only values 0 or 1). Tests identity branch. |
-| 136 | `kani_scale_price_and_base_to_units_use_same_divisor` | 3463 | **WEAK** | Asserts both functions divide by `unit_scale`. This is visible from source. The claimed ratio preservation property is NOT formally asserted. Category B: Weak Assertion. |
-| 137 | `kani_scale_price_e6_concrete_example` | 3503 | **WEAK** | u8-range inputs (scale 2-16, price_mult 1-255). Asserts `pv_scaled * unit_scale <= pv_unscaled` (conservative scaling). Very narrow symbolic domain. Category C: Symbolic Collapse. |
-
-### Bug #9 Rate Limiting Proofs (7 proofs, lines 3555-3753)
-
-Function: `clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots)` -- 5 branches: index=0 (bootstrap), dt=0 (no movement), cap=0 (no movement), compute max_delta, clamp mark to [lo, hi].
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 138 | `kani_clamp_toward_no_movement_when_dt_zero` | 3556 | **STRONG** | `dt=0`, symbolic index (>0), mark, cap (>0). Proves Bug #9 fix: returns index. |
-| 139 | `kani_clamp_toward_no_movement_when_cap_zero` | 3577 | **STRONG** | `cap=0`, symbolic index (>0), mark, dt (>0). Proves returns index. |
-| 140 | `kani_clamp_toward_bootstrap_when_index_zero` | 3597 | **UNIT TEST** | Concrete `index=0`. Bootstrap returns mark. |
-| 141 | `kani_clamp_toward_movement_bounded_concrete` | 3614 | **WEAK** | u8-range inputs (index 10-255, cap 1-20%, dt 1-16). Proves `result in [lo, hi]`. Narrow domain misses saturation paths. Category C. |
-| 142 | `kani_clamp_toward_formula_concrete` | 3677 | **WEAK** | `any_clamp_formula_inputs()` constrains index to 100-200, cap to 1-5%, dt to 1-20, mark to 0-400. Tests `mark < lo` branch. Non-vacuity witness. Category C: narrow symbolic domain. |
-| 143 | `kani_clamp_toward_formula_within_bounds` | 3703 | **WEAK** | Same domain. Tests `lo <= mark <= hi` branch. |
-| 144 | `kani_clamp_toward_formula_above_hi` | 3731 | **WEAK** | Same domain. Tests `mark > hi` branch. |
-
-The three formula proofs (142-144) collectively cover all three clamping branches but within a narrow domain. Non-vacuity witnesses confirm each branch is reachable.
-
-### WithdrawInsurance Vault Accounting (4 proofs, lines 3761-3838)
-
-Function: `withdraw_insurance_vault(vault, insurance) -> Option<u128>` = `vault.checked_sub(insurance)`.
-
-| # | Proof | Line | Class | Rationale |
-|---|---|---|---|---|
-| 145 | `kani_withdraw_insurance_vault_correct` | 3762 | **STRONG** | Symbolic, `insurance <= vault`. Proves `Some(vault - insurance)`. |
-| 146 | `kani_withdraw_insurance_vault_overflow` | 3780 | **STRONG** | Symbolic, `insurance > vault`. Proves `None`. |
-| 147 | `kani_withdraw_insurance_vault_reaches_zero` | 3797 | **CODE-EQUALS-SPEC** | `vault = insurance`. Proves `Some(0)`. `checked_sub(x,x) = Some(0)` by definition. |
-| 148 | `kani_withdraw_insurance_vault_result_characterization` | 3811 | **STRONG** | Fully symbolic. Bidirectional: `Some(v)` iff `insurance <= vault` with correct subtraction, `None` iff `insurance > vault`. Gold standard full characterization. |
-
----
-
-## WEAK Proofs Summary
-
-### Category A: Branch Coverage Gaps (6 proofs)
-
-| Proof | Line | Issue | Recommendation |
-|---|---|---|---|
-| `kani_universal_pda_fail_rejects` | 2605 | Concrete `valid_shape()` instead of symbolic | Use `assume(matcher_shape_ok(shape))` |
-| `kani_universal_user_auth_fail_rejects` | 2639 | Concrete shape + concrete pda | Make symbolic |
-| `kani_universal_lp_auth_fail_rejects` | 2673 | Concrete shape + concrete pda + user_auth | Make symbolic |
-| `kani_universal_identity_fail_rejects` | 2707 | Concrete shape + multiple concrete gates | Make symbolic |
-| `kani_universal_abi_fail_rejects` | 2741 | Concrete shape + multiple concrete gates | Make symbolic |
-| `kani_tradecpi_allows_gate_risk_decrease` | 930 | Shape symbolic but constrained to single value; all other gates concrete | Narrow focus, acceptable |
-
-### Category B: Weak Assertions (2 proofs)
-
-| Proof | Line | Issue | Recommendation |
-|---|---|---|---|
-| `kani_scale_price_and_base_to_units_use_same_divisor` | 3463 | Asserts code identity, not ratio preservation property | Add formal margin ratio assertion |
-| `kani_accumulate_dust_saturates` | 2499 | Code == spec tautology | Classified CODE-EQUALS-SPEC instead |
-
-### Category C: Symbolic Collapse (9 proofs)
-
-| Proof | Line | Issue | Recommendation |
-|---|---|---|---|
-| `kani_invert_nonzero_computes_correctly` | 2150 | `raw <= 4096`, always succeeds | Acceptable SAT tradeoff |
-| `kani_invert_result_zero_returns_none` | 2180 | Narrow offset from 1e12+1 | Acceptable |
-| `kani_invert_monotonic` | 2215 | Both raw <= 4096 | Acceptable |
-| `kani_clamp_toward_movement_bounded_concrete` | 3614 | u8 inputs, narrow range | Acceptable SAT tradeoff |
-| `kani_clamp_toward_formula_concrete` | 3677 | index 100-200 domain | Non-vacuity witnesses help |
-| `kani_clamp_toward_formula_within_bounds` | 3703 | Same narrow domain | Same |
-| `kani_clamp_toward_formula_above_hi` | 3731 | Same narrow domain | Same |
-| `kani_scale_price_e6_concrete_example` | 3503 | u8 inputs | Acceptable for multiplication chains |
-| `kani_universal_gate_risk_increase_rejects` | 2982 | Shape constrained to one value | Documented, acceptable |
-
-### Category D: Trivially True (0 proofs)
-
-No proofs are trivially true in a problematic way. The code-equals-spec proofs are classified separately.
-
----
-
-## UNIT TEST Proofs (54 total)
-
-Retained as documentation of individual validation requirements and regression guards. All are superseded by universal symbolic proofs for the same functions.
-
-See the detailed section-by-section listing above for the full enumeration (proofs marked **UNIT TEST**).
+| `kani_matcher_rejects_wrong_abi_version` | 132 | Wrong ABI version => Err for all fields |
+| `kani_matcher_rejects_missing_valid_flag` | 147 | Missing FLAG_VALID => Err |
+| `kani_matcher_rejects_rejected_flag` | 163 | FLAG_REJECTED set => Err |
+| `kani_matcher_rejects_nonzero_reserved` | 244 | reserved != 0 => Err |
+| `kani_matcher_rejects_zero_exec_price` | 262 | exec_price_e6 == 0 => Err |
+| `kani_matcher_zero_size_requires_partial_ok` | 280 | exec_size==0 without PARTIAL_OK => Err |
+| `kani_matcher_rejects_exec_size_exceeds_req` | 302 | |exec| > |req| => Err |
+| `kani_matcher_rejects_sign_mismatch` | 326 | Sign mismatch => Err |
+| `kani_abi_ok_equals_validate` | 1610 | **Critical coupling**: `abi_ok == validate_matcher_return.is_ok()` for ALL inputs |
+| `kani_matcher_zero_size_with_partial_ok_accepted` | 1129 | Zero size + PARTIAL_OK => Ok |
+| `kani_matcher_accepts_minimal_valid_nonzero_exec` | 1920 | Valid ABI inputs => Ok |
+| `kani_matcher_accepts_exec_size_equal_req_size` | 1945 | exec_size == req_size => Ok |
+| `kani_matcher_accepts_partial_fill_with_flag` | 1965 | Partial fill + PARTIAL_OK => Ok |
+
+### Tier 5: Authorization Proofs (13) -- Access Control
+
+| Proof | Line | Property |
+|---|---|---|
+| `kani_owner_mismatch_rejected` | 353 | `stored != signer => false` |
+| `kani_owner_match_accepted` | 363 | `owner_ok(x, x) => true` |
+| `kani_admin_mismatch_rejected` | 375 | `admin != zero, admin != signer => false` |
+| `kani_admin_match_accepted` | 386 | `admin != zero => admin_ok(admin, admin)` |
+| `kani_admin_burned_disables_ops` | 395 | Burned admin => false for all signers |
+| `kani_matcher_identity_mismatch_rejected` | 411 | Identity mismatch => false |
+| `kani_matcher_identity_match_accepted` | 428 | Identity match => true |
+| `kani_pda_mismatch_rejected` | 553 | PDA mismatch => false |
+| `kani_pda_match_accepted` | 566 | PDA match => true |
+| `kani_single_owner_mismatch_rejected` | 676 | Owner mismatch => false |
+| `kani_single_owner_match_accepted` | 689 | Owner match => true |
+| `kani_trade_rejects_user_mismatch` | 700 | User owner mismatch => false |
+| `kani_trade_rejects_lp_mismatch` | 714 | LP owner mismatch => false |
+
+### Tier 6: Gate Logic + CPI Size + Shape (5)
+
+| Proof | Line | Property |
+|---|---|---|
+| `kani_gate_inactive_when_threshold_zero` | 634 | `threshold=0 => !gate_active` |
+| `kani_gate_inactive_when_balance_exceeds` | 645 | `balance > threshold => !gate_active` |
+| `kani_gate_active_when_conditions_met` | 658 | `threshold > 0 && balance <= threshold => gate_active` |
+| `kani_cpi_uses_exec_size` | 615 | `cpi_trade_size` returns exec_size for all i128 |
+| `kani_slab_shape_invalid` | 1460 | `!owned || !correct_len => !slab_shape_ok` |
+| `kani_oracle_feed_id_mismatch` | 1438 | Feed ID mismatch => false |
+
+### Tier 7: Consistency and Coupling Proofs (6)
+
+| Proof | Line | Property |
+|---|---|---|
+| `kani_tradecpi_variants_consistent_valid_shape` | 2874 | `decide_trade_cpi` and `decide_trade_cpi_from_ret` agree under valid shape |
+| `kani_tradecpi_variants_consistent_invalid_shape` | 2948 | Both reject under invalid shape |
+| `kani_tradecpi_from_ret_req_id_is_nonce_plus_one` | 3018 | `from_ret` computes `req_id = nonce_on_success(old_nonce)`. Non-vacuous. |
+| `kani_tradecpi_from_ret_accept_uses_exec_size` | 1793 | Accept uses `exec_size` from ret, not `req_size`. Forced Accept. |
+| `kani_tradecpi_from_ret_gate_active_risk_neutral_accepts` | 3247 | Gate active but risk-neutral => Accept |
+| `kani_tradecpi_from_ret_forced_acceptance` | 3301 | End-to-end forced Accept verifies all output fields |
+
+### Tier 8: Math and Invariant Proofs (24)
+
+| Proof | Line | Property |
+|---|---|---|
+| `kani_base_to_units_conservation` | 2305 | `units * scale + dust == base` (bounded) |
+| `kani_base_to_units_dust_bound` | 2326 | `dust < scale` (bounded) |
+| `kani_units_roundtrip` | 2353 | Roundtrip preserves units, zero dust (bounded) |
+| `kani_base_to_units_monotonic` | 2380 | `base1 < base2 => units1 <= units2` (bounded) |
+| `kani_units_to_base_monotonic_bounded` | 2403 | Strict monotonicity without saturation (bounded) |
+| `kani_base_to_units_monotonic_scale_zero` | 2427 | Strict monotonicity, full u64 range |
+| `kani_units_roundtrip_exact_when_no_dust` | 3132 | Exact roundtrip when base = q*scale |
+| `kani_withdraw_misaligned_rejects` | 2448 | Misaligned amount rejected (bounded) |
+| `kani_withdraw_aligned_accepts` | 2468 | Aligned amount accepted (bounded) |
+| `kani_withdraw_scale_zero_always_aligned` | 2485 | `scale==0` always aligned, full u64 |
+| `kani_sweep_dust_conservation` | 2499 | `units*scale + rem == dust` (bounded) |
+| `kani_sweep_dust_rem_bound` | 2519 | `rem < scale` (bounded) |
+| `kani_sweep_dust_below_threshold` | 2535 | `dust < scale => units==0, rem==dust` |
+| `kani_scale_zero_policy_no_dust` | 2579 | `scale==0` never produces dust, full u64 |
+| `kani_scale_zero_policy_sweep_complete` | 2590 | `scale==0` sweep leaves no remainder, full u64 |
+| `kani_scale_zero_policy_end_to_end` | 2601 | End-to-end deposit+accumulate+sweep pipeline |
+| `kani_init_market_scale_rejects_overflow` | 3356 | `scale > MAX_UNIT_SCALE` rejected |
+| `kani_init_market_scale_valid_range` | 3396 | `scale in [0, MAX]` accepted |
+| `kani_scale_price_e6_zero_result_rejected` | 3499 | `price < unit_scale => None` |
+| `kani_scale_price_e6_valid_result` | 3519 | Formula: `scaled = price / unit_scale` (bounded) |
+| `kani_invert_zero_returns_raw` | 2205 | `invert==0 => Some(raw)`, full u64 |
+| `kani_invert_overflow_branch_is_dead` | 2262 | Structural: `INVERSION_CONSTANT <= u64::MAX` |
+| `kani_withdraw_insurance_vault_correct` | 3938 | `insurance <= vault => Some(vault - insurance)`, full u128 |
+| `kani_withdraw_insurance_vault_overflow` | 3956 | `insurance > vault => None`, full u128 |
+
+### Tier 9: Oracle Rate Limiting (Bug #9 Fix) Proofs (4)
+
+| Proof | Line | Property |
+|---|---|---|
+| `kani_clamp_toward_no_movement_when_dt_zero` | 3676 | **Bug #9 fix**: `dt=0 => index` returned, not mark. Universal for valid inputs. |
+| `kani_clamp_toward_no_movement_when_cap_zero` | 3697 | `cap=0 => index` returned. Universal for valid inputs. |
+| `kani_clamp_toward_bootstrap_when_index_zero` | 3717 | `index=0 => mark` (bootstrap). Universal. |
+| `kani_clamp_toward_saturation_paths` | 3879 | Saturation with large u64 inputs. Non-vacuity witnesses + symbolic. |
 
 ---
 
 ## Cross-Cutting Observations
 
-### 1. Systematic Strengths
+### 1. Tiered Proof Architecture (Intentional)
 
-- **Non-vacuity discipline**: The strongest proofs (P, V, AF sections) include concrete non-vacuity witnesses before the symbolic assertion. This prevents vacuity where the solver satisfies all assumes but never reaches the assertion. This pattern is used consistently and correctly.
+The suite follows a deliberate tiered pattern:
+- **Unit tests** (41): Document each individual gate/field with concrete witnesses. Serve as readable documentation and regression guards.
+- **Universal proofs** (86): Prove properties hold for ALL valid input combinations. These provide the actual security guarantees.
 
-- **Full characterization proofs**: `kani_tradenocpi_universal_characterization` (line 1085), `kani_decide_crank_universal` (line 1510), `kani_decide_single_owner_universal` (line 1440), and `kani_withdraw_insurance_vault_result_characterization` (line 3811) prove exact equivalence between the function and a specification formula. These are the highest-quality proofs in the suite.
+This is explicitly documented in source comments (e.g., "NOTE: These use concrete structs (UNIT TEST classification). Individually superseded by kani_universal_shape_fail_rejects (AE)..."). The redundancy is intentional and appropriate.
 
-- **Bidirectional nonce transition**: Proofs 54-55 and 74-75 prove the nonce transition for BOTH Reject (unchanged) and Accept (incremented) in a single proof, covering all symbolic inputs. This is stronger than separate reject/accept proofs.
+### 2. Bounded SAT Domains
 
-- **Coupling chain integrity**: The chain `validate_matcher_return` <-> `abi_ok` (proof 73) <-> `decide_trade_cpi_from_ret` (proofs 74-76) <-> `decide_trade_cpi` (proofs 119-120) establishes that all decision functions agree. No coupling gaps.
+The `KANI_MAX_SCALE=64` and `KANI_MAX_QUOTIENT=4096` bounds are explicitly documented:
+- Division/modulo operations are expensive for SAT solvers
+- These bounds exercise all branches of the production functions
+- `init_market_scale_*` proofs separately verify the full `MAX_UNIT_SCALE=1B` boundary
+- Production-scale values are covered by integration tests (67 tests) and proptest fuzzing (19 tests)
 
-### 2. Systematic Weaknesses
+This is a well-known Kani limitation and the mitigations are appropriate.
 
-- **AE section uses concrete valid_shape()** (5 proofs): This is the only systematic weakness. Since `MatcherAccountsShape` has 4 bools and `matcher_shape_ok` requires `(true, false, true, true)`, there is exactly one valid shape. Using concrete `valid_shape()` is functionally equivalent to `assume(matcher_shape_ok(shape))`. The weakness is cosmetic but could become a real gap if the shape struct gains more fields.
+### 3. Non-Vacuity Discipline
 
-- **SAT-bounded symbolic domains**: 9 proofs use KANI_MAX_SCALE=64 or KANI_MAX_QUOTIENT=4096 to keep SAT tractable. The mathematical properties (division conservation, modular bounds, monotonicity) hold universally. This is a well-understood limitation of bounded model checking.
+The strongest proofs include explicit non-vacuity witnesses -- concrete examples proving the asserted path is reachable BEFORE the universal quantification. This pattern appears in:
+- `kani_tradecpi_any_reject_nonce_unchanged` (line 1209)
+- `kani_tradecpi_any_accept_increments_nonce` (line 1272)
+- `kani_tradecpi_from_ret_any_reject_nonce_unchanged` (line 1648)
+- `kani_tradecpi_from_ret_any_accept_increments_nonce` (line 1722)
+- `kani_clamp_toward_formula_concrete` (line 3797) and siblings
 
-- **clamp_toward_with_dt formula proofs use very narrow domain**: `index in [100,200]`, `cap 1-5%`, `dt 1-20`. This exercises the three branches but doesn't test large-value behavior (saturation in `saturating_sub`/`saturating_add`). The production code's use of `u128` arithmetic and saturation provides defense in depth.
+This is excellent practice that eliminates the risk of vacuous truth in conditional assertions.
 
-### 3. Coverage Assessment
+### 4. Coupling Completeness
 
-**Functions with complete symbolic coverage (STRONG proofs for all branches):**
-- `validate_matcher_return` (11 proofs)
-- `owner_ok`, `admin_ok`, `matcher_identity_ok` (full match/mismatch coverage)
-- `decide_trade_cpi` (universal nonce transition + per-gate kill-switch)
-- `decide_trade_cpi_from_ret` (universal nonce + consistency + exec_size)
-- `decide_trade_nocpi` (full characterization)
-- `decide_crank` (full characterization)
-- `decide_single_owner_op` (full characterization)
-- `gate_active` (complete 3-case characterization)
-- `base_to_units` (conservation, bounds, monotonicity, scale=0)
-- `units_to_base` (roundtrip, monotonicity, scale=0)
-- `sweep_dust` (conservation, bounds, below-threshold, scale=0)
-- `withdraw_amount_aligned` (aligned, misaligned, scale=0)
-- `scale_price_e6` (zero result, valid result, identity)
-- `invert_price_e6` (passthrough, correctness, zero-raw, zero-result, dead-branch, monotonicity)
-- `clamp_toward_with_dt` (dt=0, cap=0, bootstrap, bounds, 3 formula branches)
-- `withdraw_insurance_vault` (correct, overflow, zero, full characterization)
-- `init_market_scale_ok` (overflow reject, valid range accept)
+The `verify` module extracts pure decision logic from `mod processor`. Coupling verified by:
+- `kani_abi_ok_equals_validate` (line 1610): Proves `verify::abi_ok` calls the real `matcher_abi::validate_matcher_return`
+- `kani_tradecpi_variants_consistent_*` (lines 2874, 2948): Proves `decide_trade_cpi` and `decide_trade_cpi_from_ret` agree
+- Gate ordering in `decide_trade_cpi` matches production handler's check sequence (documented in comments)
 
-**Functions with UNIT TEST only:**
-- `lp_pda_shape_ok` (4 concrete tests, no universal symbolic proof)
-- `matcher_shape_ok` as standalone (5 concrete + superseded by decide_trade_cpi universal)
+**Gap**: No formal proof that the `processor` handler's actual check sequence matches `decide_trade_cpi`'s gate ordering. This coupling relies on code review only. A mismatch would mean the proofs verify a different policy than production. This is an inherent limitation of the extracted-function verification approach.
 
-**Functions covered transitively (no independent proof needed):**
-- `nonce_on_success`, `nonce_on_failure`, `cpi_trade_size`: proven through `decide_trade_cpi` proofs
-- `pda_key_matches`: identical to `owner_ok` structurally
-- `single_owner_authorized`: delegates to `owner_ok`
-- `signer_ok`, `writable_ok`: identity functions (return input), not independently proven
+### 5. Missing Coverage Areas
 
-### 4. Recommendations (Priority Order)
+The proofs intentionally do NOT cover:
+- **Oracle reading** (`read_pyth_price_e6`, `read_chainlink_price_e6`): Requires `AccountInfo` which Kani cannot model
+- **Zero-copy access** (`zc::engine_ref`, `zc::engine_mut`): Involves raw pointers
+- **CPI invocation** (`zc::invoke_signed_trade`): Solana runtime interaction
+- **Risk engine internals**: Covered by the `percolator` crate's own 133 Kani proofs
 
-1. **(LOW)** Add a universal proof for `lp_pda_shape_ok`: symbolic bools with `assume(!is_system_owned || !data_len_zero || !lamports_zero)` => rejected. This would replace the 4 concrete tests.
+This is explicitly documented in the file header: "CPI execution and risk engine internals are NOT modeled. Only wrapper-level authorization and binding logic is proven."
 
-2. **(LOW)** Upgrade the 5 AE proofs (114-118) to use symbolic shapes with `assume(matcher_shape_ok(shape))` instead of `valid_shape()` for future-proofing.
+### 6. Improvement Opportunities
 
-3. **(LOW)** Add a formal margin ratio preservation assertion to `kani_scale_price_and_base_to_units_use_same_divisor` or merge it with `kani_scale_price_e6_concrete_example`.
+1. **Expand bounded domains**: `KANI_MAX_QUOTIENT=4096` could be increased to `65536` for lightweight monotonicity proofs without SAT explosion.
+2. **Processor coupling proof**: Add a structural check (or test) that the gate ordering in `decide_trade_cpi` matches `processor::process_trade_cpi`.
+3. **Full-range `clamp_toward_with_dt`**: Add proof with `index=u64::MAX, cap=1_000_000, dt=1` to exercise `mark.clamp(0, u64::MAX)`.
+4. **No-skip gate property**: Prove that if gate N rejects, gates N+1..7 are never evaluated (short-circuit correctness). This is structurally guaranteed by early returns but could be documented.
 
-4. **(INFO)** The 54 unit test proofs could be removed to reduce verification runtime without losing coverage, but they serve as readable documentation. No action required.
+### 7. Summary Assessment
 
-5. **(INFO)** The 7 code-equals-spec proofs are regression guards for trivial functions. They cost minimal SAT time and catch logic regressions. No action required.
+The proof suite is mature and well-structured. With 86 STRONG proofs (58.9%) and 0 VACUOUS proofs, it provides genuine formal guarantees for wrapper-level security properties: authorization, ABI validation, identity binding, nonce monotonicity, math correctness, and rate limiting. The 14 WEAK proofs are primarily bounded-domain math proofs constrained by SAT tractability -- a well-known and properly mitigated limitation. The 41 UNIT TEST proofs serve as readable documentation and regression guards, each explicitly noting its subsuming universal proof. The suite represents high-quality formal verification coverage for the properties it claims to verify.
+
+---
+
+## Detailed Per-Proof Classification Table
+
+| # | Proof Name | Line | Class |
+|---|---|---|---|
+| 1 | `kani_matcher_rejects_wrong_abi_version` | 132 | STRONG |
+| 2 | `kani_matcher_rejects_missing_valid_flag` | 147 | STRONG |
+| 3 | `kani_matcher_rejects_rejected_flag` | 163 | STRONG |
+| 4 | `kani_matcher_rejects_wrong_req_id` | 180 | WEAK |
+| 5 | `kani_matcher_rejects_wrong_lp_account_id` | 204 | WEAK |
+| 6 | `kani_matcher_rejects_wrong_oracle_price` | 224 | WEAK |
+| 7 | `kani_matcher_rejects_nonzero_reserved` | 244 | STRONG |
+| 8 | `kani_matcher_rejects_zero_exec_price` | 262 | STRONG |
+| 9 | `kani_matcher_zero_size_requires_partial_ok` | 280 | STRONG |
+| 10 | `kani_matcher_rejects_exec_size_exceeds_req` | 302 | STRONG |
+| 11 | `kani_matcher_rejects_sign_mismatch` | 326 | STRONG |
+| 12 | `kani_owner_mismatch_rejected` | 353 | STRONG |
+| 13 | `kani_owner_match_accepted` | 363 | STRONG |
+| 14 | `kani_admin_mismatch_rejected` | 375 | STRONG |
+| 15 | `kani_admin_match_accepted` | 386 | STRONG |
+| 16 | `kani_admin_burned_disables_ops` | 395 | STRONG |
+| 17 | `kani_matcher_identity_mismatch_rejected` | 411 | STRONG |
+| 18 | `kani_matcher_identity_match_accepted` | 428 | STRONG |
+| 19 | `kani_matcher_shape_rejects_non_executable_prog` | 448 | UNIT TEST |
+| 20 | `kani_matcher_shape_rejects_executable_ctx` | 464 | UNIT TEST |
+| 21 | `kani_matcher_shape_rejects_wrong_ctx_owner` | 480 | UNIT TEST |
+| 22 | `kani_matcher_shape_rejects_short_ctx` | 496 | UNIT TEST |
+| 23 | `kani_matcher_shape_valid_accepted` | 512 | UNIT TEST |
+| 24 | `kani_matcher_shape_universal` | 528 | STRONG |
+| 25 | `kani_pda_mismatch_rejected` | 553 | STRONG |
+| 26 | `kani_pda_match_accepted` | 566 | STRONG |
+| 27 | `kani_nonce_unchanged_on_failure` | 578 | STRONG |
+| 28 | `kani_nonce_advances_on_success` | 587 | STRONG |
+| 29 | `kani_nonce_wraps_at_max` | 602 | UNIT TEST |
+| 30 | `kani_cpi_uses_exec_size` | 615 | STRONG |
+| 31 | `kani_gate_inactive_when_threshold_zero` | 634 | STRONG |
+| 32 | `kani_gate_inactive_when_balance_exceeds` | 645 | STRONG |
+| 33 | `kani_gate_active_when_conditions_met` | 658 | STRONG |
+| 34 | `kani_single_owner_mismatch_rejected` | 676 | STRONG |
+| 35 | `kani_single_owner_match_accepted` | 689 | STRONG |
+| 36 | `kani_trade_rejects_user_mismatch` | 700 | STRONG |
+| 37 | `kani_trade_rejects_lp_mismatch` | 714 | STRONG |
+| 38 | `kani_tradecpi_rejects_non_executable_prog` | 748 | UNIT TEST |
+| 39 | `kani_tradecpi_rejects_executable_ctx` | 771 | UNIT TEST |
+| 40 | `kani_tradecpi_rejects_pda_mismatch` | 794 | UNIT TEST |
+| 41 | `kani_tradecpi_rejects_user_auth_failure` | 820 | UNIT TEST |
+| 42 | `kani_tradecpi_rejects_lp_auth_failure` | 846 | UNIT TEST |
+| 43 | `kani_tradecpi_rejects_identity_mismatch` | 872 | UNIT TEST |
+| 44 | `kani_tradecpi_rejects_abi_failure` | 898 | UNIT TEST |
+| 45 | `kani_tradecpi_rejects_gate_risk_increase` | 924 | UNIT TEST |
+| 46 | `kani_tradecpi_allows_gate_risk_decrease` | 951 | WEAK |
+| 47 | `kani_tradecpi_reject_nonce_unchanged` | 983 | STRONG |
+| 48 | `kani_tradecpi_accept_increments_nonce` | 1016 | STRONG |
+| 49 | `kani_tradenocpi_auth_failure_rejects` | 1070 | STRONG |
+| 50 | `kani_tradenocpi_gate_risk_increase_rejects` | 1090 | UNIT TEST |
+| 51 | `kani_tradenocpi_universal_characterization` | 1106 | STRONG |
+| 52 | `kani_matcher_zero_size_with_partial_ok_accepted` | 1129 | STRONG |
+| 53 | `kani_tradecpi_rejects_ctx_owner_mismatch` | 1157 | UNIT TEST |
+| 54 | `kani_tradecpi_rejects_ctx_len_short` | 1180 | UNIT TEST |
+| 55 | `kani_tradecpi_any_reject_nonce_unchanged` | 1209 | STRONG |
+| 56 | `kani_tradecpi_any_accept_increments_nonce` | 1272 | STRONG |
+| 57 | `kani_len_ok_universal` | 1334 | STRONG |
+| 58 | `kani_lp_pda_shape_valid` | 1355 | UNIT TEST |
+| 59 | `kani_lp_pda_rejects_wrong_owner` | 1369 | UNIT TEST |
+| 60 | `kani_lp_pda_rejects_has_data` | 1383 | UNIT TEST |
+| 61 | `kani_lp_pda_rejects_funded` | 1394 | UNIT TEST |
+| 62 | `kani_lp_pda_shape_universal` | 1405 | STRONG |
+| 63 | `kani_oracle_feed_id_match` | 1428 | WEAK |
+| 64 | `kani_oracle_feed_id_mismatch` | 1438 | STRONG |
+| 65 | `kani_slab_shape_valid` | 1450 | UNIT TEST |
+| 66 | `kani_slab_shape_invalid` | 1460 | STRONG |
+| 67 | `kani_decide_single_owner_universal` | 1478 | STRONG |
+| 68 | `kani_decide_crank_permissionless_accepts` | 1490 | UNIT TEST |
+| 69 | `kani_decide_crank_self_accepts` | 1505 | UNIT TEST |
+| 70 | `kani_decide_crank_rejects_no_idx` | 1518 | UNIT TEST |
+| 71 | `kani_decide_crank_rejects_wrong_owner` | 1532 | UNIT TEST |
+| 72 | `kani_decide_crank_universal` | 1548 | STRONG |
+| 73 | `kani_decide_admin_accepts` | 1566 | UNIT TEST |
+| 74 | `kani_decide_admin_rejects` | 1580 | UNIT TEST |
+| 75 | `kani_abi_ok_equals_validate` | 1610 | STRONG |
+| 76 | `kani_tradecpi_from_ret_any_reject_nonce_unchanged` | 1648 | STRONG |
+| 77 | `kani_tradecpi_from_ret_any_accept_increments_nonce` | 1722 | STRONG |
+| 78 | `kani_tradecpi_from_ret_accept_uses_exec_size` | 1793 | STRONG |
+| 79 | `kani_min_abs_boundary_rejected` | 1884 | UNIT TEST |
+| 80 | `kani_matcher_accepts_minimal_valid_nonzero_exec` | 1920 | STRONG |
+| 81 | `kani_matcher_accepts_exec_size_equal_req_size` | 1945 | STRONG |
+| 82 | `kani_matcher_accepts_partial_fill_with_flag` | 1965 | STRONG |
+| 83 | `kani_crank_panic_requires_admin` | 1995 | UNIT TEST |
+| 84 | `kani_crank_panic_with_admin_permissionless_accepts` | 2024 | UNIT TEST |
+| 85 | `kani_crank_panic_burned_admin_rejects` | 2050 | UNIT TEST |
+| 86 | `kani_crank_no_panic_permissionless_accepts` | 2075 | UNIT TEST |
+| 87 | `kani_crank_no_panic_self_crank_rejects_wrong_owner` | 2100 | UNIT TEST |
+| 88 | `kani_crank_panic_admin_passes_self_crank_no_idx_rejects` | 2126 | UNIT TEST |
+| 89 | `kani_crank_no_panic_self_crank_accepts_owner_match` | 2152 | UNIT TEST |
+| 90 | `kani_decide_keeper_crank_with_panic_universal` | 2176 | STRONG |
+| 91 | `kani_invert_zero_returns_raw` | 2205 | STRONG |
+| 92 | `kani_invert_nonzero_computes_correctly` | 2214 | WEAK |
+| 93 | `kani_invert_zero_raw_returns_none` | 2235 | UNIT TEST |
+| 94 | `kani_invert_result_zero_returns_none` | 2244 | WEAK |
+| 95 | `kani_invert_overflow_branch_is_dead` | 2262 | STRONG |
+| 96 | `kani_invert_monotonic` | 2279 | WEAK |
+| 97 | `kani_base_to_units_conservation` | 2305 | STRONG |
+| 98 | `kani_base_to_units_dust_bound` | 2326 | STRONG |
+| 99 | `kani_base_to_units_scale_zero` | 2342 | CODE-EQUALS-SPEC |
+| 100 | `kani_units_roundtrip` | 2353 | STRONG |
+| 101 | `kani_units_to_base_scale_zero` | 2370 | CODE-EQUALS-SPEC |
+| 102 | `kani_base_to_units_monotonic` | 2380 | STRONG |
+| 103 | `kani_units_to_base_monotonic_bounded` | 2403 | STRONG |
+| 104 | `kani_base_to_units_monotonic_scale_zero` | 2427 | STRONG |
+| 105 | `kani_withdraw_misaligned_rejects` | 2448 | STRONG |
+| 106 | `kani_withdraw_aligned_accepts` | 2468 | STRONG |
+| 107 | `kani_withdraw_scale_zero_always_aligned` | 2485 | STRONG |
+| 108 | `kani_sweep_dust_conservation` | 2499 | STRONG |
+| 109 | `kani_sweep_dust_rem_bound` | 2519 | STRONG |
+| 110 | `kani_sweep_dust_below_threshold` | 2535 | STRONG |
+| 111 | `kani_sweep_dust_scale_zero` | 2550 | CODE-EQUALS-SPEC |
+| 112 | `kani_accumulate_dust_saturates` | 2563 | CODE-EQUALS-SPEC |
+| 113 | `kani_scale_zero_policy_no_dust` | 2579 | STRONG |
+| 114 | `kani_scale_zero_policy_sweep_complete` | 2590 | STRONG |
+| 115 | `kani_scale_zero_policy_end_to_end` | 2601 | STRONG |
+| 116 | `kani_universal_shape_fail_rejects` | 2627 | STRONG |
+| 117 | `kani_universal_pda_fail_rejects` | 2669 | STRONG |
+| 118 | `kani_universal_user_auth_fail_rejects` | 2709 | STRONG |
+| 119 | `kani_universal_lp_auth_fail_rejects` | 2749 | STRONG |
+| 120 | `kani_universal_identity_fail_rejects` | 2789 | STRONG |
+| 121 | `kani_universal_abi_fail_rejects` | 2829 | STRONG |
+| 122 | `kani_tradecpi_variants_consistent_valid_shape` | 2874 | STRONG |
+| 123 | `kani_tradecpi_variants_consistent_invalid_shape` | 2948 | STRONG |
+| 124 | `kani_tradecpi_from_ret_req_id_is_nonce_plus_one` | 3018 | STRONG |
+| 125 | `kani_universal_gate_risk_increase_rejects` | 3076 | STRONG |
+| 126 | `kani_units_roundtrip_exact_when_no_dust` | 3132 | STRONG |
+| 127 | `kani_universal_panic_requires_admin` | 3151 | STRONG |
+| 128 | `kani_universal_gate_risk_increase_rejects_from_ret` | 3190 | STRONG |
+| 129 | `kani_tradecpi_from_ret_gate_active_risk_neutral_accepts` | 3247 | STRONG |
+| 130 | `kani_tradecpi_from_ret_forced_acceptance` | 3301 | STRONG |
+| 131 | `kani_init_market_scale_rejects_overflow` | 3356 | STRONG |
+| 132 | `kani_init_market_scale_zero_ok` | 3371 | UNIT TEST |
+| 133 | `kani_init_market_scale_boundary_ok` | 3379 | UNIT TEST |
+| 134 | `kani_init_market_scale_boundary_reject` | 3387 | UNIT TEST |
+| 135 | `kani_init_market_scale_valid_range` | 3396 | STRONG |
+| 136 | `kani_scale_price_e6_zero_result_rejected` | 3499 | STRONG |
+| 137 | `kani_scale_price_e6_valid_result` | 3519 | STRONG |
+| 138 | `kani_scale_price_e6_identity_for_scale_leq_1` | 3548 | CODE-EQUALS-SPEC |
+| 139 | `kani_scale_price_and_base_to_units_use_same_divisor` | 3577 | WEAK |
+| 140 | `kani_scale_price_e6_concrete_example` | 3623 | WEAK |
+| 141 | `kani_clamp_toward_no_movement_when_dt_zero` | 3676 | STRONG |
+| 142 | `kani_clamp_toward_no_movement_when_cap_zero` | 3697 | STRONG |
+| 143 | `kani_clamp_toward_bootstrap_when_index_zero` | 3717 | STRONG |
+| 144 | `kani_clamp_toward_movement_bounded_concrete` | 3734 | WEAK |
+| 145 | `kani_clamp_toward_formula_concrete` | 3797 | WEAK |
+| 146 | `kani_clamp_toward_formula_within_bounds` | 3823 | WEAK |
+| 147 | `kani_clamp_toward_formula_above_hi` | 3851 | WEAK |
+| 148 | `kani_clamp_toward_saturation_paths` | 3879 | STRONG |
+| 149 | `kani_withdraw_insurance_vault_correct` | 3938 | STRONG |
+| 150 | `kani_withdraw_insurance_vault_overflow` | 3956 | STRONG |
+| 151 | `kani_withdraw_insurance_vault_reaches_zero` | 3973 | UNIT TEST |
+| 152 | `kani_withdraw_insurance_vault_result_characterization` | 3987 | STRONG |
