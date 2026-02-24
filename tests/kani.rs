@@ -443,86 +443,6 @@ fn kani_matcher_identity_match_accepted() {
 // readable documentation of each field's validation requirement.
 // =============================================================================
 
-/// Prove: non-executable matcher program is rejected
-#[kani::proof]
-fn kani_matcher_shape_rejects_non_executable_prog() {
-    let shape = MatcherAccountsShape {
-        prog_executable: false, // BAD
-        ctx_executable: false,
-        ctx_owner_is_prog: true,
-        ctx_len_ok: true,
-    };
-
-    assert!(
-        !matcher_shape_ok(shape),
-        "non-executable matcher program must be rejected"
-    );
-}
-
-/// Prove: executable matcher context is rejected
-#[kani::proof]
-fn kani_matcher_shape_rejects_executable_ctx() {
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: true, // BAD
-        ctx_owner_is_prog: true,
-        ctx_len_ok: true,
-    };
-
-    assert!(
-        !matcher_shape_ok(shape),
-        "executable matcher context must be rejected"
-    );
-}
-
-/// Prove: context not owned by program is rejected
-#[kani::proof]
-fn kani_matcher_shape_rejects_wrong_ctx_owner() {
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: false,
-        ctx_owner_is_prog: false, // BAD
-        ctx_len_ok: true,
-    };
-
-    assert!(
-        !matcher_shape_ok(shape),
-        "context not owned by program must be rejected"
-    );
-}
-
-/// Prove: insufficient context length is rejected
-#[kani::proof]
-fn kani_matcher_shape_rejects_short_ctx() {
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: false,
-        ctx_owner_is_prog: true,
-        ctx_len_ok: false, // BAD
-    };
-
-    assert!(
-        !matcher_shape_ok(shape),
-        "insufficient context length must be rejected"
-    );
-}
-
-/// Prove: valid matcher shape is accepted
-#[kani::proof]
-fn kani_matcher_shape_valid_accepted() {
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: false,
-        ctx_owner_is_prog: true,
-        ctx_len_ok: true,
-    };
-
-    assert!(
-        matcher_shape_ok(shape),
-        "valid matcher shape must be accepted"
-    );
-}
-
 /// Universal: matcher_shape_ok is fully characterized
 #[kani::proof]
 fn kani_matcher_shape_universal() {
@@ -595,16 +515,6 @@ fn kani_nonce_advances_on_success() {
     );
 }
 
-/// Regression: nonce wraps correctly at u64::MAX
-/// NOTE (UNIT TEST): Subsumed by kani_nonce_advances_on_success (universal).
-/// Kept as explicit boundary documentation and regression guard.
-#[kani::proof]
-fn kani_nonce_wraps_at_max() {
-    let old_nonce = u64::MAX;
-    let new_nonce = nonce_on_success(old_nonce);
-
-    assert_eq!(new_nonce, 0, "nonce must wrap to 0 at u64::MAX");
-}
 
 // =============================================================================
 // H. CPI USES EXEC_SIZE (1 proof) - CRITICAL
@@ -741,208 +651,6 @@ fn valid_shape() -> MatcherAccountsShape {
         ctx_owner_is_prog: true,
         ctx_len_ok: true,
     }
-}
-
-/// Prove: TradeCpi rejects on bad matcher shape (non-executable prog)
-#[kani::proof]
-fn kani_tradecpi_rejects_non_executable_prog() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: false, // BAD
-        ctx_executable: false,
-        ctx_owner_is_prog: true,
-        ctx_len_ok: true,
-    };
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject non-executable matcher program"
-    );
-}
-
-/// Prove: TradeCpi rejects on bad matcher shape (executable ctx)
-#[kani::proof]
-fn kani_tradecpi_rejects_executable_ctx() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: true, // BAD
-        ctx_owner_is_prog: true,
-        ctx_len_ok: true,
-    };
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject executable matcher context"
-    );
-}
-
-/// Prove: TradeCpi rejects on PDA mismatch (even if everything else valid)
-#[kani::proof]
-fn kani_tradecpi_rejects_pda_mismatch() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        valid_shape(),
-        true,  // identity_ok
-        false, // pda_ok - BAD
-        true,  // abi_ok
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
-        false, // gate_active
-        false, // risk_increase
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject PDA mismatch"
-    );
-}
-
-/// Prove: TradeCpi rejects on user auth failure
-#[kani::proof]
-fn kani_tradecpi_rejects_user_auth_failure() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        valid_shape(),
-        true,  // identity_ok
-        true,  // pda_ok
-        true,  // abi_ok
-        false, // user_auth_ok - BAD
-        true,  // lp_auth_ok
-        false, // gate_active
-        false, // risk_increase
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject user auth failure"
-    );
-}
-
-/// Prove: TradeCpi rejects on LP auth failure
-#[kani::proof]
-fn kani_tradecpi_rejects_lp_auth_failure() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        valid_shape(),
-        true,  // identity_ok
-        true,  // pda_ok
-        true,  // abi_ok
-        true,  // user_auth_ok
-        false, // lp_auth_ok - BAD
-        false, // gate_active
-        false, // risk_increase
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject LP auth failure"
-    );
-}
-
-/// Prove: TradeCpi rejects on identity mismatch (even if ABI valid)
-#[kani::proof]
-fn kani_tradecpi_rejects_identity_mismatch() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        valid_shape(),
-        false, // identity_ok - BAD
-        true,  // pda_ok
-        true,  // abi_ok (strong adversary: valid ABI but wrong identity)
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
-        false, // gate_active
-        false, // risk_increase
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject identity mismatch even if ABI valid"
-    );
-}
-
-/// Prove: TradeCpi rejects on ABI validation failure
-#[kani::proof]
-fn kani_tradecpi_rejects_abi_failure() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        valid_shape(),
-        true,  // identity_ok
-        true,  // pda_ok
-        false, // abi_ok - BAD
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
-        false, // gate_active
-        false, // risk_increase
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject ABI validation failure"
-    );
-}
-
-/// Prove: TradeCpi rejects on gate active + risk increase
-#[kani::proof]
-fn kani_tradecpi_rejects_gate_risk_increase() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        valid_shape(),
-        true, // identity_ok
-        true, // pda_ok
-        true, // abi_ok
-        true, // user_auth_ok
-        true, // lp_auth_ok
-        true, // gate_active - ACTIVE
-        true, // risk_increase - INCREASING
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject when gate active and risk increasing"
-    );
 }
 
 /// Prove: TradeCpi allows trade when gate_active=true but risk_increase=false
@@ -1084,23 +792,6 @@ fn kani_tradenocpi_auth_failure_rejects() {
     );
 }
 
-/// Universal: TradeNoCpi rejects when gate_active && risk_increase
-/// (even with valid auth)
-#[kani::proof]
-fn kani_tradenocpi_gate_risk_increase_rejects() {
-    let user_auth_ok = true;
-    let lp_auth_ok = true;
-    let gate_active = true;
-    let risk_increase = true;
-
-    let decision = decide_trade_nocpi(user_auth_ok, lp_auth_ok, gate_active, risk_increase);
-    assert_eq!(
-        decision,
-        TradeNoCpiDecision::Reject,
-        "TradeNoCpi must reject when gate active and risk increasing"
-    );
-}
-
 /// Universal: TradeNoCpi decision is fully characterized by its inputs
 #[kani::proof]
 fn kani_tradenocpi_universal_characterization() {
@@ -1151,52 +842,6 @@ fn kani_matcher_zero_size_with_partial_ok_accepted() {
 // =============================================================================
 // O. MISSING SHAPE COUPLING PROOFS (2 proofs)
 // =============================================================================
-
-/// Prove: TradeCpi rejects on bad matcher shape (ctx owner mismatch)
-#[kani::proof]
-fn kani_tradecpi_rejects_ctx_owner_mismatch() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: false,
-        ctx_owner_is_prog: false, // BAD - context not owned by program
-        ctx_len_ok: true,
-    };
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject when context not owned by matcher program"
-    );
-}
-
-/// Prove: TradeCpi rejects on bad matcher shape (ctx too short)
-#[kani::proof]
-fn kani_tradecpi_rejects_ctx_len_short() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: true,
-        ctx_executable: false,
-        ctx_owner_is_prog: true,
-        ctx_len_ok: false, // BAD - context length insufficient
-    };
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "TradeCpi must reject when context length insufficient"
-    );
-}
 
 // =============================================================================
 // P. UNIVERSAL REJECT => NONCE UNCHANGED (1 proof)
@@ -1350,56 +995,6 @@ fn kani_len_ok_universal() {
 // validation requirement. The function is a simple conjunction (&&).
 // =============================================================================
 
-/// Prove: valid LP PDA shape is accepted
-#[kani::proof]
-fn kani_lp_pda_shape_valid() {
-    let shape = LpPdaShape {
-        is_system_owned: true,
-        data_len_zero: true,
-        lamports_zero: true,
-    };
-    assert!(
-        lp_pda_shape_ok(shape),
-        "valid LP PDA shape must be accepted"
-    );
-}
-
-/// Prove: non-system-owned LP PDA is rejected
-#[kani::proof]
-fn kani_lp_pda_rejects_wrong_owner() {
-    let shape = LpPdaShape {
-        is_system_owned: false,
-        data_len_zero: true,
-        lamports_zero: true,
-    };
-    assert!(
-        !lp_pda_shape_ok(shape),
-        "non-system-owned LP PDA must be rejected"
-    );
-}
-
-/// Prove: LP PDA with data is rejected
-#[kani::proof]
-fn kani_lp_pda_rejects_has_data() {
-    let shape = LpPdaShape {
-        is_system_owned: true,
-        data_len_zero: false,
-        lamports_zero: true,
-    };
-    assert!(!lp_pda_shape_ok(shape), "LP PDA with data must be rejected");
-}
-
-/// Prove: funded LP PDA is rejected
-#[kani::proof]
-fn kani_lp_pda_rejects_funded() {
-    let shape = LpPdaShape {
-        is_system_owned: true,
-        data_len_zero: true,
-        lamports_zero: false,
-    };
-    assert!(!lp_pda_shape_ok(shape), "funded LP PDA must be rejected");
-}
-
 /// Universal: lp_pda_shape_ok is fully characterized as 3-way AND
 #[kani::proof]
 fn kani_lp_pda_shape_universal() {
@@ -1421,51 +1016,30 @@ fn kani_lp_pda_shape_universal() {
 // S. ORACLE FEED_ID AND SLAB SHAPE (4 proofs)
 // =============================================================================
 
-/// Prove: oracle_feed_id_ok accepts matching feed_ids
-/// NOTE (trivially true): x==x is a tautology, but serves as a coupling guard
-/// to catch regressions if oracle_feed_id_ok logic changes.
+/// Universal: oracle_feed_id_ok == (expected == provided)
 #[kani::proof]
-fn kani_oracle_feed_id_match() {
-    let feed_id: [u8; 32] = kani::any();
-    assert!(
-        oracle_feed_id_ok(feed_id, feed_id),
-        "matching oracle feed_ids must be accepted"
-    );
-}
-
-/// Prove: oracle_feed_id_ok rejects mismatched feed_ids
-#[kani::proof]
-fn kani_oracle_feed_id_mismatch() {
+fn kani_oracle_feed_id_universal() {
     let expected: [u8; 32] = kani::any();
     let provided: [u8; 32] = kani::any();
-    kani::assume(expected != provided);
-    assert!(
-        !oracle_feed_id_ok(expected, provided),
-        "mismatched oracle feed_ids must be rejected"
+    assert_eq!(
+        oracle_feed_id_ok(expected, provided),
+        expected == provided,
+        "oracle_feed_id_ok must equal (expected == provided)"
     );
 }
 
 /// Prove: valid slab shape is accepted
 #[kani::proof]
-fn kani_slab_shape_valid() {
-    let shape = SlabShape {
-        owned_by_program: true,
-        correct_len: true,
-    };
-    assert!(slab_shape_ok(shape), "valid slab shape must be accepted");
-}
-
-/// Prove: invalid slab shape is rejected
-#[kani::proof]
-fn kani_slab_shape_invalid() {
+fn kani_slab_shape_universal() {
     let owned: bool = kani::any();
     let correct_len: bool = kani::any();
-    kani::assume(!owned || !correct_len);
     let shape = SlabShape {
         owned_by_program: owned,
         correct_len: correct_len,
     };
-    assert!(!slab_shape_ok(shape), "invalid slab shape must be rejected");
+    let expected = owned && correct_len;
+    assert_eq!(slab_shape_ok(shape), expected,
+        "slab_shape_ok must equal (owned && correct_len)");
 }
 
 // =============================================================================
@@ -1483,63 +1057,6 @@ fn kani_decide_single_owner_universal() {
     } else {
         assert_eq!(decision, SimpleDecision::Reject, "auth fail must reject");
     }
-}
-
-/// Prove: decide_crank accepts in permissionless mode
-#[kani::proof]
-fn kani_decide_crank_permissionless_accepts() {
-    let idx_exists: bool = kani::any();
-    let stored: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    // Permissionless mode always accepts regardless of idx/owner
-    let decision = decide_crank(true, idx_exists, stored, signer);
-    assert_eq!(
-        decision,
-        SimpleDecision::Accept,
-        "permissionless crank must always accept"
-    );
-}
-
-/// Prove: decide_crank accepts self-crank when idx exists and owner matches
-#[kani::proof]
-fn kani_decide_crank_self_accepts() {
-    let owner: [u8; 32] = kani::any();
-    // Self-crank mode with valid idx and matching owner
-    let decision = decide_crank(false, true, owner, owner);
-    assert_eq!(
-        decision,
-        SimpleDecision::Accept,
-        "self-crank must accept when idx exists and owner matches"
-    );
-}
-
-/// Prove: decide_crank rejects self-crank when idx doesn't exist
-#[kani::proof]
-fn kani_decide_crank_rejects_no_idx() {
-    let stored: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    // Self-crank mode with non-existent idx must reject
-    let decision = decide_crank(false, false, stored, signer);
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "self-crank must reject when idx doesn't exist"
-    );
-}
-
-/// Prove: decide_crank rejects self-crank when owner doesn't match
-#[kani::proof]
-fn kani_decide_crank_rejects_wrong_owner() {
-    let stored: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    kani::assume(stored != signer);
-    // Self-crank mode with existing idx but wrong owner must reject
-    let decision = decide_crank(false, true, stored, signer);
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "self-crank must reject when owner doesn't match"
-    );
 }
 
 /// Universal: decide_crank is fully characterized by its inputs
@@ -1561,42 +1078,21 @@ fn kani_decide_crank_universal() {
     }
 }
 
-/// Prove: decide_admin_op accepts valid admin
+/// Universal: decide_admin_op is fully characterized
+/// accept iff admin != [0;32] && admin == signer
 #[kani::proof]
-fn kani_decide_admin_accepts() {
+fn kani_decide_admin_universal() {
     let admin: [u8; 32] = kani::any();
-    kani::assume(admin != [0u8; 32]);
-
-    let decision = decide_admin_op(admin, admin);
-    assert_eq!(
-        decision,
-        SimpleDecision::Accept,
-        "admin op must accept matching non-burned admin"
-    );
-}
-
-/// Prove: decide_admin_op rejects invalid admin
-#[kani::proof]
-fn kani_decide_admin_rejects() {
-    // Case 1: burned admin
     let signer: [u8; 32] = kani::any();
-    let decision1 = decide_admin_op([0u8; 32], signer);
-    assert_eq!(
-        decision1,
-        SimpleDecision::Reject,
-        "burned admin must reject"
-    );
 
-    // Case 2: admin mismatch
-    let admin: [u8; 32] = kani::any();
-    kani::assume(admin != [0u8; 32]);
-    kani::assume(admin != signer);
-    let decision2 = decide_admin_op(admin, signer);
-    assert_eq!(
-        decision2,
-        SimpleDecision::Reject,
-        "admin mismatch must reject"
-    );
+    let decision = decide_admin_op(admin, signer);
+
+    let should_accept = admin != [0u8; 32] && admin == signer;
+    if should_accept {
+        assert_eq!(decision, SimpleDecision::Accept, "valid admin must accept");
+    } else {
+        assert_eq!(decision, SimpleDecision::Reject, "invalid admin must reject");
+    }
 }
 
 // =============================================================================
@@ -1986,189 +1482,6 @@ fn kani_matcher_accepts_partial_fill_with_flag() {
     );
 }
 
-// =============================================================================
-// Z. KEEPER CRANK WITH ALLOW_PANIC PROOFS (6 proofs)
-// =============================================================================
-
-/// Prove: allow_panic requires admin auth - rejects non-admin
-#[kani::proof]
-fn kani_crank_panic_requires_admin() {
-    let admin: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    kani::assume(admin != [0u8; 32]); // Not burned
-    kani::assume(admin != signer); // Signer is NOT admin
-
-    let stored_owner: [u8; 32] = kani::any();
-    let permissionless: bool = kani::any();
-    let idx_exists: bool = kani::any();
-
-    // allow_panic != 0 but signer != admin => reject
-    let decision = decide_keeper_crank_with_panic(
-        1, // allow_panic != 0
-        admin,
-        signer,
-        permissionless,
-        idx_exists,
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "allow_panic without admin auth must reject"
-    );
-}
-
-/// Prove: allow_panic with valid admin auth proceeds to crank logic
-#[kani::proof]
-fn kani_crank_panic_with_admin_permissionless_accepts() {
-    let admin: [u8; 32] = kani::any();
-    kani::assume(admin != [0u8; 32]); // Not burned
-
-    let stored_owner: [u8; 32] = kani::any();
-    let idx_exists: bool = kani::any();
-
-    // allow_panic != 0, signer == admin, permissionless mode
-    let decision = decide_keeper_crank_with_panic(
-        1, // allow_panic != 0
-        admin,
-        admin, // signer == admin
-        true,  // permissionless
-        idx_exists,
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Accept,
-        "allow_panic with admin + permissionless must accept"
-    );
-}
-
-/// Prove: allow_panic with burned admin always rejects
-#[kani::proof]
-fn kani_crank_panic_burned_admin_rejects() {
-    let signer: [u8; 32] = kani::any();
-    let stored_owner: [u8; 32] = kani::any();
-    let permissionless: bool = kani::any();
-    let idx_exists: bool = kani::any();
-
-    // allow_panic != 0, admin is burned
-    let decision = decide_keeper_crank_with_panic(
-        1,         // allow_panic != 0
-        [0u8; 32], // burned admin
-        signer,
-        permissionless,
-        idx_exists,
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "allow_panic with burned admin must reject"
-    );
-}
-
-/// Prove: without allow_panic, permissionless crank accepts without admin
-#[kani::proof]
-fn kani_crank_no_panic_permissionless_accepts() {
-    let admin: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    let stored_owner: [u8; 32] = kani::any();
-    let idx_exists: bool = kani::any();
-
-    // allow_panic == 0, permissionless mode - accepts regardless of admin
-    let decision = decide_keeper_crank_with_panic(
-        0, // allow_panic == 0
-        admin,
-        signer,
-        true,
-        idx_exists,
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Accept,
-        "no allow_panic + permissionless must accept"
-    );
-}
-
-/// Prove: without allow_panic, self-crank needs idx + owner match
-#[kani::proof]
-fn kani_crank_no_panic_self_crank_rejects_wrong_owner() {
-    let admin: [u8; 32] = kani::any();
-    let stored_owner: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    kani::assume(stored_owner != signer);
-
-    // allow_panic == 0, self-crank mode, idx exists, but owner mismatch
-    let decision = decide_keeper_crank_with_panic(
-        0, // allow_panic == 0
-        admin,
-        signer,
-        false, // self-crank
-        true,  // idx exists
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "self-crank with owner mismatch must reject"
-    );
-}
-
-/// Prove: allow_panic with admin passes but self-crank with idx_exists=false rejects
-/// Covers the gap: admin auth succeeds, but permissionless=false + !idx_exists fails
-#[kani::proof]
-fn kani_crank_panic_admin_passes_self_crank_no_idx_rejects() {
-    let admin: [u8; 32] = kani::any();
-    kani::assume(admin != [0u8; 32]); // Not burned
-
-    let stored_owner: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-
-    // allow_panic != 0, admin passes, but self-crank mode with no idx
-    let decision = decide_keeper_crank_with_panic(
-        1,     // allow_panic != 0
-        admin,
-        admin, // signer == admin (admin auth passes)
-        false, // permissionless=false (self-crank mode)
-        false, // idx_exists=false
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "admin auth + self-crank with no idx must reject"
-    );
-}
-
-/// Prove: without allow_panic, self-crank with owner match accepts
-#[kani::proof]
-fn kani_crank_no_panic_self_crank_accepts_owner_match() {
-    let admin: [u8; 32] = kani::any();
-    let owner: [u8; 32] = kani::any();
-
-    // allow_panic == 0, self-crank mode, idx exists, owner matches
-    let decision = decide_keeper_crank_with_panic(
-        0, // allow_panic == 0
-        admin, owner, // signer == owner
-        false, // self-crank
-        true,  // idx exists
-        owner, // stored_owner == signer
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Accept,
-        "self-crank with owner match must accept"
-    );
-}
-
 /// Universal characterization: decide_keeper_crank_with_panic ==
 ///   if allow_panic != 0 && !admin_ok(admin, signer) => Reject
 ///   else => decide_crank(permissionless, idx_exists, stored_owner, signer)
@@ -2230,10 +1543,12 @@ fn kani_invert_nonzero_computes_correctly() {
     );
 }
 
-/// Prove: raw==0 always returns None (div by zero protection)
+/// Prove: raw==0 always returns None for any non-zero invert (div by zero protection)
 #[kani::proof]
 fn kani_invert_zero_raw_returns_none() {
-    let result = invert_price_e6(0, 1);
+    let invert: u8 = kani::any();
+    kani::assume(invert != 0);
+    let result = invert_price_e6(0, invert);
     assert!(result.is_none(), "raw==0 must return None");
 }
 
@@ -3366,31 +2681,6 @@ fn kani_init_market_scale_rejects_overflow() {
     assert!(!result, "scale > MAX_UNIT_SCALE must be rejected");
 }
 
-/// Prove: scale=0 is accepted (disables scaling)
-#[kani::proof]
-fn kani_init_market_scale_zero_ok() {
-    let result = init_market_scale_ok(0);
-
-    assert!(result, "scale=0 must be accepted");
-}
-
-/// Prove: scale=MAX_UNIT_SCALE is accepted (boundary)
-#[kani::proof]
-fn kani_init_market_scale_boundary_ok() {
-    let result = init_market_scale_ok(MAX_UNIT_SCALE);
-
-    assert!(result, "scale=MAX_UNIT_SCALE must be accepted");
-}
-
-/// Prove: scale=MAX_UNIT_SCALE+1 is rejected (boundary)
-#[kani::proof]
-fn kani_init_market_scale_boundary_reject() {
-    // Keep this proof non-vacuous: boundary+1 must be constructible.
-    assert!(MAX_UNIT_SCALE < u32::MAX, "MAX_UNIT_SCALE must allow +1 boundary test");
-    let result = init_market_scale_ok(MAX_UNIT_SCALE + 1);
-    assert!(!result, "scale=MAX_UNIT_SCALE+1 must be rejected");
-}
-
 /// Prove: any scale in valid range [0, MAX_UNIT_SCALE] is accepted
 #[kani::proof]
 fn kani_init_market_scale_valid_range() {
@@ -3966,20 +3256,6 @@ fn kani_withdraw_insurance_vault_overflow() {
 
 /// Prove: After withdraw_insurance, if all capital is already withdrawn,
 /// vault reaches zero (enabling CloseSlab).
-/// NOTE (trivially true): checked_sub(x, x) = Some(0) by definition. Kept as
-/// documentation of the CloseSlab precondition. Subsumed by
-/// kani_withdraw_insurance_vault_result_characterization.
-#[kani::proof]
-fn kani_withdraw_insurance_vault_reaches_zero() {
-    let insurance: u128 = kani::any();
-    // When vault == insurance (all capital already withdrawn, only insurance remains)
-    let vault_before = insurance;
-
-    let result = withdraw_insurance_vault(vault_before, insurance);
-    assert!(result.is_some(), "must succeed when vault == insurance");
-    assert_eq!(result.unwrap(), 0, "vault must be zero after withdrawing all insurance");
-}
-
 /// Prove complete result characterization for withdraw_insurance_vault:
 /// - `Some(vault_after)` iff insurance <= vault_before, with exact subtraction
 /// - `None` iff insurance > vault_before
