@@ -124,7 +124,9 @@ fn any_matcher_return_fields() -> MatcherReturnFields {
 }
 
 // =============================================================================
-// A. MATCHER ABI VALIDATION (11 proofs - program-level, keep these)
+// A. MATCHER ABI VALIDATION (8 proofs - program-level)
+// req_id/lp_account_id/oracle_price single-gate proofs removed:
+// subsumed by kani_abi_ok_equals_validate (section R)
 // =============================================================================
 
 /// Prove: wrong ABI version is always rejected
@@ -173,70 +175,6 @@ fn kani_matcher_rejects_rejected_flag() {
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
     assert!(result.is_err(), "REJECTED flag must cause rejection");
-}
-
-/// Prove: wrong req_id is always rejected
-#[kani::proof]
-fn kani_matcher_rejects_wrong_req_id() {
-    let mut ret = any_matcher_return();
-    ret.abi_version = MATCHER_ABI_VERSION;
-    ret.flags = FLAG_VALID;
-    ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
-
-    let lp_account_id: u64 = ret.lp_account_id;
-    let oracle_price: u64 = ret.oracle_price_e6;
-    let req_size: i128 = kani::any();
-    kani::assume(req_size != 0);
-    kani::assume(ret.exec_size != 0);
-    kani::assume(ret.exec_size.signum() == req_size.signum());
-    kani::assume(ret.exec_size.unsigned_abs() <= req_size.unsigned_abs());
-
-    let req_id: u64 = kani::any();
-    kani::assume(ret.req_id != req_id);
-
-    let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_err(), "wrong req_id must be rejected");
-}
-
-/// Prove: wrong lp_account_id is always rejected
-#[kani::proof]
-fn kani_matcher_rejects_wrong_lp_account_id() {
-    let mut ret = any_matcher_return();
-    ret.abi_version = MATCHER_ABI_VERSION;
-    ret.flags = FLAG_VALID;
-    ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
-
-    let lp_account_id: u64 = kani::any();
-    kani::assume(ret.lp_account_id != lp_account_id);
-
-    let oracle_price: u64 = ret.oracle_price_e6;
-    let req_size: i128 = kani::any();
-    let req_id: u64 = ret.req_id;
-
-    let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_err(), "wrong lp_account_id must be rejected");
-}
-
-/// Prove: wrong oracle_price is always rejected
-#[kani::proof]
-fn kani_matcher_rejects_wrong_oracle_price() {
-    let mut ret = any_matcher_return();
-    ret.abi_version = MATCHER_ABI_VERSION;
-    ret.flags = FLAG_VALID;
-    ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
-
-    let lp_account_id: u64 = ret.lp_account_id;
-    let oracle_price: u64 = kani::any();
-    kani::assume(ret.oracle_price_e6 != oracle_price);
-
-    let req_size: i128 = kani::any();
-    let req_id: u64 = ret.req_id;
-
-    let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-    assert!(result.is_err(), "wrong oracle_price must be rejected");
 }
 
 /// Prove: non-zero reserved field is always rejected
@@ -634,13 +572,14 @@ fn kani_trade_rejects_lp_mismatch() {
 }
 
 // =============================================================================
-// L. TRADECPI DECISION COUPLING (11 proofs) - CRITICAL
+// L. TRADECPI DECISION COUPLING - CRITICAL
 // These prove program-level policies, not just helper semantics.
 //
-// NOTE: The 8 specific gate-failure proofs (lines ~718-916) use concrete boolean
-// inputs and are individually superseded by the universal proofs in sections
-// AE (6 proofs) and AG/AI (kill-switch). They are retained as readable
-// documentation of each gate's rejection behavior and regression guards.
+// kani_decide_trade_cpi_universal fully characterizes the function:
+// Accept iff shape_ok && identity && pda && abi && user && lp && !(gate && risk).
+// Subsumes all individual gate rejection proofs (AE section) and the former
+// kani_tradecpi_allows_gate_risk_decrease. Individual AE proofs retained as
+// readable documentation.
 // =============================================================================
 
 /// Helper: create a valid shape for testing other conditions
@@ -653,10 +592,12 @@ fn valid_shape() -> MatcherAccountsShape {
     }
 }
 
-/// Prove: TradeCpi allows trade when gate_active=true but risk_increase=false
-/// Strengthened: shape and other booleans are symbolic (only constrain gate+risk)
+/// Universal characterization of decide_trade_cpi: fully symbolic inputs.
+/// Proves: Accept iff shape_ok && identity && pda && abi && user && lp && !(gate && risk).
+/// On Accept: new_nonce == nonce_on_success(old_nonce), chosen_size == exec_size.
+/// Subsumes kani_tradecpi_allows_gate_risk_decrease and all individual gate rejection proofs.
 #[kani::proof]
-fn kani_tradecpi_allows_gate_risk_decrease() {
+fn kani_decide_trade_cpi_universal() {
     let old_nonce: u64 = kani::any();
     let exec_size: i128 = kani::any();
     let shape = MatcherAccountsShape {
@@ -665,25 +606,38 @@ fn kani_tradecpi_allows_gate_risk_decrease() {
         ctx_owner_is_prog: kani::any(),
         ctx_len_ok: kani::any(),
     };
-    kani::assume(matcher_shape_ok(shape));
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let abi_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let gate_active: bool = kani::any();
+    let risk_increase: bool = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce,
-        shape,
-        true,  // identity_ok
-        true,  // pda_ok
-        true,  // abi_ok
-        true,  // user_auth_ok
-        true,  // lp_auth_ok
-        true,  // gate_active — ACTIVE
-        false, // risk_increase — NOT increasing
-        exec_size,
+        old_nonce, shape, identity_ok, pda_ok, abi_ok,
+        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size,
     );
 
-    assert!(
-        matches!(decision, TradeCpiDecision::Accept { .. }),
-        "TradeCpi must allow risk-reducing trade when gate active"
-    );
+    let should_accept = matcher_shape_ok(shape)
+        && identity_ok && pda_ok && abi_ok
+        && user_auth_ok && lp_auth_ok
+        && !(gate_active && risk_increase);
+
+    if should_accept {
+        match decision {
+            TradeCpiDecision::Accept { new_nonce, chosen_size } => {
+                assert_eq!(new_nonce, nonce_on_success(old_nonce),
+                    "accept nonce must be nonce_on_success(old_nonce)");
+                assert_eq!(chosen_size, exec_size,
+                    "accept chosen_size must equal exec_size");
+            }
+            _ => panic!("all gates pass but got Reject"),
+        }
+    } else {
+        assert_eq!(decision, TradeCpiDecision::Reject,
+            "any gate failure must produce Reject");
+    }
 }
 
 /// Prove: TradeCpi reject leaves nonce unchanged for all invalid matcher shapes.
