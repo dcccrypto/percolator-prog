@@ -1526,16 +1526,16 @@ fn kani_invert_zero_returns_raw() {
 #[kani::proof]
 fn kani_invert_nonzero_computes_correctly() {
     let raw: u64 = kani::any();
-    // Constrain to valid range where inversion must succeed, capped for SAT solver
+    // Bounded: 128-bit division + equality is SAT-heavy; 4096 keeps it under 30s
     kani::assume(raw > 0);
-    kani::assume(raw <= KANI_MAX_QUOTIENT); // also ensures result >= 1 since 1e12/4096 >> 1
+    kani::assume(raw <= 4096);
 
     let result = invert_price_e6(raw, 1);
 
-    // Force success - must not be None in valid range
+    // Must succeed: 1e12 / raw >= 1 when raw <= 1e12
     let inverted = result.expect("inversion must succeed for raw in (0, 1e12]");
 
-    // Verify correctness
+    // Verify correctness: exact floor division
     let expected = INVERSION_CONSTANT / (raw as u128);
     assert_eq!(
         inverted as u128, expected,
@@ -1552,16 +1552,12 @@ fn kani_invert_zero_raw_returns_none() {
     assert!(result.is_none(), "raw==0 must return None");
 }
 
-/// Prove: inverted==0 returns None (result too small)
-/// NOTE (WEAK): Only tests raw > 1e12; the overflow branch (inverted > u64::MAX)
-/// is proven dead by kani_invert_overflow_branch_is_dead above.
+/// Prove: inverted==0 returns None for ALL raw > INVERSION_CONSTANT
+/// Since 1e12 / raw < 1 when raw > 1e12, the result floors to 0 => None.
 #[kani::proof]
 fn kani_invert_result_zero_returns_none() {
-    // For inverted to be 0, we need 1e12 / raw < 1, i.e., raw > 1e12
-    // Use a representative value just above the threshold
-    let offset: u64 = kani::any();
-    kani::assume(offset <= KANI_MAX_QUOTIENT);
-    let raw = 1_000_000_000_001u64.saturating_add(offset);
+    let raw: u64 = kani::any();
+    kani::assume(raw > INVERSION_CONSTANT as u64);
 
     let result = invert_price_e6(raw, 1);
     assert!(
