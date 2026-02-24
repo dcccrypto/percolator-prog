@@ -1477,17 +1477,17 @@ fn kani_invert_zero_returns_raw() {
 
 /// Prove: invert!=0 with valid raw returns correct floor(1e12/raw)
 /// NON-VACUOUS: forces success path by constraining raw to valid range
+/// Bounded to 8192: 128-bit division + equality is SAT-heavy (~66s)
 #[kani::proof]
 fn kani_invert_nonzero_computes_correctly() {
     let raw: u64 = kani::any();
-    // Bounded: 128-bit division + equality is SAT-heavy; 4096 keeps it under 30s
     kani::assume(raw > 0);
-    kani::assume(raw <= 4096);
+    kani::assume(raw <= 8192);
 
     let result = invert_price_e6(raw, 1);
 
     // Must succeed: 1e12 / raw >= 1 when raw <= 1e12
-    let inverted = result.expect("inversion must succeed for raw in (0, 1e12]");
+    let inverted = result.expect("inversion must succeed for raw in (0, 8192]");
 
     // Verify correctness: exact floor division
     let expected = INVERSION_CONSTANT / (raw as u128);
@@ -2812,13 +2812,13 @@ fn kani_scale_price_e6_identity_for_scale_leq_1() {
 /// - oracle_scaled = oracle_price / unit_scale (via scale_price_e6)
 ///
 /// Both divide by the same unit_scale, so margin ratios are preserved.
-/// Uses u8 inputs for SAT tractability (deep multiplication chains).
+/// Uses u16 multipliers + u8 scale/pos for SAT tractability (deep multiplication chains).
 #[kani::proof]
 fn kani_scale_price_and_base_to_units_use_same_divisor() {
-    // u8 inputs keep the 3-deep multiplication chain SAT-tractable
+    // u16 multipliers + u8 scale/pos keep the 3-deep chain SAT-tractable
     let scale_raw: u8 = kani::any();
-    let base_mult: u8 = kani::any();
-    let price_mult: u8 = kani::any();
+    let base_mult: u16 = kani::any();
+    let price_mult: u16 = kani::any();
     let pos_raw: u8 = kani::any();
 
     kani::assume(scale_raw >= 2);
@@ -2858,12 +2858,11 @@ fn kani_scale_price_and_base_to_units_use_same_divisor() {
 }
 
 /// Prove scaled-price math preserves conservative margin behavior under unit scaling.
-/// Uses tightly bounded u8 inputs for SAT tractability (deep multiplication chains).
+/// Uses u16 multipliers + u8 scale/bps for SAT tractability.
 #[kani::proof]
 fn kani_scale_price_e6_concrete_example() {
-    // Use u8 inputs to keep multiplication chains tractable for SAT solver.
     let scale_raw: u8 = kani::any();
-    let price_mult: u8 = kani::any();
+    let price_mult: u16 = kani::any();
     let pos_raw: u8 = kani::any();
     let bps_raw: u8 = kani::any();
 
@@ -2969,7 +2968,8 @@ fn kani_clamp_toward_bootstrap_when_index_zero() {
 }
 
 /// Prove: Index movement is always bounded by computed max_delta.
-/// Uses u8-range inputs to keep the triple-multiplication SAT tractable.
+/// Uses u8-range inputs; triple-multiplication chain limits SAT tractability.
+/// Companion: kani_clamp_toward_saturation_paths covers large u64 values.
 #[kani::proof]
 fn kani_clamp_toward_movement_bounded_concrete() {
     let index_raw: u8 = kani::any();
@@ -3000,26 +3000,27 @@ fn kani_clamp_toward_movement_bounded_concrete() {
 }
 
 /// Shared bounded symbolic domain for clamp branch formula proofs.
-/// Bounds are chosen to keep SAT tractable while preserving symbolic cap/dt.
+/// Bounds widened to u16 index/mark while keeping triple-multiply SAT tractable.
 fn any_clamp_formula_inputs() -> (u64, u64, u64, u64, u64, u64) {
-    let index_raw: u8 = kani::any();
+    let index_raw: u16 = kani::any();
     let cap_steps_raw: u8 = kani::any(); // 1 step = 10_000 e2bps (1.00%)
     let dt_slots_raw: u8 = kani::any();
     let mark_raw: u16 = kani::any();
 
     kani::assume(index_raw >= 100);
-    kani::assume(index_raw <= 200);
+    kani::assume(index_raw <= 1000);
     kani::assume(cap_steps_raw > 0);
     kani::assume(cap_steps_raw <= 5); // 1%..5% cap
     kani::assume(dt_slots_raw > 0);
     kani::assume(dt_slots_raw <= 20);
-    kani::assume(mark_raw <= 400);
+    kani::assume(mark_raw <= 2000);
 
     let index_u32 = index_raw as u32;
     let cap_u32 = (cap_steps_raw as u32) * 10_000u32;
     let dt_u32 = dt_slots_raw as u32;
 
     // With the bounds above, this product fits in u32 without overflow.
+    // max: 1000 * 50000 * 20 = 1_000_000_000 < u32::MAX
     let max_delta = (index_u32 * cap_u32 * dt_u32 / 1_000_000u32) as u64;
     let index = index_u32 as u64;
     kani::assume(max_delta > 0); // Non-trivial clamping regime
