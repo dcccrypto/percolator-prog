@@ -3283,3 +3283,329 @@ fn test_close_slab_non_admin_rejected() {
         "Slab should still be initialized after failed close"
     );
 }
+
+// === UpdateHyperpMark — Minimum DEX Liquidity Tests (PERC-141 / GH #297 Fix 1) ===
+
+/// Build a PumpSwap pool account mock.
+/// Layout: 195+ bytes, with base_vault at offset 131, quote_vault at offset 163.
+fn make_pumpswap_pool(base_vault_key: &Pubkey, quote_vault_key: &Pubkey) -> Vec<u8> {
+    let mut data = vec![0u8; 256]; // generous size
+                                   // base_vault at offset 131
+    data[131..163].copy_from_slice(base_vault_key.as_ref());
+    // quote_vault at offset 163
+    data[163..195].copy_from_slice(quote_vault_key.as_ref());
+    data
+}
+
+/// Build a mock SPL token account with the given amount at the standard offset (64).
+fn make_spl_vault(amount: u64) -> Vec<u8> {
+    let mut data = vec![0u8; 165]; // SPL Token Account is 165 bytes
+                                   // Amount at offset 64 (le bytes)
+    data[64..72].copy_from_slice(&amount.to_le_bytes());
+    data
+}
+
+/// Encode an InitMarket instruction for a Hyperp market (index_feed_id = [0; 32]).
+fn encode_init_hyperp_market(
+    admin_key: &Pubkey,
+    mint_key: &Pubkey,
+    initial_mark_price_e6: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8]; // Tag 0 = InitMarket
+    encode_pubkey(admin_key, &mut data);
+    encode_pubkey(mint_key, &mut data);
+    encode_bytes32(&[0u8; 32], &mut data); // index_feed_id = all zeros (Hyperp mode)
+    encode_u64(100, &mut data); // max_staleness_secs
+    encode_u16(500, &mut data); // conf_filter_bps
+    data.push(0u8); // invert
+    encode_u32(0, &mut data); // unit_scale
+    encode_u64(initial_mark_price_e6, &mut data); // initial_mark_price_e6 — REQUIRED for Hyperp
+                                                  // RiskParams
+    encode_u64(0, &mut data); // warmup_period_slots
+    encode_u64(500, &mut data); // maintenance_margin_bps
+    encode_u64(1000, &mut data); // initial_margin_bps
+    encode_u64(30, &mut data); // trading_fee_bps
+    encode_u64(64, &mut data); // max_accounts
+    encode_u128(0, &mut data); // new_account_fee
+    encode_u128(0, &mut data); // risk_reduction_threshold
+    encode_u128(0, &mut data); // maintenance_fee_per_slot
+    encode_u64(100, &mut data); // max_crank_staleness_slots
+    encode_u64(0, &mut data); // liquidation_fee_bps
+    encode_u128(0, &mut data); // liquidation_fee_cap
+    encode_u64(0, &mut data); // liquidation_buffer_bps
+    encode_u128(0, &mut data); // min_liquidation_abs
+    data
+}
+
+/// Encode UpdateHyperpMark instruction (Tag 34, no body payload).
+fn encode_update_hyperp_mark() -> Vec<u8> {
+    vec![percolator_prog::tags::TAG_UPDATE_HYPERP_MARK]
+}
+
+/// Setup a Hyperp market fixture: same as setup_market() but will be
+/// initialized with index_feed_id = [0;32] for Hyperp mode.
+fn setup_hyperp_market() -> MarketFixture {
+    // Reuse the same fixture as setup_market — the Hyperp mode is determined
+    // by the instruction data (index_feed_id = [0;32]), not the accounts.
+    setup_market()
+}
+
+/// Test: UpdateHyperpMark rejects when PumpSwap pool has insufficient liquidity.
+/// GH #297 Fix 1: Minimum DEX liquidity check prevents bootstrap manipulation.
+#[test]
+fn test_update_hyperp_mark_rejects_insufficient_pumpswap_liquidity() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 100_000_000u64; // $100 in e6
+
+    // Initialize a Hyperp market (same account layout as test_init_market)
+    let init_data = encode_init_hyperp_market(&f.admin.key, &f.mint.key, initial_mark);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = [
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        let res = process_instruction(&f.program_id, &accounts, &init_data);
+        assert!(res.is_ok(), "InitMarket Hyperp should succeed: {:?}", res);
+    }
+
+    // Verify market is in Hyperp mode
+    let config = state::read_config(&f.slab.data);
+    assert!(oracle::is_hyperp_mode(&config), "Should be Hyperp mode");
+    assert_eq!(
+        config.authority_price_e6, initial_mark,
+        "Initial mark should be set"
+    );
+
+    // Build PumpSwap pool with LOW liquidity (1 lamport quote = way below threshold)
+    let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
+    let base_vault_key = Pubkey::new_unique();
+    let quote_vault_key = Pubkey::new_unique();
+    let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
+
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
+    let mut base_vault =
+        TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000)); // 1 token
+    let mut quote_vault = TestAccount::new(quote_vault_key, spl_token::ID, 0, make_spl_vault(1)); // 1 lamport — insufficient
+
+    // Advance clock so dt_slots > 0
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200), // slot 200 > 100
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        base_vault.to_info(),
+        quote_vault.to_info(),
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert_eq!(
+        res,
+        Err(PercolatorError::InsufficientDexLiquidity.into()),
+        "UpdateHyperpMark should reject insufficient DEX liquidity"
+    );
+}
+
+/// Test: UpdateHyperpMark succeeds when PumpSwap pool has sufficient liquidity.
+#[test]
+fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 100_000_000u64; // $100 in e6
+
+    // Initialize a Hyperp market
+    let init_data = encode_init_hyperp_market(&f.admin.key, &f.mint.key, initial_mark);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = [
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        let res = process_instruction(&f.program_id, &accounts, &init_data);
+        assert!(res.is_ok(), "InitMarket Hyperp should succeed: {:?}", res);
+    }
+
+    // Build PumpSwap pool with SUFFICIENT liquidity (200M quote = $200 USDC)
+    let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
+    let base_vault_key = Pubkey::new_unique();
+    let quote_vault_key = Pubkey::new_unique();
+    let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
+
+    let base_amount = 2_000_000u64; // 2 tokens (base)
+    let quote_amount = 200_000_000u64; // 200 USDC — well above 100M threshold
+
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
+    let mut base_vault = TestAccount::new(
+        base_vault_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(base_amount),
+    );
+    let mut quote_vault = TestAccount::new(
+        quote_vault_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(quote_amount),
+    );
+
+    // Advance clock
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        base_vault.to_info(),
+        quote_vault.to_info(),
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert!(
+        res.is_ok(),
+        "UpdateHyperpMark should succeed with sufficient liquidity: {:?}",
+        res
+    );
+
+    // Verify mark price was updated (should be EMA between initial mark and DEX price)
+    let config = state::read_config(&f.slab.data);
+    assert_ne!(
+        config.authority_price_e6, 0,
+        "Mark price should be non-zero"
+    );
+}
+
+/// Test: UpdateHyperpMark rejects on exactly-at-boundary liquidity (edge case).
+/// quote_liquidity == MIN_DEX_QUOTE_LIQUIDITY - 1 should be rejected.
+#[test]
+fn test_update_hyperp_mark_boundary_liquidity() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 100_000_000u64;
+
+    // Initialize Hyperp market
+    let init_data = encode_init_hyperp_market(&f.admin.key, &f.mint.key, initial_mark);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = [
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        let res = process_instruction(&f.program_id, &accounts, &init_data);
+        assert!(res.is_ok(), "InitMarket should succeed: {:?}", res);
+    }
+
+    // Pool with exactly threshold - 1 liquidity
+    let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
+    let base_vault_key = Pubkey::new_unique();
+    let quote_vault_key = Pubkey::new_unique();
+    let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
+
+    let threshold = percolator_prog::constants::MIN_DEX_QUOTE_LIQUIDITY;
+    let below_threshold = threshold.saturating_sub(1);
+
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
+    let mut base_vault =
+        TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000));
+    let mut quote_vault = TestAccount::new(
+        quote_vault_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(below_threshold),
+    );
+
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        base_vault.to_info(),
+        quote_vault.to_info(),
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert_eq!(
+        res,
+        Err(PercolatorError::InsufficientDexLiquidity.into()),
+        "Boundary case: threshold-1 should be rejected"
+    );
+}
+
+/// Test: Non-Hyperp market cannot use UpdateHyperpMark (existing security check).
+#[test]
+fn test_update_hyperp_mark_rejects_non_hyperp_market() {
+    let mut f = setup_market();
+    let crank_staleness = 100u64;
+    let init_data = encode_init_market(&f, crank_staleness);
+
+    // Init a standard (Pyth) market
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = [
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        let res = process_instruction(&f.program_id, &accounts, &init_data);
+        assert!(res.is_ok(), "InitMarket should succeed");
+    }
+
+    // Try UpdateHyperpMark on non-Hyperp market — should fail
+    let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, vec![0u8; 256]);
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    let accounts = [f.slab.to_info(), pool_account.to_info(), clock.to_info()];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert!(
+        res.is_err(),
+        "UpdateHyperpMark should reject non-Hyperp markets"
+    );
+}
