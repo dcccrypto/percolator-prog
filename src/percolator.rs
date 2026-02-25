@@ -5508,6 +5508,20 @@ pub mod processor {
                 require_admin(header.admin, a_admin.key)?;
 
                 let mut config = state::read_config(&data);
+
+                // SECURITY (#297 Fix 2): Prevent admin from disabling circuit breaker
+                // on Hyperp markets. Enforce minimum cap to protect EMA from manipulation.
+                if oracle::is_hyperp_mode(&config)
+                    && max_change_e2bps < crate::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS
+                {
+                    msg!(
+                        "SetOracleCap: Hyperp markets require cap >= {} (got {})",
+                        crate::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+                        max_change_e2bps
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 config.oracle_price_cap_e2bps = max_change_e2bps;
                 state::write_config(&mut data, &config);
             }
@@ -6623,14 +6637,21 @@ pub mod processor {
 
                 let dex_price = dex_result.price_e6;
 
-                // Apply EMA smoothing with circuit breaker
+                // SECURITY (#297 Fix 2): Circuit breaker BEFORE EMA update.
+                // The DEX spot price must be clamped before it propagates into the EMA.
+                // Enforce a minimum cap — even if admin set oracle_price_cap_e2bps to 0,
+                // Hyperp markets always use at least DEFAULT_HYPERP_PRICE_CAP_E2BPS.
                 let prev_mark = config.authority_price_e6;
+                let effective_cap = core::cmp::max(
+                    config.oracle_price_cap_e2bps,
+                    crate::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+                );
                 let new_mark = oracle::compute_ema_mark_price(
                     prev_mark,
                     dex_price,
                     dt_slots,
                     crate::constants::MARK_PRICE_EMA_ALPHA_E6,
-                    config.oracle_price_cap_e2bps,
+                    effective_cap,
                 );
 
                 config.authority_price_e6 = new_mark;

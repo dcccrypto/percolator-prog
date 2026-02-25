@@ -3587,3 +3587,49 @@ fn test_update_hyperp_mark_rejects_non_hyperp_market() {
     let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
     assert!(res.is_err(), "UpdateHyperpMark should reject non-Hyperp markets");
 }
+
+// === PERC-142: Circuit breaker BEFORE EMA update tests ===
+
+/// Test: compute_ema_mark_price clamps oracle before EMA blending.
+/// A large oracle deviation should be bounded by the cap.
+#[test]
+fn test_circuit_breaker_clamps_before_ema() {
+    use percolator_prog::oracle::compute_ema_mark_price;
+
+    let prev_mark = 100_000_000u64; // $100 in e6
+    let wild_oracle = 200_000_000u64; // $200 — 100% deviation
+    let cap = 10_000u64; // 1% per slot
+    let dt = 1u64;
+    let alpha = 100_000u64; // 10% EMA weight
+
+    let result = compute_ema_mark_price(prev_mark, wild_oracle, dt, alpha, cap);
+
+    // With 1% cap and dt=1: max deviation = 100M * 10000 / 1M = 1M
+    // Clamped oracle = 101_000_000
+    // EMA: 0.1 * 101M + 0.9 * 100M = 10.1M + 90M = 100.1M
+    assert!(result <= 101_000_000, "result {} should be capped", result);
+    assert!(result > prev_mark, "result should increase toward oracle");
+}
+
+/// Test: with cap=0, the effective cap in UpdateHyperpMark should still use DEFAULT.
+/// This tests the max() enforcement added in PERC-142.
+#[test]
+fn test_hyperp_effective_cap_enforces_minimum() {
+    use percolator_prog::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS;
+    use percolator_prog::oracle::compute_ema_mark_price;
+
+    let prev_mark = 100_000_000u64;
+    let oracle = 200_000_000u64;
+    let dt = 1u64;
+    let alpha = 500_000u64; // 50% weight
+
+    // With cap=0, compute_ema_mark_price would return oracle directly (no clamping).
+    let no_cap_result = compute_ema_mark_price(prev_mark, oracle, dt, alpha, 0);
+    assert_eq!(no_cap_result, 150_000_000, "no cap: should be raw EMA blend");
+
+    // With effective_cap = max(0, DEFAULT), the result should be clamped.
+    let effective_cap = core::cmp::max(0u64, DEFAULT_HYPERP_PRICE_CAP_E2BPS);
+    let capped_result = compute_ema_mark_price(prev_mark, oracle, dt, alpha, effective_cap);
+    assert!(capped_result < no_cap_result, "capped {} should be less than uncapped {}", capped_result, no_cap_result);
+    assert!(capped_result > prev_mark, "should still move toward oracle");
+}
