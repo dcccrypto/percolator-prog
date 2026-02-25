@@ -3290,7 +3290,7 @@ fn test_close_slab_non_admin_rejected() {
 /// Layout: 195+ bytes, with base_vault at offset 131, quote_vault at offset 163.
 fn make_pumpswap_pool(base_vault_key: &Pubkey, quote_vault_key: &Pubkey) -> Vec<u8> {
     let mut data = vec![0u8; 256]; // generous size
-    // base_vault at offset 131
+                                   // base_vault at offset 131
     data[131..163].copy_from_slice(base_vault_key.as_ref());
     // quote_vault at offset 163
     data[163..195].copy_from_slice(quote_vault_key.as_ref());
@@ -3300,7 +3300,7 @@ fn make_pumpswap_pool(base_vault_key: &Pubkey, quote_vault_key: &Pubkey) -> Vec<
 /// Build a mock SPL token account with the given amount at the standard offset (64).
 fn make_spl_vault(amount: u64) -> Vec<u8> {
     let mut data = vec![0u8; 165]; // SPL Token Account is 165 bytes
-    // Amount at offset 64 (le bytes)
+                                   // Amount at offset 64 (le bytes)
     data[64..72].copy_from_slice(&amount.to_le_bytes());
     data
 }
@@ -3320,7 +3320,7 @@ fn encode_init_hyperp_market(
     data.push(0u8); // invert
     encode_u32(0, &mut data); // unit_scale
     encode_u64(initial_mark_price_e6, &mut data); // initial_mark_price_e6 — REQUIRED for Hyperp
-    // RiskParams
+                                                  // RiskParams
     encode_u64(0, &mut data); // warmup_period_slots
     encode_u64(500, &mut data); // maintenance_margin_bps
     encode_u64(1000, &mut data); // initial_margin_bps
@@ -3379,7 +3379,10 @@ fn test_update_hyperp_mark_rejects_insufficient_pumpswap_liquidity() {
     // Verify market is in Hyperp mode
     let config = state::read_config(&f.slab.data);
     assert!(oracle::is_hyperp_mode(&config), "Should be Hyperp mode");
-    assert_eq!(config.authority_price_e6, initial_mark, "Initial mark should be set");
+    assert_eq!(
+        config.authority_price_e6, initial_mark,
+        "Initial mark should be set"
+    );
 
     // Build PumpSwap pool with LOW liquidity (1 lamport quote = way below threshold)
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
@@ -3388,7 +3391,8 @@ fn test_update_hyperp_mark_rejects_insufficient_pumpswap_liquidity() {
     let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
-    let mut base_vault = TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000)); // 1 token
+    let mut base_vault =
+        TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000)); // 1 token
     let mut quote_vault = TestAccount::new(quote_vault_key, spl_token::ID, 0, make_spl_vault(1)); // 1 lamport — insufficient
 
     // Advance clock so dt_slots > 0
@@ -3450,8 +3454,18 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
     let quote_amount = 200_000_000u64; // 200 USDC — well above 100M threshold
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
-    let mut base_vault = TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(base_amount));
-    let mut quote_vault = TestAccount::new(quote_vault_key, spl_token::ID, 0, make_spl_vault(quote_amount));
+    let mut base_vault = TestAccount::new(
+        base_vault_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(base_amount),
+    );
+    let mut quote_vault = TestAccount::new(
+        quote_vault_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(quote_amount),
+    );
 
     // Advance clock
     let mut clock = TestAccount::new(
@@ -3478,7 +3492,10 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
 
     // Verify mark price was updated (should be EMA between initial mark and DEX price)
     let config = state::read_config(&f.slab.data);
-    assert_ne!(config.authority_price_e6, 0, "Mark price should be non-zero");
+    assert_ne!(
+        config.authority_price_e6, 0,
+        "Mark price should be non-zero"
+    );
 }
 
 /// Test: UpdateHyperpMark rejects on exactly-at-boundary liquidity (edge case).
@@ -3517,8 +3534,14 @@ fn test_update_hyperp_mark_boundary_liquidity() {
     let below_threshold = threshold.saturating_sub(1);
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
-    let mut base_vault = TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000));
-    let mut quote_vault = TestAccount::new(quote_vault_key, spl_token::ID, 0, make_spl_vault(below_threshold));
+    let mut base_vault =
+        TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000));
+    let mut quote_vault = TestAccount::new(
+        quote_vault_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(below_threshold),
+    );
 
     let mut clock = TestAccount::new(
         solana_program::sysvar::clock::id(),
@@ -3578,12 +3601,11 @@ fn test_update_hyperp_mark_rejects_non_hyperp_market() {
         make_clock(200, 200),
     );
 
-    let accounts = [
-        f.slab.to_info(),
-        pool_account.to_info(),
-        clock.to_info(),
-    ];
+    let accounts = [f.slab.to_info(), pool_account.to_info(), clock.to_info()];
 
     let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
-    assert!(res.is_err(), "UpdateHyperpMark should reject non-Hyperp markets");
+    assert!(
+        res.is_err(),
+        "UpdateHyperpMark should reject non-Hyperp markets"
+    );
 }

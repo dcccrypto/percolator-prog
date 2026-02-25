@@ -2864,68 +2864,67 @@ pub mod oracle {
         // Use the DEX pool's own pubkey as the feed ID (standard for Hyperp mode)
         let dex_feed_id = price_ai.key.to_bytes();
 
-        let (raw_price, quote_liquidity) =
-            if *price_ai.owner == PUMPSWAP_PROGRAM_ID {
-                // PumpSwap: read price and extract quote vault balance as liquidity
-                let pool_data = price_ai.try_borrow_data()?;
-                if pool_data.len() < PUMPSWAP_MIN_LEN {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                if remaining_accounts.len() < 2 {
-                    return Err(ProgramError::NotEnoughAccountKeys);
-                }
+        let (raw_price, quote_liquidity) = if *price_ai.owner == PUMPSWAP_PROGRAM_ID {
+            // PumpSwap: read price and extract quote vault balance as liquidity
+            let pool_data = price_ai.try_borrow_data()?;
+            if pool_data.len() < PUMPSWAP_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            if remaining_accounts.len() < 2 {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            }
 
-                // Read quote vault balance as liquidity metric
-                let quote_vault_data = remaining_accounts[1].try_borrow_data()?;
-                if quote_vault_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let quote_amount = u64::from_le_bytes(
-                    quote_vault_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+            // Read quote vault balance as liquidity metric
+            let quote_vault_data = remaining_accounts[1].try_borrow_data()?;
+            if quote_vault_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let quote_amount = u64::from_le_bytes(
+                quote_vault_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            // Drop borrows before calling read_pumpswap_price_e6 which re-borrows
+            drop(quote_vault_data);
+            drop(pool_data);
+
+            let price = read_pumpswap_price_e6(price_ai, &dex_feed_id, remaining_accounts)?;
+            (price, quote_amount)
+        } else if *price_ai.owner == RAYDIUM_CLMM_PROGRAM_ID {
+            // Raydium CLMM: use the liquidity field as depth indicator
+            let data = price_ai.try_borrow_data()?;
+            if data.len() < RAYDIUM_CLMM_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // Raydium CLMM pool has a liquidity field (u128) at offset 237
+            // This represents the active in-range liquidity
+            const RAYDIUM_CLMM_OFF_LIQUIDITY: usize = 237;
+            let liquidity = if data.len() >= RAYDIUM_CLMM_OFF_LIQUIDITY + 16 {
+                let liq = u128::from_le_bytes(
+                    data[RAYDIUM_CLMM_OFF_LIQUIDITY..RAYDIUM_CLMM_OFF_LIQUIDITY + 16]
                         .try_into()
                         .unwrap(),
                 );
-                // Drop borrows before calling read_pumpswap_price_e6 which re-borrows
-                drop(quote_vault_data);
-                drop(pool_data);
-
-                let price = read_pumpswap_price_e6(price_ai, &dex_feed_id, remaining_accounts)?;
-                (price, quote_amount)
-            } else if *price_ai.owner == RAYDIUM_CLMM_PROGRAM_ID {
-                // Raydium CLMM: use the liquidity field as depth indicator
-                let data = price_ai.try_borrow_data()?;
-                if data.len() < RAYDIUM_CLMM_MIN_LEN {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                // Raydium CLMM pool has a liquidity field (u128) at offset 237
-                // This represents the active in-range liquidity
-                const RAYDIUM_CLMM_OFF_LIQUIDITY: usize = 237;
-                let liquidity = if data.len() >= RAYDIUM_CLMM_OFF_LIQUIDITY + 16 {
-                    let liq = u128::from_le_bytes(
-                        data[RAYDIUM_CLMM_OFF_LIQUIDITY..RAYDIUM_CLMM_OFF_LIQUIDITY + 16]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    // Convert to u64 by taking sqrt (liquidity in CLMM is L^2-like)
-                    // Use a rough approximation: if liq > u64::MAX, saturate
-                    core::cmp::min(liq, u64::MAX as u128) as u64
-                } else {
-                    0
-                };
-                drop(data);
-
-                let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
-                (price, liquidity)
-            } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
-                // Meteora DLMM: no direct liquidity field accessible without scanning bins.
-                // The price calculation succeeding (non-zero result) implies SOME liquidity.
-                // We use u64::MAX as a sentinel meaning "liquidity not measurable but present".
-                // The caller can skip the liquidity check for Meteora or use a different threshold.
-                let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
-                (price, u64::MAX)
+                // Convert to u64 by taking sqrt (liquidity in CLMM is L^2-like)
+                // Use a rough approximation: if liq > u64::MAX, saturate
+                core::cmp::min(liq, u64::MAX as u128) as u64
             } else {
-                return Err(PercolatorError::OracleInvalid.into());
+                0
             };
+            drop(data);
+
+            let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
+            (price, liquidity)
+        } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
+            // Meteora DLMM: no direct liquidity field accessible without scanning bins.
+            // The price calculation succeeding (non-zero result) implies SOME liquidity.
+            // We use u64::MAX as a sentinel meaning "liquidity not measurable but present".
+            // The caller can skip the liquidity check for Meteora or use a different threshold.
+            let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
+            (price, u64::MAX)
+        } else {
+            return Err(PercolatorError::OracleInvalid.into());
+        };
 
         // Apply inversion and unit scaling to the price
         let price_after_invert = crate::verify::invert_price_e6(raw_price, invert)
