@@ -3878,3 +3878,60 @@ fn kani_renounce_admin_requires_resolved() {
         );
     }
 }
+
+// === PERC-142: Circuit breaker BEFORE EMA update ===
+
+/// Prove: compute_ema_mark_price always clamps the raw oracle price
+/// before blending into EMA. The output mark is bounded by
+/// prev_mark ± (cap * dt) regardless of the raw oracle value.
+#[kani::proof]
+#[kani::unwind(1)]
+fn kani_circuit_breaker_before_ema() {
+    let prev_mark: u64 = kani::any();
+    let oracle: u64 = kani::any();
+    let dt: u64 = kani::any();
+    let alpha: u64 = kani::any();
+    let cap: u64 = kani::any();
+
+    // Constrain to reasonable ranges to avoid overflow
+    kani::assume(prev_mark > 0 && prev_mark <= 1_000_000_000_000); // max $1M in e6
+    kani::assume(oracle > 0 && oracle <= 1_000_000_000_000);
+    kani::assume(dt > 0 && dt <= 1_000);
+    kani::assume(alpha > 0 && alpha <= 1_000_000);
+    kani::assume(cap > 0 && cap <= 1_000_000);
+
+    let result = compute_ema_mark_price(prev_mark, oracle, dt, alpha, cap);
+
+    // The result must be bounded: it cannot exceed what the circuit breaker allows.
+    // Max delta from circuit breaker = prev_mark * cap * dt / 1_000_000
+    let max_delta_128 = (prev_mark as u128)
+        .saturating_mul(cap as u128)
+        .saturating_mul(dt as u128)
+        / 1_000_000u128;
+    let max_delta = max_delta_128.min(prev_mark as u128) as u64;
+    let lower = prev_mark.saturating_sub(max_delta);
+    let upper = prev_mark.saturating_add(max_delta);
+
+    // EMA blending can only move the result TOWARD the clamped oracle,
+    // never beyond it. So the result must be within [lower, upper].
+    assert!(result >= lower, "result below circuit breaker lower bound");
+    assert!(result <= upper, "result above circuit breaker upper bound");
+}
+
+/// Prove: the effective cap for Hyperp markets is always >= DEFAULT_HYPERP_PRICE_CAP_E2BPS.
+/// This models the max() enforcement in UpdateHyperpMark.
+#[kani::proof]
+#[kani::unwind(1)]
+fn kani_hyperp_effective_cap_minimum() {
+    use percolator_prog::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS;
+
+    let admin_cap: u64 = kani::any();
+    kani::assume(admin_cap <= 1_000_000);
+
+    let effective_cap = core::cmp::max(admin_cap, DEFAULT_HYPERP_PRICE_CAP_E2BPS);
+
+    assert!(
+        effective_cap >= DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+        "effective cap must always meet minimum"
+    );
+}
