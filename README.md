@@ -483,3 +483,17 @@ npx tsx tests/t22-devnet-stress.ts
 ```
 
 These addresses are deployed on Solana **devnet**.
+
+---
+
+## Related Repositories
+
+| Repository | Description |
+|-----------|-------------|
+| [percolator](https://github.com/dcccrypto/percolator) | Core risk engine crate (Rust) — the accounting engine this program wraps |
+| [percolator-matcher](https://github.com/dcccrypto/percolator-matcher) | Reference matcher program for LP pricing via CPI |
+| [percolator-stake](https://github.com/dcccrypto/percolator-stake) | Insurance LP staking program |
+| [percolator-sdk](https://github.com/dcccrypto/percolator-sdk) | TypeScript SDK for client integration |
+| [percolator-ops](https://github.com/dcccrypto/percolator-ops) | Operations dashboard |
+| [percolator-mobile](https://github.com/dcccrypto/percolator-mobile) | Solana Seeker mobile trading app |
+| [percolator-launch](https://github.com/dcccrypto/percolator-launch) | Full-stack launch platform (monorepo) |
