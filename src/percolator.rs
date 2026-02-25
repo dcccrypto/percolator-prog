@@ -972,14 +972,15 @@ pub mod zc {
 
     use solana_program::{
         account_info::AccountInfo, instruction::Instruction as SolInstruction,
-        program::invoke_signed,
+        program::invoke_signed_unchecked,
     };
 
     /// Invoke the matcher program via CPI with proper lifetime coercion.
     ///
-    /// This is the ONLY place where unsafe lifetime transmute is allowed.
-    /// The transmute is sound because:
-    /// - We are shortening lifetime from 'a (caller) to local scope
+    /// PERC-154: Uses invoke_signed_unchecked to skip RefCell borrow validation
+    /// (~200 CU savings). This is safe because:
+    /// - a_lp_pda is system-owned with empty data (no RefCell contention)
+    /// - a_matcher_ctx is writable and we don't hold borrows across the CPI
     /// - The AccountInfo is only used for the duration of invoke_signed
     /// - We don't hold references past the function call
     #[inline]
@@ -992,10 +993,12 @@ pub mod zc {
     ) -> Result<(), ProgramError> {
         // SAFETY: AccountInfos have lifetime 'a from the caller.
         // We clone them to get owned values (still with 'a lifetime internally).
-        // The invoke_signed call consumes them by reference and returns.
-        // No lifetime extension occurs.
+        // The invoke_signed_unchecked call consumes them by reference and returns.
+        // No lifetime extension occurs. RefCell validation skipped because:
+        // - a_lp_pda is system-owned PDA with 0 data and 0 lamports (validated earlier)
+        // - a_matcher_ctx borrow was dropped before this call
         let infos = [a_lp_pda.clone(), a_matcher_ctx.clone()];
-        invoke_signed(ix, &infos, &[seeds])
+        invoke_signed_unchecked(ix, &infos, &[seeds])
     }
 }
 
