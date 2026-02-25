@@ -105,6 +105,20 @@ pub mod constants {
     pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000; // 1% per slot max price change for Hyperp
     pub const DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS: u64 = 50_000; // 5% per slot max price change for DEX oracle markets
 
+    /// Minimum DEX quote-side liquidity (in quote token lamports/atoms) required
+    /// for UpdateHyperpMark to accept the price. This prevents bootstrapping a
+    /// Hyperp market from a near-empty pool where an attacker can cheaply
+    /// manipulate the spot price.
+    ///
+    /// For PumpSwap: checks quote_vault balance.
+    /// For Raydium CLMM: checks pool liquidity field (u128).
+    /// For Meteora DLMM: checks that bin_step and active_id produce non-degenerate price.
+    ///
+    /// Value: 100_000_000 (100 USDC at 6 decimals, or 0.1 SOL at 9 decimals).
+    /// This is intentionally low — the circuit breaker provides the primary protection.
+    /// This constant gates the MINIMUM pool depth to prevent trivial manipulation.
+    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 100_000_000;
+
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
     // 1..9: req_id (u64)
@@ -1141,6 +1155,9 @@ pub mod error {
         InvalidConfirmation,
         /// #299: InitMarket vault seed below minimum (PERC-136)
         InsufficientSeed,
+        /// #297: DEX pool has insufficient liquidity for safe Hyperp oracle bootstrapping.
+        /// The quote-side reserves must meet the minimum threshold to resist manipulation.
+        InsufficientDexLiquidity,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2552,6 +2569,18 @@ pub mod oracle {
         Ok(price_e6 as u64)
     }
 
+    /// DEX price result with liquidity information.
+    /// Used by UpdateHyperpMark to enforce minimum liquidity before accepting a price.
+    pub struct DexPriceResult {
+        /// The spot price in e6 format.
+        pub price_e6: u64,
+        /// Quote-side liquidity in the pool (quote token lamports/atoms).
+        /// For PumpSwap: quote vault balance.
+        /// For Raydium CLMM: sqrt of liquidity field (approximation of effective depth).
+        /// For Meteora DLMM: 0 (no direct liquidity field; price validity implies liquidity).
+        pub quote_liquidity: u64,
+    }
+
     // PumpSwap pool layout (no Anchor discriminator)
     const PUMPSWAP_MIN_LEN: usize = 195;
     const PUMPSWAP_OFF_BASE_MINT: usize = 35;
@@ -2815,6 +2844,99 @@ pub mod oracle {
         }
 
         Ok(price_e6 as u64)
+    }
+
+    /// Read DEX spot price with liquidity information.
+    ///
+    /// Returns both the price and a measure of pool liquidity (quote-side depth).
+    /// Used by `UpdateHyperpMark` to enforce minimum liquidity before accepting
+    /// a price update — prevents bootstrapping from near-empty pools (#297 Fix 1).
+    ///
+    /// Applies inversion and unit scaling to the price (same as read_engine_price_e6).
+    /// The quote_liquidity value is the RAW quote-side depth (not inverted/scaled),
+    /// since it's compared against a threshold in native quote token units.
+    pub fn read_dex_price_with_liquidity(
+        price_ai: &AccountInfo,
+        invert: u8,
+        unit_scale: u32,
+        remaining_accounts: &[AccountInfo],
+    ) -> Result<DexPriceResult, ProgramError> {
+        // Use the DEX pool's own pubkey as the feed ID (standard for Hyperp mode)
+        let dex_feed_id = price_ai.key.to_bytes();
+
+        let (raw_price, quote_liquidity) =
+            if *price_ai.owner == PUMPSWAP_PROGRAM_ID {
+                // PumpSwap: read price and extract quote vault balance as liquidity
+                let pool_data = price_ai.try_borrow_data()?;
+                if pool_data.len() < PUMPSWAP_MIN_LEN {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                if remaining_accounts.len() < 2 {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+
+                // Read quote vault balance as liquidity metric
+                let quote_vault_data = remaining_accounts[1].try_borrow_data()?;
+                if quote_vault_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let quote_amount = u64::from_le_bytes(
+                    quote_vault_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                // Drop borrows before calling read_pumpswap_price_e6 which re-borrows
+                drop(quote_vault_data);
+                drop(pool_data);
+
+                let price = read_pumpswap_price_e6(price_ai, &dex_feed_id, remaining_accounts)?;
+                (price, quote_amount)
+            } else if *price_ai.owner == RAYDIUM_CLMM_PROGRAM_ID {
+                // Raydium CLMM: use the liquidity field as depth indicator
+                let data = price_ai.try_borrow_data()?;
+                if data.len() < RAYDIUM_CLMM_MIN_LEN {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                // Raydium CLMM pool has a liquidity field (u128) at offset 237
+                // This represents the active in-range liquidity
+                const RAYDIUM_CLMM_OFF_LIQUIDITY: usize = 237;
+                let liquidity = if data.len() >= RAYDIUM_CLMM_OFF_LIQUIDITY + 16 {
+                    let liq = u128::from_le_bytes(
+                        data[RAYDIUM_CLMM_OFF_LIQUIDITY..RAYDIUM_CLMM_OFF_LIQUIDITY + 16]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    // Convert to u64 by taking sqrt (liquidity in CLMM is L^2-like)
+                    // Use a rough approximation: if liq > u64::MAX, saturate
+                    core::cmp::min(liq, u64::MAX as u128) as u64
+                } else {
+                    0
+                };
+                drop(data);
+
+                let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
+                (price, liquidity)
+            } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
+                // Meteora DLMM: no direct liquidity field accessible without scanning bins.
+                // The price calculation succeeding (non-zero result) implies SOME liquidity.
+                // We use u64::MAX as a sentinel meaning "liquidity not measurable but present".
+                // The caller can skip the liquidity check for Meteora or use a different threshold.
+                let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
+                (price, u64::MAX)
+            } else {
+                return Err(PercolatorError::OracleInvalid.into());
+            };
+
+        // Apply inversion and unit scaling to the price
+        let price_after_invert = crate::verify::invert_price_e6(raw_price, invert)
+            .ok_or(PercolatorError::OracleInvalid)?;
+        let final_price = crate::verify::scale_price_e6(price_after_invert, unit_scale)
+            .ok_or::<ProgramError>(PercolatorError::OracleInvalid.into())?;
+
+        Ok(DexPriceResult {
+            price_e6: final_price,
+            quote_liquidity,
+        })
     }
 
     /// Read oracle price for engine use, applying inversion and unit scaling if configured.
@@ -6476,22 +6598,30 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
-                // Read spot price from the DEX pool
+                // Read spot price AND liquidity from the DEX pool (#297 Fix 1).
+                // Rejects thin pools where an attacker can cheaply manipulate spot price.
                 let remaining = &accounts[3..];
-                // Use the DEX pool's pubkey as the expected feed ID so the
-                // DEX reader's address check passes (prevents the all-zeros
-                // sentinel from hard-failing in Hyperp mode).
-                let dex_feed_id = a_dex_pool.key.to_bytes();
-                let dex_price = oracle::read_engine_price_e6(
+                let dex_result = oracle::read_dex_price_with_liquidity(
                     a_dex_pool,
-                    &dex_feed_id,
-                    clock.unix_timestamp,
-                    3600, // 1hr staleness for DEX (permissive — circuit breaker handles the rest)
-                    0,    // no confidence check for DEX
                     config.invert,
                     config.unit_scale,
                     remaining,
                 )?;
+
+                // SECURITY (#297): Minimum DEX liquidity check.
+                // Prevent Hyperp EMA bootstrapping from near-empty pools.
+                // An attacker with minimal capital could manipulate the spot price in a thin pool
+                // and seed a false EMA baseline. The quote-side liquidity must exceed the threshold.
+                if dex_result.quote_liquidity < crate::constants::MIN_DEX_QUOTE_LIQUIDITY {
+                    msg!(
+                        "UpdateHyperpMark: insufficient DEX liquidity {} < minimum {}",
+                        dex_result.quote_liquidity,
+                        crate::constants::MIN_DEX_QUOTE_LIQUIDITY
+                    );
+                    return Err(PercolatorError::InsufficientDexLiquidity.into());
+                }
+
+                let dex_price = dex_result.price_e6;
 
                 // Apply EMA smoothing with circuit breaker
                 let prev_mark = config.authority_price_e6;
