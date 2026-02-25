@@ -51,6 +51,9 @@ pub const TAG_SET_PYTH_ORACLE: u8 = 32;
 pub const TAG_UPDATE_MARK_PRICE: u8 = 33;
 /// Update Hyperp mark from DEX oracle (PERC-119).
 pub const TAG_UPDATE_HYPERP_MARK: u8 = 34;
+/// Optimized TradeCpi with caller-provided PDA bump (PERC-154).
+/// Eliminates find_program_address (~1500 CU savings).
+pub const TAG_TRADE_CPI_V2: u8 = 35;
 
 #[cfg(test)]
 mod tests {
@@ -95,6 +98,7 @@ mod tests {
             TAG_SET_PYTH_ORACLE,
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
+            TAG_TRADE_CPI_V2,
         ];
 
         for i in 0..tags.len() {
@@ -143,6 +147,7 @@ mod tests {
             TAG_SET_PYTH_ORACLE,
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
+            TAG_TRADE_CPI_V2,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {

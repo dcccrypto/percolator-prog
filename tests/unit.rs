@@ -3647,11 +3647,19 @@ fn test_hyperp_effective_cap_enforces_minimum() {
 
     // With cap=0, compute_ema_mark_price would return oracle directly (no clamping).
     let no_cap_result = compute_ema_mark_price(prev_mark, oracle, dt, alpha, 0);
-    assert_eq!(no_cap_result, 150_000_000, "no cap: should be raw EMA blend");
+    assert_eq!(
+        no_cap_result, 150_000_000,
+        "no cap: should be raw EMA blend"
+    );
 
     // With effective_cap = max(0, DEFAULT), the result should be clamped.
     let effective_cap = core::cmp::max(0u64, DEFAULT_HYPERP_PRICE_CAP_E2BPS);
     let capped_result = compute_ema_mark_price(prev_mark, oracle, dt, alpha, effective_cap);
-    assert!(capped_result < no_cap_result, "capped {} should be less than uncapped {}", capped_result, no_cap_result);
+    assert!(
+        capped_result < no_cap_result,
+        "capped {} should be less than uncapped {}",
+        capped_result,
+        no_cap_result
+    );
     assert!(capped_result > prev_mark, "should still move toward oracle");
 }
