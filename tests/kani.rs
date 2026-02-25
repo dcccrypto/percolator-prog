@@ -3239,3 +3239,34 @@ fn kani_withdraw_insurance_vault_result_characterization() {
         }
     }
 }
+
+// =============================================================================
+// INDUCTIVE: Full-domain algebraic properties
+//
+// These proofs use fully symbolic inputs (no bounded ranges) and verify
+// properties via comparison logic rather than multiplication of unknowns
+// (which creates intractable SAT constraints in CBMC).
+//
+// Note: Floor-division properties (monotonicity, conservatism) cannot be
+// proved inductively in CBMC because they require symbolic×symbolic
+// multiplication. The bounded proofs above verify the implementation IS
+// floor division; the mathematical properties follow trivially.
+// =============================================================================
+
+/// Inductive: clamp(mark, lo, hi) is always within [lo, hi] for any mark, lo, hi
+///
+/// This is a trivial property of clamp but proves it holds for the full u64 domain,
+/// complementing the bounded kani_clamp_toward_movement_bounded_concrete which
+/// verifies the max_delta COMPUTATION is correct (for u8 inputs).
+#[kani::proof]
+fn inductive_clamp_within_bounds() {
+    let mark: u64 = kani::any();
+    let lo: u64 = kani::any();
+    let hi: u64 = kani::any();
+    kani::assume(lo <= hi);
+
+    let result = mark.clamp(lo, hi);
+
+    assert!(result >= lo && result <= hi, "clamp must stay within [lo, hi]");
+}
+
