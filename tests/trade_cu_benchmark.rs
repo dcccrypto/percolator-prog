@@ -13,8 +13,12 @@
 //! 7. Large position size vs small position size
 //! 8. Trade with many active accounts in slab (contention test)
 //!
-//! Build BPF: cargo build-sbf --features test
+//! Build BPF: cargo build-sbf
 //! Run: cargo test --release --test trade_cu_benchmark -- --nocapture
+//!
+//! NOTE: Uses production BPF binary (not --features test) because the test
+//! feature bypasses CPI for token transfers, which causes
+//! ExternalAccountDataModified errors in LiteSVM's BPF runtime.
 
 use litesvm::LiteSVM;
 use solana_sdk::{
@@ -31,17 +35,11 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
-// SLAB_LEN for SBF
-#[cfg(feature = "test")]
-const SLAB_LEN: usize = 16312; // MAX_ACCOUNTS=64
-
-#[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 992560; // MAX_ACCOUNTS=4096
-
-#[cfg(feature = "test")]
-const MAX_ACCOUNTS: usize = 64;
-
-#[cfg(not(feature = "test"))]
+// SLAB_LEN for production SBF (MAX_ACCOUNTS=4096).
+// Note: struct layouts differ between BPF and native; these are BPF values.
+// Use `cargo build-sbf` (NOT --features test) — the test feature bypasses CPI
+// for token transfers, which fails in LiteSVM's BPF runtime.
+const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -109,6 +107,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 = not Hyperp mode)
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
@@ -175,7 +174,7 @@ impl TradeTestEnv {
         let path = program_path();
         if !path.exists() {
             panic!(
-                "BPF not found at {:?}. Run: cargo build-sbf --features test",
+                "BPF not found at {:?}. Run: cargo build-sbf",
                 path
             );
         }
@@ -220,11 +219,13 @@ impl TradeTestEnv {
         )
         .unwrap();
 
+        // Pre-fund vault with seed deposit (production BPF requires MIN_INIT_MARKET_SEED = 500 USDC).
+        // We add extra tokens as LP liquidity buffer.
         svm.set_account(
             vault,
             Account {
                 lamports: 1_000_000,
-                data: make_token_account_data(&mint, &vault_pda, 0),
+                data: make_token_account_data(&mint, &vault_pda, 1_000_000_000),
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -313,6 +314,7 @@ impl TradeTestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
+        self.svm.expire_blockhash();
     }
 
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
@@ -371,6 +373,7 @@ impl TradeTestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
+        self.svm.expire_blockhash();
         0
     }
 
@@ -399,6 +402,7 @@ impl TradeTestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
+        self.svm.expire_blockhash();
         1 // LP is 0
     }
 
@@ -425,6 +429,7 @@ impl TradeTestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("deposit failed");
+        self.svm.expire_blockhash();
     }
 
     /// Execute a trade and return compute units consumed
@@ -458,7 +463,11 @@ impl TradeTestEnv {
             self.svm.latest_blockhash(),
         );
         match self.svm.send_transaction(tx) {
-            Ok(result) => Ok((result.compute_units_consumed, result.logs)),
+            Ok(result) => {
+                // Advance blockhash so the next transaction isn't rejected as duplicate
+                self.svm.expire_blockhash();
+                Ok((result.compute_units_consumed, result.logs))
+            }
             Err(e) => Err(format!("{:?}", e)),
         }
     }
@@ -554,7 +563,7 @@ fn benchmark_trade_cu() {
 
     let path = program_path();
     if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf --features test");
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
     }
 
@@ -743,9 +752,8 @@ fn benchmark_trade_cu() {
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Scenario 8: 🏋️ Trade with active accounts in slab");
     {
-        #[cfg(feature = "test")]
-        let account_counts = [1usize, 5, 10, 20, 40, 60];
-        #[cfg(not(feature = "test"))]
+        // Test with increasing numbers of active accounts in slab
+        // Limited to smaller counts to keep benchmark runtime reasonable
         let account_counts = [1usize, 10, 100, 500, 1000, 2000, 4000];
 
         for &num_others in &account_counts {
@@ -788,6 +796,7 @@ fn benchmark_trade_cu() {
                     env.svm.latest_blockhash(),
                 );
                 env.svm.send_transaction(tx).unwrap();
+                env.svm.expire_blockhash();
 
                 let other_idx = (i + 1) as u16;
                 env.deposit(&other, other_idx, 10_000_000);
@@ -828,6 +837,7 @@ fn benchmark_trade_cu() {
                 env.svm.latest_blockhash(),
             );
             env.svm.send_transaction(tx).unwrap();
+            env.svm.expire_blockhash();
 
             let user_idx = user_idx_raw as u16;
             env.deposit(&user, user_idx, 100_000_000);
@@ -848,9 +858,9 @@ fn benchmark_trade_cu() {
     println!("  - invoke_signed_unchecked: skip RefCell validation (~200 CU)");
     println!("• Compare these numbers against pre-PERC-154 build to measure savings");
     println!("• To benchmark before optimization:");
-    println!("    git stash && git checkout 75bab65 && cargo build-sbf --features test");
+    println!("    git stash && git checkout 75bab65 && cargo build-sbf");
     println!("    cargo test --release --test trade_cu_benchmark -- --nocapture");
-    println!("    git checkout master && git stash pop && cargo build-sbf --features test");
+    println!("    git checkout master && git stash pop && cargo build-sbf");
 }
 
 /// Comparative benchmark helper: run the same workload and return results as a struct
@@ -862,7 +872,7 @@ fn benchmark_trade_cu_summary_table() {
 
     let path = program_path();
     if !path.exists() {
-        println!("SKIP: BPF not found. Run: cargo build-sbf --features test");
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
     }
 
@@ -921,6 +931,6 @@ fn benchmark_trade_cu_summary_table() {
     println!("└────────────────────────────────┴──────────┘");
     println!();
     println!("To compare pre/post PERC-154 optimization:");
-    println!("  PRE:  git checkout 75bab65 && cargo build-sbf --features test && cargo test --release --test trade_cu_benchmark -- --nocapture");
-    println!("  POST: git checkout master  && cargo build-sbf --features test && cargo test --release --test trade_cu_benchmark -- --nocapture");
+    println!("  PRE:  git checkout 75bab65 && cargo build-sbf && cargo test --release --test trade_cu_benchmark -- --nocapture");
+    println!("  POST: git checkout master  && cargo build-sbf && cargo test --release --test trade_cu_benchmark -- --nocapture");
 }

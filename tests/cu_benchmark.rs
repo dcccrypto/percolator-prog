@@ -27,17 +27,9 @@ use std::path::PathBuf;
 // Note: Can't read BPF slab from native - struct layouts differ:
 // BPF SLAB_LEN: ~1.1MB, Native SLAB_LEN: ~1.2MB (even with repr(C) and same MAX_ACCOUNTS)
 
-// SLAB_LEN for SBF - differs between test and production
-#[cfg(feature = "test")]
-const SLAB_LEN: usize = 16312; // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
-
-#[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 992560; // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
-
-#[cfg(feature = "test")]
-const MAX_ACCOUNTS: usize = 64;
-
-#[cfg(not(feature = "test"))]
+// SLAB_LEN for SBF — production build only (test feature bypasses CPI, breaks LiteSVM).
+// Note: BPF struct layout differs from native; these are BPF values.
+const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -120,7 +112,8 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
-                                                 // RiskParams
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 = not Hyperp mode)
+    // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
@@ -242,7 +235,7 @@ impl TestEnv {
             vault,
             Account {
                 lamports: 1_000_000,
-                data: make_token_account_data(&mint, &vault_pda, 0),
+                data: make_token_account_data(&mint, &vault_pda, 1_000_000_000), // Pre-fund for seed deposit
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
