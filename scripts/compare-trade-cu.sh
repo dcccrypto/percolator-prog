@@ -77,18 +77,6 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Step 5: Comparison"
 echo
 
-# Extract CU values from both files
-extract_cu() {
-    local file="$1"
-    grep "│" "$file" | grep -v "Operation" | grep -v "──" | while IFS='│' read -r _ op cu _; do
-        op=$(echo "$op" | xargs)
-        cu=$(echo "$cu" | xargs)
-        if [ -n "$op" ] && [ -n "$cu" ]; then
-            printf "%-35s %s\n" "$op" "$cu"
-        fi
-    done
-}
-
 echo "┌────────────────────────────────┬──────────┬──────────┬─────────┐"
 echo "│ Operation                      │  BEFORE  │  AFTER   │ Savings │"
 echo "├────────────────────────────────┼──────────┼──────────┼─────────┤"
@@ -105,7 +93,6 @@ while IFS=$'\t' read -r before_line after_line; do
     if [ -n "$before_cu" ] && [ -n "$after_cu" ]; then
         savings=$((before_cu - after_cu))
         if [ "$before_cu" -gt 0 ]; then
-            pct=$(echo "scale=1; $savings * 100 / $before_cu" | bc 2>/dev/null || echo "?")
             printf "│ %-30s │ %8s │ %8s │ %+6d  │\n" "$op" "$before_cu" "$after_cu" "$savings"
         fi
     fi

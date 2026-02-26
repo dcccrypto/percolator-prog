@@ -113,7 +113,7 @@ fn encode_init_market_with_params(
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 = not Hyperp mode)
-    // RiskParams
+                                                 // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
@@ -1522,8 +1522,8 @@ fn benchmark_worst_case_scenarios() {
             let expected_liq = num_users / 2;
             if total_liqs > 0 {
                 println!(
-                    "    ✓ MTM margin check working - {} liquidations triggered",
-                    total_liqs
+                    "    ✓ MTM margin check working - {} of ~{} expected liquidations triggered",
+                    total_liqs, expected_liq
                 );
             }
         }

@@ -44,9 +44,8 @@ const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b,
-    0x90, 0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38,
-    0x58, 0x81,
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ]);
 
 const BENCHMARK_FEED_ID: [u8; 32] = [0xABu8; 32];
@@ -108,7 +107,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 = not Hyperp mode)
-    // RiskParams
+                                                 // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
@@ -173,10 +172,7 @@ impl TradeTestEnv {
     fn new() -> Self {
         let path = program_path();
         if !path.exists() {
-            panic!(
-                "BPF not found at {:?}. Run: cargo build-sbf",
-                path
-            );
+            panic!("BPF not found at {:?}. Run: cargo build-sbf", path);
         }
 
         let mut svm = LiteSVM::new();
@@ -189,8 +185,7 @@ impl TradeTestEnv {
         let mint = Pubkey::new_unique();
         let pyth_index = Pubkey::new_unique();
         let pyth_col = Pubkey::new_unique();
-        let (vault_pda, _) =
-            Pubkey::find_program_address(&[b"vault", slab.as_ref()], &program_id);
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab.as_ref()], &program_id);
         let vault = Pubkey::new_unique();
 
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
@@ -546,6 +541,9 @@ fn measure_n_trades(
         total += cu;
     }
 
+    if sizes.is_empty() {
+        return (0, 0, 0);
+    }
     let avg = total / sizes.len() as u64;
     (min, max, avg)
 }
@@ -771,9 +769,7 @@ fn benchmark_trade_cu() {
             // Create N other users with positions
             for i in 0..num_others {
                 let other = Keypair::new();
-                env.svm
-                    .airdrop(&other.pubkey(), 1_000_000_000)
-                    .unwrap();
+                env.svm.airdrop(&other.pubkey(), 1_000_000_000).unwrap();
                 let ata = env.create_ata(&other.pubkey(), 0);
 
                 let ix = Instruction {
@@ -803,18 +799,14 @@ fn benchmark_trade_cu() {
 
                 // Open position for each
                 let size = if i % 2 == 0 { 100i128 } else { -100i128 };
-                match env.trade_with_cu(&other, &lp, 0, other_idx, size, 400_000) {
-                    Ok(_) => {}
-                    Err(e) => println!("    Warning: trade failed for user {}: {}", i, e),
-                }
+                env.trade_with_cu(&other, &lp, 0, other_idx, size, 400_000)
+                    .unwrap_or_else(|e| panic!("Preload trade failed for user {}: {}", i, e));
             }
 
             // Now create OUR user and trade
             let user = Keypair::new();
             let user_idx_raw = num_others + 1;
-            env.svm
-                .airdrop(&user.pubkey(), 1_000_000_000)
-                .unwrap();
+            env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
             let ata = env.create_ata(&user.pubkey(), 0);
 
             let ix = Instruction {
@@ -860,7 +852,7 @@ fn benchmark_trade_cu() {
     println!("• To benchmark before optimization:");
     println!("    git stash && git checkout 75bab65 && cargo build-sbf");
     println!("    cargo test --release --test trade_cu_benchmark -- --nocapture");
-    println!("    git checkout master && git stash pop && cargo build-sbf");
+    println!("    git checkout main && git stash pop && cargo build-sbf");
 }
 
 /// Comparative benchmark helper: run the same workload and return results as a struct
@@ -932,5 +924,5 @@ fn benchmark_trade_cu_summary_table() {
     println!();
     println!("To compare pre/post PERC-154 optimization:");
     println!("  PRE:  git checkout 75bab65 && cargo build-sbf && cargo test --release --test trade_cu_benchmark -- --nocapture");
-    println!("  POST: git checkout master  && cargo build-sbf && cargo test --release --test trade_cu_benchmark -- --nocapture");
+    println!("  POST: git checkout main  && cargo build-sbf && cargo test --release --test trade_cu_benchmark -- --nocapture");
 }

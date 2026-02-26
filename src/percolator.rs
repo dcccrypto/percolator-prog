@@ -4767,8 +4767,8 @@ pub mod processor {
             } => {
                 // PERC-154: TradeCpi and TradeCpiV2 share the same handler.
                 // V2 provides the PDA bump to skip find_program_address (~1500 CU).
-                let caller_bump = match instruction {
-                    Instruction::TradeCpiV2 { bump, .. } => Some(bump),
+                let caller_bump = match &instruction {
+                    Instruction::TradeCpiV2 { bump, .. } => Some(*bump),
                     _ => None,
                 };
 
