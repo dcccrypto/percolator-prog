@@ -481,11 +481,12 @@ fn test_bpf_i128_alignment() {
     )
     .unwrap();
 
+    // SECURITY #299: Vault must be pre-funded with >= MIN_INIT_MARKET_SEED (500M)
     svm.set_account(
         vault,
         SolanaAccount {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
+            data: make_token_account_data(&mint, &vault_pda, 500_000_000),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
