@@ -729,11 +729,11 @@ fn test_trade() {
     }
 
     {
+        // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
         let accounts = vec![
             user.to_info(),
             lp.to_info(),
             f.slab.to_info(),
-            f.clock.to_info(),
             f.pyth_index.to_info(),
         ];
         process_instruction(
@@ -961,11 +961,11 @@ fn test_trade_wrong_signer() {
     )
     .signer();
     {
+        // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
         let accs = vec![
             attacker.to_info(),
             lp.to_info(),
             f.slab.to_info(),
-            f.clock.to_info(),
             f.pyth_index.to_info(),
         ];
         let res = process_instruction(&f.program_id, &accs, &encode_trade(lp_idx, user_idx, 100));
@@ -1067,11 +1067,11 @@ fn test_trade_cpi_wrong_pda_key_rejected() {
         vec![],
     );
 
+    // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
     let accs = vec![
         user.to_info(),
         lp.to_info(),
         f.slab.to_info(),
-        f.clock.to_info(),
         f.pyth_index.to_info(),
         matcher_program.to_info(),
         matcher_ctx.to_info(),
@@ -1183,16 +1183,16 @@ fn test_trade_cpi_wrong_lp_owner_rejected() {
         Pubkey::find_program_address(&[b"lp", f.slab.key.as_ref(), &lp_bytes], &f.program_id);
     let mut lp_pda = TestAccount::new(lp_pda_key, solana_program::system_program::id(), 0, vec![]);
 
+    // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
     let res = {
         let accs = vec![
             user.to_info(),            // 0
             wrong_lp.to_info(),        // 1 (WRONG OWNER)
             f.slab.to_info(),          // 2
-            f.clock.to_info(),         // 3
-            f.pyth_index.to_info(),    // 4 oracle
-            matcher_program.to_info(), // 5 matcher
-            matcher_ctx.to_info(),     // 6 context
-            lp_pda.to_info(),          // 7 lp_pda
+            f.pyth_index.to_info(),    // 3 oracle
+            matcher_program.to_info(), // 4 matcher
+            matcher_ctx.to_info(),     // 5 context
+            lp_pda.to_info(),          // 6 lp_pda
         ];
         process_instruction(
             &f.program_id,
@@ -1300,16 +1300,16 @@ fn test_trade_cpi_wrong_oracle_key_rejected() {
         Pubkey::find_program_address(&[b"lp", f.slab.key.as_ref(), &lp_bytes], &f.program_id);
     let mut lp_pda = TestAccount::new(lp_pda_key, solana_program::system_program::id(), 0, vec![]);
 
+    // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
     let res = {
         let accs = vec![
             user.to_info(),            // 0
             lp.to_info(),              // 1
             f.slab.to_info(),          // 2
-            f.clock.to_info(),         // 3
-            wrong_oracle.to_info(),    // 4 oracle (WRONG FEED_ID)
-            matcher_program.to_info(), // 5 matcher
-            matcher_ctx.to_info(),     // 6 context
-            lp_pda.to_info(),          // 7 lp_pda
+            wrong_oracle.to_info(),    // 3 oracle (WRONG FEED_ID)
+            matcher_program.to_info(), // 4 matcher
+            matcher_ctx.to_info(),     // 5 context
+            lp_pda.to_info(),          // 6 lp_pda
         ];
         process_instruction(
             &f.program_id,
@@ -1538,13 +1538,13 @@ fn test_crank_updates_threshold_from_risk_metric() {
     }
 
     // Execute trade to create positions
+    // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
     let trade_size: i128 = 100_000;
     {
         let accs = vec![
             user.to_info(),
             lp.to_info(),
             f.slab.to_info(),
-            f.clock.to_info(),
             f.pyth_index.to_info(),
         ];
         process_instruction(
