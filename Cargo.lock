@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
-source = "git+https://github.com/dcccrypto/percolator.git?branch=master#a235a5f2147e5ccc69b02bb9ae0c8e7b70564c6d"
+source = "git+https://github.com/dcccrypto/percolator.git?branch=fix%2FPERC-214-div-zero-and-neg-safety#2ba4b65c9d7f1ac3e2ab888a608e487bc2b7c9d5"
 
 [[package]]
 name = "percolator-prog"
