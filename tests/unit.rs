@@ -2293,7 +2293,8 @@ fn test_renounce_admin_requires_resolved() {
     // Must include the confirmation u64 so instruction parsing succeeds
     // and we reach the resolved-market check.
     let mut renounce_data = vec![23u8]; // TAG_RENOUNCE_ADMIN
-    renounce_data.extend_from_slice(&percolator_prog::constants::RENOUNCE_ADMIN_CONFIRMATION.to_le_bytes());
+    renounce_data
+        .extend_from_slice(&percolator_prog::constants::RENOUNCE_ADMIN_CONFIRMATION.to_le_bytes());
     {
         let accounts = vec![f.admin.to_info(), f.slab.to_info()];
         let res = process_instruction(&f.program_id, &accounts, &renounce_data);
@@ -2708,7 +2709,8 @@ fn test_vault_amount_matches_engine_vault_plus_dust() {
     // Assert INVARIANT #1: vault_base = seed + engine_vault * unit_scale + dust_base
     // The VAULT_SEED pre-funds the vault but is NOT tracked in the engine, so we
     // must account for it separately.
-    let computed_base = VAULT_SEED + engine_vault_units.get() as u64 * unit_scale as u64 + dust_base;
+    let computed_base =
+        VAULT_SEED + engine_vault_units.get() as u64 * unit_scale as u64 + dust_base;
     assert_eq!(
         vault_base, computed_base,
         "INVARIANT #1 FAILED: vault_base({}) != seed({}) + engine_vault({}) * scale({}) + dust({}) = {}",
@@ -3110,7 +3112,8 @@ fn test_dust_sweep_preserves_real_to_accounted_equality() {
     );
 
     // Verify INVARIANT #1 still holds after sweep (seed offset excluded)
-    let computed_base = VAULT_SEED + engine_vault_after.get() as u64 * unit_scale as u64 + dust_after_crank;
+    let computed_base =
+        VAULT_SEED + engine_vault_after.get() as u64 * unit_scale as u64 + dust_after_crank;
     assert_eq!(vault_base, computed_base,
             "INVARIANT #1 FAILED after sweep: vault_base({}) != seed({}) + engine_vault({}) * scale({}) + dust({}) = {}",
             vault_base, VAULT_SEED, engine_vault_after, unit_scale, dust_after_crank, computed_base);
