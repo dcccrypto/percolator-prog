@@ -907,9 +907,9 @@ fn benchmark_trade_cu_summary_table() {
     let cu = measure_trade(&mut env, &user, &lp, 0, user_idx, 400);
     println!("│ Flip short→long (+400)         │ {:>8} │", cu);
 
-    // Close
-    let cu = measure_trade(&mut env, &user, &lp, 0, user_idx, -175);
-    println!("│ Close position (-175)          │ {:>8} │", cu);
+    // Close (position is +225 after flip, so -225 closes it)
+    let cu = measure_trade(&mut env, &user, &lp, 0, user_idx, -225);
+    println!("│ Close position (-225)          │ {:>8} │", cu);
 
     // Reopen for another measurement
     let cu = measure_trade(&mut env, &user, &lp, 0, user_idx, 1);

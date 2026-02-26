@@ -51,8 +51,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Step 1/4: Building BEFORE ($BEFORE_COMMIT)..."
 git checkout "$BEFORE_COMMIT" 2>/dev/null
 
-echo "  Building BPF (--features test)..."
-cargo build-sbf --features test 2>&1 | tail -3
+echo "  Building BPF (production, no test feature)..."
+cargo build-sbf 2>&1 | tail -3
 
 echo "Step 2/4: Running trade CU benchmark (BEFORE)..."
 cargo test --release --test trade_cu_benchmark benchmark_trade_cu_summary_table -- --nocapture 2>&1 \
@@ -64,8 +64,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Step 3/4: Building AFTER (master/HEAD)..."
 git checkout - 2>/dev/null
 
-echo "  Building BPF (--features test)..."
-cargo build-sbf --features test 2>&1 | tail -3
+echo "  Building BPF (production, no test feature)..."
+cargo build-sbf 2>&1 | tail -3
 
 echo "Step 4/4: Running trade CU benchmark (AFTER)..."
 cargo test --release --test trade_cu_benchmark benchmark_trade_cu_summary_table -- --nocapture 2>&1 \

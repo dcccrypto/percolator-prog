@@ -27,7 +27,10 @@ use std::path::PathBuf;
 // Note: Can't read BPF slab from native - struct layouts differ:
 // BPF SLAB_LEN: ~1.1MB, Native SLAB_LEN: ~1.2MB (even with repr(C) and same MAX_ACCOUNTS)
 
-// SLAB_LEN for SBF — production build only (test feature bypasses CPI, breaks LiteSVM).
+// SLAB_LEN for SBF — production build only (do NOT use --features test, as the
+// test feature bypasses CPI for token transfers, which causes
+// ExternalAccountDataModified errors in LiteSVM's BPF runtime).
+// Build with: cargo build-sbf   (no --features test)
 // Note: BPF struct layout differs from native; these are BPF values.
 const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
@@ -172,6 +175,16 @@ fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
     data.extend_from_slice(&user.to_le_bytes());
     data.extend_from_slice(&size.to_le_bytes());
     data
+}
+
+/// Parse a string as hex (0x prefix) or decimal.
+fn parse_hex_or_dec(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).unwrap_or(0)
+    } else {
+        s.parse().unwrap_or(0)
+    }
 }
 
 struct TestEnv {
@@ -1287,16 +1300,6 @@ fn benchmark_worst_case_scenarios() {
                 let mut max_accounts: u64 = 0;
                 let mut found_stats = false;
 
-                // Helper to parse hex or decimal
-                fn parse_hex_or_dec(s: &str) -> u64 {
-                    let s = s.trim();
-                    if let Some(hex) = s.strip_prefix("0x") {
-                        u64::from_str_radix(hex, 16).unwrap_or(0)
-                    } else {
-                        s.parse().unwrap_or(0)
-                    }
-                }
-
                 for (i, log) in last_logs.iter().enumerate() {
                     if log.contains("CRANK_STATS") {
                         // Next log line should have the sol_log_64 output
@@ -1442,16 +1445,6 @@ fn benchmark_worst_case_scenarios() {
         let mut any_failed = false;
         let mut last_max_acc: u64 = 0;
         let mut last_insurance: u64 = 0;
-
-        // Helper to parse hex or decimal
-        fn parse_hex_or_dec(s: &str) -> u64 {
-            let s = s.trim();
-            if let Some(hex) = s.strip_prefix("0x") {
-                u64::from_str_radix(hex, 16).unwrap_or(0)
-            } else {
-                s.parse().unwrap_or(0)
-            }
-        }
 
         for crank_num in 0..64 {
             match env.try_crank() {
