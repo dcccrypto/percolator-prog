@@ -439,13 +439,13 @@ impl TradeTestEnv {
     ) -> Result<(u64, Vec<String>), String> {
         let budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
 
+        // PERC-199: Clock sysvar removed — Clock::get() syscall used instead.
         let trade_ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(lp.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_trade(lp_idx, user_idx, size),

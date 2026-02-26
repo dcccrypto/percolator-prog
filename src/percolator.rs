@@ -4667,7 +4667,10 @@ pub mod processor {
                 user_idx,
                 size,
             } => {
-                accounts::expect_len(accounts, 5)?;
+                // PERC-199: Removed clock sysvar from accounts (was [5] → now [4]).
+                // Clock::get() syscall replaces Clock::from_account_info, saving CU
+                // and reducing the instruction's account count by 1.
+                accounts::expect_len(accounts, 4)?;
                 let a_user = &accounts[0];
                 let a_lp = &accounts[1];
                 let a_slab = &accounts[2];
@@ -4688,8 +4691,10 @@ pub mod processor {
 
                 let mut config = state::read_config(&data);
 
-                let clock = Clock::from_account_info(&accounts[3])?;
-                let a_oracle = &accounts[4];
+                // PERC-199: Clock::get() replaces Clock::from_account_info — clock
+                // sysvar account removed from the instruction entirely.
+                let clock = Clock::get()?;
+                let a_oracle = &accounts[3];
 
                 // Hyperp mode: reject TradeNoCpi to prevent mark price manipulation
                 // All trades must go through TradeCpi with a pinned matcher
@@ -4702,7 +4707,7 @@ pub mod processor {
                     &mut config,
                     a_oracle,
                     clock.unix_timestamp,
-                    &accounts[5..],
+                    &accounts[4..],
                 )?;
                 state::write_config(&mut data, &config);
 
@@ -4778,16 +4783,16 @@ pub mod processor {
                     _ => None,
                 };
 
-                // Phase 1: Updated account layout - lp_pda must be in accounts
-                accounts::expect_len(accounts, 8)?;
+                // PERC-199: Clock sysvar removed from accounts (was 8 → now 7).
+                // Clock::get() syscall replaces Clock::from_account_info.
+                accounts::expect_len(accounts, 7)?;
                 let a_user = &accounts[0];
                 let a_lp_owner = &accounts[1];
                 let a_slab = &accounts[2];
-                let a_clock = &accounts[3];
-                let a_oracle = &accounts[4];
-                let a_matcher_prog = &accounts[5];
-                let a_matcher_ctx = &accounts[6];
-                let a_lp_pda = &accounts[7];
+                let a_oracle = &accounts[3];
+                let a_matcher_prog = &accounts[4];
+                let a_matcher_ctx = &accounts[5];
+                let a_lp_pda = &accounts[6];
 
                 accounts::expect_signer(a_user)?;
                 // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
@@ -4907,7 +4912,8 @@ pub mod processor {
                     return Err(PercolatorError::EngineInvalidMatchingEngine.into());
                 }
 
-                let clock = Clock::from_account_info(a_clock)?;
+                // PERC-199: Clock::get() saves ~50-100 CU vs from_account_info deserialization
+                let clock = Clock::get()?;
                 // Read oracle price: Hyperp mode uses index directly, otherwise circuit-breaker clamping
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
@@ -4922,7 +4928,7 @@ pub mod processor {
                         &mut config,
                         a_oracle,
                         clock.unix_timestamp,
-                        &accounts[8..],
+                        &accounts[7..],
                     )?
                 };
 
@@ -4992,6 +4998,20 @@ pub mod processor {
                 };
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
+
+                    // PERC-199: Hyperp mark price update — apply BEFORE write_config to
+                    // eliminate the second read_config()+write_config() pair (~100 CU saved).
+                    // Safe because last_effective_price_e6 and oracle_price_cap_e2bps are
+                    // unchanged since the first read.
+                    if is_hyperp {
+                        let clamped_mark = oracle::clamp_oracle_price(
+                            config.last_effective_price_e6,
+                            ret.exec_price_e6,
+                            config.oracle_price_cap_e2bps,
+                        );
+                        config.authority_price_e6 = clamped_mark;
+                    }
+
                     state::write_config(&mut data, &config);
                     let engine = zc::engine_mut(&mut data)?;
 
@@ -5036,21 +5056,6 @@ pub mod processor {
                     }
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
-
-                    // Hyperp mode: update mark price with execution price
-                    // Apply circuit breaker to prevent extreme mark price manipulation
-                    if is_hyperp {
-                        let mut config = state::read_config(&data);
-                        // Clamp exec_price against current index to prevent manipulation
-                        // Uses same circuit breaker as PushOraclePrice for consistency
-                        let clamped_mark = oracle::clamp_oracle_price(
-                            config.last_effective_price_e6,
-                            ret.exec_price_e6,
-                            config.oracle_price_cap_e2bps,
-                        );
-                        config.authority_price_e6 = clamped_mark;
-                        state::write_config(&mut data, &config);
-                    }
                 }
             }
             Instruction::LiquidateAtOracle { target_idx } => {
