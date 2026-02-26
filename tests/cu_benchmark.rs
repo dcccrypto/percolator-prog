@@ -27,17 +27,12 @@ use std::path::PathBuf;
 // Note: Can't read BPF slab from native - struct layouts differ:
 // BPF SLAB_LEN: ~1.1MB, Native SLAB_LEN: ~1.2MB (even with repr(C) and same MAX_ACCOUNTS)
 
-// SLAB_LEN for SBF - differs between test and production
-#[cfg(feature = "test")]
-const SLAB_LEN: usize = 16312; // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
-
-#[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 992560; // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
-
-#[cfg(feature = "test")]
-const MAX_ACCOUNTS: usize = 64;
-
-#[cfg(not(feature = "test"))]
+// SLAB_LEN for SBF — production build only (do NOT use --features test, as the
+// test feature bypasses CPI for token transfers, which causes
+// ExternalAccountDataModified errors in LiteSVM's BPF runtime).
+// Build with: cargo build-sbf   (no --features test)
+// Note: BPF struct layout differs from native; these are BPF values.
+const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -120,6 +115,7 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 = not Hyperp mode)
                                                  // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
@@ -179,6 +175,16 @@ fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
     data.extend_from_slice(&user.to_le_bytes());
     data.extend_from_slice(&size.to_le_bytes());
     data
+}
+
+/// Parse a string as hex (0x prefix) or decimal.
+fn parse_hex_or_dec(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).unwrap_or(0)
+    } else {
+        s.parse().unwrap_or(0)
+    }
 }
 
 struct TestEnv {
@@ -242,7 +248,7 @@ impl TestEnv {
             vault,
             Account {
                 lamports: 1_000_000,
-                data: make_token_account_data(&mint, &vault_pda, 0),
+                data: make_token_account_data(&mint, &vault_pda, 1_000_000_000), // Pre-fund for seed deposit
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -1294,16 +1300,6 @@ fn benchmark_worst_case_scenarios() {
                 let mut max_accounts: u64 = 0;
                 let mut found_stats = false;
 
-                // Helper to parse hex or decimal
-                fn parse_hex_or_dec(s: &str) -> u64 {
-                    let s = s.trim();
-                    if let Some(hex) = s.strip_prefix("0x") {
-                        u64::from_str_radix(hex, 16).unwrap_or(0)
-                    } else {
-                        s.parse().unwrap_or(0)
-                    }
-                }
-
                 for (i, log) in last_logs.iter().enumerate() {
                     if log.contains("CRANK_STATS") {
                         // Next log line should have the sol_log_64 output
@@ -1450,16 +1446,6 @@ fn benchmark_worst_case_scenarios() {
         let mut last_max_acc: u64 = 0;
         let mut last_insurance: u64 = 0;
 
-        // Helper to parse hex or decimal
-        fn parse_hex_or_dec(s: &str) -> u64 {
-            let s = s.trim();
-            if let Some(hex) = s.strip_prefix("0x") {
-                u64::from_str_radix(hex, 16).unwrap_or(0)
-            } else {
-                s.parse().unwrap_or(0)
-            }
-        }
-
         for crank_num in 0..64 {
             match env.try_crank() {
                 Ok((cu, logs)) => {
@@ -1529,8 +1515,8 @@ fn benchmark_worst_case_scenarios() {
             let expected_liq = num_users / 2;
             if total_liqs > 0 {
                 println!(
-                    "    ✓ MTM margin check working - {} liquidations triggered",
-                    total_liqs
+                    "    ✓ MTM margin check working - {} of ~{} expected liquidations triggered",
+                    total_liqs, expected_liq
                 );
             }
         }

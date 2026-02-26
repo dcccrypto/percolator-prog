@@ -989,6 +989,7 @@ pub mod zc {
         ix: &SolInstruction,
         a_lp_pda: &AccountInfo<'a>,
         a_matcher_ctx: &AccountInfo<'a>,
+        a_matcher_prog: &AccountInfo<'a>,
         seeds: &[&[u8]],
     ) -> Result<(), ProgramError> {
         // SAFETY: AccountInfos have lifetime 'a from the caller.
@@ -997,7 +998,12 @@ pub mod zc {
         // No lifetime extension occurs. RefCell validation skipped because:
         // - a_lp_pda is system-owned PDA with 0 data and 0 lamports (validated earlier)
         // - a_matcher_ctx borrow was dropped before this call
-        let infos = [a_lp_pda.clone(), a_matcher_ctx.clone()];
+        // - a_matcher_prog is the program being invoked (required by Solana CPI)
+        let infos = [
+            a_lp_pda.clone(),
+            a_matcher_ctx.clone(),
+            a_matcher_prog.clone(),
+        ];
         invoke_signed_unchecked(ix, &infos, &[seeds])
     }
 }
@@ -4767,8 +4773,8 @@ pub mod processor {
             } => {
                 // PERC-154: TradeCpi and TradeCpiV2 share the same handler.
                 // V2 provides the PDA bump to skip find_program_address (~1500 CU).
-                let caller_bump = match instruction {
-                    Instruction::TradeCpiV2 { bump, .. } => Some(bump),
+                let caller_bump = match &instruction {
+                    Instruction::TradeCpiV2 { bump, .. } => Some(*bump),
                     _ => None,
                 };
 
@@ -4924,7 +4930,7 @@ pub mod processor {
                 // Security is maintained by ABI validation which checks req_id (nonce),
                 // lp_account_id, and oracle_price_e6 all match the request parameters.
 
-                // PERC-154: Stack-allocated CPI data — eliminates heap allocation (~100-200 CU)
+                // PERC-154: Stack-allocated CPI data — reduces intermediate heap work (~100-200 CU)
                 let mut cpi_data = [0u8; MATCHER_CALL_LEN];
                 {
                     let mut off = 0usize;
@@ -4942,7 +4948,9 @@ pub mod processor {
                     // remaining 24 bytes are already zero (padding)
                 }
 
-                // PERC-154: Stack-allocated account metas — eliminates heap allocation
+                // PERC-154: Stack-allocated account metas — reduces intermediate heap work
+                // Note: metas.to_vec() and cpi_data.to_vec() still allocate, but the
+                // stack-based construction avoids additional intermediate allocations.
                 let metas = [
                     AccountMeta::new_readonly(*a_lp_pda.key, true), // Will become signer via invoke_signed
                     AccountMeta::new(*a_matcher_ctx.key, false),
@@ -4958,7 +4966,7 @@ pub mod processor {
                 let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
 
                 // Phase 2: Use zc helper for CPI - slab not passed to avoid ExternalAccountDataModified
-                zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, seeds)?;
+                zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, a_matcher_prog, seeds)?;
 
                 let ctx_data = a_matcher_ctx.try_borrow_data()?;
                 let ret = crate::matcher_abi::read_matcher_return(&ctx_data)?;
