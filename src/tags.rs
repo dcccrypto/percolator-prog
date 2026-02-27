@@ -54,6 +54,8 @@ pub const TAG_UPDATE_HYPERP_MARK: u8 = 34;
 /// Optimized TradeCpi with caller-provided PDA bump (PERC-154).
 /// Eliminates find_program_address (~1500 CU savings).
 pub const TAG_TRADE_CPI_V2: u8 = 35;
+/// Unresolve a market: clear RESOLVED flag, re-enable trading (PERC-273).
+pub const TAG_UNRESOLVE_MARKET: u8 = 36;
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +101,7 @@ mod tests {
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
             TAG_TRADE_CPI_V2,
+            TAG_UNRESOLVE_MARKET,
         ];
 
         for i in 0..tags.len() {
@@ -148,6 +151,7 @@ mod tests {
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
             TAG_TRADE_CPI_V2,
+            TAG_UNRESOLVE_MARKET,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {

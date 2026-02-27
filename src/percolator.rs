@@ -1673,6 +1673,9 @@ pub mod ix {
             initial_margin_bps: u64,
             maintenance_margin_bps: u64,
             trading_fee_bps: Option<u64>,
+            /// OI cap multiplier in bps. 0 = disabled. 100_000 = 10x vault.
+            /// None = don't change (backwards compatible).
+            oi_cap_multiplier_bps: Option<u64>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -1777,6 +1780,10 @@ pub mod ix {
             size: i128,
             bump: u8,
         },
+        /// PERC-273: Unresolve a market — clear RESOLVED flag, re-enable trading.
+        /// Admin only. Emits sol_log event for transparency.
+        /// Accounts: [admin(signer), slab(writable)]
+        UnresolveMarket,
     }
 
     impl Instruction {
@@ -1973,8 +1980,14 @@ pub mod ix {
                     // UpdateRiskParams
                     let initial_margin_bps = read_u64(&mut rest)?;
                     let maintenance_margin_bps = read_u64(&mut rest)?;
-                    // Optional: trading_fee_bps (backwards compatible — old clients send 17 bytes, new send 25)
+                    // Optional: trading_fee_bps (backwards compatible — old clients send 17 bytes, new send 25+)
                     let trading_fee_bps = if rest.len() >= 8 {
+                        Some(read_u64(&mut rest)?)
+                    } else {
+                        None
+                    };
+                    // Optional: oi_cap_multiplier_bps (PERC-273, backwards compatible)
+                    let oi_cap_multiplier_bps = if rest.len() >= 8 {
                         Some(read_u64(&mut rest)?)
                     } else {
                         None
@@ -1983,6 +1996,7 @@ pub mod ix {
                         initial_margin_bps,
                         maintenance_margin_bps,
                         trading_fee_bps,
+                        oi_cap_multiplier_bps,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2086,6 +2100,7 @@ pub mod ix {
                         bump,
                     })
                 }
+                TAG_UNRESOLVE_MARKET => Ok(Instruction::UnresolveMarket),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -2374,6 +2389,16 @@ pub mod state {
         /// Last effective oracle price (after clamping), in e6 format.
         /// 0 = no history (first price accepted as-is).
         pub last_effective_price_e6: u64,
+
+        // ========================================
+        // Dynamic OI Cap (PERC-273)
+        // ========================================
+        /// OI cap multiplier in basis points. Max OI = vault * multiplier / 10_000.
+        /// 0 = disabled (no OI cap). 100_000 = 10x vault capital.
+        /// Set via UpdateMarginParams instruction.
+        pub oi_cap_multiplier_bps: u64,
+        /// Reserved for alignment (struct must be multiple of 16 bytes for u128 fields).
+        pub _oi_reserved: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -2487,6 +2512,12 @@ pub mod state {
     /// Set the resolved flag.
     pub fn set_resolved(data: &mut [u8]) {
         let flags = read_flags(data) | FLAG_RESOLVED;
+        write_flags(data, flags);
+    }
+
+    /// Clear the resolved flag (PERC-273: UnresolveMarket).
+    pub fn clear_resolved(data: &mut [u8]) {
+        let flags = read_flags(data) & !FLAG_RESOLVED;
         write_flags(data, flags);
     }
 
@@ -4136,6 +4167,24 @@ pub mod processor {
         Ok(())
     }
 
+    /// PERC-273: Check dynamic OI cap after trade execution.
+    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
+    fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
+        let multiplier = config.oi_cap_multiplier_bps;
+        if multiplier == 0 {
+            return Ok(()); // OI cap disabled
+        }
+        let vault = engine.vault.get();
+        let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+        let current_oi = engine.total_open_interest.get();
+        if current_oi > max_oi {
+            msg!("OI cap exceeded: current={} max={} (vault={} multiplier={})",
+                current_oi, max_oi, vault, multiplier);
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        Ok(())
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
         if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
@@ -4417,6 +4466,9 @@ pub mod processor {
                         DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
                     },
                     last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+                    // PERC-273: OI cap disabled by default
+                    oi_cap_multiplier_bps: 0,
+                    _oi_reserved: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -5128,6 +5180,10 @@ pub mod processor {
                 engine
                     .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error)?;
+
+                // PERC-273: Dynamic OI cap check after trade
+                check_oi_cap(engine, &config)?;
+
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
@@ -5438,6 +5494,10 @@ pub mod processor {
                     engine
                         .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
                         .map_err(map_risk_error)?;
+
+                    // PERC-273: Dynamic OI cap check after trade
+                    check_oi_cap(engine, &config)?;
+
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
@@ -6164,6 +6224,7 @@ pub mod processor {
                 initial_margin_bps,
                 maintenance_margin_bps,
                 trading_fee_bps,
+                oi_cap_multiplier_bps,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -6206,6 +6267,17 @@ pub mod processor {
                 if let Some(fee) = trading_fee_bps {
                     engine.params.trading_fee_bps = fee;
                 }
+
+                // PERC-273: Update OI cap multiplier if provided
+                if let Some(oi_cap) = oi_cap_multiplier_bps {
+                    let mut config = state::read_config(&data);
+                    config.oi_cap_multiplier_bps = oi_cap;
+                    state::write_config(&mut data, &config);
+                    msg!("UpdateRiskParams: oi_cap_multiplier_bps={}", oi_cap);
+                }
+
+                msg!("UpdateRiskParams: initial_margin_bps={}, maintenance_margin_bps={}, trading_fee_bps={:?}",
+                    initial_margin_bps, maintenance_margin_bps, trading_fee_bps);
             }
 
             Instruction::RenounceAdmin { confirmation } => {
@@ -7127,6 +7199,34 @@ pub mod processor {
                     new_mark,
                     dt_slots
                 );
+            }
+
+            Instruction::UnresolveMarket => {
+                // PERC-273: Unresolve market — clear RESOLVED flag, re-enable trading.
+                // Admin only. Emits event log for transparency.
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Must currently be resolved
+                if !state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Clear the resolved flag
+                state::clear_resolved(&mut data);
+
+                msg!("UnresolveMarket: admin={} slab={}", a_admin.key, a_slab.key);
             }
         }
         Ok(())

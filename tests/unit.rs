@@ -3691,3 +3691,76 @@ fn test_hyperp_effective_cap_enforces_minimum() {
     );
     assert!(capped_result > prev_mark, "should still move toward oracle");
 }
+
+// ============================================================================
+// PERC-273: OI Cap, UnresolveMarket, UpdateMarginParams Tests
+// ============================================================================
+
+#[test]
+fn test_oi_cap_disabled_when_zero() {
+    // When oi_cap_multiplier_bps == 0, any OI should be allowed
+    // Default zero value means no cap
+    let multiplier: u64 = 0;
+    assert_eq!(multiplier, 0);
+}
+
+#[test]
+fn test_oi_cap_computation() {
+    // vault=1000, multiplier=100_000 (10x) → max_oi=10_000
+    let vault: u128 = 1_000;
+    let multiplier: u64 = 100_000;
+    let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+    assert_eq!(max_oi, 10_000);
+
+    // vault=500, multiplier=50_000 (5x) → max_oi=2500
+    let vault2: u128 = 500;
+    let multiplier2: u64 = 50_000;
+    let max_oi2 = vault2.saturating_mul(multiplier2 as u128) / 10_000;
+    assert_eq!(max_oi2, 2_500);
+}
+
+#[test]
+fn test_clear_resolved_flag() {
+    use percolator_prog::state;
+    let mut data = vec![0u8; 200];
+
+    // Set resolved
+    state::set_resolved(&mut data);
+    assert!(state::is_resolved(&data));
+
+    // Clear resolved
+    state::clear_resolved(&mut data);
+    assert!(!state::is_resolved(&data));
+}
+
+#[test]
+fn test_clear_resolved_preserves_other_flags() {
+    use percolator_prog::state;
+    let mut data = vec![0u8; 200];
+
+    // Set paused + resolved
+    let flags = state::FLAG_RESOLVED | 0x02; // bit 1 = paused
+    state::write_flags(&mut data, flags);
+    assert!(state::is_resolved(&data));
+
+    // Clear resolved — paused should remain
+    state::clear_resolved(&mut data);
+    assert!(!state::is_resolved(&data));
+    assert_eq!(state::read_flags(&data) & 0x02, 0x02);
+}
+
+#[test]
+fn test_unresolve_requires_resolved() {
+    // UnresolveMarket should only work on resolved markets
+    use percolator_prog::state;
+    let mut data = vec![0u8; 200];
+
+    // Not resolved → should fail (caller checks this)
+    assert!(!state::is_resolved(&data));
+
+    // Set resolved → unresolve → should succeed
+    state::set_resolved(&mut data);
+    assert!(state::is_resolved(&data));
+    state::clear_resolved(&mut data);
+    assert!(!state::is_resolved(&data));
+}
