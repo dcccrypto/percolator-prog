@@ -990,7 +990,9 @@ pub mod verify {
             return 0;
         }
         // Ceiling division: (notional * fee_bps + 9999) / 10_000
-        let numerator = notional.saturating_mul(fee_bps as u128).saturating_add(9999);
+        let numerator = notional
+            .saturating_mul(fee_bps as u128)
+            .saturating_add(9999);
         numerator / 10_000
     }
 
@@ -1091,11 +1093,7 @@ pub mod verify {
     /// After a trade of `size`: new_user = old_user + size, new_lp = old_lp - size.
     /// Returns (new_user_pos, new_lp_pos, zero_sum_holds).
     #[inline]
-    pub fn apply_trade_positions(
-        old_user: i128,
-        old_lp: i128,
-        size: i128,
-    ) -> (i128, i128, bool) {
+    pub fn apply_trade_positions(old_user: i128, old_lp: i128, size: i128) -> (i128, i128, bool) {
         let new_user = old_user.saturating_add(size);
         let new_lp = old_lp.saturating_sub(size);
         // Zero-sum: if old_user + old_lp == 0, then new_user + new_lp should == 0
@@ -1179,8 +1177,7 @@ pub mod verify {
     /// total_dust = accumulated dust
     /// Conservation: total_units * scale + total_dust == total_base_in
     #[inline]
-    pub fn dust_conservation_check(
-        deposits: &[(u64, u32)], // (amount, scale) pairs
+    pub fn dust_conservation_check(deposits: &[(u64, u32)], // (amount, scale) pairs
     ) -> bool {
         let mut total_units: u128 = 0;
         let mut total_dust: u64 = 0;
@@ -1213,11 +1210,7 @@ pub mod verify {
     /// Returns true if the liquidation is safe (no profit for the liquidated).
     /// close_pnl is the PnL from closing at oracle price.
     #[inline]
-    pub fn liquidation_no_profit(
-        equity_before: u128,
-        equity_after: u128,
-        fee_paid: u128,
-    ) -> bool {
+    pub fn liquidation_no_profit(equity_before: u128, equity_after: u128, fee_paid: u128) -> bool {
         // After liquidation, equity should decrease by at least the fee
         // (no gaming via self-liquidation)
         equity_after <= equity_before
@@ -1227,10 +1220,7 @@ pub mod verify {
     /// penalty = liquidation_fee (paid to insurance fund).
     /// Net effect on liquidated account = -penalty (always negative).
     #[inline]
-    pub fn self_liquidation_unprofitable(
-        position_value: u128,
-        fee_bps: u64,
-    ) -> bool {
+    pub fn self_liquidation_unprofitable(position_value: u128, fee_bps: u64) -> bool {
         // Any fee > 0 makes self-liquidation strictly worse than just closing
         if fee_bps == 0 {
             return true; // Zero fee = no penalty but also no profit from liquidation
@@ -1250,20 +1240,14 @@ pub mod verify {
         if current_price == 0 || cap_e2bps == 0 {
             return 0;
         }
-        let delta = (current_price as u128)
-            .saturating_mul(cap_e2bps as u128)
-            / 1_000_000u128;
+        let delta = (current_price as u128).saturating_mul(cap_e2bps as u128) / 1_000_000u128;
         delta.min(current_price as u128) as u64
     }
 
     /// Verify that mark price movement is bounded within one slot.
     /// This is the key sandwich resistance property.
     #[inline]
-    pub fn price_impact_bounded(
-        price_before: u64,
-        price_after: u64,
-        cap_e2bps: u64,
-    ) -> bool {
+    pub fn price_impact_bounded(price_before: u64, price_after: u64, cap_e2bps: u64) -> bool {
         let max_impact = max_price_impact(price_before, cap_e2bps);
         let lo = price_before.saturating_sub(max_impact);
         let hi = price_before.saturating_add(max_impact);
@@ -1283,11 +1267,7 @@ pub mod verify {
     /// Circuit breaker should fire for extreme oracle jumps.
     /// A 99% drop from prev_price should trigger the breaker for any reasonable cap.
     #[inline]
-    pub fn extreme_drop_triggers_breaker(
-        prev_price: u64,
-        cap_e2bps: u64,
-        dt_slots: u64,
-    ) -> bool {
+    pub fn extreme_drop_triggers_breaker(prev_price: u64, cap_e2bps: u64, dt_slots: u64) -> bool {
         if prev_price == 0 || cap_e2bps == 0 || dt_slots == 0 {
             return false; // Breaker disabled
         }

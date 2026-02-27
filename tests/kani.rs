@@ -31,8 +31,15 @@ use percolator_prog::verify::{
     // New: Dust math
     accumulate_dust,
     admin_ok,
+    apply_trade_positions,
     // New: Unit scale conversion math
     base_to_units,
+    checked_deposit,
+    checked_withdraw,
+    circuit_breaker_triggered,
+    compute_fee_ceil,
+    compute_fee_floor,
+    convert_decimals,
     cpi_trade_size,
     decide_admin_op,
     decide_crank,
@@ -43,6 +50,8 @@ use percolator_prog::verify::{
     decide_trade_cpi_from_ret,
     decide_trade_nocpi,
     decision_nonce,
+    ema_step_unclamped,
+    extreme_drop_triggers_breaker,
     gate_active,
     // New: InitMarket scale validation
     init_market_scale_ok,
@@ -52,17 +61,26 @@ use percolator_prog::verify::{
     // PERC-117: Pyth oracle verification helpers
     is_pyth_pinned_mode,
     len_ok,
+    liquidation_no_profit,
     lp_pda_shape_ok,
+    mark_distance_after_step,
     matcher_identity_ok,
     matcher_shape_ok,
+    max_price_impact,
     nonce_on_failure,
     nonce_on_success,
+    nonces_serialize_correctly,
+    operation_allowed_in_state,
     oracle_feed_id_ok,
+    oracle_price_valid,
     owner_ok,
     pda_key_matches,
+    position_zero_sum,
+    price_impact_bounded,
     pyth_price_is_fresh,
     // New: Oracle unit scale math
     scale_price_e6,
+    self_liquidation_unprofitable,
     // Account validation helpers
     signer_ok,
     // Decision helpers for program-level coupling proofs
@@ -71,9 +89,13 @@ use percolator_prog::verify::{
     sweep_dust,
     trade_authorized,
     units_to_base,
+    valid_state_transition,
     // New: Withdraw alignment
     withdraw_amount_aligned,
     writable_ok,
+    // PERC-241: Additional imports for 10 uncovered properties
+    AccountOp,
+    AccountState,
     LpPdaShape,
     MatcherAccountsShape,
     // ABI validation from real inputs
@@ -83,28 +105,6 @@ use percolator_prog::verify::{
     TradeCpiDecision,
     TradeNoCpiDecision,
     INVERSION_CONSTANT,
-    // PERC-241: Additional imports for 10 uncovered properties
-    AccountOp,
-    AccountState,
-    apply_trade_positions,
-    checked_deposit,
-    checked_withdraw,
-    circuit_breaker_triggered,
-    compute_fee_ceil,
-    compute_fee_floor,
-    convert_decimals,
-    ema_step_unclamped,
-    extreme_drop_triggers_breaker,
-    liquidation_no_profit,
-    mark_distance_after_step,
-    max_price_impact,
-    nonces_serialize_correctly,
-    operation_allowed_in_state,
-    oracle_price_valid,
-    position_zero_sum,
-    price_impact_bounded,
-    self_liquidation_unprofitable,
-    valid_state_transition,
 };
 
 // Kani-specific bounds to avoid SAT explosion on division/modulo.
@@ -4048,7 +4048,10 @@ fn kani_decimals_6_decimal_unit_conversion() {
 
     // Conservation
     let reconstructed = (units as u128) * 1000 + (dust as u128);
-    assert_eq!(reconstructed, usdc_atoms as u128, "6-decimal token: conservation must hold");
+    assert_eq!(
+        reconstructed, usdc_atoms as u128,
+        "6-decimal token: conservation must hold"
+    );
     assert!(dust < 1000, "6-decimal token: dust must be < scale");
 }
 
@@ -4105,7 +4108,10 @@ fn kani_u64max_deposit_max_into_max() {
     let result = checked_deposit(old_capital, amount);
 
     // u64::MAX + u64::MAX = 2 * u64::MAX, which fits in u128
-    assert!(result.is_some(), "u64::MAX + u64::MAX must not overflow u128");
+    assert!(
+        result.is_some(),
+        "u64::MAX + u64::MAX must not overflow u128"
+    );
     assert_eq!(
         result.unwrap(),
         (u64::MAX as u128) * 2,
@@ -4265,11 +4271,22 @@ fn kani_concurrency_two_successes_monotone_nonce() {
 
     let (after_op1, after_op2) = nonces_serialize_correctly(nonce_before, true, true);
 
-    assert_eq!(after_op1, nonce_before.wrapping_add(1), "op1 increments nonce");
-    assert_eq!(after_op2, nonce_before.wrapping_add(2), "op2 increments again");
+    assert_eq!(
+        after_op1,
+        nonce_before.wrapping_add(1),
+        "op1 increments nonce"
+    );
+    assert_eq!(
+        after_op2,
+        nonce_before.wrapping_add(2),
+        "op2 increments again"
+    );
     // Unless wrapping, op2 > op1 > before
     if nonce_before < u64::MAX - 1 {
-        assert!(after_op1 > nonce_before, "nonce must increase after success");
+        assert!(
+            after_op1 > nonce_before,
+            "nonce must increase after success"
+        );
         assert!(after_op2 > after_op1, "nonce must increase again");
     }
 }
@@ -4531,7 +4548,10 @@ fn kani_fee_nonzero_for_any_nonzero_trade() {
 
     let fee = compute_fee_ceil(notional, fee_bps);
 
-    assert!(fee >= 1, "non-zero trade with non-zero fee_bps must charge at least 1");
+    assert!(
+        fee >= 1,
+        "non-zero trade with non-zero fee_bps must charge at least 1"
+    );
 }
 
 /// Prove: fee == 0 iff notional == 0 or fee_bps == 0.
@@ -4618,8 +4638,7 @@ fn kani_dust_single_deposit_conservation() {
     let reconstructed = (units as u128) * (scale as u128) + (dust as u128);
 
     assert_eq!(
-        reconstructed,
-        amount as u128,
+        reconstructed, amount as u128,
         "single deposit: units*scale + dust == amount"
     );
 }
@@ -4664,7 +4683,10 @@ fn kani_dust_accumulation_commutative() {
     let result_12 = accumulate_dust(d1, d2);
     let result_21 = accumulate_dust(d2, d1);
 
-    assert_eq!(result_12, result_21, "dust accumulation must be commutative");
+    assert_eq!(
+        result_12, result_21,
+        "dust accumulation must be commutative"
+    );
 }
 
 /// Prove: dust accumulation is associative (within saturation).
@@ -4679,7 +4701,10 @@ fn kani_dust_accumulation_associative() {
     let left = accumulate_dust(accumulate_dust(d1, d2), d3);
     let right = accumulate_dust(d1, accumulate_dust(d2, d3));
 
-    assert_eq!(left, right, "dust accumulation must be associative (no saturation)");
+    assert_eq!(
+        left, right,
+        "dust accumulation must be associative (no saturation)"
+    );
 }
 
 /// Prove: after sweep, remaining dust is always less than one unit.
@@ -4738,7 +4763,10 @@ fn kani_selfliq_unprofitable_with_fee() {
     kani::assume(position_value <= u64::MAX as u128);
 
     let unprofitable = self_liquidation_unprofitable(position_value, fee_bps);
-    assert!(unprofitable, "any positive fee makes self-liquidation unprofitable");
+    assert!(
+        unprofitable,
+        "any positive fee makes self-liquidation unprofitable"
+    );
 }
 
 /// Prove: liquidation fee is always positive for non-zero position with non-zero bps.
@@ -4752,7 +4780,10 @@ fn kani_selfliq_fee_always_positive() {
     kani::assume(position_value <= u64::MAX as u128);
 
     let fee = compute_fee_ceil(position_value, fee_bps);
-    assert!(fee > 0, "liquidation fee must be positive for non-zero position");
+    assert!(
+        fee > 0,
+        "liquidation fee must be positive for non-zero position"
+    );
 }
 
 /// Prove: zero position has zero liquidation cost.
@@ -4780,9 +4811,7 @@ fn kani_sandwich_impact_proportional() {
     let impact = max_price_impact(price, cap);
 
     // Impact = price * cap / 1_000_000, capped at price
-    let expected = (price as u128)
-        .saturating_mul(cap as u128)
-        / 1_000_000u128;
+    let expected = (price as u128).saturating_mul(cap as u128) / 1_000_000u128;
     let expected = expected.min(price as u128) as u64;
 
     assert_eq!(impact, expected, "impact must equal price * cap / 1e6");
@@ -4853,7 +4882,10 @@ fn kani_oracle_zero_price_rejected() {
 #[kani::proof]
 fn kani_oracle_max_price_rejected() {
     let valid = oracle_price_valid(u64::MAX);
-    assert!(!valid, "u64::MAX must exceed MAX_ORACLE_PRICE and be rejected");
+    assert!(
+        !valid,
+        "u64::MAX must exceed MAX_ORACLE_PRICE and be rejected"
+    );
 }
 
 /// Prove: valid prices in range (1..=MAX_ORACLE_PRICE) are accepted.
@@ -4923,9 +4955,7 @@ fn kani_oracle_adversarial_max_clamped() {
     // u64::MAX oracle should be clamped to prev_mark + max_delta
     let result = compute_ema_mark_price(prev_mark, u64::MAX, 1, 1_000_000, cap);
 
-    let max_delta = (prev_mark as u128)
-        .saturating_mul(cap as u128)
-        / 1_000_000u128;
+    let max_delta = (prev_mark as u128).saturating_mul(cap as u128) / 1_000_000u128;
     let max_delta = max_delta.min(prev_mark as u128) as u64;
     let hi = prev_mark.saturating_add(max_delta);
 
@@ -4961,6 +4991,9 @@ fn kani_oracle_validation_and_breaker_compose() {
         let max_delta = prev_mark as u128 * 10_000 / 1_000_000;
         let hi = prev_mark + max_delta as u64;
         let lo = prev_mark.saturating_sub(max_delta as u64);
-        assert!(result >= lo && result <= hi, "valid oracle must produce bounded result");
+        assert!(
+            result >= lo && result <= hi,
+            "valid oracle must produce bounded result"
+        );
     }
 }
