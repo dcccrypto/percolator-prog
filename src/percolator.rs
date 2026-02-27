@@ -4178,8 +4178,13 @@ pub mod processor {
         let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
         let current_oi = engine.total_open_interest.get();
         if current_oi > max_oi {
-            msg!("OI cap exceeded: current={} max={} (vault={} multiplier={})",
-                current_oi, max_oi, vault, multiplier);
+            msg!(
+                "OI cap exceeded: current={} max={} (vault={} multiplier={})",
+                current_oi,
+                max_oi,
+                vault,
+                multiplier
+            );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
         Ok(())

@@ -5122,5 +5122,8 @@ fn proof_margin_always_requires_positive_collateral() {
     let required_margin = notional * (initial_margin_bps as u128) / 10_000;
 
     // Required margin is always > 0 for any valid position
-    assert!(required_margin > 0, "Margin must be positive for any open position");
+    assert!(
+        required_margin > 0,
+        "Margin must be positive for any open position"
+    );
 }
