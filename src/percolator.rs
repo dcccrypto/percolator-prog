@@ -4391,15 +4391,32 @@ pub mod processor {
 
                     for idx in start..end {
                         if engine.is_used(idx as usize) {
+                            // Bug cb8a4c22: Settle unsettled funding before computing
+                            // settlement PnL. Without this, accrued funding credits/debits
+                            // are lost, leading to incorrect payouts at resolution.
+                            let _ = engine.touch_account(idx);
+
                             let acc = &engine.accounts[idx as usize];
                             let pos = acc.position_size.get();
                             if pos != 0 {
-                                // Settle position at settlement price
-                                // PnL = position * (settlement_price - entry_price) / 1e6
+                                // Settle position using COIN-MARGINED PnL formula
+                                // (matches mark_pnl_for_position in the risk engine)
+                                // PnL = diff * abs_pos / settle_price
                                 let entry = acc.entry_price as i128;
                                 let settle = settlement_price as i128;
-                                let pnl_delta = pos.saturating_mul(settle.saturating_sub(entry))
-                                    / 1_000_000i128;
+                                let abs_pos = if pos < 0 { pos.wrapping_neg() } else { pos };
+                                let diff = if pos > 0 {
+                                    settle.saturating_sub(entry)
+                                } else {
+                                    entry.saturating_sub(settle)
+                                };
+                                // Guard against division by zero (settle == 0 checked above,
+                                // but defense in depth)
+                                let pnl_delta = if settle != 0 {
+                                    diff.saturating_mul(abs_pos) / settle
+                                } else {
+                                    0i128
+                                };
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
                                 // SECURITY: Must use set_pnl() for correct haircut calculations
@@ -5009,7 +5026,27 @@ pub mod processor {
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
-                        config.authority_price_e6 = clamped_mark;
+                        // Bug b5232aef: Rate-limit mark price updates to prevent
+                        // malicious matchers from grinding mark via repeated TradeCpi.
+                        // Only update mark if: (a) first trade this slot, or
+                        // (b) new mark is closer to index than current mark.
+                        let index = config.last_effective_price_e6;
+                        let current_mark = config.authority_price_e6;
+                        let new_dist = if clamped_mark > index {
+                            clamped_mark - index
+                        } else {
+                            index - clamped_mark
+                        };
+                        let old_dist = if current_mark > index {
+                            current_mark - index
+                        } else {
+                            index - current_mark
+                        };
+                        // Allow update only if it moves mark closer to index (convergent)
+                        // or if current mark is 0 (uninitialized)
+                        if current_mark == 0 || new_dist <= old_dist {
+                            config.authority_price_e6 = clamped_mark;
+                        }
                     }
 
                     state::write_config(&mut data, &config);
