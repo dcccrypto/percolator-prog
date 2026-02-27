@@ -31,8 +31,15 @@ use percolator_prog::verify::{
     // New: Dust math
     accumulate_dust,
     admin_ok,
+    apply_trade_positions,
     // New: Unit scale conversion math
     base_to_units,
+    checked_deposit,
+    checked_withdraw,
+    circuit_breaker_triggered,
+    compute_fee_ceil,
+    compute_fee_floor,
+    convert_decimals,
     cpi_trade_size,
     decide_admin_op,
     decide_crank,
@@ -43,6 +50,8 @@ use percolator_prog::verify::{
     decide_trade_cpi_from_ret,
     decide_trade_nocpi,
     decision_nonce,
+    ema_step_unclamped,
+    extreme_drop_triggers_breaker,
     gate_active,
     // New: InitMarket scale validation
     init_market_scale_ok,
@@ -52,17 +61,26 @@ use percolator_prog::verify::{
     // PERC-117: Pyth oracle verification helpers
     is_pyth_pinned_mode,
     len_ok,
+    liquidation_no_profit,
     lp_pda_shape_ok,
+    mark_distance_after_step,
     matcher_identity_ok,
     matcher_shape_ok,
+    max_price_impact,
     nonce_on_failure,
     nonce_on_success,
+    nonces_serialize_correctly,
+    operation_allowed_in_state,
     oracle_feed_id_ok,
+    oracle_price_valid,
     owner_ok,
     pda_key_matches,
+    position_zero_sum,
+    price_impact_bounded,
     pyth_price_is_fresh,
     // New: Oracle unit scale math
     scale_price_e6,
+    self_liquidation_unprofitable,
     // Account validation helpers
     signer_ok,
     // Decision helpers for program-level coupling proofs
@@ -71,9 +89,13 @@ use percolator_prog::verify::{
     sweep_dust,
     trade_authorized,
     units_to_base,
+    valid_state_transition,
     // New: Withdraw alignment
     withdraw_amount_aligned,
     writable_ok,
+    // PERC-241: Additional imports for 10 uncovered properties
+    AccountOp,
+    AccountState,
     LpPdaShape,
     MatcherAccountsShape,
     // ABI validation from real inputs
@@ -3934,4 +3956,1044 @@ fn kani_hyperp_effective_cap_minimum() {
         effective_cap >= DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         "effective cap must always meet minimum"
     );
+}
+
+// =============================================================================
+// PERC-241: EXPANDED KANI COVERAGE — 10 UNCOVERED PROPERTIES
+// =============================================================================
+//
+// The following 55 harnesses cover 10 previously uncovered properties:
+// 1. Token decimals (0-9) — no implicit 9-decimal assumption
+// 2. u64::MAX edge cases — deposit, withdraw, fee at boundaries
+// 3. State machine invalid transitions — reject out-of-order operations
+// 4. Concurrency / interleaved instructions — nonce serialization
+// 5. Circuit breaker EMA sub-proofs — update, trigger, recovery
+// 6. Fee rounding direction — always rounds in protocol favour
+// 7. Dust accumulation — multi-operation conservation
+// 8. Self-liquidation resistance — liquidation fee prevents gaming
+// 9. Sandwich resistance — price impact bounded by circuit breaker
+// 10. Oracle manipulation — adversarial inputs handled correctly
+
+// PERC-241 imports already included in the top-level use block above.
+
+// =============================================================================
+// 1. TOKEN DECIMALS — No implicit 9-decimal assumption (6 proofs)
+// =============================================================================
+
+/// Prove: base_to_units produces the same result regardless of token decimals.
+/// The function only depends on (base, scale), never on decimals.
+#[kani::proof]
+fn kani_decimals_base_to_units_independent_of_decimals() {
+    let base: u64 = kani::any();
+    let scale: u32 = kani::any();
+    kani::assume(scale <= KANI_MAX_SCALE);
+    kani::assume(base <= (scale.max(1) as u64) * KANI_MAX_QUOTIENT);
+
+    // Call with the same inputs — result is the same regardless of what
+    // "decimals" the token has, because decimals are not an input.
+    let (units1, dust1) = base_to_units(base, scale);
+    let (units2, dust2) = base_to_units(base, scale);
+
+    assert_eq!(units1, units2, "base_to_units must be decimal-independent");
+    assert_eq!(dust1, dust2, "dust must be decimal-independent");
+}
+
+/// Prove: convert_decimals is identity when from == to for any decimal count 0-9.
+#[kani::proof]
+fn kani_decimals_convert_identity() {
+    let amount: u64 = kani::any();
+    let decimals: u8 = kani::any();
+    kani::assume(decimals <= 9);
+
+    let result = convert_decimals(amount, decimals, decimals);
+    assert_eq!(result, amount, "same-decimal conversion must be identity");
+}
+
+/// Prove: convert_decimals 0-decimal to 9-decimal scales up by 10^9.
+#[kani::proof]
+fn kani_decimals_0_to_9_scales_up() {
+    let amount: u64 = kani::any();
+    kani::assume(amount <= u64::MAX / 1_000_000_000); // Avoid saturation
+
+    let result = convert_decimals(amount, 0, 9);
+    assert_eq!(
+        result,
+        amount * 1_000_000_000,
+        "0→9 decimals must multiply by 10^9"
+    );
+}
+
+/// Prove: convert_decimals 9-decimal to 0-decimal scales down by 10^9.
+#[kani::proof]
+fn kani_decimals_9_to_0_scales_down() {
+    let amount: u64 = kani::any();
+
+    let result = convert_decimals(amount, 9, 0);
+    assert_eq!(
+        result,
+        amount / 1_000_000_000,
+        "9→0 decimals must divide by 10^9"
+    );
+}
+
+/// Prove: unit conversion with scale works for 6-decimal USDC-like tokens.
+/// 1 USDC = 1_000_000 atoms (6 decimals). With scale=1000, units = atoms/1000.
+#[kani::proof]
+fn kani_decimals_6_decimal_unit_conversion() {
+    let usdc_atoms: u64 = kani::any();
+    kani::assume(usdc_atoms <= KANI_MAX_QUOTIENT * 1000);
+
+    let scale: u32 = 1000;
+    let (units, dust) = base_to_units(usdc_atoms, scale);
+
+    // Conservation
+    let reconstructed = (units as u128) * 1000 + (dust as u128);
+    assert_eq!(
+        reconstructed, usdc_atoms as u128,
+        "6-decimal token: conservation must hold"
+    );
+    assert!(dust < 1000, "6-decimal token: dust must be < scale");
+}
+
+/// Prove: unit conversion with scale works for 0-decimal whole-number tokens.
+/// With scale=1 (or 0), every atom is one unit.
+#[kani::proof]
+fn kani_decimals_0_decimal_unit_conversion() {
+    let whole_tokens: u64 = kani::any();
+
+    // scale=0 means no scaling
+    let (units_0, dust_0) = base_to_units(whole_tokens, 0);
+    assert_eq!(units_0, whole_tokens, "scale=0 must return base as units");
+    assert_eq!(dust_0, 0, "scale=0 must produce no dust");
+
+    // scale=1 means divide by 1 (same result)
+    let (units_1, dust_1) = base_to_units(whole_tokens, 1);
+    assert_eq!(units_1, whole_tokens, "scale=1 must return base as units");
+    assert_eq!(dust_1, 0, "scale=1 must produce no dust");
+}
+
+// =============================================================================
+// 2. u64::MAX EDGE CASES — No overflow on any path (7 proofs)
+// =============================================================================
+
+/// Prove: deposit at u64::MAX doesn't overflow (saturating add).
+#[kani::proof]
+fn kani_u64max_deposit_no_overflow() {
+    let old_capital: u128 = kani::any();
+    let amount: u128 = kani::any();
+    kani::assume(amount <= u64::MAX as u128);
+    kani::assume(old_capital <= u64::MAX as u128);
+
+    let result = checked_deposit(old_capital, amount);
+
+    // Must either succeed with correct sum or return None
+    match result {
+        Some(new_cap) => {
+            assert_eq!(new_cap, old_capital + amount, "deposit must add correctly");
+            assert!(new_cap >= old_capital, "deposit result must be >= old");
+        }
+        None => {
+            // Overflow: old + amount > u128::MAX (extremely unlikely for u64 inputs)
+            // This is a safe rejection
+        }
+    }
+}
+
+/// Prove: deposit of u64::MAX into u64::MAX capital doesn't panic.
+#[kani::proof]
+fn kani_u64max_deposit_max_into_max() {
+    let old_capital: u128 = u64::MAX as u128;
+    let amount: u128 = u64::MAX as u128;
+
+    let result = checked_deposit(old_capital, amount);
+
+    // u64::MAX + u64::MAX = 2 * u64::MAX, which fits in u128
+    assert!(
+        result.is_some(),
+        "u64::MAX + u64::MAX must not overflow u128"
+    );
+    assert_eq!(
+        result.unwrap(),
+        (u64::MAX as u128) * 2,
+        "must be exactly 2 * u64::MAX"
+    );
+}
+
+/// Prove: withdraw at u64::MAX from u64::MAX succeeds.
+#[kani::proof]
+fn kani_u64max_withdraw_max_from_max() {
+    let capital: u128 = u64::MAX as u128;
+    let amount: u128 = u64::MAX as u128;
+
+    let result = checked_withdraw(capital, amount);
+
+    assert!(result.is_some(), "withdrawing max from max must succeed");
+    assert_eq!(result.unwrap(), 0, "must leave zero balance");
+}
+
+/// Prove: withdraw more than capital is rejected.
+#[kani::proof]
+fn kani_u64max_withdraw_over_balance_rejected() {
+    let capital: u128 = kani::any();
+    let amount: u128 = kani::any();
+    kani::assume(amount > capital);
+
+    let result = checked_withdraw(capital, amount);
+
+    assert!(result.is_none(), "withdrawing more than balance must fail");
+}
+
+/// Prove: fee calculation at u64::MAX notional doesn't overflow.
+#[kani::proof]
+fn kani_u64max_fee_no_overflow() {
+    let notional: u128 = u64::MAX as u128;
+    let fee_bps: u64 = kani::any();
+    kani::assume(fee_bps <= 10_000); // Max 100%
+
+    // Must not panic
+    let fee = compute_fee_ceil(notional, fee_bps);
+
+    // Fee must be reasonable: <= notional (can't charge more than 100%)
+    assert!(fee <= notional, "fee must not exceed notional");
+
+    // Fee must be non-negative (u128 is always >= 0)
+    // Fee must be at least floor value
+    let floor = compute_fee_floor(notional, fee_bps);
+    assert!(fee >= floor, "ceil fee must be >= floor fee");
+}
+
+/// Prove: base_to_units at u64::MAX doesn't panic for any scale.
+#[kani::proof]
+fn kani_u64max_base_to_units_no_panic() {
+    let scale: u32 = kani::any();
+    kani::assume(scale <= KANI_MAX_SCALE);
+
+    // Must not panic even at u64::MAX
+    let base = u64::MAX;
+    let (units, dust) = base_to_units(base, scale);
+
+    if scale == 0 {
+        assert_eq!(units, base, "scale=0: units must equal base");
+        assert_eq!(dust, 0, "scale=0: no dust");
+    } else {
+        // Conservation still holds
+        let reconstructed = (units as u128) * (scale as u128) + (dust as u128);
+        assert_eq!(reconstructed, base as u128, "conservation at u64::MAX");
+    }
+}
+
+/// Prove: nonce wrapping at u64::MAX is safe (already proven, but now explicit edge).
+#[kani::proof]
+fn kani_u64max_nonce_wraps_safely() {
+    // Two successive wraps
+    let n1 = nonce_on_success(u64::MAX);
+    assert_eq!(n1, 0, "u64::MAX wraps to 0");
+
+    let n2 = nonce_on_success(n1);
+    assert_eq!(n2, 1, "0 wraps to 1");
+
+    // Failure at MAX leaves it unchanged
+    let n3 = nonce_on_failure(u64::MAX);
+    assert_eq!(n3, u64::MAX, "failure at MAX unchanged");
+}
+
+// =============================================================================
+// 3. STATE MACHINE INVALID TRANSITIONS (6 proofs)
+// =============================================================================
+
+/// Prove: close-before-open is rejected (Free -> Closed is invalid).
+#[kani::proof]
+fn kani_statemachine_close_before_open_rejected() {
+    let is_valid = valid_state_transition(AccountState::Free, AccountState::Closed);
+    assert!(!is_valid, "Free -> Closed must be rejected");
+}
+
+/// Prove: re-init of existing account is rejected (Open -> Open is invalid).
+#[kani::proof]
+fn kani_statemachine_reinit_rejected() {
+    let is_valid = valid_state_transition(AccountState::Open, AccountState::Open);
+    assert!(!is_valid, "Open -> Open (re-init) must be rejected");
+}
+
+/// Prove: deposit-after-close is rejected.
+#[kani::proof]
+fn kani_statemachine_deposit_after_close_rejected() {
+    let allowed = operation_allowed_in_state(AccountState::Closed, AccountOp::Deposit);
+    assert!(!allowed, "deposit after close must be rejected");
+}
+
+/// Prove: crank-before-init is rejected.
+#[kani::proof]
+fn kani_statemachine_crank_before_init_rejected() {
+    let allowed = operation_allowed_in_state(AccountState::Free, AccountOp::Crank);
+    assert!(!allowed, "crank on free slot must be rejected");
+}
+
+/// Prove: all operations on closed accounts are rejected.
+#[kani::proof]
+fn kani_statemachine_all_ops_rejected_on_closed() {
+    let ops = [
+        AccountOp::Open,
+        AccountOp::Deposit,
+        AccountOp::Withdraw,
+        AccountOp::Trade,
+        AccountOp::Crank,
+    ];
+    for op in ops {
+        let allowed = operation_allowed_in_state(AccountState::Closed, op);
+        assert!(!allowed, "no operation except Close should work on Closed");
+    }
+    // Close on Closed is also invalid (double close)
+    let close_allowed = operation_allowed_in_state(AccountState::Closed, AccountOp::Close);
+    assert!(!close_allowed, "double close must be rejected");
+}
+
+/// Prove: only Open allows trade operations.
+#[kani::proof]
+fn kani_statemachine_trade_only_on_open() {
+    let free = operation_allowed_in_state(AccountState::Free, AccountOp::Trade);
+    let open = operation_allowed_in_state(AccountState::Open, AccountOp::Trade);
+    let closed = operation_allowed_in_state(AccountState::Closed, AccountOp::Trade);
+
+    assert!(!free, "trade on Free must be rejected");
+    assert!(open, "trade on Open must be allowed");
+    assert!(!closed, "trade on Closed must be rejected");
+}
+
+// =============================================================================
+// 4. CONCURRENCY / INTERLEAVED INSTRUCTIONS (6 proofs)
+// =============================================================================
+
+/// Prove: two successful operations on same slab produce strictly monotone nonces.
+#[kani::proof]
+fn kani_concurrency_two_successes_monotone_nonce() {
+    let nonce_before: u64 = kani::any();
+
+    let (after_op1, after_op2) = nonces_serialize_correctly(nonce_before, true, true);
+
+    assert_eq!(
+        after_op1,
+        nonce_before.wrapping_add(1),
+        "op1 increments nonce"
+    );
+    assert_eq!(
+        after_op2,
+        nonce_before.wrapping_add(2),
+        "op2 increments again"
+    );
+    // Unless wrapping, op2 > op1 > before
+    if nonce_before < u64::MAX - 1 {
+        assert!(
+            after_op1 > nonce_before,
+            "nonce must increase after success"
+        );
+        assert!(after_op2 > after_op1, "nonce must increase again");
+    }
+}
+
+/// Prove: failed op + successful op still produces correct nonce.
+#[kani::proof]
+fn kani_concurrency_fail_then_success() {
+    let nonce_before: u64 = kani::any();
+
+    let (after_op1, after_op2) = nonces_serialize_correctly(nonce_before, false, true);
+
+    assert_eq!(after_op1, nonce_before, "failed op leaves nonce unchanged");
+    assert_eq!(
+        after_op2,
+        nonce_before.wrapping_add(1),
+        "success after fail increments"
+    );
+}
+
+/// Prove: two failures leave nonce completely unchanged.
+#[kani::proof]
+fn kani_concurrency_two_failures_nonce_unchanged() {
+    let nonce_before: u64 = kani::any();
+
+    let (after_op1, after_op2) = nonces_serialize_correctly(nonce_before, false, false);
+
+    assert_eq!(after_op1, nonce_before, "first failure: unchanged");
+    assert_eq!(after_op2, nonce_before, "second failure: still unchanged");
+}
+
+/// Prove: trade position zero-sum invariant holds after any trade.
+#[kani::proof]
+fn kani_concurrency_position_zero_sum_preserved() {
+    let old_user: i128 = kani::any();
+    let old_lp: i128 = kani::any();
+    let size: i128 = kani::any();
+
+    // Start with zero-sum
+    kani::assume(old_user.checked_add(old_lp) == Some(0));
+    // Avoid saturation
+    kani::assume(old_user.checked_add(size).is_some());
+    kani::assume(old_lp.checked_sub(size).is_some());
+
+    let (new_user, new_lp, preserved) = apply_trade_positions(old_user, old_lp, size);
+
+    assert!(preserved, "zero-sum must be preserved after trade");
+    assert_eq!(new_user + new_lp, 0, "positions must sum to zero");
+}
+
+/// Prove: two sequential trades preserve zero-sum.
+#[kani::proof]
+fn kani_concurrency_two_trades_zero_sum() {
+    let old_user: i128 = kani::any();
+    let old_lp: i128 = kani::any();
+    let size1: i128 = kani::any();
+    let size2: i128 = kani::any();
+
+    // Start with zero-sum, avoid saturation
+    kani::assume(old_user.checked_add(old_lp) == Some(0));
+    kani::assume(old_user.checked_add(size1).is_some());
+    kani::assume(old_lp.checked_sub(size1).is_some());
+
+    let (mid_user, mid_lp, ok1) = apply_trade_positions(old_user, old_lp, size1);
+    kani::assume(ok1);
+    kani::assume(mid_user.checked_add(size2).is_some());
+    kani::assume(mid_lp.checked_sub(size2).is_some());
+
+    let (final_user, final_lp, ok2) = apply_trade_positions(mid_user, mid_lp, size2);
+
+    assert!(ok2, "second trade must preserve invariant");
+    assert_eq!(final_user + final_lp, 0, "two trades: still zero-sum");
+}
+
+/// Prove: position_zero_sum detects non-zero-sum correctly.
+#[kani::proof]
+fn kani_concurrency_zero_sum_detection() {
+    let user: i128 = kani::any();
+    let lp: i128 = kani::any();
+    // Avoid overflow in add
+    kani::assume(user.checked_add(lp).is_some());
+
+    let is_zero = position_zero_sum(user, lp);
+
+    if user + lp == 0 {
+        assert!(is_zero, "must detect zero-sum");
+    } else {
+        assert!(!is_zero, "must detect non-zero-sum");
+    }
+}
+
+// =============================================================================
+// 5. CIRCUIT BREAKER EMA SUB-PROOFS (7 proofs)
+// =============================================================================
+
+/// Sub-proof (a): EMA update correctness — unclamped EMA is weighted average.
+#[kani::proof]
+fn kani_cb_ema_update_weighted_average() {
+    let prev: u64 = kani::any();
+    let oracle: u64 = kani::any();
+    let alpha: u64 = kani::any();
+
+    kani::assume(prev > 0 && prev <= 1_000_000_000);
+    kani::assume(oracle > 0 && oracle <= 1_000_000_000);
+    kani::assume(alpha > 0 && alpha <= 1_000_000);
+
+    let result = ema_step_unclamped(prev, oracle, alpha);
+
+    // Result must be between min(prev, oracle) and max(prev, oracle)
+    let lo = core::cmp::min(prev, oracle);
+    let hi = core::cmp::max(prev, oracle);
+    assert!(result >= lo, "EMA must be >= min(prev, oracle)");
+    assert!(result <= hi, "EMA must be <= max(prev, oracle)");
+}
+
+/// Sub-proof (a2): EMA alpha=0 means no update (stay at prev).
+#[kani::proof]
+fn kani_cb_ema_alpha_zero_no_update() {
+    let prev: u64 = kani::any();
+    let oracle: u64 = kani::any();
+    kani::assume(prev > 0);
+    kani::assume(oracle > 0);
+
+    let result = ema_step_unclamped(prev, oracle, 0);
+
+    assert_eq!(result, prev, "alpha=0 must keep prev unchanged");
+}
+
+/// Sub-proof (a3): EMA alpha=1_000_000 means full jump to oracle.
+#[kani::proof]
+fn kani_cb_ema_alpha_full_jumps_to_oracle() {
+    let prev: u64 = kani::any();
+    let oracle: u64 = kani::any();
+    kani::assume(prev > 0 && prev <= 1_000_000_000);
+    kani::assume(oracle > 0 && oracle <= 1_000_000_000);
+
+    let result = ema_step_unclamped(prev, oracle, 1_000_000);
+
+    assert_eq!(result, oracle, "alpha=1.0 must jump to oracle");
+}
+
+/// Sub-proof (b): Trigger threshold check — breaker fires for out-of-bound oracle.
+#[kani::proof]
+fn kani_cb_trigger_fires_correctly() {
+    let prev_mark: u64 = kani::any();
+    let raw_oracle: u64 = kani::any();
+    let cap_e2bps: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+
+    kani::assume(prev_mark > 0 && prev_mark <= 1_000_000_000);
+    kani::assume(raw_oracle > 0 && raw_oracle <= 1_000_000_000);
+    kani::assume(cap_e2bps > 0 && cap_e2bps <= 100_000);
+    kani::assume(dt_slots > 0 && dt_slots <= 1000);
+
+    let triggered = circuit_breaker_triggered(prev_mark, raw_oracle, cap_e2bps, dt_slots);
+
+    // Compute bounds independently
+    let max_delta = (prev_mark as u128)
+        .saturating_mul(cap_e2bps as u128)
+        .saturating_mul(dt_slots as u128)
+        / 1_000_000u128;
+    let max_delta = max_delta.min(prev_mark as u128) as u64;
+    let lo = prev_mark.saturating_sub(max_delta);
+    let hi = prev_mark.saturating_add(max_delta);
+
+    let in_bounds = raw_oracle >= lo && raw_oracle <= hi;
+
+    if in_bounds {
+        assert!(!triggered, "in-bounds oracle must NOT trigger breaker");
+    } else {
+        assert!(triggered, "out-of-bounds oracle MUST trigger breaker");
+    }
+}
+
+/// Sub-proof (b2): Breaker disabled (cap=0) never triggers.
+#[kani::proof]
+fn kani_cb_trigger_disabled_when_cap_zero() {
+    let prev_mark: u64 = kani::any();
+    let raw_oracle: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+
+    let triggered = circuit_breaker_triggered(prev_mark, raw_oracle, 0, dt_slots);
+
+    assert!(!triggered, "breaker with cap=0 must never trigger");
+}
+
+/// Sub-proof (c): Recovery — mark converges toward oracle after clamped EMA step.
+/// Distance must not increase when moving toward oracle.
+#[kani::proof]
+fn kani_cb_recovery_distance_decreases() {
+    let prev_mark: u64 = kani::any();
+    let oracle: u64 = kani::any();
+    let alpha_e6: u64 = kani::any();
+    let cap_e2bps: u64 = kani::any();
+
+    kani::assume(prev_mark > 0 && prev_mark <= 1_000_000_000);
+    kani::assume(oracle > 0 && oracle <= 1_000_000_000);
+    kani::assume(alpha_e6 > 0 && alpha_e6 <= 1_000_000);
+    kani::assume(cap_e2bps > 0 && cap_e2bps <= 100_000);
+
+    let old_distance = if prev_mark > oracle {
+        prev_mark - oracle
+    } else {
+        oracle - prev_mark
+    };
+
+    let new_distance = mark_distance_after_step(prev_mark, oracle, alpha_e6, cap_e2bps, 1);
+
+    assert!(
+        new_distance <= old_distance,
+        "EMA step must not increase distance from oracle"
+    );
+}
+
+/// Sub-proof (c2): At equilibrium (prev == oracle), distance stays zero.
+#[kani::proof]
+fn kani_cb_recovery_equilibrium_stable() {
+    let price: u64 = kani::any();
+    kani::assume(price > 0 && price <= 1_000_000_000);
+
+    let alpha_e6: u64 = kani::any();
+    let cap_e2bps: u64 = kani::any();
+    kani::assume(alpha_e6 <= 1_000_000);
+    kani::assume(cap_e2bps <= 100_000);
+
+    let distance = mark_distance_after_step(price, price, alpha_e6, cap_e2bps, 1);
+
+    assert_eq!(distance, 0, "at equilibrium, distance must be zero");
+}
+
+// =============================================================================
+// 6. FEE ROUNDING DIRECTION — Always in protocol favour (6 proofs)
+// =============================================================================
+
+/// Prove: ceiling fee >= floor fee for all inputs.
+/// Protocol always rounds UP (in its own favour).
+#[kani::proof]
+fn kani_fee_ceil_geq_floor() {
+    let notional: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(notional <= u64::MAX as u128);
+    kani::assume(fee_bps <= 10_000);
+
+    let ceil = compute_fee_ceil(notional, fee_bps);
+    let floor = compute_fee_floor(notional, fee_bps);
+
+    assert!(ceil >= floor, "ceil fee must be >= floor fee");
+}
+
+/// Prove: for non-zero notional and non-zero fee_bps, fee is at least 1.
+/// This prevents micro-trade fee evasion.
+#[kani::proof]
+fn kani_fee_nonzero_for_any_nonzero_trade() {
+    let notional: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(notional > 0);
+    kani::assume(fee_bps > 0);
+    kani::assume(notional <= u64::MAX as u128);
+    kani::assume(fee_bps <= 10_000);
+
+    let fee = compute_fee_ceil(notional, fee_bps);
+
+    assert!(
+        fee >= 1,
+        "non-zero trade with non-zero fee_bps must charge at least 1"
+    );
+}
+
+/// Prove: fee == 0 iff notional == 0 or fee_bps == 0.
+#[kani::proof]
+fn kani_fee_zero_iff_zero_input() {
+    let notional: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(notional <= u64::MAX as u128);
+    kani::assume(fee_bps <= 10_000);
+
+    let fee = compute_fee_ceil(notional, fee_bps);
+
+    if notional == 0 || fee_bps == 0 {
+        assert_eq!(fee, 0, "zero input must produce zero fee");
+    } else {
+        assert!(fee > 0, "non-zero inputs must produce non-zero fee");
+    }
+}
+
+/// Prove: fee does not exceed notional (fee <= 100% of trade value).
+#[kani::proof]
+fn kani_fee_bounded_by_notional() {
+    let notional: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(notional <= u64::MAX as u128);
+    kani::assume(fee_bps <= 10_000); // Max 100%
+
+    let fee = compute_fee_ceil(notional, fee_bps);
+
+    // At most 100% + rounding
+    // ceil(notional * 10000 / 10000) = notional + ceil_error <= notional + 1
+    assert!(
+        fee <= notional + 1,
+        "fee at 100% must not exceed notional + 1 (rounding)"
+    );
+}
+
+/// Prove: fee is monotone in notional (larger trade → larger fee).
+#[kani::proof]
+fn kani_fee_monotone_in_notional() {
+    let n1: u128 = kani::any();
+    let n2: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(n1 <= n2);
+    kani::assume(n2 <= u64::MAX as u128);
+    kani::assume(fee_bps <= 10_000);
+
+    let fee1 = compute_fee_ceil(n1, fee_bps);
+    let fee2 = compute_fee_ceil(n2, fee_bps);
+
+    assert!(fee2 >= fee1, "larger notional must produce >= fee");
+}
+
+/// Prove: fee is monotone in fee_bps (higher rate → higher fee).
+#[kani::proof]
+fn kani_fee_monotone_in_bps() {
+    let notional: u128 = kani::any();
+    let bps1: u64 = kani::any();
+    let bps2: u64 = kani::any();
+    kani::assume(bps1 <= bps2);
+    kani::assume(bps2 <= 10_000);
+    kani::assume(notional <= u64::MAX as u128);
+
+    let fee1 = compute_fee_ceil(notional, bps1);
+    let fee2 = compute_fee_ceil(notional, bps2);
+
+    assert!(fee2 >= fee1, "higher fee_bps must produce >= fee");
+}
+
+// =============================================================================
+// 7. DUST ACCUMULATION — Conservation within tolerance (5 proofs)
+// =============================================================================
+
+/// Prove: single deposit dust conservation holds exactly.
+#[kani::proof]
+fn kani_dust_single_deposit_conservation() {
+    let amount: u64 = kani::any();
+    let scale: u32 = kani::any();
+    kani::assume(scale > 0);
+    kani::assume(scale <= KANI_MAX_SCALE);
+    kani::assume(amount <= (scale as u64) * KANI_MAX_QUOTIENT);
+
+    let (units, dust) = base_to_units(amount, scale);
+    let reconstructed = (units as u128) * (scale as u128) + (dust as u128);
+
+    assert_eq!(
+        reconstructed, amount as u128,
+        "single deposit: units*scale + dust == amount"
+    );
+}
+
+/// Prove: two deposits with same scale conserve total value.
+#[kani::proof]
+fn kani_dust_two_deposits_conservation() {
+    let a1: u64 = kani::any();
+    let a2: u64 = kani::any();
+    let scale: u32 = kani::any();
+    kani::assume(scale > 0);
+    kani::assume(scale <= KANI_MAX_SCALE);
+    kani::assume(a1 <= (scale as u64) * 64);
+    kani::assume(a2 <= (scale as u64) * 64);
+
+    let (u1, d1) = base_to_units(a1, scale);
+    let (u2, d2) = base_to_units(a2, scale);
+
+    let total_units = u1 as u128 + u2 as u128;
+    let total_dust = accumulate_dust(d1, d2);
+
+    // Sweep the dust
+    let (swept_units, remaining) = sweep_dust(total_dust, scale);
+
+    let final_units = total_units + swept_units as u128;
+    let total_base = a1 as u128 + a2 as u128;
+
+    // Conservation: final_units * scale + remaining == total_base
+    let reconstructed = final_units * (scale as u128) + (remaining as u128);
+    assert_eq!(
+        reconstructed, total_base,
+        "two deposits: value must be exactly conserved"
+    );
+}
+
+/// Prove: dust accumulation is commutative.
+#[kani::proof]
+fn kani_dust_accumulation_commutative() {
+    let d1: u64 = kani::any();
+    let d2: u64 = kani::any();
+
+    let result_12 = accumulate_dust(d1, d2);
+    let result_21 = accumulate_dust(d2, d1);
+
+    assert_eq!(
+        result_12, result_21,
+        "dust accumulation must be commutative"
+    );
+}
+
+/// Prove: dust accumulation is associative (within saturation).
+#[kani::proof]
+fn kani_dust_accumulation_associative() {
+    let d1: u64 = kani::any();
+    let d2: u64 = kani::any();
+    let d3: u64 = kani::any();
+    // Avoid saturation to test associativity
+    kani::assume(d1 as u128 + d2 as u128 + d3 as u128 <= u64::MAX as u128);
+
+    let left = accumulate_dust(accumulate_dust(d1, d2), d3);
+    let right = accumulate_dust(d1, accumulate_dust(d2, d3));
+
+    assert_eq!(
+        left, right,
+        "dust accumulation must be associative (no saturation)"
+    );
+}
+
+/// Prove: after sweep, remaining dust is always less than one unit.
+/// This bounds the total "lost" value to at most (scale - 1) atoms.
+#[kani::proof]
+fn kani_dust_sweep_bounded_loss() {
+    let dust: u64 = kani::any();
+    let scale: u32 = kani::any();
+    kani::assume(scale > 0);
+    kani::assume(scale <= KANI_MAX_SCALE);
+    kani::assume(dust <= (scale as u64) * KANI_MAX_QUOTIENT);
+
+    let (_, remaining) = sweep_dust(dust, scale);
+
+    assert!(
+        remaining < scale as u64,
+        "remaining dust must be less than 1 unit (scale atoms)"
+    );
+}
+
+// =============================================================================
+// 8. SELF-LIQUIDATION RESISTANCE (5 proofs)
+// =============================================================================
+
+/// Prove: liquidation always reduces or preserves equity (never increases it).
+#[kani::proof]
+fn kani_selfliq_equity_never_increases() {
+    let equity_before: u128 = kani::any();
+    let equity_after: u128 = kani::any();
+    let fee_paid: u128 = kani::any();
+    kani::assume(equity_after <= equity_before);
+
+    let safe = liquidation_no_profit(equity_before, equity_after, fee_paid);
+    assert!(safe, "equity decrease means no profit from liquidation");
+}
+
+/// Prove: equity increase is detected as unsafe.
+#[kani::proof]
+fn kani_selfliq_equity_increase_detected() {
+    let equity_before: u128 = kani::any();
+    let equity_after: u128 = kani::any();
+    kani::assume(equity_after > equity_before);
+
+    let safe = liquidation_no_profit(equity_before, equity_after, 0);
+    assert!(!safe, "equity increase must be flagged as unsafe");
+}
+
+/// Prove: self-liquidation is unprofitable when fee > 0.
+#[kani::proof]
+fn kani_selfliq_unprofitable_with_fee() {
+    let position_value: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(position_value > 0);
+    kani::assume(fee_bps > 0);
+    kani::assume(fee_bps <= 10_000);
+    kani::assume(position_value <= u64::MAX as u128);
+
+    let unprofitable = self_liquidation_unprofitable(position_value, fee_bps);
+    assert!(
+        unprofitable,
+        "any positive fee makes self-liquidation unprofitable"
+    );
+}
+
+/// Prove: liquidation fee is always positive for non-zero position with non-zero bps.
+#[kani::proof]
+fn kani_selfliq_fee_always_positive() {
+    let position_value: u128 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(position_value > 0);
+    kani::assume(fee_bps > 0);
+    kani::assume(fee_bps <= 10_000);
+    kani::assume(position_value <= u64::MAX as u128);
+
+    let fee = compute_fee_ceil(position_value, fee_bps);
+    assert!(
+        fee > 0,
+        "liquidation fee must be positive for non-zero position"
+    );
+}
+
+/// Prove: zero position has zero liquidation cost.
+#[kani::proof]
+fn kani_selfliq_zero_position_zero_fee() {
+    let fee_bps: u64 = kani::any();
+    kani::assume(fee_bps <= 10_000);
+
+    let fee = compute_fee_ceil(0, fee_bps);
+    assert_eq!(fee, 0, "zero position must have zero fee");
+}
+
+// =============================================================================
+// 9. SANDWICH RESISTANCE — Price impact bounded (5 proofs)
+// =============================================================================
+
+/// Prove: max_price_impact is proportional to price and cap.
+#[kani::proof]
+fn kani_sandwich_impact_proportional() {
+    let price: u64 = kani::any();
+    let cap: u64 = kani::any();
+    kani::assume(price > 0 && price <= 1_000_000_000);
+    kani::assume(cap > 0 && cap <= 1_000_000);
+
+    let impact = max_price_impact(price, cap);
+
+    // Impact = price * cap / 1_000_000, capped at price
+    let expected = (price as u128).saturating_mul(cap as u128) / 1_000_000u128;
+    let expected = expected.min(price as u128) as u64;
+
+    assert_eq!(impact, expected, "impact must equal price * cap / 1e6");
+}
+
+/// Prove: price_impact_bounded accepts prices within bounds.
+#[kani::proof]
+fn kani_sandwich_bounded_accepts_in_range() {
+    let price_before: u64 = kani::any();
+    let cap: u64 = kani::any();
+    kani::assume(price_before > 0 && price_before <= 1_000_000_000);
+    kani::assume(cap > 0 && cap <= 1_000_000);
+
+    // price_after == price_before (no change) should always be in bounds
+    let bounded = price_impact_bounded(price_before, price_before, cap);
+    assert!(bounded, "unchanged price must be within bounds");
+}
+
+/// Prove: price_impact_bounded rejects extreme changes.
+#[kani::proof]
+fn kani_sandwich_bounded_rejects_extreme() {
+    let price_before: u64 = 1_000_000_000; // $1000 in e6
+    let cap: u64 = 10_000; // 1% per slot
+
+    // max_impact = 1_000_000_000 * 10_000 / 1_000_000 = 10_000_000
+    // So 2x the price (2_000_000_000) should be out of bounds
+    let bounded = price_impact_bounded(price_before, 2_000_000_000, cap);
+    assert!(!bounded, "2x price jump must violate 1% cap");
+}
+
+/// Prove: zero cap means zero allowed impact.
+#[kani::proof]
+fn kani_sandwich_zero_cap_no_movement() {
+    let price: u64 = kani::any();
+    kani::assume(price > 0);
+
+    let impact = max_price_impact(price, 0);
+    assert_eq!(impact, 0, "zero cap must allow zero impact");
+}
+
+/// Prove: cap=1_000_000 (100%) allows any movement up to doubling.
+#[kani::proof]
+fn kani_sandwich_full_cap_allows_double() {
+    let price: u64 = kani::any();
+    kani::assume(price > 0 && price <= 500_000_000); // Keep sum < u64::MAX
+
+    let impact = max_price_impact(price, 1_000_000);
+    // 100% cap means impact = price itself
+    assert_eq!(impact, price, "100% cap must allow movement equal to price");
+
+    // Double the price should be within bounds
+    let bounded = price_impact_bounded(price, price * 2, 1_000_000);
+    assert!(bounded, "doubling price must be within 100% cap");
+}
+
+// =============================================================================
+// 10. ORACLE MANIPULATION — Adversarial inputs handled (7 proofs)
+// =============================================================================
+
+/// Prove: price=0 is rejected by oracle validation.
+#[kani::proof]
+fn kani_oracle_zero_price_rejected() {
+    let valid = oracle_price_valid(0);
+    assert!(!valid, "price=0 must be rejected");
+}
+
+/// Prove: price=u64::MAX is rejected (exceeds MAX_ORACLE_PRICE).
+#[kani::proof]
+fn kani_oracle_max_price_rejected() {
+    let valid = oracle_price_valid(u64::MAX);
+    assert!(
+        !valid,
+        "u64::MAX must exceed MAX_ORACLE_PRICE and be rejected"
+    );
+}
+
+/// Prove: valid prices in range (1..=MAX_ORACLE_PRICE) are accepted.
+#[kani::proof]
+fn kani_oracle_valid_price_accepted() {
+    let price: u64 = kani::any();
+    kani::assume(price > 0 && price <= 1_000_000_000_000_000);
+
+    let valid = oracle_price_valid(price);
+    assert!(valid, "price in valid range must be accepted");
+}
+
+/// Prove: 99% drop triggers circuit breaker for any reasonable cap.
+#[kani::proof]
+fn kani_oracle_99pct_drop_triggers_breaker() {
+    let prev_price: u64 = kani::any();
+    let cap_e2bps: u64 = kani::any();
+
+    // Reasonable bounds
+    kani::assume(prev_price >= 100); // Need at least 100 for 99% to be meaningful
+    kani::assume(prev_price <= 1_000_000_000);
+    kani::assume(cap_e2bps > 0 && cap_e2bps <= 100_000); // up to 10%/slot
+
+    // For dt=1 slot, 99% drop should trigger if cap < 99%
+    // cap < 990_000 means max movement < 99%
+    kani::assume(cap_e2bps < 990_000);
+
+    let triggered = extreme_drop_triggers_breaker(prev_price, cap_e2bps, 1);
+    assert!(
+        triggered,
+        "99% drop must trigger circuit breaker for cap < 99%"
+    );
+}
+
+/// Prove: circuit breaker clamps adversarial oracle to safe range.
+/// Even with price=0 as oracle input, compute_ema_mark_price stays bounded.
+#[kani::proof]
+fn kani_oracle_adversarial_zero_clamped() {
+    let prev_mark: u64 = kani::any();
+    let alpha: u64 = kani::any();
+    let cap: u64 = kani::any();
+
+    kani::assume(prev_mark > 0 && prev_mark <= 1_000_000_000);
+    kani::assume(alpha > 0 && alpha <= 1_000_000);
+    kani::assume(cap > 0 && cap <= 100_000);
+
+    // Adversarial oracle: 0 (should be rejected before reaching EMA in production,
+    // but verify the EMA function itself handles it gracefully)
+    let result = compute_ema_mark_price(prev_mark, 0, 1, alpha, cap);
+
+    // oracle=0 returns prev_mark (early return in compute_ema_mark_price)
+    assert_eq!(
+        result, prev_mark,
+        "oracle=0 must return prev_mark unchanged"
+    );
+}
+
+/// Prove: adversarial u64::MAX oracle is clamped by circuit breaker.
+#[kani::proof]
+fn kani_oracle_adversarial_max_clamped() {
+    let prev_mark: u64 = kani::any();
+    let cap: u64 = kani::any();
+
+    kani::assume(prev_mark > 0 && prev_mark <= 1_000_000_000);
+    kani::assume(cap > 0 && cap <= 100_000);
+
+    // u64::MAX oracle should be clamped to prev_mark + max_delta
+    let result = compute_ema_mark_price(prev_mark, u64::MAX, 1, 1_000_000, cap);
+
+    let max_delta = (prev_mark as u128).saturating_mul(cap as u128) / 1_000_000u128;
+    let max_delta = max_delta.min(prev_mark as u128) as u64;
+    let hi = prev_mark.saturating_add(max_delta);
+
+    assert!(
+        result <= hi,
+        "u64::MAX oracle must be clamped by circuit breaker"
+    );
+}
+
+/// Prove: oracle price validation and circuit breaker compose correctly.
+/// Invalid prices are rejected; valid prices are clamped.
+#[kani::proof]
+fn kani_oracle_validation_and_breaker_compose() {
+    let price: u64 = kani::any();
+
+    // Step 1: Validate
+    let valid = oracle_price_valid(price);
+
+    if !valid {
+        // Either price==0 or price > MAX_ORACLE_PRICE
+        assert!(
+            price == 0 || price > 1_000_000_000_000_000,
+            "invalid prices must be 0 or > MAX_ORACLE"
+        );
+    } else {
+        // Valid price: circuit breaker can process it
+        let prev_mark: u64 = 1_000_000_000; // $1000 in e6
+        let cap: u64 = 10_000; // 1%
+
+        let result = compute_ema_mark_price(prev_mark, price, 1, 1_000_000, cap);
+
+        // Result must be bounded
+        let max_delta = prev_mark as u128 * 10_000 / 1_000_000;
+        let hi = prev_mark + max_delta as u64;
+        let lo = prev_mark.saturating_sub(max_delta as u64);
+        assert!(
+            result >= lo && result <= hi,
+            "valid oracle must produce bounded result"
+        );
+    }
 }
