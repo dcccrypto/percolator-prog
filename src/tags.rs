@@ -54,6 +54,20 @@ pub const TAG_UPDATE_HYPERP_MARK: u8 = 34;
 /// Optimized TradeCpi with caller-provided PDA bump (PERC-154).
 /// Eliminates find_program_address (~1500 CU savings).
 pub const TAG_TRADE_CPI_V2: u8 = 35;
+/// Unresolve a market: clear RESOLVED flag, re-enable trading (PERC-273).
+pub const TAG_UNRESOLVE_MARKET: u8 = 36;
+
+// ═══════════════════════════════════════════════════════════════
+// LP Vault instructions (PERC-272)
+// ═══════════════════════════════════════════════════════════════
+/// Create LP vault: initialise state PDA + SPL mint for LP shares (PERC-272).
+pub const TAG_CREATE_LP_VAULT: u8 = 37;
+/// Deposit into LP vault: transfer SOL → vault, mint LP shares (PERC-272).
+pub const TAG_LP_VAULT_DEPOSIT: u8 = 38;
+/// Withdraw from LP vault: burn LP shares, receive SOL (PERC-272).
+pub const TAG_LP_VAULT_WITHDRAW: u8 = 39;
+/// Permissionless crank: distribute accrued fee revenue to LP vault capital (PERC-272).
+pub const TAG_LP_VAULT_CRANK_FEES: u8 = 40;
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +113,11 @@ mod tests {
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
             TAG_TRADE_CPI_V2,
+            TAG_UNRESOLVE_MARKET,
+            TAG_CREATE_LP_VAULT,
+            TAG_LP_VAULT_DEPOSIT,
+            TAG_LP_VAULT_WITHDRAW,
+            TAG_LP_VAULT_CRANK_FEES,
         ];
 
         for i in 0..tags.len() {
@@ -148,6 +167,11 @@ mod tests {
             TAG_UPDATE_MARK_PRICE,
             TAG_UPDATE_HYPERP_MARK,
             TAG_TRADE_CPI_V2,
+            TAG_UNRESOLVE_MARKET,
+            TAG_CREATE_LP_VAULT,
+            TAG_LP_VAULT_DEPOSIT,
+            TAG_LP_VAULT_WITHDRAW,
+            TAG_LP_VAULT_CRANK_FEES,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {

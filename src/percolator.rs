@@ -1602,6 +1602,20 @@ pub mod error {
         /// #297: DEX pool has insufficient liquidity for safe Hyperp oracle bootstrapping.
         /// The quote-side reserves must meet the minimum threshold to resist manipulation.
         InsufficientDexLiquidity,
+        /// PERC-272: LP vault already created for this market.
+        LpVaultAlreadyExists,
+        /// PERC-272: LP vault not yet created (call CreateLpVault first).
+        LpVaultNotCreated,
+        /// PERC-272: LP vault zero amount (deposit or withdraw amount is zero).
+        LpVaultZeroAmount,
+        /// PERC-272: LP vault supply/capital mismatch (supply > 0 but capital == 0).
+        LpVaultSupplyMismatch,
+        /// PERC-272: LP vault withdrawal exceeds available capital after OI reservation.
+        LpVaultWithdrawExceedsAvailable,
+        /// PERC-272: LP vault fee share basis points out of range (0..=10_000).
+        LpVaultInvalidFeeShare,
+        /// PERC-272: No new fees to distribute to LP vault.
+        LpVaultNoNewFees,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1756,6 +1770,9 @@ pub mod ix {
             initial_margin_bps: u64,
             maintenance_margin_bps: u64,
             trading_fee_bps: Option<u64>,
+            /// OI cap multiplier in bps. 0 = disabled. 100_000 = 10x vault.
+            /// None = don't change (backwards compatible).
+            oi_cap_multiplier_bps: Option<u64>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -1860,6 +1877,45 @@ pub mod ix {
             size: i128,
             bump: u8,
         },
+        /// PERC-273: Unresolve a market — clear RESOLVED flag, re-enable trading.
+        /// Admin only. Requires confirmation code to prevent accidental invocation.
+        /// Accounts: [admin(signer), slab(writable)]
+        UnresolveMarket {
+            /// Must equal 0xDEAD_BEEF_CAFE_1234 to confirm intent
+            confirmation: u64,
+        },
+
+        /// PERC-272: Create LP vault — initialise state PDA + SPL mint for LP shares.
+        /// Admin only. One per market.
+        /// fee_share_bps: 0..=10_000 — portion of trading fees directed to LP vault.
+        /// Accounts: [admin(signer,payer), slab(writable), lp_vault_state(writable),
+        ///            lp_vault_mint(writable), vault_authority, system_program,
+        ///            token_program, rent_sysvar]
+        CreateLpVault {
+            fee_share_bps: u64,
+        },
+        /// PERC-272: Deposit SOL into LP vault, receive LP shares.
+        /// Permissionless. LP shares are freely transferable SPL tokens.
+        /// Accounts: [depositor(signer), slab(writable), depositor_ata(writable),
+        ///            vault(writable), token_program, lp_vault_mint(writable),
+        ///            depositor_lp_ata(writable), vault_authority,
+        ///            lp_vault_state(writable)]
+        LpVaultDeposit {
+            amount: u64,
+        },
+        /// PERC-272: Burn LP shares and withdraw proportional SOL from LP vault.
+        /// Cannot withdraw if it would bring vault capital below OI reservation.
+        /// Accounts: [withdrawer(signer), slab(writable), withdrawer_ata(writable),
+        ///            vault(writable), token_program, lp_vault_mint(writable),
+        ///            withdrawer_lp_ata(writable), vault_authority,
+        ///            lp_vault_state(writable)]
+        LpVaultWithdraw {
+            lp_amount: u64,
+        },
+        /// PERC-272: Permissionless crank — distribute accrued fee revenue to LP vault.
+        /// Reads fee_revenue delta since last snapshot, credits LP portion to vault capital.
+        /// Accounts: [slab(writable), lp_vault_state(writable)]
+        LpVaultCrankFees,
     }
 
     impl Instruction {
@@ -2056,8 +2112,14 @@ pub mod ix {
                     // UpdateRiskParams
                     let initial_margin_bps = read_u64(&mut rest)?;
                     let maintenance_margin_bps = read_u64(&mut rest)?;
-                    // Optional: trading_fee_bps (backwards compatible — old clients send 17 bytes, new send 25)
+                    // Optional: trading_fee_bps (backwards compatible — old clients send 17 bytes, new send 25+)
                     let trading_fee_bps = if rest.len() >= 8 {
+                        Some(read_u64(&mut rest)?)
+                    } else {
+                        None
+                    };
+                    // Optional: oi_cap_multiplier_bps (PERC-273, backwards compatible)
+                    let oi_cap_multiplier_bps = if rest.len() >= 8 {
                         Some(read_u64(&mut rest)?)
                     } else {
                         None
@@ -2066,6 +2128,7 @@ pub mod ix {
                         initial_margin_bps,
                         maintenance_margin_bps,
                         trading_fee_bps,
+                        oi_cap_multiplier_bps,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2169,6 +2232,23 @@ pub mod ix {
                         bump,
                     })
                 }
+                TAG_UNRESOLVE_MARKET => {
+                    let confirmation = read_u64(&mut rest)?;
+                    Ok(Instruction::UnresolveMarket { confirmation })
+                }
+                TAG_CREATE_LP_VAULT => {
+                    let fee_share_bps = read_u64(&mut rest)?;
+                    Ok(Instruction::CreateLpVault { fee_share_bps })
+                }
+                TAG_LP_VAULT_DEPOSIT => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::LpVaultDeposit { amount })
+                }
+                TAG_LP_VAULT_WITHDRAW => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::LpVaultWithdraw { lp_amount })
+                }
+                TAG_LP_VAULT_CRANK_FEES => Ok(Instruction::LpVaultCrankFees),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -2344,6 +2424,16 @@ pub mod accounts {
     pub fn derive_insurance_lp_mint(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[b"ins_lp", slab_key.as_ref()], program_id)
     }
+
+    /// PERC-272: Derive LP vault state PDA.
+    pub fn derive_lp_vault_state(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], program_id)
+    }
+
+    /// PERC-272: Derive LP vault SPL mint PDA.
+    pub fn derive_lp_vault_mint(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], program_id)
+    }
 }
 
 // 6. mod state
@@ -2457,6 +2547,16 @@ pub mod state {
         /// Last effective oracle price (after clamping), in e6 format.
         /// 0 = no history (first price accepted as-is).
         pub last_effective_price_e6: u64,
+
+        // ========================================
+        // Dynamic OI Cap (PERC-273)
+        // ========================================
+        /// OI cap multiplier in basis points. Max OI = vault * multiplier / 10_000.
+        /// 0 = disabled (no OI cap). 100_000 = 10x vault capital.
+        /// Set via UpdateMarginParams instruction.
+        pub oi_cap_multiplier_bps: u64,
+        /// Reserved for alignment (struct must be multiple of 16 bytes for u128 fields).
+        pub _oi_reserved: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -2570,6 +2670,12 @@ pub mod state {
     /// Set the resolved flag.
     pub fn set_resolved(data: &mut [u8]) {
         let flags = read_flags(data) | FLAG_RESOLVED;
+        write_flags(data, flags);
+    }
+
+    /// Clear the resolved flag (PERC-273: UnresolveMarket).
+    pub fn clear_resolved(data: &mut [u8]) {
+        let flags = read_flags(data) & !FLAG_RESOLVED;
         write_flags(data, flags);
     }
 
@@ -4222,6 +4328,87 @@ pub mod insurance_lp {
     }
 }
 
+// 9b. mod lp_vault — LP vault state and helpers (PERC-272)
+pub mod lp_vault {
+    use bytemuck::{Pod, Zeroable};
+
+    /// LP vault state account size in bytes.
+    pub const LP_VAULT_STATE_LEN: usize = core::mem::size_of::<LpVaultState>();
+
+    /// Magic value for LP vault state: "LPVAULT\0" = 0x4C505641554C5400
+    pub const LP_VAULT_MAGIC: u64 = 0x4C50_5641_554C_5400;
+
+    /// LP vault state PDA account layout.
+    ///
+    /// Seeds: `["lp_vault", slab_key]`.
+    /// Tracks total LP capital, fee distribution snapshots, and epoch.
+    /// Epoch-based: auto-resolves on deposit/withdraw, no admin reset needed.
+    /// LP vault state: all u128 fields at 16-byte aligned offsets.
+    /// Layout (total 128 bytes):
+    ///   0..8   magic (u64)
+    ///   8..16  fee_share_bps (u64)
+    ///   16..32 total_capital (u128)
+    ///   32..40 epoch (u64)
+    ///   40..48 last_crank_slot (u64)
+    ///   48..64 last_fee_snapshot (u128)
+    ///   64..80 total_fees_distributed (u128)
+    ///   80..128 _reserved ([u8; 48])
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct LpVaultState {
+        /// Magic identifier: LP_VAULT_MAGIC when initialized.
+        pub magic: u64,
+        /// Fee share in basis points (0..=10_000). Portion of trading fees
+        /// redirected from insurance fund to LP vault on crank.
+        pub fee_share_bps: u64,
+        /// Total LP capital in engine units (deposit units, not base tokens).
+        /// Increases on deposit + fee crank. Decreases on withdraw.
+        pub total_capital: u128,
+        /// Auto-incrementing epoch. Incremented when vault is fully drained.
+        /// Epochs allow trustless resolution without admin intervention:
+        /// a drained vault auto-starts a fresh epoch on next deposit.
+        pub epoch: u64,
+        /// Slot of last fee crank (prevents double-crank in same slot).
+        pub last_crank_slot: u64,
+        /// Snapshot of `engine.insurance_fund.fee_revenue` at last fee crank.
+        /// Delta since snapshot = new fees to distribute.
+        pub last_fee_snapshot: u128,
+        /// Total fees ever distributed to LP vault (monotonically increasing).
+        pub total_fees_distributed: u128,
+        /// Reserved for future use (alignment + forward compat).
+        pub _reserved: [u8; 48],
+    }
+
+    impl LpVaultState {
+        /// Check if this state account is initialised.
+        #[inline]
+        pub fn is_initialized(&self) -> bool {
+            self.magic == LP_VAULT_MAGIC
+        }
+
+        /// Create a zeroed LP vault state.
+        #[inline]
+        pub fn new_zeroed() -> Self {
+            <Self as Zeroable>::zeroed()
+        }
+    }
+
+    /// Read LP vault state from raw account data.
+    pub fn read_lp_vault_state(data: &[u8]) -> Option<LpVaultState> {
+        if data.len() < LP_VAULT_STATE_LEN {
+            return None;
+        }
+        let bytes = &data[..LP_VAULT_STATE_LEN];
+        Some(*bytemuck::from_bytes::<LpVaultState>(bytes))
+    }
+
+    /// Write LP vault state to raw account data.
+    pub fn write_lp_vault_state(data: &mut [u8], state: &LpVaultState) {
+        let bytes = bytemuck::bytes_of(state);
+        data[..LP_VAULT_STATE_LEN].copy_from_slice(bytes);
+    }
+}
+
 // 9. mod processor
 pub mod processor {
     use crate::{
@@ -4329,6 +4516,29 @@ pub mod processor {
     fn require_not_paused(data: &[u8]) -> Result<(), ProgramError> {
         if state::is_paused(data) {
             return Err(PercolatorError::MarketPaused.into());
+        }
+        Ok(())
+    }
+
+    /// PERC-273: Check dynamic OI cap after trade execution.
+    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
+    fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
+        let multiplier = config.oi_cap_multiplier_bps;
+        if multiplier == 0 {
+            return Ok(()); // OI cap disabled
+        }
+        let vault = engine.vault.get();
+        let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+        let current_oi = engine.total_open_interest.get();
+        if current_oi > max_oi {
+            msg!(
+                "OI cap exceeded: current={} max={} (vault={} multiplier={})",
+                current_oi,
+                max_oi,
+                vault,
+                multiplier
+            );
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
         Ok(())
     }
@@ -4614,6 +4824,9 @@ pub mod processor {
                         DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
                     },
                     last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+                    // PERC-273: OI cap disabled by default
+                    oi_cap_multiplier_bps: 0,
+                    _oi_reserved: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -5325,6 +5538,10 @@ pub mod processor {
                 engine
                     .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error)?;
+
+                // PERC-273: Dynamic OI cap check after trade
+                check_oi_cap(engine, &config)?;
+
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
@@ -5635,6 +5852,10 @@ pub mod processor {
                     engine
                         .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
                         .map_err(map_risk_error)?;
+
+                    // PERC-273: Dynamic OI cap check after trade
+                    check_oi_cap(engine, &config)?;
+
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
@@ -6361,6 +6582,7 @@ pub mod processor {
                 initial_margin_bps,
                 maintenance_margin_bps,
                 trading_fee_bps,
+                oi_cap_multiplier_bps,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -6403,6 +6625,17 @@ pub mod processor {
                 if let Some(fee) = trading_fee_bps {
                     engine.params.trading_fee_bps = fee;
                 }
+
+                // PERC-273: Update OI cap multiplier if provided
+                if let Some(oi_cap) = oi_cap_multiplier_bps {
+                    let mut config = state::read_config(&data);
+                    config.oi_cap_multiplier_bps = oi_cap;
+                    state::write_config(&mut data, &config);
+                    msg!("UpdateRiskParams: oi_cap_multiplier_bps={}", oi_cap);
+                }
+
+                msg!("UpdateRiskParams: initial_margin_bps={}, maintenance_margin_bps={}, trading_fee_bps={:?}",
+                    initial_margin_bps, maintenance_margin_bps, trading_fee_bps);
             }
 
             Instruction::RenounceAdmin { confirmation } => {
@@ -7323,6 +7556,590 @@ pub mod processor {
                     prev_mark,
                     new_mark,
                     dt_slots
+                );
+            }
+
+            Instruction::UnresolveMarket { confirmation } => {
+                // PERC-273: Unresolve market — clear RESOLVED flag, re-enable trading.
+                // Admin only. Requires confirmation code to prevent accidental invocation.
+                const UNRESOLVE_CONFIRMATION: u64 = 0xDEAD_BEEF_CAFE_1234;
+                if confirmation != UNRESOLVE_CONFIRMATION {
+                    msg!("UnresolveMarket: invalid confirmation code");
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Must currently be resolved
+                if !state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Clear the resolved flag
+                state::clear_resolved(&mut data);
+
+                msg!("UnresolveMarket: admin={} slab={}", a_admin.key, a_slab.key);
+            }
+
+            // ================================================================
+            // PERC-272: LP Vault Instructions
+            // ================================================================
+            Instruction::CreateLpVault { fee_share_bps } => {
+                // Create LP vault: initialise state PDA + SPL mint.
+                // Admin only, one per market.
+                // Accounts: [admin(signer,payer), slab(writable), lp_vault_state(writable),
+                //            lp_vault_mint(writable), vault_authority, system_program,
+                //            token_program, rent_sysvar]
+                accounts::expect_len(accounts, 8)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_lp_vault_state = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_vault_authority = &accounts[4];
+                let a_system = &accounts[5];
+                let a_token = &accounts[6];
+                let a_rent = &accounts[7];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                verify_token_program(a_token)?;
+
+                if fee_share_bps > 10_000 {
+                    return Err(PercolatorError::LpVaultInvalidFeeShare.into());
+                }
+
+                let data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+                drop(data);
+
+                // Verify LP vault state PDA
+                #[allow(unused_variables)]
+                let (expected_state, state_bump) =
+                    accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                // Check not already created: in non-test mode, data_len == 0 means
+                // the PDA has not been created yet. In test mode, the account is
+                // pre-allocated with zeroed data, so we check the magic value.
+                if a_lp_vault_state.data_len() > 0 {
+                    let state_data = a_lp_vault_state.try_borrow_data()?;
+                    if state_data.len() >= 8 {
+                        let magic = u64::from_le_bytes(state_data[..8].try_into().unwrap());
+                        if magic == crate::lp_vault::LP_VAULT_MAGIC {
+                            return Err(PercolatorError::LpVaultAlreadyExists.into());
+                        }
+                    }
+                    drop(state_data);
+                }
+
+                // Verify LP vault mint PDA
+                let (expected_mint, mint_bump) =
+                    accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+                // Verify vault authority PDA
+                let (auth, _vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                // Create state PDA account
+                #[cfg(not(feature = "test"))]
+                {
+                    use solana_program::program::invoke_signed;
+                    use solana_program::sysvar::Sysvar;
+
+                    let space = crate::lp_vault::LP_VAULT_STATE_LEN;
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(space);
+
+                    let state_seeds: &[&[u8]] = &[b"lp_vault", a_slab.key.as_ref(), &[state_bump]];
+                    let create_ix = solana_program::system_instruction::create_account(
+                        a_admin.key,
+                        a_lp_vault_state.key,
+                        lamports,
+                        space as u64,
+                        program_id,
+                    );
+                    invoke_signed(
+                        &create_ix,
+                        &[a_admin.clone(), a_lp_vault_state.clone(), a_system.clone()],
+                        &[state_seeds],
+                    )?;
+                }
+                #[cfg(feature = "test")]
+                {
+                    let _ = a_system;
+                    // In test mode the account is pre-created with correct size
+                }
+
+                // Initialise LP vault state
+                {
+                    let mut state_data = a_lp_vault_state.try_borrow_mut_data()?;
+                    if state_data.len() < crate::lp_vault::LP_VAULT_STATE_LEN {
+                        return Err(ProgramError::AccountDataTooSmall);
+                    }
+                    let mut vault_state = crate::lp_vault::LpVaultState::new_zeroed();
+                    vault_state.magic = crate::lp_vault::LP_VAULT_MAGIC;
+                    vault_state.fee_share_bps = fee_share_bps;
+                    vault_state.epoch = 1;
+                    // Snapshot current fee_revenue so we only distribute NEW fees
+                    let slab_data = a_slab.try_borrow_data()?;
+                    let engine = zc::engine_ref(&slab_data)?;
+                    vault_state.last_fee_snapshot = engine.insurance_fund.fee_revenue.get();
+                    drop(slab_data);
+                    crate::lp_vault::write_lp_vault_state(&mut state_data, &vault_state);
+                }
+
+                // Create LP vault mint (reuse insurance_lp::create_mint)
+                let mint_seeds: &[&[u8]] = &[b"lp_vault_mint", a_slab.key.as_ref(), &[mint_bump]];
+                // Read collateral decimals from config
+                let slab_data = a_slab.try_borrow_data()?;
+                let config = state::read_config(&slab_data);
+                drop(slab_data);
+                // Use same decimals as collateral for LP token
+                let decimals = 6u8; // Standard for SOL-denominated vaults
+                let _ = config;
+                crate::insurance_lp::create_mint(
+                    a_admin,
+                    a_lp_vault_mint,
+                    a_vault_authority,
+                    a_system,
+                    a_token,
+                    a_rent,
+                    decimals,
+                    mint_seeds,
+                )?;
+
+                msg!(
+                    "LP vault created: fee_share={}bps slab={}",
+                    fee_share_bps,
+                    a_slab.key
+                );
+            }
+
+            Instruction::LpVaultDeposit { amount } => {
+                // Deposit SOL into LP vault, receive LP shares.
+                // Accounts: [depositor(signer), slab(writable), depositor_ata(writable),
+                //            vault(writable), token_program, lp_vault_mint(writable),
+                //            depositor_lp_ata(writable), vault_authority,
+                //            lp_vault_state(writable)]
+                accounts::expect_len(accounts, 9)?;
+                let a_depositor = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_depositor_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_lp_vault_mint = &accounts[5];
+                let a_depositor_lp_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+                let a_lp_vault_state = &accounts[8];
+
+                accounts::expect_signer(a_depositor)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_depositor_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                accounts::expect_writable(a_depositor_lp_ata)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                verify_token_program(a_token)?;
+
+                if amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                // Block deposits on resolved or paused markets
+                if state::is_resolved(&slab_data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                require_not_paused(&slab_data)?;
+
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                // Verify vault
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_depositor_ata, a_depositor.key, &mint)?;
+
+                // Verify LP vault mint PDA
+                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+                if a_lp_vault_mint.data_len() == 0 {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                // Verify LP vault state PDA
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                // Verify vault authority PDA
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                // Read LP vault state
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                // Read current LP supply and vault capital
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+                let capital_before = vault_state.total_capital;
+
+                // Transfer collateral from depositor to vault
+                // Must drop slab_data borrow to allow collateral::deposit CPI
+                drop(slab_data);
+                collateral::deposit(a_token, a_depositor_ata, a_vault, a_depositor, amount)?;
+
+                // Convert base tokens to units
+                let slab_data = a_slab.try_borrow_data()?;
+                let config = state::read_config(&slab_data);
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+                drop(slab_data);
+
+                // Accumulate dust
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let old_dust = state::read_dust_base(&slab_data);
+                state::write_dust_base(&mut slab_data, old_dust.saturating_add(dust));
+
+                // Calculate LP tokens to mint
+                let lp_tokens_to_mint: u64 = if lp_supply == 0 || capital_before == 0 {
+                    // First deposit (or fresh epoch after drain): 1:1
+                    // If epoch incremented due to drain, LP supply is 0 and capital is 0.
+                    if lp_supply > 0 && capital_before == 0 {
+                        // Supply > 0 but capital == 0: vault was drained. Start fresh epoch.
+                        vault_state.epoch = vault_state.epoch.saturating_add(1);
+                        // Previous shares are worthless. Mint fresh for new depositor.
+                        // NOTE: old share holders get nothing (vault was fully drained).
+                    }
+                    units
+                } else {
+                    // Proportional: tokens = deposit_units * supply / capital
+                    let numerator = (units as u128)
+                        .checked_mul(lp_supply as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let result = numerator / capital_before;
+                    if result > u64::MAX as u128 {
+                        return Err(PercolatorError::EngineOverflow.into());
+                    }
+                    result as u64
+                };
+
+                if lp_tokens_to_mint == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                // Increase LP vault capital
+                vault_state.total_capital = vault_state
+                    .total_capital
+                    .checked_add(units as u128)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                // Update engine vault balance (tokens are already in the vault token account)
+                let engine = zc::engine_mut(&mut slab_data)?;
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_add(units as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                // Write updated vault state
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+                drop(vs_data);
+
+                // Mint LP tokens to depositor
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                crate::insurance_lp::mint_to(
+                    a_token,
+                    a_lp_vault_mint,
+                    a_depositor_lp_ata,
+                    a_vault_authority,
+                    lp_tokens_to_mint,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "LP vault deposit: {} tokens, {} LP shares minted, epoch={}",
+                    amount,
+                    lp_tokens_to_mint,
+                    vault_state.epoch
+                );
+            }
+
+            Instruction::LpVaultWithdraw { lp_amount } => {
+                // Burn LP shares and withdraw proportional SOL from LP vault.
+                // Accounts: [withdrawer(signer), slab(writable), withdrawer_ata(writable),
+                //            vault(writable), token_program, lp_vault_mint(writable),
+                //            withdrawer_lp_ata(writable), vault_authority,
+                //            lp_vault_state(writable)]
+                accounts::expect_len(accounts, 9)?;
+                let a_withdrawer = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_withdrawer_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_lp_vault_mint = &accounts[5];
+                let a_withdrawer_lp_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+                let a_lp_vault_state = &accounts[8];
+
+                accounts::expect_signer(a_withdrawer)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_withdrawer_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                accounts::expect_writable(a_withdrawer_lp_ata)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                verify_token_program(a_token)?;
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                // Verify vault
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_withdrawer_ata, a_withdrawer.key, &mint)?;
+
+                // Verify LP vault mint PDA
+                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+
+                // Verify LP vault state PDA
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                // Verify vault authority
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                // Read LP vault state
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+                let capital = vault_state.total_capital;
+
+                if lp_supply == 0 || capital == 0 {
+                    return Err(PercolatorError::LpVaultSupplyMismatch.into());
+                }
+
+                // Calculate units to return: lp_amount * capital / supply
+                // Round DOWN (user gets less — vault is never underfunded)
+                let numerator = (lp_amount as u128)
+                    .checked_mul(capital)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+                let units_to_return = numerator / (lp_supply as u128);
+
+                if units_to_return == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                // OI reservation check: cannot withdraw if it would make vault
+                // too small to back current OI. After withdrawal:
+                //   remaining_capital >= total_oi / (oi_cap_multiplier / 10_000)
+                // Equivalently: remaining_capital * multiplier / 10_000 >= total_oi
+                let oi_multiplier = config.oi_cap_multiplier_bps;
+                if oi_multiplier > 0 {
+                    let remaining_capital = capital.saturating_sub(units_to_return);
+                    let engine = zc::engine_ref(&slab_data)?;
+                    let current_oi = engine.total_open_interest.get();
+                    let max_oi_after =
+                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+                    if current_oi > max_oi_after {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+
+                // Convert units to base tokens
+                let units_u64 = if units_to_return > u64::MAX as u128 {
+                    return Err(PercolatorError::EngineOverflow.into());
+                } else {
+                    units_to_return as u64
+                };
+                let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                // Reduce LP vault capital
+                vault_state.total_capital = capital
+                    .checked_sub(units_to_return)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                // Reduce engine vault balance
+                let engine = zc::engine_mut(&mut slab_data)?;
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_sub(units_to_return)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                // Write updated vault state
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+                drop(vs_data);
+
+                // Burn LP tokens from withdrawer
+                crate::insurance_lp::burn(
+                    a_token,
+                    a_lp_vault_mint,
+                    a_withdrawer_lp_ata,
+                    a_withdrawer,
+                    lp_amount,
+                )?;
+
+                // Transfer collateral from vault to withdrawer
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_withdrawer_ata,
+                    a_vault_authority,
+                    base_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "LP vault withdraw: {} LP burned, {} tokens returned, epoch={}",
+                    lp_amount,
+                    base_amount,
+                    vault_state.epoch
+                );
+            }
+
+            Instruction::LpVaultCrankFees => {
+                // Permissionless crank: distribute accrued fee revenue to LP vault.
+                // Reads fee_revenue delta since last snapshot, credits LP portion.
+                // Accounts: [slab(writable), lp_vault_state(writable)]
+                accounts::expect_len(accounts, 2)?;
+                let a_slab = &accounts[0];
+                let a_lp_vault_state = &accounts[1];
+
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                // Verify LP vault state PDA
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                // Read LP vault state
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                // Read current fee revenue from engine
+                let engine = zc::engine_mut(&mut slab_data)?;
+                let current_fee_revenue = engine.insurance_fund.fee_revenue.get();
+                let last_snapshot = vault_state.last_fee_snapshot;
+
+                // Calculate new fees since last crank
+                let fee_delta = current_fee_revenue.saturating_sub(last_snapshot);
+                if fee_delta == 0 {
+                    return Err(PercolatorError::LpVaultNoNewFees.into());
+                }
+
+                // LP vault gets fee_share_bps portion of the delta
+                let lp_portion =
+                    fee_delta.saturating_mul(vault_state.fee_share_bps as u128) / 10_000;
+
+                if lp_portion > 0 {
+                    // Move lp_portion from insurance fund balance to LP vault capital.
+                    // The tokens are already in the vault token account — this just
+                    // updates the internal accounting (insurance → LP vault).
+                    let ins_balance = engine.insurance_fund.balance.get();
+                    let actual_transfer = core::cmp::min(lp_portion, ins_balance);
+
+                    engine.insurance_fund.balance =
+                        percolator::U128::new(ins_balance.saturating_sub(actual_transfer));
+
+                    vault_state.total_capital = vault_state
+                        .total_capital
+                        .checked_add(actual_transfer)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    vault_state.total_fees_distributed = vault_state
+                        .total_fees_distributed
+                        .checked_add(actual_transfer)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                }
+
+                // Update snapshot and last crank slot
+                vault_state.last_fee_snapshot = current_fee_revenue;
+                let clock = Clock::get()?;
+                vault_state.last_crank_slot = clock.slot;
+                drop(slab_data);
+
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+
+                msg!(
+                    "LP vault fee crank: delta={} lp_portion={} new_capital={} slot={}",
+                    fee_delta,
+                    lp_portion,
+                    vault_state.total_capital,
+                    clock.slot
                 );
             }
         }

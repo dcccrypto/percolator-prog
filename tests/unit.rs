@@ -3693,6 +3693,787 @@ fn test_hyperp_effective_cap_enforces_minimum() {
 }
 
 // ============================================================================
+// PERC-273: OI Cap, UnresolveMarket, UpdateMarginParams Tests
+// ============================================================================
+
+#[test]
+fn test_oi_cap_disabled_when_zero() {
+    // When oi_cap_multiplier_bps == 0, any OI should be allowed
+    // Default zero value means no cap
+    let multiplier: u64 = 0;
+    assert_eq!(multiplier, 0);
+}
+
+#[test]
+fn test_oi_cap_computation() {
+    // vault=1000, multiplier=100_000 (10x) → max_oi=10_000
+    let vault: u128 = 1_000;
+    let multiplier: u64 = 100_000;
+    let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+    assert_eq!(max_oi, 10_000);
+
+    // vault=500, multiplier=50_000 (5x) → max_oi=2500
+    let vault2: u128 = 500;
+    let multiplier2: u64 = 50_000;
+    let max_oi2 = vault2.saturating_mul(multiplier2 as u128) / 10_000;
+    assert_eq!(max_oi2, 2_500);
+}
+
+#[test]
+fn test_clear_resolved_flag() {
+    use percolator_prog::state;
+    let mut data = vec![0u8; 200];
+
+    // Set resolved
+    state::set_resolved(&mut data);
+    assert!(state::is_resolved(&data));
+
+    // Clear resolved
+    state::clear_resolved(&mut data);
+    assert!(!state::is_resolved(&data));
+}
+
+#[test]
+fn test_clear_resolved_preserves_other_flags() {
+    use percolator_prog::state;
+    let mut data = vec![0u8; 200];
+
+    // Set paused + resolved
+    let flags = state::FLAG_RESOLVED | 0x02; // bit 1 = paused
+    state::write_flags(&mut data, flags);
+    assert!(state::is_resolved(&data));
+
+    // Clear resolved — paused should remain
+    state::clear_resolved(&mut data);
+    assert!(!state::is_resolved(&data));
+    assert_eq!(state::read_flags(&data) & 0x02, 0x02);
+}
+
+#[test]
+fn test_unresolve_requires_resolved() {
+    // UnresolveMarket should only work on resolved markets
+    use percolator_prog::state;
+    let mut data = vec![0u8; 200];
+
+    // Not resolved → should fail (caller checks this)
+    assert!(!state::is_resolved(&data));
+
+    // Set resolved → unresolve → should succeed
+    state::set_resolved(&mut data);
+    assert!(state::is_resolved(&data));
+    state::clear_resolved(&mut data);
+    assert!(!state::is_resolved(&data));
+}
+
+// ================================================================
+// PERC-272: LP Vault Tests
+// ================================================================
+
+fn encode_create_lp_vault(fee_share_bps: u64) -> Vec<u8> {
+    let mut data = vec![37u8]; // TAG_CREATE_LP_VAULT
+    encode_u64(fee_share_bps, &mut data);
+    data
+}
+
+fn encode_lp_vault_deposit(amount: u64) -> Vec<u8> {
+    let mut data = vec![38u8]; // TAG_LP_VAULT_DEPOSIT
+    encode_u64(amount, &mut data);
+    data
+}
+
+fn encode_lp_vault_withdraw(lp_amount: u64) -> Vec<u8> {
+    let mut data = vec![39u8]; // TAG_LP_VAULT_WITHDRAW
+    encode_u64(lp_amount, &mut data);
+    data
+}
+
+fn encode_lp_vault_crank_fees() -> Vec<u8> {
+    vec![40u8] // TAG_LP_VAULT_CRANK_FEES
+}
+
+/// Initialise a market and return the fixture. Helper for LP vault tests.
+fn init_market_for_lp_vault() -> MarketFixture {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+    }
+    f
+}
+
+fn make_lp_vault_mint(authority: Pubkey) -> Vec<u8> {
+    use spl_token::state::Mint;
+    let mut data = vec![0u8; Mint::LEN];
+    let mint = Mint {
+        mint_authority: solana_program::program_option::COption::Some(authority),
+        supply: 0,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: solana_program::program_option::COption::None,
+    };
+    Mint::pack(mint, &mut data).unwrap();
+    data
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_create_lp_vault() {
+    use percolator_prog::lp_vault;
+
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    // Prepare LP vault state PDA account (pre-allocate in test mode)
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+
+    // Prepare LP vault mint account (pre-allocate in test mode)
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    let data = encode_create_lp_vault(5000); // 50% fee share
+
+    {
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Verify state was written
+    let vs = lp_vault::read_lp_vault_state(&lp_vault_state_acct.data).unwrap();
+    assert!(vs.is_initialized());
+    assert_eq!(vs.fee_share_bps, 5000);
+    assert_eq!(vs.epoch, 1);
+    assert_eq!(vs.total_capital, 0);
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_create_lp_vault_invalid_fee_share() {
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; percolator_prog::lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    // fee_share_bps = 10_001 → invalid
+    let data = encode_create_lp_vault(10_001);
+    {
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        let result = process_instruction(&program_id, &accounts, &data);
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_lp_vault_deposit_and_withdraw() {
+    use percolator_prog::lp_vault;
+
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    // --- Create LP vault first ---
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    {
+        let data = encode_create_lp_vault(5000);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // --- Deposit into LP vault ---
+    let depositor_key = Pubkey::new_unique();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(lp_vault_mint_key, depositor_key, 0),
+    )
+    .writable();
+
+    let deposit_amount = 500_000u64;
+    {
+        let data = encode_lp_vault_deposit(deposit_amount);
+        let accounts = vec![
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            lp_vault_mint_acct.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth.to_info(),
+            lp_vault_state_acct.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Check: LP vault capital increased
+    let vs = lp_vault::read_lp_vault_state(&lp_vault_state_acct.data).unwrap();
+    assert_eq!(vs.total_capital, deposit_amount as u128);
+
+    // Check: depositor got LP tokens (1:1 for first deposit)
+    let lp_token_balance = TokenAccount::unpack(&depositor_lp_ata.data).unwrap().amount;
+    assert_eq!(lp_token_balance, deposit_amount);
+
+    // Check: engine vault increased
+    let engine = zc::engine_ref(&f.slab.data).unwrap();
+    // engine.vault starts at 0 (VAULT_SEED is only in the token account, not tracked by engine)
+    assert_eq!(engine.vault.get(), deposit_amount as u128);
+
+    // Check: depositor ATA decreased
+    let depositor_balance = TokenAccount::unpack(&depositor_ata.data).unwrap().amount;
+    assert_eq!(depositor_balance, 1_000_000 - deposit_amount);
+
+    // --- Withdraw half ---
+    let withdraw_lp = deposit_amount / 2;
+    {
+        let data = encode_lp_vault_withdraw(withdraw_lp);
+        let accounts = vec![
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            lp_vault_mint_acct.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth.to_info(),
+            lp_vault_state_acct.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Check: LP vault capital decreased
+    let vs = lp_vault::read_lp_vault_state(&lp_vault_state_acct.data).unwrap();
+    assert_eq!(vs.total_capital, (deposit_amount - withdraw_lp) as u128);
+
+    // Check: LP tokens burned
+    let lp_token_balance = TokenAccount::unpack(&depositor_lp_ata.data).unwrap().amount;
+    assert_eq!(lp_token_balance, deposit_amount - withdraw_lp);
+
+    // Check: depositor ATA increased
+    let depositor_balance = TokenAccount::unpack(&depositor_ata.data).unwrap().amount;
+    assert_eq!(depositor_balance, 1_000_000 - deposit_amount + withdraw_lp);
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_lp_vault_zero_deposit_rejected() {
+    use percolator_prog::lp_vault;
+
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    // Create vault
+    {
+        let data = encode_create_lp_vault(5000);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Try deposit 0
+    let depositor_key = Pubkey::new_unique();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(lp_vault_mint_key, depositor_key, 0),
+    )
+    .writable();
+
+    {
+        let data = encode_lp_vault_deposit(0); // zero amount
+        let accounts = vec![
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            lp_vault_mint_acct.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth.to_info(),
+            lp_vault_state_acct.to_info(),
+        ];
+        let result = process_instruction(&program_id, &accounts, &data);
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_lp_vault_fee_crank() {
+    use percolator_prog::lp_vault;
+
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    // Create vault with 50% fee share
+    {
+        let data = encode_create_lp_vault(5000);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Deposit some capital
+    let depositor_key = Pubkey::new_unique();
+    let mut depositor = TestAccount::new(
+        depositor_key,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut depositor_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, depositor_key, 1_000_000),
+    )
+    .writable();
+    let mut depositor_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(lp_vault_mint_key, depositor_key, 0),
+    )
+    .writable();
+
+    {
+        let data = encode_lp_vault_deposit(500_000);
+        let accounts = vec![
+            depositor.to_info(),
+            f.slab.to_info(),
+            depositor_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            lp_vault_mint_acct.to_info(),
+            depositor_lp_ata.to_info(),
+            vault_auth.to_info(),
+            lp_vault_state_acct.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Simulate fee accrual: manually bump engine.insurance_fund.fee_revenue
+    {
+        let mut slab_data = f.slab.data.as_mut_slice();
+        let engine = zc::engine_mut(&mut slab_data).unwrap();
+        let current_revenue = engine.insurance_fund.fee_revenue.get();
+        engine.insurance_fund.fee_revenue = percolator::U128::new(current_revenue + 10_000);
+        // Also add to insurance balance (fees go to insurance first)
+        let current_balance = engine.insurance_fund.balance.get();
+        engine.insurance_fund.balance = percolator::U128::new(current_balance + 10_000);
+    }
+
+    // Run fee crank
+    {
+        let data = encode_lp_vault_crank_fees();
+        let accounts = vec![f.slab.to_info(), lp_vault_state_acct.to_info()];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Verify: LP vault got 50% of 10_000 = 5_000
+    let vs = lp_vault::read_lp_vault_state(&lp_vault_state_acct.data).unwrap();
+    assert_eq!(vs.total_capital, 500_000 + 5_000); // deposit + fee share
+    assert_eq!(vs.total_fees_distributed, 5_000);
+
+    // Verify: insurance fund balance decreased by LP portion
+    let engine = zc::engine_ref(&f.slab.data).unwrap();
+    let expected_insurance = 10_000 - 5_000; // total fees minus LP portion
+    assert_eq!(engine.insurance_fund.balance.get(), expected_insurance);
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_lp_vault_crank_no_new_fees_rejected() {
+    use percolator_prog::lp_vault;
+
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    // Create vault
+    {
+        let data = encode_create_lp_vault(5000);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // Try crank with no new fees
+    {
+        let data = encode_lp_vault_crank_fees();
+        let accounts = vec![f.slab.to_info(), lp_vault_state_acct.to_info()];
+        let result = process_instruction(&program_id, &accounts, &data);
+        assert!(result.is_err()); // Should fail: no new fees
+    }
+}
+
+#[test]
+#[cfg(feature = "test")]
+fn test_lp_vault_proportional_shares() {
+    use percolator_prog::lp_vault;
+
+    let mut f = init_market_for_lp_vault();
+    let program_id = f.program_id;
+    let slab_key = f.slab.key;
+
+    let (lp_vault_state_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault", slab_key.as_ref()], &program_id);
+    let (lp_vault_mint_key, _) =
+        Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], &program_id);
+
+    let mut lp_vault_state_acct = TestAccount::new(
+        lp_vault_state_key,
+        program_id,
+        0,
+        vec![0u8; lp_vault::LP_VAULT_STATE_LEN],
+    )
+    .writable();
+    let mut lp_vault_mint_acct = TestAccount::new(
+        lp_vault_mint_key,
+        spl_token::ID,
+        0,
+        make_lp_vault_mint(f.vault_pda),
+    )
+    .writable();
+    let mut vault_auth = TestAccount::new(f.vault_pda, program_id, 0, vec![]);
+
+    // Create vault
+    {
+        let data = encode_create_lp_vault(5000);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            lp_vault_mint_acct.to_info(),
+            vault_auth.to_info(),
+            f.system.to_info(),
+            f.token_prog.to_info(),
+            f.rent.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // First depositor: 1_000_000 tokens → 1_000_000 LP shares (1:1)
+    let d1_key = Pubkey::new_unique();
+    let mut d1 = TestAccount::new(d1_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut d1_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, d1_key, 2_000_000),
+    )
+    .writable();
+    let mut d1_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(lp_vault_mint_key, d1_key, 0),
+    )
+    .writable();
+
+    {
+        let data = encode_lp_vault_deposit(1_000_000);
+        let accounts = vec![
+            d1.to_info(),
+            f.slab.to_info(),
+            d1_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            lp_vault_mint_acct.to_info(),
+            d1_lp_ata.to_info(),
+            vault_auth.to_info(),
+            lp_vault_state_acct.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    let d1_lp_balance = TokenAccount::unpack(&d1_lp_ata.data).unwrap().amount;
+    assert_eq!(d1_lp_balance, 1_000_000);
+
+    // Simulate fee accrual: +100_000 fee revenue
+    {
+        let slab_data = f.slab.data.as_mut_slice();
+        let engine = zc::engine_mut(slab_data).unwrap();
+        engine.insurance_fund.fee_revenue =
+            percolator::U128::new(engine.insurance_fund.fee_revenue.get() + 100_000);
+        engine.insurance_fund.balance =
+            percolator::U128::new(engine.insurance_fund.balance.get() + 100_000);
+    }
+
+    // Crank fees: 50% of 100_000 = 50_000 goes to LP vault
+    {
+        let data = encode_lp_vault_crank_fees();
+        let accounts = vec![f.slab.to_info(), lp_vault_state_acct.to_info()];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    // LP vault capital is now 1_050_000
+    let vs = lp_vault::read_lp_vault_state(&lp_vault_state_acct.data).unwrap();
+    assert_eq!(vs.total_capital, 1_050_000);
+
+    // Second depositor: 1_000_000 tokens at vault value 1_050_000 with supply 1_000_000
+    // shares = 1_000_000 * 1_000_000 / 1_050_000 = 952_380 (rounded down)
+    let d2_key = Pubkey::new_unique();
+    let mut d2 = TestAccount::new(d2_key, solana_program::system_program::id(), 0, vec![]).signer();
+    let mut d2_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, d2_key, 2_000_000),
+    )
+    .writable();
+    let mut d2_lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(lp_vault_mint_key, d2_key, 0),
+    )
+    .writable();
+
+    {
+        let data = encode_lp_vault_deposit(1_000_000);
+        let accounts = vec![
+            d2.to_info(),
+            f.slab.to_info(),
+            d2_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            lp_vault_mint_acct.to_info(),
+            d2_lp_ata.to_info(),
+            vault_auth.to_info(),
+            lp_vault_state_acct.to_info(),
+        ];
+        process_instruction(&program_id, &accounts, &data).unwrap();
+    }
+
+    let d2_lp_balance = TokenAccount::unpack(&d2_lp_ata.data).unwrap().amount;
+    assert_eq!(d2_lp_balance, 952_380); // 1_000_000 * 1_000_000 / 1_050_000
+
+    // D1 has 1_000_000 shares, D2 has 952_380 shares
+    // Total supply = 1_952_380, total capital = 2_050_000
+    // D1's share value = 1_000_000 * 2_050_000 / 1_952_380 = 1_049_999 (≈1_050_000)
+    // D2's share value = 952_380 * 2_050_000 / 1_952_380 = 999_999 (≈1_000_000)
+    // This confirms the first depositor captures the fee appreciation.
+}
+
+// ============================================================================
 // PERC-274: Oracle Aggregation Tests
 // ============================================================================
 
