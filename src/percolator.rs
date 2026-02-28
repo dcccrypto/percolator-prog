@@ -4557,14 +4557,21 @@ pub mod processor {
 
     /// PERC-272: Check max PnL cap after trade execution.
     /// If max_pnl_cap > 0, enforce: pnl_pos_tot <= max_pnl_cap.
-    fn check_pnl_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
+    fn check_pnl_cap(
+        engine: &RiskEngine,
+        config: &state::MarketConfig,
+    ) -> Result<(), ProgramError> {
         let cap = config.max_pnl_cap;
         if cap == 0 {
             return Ok(()); // PnL cap disabled
         }
         let current_pnl = engine.pnl_pos_tot.get();
         if current_pnl > cap as u128 {
-            msg!("PnL cap exceeded: current_pnl_pos_tot={} max={}", current_pnl, cap);
+            msg!(
+                "PnL cap exceeded: current_pnl_pos_tot={} max={}",
+                current_pnl,
+                cap
+            );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
         Ok(())
@@ -6667,7 +6674,11 @@ pub mod processor {
                         config.max_pnl_cap = pnl_cap;
                     }
                     state::write_config(&mut data, &config);
-                    msg!("UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}", oi_cap_multiplier_bps, max_pnl_cap);
+                    msg!(
+                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}",
+                        oi_cap_multiplier_bps,
+                        max_pnl_cap
+                    );
                 }
 
                 msg!("UpdateRiskParams: initial_margin_bps={}, maintenance_margin_bps={}, trading_fee_bps={:?}",

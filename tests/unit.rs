@@ -4473,7 +4473,6 @@ fn test_lp_vault_proportional_shares() {
     // This confirms the first depositor captures the fee appreciation.
 }
 
-
 // ============================================================================
 // PERC-274: Oracle Aggregation Tests
 // ============================================================================
