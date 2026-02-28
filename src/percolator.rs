@@ -1275,6 +1275,89 @@ pub mod verify {
         let crashed_price = prev_price / 100;
         circuit_breaker_triggered(prev_price, crashed_price, cap_e2bps, dt_slots)
     }
+
+    // ========================================
+    // PERC-274: Oracle Aggregation (Pure Logic)
+    // ========================================
+
+    /// Compute median of up to MAX_ORACLE_SOURCES prices (sorted in-place).
+    /// Returns None if no valid prices (all zeros filtered out).
+    ///
+    /// Invariant: result is always >= min(inputs) and <= max(inputs).
+    pub const MAX_ORACLE_SOURCES: usize = 5;
+
+    pub fn median_price(prices: &mut [u64]) -> Option<u64> {
+        // Filter out zeros (invalid/failed oracle reads)
+        let mut valid: [u64; MAX_ORACLE_SOURCES] = [0; MAX_ORACLE_SOURCES];
+        let mut count = 0usize;
+        for &p in prices.iter() {
+            if p > 0 && count < MAX_ORACLE_SOURCES {
+                valid[count] = p;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+
+        // Sort valid prices (insertion sort — tiny array, no alloc)
+        for i in 1..count {
+            let key = valid[i];
+            let mut j = i;
+            while j > 0 && valid[j - 1] > key {
+                valid[j] = valid[j - 1];
+                j -= 1;
+            }
+            valid[j] = key;
+        }
+
+        // Median: middle element for odd count, average of two middle for even
+        if count % 2 == 1 {
+            Some(valid[count / 2])
+        } else {
+            let a = valid[count / 2 - 1] as u128;
+            let b = valid[count / 2] as u128;
+            Some(((a + b) / 2) as u64)
+        }
+    }
+
+    /// Check if a new price deviates too much from last accepted price.
+    /// Returns true if deviation exceeds max_deviation_bps.
+    /// 0 = disabled (no deviation check).
+    pub fn price_deviates_too_much(
+        last_price: u64,
+        new_price: u64,
+        max_deviation_bps: u64,
+    ) -> bool {
+        if last_price == 0 || max_deviation_bps == 0 {
+            return false; // First price or check disabled
+        }
+        let diff = if new_price > last_price {
+            new_price - last_price
+        } else {
+            last_price - new_price
+        };
+        // deviation = diff * 10_000 / last_price
+        let deviation_bps = (diff as u128) * 10_000 / (last_price as u128);
+        deviation_bps > max_deviation_bps as u128
+    }
+
+    /// Ring buffer price history entry.
+    #[derive(Clone, Copy)]
+    pub struct PriceHistoryEntry {
+        pub price_e6: u64,
+        pub timestamp: i64,
+        pub slot: u64,
+        pub source_count: u8,
+    }
+
+    /// Update a ring buffer of price history. Returns new cursor.
+    pub fn ring_buffer_push(cursor: u8, capacity: u8) -> u8 {
+        if capacity == 0 {
+            return 0;
+        }
+        (cursor + 1) % capacity
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -3651,6 +3734,120 @@ pub mod oracle {
         };
         let clamped = clamp_oracle_price(config.last_effective_price_e6, raw, effective_cap);
         config.last_effective_price_e6 = clamped;
+        Ok(clamped)
+    }
+
+    // =========================================================================
+    // PERC-274: Multi-source Oracle Aggregation
+    // =========================================================================
+
+    /// Read price from multiple oracle sources and compute median.
+    /// Falls back to single-source if only one oracle account provided.
+    ///
+    /// Sources tried (in order): primary oracle, then remaining_accounts[0..N]
+    /// Each source that fails silently returns 0 (filtered by median).
+    /// Requires at least 1 valid price to succeed.
+    ///
+    /// Emits sol_log with accepted price, source count, and timestamp for
+    /// on-chain transparency and off-chain indexing.
+    pub fn read_price_aggregated(
+        config: &mut super::state::MarketConfig,
+        primary_oracle: &AccountInfo,
+        now_unix_ts: i64,
+        remaining_accounts: &[AccountInfo],
+    ) -> Result<u64, ProgramError> {
+        use crate::verify::{median_price, MAX_ORACLE_SOURCES};
+
+        let mut prices = [0u64; MAX_ORACLE_SOURCES];
+        let mut source_count = 0u8;
+
+        // Try primary oracle
+        if let Ok(p) =
+            read_price_with_authority(config, primary_oracle, now_unix_ts, remaining_accounts)
+        {
+            if p > 0 {
+                prices[0] = p;
+                source_count += 1;
+            }
+        }
+
+        // Try additional oracle accounts from remaining_accounts
+        // Convention: after any PumpSwap vault accounts, additional oracles start
+        // We try each remaining account as a potential oracle
+        for (i, extra) in remaining_accounts.iter().enumerate() {
+            if source_count as usize >= MAX_ORACLE_SOURCES {
+                break;
+            }
+            // Skip accounts that are clearly not oracles (system program, token program, etc.)
+            if extra.data_len() < 100 {
+                continue;
+            }
+            // Try Pyth
+            if let Ok(p) = read_pyth_price_e6(
+                extra,
+                &config.index_feed_id,
+                now_unix_ts,
+                config.max_staleness_secs,
+                config.conf_filter_bps,
+            ) {
+                if p > 0 {
+                    prices[source_count as usize] = p;
+                    source_count += 1;
+                    continue;
+                }
+            }
+            // Try Chainlink (use index_feed_id as expected pubkey for validation)
+            if let Ok(p) = read_chainlink_price_e6(
+                extra,
+                &config.index_feed_id,
+                now_unix_ts,
+                config.max_staleness_secs,
+            ) {
+                if p > 0 {
+                    prices[source_count as usize] = p;
+                    source_count += 1;
+                }
+            }
+        }
+
+        if source_count == 0 {
+            return Err(super::error::PercolatorError::OracleStale.into());
+        }
+
+        // Compute median
+        let median = median_price(&mut prices)
+            .ok_or::<ProgramError>(super::error::PercolatorError::OracleStale.into())?;
+
+        // Apply circuit breaker clamping
+        let effective_cap = if is_dex_oracle(primary_oracle)
+            && config.oracle_price_cap_e2bps < DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
+        {
+            DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
+        } else {
+            config.oracle_price_cap_e2bps
+        };
+        let clamped = clamp_oracle_price(config.last_effective_price_e6, median, effective_cap);
+        config.last_effective_price_e6 = clamped;
+
+        // Emit price event for on-chain transparency
+        #[cfg(not(feature = "test"))]
+        {
+            use alloc::format;
+            solana_program::msg!(
+                "OracleAggregated: price={} sources={} median={} clamped={} ts={}",
+                clamped,
+                source_count,
+                median,
+                clamped,
+                now_unix_ts
+            );
+        }
+        #[cfg(feature = "test")]
+        {
+            // In test mode, msg! doesn't need alloc::format
+            let _ = (clamped, source_count, median, now_unix_ts);
+        }
+
         Ok(clamped)
     }
 
