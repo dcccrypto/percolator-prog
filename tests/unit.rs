@@ -4472,3 +4472,78 @@ fn test_lp_vault_proportional_shares() {
     // D2's share value = 952_380 * 2_050_000 / 1_952_380 = 999_999 (≈1_000_000)
     // This confirms the first depositor captures the fee appreciation.
 }
+
+// ============================================================================
+// PERC-274: Oracle Aggregation Tests
+// ============================================================================
+
+#[test]
+fn test_median_three_prices() {
+    use percolator_prog::verify::median_price;
+    let mut prices = [100, 200, 150, 0, 0];
+    assert_eq!(median_price(&mut prices), Some(150));
+}
+
+#[test]
+fn test_median_two_prices() {
+    use percolator_prog::verify::median_price;
+    let mut prices = [100, 200, 0, 0, 0];
+    assert_eq!(median_price(&mut prices), Some(150)); // average of 100 and 200
+}
+
+#[test]
+fn test_median_five_prices() {
+    use percolator_prog::verify::median_price;
+    let mut prices = [500, 100, 300, 200, 400];
+    assert_eq!(median_price(&mut prices), Some(300));
+}
+
+#[test]
+fn test_median_with_zeros_filtered() {
+    use percolator_prog::verify::median_price;
+    let mut prices = [0, 100, 0, 300, 0];
+    assert_eq!(median_price(&mut prices), Some(200)); // median of [100, 300]
+}
+
+#[test]
+fn test_median_all_zeros() {
+    use percolator_prog::verify::median_price;
+    let mut prices = [0, 0, 0, 0, 0];
+    assert_eq!(median_price(&mut prices), None);
+}
+
+#[test]
+fn test_median_single() {
+    use percolator_prog::verify::median_price;
+    let mut prices = [42, 0, 0, 0, 0];
+    assert_eq!(median_price(&mut prices), Some(42));
+}
+
+#[test]
+fn test_deviation_small() {
+    use percolator_prog::verify::price_deviates_too_much;
+    // 1% deviation with 500 bps (5%) cap → not too much
+    assert!(!price_deviates_too_much(10000, 10100, 500));
+}
+
+#[test]
+fn test_deviation_large() {
+    use percolator_prog::verify::price_deviates_too_much;
+    // 20% deviation with 500 bps (5%) cap → too much
+    assert!(price_deviates_too_much(10000, 12000, 500));
+}
+
+#[test]
+fn test_deviation_zero_last() {
+    use percolator_prog::verify::price_deviates_too_much;
+    // First price (last=0) → always OK
+    assert!(!price_deviates_too_much(0, 10000, 500));
+}
+
+#[test]
+fn test_ring_buffer_push() {
+    use percolator_prog::verify::ring_buffer_push;
+    assert_eq!(ring_buffer_push(0, 8), 1);
+    assert_eq!(ring_buffer_push(7, 8), 0); // wraps
+    assert_eq!(ring_buffer_push(3, 8), 4);
+}

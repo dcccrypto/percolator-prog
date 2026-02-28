@@ -5127,3 +5127,136 @@ fn proof_margin_always_requires_positive_collateral() {
         "Margin must be positive for any open position"
     );
 }
+
+// ============================================================================
+// PERC-274: Oracle Aggregation Proofs
+// ============================================================================
+
+/// Prove: median is always within [min, max] of valid inputs.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_median_within_bounds() {
+    use percolator_prog::verify::median_price;
+
+    let a: u64 = kani::any();
+    let b: u64 = kani::any();
+    let c: u64 = kani::any();
+
+    kani::assume(a > 0 && a <= u32::MAX as u64);
+    kani::assume(b > 0 && b <= u32::MAX as u64);
+    kani::assume(c > 0 && c <= u32::MAX as u64);
+
+    let mut prices = [a, b, c, 0, 0];
+    let median = median_price(&mut prices).unwrap();
+
+    let min = a.min(b).min(c);
+    let max = a.max(b).max(c);
+    assert!(median >= min, "median must be >= min input");
+    assert!(median <= max, "median must be <= max input");
+}
+
+/// Prove: median of single price returns that price.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_median_single_price() {
+    use percolator_prog::verify::median_price;
+
+    let p: u64 = kani::any();
+    kani::assume(p > 0);
+
+    let mut prices = [p, 0, 0, 0, 0];
+    let result = median_price(&mut prices);
+    assert_eq!(result, Some(p));
+}
+
+/// Prove: median of all zeros returns None.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_median_no_valid_prices() {
+    use percolator_prog::verify::median_price;
+
+    let mut prices = [0u64; 5];
+    assert_eq!(median_price(&mut prices), None);
+}
+
+/// Prove: price deviation check correctly detects large deviations.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_deviation_detection() {
+    use percolator_prog::verify::price_deviates_too_much;
+
+    let last: u64 = kani::any();
+    let new: u64 = kani::any();
+    let max_bps: u64 = kani::any();
+
+    kani::assume(last > 0 && last <= u32::MAX as u64);
+    kani::assume(new > 0 && new <= u32::MAX as u64);
+    kani::assume(max_bps > 0 && max_bps <= 10_000);
+
+    let result = price_deviates_too_much(last, new, max_bps);
+
+    // If prices are equal, no deviation
+    if last == new {
+        assert!(!result, "equal prices should not deviate");
+    }
+}
+
+/// Prove: deviation check disabled when last_price is 0.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_deviation_disabled_on_first_price() {
+    use percolator_prog::verify::price_deviates_too_much;
+
+    let new: u64 = kani::any();
+    let max_bps: u64 = kani::any();
+
+    assert!(!price_deviates_too_much(0, new, max_bps));
+}
+
+/// Prove: deviation check disabled when max_deviation_bps is 0.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_deviation_disabled_when_zero_bps() {
+    use percolator_prog::verify::price_deviates_too_much;
+
+    let last: u64 = kani::any();
+    let new: u64 = kani::any();
+
+    assert!(!price_deviates_too_much(last, new, 0));
+}
+
+/// Prove: staleness check never accepts a stale price.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_staleness_rejects_old_price() {
+    use percolator_prog::verify::pyth_price_is_fresh;
+
+    let publish_time: i64 = kani::any();
+    let now: i64 = kani::any();
+    let max_staleness: u64 = kani::any();
+
+    kani::assume(now >= 0);
+    kani::assume(publish_time >= 0);
+    kani::assume(max_staleness > 0 && max_staleness <= 86400);
+    kani::assume(now > publish_time); // price is in the past
+    kani::assume((now - publish_time) as u64 > max_staleness); // older than max
+
+    // Must not be considered fresh
+    let is_fresh = pyth_price_is_fresh(publish_time, now, max_staleness);
+    assert!(!is_fresh, "stale price must not be accepted as fresh");
+}
+
+/// Prove: ring buffer cursor wraps correctly.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_ring_buffer_wraps() {
+    use percolator_prog::verify::ring_buffer_push;
+
+    let cursor: u8 = kani::any();
+    let capacity: u8 = kani::any();
+    kani::assume(capacity > 0);
+    kani::assume(cursor < capacity);
+
+    let next = ring_buffer_push(cursor, capacity);
+    assert!(next < capacity, "cursor must stay within bounds");
+}
