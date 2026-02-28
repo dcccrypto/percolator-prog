@@ -3644,7 +3644,9 @@ pub mod oracle {
         let mut source_count = 0u8;
 
         // Try primary oracle
-        if let Ok(p) = read_price_with_authority(config, primary_oracle, now_unix_ts, remaining_accounts) {
+        if let Ok(p) =
+            read_price_with_authority(config, primary_oracle, now_unix_ts, remaining_accounts)
+        {
             if p > 0 {
                 prices[0] = p;
                 source_count += 1;
@@ -3677,7 +3679,12 @@ pub mod oracle {
                 }
             }
             // Try Chainlink (use index_feed_id as expected pubkey for validation)
-            if let Ok(p) = read_chainlink_price_e6(extra, &config.index_feed_id, now_unix_ts, config.max_staleness_secs) {
+            if let Ok(p) = read_chainlink_price_e6(
+                extra,
+                &config.index_feed_id,
+                now_unix_ts,
+                config.max_staleness_secs,
+            ) {
                 if p > 0 {
                     prices[source_count as usize] = p;
                     source_count += 1;
@@ -3710,7 +3717,11 @@ pub mod oracle {
             use alloc::format;
             solana_program::msg!(
                 "OracleAggregated: price={} sources={} median={} clamped={} ts={}",
-                clamped, source_count, median, clamped, now_unix_ts
+                clamped,
+                source_count,
+                median,
+                clamped,
+                now_unix_ts
             );
         }
         #[cfg(feature = "test")]
