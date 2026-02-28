@@ -1690,6 +1690,9 @@ pub mod ix {
             /// OI cap multiplier in bps. 0 = disabled. 100_000 = 10x vault.
             /// None = don't change (backwards compatible).
             oi_cap_multiplier_bps: Option<u64>,
+            /// Max total positive PnL cap. 0 = disabled.
+            /// None = don't change (backwards compatible).
+            max_pnl_cap: Option<u64>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -2041,11 +2044,18 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // Optional: max_pnl_cap (PERC-272, backwards compatible)
+                    let max_pnl_cap = if rest.len() >= 8 {
+                        Some(read_u64(&mut rest)?)
+                    } else {
+                        None
+                    };
                     Ok(Instruction::UpdateRiskParams {
                         initial_margin_bps,
                         maintenance_margin_bps,
                         trading_fee_bps,
                         oi_cap_multiplier_bps,
+                        max_pnl_cap,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2472,8 +2482,10 @@ pub mod state {
         /// 0 = disabled (no OI cap). 100_000 = 10x vault capital.
         /// Set via UpdateMarginParams instruction.
         pub oi_cap_multiplier_bps: u64,
-        /// Reserved for alignment (struct must be multiple of 16 bytes for u128 fields).
-        pub _oi_reserved: u64,
+        /// Max total positive PnL allowed (absolute, in collateral units).
+        /// 0 = disabled. Trades rejected if pnl_pos_tot would exceed this.
+        /// Set via UpdateRiskParams. Prevents LP capital exhaustion.
+        pub max_pnl_cap: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4346,6 +4358,21 @@ pub mod processor {
         Ok(())
     }
 
+    /// PERC-272: Check max PnL cap after trade execution.
+    /// If max_pnl_cap > 0, enforce: pnl_pos_tot <= max_pnl_cap.
+    fn check_pnl_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
+        let cap = config.max_pnl_cap;
+        if cap == 0 {
+            return Ok(()); // PnL cap disabled
+        }
+        let current_pnl = engine.pnl_pos_tot.get();
+        if current_pnl > cap as u128 {
+            msg!("PnL cap exceeded: current_pnl_pos_tot={} max={}", current_pnl, cap);
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        Ok(())
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
         if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
@@ -4629,7 +4656,7 @@ pub mod processor {
                     last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     // PERC-273: OI cap disabled by default
                     oi_cap_multiplier_bps: 0,
-                    _oi_reserved: 0,
+                    max_pnl_cap: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -5344,6 +5371,7 @@ pub mod processor {
 
                 // PERC-273: Dynamic OI cap check after trade
                 check_oi_cap(engine, &config)?;
+                check_pnl_cap(engine, &config)?;
 
                 #[cfg(feature = "cu-audit")]
                 {
@@ -5658,6 +5686,7 @@ pub mod processor {
 
                     // PERC-273: Dynamic OI cap check after trade
                     check_oi_cap(engine, &config)?;
+                check_pnl_cap(engine, &config)?;
 
                     #[cfg(feature = "cu-audit")]
                     {
@@ -6386,6 +6415,7 @@ pub mod processor {
                 maintenance_margin_bps,
                 trading_fee_bps,
                 oi_cap_multiplier_bps,
+                max_pnl_cap,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -6430,11 +6460,17 @@ pub mod processor {
                 }
 
                 // PERC-273: Update OI cap multiplier if provided
-                if let Some(oi_cap) = oi_cap_multiplier_bps {
+                // PERC-272: Update max PnL cap if provided
+                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() {
                     let mut config = state::read_config(&data);
-                    config.oi_cap_multiplier_bps = oi_cap;
+                    if let Some(oi_cap) = oi_cap_multiplier_bps {
+                        config.oi_cap_multiplier_bps = oi_cap;
+                    }
+                    if let Some(pnl_cap) = max_pnl_cap {
+                        config.max_pnl_cap = pnl_cap;
+                    }
                     state::write_config(&mut data, &config);
-                    msg!("UpdateRiskParams: oi_cap_multiplier_bps={}", oi_cap);
+                    msg!("UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}", oi_cap_multiplier_bps, max_pnl_cap);
                 }
 
                 msg!("UpdateRiskParams: initial_margin_bps={}, maintenance_margin_bps={}, trading_fee_bps={:?}",
