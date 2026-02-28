@@ -7929,17 +7929,20 @@ pub mod processor {
                         .ok_or(PercolatorError::EngineOverflow)?;
                 }
 
-                // Update snapshot
+                // Update snapshot and last crank slot
                 vault_state.last_fee_snapshot = current_fee_revenue;
+                let clock = Clock::get()?;
+                vault_state.last_crank_slot = clock.slot;
                 drop(slab_data);
 
                 crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
 
                 msg!(
-                    "LP vault fee crank: delta={} lp_portion={} new_capital={}",
+                    "LP vault fee crank: delta={} lp_portion={} new_capital={} slot={}",
                     fee_delta,
                     lp_portion,
-                    vault_state.total_capital
+                    vault_state.total_capital,
+                    clock.slot
                 );
             }
         }
