@@ -1795,9 +1795,12 @@ pub mod ix {
             bump: u8,
         },
         /// PERC-273: Unresolve a market — clear RESOLVED flag, re-enable trading.
-        /// Admin only. Emits sol_log event for transparency.
+        /// Admin only. Requires confirmation code to prevent accidental invocation.
         /// Accounts: [admin(signer), slab(writable)]
-        UnresolveMarket,
+        UnresolveMarket {
+            /// Must equal 0xDEAD_BEEF_CAFE_1234 to confirm intent
+            confirmation: u64,
+        },
 
         /// PERC-272: Create LP vault — initialise state PDA + SPL mint for LP shares.
         /// Admin only. One per market.
@@ -2146,7 +2149,10 @@ pub mod ix {
                         bump,
                     })
                 }
-                TAG_UNRESOLVE_MARKET => Ok(Instruction::UnresolveMarket),
+                TAG_UNRESOLVE_MARKET => {
+                    let confirmation = read_u64(&mut rest)?;
+                    Ok(Instruction::UnresolveMarket { confirmation })
+                }
                 TAG_CREATE_LP_VAULT => {
                     let fee_share_bps = read_u64(&mut rest)?;
                     Ok(Instruction::CreateLpVault { fee_share_bps })
@@ -7356,9 +7362,14 @@ pub mod processor {
                 );
             }
 
-            Instruction::UnresolveMarket => {
+            Instruction::UnresolveMarket { confirmation } => {
                 // PERC-273: Unresolve market — clear RESOLVED flag, re-enable trading.
-                // Admin only. Emits event log for transparency.
+                // Admin only. Requires confirmation code to prevent accidental invocation.
+                const UNRESOLVE_CONFIRMATION: u64 = 0xDEAD_BEEF_CAFE_1234;
+                if confirmation != UNRESOLVE_CONFIRMATION {
+                    msg!("UnresolveMarket: invalid confirmation code");
+                    return Err(ProgramError::InvalidInstructionData);
+                }
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
@@ -7908,11 +7919,14 @@ pub mod processor {
                     engine.insurance_fund.balance =
                         percolator::U128::new(ins_balance.saturating_sub(actual_transfer));
 
-                    vault_state.total_capital =
-                        vault_state.total_capital.saturating_add(actual_transfer);
+                    vault_state.total_capital = vault_state
+                        .total_capital
+                        .checked_add(actual_transfer)
+                        .ok_or(PercolatorError::EngineOverflow)?;
                     vault_state.total_fees_distributed = vault_state
                         .total_fees_distributed
-                        .saturating_add(actual_transfer);
+                        .checked_add(actual_transfer)
+                        .ok_or(PercolatorError::EngineOverflow)?;
                 }
 
                 // Update snapshot
