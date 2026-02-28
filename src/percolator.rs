@@ -5686,7 +5686,7 @@ pub mod processor {
 
                     // PERC-273: Dynamic OI cap check after trade
                     check_oi_cap(engine, &config)?;
-                check_pnl_cap(engine, &config)?;
+                    check_pnl_cap(engine, &config)?;
 
                     #[cfg(feature = "cu-audit")]
                     {
