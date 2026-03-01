@@ -47,7 +47,7 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
-    const _: [(); 432] = [(); CONFIG_LEN];
+    const _: [(); 448] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -2709,6 +2709,16 @@ pub mod state {
         pub _rebalancing_pad: [u8; 6],
         /// Runtime: slot when rebalancing mode was activated (0 if inactive).
         pub rebalancing_start_slot: u64,
+
+        // ========================================
+        // Orphan Market Penalty (PERC-307)
+        // ========================================
+        /// Slots of oracle staleness before orphan penalty kicks in (default 1000).
+        /// 0 = disabled.
+        pub orphan_threshold_slots: u64,
+        /// Penalty rate in bps per slot applied to position funding when oracle stale.
+        pub orphan_penalty_bps_per_slot: u16,
+        pub _orphan_pad: [u8; 6],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -2832,7 +2842,7 @@ pub mod state {
     }
 
     pub fn read_config(data: &[u8]) -> MarketConfig {
-        let mut c = MarketConfig::zeroed();
+        let mut c: MarketConfig = bytemuck::Zeroable::zeroed();
         let src = &data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
         let dst = bytemuck::bytes_of_mut(&mut c);
         dst.copy_from_slice(src);
@@ -4952,6 +4962,125 @@ pub mod processor {
         }
     }
 
+    /// PERC-307: Compute orphan penalty for a position.
+    /// Returns penalty amount in collateral units (to be added to insurance fund).
+    /// Penalty = |position_size| * penalty_bps * stale_slots / 10_000
+    /// Only applies if oracle is stale AND market is not resolved.
+    fn compute_orphan_penalty(
+        config: &state::MarketConfig,
+        current_slot: u64,
+        last_oracle_slot: u64,
+        is_resolved: bool,
+        position_size_abs: u128,
+    ) -> u128 {
+        if is_resolved
+            || config.orphan_threshold_slots == 0
+            || config.orphan_penalty_bps_per_slot == 0
+        {
+            return 0;
+        }
+        let staleness = current_slot.saturating_sub(last_oracle_slot);
+        if staleness <= config.orphan_threshold_slots {
+            return 0;
+        }
+        let penalty_slots = staleness - config.orphan_threshold_slots;
+        let penalty_bps = config.orphan_penalty_bps_per_slot as u128;
+        position_size_abs
+            .saturating_mul(penalty_bps)
+            .saturating_mul(penalty_slots as u128)
+            / 10_000
+    }
+
+    #[cfg(test)]
+    mod orphan_tests {
+        use super::*;
+        use crate::state::MarketConfig;
+
+        fn test_config(threshold: u64, penalty_bps: u16) -> MarketConfig {
+            let mut c: MarketConfig = bytemuck::Zeroable::zeroed();
+            c.orphan_threshold_slots = threshold;
+            c.orphan_penalty_bps_per_slot = penalty_bps;
+            c
+        }
+
+        #[test]
+        fn test_no_penalty_when_disabled() {
+            let c = test_config(0, 1);
+            assert_eq!(compute_orphan_penalty(&c, 2000, 500, false, 1000), 0);
+        }
+
+        #[test]
+        fn test_no_penalty_when_not_stale() {
+            let c = test_config(1000, 1);
+            assert_eq!(compute_orphan_penalty(&c, 1500, 1000, false, 1000), 0);
+        }
+
+        #[test]
+        fn test_no_penalty_when_resolved() {
+            let c = test_config(1000, 1);
+            assert_eq!(compute_orphan_penalty(&c, 3000, 500, true, 1000), 0);
+        }
+
+        #[test]
+        fn test_penalty_applied() {
+            let c = test_config(1000, 1); // 1 bps per slot
+                                          // staleness = 2500, penalty_slots = 1500
+                                          // penalty = 1000 * 1 * 1500 / 10000 = 150
+            assert_eq!(compute_orphan_penalty(&c, 3000, 500, false, 1000), 150);
+        }
+
+        #[test]
+        fn test_penalty_at_boundary() {
+            let c = test_config(1000, 1);
+            // staleness = 1000, exactly at threshold → no penalty
+            assert_eq!(compute_orphan_penalty(&c, 2000, 1000, false, 1000), 0);
+            // staleness = 1001 → 1 penalty slot
+            assert_eq!(compute_orphan_penalty(&c, 2001, 1000, false, 10000), 1);
+        }
+    }
+
+    #[cfg(kani)]
+    mod orphan_proofs {
+        use super::*;
+
+        #[kani::proof]
+        #[kani::unwind(1)]
+        fn proof_orphan_penalty_only_applies_when_oracle_stale_and_not_resolved() {
+            let threshold: u64 = kani::any();
+            let penalty_bps: u16 = kani::any();
+            let current_slot: u64 = kani::any();
+            let last_oracle_slot: u64 = kani::any();
+            let is_resolved: bool = kani::any();
+            let pos_abs: u128 = kani::any();
+
+            kani::assume(threshold <= 100_000);
+            kani::assume(current_slot <= 1_000_000);
+            kani::assume(last_oracle_slot <= current_slot);
+            kani::assume(pos_abs <= 1_000_000_000_000);
+
+            let mut c: crate::state::MarketConfig = bytemuck::Zeroable::zeroed();
+            c.orphan_threshold_slots = threshold;
+            c.orphan_penalty_bps_per_slot = penalty_bps;
+
+            let penalty =
+                compute_orphan_penalty(&c, current_slot, last_oracle_slot, is_resolved, pos_abs);
+
+            // PROPERTY 1: penalty is zero if resolved
+            if is_resolved {
+                assert!(penalty == 0, "penalty must be 0 when resolved");
+            }
+            // PROPERTY 2: penalty is zero if not stale enough
+            let staleness = current_slot.saturating_sub(last_oracle_slot);
+            if staleness <= threshold {
+                assert!(penalty == 0, "penalty must be 0 when not stale");
+            }
+            // PROPERTY 3: penalty is zero if disabled
+            if threshold == 0 || penalty_bps == 0 {
+                assert!(penalty == 0, "penalty must be 0 when disabled");
+            }
+        }
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
         if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
@@ -5252,6 +5381,10 @@ pub mod processor {
                     rebalancing_active: 0,
                     _rebalancing_pad: [0; 6],
                     rebalancing_start_slot: 0,
+                    // PERC-307: Orphan penalty disabled by default
+                    orphan_threshold_slots: 0,
+                    orphan_penalty_bps_per_slot: 0,
+                    _orphan_pad: [0; 6],
                 };
                 state::write_config(&mut data, &config);
 
