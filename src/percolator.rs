@@ -1410,6 +1410,75 @@ pub mod verify {
         // Clamp to target (should never exceed due to elapsed < oi_ramp_slots, but be safe)
         let result = RAMP_START_BPS.saturating_add(ramp_add as u64);
         core::cmp::min(result, oi_cap_multiplier_bps)
+    // ========================================
+    // PERC-304: LP Utilization-Curve Fee Multiplier
+    // ========================================
+
+    /// Kink-curve fee multiplier constants (basis points).
+    pub const FEE_MULT_BASE_BPS: u64 = 10_000; // 1.0x (floor)
+    pub const FEE_MULT_KINK1_BPS: u64 = 25_000; // 2.5x (at 80% util)
+    pub const FEE_MULT_MAX_BPS: u64 = 75_000; // 7.5x (at 100% util)
+    pub const UTIL_KINK1_BPS: u64 = 5_000; // 50% utilization
+    pub const UTIL_KINK2_BPS: u64 = 8_000; // 80% utilization
+    pub const UTIL_MAX_BPS: u64 = 10_000; // 100% utilization
+
+    /// PERC-304: Compute fee multiplier based on OI utilization kink curve.
+    ///
+    /// Three-segment piecewise linear curve (same principle as Drift borrow rate):
+    ///
+    /// | Utilization         | Multiplier                                      |
+    /// |---------------------|-------------------------------------------------|
+    /// | 0–50 %  (0–5000)    | 1.0× (10 000 bps)                              |
+    /// | 50–80 % (5000–8000) | Linear 1.0×→2.5× (10 000 → 25 000 bps)        |
+    /// | 80–100% (8000–10000)| Linear 2.5×→7.5× (25 000 → 75 000 bps)        |
+    /// | > 100 %             | Capped at 7.5× (75 000 bps)                    |
+    ///
+    /// Input:  `util_bps` — utilization in basis points (0 = idle, 10 000 = fully utilised).
+    ///         Values > 10 000 are possible if OI exceeds the cap.
+    /// Output: multiplier in bps ∈ [10 000, 75 000].
+    ///
+    /// All arithmetic is u64; no overflow possible for inputs ≤ 10 000.
+    /// Monotonically non-decreasing — proven by Kani harness
+    /// `proof_fee_mult_monotonically_increases_with_utilization`.
+    #[inline]
+    pub fn compute_fee_multiplier_bps(util_bps: u64) -> u64 {
+        if util_bps <= UTIL_KINK1_BPS {
+            // Segment 1: flat 1.0×
+            FEE_MULT_BASE_BPS
+        } else if util_bps <= UTIL_KINK2_BPS {
+            // Segment 2: linear 1.0× → 2.5× over [50%, 80%]
+            // slope = (25_000 - 10_000) / (8_000 - 5_000) = 15_000 / 3_000 = 5 bps per util_bps
+            let excess = util_bps - UTIL_KINK1_BPS; // 0..3_000
+            let range_mult = FEE_MULT_KINK1_BPS - FEE_MULT_BASE_BPS; // 15_000
+            let range_util = UTIL_KINK2_BPS - UTIL_KINK1_BPS; // 3_000
+            FEE_MULT_BASE_BPS + excess * range_mult / range_util
+        } else if util_bps <= UTIL_MAX_BPS {
+            // Segment 3: linear 2.5× → 7.5× over [80%, 100%]
+            // slope = (75_000 - 25_000) / (10_000 - 8_000) = 50_000 / 2_000 = 25 bps per util_bps
+            let excess = util_bps - UTIL_KINK2_BPS; // 0..2_000
+            let range_mult = FEE_MULT_MAX_BPS - FEE_MULT_KINK1_BPS; // 50_000
+            let range_util = UTIL_MAX_BPS - UTIL_KINK2_BPS; // 2_000
+            FEE_MULT_KINK1_BPS + excess * range_mult / range_util
+        } else {
+            // Segment 4: capped at 7.5×
+            FEE_MULT_MAX_BPS
+        }
+    }
+
+    /// Compute OI utilization in basis points.
+    ///
+    /// `util_bps = current_oi * 10_000 / max_oi`
+    ///
+    /// Returns 0 if max_oi is 0 (OI cap disabled or vault empty).
+    /// Can return > 10_000 if OI exceeds the cap (over-utilised).
+    #[inline]
+    pub fn compute_util_bps(current_oi: u128, max_oi: u128) -> u64 {
+        if max_oi == 0 {
+            return 0;
+        }
+        let util = current_oi.saturating_mul(10_000) / max_oi;
+        // Clamp to u64 (can't realistically exceed but be safe)
+        core::cmp::min(util, u64::MAX as u128) as u64
     }
 }
 
@@ -1969,11 +2038,15 @@ pub mod ix {
         /// PERC-272: Create LP vault — initialise state PDA + SPL mint for LP shares.
         /// Admin only. One per market.
         /// fee_share_bps: 0..=10_000 — portion of trading fees directed to LP vault.
+        /// util_curve_enabled: PERC-304 — enable utilization kink curve for fee multiplier.
+        ///   Optional (backwards compatible). Default: false (disabled).
         /// Accounts: [admin(signer,payer), slab(writable), lp_vault_state(writable),
         ///            lp_vault_mint(writable), vault_authority, system_program,
         ///            token_program, rent_sysvar]
         CreateLpVault {
             fee_share_bps: u64,
+            /// PERC-304: Whether to enable the utilization kink curve.
+            util_curve_enabled: bool,
         },
         /// PERC-272: Deposit SOL into LP vault, receive LP shares.
         /// Permissionless. LP shares are freely transferable SPL tokens.
@@ -2389,7 +2462,16 @@ pub mod ix {
                 }
                 TAG_CREATE_LP_VAULT => {
                     let fee_share_bps = read_u64(&mut rest)?;
-                    Ok(Instruction::CreateLpVault { fee_share_bps })
+                    // PERC-304: Optional util_curve_enabled byte (backwards compatible)
+                    let util_curve_enabled = if !rest.is_empty() {
+                        read_u8(&mut rest)? != 0
+                    } else {
+                        false
+                    };
+                    Ok(Instruction::CreateLpVault {
+                        fee_share_bps,
+                        util_curve_enabled,
+                    })
                 }
                 TAG_LP_VAULT_DEPOSIT => {
                     let amount = read_u64(&mut rest)?;
@@ -4657,7 +4739,10 @@ pub mod lp_vault {
     ///   40..48 last_crank_slot (u64)
     ///   48..64 last_fee_snapshot (u128)
     ///   64..80 total_fees_distributed (u128)
-    ///   80..128 _reserved ([u8; 48])
+    ///   80..84 current_fee_mult_bps (u32) — PERC-304
+    ///   84     lp_util_curve_enabled (u8) — PERC-304
+    ///   85..88 _padding304 ([u8; 3])
+    ///   88..128 _reserved ([u8; 40])
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
     pub struct LpVaultState {
@@ -4684,6 +4769,17 @@ pub mod lp_vault {
         pub loyalty_enabled: u8,
         pub _loyalty_pad: [u8; 7],
         /// Reserved for future use.
+        /// PERC-304: Current fee multiplier in basis points (10_000 = 1.0×).
+        /// Updated on every LpVaultCrankFees when util curve is enabled.
+        /// Readable by off-chain keepers/SDK for APY display.
+        pub current_fee_mult_bps: u32,
+        /// PERC-304: Whether the utilization kink curve is active.
+        /// 0 = disabled (multiplier always 1.0×), 1 = enabled.
+        /// Set via CreateLpVault instruction (optional parameter).
+        pub lp_util_curve_enabled: u8,
+        /// Alignment padding (PERC-304).
+        pub _padding304: [u8; 3],
+        /// Reserved for future use (alignment + forward compat).
         pub _reserved: [u8; 40],
     }
 
@@ -8670,7 +8766,10 @@ pub mod processor {
             // ================================================================
             // PERC-272: LP Vault Instructions
             // ================================================================
-            Instruction::CreateLpVault { fee_share_bps } => {
+            Instruction::CreateLpVault {
+                fee_share_bps,
+                util_curve_enabled,
+            } => {
                 // Create LP vault: initialise state PDA + SPL mint.
                 // Admin only, one per market.
                 // Accounts: [admin(signer,payer), slab(writable), lp_vault_state(writable),
@@ -8773,6 +8872,9 @@ pub mod processor {
                     vault_state.magic = crate::lp_vault::LP_VAULT_MAGIC;
                     vault_state.fee_share_bps = fee_share_bps;
                     vault_state.epoch = 1;
+                    // PERC-304: Set util curve flag and initial multiplier
+                    vault_state.lp_util_curve_enabled = if util_curve_enabled { 1 } else { 0 };
+                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
                     // Snapshot current fee_revenue so we only distribute NEW fees
                     let slab_data = a_slab.try_borrow_data()?;
                     let engine = zc::engine_ref(&slab_data)?;
@@ -8802,8 +8904,9 @@ pub mod processor {
                 )?;
 
                 msg!(
-                    "LP vault created: fee_share={}bps slab={}",
+                    "LP vault created: fee_share={}bps util_curve={} slab={}",
                     fee_share_bps,
+                    util_curve_enabled,
                     a_slab.key
                 );
             }
@@ -9149,6 +9252,7 @@ pub mod processor {
             Instruction::LpVaultCrankFees => {
                 // Permissionless crank: distribute accrued fee revenue to LP vault.
                 // Reads fee_revenue delta since last snapshot, credits LP portion.
+                // PERC-304: If util curve enabled, applies utilization-based fee multiplier.
                 // Accounts: [slab(writable), lp_vault_state(writable)]
                 accounts::expect_len(accounts, 2)?;
                 let a_slab = &accounts[0];
@@ -9173,6 +9277,9 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultNotCreated.into());
                 }
 
+                // Read market config for OI cap multiplier (PERC-304)
+                let config = state::read_config(&slab_data);
+
                 // Read current fee revenue from engine
                 let engine = zc::engine_mut(&mut slab_data)?;
                 let current_fee_revenue = engine.insurance_fund.fee_revenue.get();
@@ -9184,9 +9291,37 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultNoNewFees.into());
                 }
 
-                // LP vault gets fee_share_bps portion of the delta
-                let lp_portion =
-                    fee_delta.saturating_mul(vault_state.fee_share_bps as u128) / 10_000;
+                // PERC-304: Compute utilization-based fee multiplier
+                let fee_mult_bps: u64 = if vault_state.lp_util_curve_enabled != 0
+                    && config.oi_cap_multiplier_bps > 0
+                {
+                    // Compute max OI from engine vault balance and config multiplier
+                    let vault_balance = engine.vault.get();
+                    let max_oi =
+                        vault_balance.saturating_mul(config.oi_cap_multiplier_bps as u128) / 10_000;
+                    let current_oi = engine.total_open_interest.get();
+
+                    // Utilization = current_oi / max_oi (in bps)
+                    let util_bps = crate::verify::compute_util_bps(current_oi, max_oi);
+                    let mult = crate::verify::compute_fee_multiplier_bps(util_bps);
+
+                    // Store the computed multiplier for off-chain readers
+                    vault_state.current_fee_mult_bps = mult as u32;
+                    mult
+                } else {
+                    // Curve disabled or no OI cap — 1.0× multiplier
+                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
+                    crate::verify::FEE_MULT_BASE_BPS
+                };
+
+                // LP vault gets fee_share_bps portion of the delta, scaled by multiplier.
+                // lp_portion = fee_delta * fee_share_bps / 10_000 * fee_mult_bps / 10_000
+                // Rewritten to minimise rounding loss:
+                //   lp_portion = fee_delta * fee_share_bps * fee_mult_bps / (10_000 * 10_000)
+                let lp_portion = fee_delta
+                    .saturating_mul(vault_state.fee_share_bps as u128)
+                    .saturating_mul(fee_mult_bps as u128)
+                    / (10_000u128 * 10_000u128);
 
                 if lp_portion > 0 {
                     // Move lp_portion from insurance fund balance to LP vault capital.
@@ -9217,8 +9352,9 @@ pub mod processor {
                 crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
 
                 msg!(
-                    "LP vault fee crank: delta={} lp_portion={} new_capital={} slot={}",
+                    "LP vault fee crank: delta={} mult={}bps lp_portion={} capital={} slot={}",
                     fee_delta,
+                    fee_mult_bps,
                     lp_portion,
                     vault_state.total_capital,
                     clock.slot
