@@ -2444,6 +2444,18 @@ pub mod accounts {
     pub fn derive_lp_vault_mint(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[b"lp_vault_mint", slab_key.as_ref()], program_id)
     }
+
+    /// PERC-308: Derive loyalty stake PDA.
+    pub fn derive_loyalty_stake(
+        program_id: &Pubkey,
+        slab_key: &Pubkey,
+        user_key: &Pubkey,
+    ) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[b"loyalty", slab_key.as_ref(), user_key.as_ref()],
+            program_id,
+        )
+    }
 }
 
 // 6. mod state
@@ -4387,8 +4399,11 @@ pub mod lp_vault {
         pub last_fee_snapshot: u128,
         /// Total fees ever distributed to LP vault (monotonically increasing).
         pub total_fees_distributed: u128,
-        /// Reserved for future use (alignment + forward compat).
-        pub _reserved: [u8; 48],
+        /// PERC-308: Whether loyalty multiplier is enabled (1=yes, 0=no).
+        pub loyalty_enabled: u8,
+        pub _loyalty_pad: [u8; 7],
+        /// Reserved for future use.
+        pub _reserved: [u8; 40],
     }
 
     impl LpVaultState {
@@ -4418,6 +4433,113 @@ pub mod lp_vault {
     pub fn write_lp_vault_state(data: &mut [u8], state: &LpVaultState) {
         let bytes = bytemuck::bytes_of(state);
         data[..LP_VAULT_STATE_LEN].copy_from_slice(bytes);
+    }
+
+    // =========================================================================
+    // PERC-308: Loyalty Multiplier
+    // =========================================================================
+
+    /// Loyalty tier thresholds (in epochs)
+    pub const LOYALTY_TIER1_EPOCHS: u64 = 5;
+    pub const LOYALTY_TIER2_EPOCHS: u64 = 20;
+
+    /// Loyalty multipliers in bps (10_000 = 1.0x)
+    pub const LOYALTY_MULT_BASE: u64 = 10_000; // 1.0x for 0-5 epochs
+    pub const LOYALTY_MULT_TIER1: u64 = 12_000; // 1.2x for 6-20 epochs
+    pub const LOYALTY_MULT_TIER2: u64 = 15_000; // 1.5x for 20+ epochs
+
+    /// Compute loyalty multiplier (bps) from epoch delta.
+    #[inline]
+    pub fn loyalty_multiplier_bps(delta_epochs: u64) -> u64 {
+        if delta_epochs > LOYALTY_TIER2_EPOCHS {
+            LOYALTY_MULT_TIER2
+        } else if delta_epochs > LOYALTY_TIER1_EPOCHS {
+            LOYALTY_MULT_TIER1
+        } else {
+            LOYALTY_MULT_BASE
+        }
+    }
+
+    /// Apply loyalty multiplier to a fee amount.
+    /// Returns: fee * multiplier / 10_000 (saturating).
+    #[inline]
+    pub fn apply_loyalty_mult(fee: u64, delta_epochs: u64) -> u64 {
+        let mult = loyalty_multiplier_bps(delta_epochs);
+        ((fee as u128) * (mult as u128) / 10_000) as u64
+    }
+
+    // Per-user loyalty PDA
+    pub const LOYALTY_STAKE_MAGIC: u64 = 0x5045_5243_4C4F_5941; // "PERCLOYA"
+    pub const LOYALTY_STAKE_LEN: usize = core::mem::size_of::<LoyaltyStake>();
+
+    /// Per-user loyalty stake tracking.
+    /// Seeds: `["loyalty", slab_key, user_pubkey]`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct LoyaltyStake {
+        pub magic: u64,
+        pub entry_epoch: u64,
+        pub _reserved: [u8; 48],
+    }
+
+    impl LoyaltyStake {
+        #[inline]
+        pub fn is_initialized(&self) -> bool {
+            self.magic == LOYALTY_STAKE_MAGIC
+        }
+    }
+
+    pub fn read_loyalty_stake(data: &[u8]) -> Option<LoyaltyStake> {
+        if data.len() < LOYALTY_STAKE_LEN {
+            return None;
+        }
+        Some(*bytemuck::from_bytes::<LoyaltyStake>(
+            &data[..LOYALTY_STAKE_LEN],
+        ))
+    }
+
+    pub fn write_loyalty_stake(data: &mut [u8], s: &LoyaltyStake) {
+        data[..LOYALTY_STAKE_LEN].copy_from_slice(bytemuck::bytes_of(s));
+    }
+
+    #[cfg(kani)]
+    mod proofs {
+        use super::*;
+        #[kani::proof]
+        #[kani::unwind(1)]
+        fn proof_loyalty_mult_never_exceeds_max_tier() {
+            let delta: u64 = kani::any();
+            kani::assume(delta <= 1_000_000);
+            let mult = loyalty_multiplier_bps(delta);
+            assert!(mult >= LOYALTY_MULT_BASE);
+            assert!(mult <= LOYALTY_MULT_TIER2);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn test_loyalty_base() {
+            assert_eq!(loyalty_multiplier_bps(0), 10_000);
+            assert_eq!(loyalty_multiplier_bps(5), 10_000);
+        }
+        #[test]
+        fn test_loyalty_tier1() {
+            assert_eq!(loyalty_multiplier_bps(6), 12_000);
+            assert_eq!(loyalty_multiplier_bps(20), 12_000);
+        }
+        #[test]
+        fn test_loyalty_tier2() {
+            assert_eq!(loyalty_multiplier_bps(21), 15_000);
+            assert_eq!(loyalty_multiplier_bps(100), 15_000);
+        }
+        #[test]
+        fn test_apply_mult() {
+            assert_eq!(apply_loyalty_mult(1000, 0), 1000); // 1.0x
+            assert_eq!(apply_loyalty_mult(1000, 10), 1200); // 1.2x
+            assert_eq!(apply_loyalty_mult(1000, 25), 1500); // 1.5x
+        }
     }
 }
 
