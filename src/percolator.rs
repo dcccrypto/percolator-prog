@@ -5938,8 +5938,7 @@ pub mod processor {
         {
             let vault_data = a_vault.try_borrow_data()?;
             if vault_data.len() >= 72 {
-                let amount =
-                    u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
+                let amount = u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
                 if amount < crate::constants::MIN_INIT_MARKET_SEED {
                     msg!(
                         "InitMarket: seed deposit {} < minimum {}",
@@ -6020,38 +6019,138 @@ pub mod processor {
             use state::write_config_bytes as wcb;
             type MC = MarketConfig;
 
-            wcb(&mut data, offset_of!(MC, collateral_mint), &a_mint.key.to_bytes());
-            wcb(&mut data, offset_of!(MC, vault_pubkey), &a_vault.key.to_bytes());
+            wcb(
+                &mut data,
+                offset_of!(MC, collateral_mint),
+                &a_mint.key.to_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, vault_pubkey),
+                &a_vault.key.to_bytes(),
+            );
             wcb(&mut data, offset_of!(MC, index_feed_id), &index_feed_id);
-            wcb(&mut data, offset_of!(MC, max_staleness_secs), &max_staleness_secs.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, conf_filter_bps), &conf_filter_bps.to_le_bytes());
+            wcb(
+                &mut data,
+                offset_of!(MC, max_staleness_secs),
+                &max_staleness_secs.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, conf_filter_bps),
+                &conf_filter_bps.to_le_bytes(),
+            );
             wcb(&mut data, offset_of!(MC, vault_authority_bump), &[bump]);
             wcb(&mut data, offset_of!(MC, invert), &[invert]);
-            wcb(&mut data, offset_of!(MC, unit_scale), &unit_scale.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_horizon_slots), &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_k_bps), &DEFAULT_FUNDING_K_BPS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_inv_scale_notional_e6), &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_max_premium_bps), &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_max_bps_per_slot), &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_premium_dampening_e6), &1_000_000u64.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, funding_premium_max_bps_per_slot), &5i64.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_floor), &DEFAULT_THRESH_FLOOR.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_risk_bps), &DEFAULT_THRESH_RISK_BPS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_update_interval_slots), &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_step_bps), &DEFAULT_THRESH_STEP_BPS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_alpha_bps), &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_min), &DEFAULT_THRESH_MIN.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_max), &DEFAULT_THRESH_MAX.to_le_bytes());
-            wcb(&mut data, offset_of!(MC, thresh_min_step), &DEFAULT_THRESH_MIN_STEP.to_le_bytes());
+            wcb(
+                &mut data,
+                offset_of!(MC, unit_scale),
+                &unit_scale.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_horizon_slots),
+                &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_k_bps),
+                &DEFAULT_FUNDING_K_BPS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_inv_scale_notional_e6),
+                &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_max_premium_bps),
+                &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_max_bps_per_slot),
+                &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_premium_dampening_e6),
+                &1_000_000u64.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, funding_premium_max_bps_per_slot),
+                &5i64.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_floor),
+                &DEFAULT_THRESH_FLOOR.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_risk_bps),
+                &DEFAULT_THRESH_RISK_BPS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_update_interval_slots),
+                &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_step_bps),
+                &DEFAULT_THRESH_STEP_BPS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_alpha_bps),
+                &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_min),
+                &DEFAULT_THRESH_MIN.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_max),
+                &DEFAULT_THRESH_MAX.to_le_bytes(),
+            );
+            wcb(
+                &mut data,
+                offset_of!(MC, thresh_min_step),
+                &DEFAULT_THRESH_MIN_STEP.to_le_bytes(),
+            );
             if is_hyperp {
-                wcb(&mut data, offset_of!(MC, authority_price_e6), &initial_mark_price_e6.to_le_bytes());
+                wcb(
+                    &mut data,
+                    offset_of!(MC, authority_price_e6),
+                    &initial_mark_price_e6.to_le_bytes(),
+                );
             }
-            let cap = if is_hyperp { DEFAULT_HYPERP_PRICE_CAP_E2BPS } else { DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS };
-            wcb(&mut data, offset_of!(MC, oracle_price_cap_e2bps), &cap.to_le_bytes());
+            let cap = if is_hyperp {
+                DEFAULT_HYPERP_PRICE_CAP_E2BPS
+            } else {
+                DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
+            };
+            wcb(
+                &mut data,
+                offset_of!(MC, oracle_price_cap_e2bps),
+                &cap.to_le_bytes(),
+            );
             if is_hyperp {
-                wcb(&mut data, offset_of!(MC, last_effective_price_e6), &initial_mark_price_e6.to_le_bytes());
+                wcb(
+                    &mut data,
+                    offset_of!(MC, last_effective_price_e6),
+                    &initial_mark_price_e6.to_le_bytes(),
+                );
             }
-            wcb(&mut data, offset_of!(MC, market_created_slot), &clock.slot.to_le_bytes());
+            wcb(
+                &mut data,
+                offset_of!(MC, market_created_slot),
+                &clock.slot.to_le_bytes(),
+            );
             wcb(&mut data, offset_of!(MC, safety_valve_epochs), &[5u8]);
         }
 
