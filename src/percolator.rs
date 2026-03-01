@@ -2105,6 +2105,11 @@ pub mod ix {
         ClaimQueuedWithdrawal,
         /// PERC-309: Cancel queued withdrawal.
         CancelQueuedWithdrawal,
+        /// PERC-305: Auto-deleverage — surgically close/reduce the most profitable
+        /// position when pnl_pos_tot exceeds max_pnl_cap. Permissionless.
+        ExecuteAdl {
+            target_idx: u16,
+        },
     }
 
     impl Instruction {
@@ -2525,12 +2530,16 @@ pub mod ix {
                 }
                 TAG_CLAIM_QUEUED_WITHDRAWAL => Ok(Instruction::ClaimQueuedWithdrawal),
                 TAG_CANCEL_QUEUED_WITHDRAWAL => Ok(Instruction::CancelQueuedWithdrawal),
+                TAG_EXECUTE_ADL => {
+                    let target_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::ExecuteAdl { target_idx })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
     }
 
-    fn read_u8(input: &mut &[u8]) -> Result<u8, ProgramError> {
+    pub(crate) fn read_u8(input: &mut &[u8]) -> Result<u8, ProgramError> {
         let (&val, rest) = input
             .split_first()
             .ok_or(ProgramError::InvalidInstructionData)?;
@@ -2538,7 +2547,7 @@ pub mod ix {
         Ok(val)
     }
 
-    fn read_u16(input: &mut &[u8]) -> Result<u16, ProgramError> {
+    pub(crate) fn read_u16(input: &mut &[u8]) -> Result<u16, ProgramError> {
         if input.len() < 2 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -2547,7 +2556,7 @@ pub mod ix {
         Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn read_u32(input: &mut &[u8]) -> Result<u32, ProgramError> {
+    pub(crate) fn read_u32(input: &mut &[u8]) -> Result<u32, ProgramError> {
         if input.len() < 4 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -2556,7 +2565,7 @@ pub mod ix {
         Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn read_u64(input: &mut &[u8]) -> Result<u64, ProgramError> {
+    pub(crate) fn read_u64(input: &mut &[u8]) -> Result<u64, ProgramError> {
         if input.len() < 8 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -2592,7 +2601,7 @@ pub mod ix {
         Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn read_pubkey(input: &mut &[u8]) -> Result<Pubkey, ProgramError> {
+    pub(crate) fn read_pubkey(input: &mut &[u8]) -> Result<Pubkey, ProgramError> {
         if input.len() < 32 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -2601,7 +2610,7 @@ pub mod ix {
         Ok(Pubkey::new_from_array(bytes.try_into().unwrap()))
     }
 
-    fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
+    pub(crate) fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
         if input.len() < 32 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -2610,7 +2619,7 @@ pub mod ix {
         Ok(bytes.try_into().unwrap())
     }
 
-    fn read_risk_params(input: &mut &[u8]) -> Result<RiskParams, ProgramError> {
+    pub(crate) fn read_risk_params(input: &mut &[u8]) -> Result<RiskParams, ProgramError> {
         Ok(RiskParams {
             warmup_period_slots: read_u64(input)?,
             maintenance_margin_bps: read_u64(input)?,
@@ -3088,6 +3097,15 @@ pub mod state {
         let src = bytemuck::bytes_of(c);
         let dst = &mut data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
         dst.copy_from_slice(src);
+    }
+
+    /// Write a single field into the config region of the slab data buffer.
+    /// `field_offset` is the byte offset of the field within MarketConfig (use `offset_of!`).
+    /// Data must already be zeroed for fields you don't write.
+    #[inline(always)]
+    pub fn write_config_bytes(data: &mut [u8], field_offset: usize, bytes: &[u8]) {
+        let start = HEADER_LEN + field_offset;
+        data[start..start + bytes.len()].copy_from_slice(bytes);
     }
 }
 
@@ -5326,7 +5344,7 @@ pub mod processor {
             MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN, VERSION,
         },
         error::{map_risk_error, PercolatorError},
-        ix::Instruction,
+        ix::{self, Instruction},
         oracle,
         state::{self, MarketConfig, SlabHeader},
         verify::compute_ramp_multiplier,
@@ -5857,255 +5875,221 @@ pub mod processor {
         Ok(())
     }
 
+    /// InitMarket handler — extracted into its own `#[inline(never)]` function so
+    /// its large locals (RiskParams, Pubkeys, feed_id) live on a *separate* stack
+    /// frame from the main dispatch match.  This is the definitive fix for the SBF
+    /// 4 KB stack overflow on small-tier builds: the main `process_instruction`
+    /// no longer constructs the `Instruction::InitMarket` variant at all.
+    #[inline(never)]
+    fn process_init_market<'a, 'b>(
+        program_id: &Pubkey,
+        accounts: &'b [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        // Parse fields directly from raw bytes — skip tag byte (already checked)
+        let mut rest = &instruction_data[1..];
+        let admin = ix::read_pubkey(&mut rest)?;
+        let collateral_mint = ix::read_pubkey(&mut rest)?;
+        let index_feed_id = ix::read_bytes32(&mut rest)?;
+        let max_staleness_secs = ix::read_u64(&mut rest)?;
+        let conf_filter_bps = ix::read_u16(&mut rest)?;
+        let invert = ix::read_u8(&mut rest)?;
+        let unit_scale = ix::read_u32(&mut rest)?;
+        let initial_mark_price_e6 = ix::read_u64(&mut rest)?;
+        let risk_params = ix::read_risk_params(&mut rest)?;
+
+        // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
+        // (feed_id is now passed in instruction data, not as account)
+        accounts::expect_len(accounts, 9)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_mint = &accounts[2];
+        let a_vault = &accounts[3];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        // Ensure instruction data matches the signer
+        if admin != *a_admin.key {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // SECURITY (H1): Enforce collateral_mint matches the account
+        if collateral_mint != *a_mint.key {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // SECURITY (H2): Validate mint is a real SPL Token mint
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token::state::Mint;
+            if *a_mint.owner != spl_token::ID {
+                return Err(ProgramError::IllegalOwner);
+            }
+            if a_mint.data_len() != Mint::LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let mint_data = a_mint.try_borrow_data()?;
+            let _ = Mint::unpack(&mint_data)?;
+        }
+
+        // SECURITY (#299): Enforce minimum seed deposit to prevent market spam.
+        {
+            let vault_data = a_vault.try_borrow_data()?;
+            if vault_data.len() >= 72 {
+                let amount =
+                    u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
+                if amount < crate::constants::MIN_INIT_MARKET_SEED {
+                    msg!(
+                        "InitMarket: seed deposit {} < minimum {}",
+                        amount,
+                        crate::constants::MIN_INIT_MARKET_SEED
+                    );
+                    return Err(PercolatorError::InsufficientSeed.into());
+                }
+            }
+        }
+
+        // Validate unit_scale
+        if !crate::verify::init_market_scale_ok(unit_scale) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Hyperp mode validation
+        let is_hyperp = index_feed_id == [0u8; 32];
+        if is_hyperp && initial_mark_price_e6 == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let initial_mark_price_e6 = if is_hyperp && invert != 0 {
+            crate::verify::invert_price_e6(initial_mark_price_e6, invert)
+                .ok_or(PercolatorError::OracleInvalid)?
+        } else {
+            initial_mark_price_e6
+        };
+
+        #[cfg(debug_assertions)]
+        {
+            if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+
+        let _ = zc::engine_mut(&mut data)?;
+
+        let header = state::read_header(&data);
+        if header.magic == MAGIC {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+
+        let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
+
+        #[cfg(not(feature = "test"))]
+        {
+            let vault_data = a_vault.try_borrow_data()?;
+            let vault_tok = spl_token::state::Account::unpack(&vault_data)?;
+            if vault_tok.amount < crate::constants::MIN_INIT_MARKET_SEED_LAMPORTS {
+                return Err(PercolatorError::InsufficientSeed.into());
+            }
+        }
+
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+
+        // Initialize engine in-place (zero-copy)
+        let engine = zc::engine_mut(&mut data)?;
+        engine
+            .init_in_place(risk_params)
+            .map_err(crate::error::map_risk_error)?;
+
+        let a_clock = &accounts[5];
+        let clock = Clock::from_account_info(a_clock)?;
+        engine.current_slot = clock.slot;
+        engine.last_funding_slot = clock.slot;
+        engine.last_crank_slot = clock.slot;
+
+        // Write config fields directly into zeroed slab buffer
+        {
+            use core::mem::offset_of;
+            use state::write_config_bytes as wcb;
+            type MC = MarketConfig;
+
+            wcb(&mut data, offset_of!(MC, collateral_mint), &a_mint.key.to_bytes());
+            wcb(&mut data, offset_of!(MC, vault_pubkey), &a_vault.key.to_bytes());
+            wcb(&mut data, offset_of!(MC, index_feed_id), &index_feed_id);
+            wcb(&mut data, offset_of!(MC, max_staleness_secs), &max_staleness_secs.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, conf_filter_bps), &conf_filter_bps.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, vault_authority_bump), &[bump]);
+            wcb(&mut data, offset_of!(MC, invert), &[invert]);
+            wcb(&mut data, offset_of!(MC, unit_scale), &unit_scale.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_horizon_slots), &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_k_bps), &DEFAULT_FUNDING_K_BPS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_inv_scale_notional_e6), &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_max_premium_bps), &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_max_bps_per_slot), &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_premium_dampening_e6), &1_000_000u64.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, funding_premium_max_bps_per_slot), &5i64.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_floor), &DEFAULT_THRESH_FLOOR.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_risk_bps), &DEFAULT_THRESH_RISK_BPS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_update_interval_slots), &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_step_bps), &DEFAULT_THRESH_STEP_BPS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_alpha_bps), &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_min), &DEFAULT_THRESH_MIN.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_max), &DEFAULT_THRESH_MAX.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, thresh_min_step), &DEFAULT_THRESH_MIN_STEP.to_le_bytes());
+            if is_hyperp {
+                wcb(&mut data, offset_of!(MC, authority_price_e6), &initial_mark_price_e6.to_le_bytes());
+            }
+            let cap = if is_hyperp { DEFAULT_HYPERP_PRICE_CAP_E2BPS } else { DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS };
+            wcb(&mut data, offset_of!(MC, oracle_price_cap_e2bps), &cap.to_le_bytes());
+            if is_hyperp {
+                wcb(&mut data, offset_of!(MC, last_effective_price_e6), &initial_mark_price_e6.to_le_bytes());
+            }
+            wcb(&mut data, offset_of!(MC, market_created_slot), &clock.slot.to_le_bytes());
+            wcb(&mut data, offset_of!(MC, safety_valve_epochs), &[5u8]);
+        }
+
+        let new_header = SlabHeader {
+            magic: MAGIC,
+            version: VERSION,
+            bump,
+            _padding: [0; 3],
+            admin: a_admin.key.to_bytes(),
+            pending_admin: [0; 32],
+            _reserved: [0; 24],
+        };
+        state::write_header(&mut data, &new_header);
+        state::write_req_nonce(&mut data, 0);
+        state::write_last_thr_update_slot(&mut data, 0);
+        Ok(())
+    }
+
     pub fn process_instruction<'a, 'b>(
         program_id: &Pubkey,
         accounts: &'b [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
+        // Early-dispatch InitMarket to a separate stack frame to avoid SBF
+        // 4 KB stack overflow.  The InitMarket variant of Instruction contains
+        // RiskParams (~300 bytes) + 3 Pubkeys + feed_id — constructing it on
+        // the same frame as the 48-arm match exhausts the stack on small tier.
+        if instruction_data.first() == Some(&crate::tags::TAG_INIT_MARKET) {
+            return process_init_market(program_id, accounts, instruction_data);
+        }
+
         let instruction = Instruction::decode(instruction_data)?;
 
         match instruction {
-            Instruction::InitMarket {
-                admin,
-                collateral_mint,
-                index_feed_id,
-                max_staleness_secs,
-                conf_filter_bps,
-                invert,
-                unit_scale,
-                initial_mark_price_e6,
-                risk_params,
-            } => {
-                // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
-                // (feed_id is now passed in instruction data, not as account)
-                accounts::expect_len(accounts, 9)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_mint = &accounts[2];
-                let a_vault = &accounts[3];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                // Ensure instruction data matches the signer
-                if admin != *a_admin.key {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // SECURITY (H1): Enforce collateral_mint matches the account
-                // This prevents signers from being confused by mismatched instruction data
-                if collateral_mint != *a_mint.key {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // SECURITY (H2): Validate mint is a real SPL Token mint
-                // Check owner == spl_token::ID and data length == Mint::LEN (82 bytes)
-                #[cfg(not(feature = "test"))]
-                {
-                    use solana_program::program_pack::Pack;
-                    use spl_token::state::Mint;
-                    if *a_mint.owner != spl_token::ID {
-                        return Err(ProgramError::IllegalOwner);
-                    }
-                    if a_mint.data_len() != Mint::LEN {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    // Verify mint is initialized by unpacking
-                    let mint_data = a_mint.try_borrow_data()?;
-                    let _ = Mint::unpack(&mint_data)?;
-                }
-
-                // SECURITY (#299): Enforce minimum seed deposit to prevent market spam.
-                // Check vault token account balance >= MIN_INIT_MARKET_SEED.
-                // The admin must fund the vault BEFORE calling InitMarket.
-                {
-                    let vault_data = a_vault.try_borrow_data()?;
-                    // SPL Token Account: amount is at offset 64..72 (u64 LE)
-                    if vault_data.len() >= 72 {
-                        let amount =
-                            u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
-                        if amount < crate::constants::MIN_INIT_MARKET_SEED {
-                            msg!(
-                                "InitMarket: seed deposit {} < minimum {}",
-                                amount,
-                                crate::constants::MIN_INIT_MARKET_SEED
-                            );
-                            return Err(PercolatorError::InsufficientSeed.into());
-                        }
-                    }
-                }
-
-                // Validate unit_scale: reject huge values that make most deposits credit 0 units
-                if !crate::verify::init_market_scale_ok(unit_scale) {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // Hyperp mode validation: if index_feed_id is all zeros, require initial_mark_price_e6
-                let is_hyperp = index_feed_id == [0u8; 32];
-                if is_hyperp && initial_mark_price_e6 == 0 {
-                    // Hyperp mode requires a non-zero initial mark price
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // For Hyperp mode with inverted markets, apply inversion to initial price
-                // This ensures the stored mark/index are in "market price" form
-                let initial_mark_price_e6 = if is_hyperp && invert != 0 {
-                    crate::verify::invert_price_e6(initial_mark_price_e6, invert)
-                        .ok_or(PercolatorError::OracleInvalid)?
-                } else {
-                    initial_mark_price_e6
-                };
-
-                #[cfg(debug_assertions)]
-                {
-                    if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                }
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-
-                let _ = zc::engine_mut(&mut data)?;
-
-                let header = state::read_header(&data);
-                if header.magic == MAGIC {
-                    return Err(PercolatorError::AlreadyInitialized.into());
-                }
-
-                let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
-
-                // SECURITY (#299): Enforce minimum seed deposit in vault.
-                // Prevents market spam when InitMarket is permissionless.
-                // The vault must be pre-funded before calling InitMarket.
-                #[cfg(not(feature = "test"))]
-                {
-                    let vault_data = a_vault.try_borrow_data()?;
-                    let vault_tok = spl_token::state::Account::unpack(&vault_data)?;
-                    if vault_tok.amount < crate::constants::MIN_INIT_MARKET_SEED_LAMPORTS {
-                        return Err(PercolatorError::InsufficientSeed.into());
-                    }
-                }
-
-                for b in data.iter_mut() {
-                    *b = 0;
-                }
-
-                // Initialize engine in-place (zero-copy) to avoid stack overflow.
-                // The data is already zeroed above, so init_in_place only sets non-zero fields.
-                let engine = zc::engine_mut(&mut data)?;
-                engine
-                    .init_in_place(risk_params)
-                    .map_err(crate::error::map_risk_error)?;
-
-                // Initialize slot fields to current slot to prevent overflow on first crank
-                // (accrue_funding checks dt < 31_536_000, which fails if last_funding_slot=0)
-                let a_clock = &accounts[5];
-                let clock = Clock::from_account_info(a_clock)?;
-                engine.current_slot = clock.slot;
-                engine.last_funding_slot = clock.slot;
-                engine.last_crank_slot = clock.slot;
-
-                let config = MarketConfig {
-                    collateral_mint: a_mint.key.to_bytes(),
-                    vault_pubkey: a_vault.key.to_bytes(),
-                    index_feed_id,
-                    max_staleness_secs,
-                    conf_filter_bps,
-                    vault_authority_bump: bump,
-                    invert,
-                    unit_scale,
-                    // Funding parameters (defaults)
-                    funding_horizon_slots: DEFAULT_FUNDING_HORIZON_SLOTS,
-                    funding_k_bps: DEFAULT_FUNDING_K_BPS,
-                    funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-                    funding_max_premium_bps: DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-                    funding_max_bps_per_slot: DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
-                    // PERC-121: Premium funding defaults (pure inventory-based)
-                    funding_premium_weight_bps: 0,
-                    funding_settlement_interval_slots: 0,
-                    funding_premium_dampening_e6: 1_000_000,
-                    funding_premium_max_bps_per_slot: 5,
-                    // Threshold parameters (defaults)
-                    thresh_floor: DEFAULT_THRESH_FLOOR,
-                    thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
-                    thresh_update_interval_slots: DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-                    thresh_step_bps: DEFAULT_THRESH_STEP_BPS,
-                    thresh_alpha_bps: DEFAULT_THRESH_ALPHA_BPS,
-                    thresh_min: DEFAULT_THRESH_MIN,
-                    thresh_max: DEFAULT_THRESH_MAX,
-                    thresh_min_step: DEFAULT_THRESH_MIN_STEP,
-                    // Oracle authority (disabled by default - use Pyth/Chainlink)
-                    // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
-                    oracle_authority: [0u8; 32],
-                    authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
-                    // Oracle price circuit breaker
-                    // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
-                    // Non-Hyperp: 5% per slot cap protects against flash-loan manipulation on DEX oracles
-                    // (also harmless for Pyth/Chainlink which already have staleness/confidence checks)
-                    oracle_price_cap_e2bps: if is_hyperp {
-                        DEFAULT_HYPERP_PRICE_CAP_E2BPS
-                    } else {
-                        DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
-                    },
-                    last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    // PERC-273: OI cap disabled by default
-                    oi_cap_multiplier_bps: 0,
-                    max_pnl_cap: 0,
-                    // PERC-302: Market maturity OI ramp
-                    market_created_slot: clock.slot,
-                    oi_ramp_slots: 0, // 0 = full cap immediately (backwards compat)
-                    // PERC-300: Adaptive funding disabled by default
-                    adaptive_funding_enabled: 0,
-                    _adaptive_pad: 0,
-                    adaptive_scale_bps: 0,
-                    _adaptive_pad2: 0,
-                    adaptive_max_funding_bps: 0,
-                    // PERC-306: Insurance isolation (disabled by default)
-                    insurance_isolation_bps: 0,
-                    _insurance_isolation_padding: [0u8; 14],
-                    // PERC-312: Safety valve disabled by default
-                    safety_valve_duration: 0,
-                    emergency_close_rebate_bps: 0,
-                    safety_valve_epochs: 5,
-                    safety_valve_enabled: 0,
-                    _safety_valve_pad: [0; 4],
-                    consecutive_max_funding_epochs: 0,
-                    rebalancing_active: 0,
-                    _rebalancing_pad: [0; 6],
-                    rebalancing_start_slot: 0,
-                    // PERC-307: Orphan penalty disabled by default
-                    orphan_threshold_slots: 0,
-                    orphan_penalty_bps_per_slot: 0,
-                    _orphan_pad: [0; 6],
-                    // PERC-314: Dispute disabled by default
-                    dispute_window_slots: 0,
-                    dispute_bond_amount: 0,
-                    resolved_slot: 0,
-                    settlement_price_e6: 0,
-                    // PERC-315: LP collateral disabled by default
-                    lp_collateral_enabled: 0,
-                    _lp_col_pad: [0; 7],
-                    lp_collateral_ltv_bps: 0,
-                };
-                state::write_config(&mut data, &config);
-
-                let new_header = SlabHeader {
-                    magic: MAGIC,
-                    version: VERSION,
-                    bump,
-                    _padding: [0; 3],
-                    admin: a_admin.key.to_bytes(),
-                    pending_admin: [0; 32],
-                    _reserved: [0; 24],
-                };
-                state::write_header(&mut data, &new_header);
-                // Step 4: Explicitly initialize nonce to 0 for determinism
-                state::write_req_nonce(&mut data, 0);
-                // Initialize threshold update slot to 0
-                state::write_last_thr_update_slot(&mut data, 0);
+            Instruction::InitMarket { .. } => {
+                // Unreachable — handled by early dispatch above.
+                // Kept so the match remains exhaustive.
+                unreachable!()
             }
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 5)?;
@@ -10373,6 +10357,97 @@ pub mod processor {
                 **queue_lamports = 0;
 
                 msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
+            }
+
+            Instruction::ExecuteAdl { target_idx } => {
+                // PERC-305: Auto-deleverage — permissionless instruction to surgically
+                // close/reduce the most profitable position when pnl_pos_tot > max_pnl_cap.
+                //
+                // Accounts:
+                //   0. [signer]   Caller (permissionless — incentive is unblocking
+                //                 the market for normal trading)
+                //   1. [writable] Slab account
+                //   2. []         Clock sysvar
+                //   3. []         Oracle account (Pyth/Chainlink/authority — same as liquidation)
+                accounts::expect_len(accounts, 4)?;
+                let a_slab = &accounts[1];
+                let a_oracle = &accounts[3];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut config = state::read_config(&data);
+
+                // ADL requires max_pnl_cap to be set
+                if config.max_pnl_cap == 0 {
+                    msg!("ADL: max_pnl_cap not configured");
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                let clock = Clock::from_account_info(&accounts[2])?;
+
+                // Read oracle price (same logic as liquidation)
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let idx = config.last_effective_price_e6;
+                    if idx == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    idx
+                } else {
+                    oracle::read_price_clamped(
+                        &mut config,
+                        a_oracle,
+                        clock.unix_timestamp,
+                        &accounts[4..],
+                    )?
+                };
+                state::write_config(&mut data, &config);
+
+                let engine = zc::engine_mut(&mut data)?;
+                check_idx(engine, target_idx)?;
+
+                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let cap = config.max_pnl_cap as u128;
+
+                // Precondition: PnL cap must be exceeded
+                if pnl_pos_tot <= cap {
+                    msg!(
+                        "ADL: pnl_pos_tot {} <= cap {}, not needed",
+                        pnl_pos_tot,
+                        cap
+                    );
+                    return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                }
+
+                let excess = pnl_pos_tot.saturating_sub(cap);
+
+                // Delegate to core engine's execute_adl — handles settlement,
+                // PnL checks, full/partial close, and OI updates.
+                let closed_abs = engine
+                    .execute_adl(target_idx, clock.slot, price, excess)
+                    .map_err(map_risk_error)?;
+
+                // Settle any realized PnL to capital after ADL
+                let final_pnl = engine.accounts[target_idx as usize].pnl.get();
+                if final_pnl > 0 {
+                    let settle = final_pnl as u128;
+                    let old_cap = engine.accounts[target_idx as usize].capital.get();
+                    engine.accounts[target_idx as usize].capital =
+                        percolator::U128::new(old_cap.saturating_add(settle));
+                    engine.set_pnl(target_idx as usize, 0);
+                    engine.c_tot = engine.c_tot.saturating_add(settle);
+                }
+
+                msg!(
+                    "ADL: idx={} closed={} excess={} pnl_pos_tot_after={}",
+                    target_idx,
+                    closed_abs,
+                    excess,
+                    engine.pnl_pos_tot.get()
+                );
             }
         }
         Ok(())
