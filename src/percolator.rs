@@ -47,7 +47,7 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
-    const _: [(); 480] = [(); CONFIG_LEN];
+    const _: [(); 496] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -1679,6 +1679,10 @@ pub mod error {
         MarketNotResolved,
         /// PERC-314: No active dispute to resolve.
         NoActiveDispute,
+        /// PERC-315: LP collateral not enabled for this market.
+        LpCollateralDisabled,
+        /// PERC-315: Position still open — cannot withdraw LP collateral.
+        LpCollateralPositionOpen,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2004,6 +2008,16 @@ pub mod ix {
         /// PERC-314: Resolve dispute (admin).
         ResolveDispute {
             accept: u8,
+        },
+        /// PERC-315: Deposit LP vault tokens as perp collateral.
+        DepositLpCollateral {
+            user_idx: u16,
+            lp_amount: u64,
+        },
+        /// PERC-315: Withdraw LP collateral (position must be closed).
+        WithdrawLpCollateral {
+            user_idx: u16,
+            lp_amount: u64,
         },
     }
 
@@ -2367,6 +2381,22 @@ pub mod ix {
                 TAG_RESOLVE_DISPUTE => {
                     let accept = read_u8(&mut rest)?;
                     Ok(Instruction::ResolveDispute { accept })
+                }
+                TAG_DEPOSIT_LP_COLLATERAL => {
+                    let user_idx = read_u16(&mut rest)?;
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::DepositLpCollateral {
+                        user_idx,
+                        lp_amount,
+                    })
+                }
+                TAG_WITHDRAW_LP_COLLATERAL => {
+                    let user_idx = read_u16(&mut rest)?;
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::WithdrawLpCollateral {
+                        user_idx,
+                        lp_amount,
+                    })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -2760,6 +2790,15 @@ pub mod state {
         pub resolved_slot: u64,
         /// Settlement price at resolution (copied from authority_price_e6).
         pub settlement_price_e6: u64,
+
+        // ========================================
+        // LP Token Collateral (PERC-315)
+        // ========================================
+        /// 1 = LP vault tokens accepted as perp collateral, 0 = disabled.
+        pub lp_collateral_enabled: u8,
+        pub _lp_col_pad: [u8; 7],
+        /// Loan-to-value ratio in basis points for LP tokens (e.g., 8000 = 80%).
+        pub lp_collateral_ltv_bps: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4722,7 +4761,121 @@ pub mod lp_vault {
     }
 }
 
-// 8b. Settlement Dispute (PERC-314)
+// 8b. LP Collateral Pricing (PERC-315)
+pub mod lp_collateral {
+    /// Compute LP token value in collateral units.
+    /// lp_value = (lp_amount * vault_tvl / total_supply) * ltv_bps / 10_000
+    pub fn lp_token_value(
+        lp_amount: u64,
+        vault_tvl: u128,
+        total_supply: u64,
+        ltv_bps: u64,
+    ) -> u128 {
+        if total_supply == 0 || vault_tvl == 0 || lp_amount == 0 {
+            return 0;
+        }
+        let raw_value = (lp_amount as u128) * vault_tvl / (total_supply as u128);
+        raw_value * (ltv_bps as u128) / 10_000
+    }
+
+    /// Check if vault TVL has dropped more than threshold since position open.
+    pub fn tvl_drawdown_exceeded(old_tvl: u64, new_tvl: u128, threshold_bps: u64) -> bool {
+        if old_tvl == 0 {
+            return false;
+        }
+        let old = old_tvl as u128;
+        if new_tvl >= old {
+            return false;
+        }
+        let drawdown_bps = (old - new_tvl) * 10_000 / old;
+        drawdown_bps > threshold_bps as u128
+    }
+
+    #[cfg(kani)]
+    mod proofs {
+        use super::*;
+
+        #[kani::proof]
+        #[kani::unwind(1)]
+        fn proof_lp_collateral_value_never_exceeds_raw_share() {
+            let lp_amount: u64 = kani::any();
+            let vault_tvl: u128 = kani::any();
+            let total_supply: u64 = kani::any();
+            let ltv_bps: u64 = kani::any();
+
+            kani::assume(lp_amount > 0 && lp_amount <= 1_000_000_000_000);
+            kani::assume(vault_tvl > 0 && vault_tvl <= 1_000_000_000_000_000);
+            kani::assume(total_supply > 0 && total_supply <= 1_000_000_000_000);
+            kani::assume(ltv_bps > 0 && ltv_bps <= 10_000);
+
+            let value = lp_token_value(lp_amount, vault_tvl, total_supply, ltv_bps);
+            let raw = (lp_amount as u128) * vault_tvl / (total_supply as u128);
+            assert!(value <= raw, "value {} > raw {}", value, raw);
+        }
+
+        #[kani::proof]
+        #[kani::unwind(1)]
+        fn proof_drawdown_monotone() {
+            let old_tvl: u64 = kani::any();
+            let new_tvl_high: u128 = kani::any();
+            let new_tvl_low: u128 = kani::any();
+            let threshold: u64 = kani::any();
+
+            kani::assume(old_tvl > 0 && old_tvl <= 1_000_000_000_000);
+            kani::assume(new_tvl_high <= old_tvl as u128);
+            kani::assume(new_tvl_low <= new_tvl_high);
+            kani::assume(threshold > 0 && threshold <= 10_000);
+
+            let triggered_high = tvl_drawdown_exceeded(old_tvl, new_tvl_high, threshold);
+            let triggered_low = tvl_drawdown_exceeded(old_tvl, new_tvl_low, threshold);
+
+            if triggered_high {
+                assert!(triggered_low);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_lp_token_value_basic() {
+            let v = lp_token_value(100, 1000, 200, 5000);
+            assert_eq!(v, 250);
+        }
+
+        #[test]
+        fn test_lp_token_value_zero_supply() {
+            assert_eq!(lp_token_value(100, 1000, 0, 5000), 0);
+        }
+
+        #[test]
+        fn test_lp_token_value_100_ltv() {
+            let v = lp_token_value(100, 1000, 200, 10_000);
+            assert_eq!(v, 500);
+        }
+
+        #[test]
+        fn test_drawdown_20pct() {
+            assert!(!tvl_drawdown_exceeded(1000, 800, 2000));
+            assert!(tvl_drawdown_exceeded(1000, 799, 2000));
+        }
+
+        #[test]
+        fn test_drawdown_no_drop() {
+            assert!(!tvl_drawdown_exceeded(1000, 1000, 2000));
+            assert!(!tvl_drawdown_exceeded(1000, 1100, 2000));
+        }
+
+        #[test]
+        fn test_drawdown_zero_old() {
+            assert!(!tvl_drawdown_exceeded(0, 0, 2000));
+        }
+    }
+}
+
+// 8c. Settlement Dispute (PERC-314)
 pub mod dispute {
     use bytemuck::{Pod, Zeroable};
 
@@ -5512,6 +5665,10 @@ pub mod processor {
                     dispute_bond_amount: 0,
                     resolved_slot: 0,
                     settlement_price_e6: 0,
+                    // PERC-315: LP collateral disabled by default
+                    lp_collateral_enabled: 0,
+                    _lp_col_pad: [0; 7],
+                    lp_collateral_ltv_bps: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -9205,6 +9362,197 @@ pub mod processor {
                 }
 
                 crate::dispute::write_dispute(&mut d_data, &dispute);
+            }
+
+            // =============================================================
+            // PERC-315: LP Token Collateral
+            // =============================================================
+            Instruction::DepositLpCollateral {
+                user_idx,
+                lp_amount,
+            } => {
+                accounts::expect_len(accounts, 7)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_user_lp_ata = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_lp_vault_state = &accounts[4];
+                let a_token = &accounts[5];
+                let a_lp_escrow = &accounts[6];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_user_lp_ata)?;
+                accounts::expect_writable(a_lp_escrow)?;
+                verify_token_program(a_token)?;
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                require_not_paused(&slab_data)?;
+
+                let config = state::read_config(&slab_data);
+                if config.lp_collateral_enabled == 0 {
+                    return Err(PercolatorError::LpCollateralDisabled.into());
+                }
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let vs_data = a_lp_vault_state.try_borrow_data()?;
+                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                let vault_tvl = vault_state.total_capital;
+                drop(vs_data);
+
+                let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+
+                let collateral_units = crate::lp_collateral::lp_token_value(
+                    lp_amount,
+                    vault_tvl,
+                    lp_supply,
+                    config.lp_collateral_ltv_bps,
+                );
+
+                if collateral_units == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                check_idx(engine, user_idx)?;
+
+                let owner = engine.accounts[user_idx as usize].owner;
+                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let clock = Clock::get()?;
+
+                engine
+                    .deposit(user_idx, collateral_units, clock.slot)
+                    .map_err(map_risk_error)?;
+
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_add(collateral_units)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
+                drop(slab_data);
+
+                collateral::deposit(a_token, a_user_lp_ata, a_lp_escrow, a_user, lp_amount)?;
+
+                msg!(
+                    "PERC-315: Deposited {} LP tokens as {} collateral units (LTV={}bps)",
+                    lp_amount,
+                    collateral_units,
+                    config.lp_collateral_ltv_bps
+                );
+            }
+
+            Instruction::WithdrawLpCollateral {
+                user_idx,
+                lp_amount,
+            } => {
+                accounts::expect_len(accounts, 8)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_user_lp_ata = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_lp_vault_state = &accounts[4];
+                let a_token = &accounts[5];
+                let a_lp_escrow = &accounts[6];
+                let a_vault_authority = &accounts[7];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_user_lp_ata)?;
+                accounts::expect_writable(a_lp_escrow)?;
+                verify_token_program(a_token)?;
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+
+                let engine = zc::engine_mut(&mut slab_data)?;
+                check_idx(engine, user_idx)?;
+
+                let owner = engine.accounts[user_idx as usize].owner;
+                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let pos = engine.accounts[user_idx as usize].position_size.get();
+                if pos != 0 {
+                    return Err(PercolatorError::LpCollateralPositionOpen.into());
+                }
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                drop(slab_data);
+
+                let vs_data = a_lp_vault_state.try_borrow_data()?;
+                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                let vault_tvl = vault_state.total_capital;
+                drop(vs_data);
+
+                let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+
+                let collateral_units = crate::lp_collateral::lp_token_value(
+                    lp_amount,
+                    vault_tvl,
+                    lp_supply,
+                    config.lp_collateral_ltv_bps,
+                );
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let engine = zc::engine_mut(&mut slab_data)?;
+
+                let clock = Clock::get()?;
+                engine
+                    .withdraw(user_idx, collateral_units, clock.slot, 0)
+                    .map_err(map_risk_error)?;
+
+                engine.vault =
+                    percolator::U128::new(engine.vault.get().saturating_sub(collateral_units));
+                drop(slab_data);
+
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_lp_escrow,
+                    a_user_lp_ata,
+                    a_vault_authority,
+                    lp_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "PERC-315: Withdrew {} LP tokens ({} collateral units)",
+                    lp_amount,
+                    collateral_units
+                );
             }
         }
         Ok(())
