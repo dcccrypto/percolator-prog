@@ -10529,16 +10529,9 @@ pub mod processor {
                     .execute_adl(target_idx, clock.slot, price, excess)
                     .map_err(map_risk_error)?;
 
-                // Settle any realized PnL to capital after ADL
-                let final_pnl = engine.accounts[target_idx as usize].pnl.get();
-                if final_pnl > 0 {
-                    let settle = final_pnl as u128;
-                    let old_cap = engine.accounts[target_idx as usize].capital.get();
-                    engine.accounts[target_idx as usize].capital =
-                        percolator::U128::new(old_cap.saturating_add(settle));
-                    engine.set_pnl(target_idx as usize, 0);
-                    engine.c_tot = engine.c_tot.saturating_add(settle);
-                }
+                // NOTE: PnL settlement and OI updates are handled by the
+                // core library's oracle_close_position_core/slice_core
+                // (called inside execute_adl). No manual settlement needed.
 
                 msg!(
                     "ADL: idx={} closed={} excess={} pnl_pos_tot_after={}",
