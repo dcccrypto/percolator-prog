@@ -532,6 +532,7 @@ pub mod verify {
     /// * `risk_increase` - Whether this trade would increase system risk
     /// * `exec_size` - The exec_size from matcher return
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn decide_trade_cpi(
         old_nonce: u64,
         shape: MatcherAccountsShape,
@@ -659,6 +660,7 @@ pub mod verify {
     /// * `oracle_price_e6` - Expected oracle price from request
     /// * `req_size` - Requested trade size
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn decide_trade_cpi_from_ret(
         old_nonce: u64,
         shape: MatcherAccountsShape,
@@ -765,9 +767,7 @@ pub mod verify {
         stored_owner: [u8; 32],
         signer: [u8; 32],
     ) -> SimpleDecision {
-        if permissionless {
-            SimpleDecision::Accept
-        } else if idx_exists && owner_ok(stored_owner, signer) {
+        if permissionless || (idx_exists && owner_ok(stored_owner, signer)) {
             SimpleDecision::Accept
         } else {
             SimpleDecision::Reject
@@ -1779,6 +1779,7 @@ pub mod ix {
     use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 
     #[derive(Debug)]
+    #[allow(clippy::large_enum_variant)]
     pub enum Instruction {
         InitMarket {
             admin: Pubkey,
@@ -2009,10 +2010,10 @@ pub mod ix {
         /// The DEX oracle account must be owned by an approved DEX program.
         ///
         /// Accounts:
-        ///   0. [writable] Slab
-        ///   1. []         DEX pool account (PumpSwap / Raydium CLMM / Meteora DLMM)
-        ///   2. []         Clock sysvar
-        ///   3..N []       Remaining accounts (PumpSwap vault0, vault1 for price calc)
+        /// - 0. `[writable]` Slab
+        /// - 1. `[]` DEX pool account (PumpSwap / Raydium CLMM / Meteora DLMM)
+        /// - 2. `[]` Clock sysvar
+        /// - 3..N `[]` Remaining accounts (PumpSwap vault0, vault1 for price calc)
         UpdateHyperpMark,
         /// PERC-154: Optimized TradeCpi with caller-provided PDA bump.
         /// Eliminates `find_program_address` (~1500 CU savings).
@@ -3003,8 +3004,8 @@ pub mod state {
     /// The nonce is stored in _reserved[0..8] as little-endian u64.
     /// Uses offset_of! for correctness even if SlabHeader layout changes.
     pub fn write_req_nonce(data: &mut [u8], nonce: u64) {
-        #[cfg(debug_assertions)]
-        debug_assert!(HEADER_LEN >= RESERVED_OFF + 16);
+        // Compile-time layout check (always true for current struct)
+        const _: () = assert!(HEADER_LEN >= RESERVED_OFF + 16);
         data[RESERVED_OFF..RESERVED_OFF + 8].copy_from_slice(&nonce.to_le_bytes());
     }
 
@@ -3205,7 +3206,7 @@ pub mod oracle {
     const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
                                         // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
                                         // The actual price data is stored directly at tail:
-    const CL_OFF_SLOT: usize = 200; // u64 - slot when updated
+    const _CL_OFF_SLOT: usize = 200; // u64 - slot when updated
     const CL_OFF_TIMESTAMP: usize = 208; // u64 - unix timestamp (seconds)
     const CL_OFF_ANSWER: usize = 216; // i128 - price answer
 
@@ -3435,8 +3436,8 @@ pub mod oracle {
 
     // Raydium CLMM PoolState layout (Anchor — 8-byte discriminator)
     const RAYDIUM_CLMM_MIN_LEN: usize = 269;
-    const RAYDIUM_CLMM_OFF_MINT0: usize = 73;
-    const RAYDIUM_CLMM_OFF_MINT1: usize = 105;
+    const _RAYDIUM_CLMM_OFF_MINT0: usize = 73;
+    const _RAYDIUM_CLMM_OFF_MINT1: usize = 105;
     const RAYDIUM_CLMM_OFF_DECIMALS0: usize = 233;
     const RAYDIUM_CLMM_OFF_DECIMALS1: usize = 234;
     const RAYDIUM_CLMM_OFF_SQRT_PRICE_X64: usize = 253;
@@ -3924,6 +3925,7 @@ pub mod oracle {
     /// Without this scaling, margin checks would compare units to base tokens incorrectly.
     ///
     /// The raw oracle is validated (staleness, confidence for Pyth) BEFORE transformations.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_engine_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
@@ -4533,7 +4535,7 @@ pub mod insurance_lp {
 
     /// Create the insurance LP mint account (PDA) and initialize it.
     /// Mint authority = vault_authority PDA. Freeze authority = None.
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::too_many_arguments)]
     pub fn create_mint<'a>(
         payer: &AccountInfo<'a>,
         mint_account: &AccountInfo<'a>,
@@ -5652,6 +5654,7 @@ pub mod processor {
     /// Returns penalty amount in collateral units (to be added to insurance fund).
     /// Penalty = |position_size| * penalty_bps * stale_slots / 10_000
     /// Only applies if oracle is stale AND market is not resolved.
+    #[allow(dead_code)] // PERC-307: Will be used when orphan penalty crank is implemented
     fn compute_orphan_penalty(
         config: &state::MarketConfig,
         current_slot: u64,
@@ -6724,7 +6727,7 @@ pub mod processor {
                     engine.set_risk_reduction_threshold(
                         final_thresh.clamp(config.thresh_min, config.thresh_max),
                     );
-                    drop(engine);
+                    let _ = engine;
                     state::write_last_thr_update_slot(&mut data, clock.slot);
                 }
 
@@ -7946,7 +7949,7 @@ pub mod processor {
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
-                engine.set_margin_params(initial_margin_bps, maintenance_margin_bps);
+                let _ = engine.set_margin_params(initial_margin_bps, maintenance_margin_bps);
 
                 // Update trading fee if provided (backwards compatible)
                 if let Some(fee) = trading_fee_bps {
