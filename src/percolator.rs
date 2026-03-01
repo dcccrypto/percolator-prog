@@ -5544,14 +5544,17 @@ pub mod processor {
             return Ok(());
         }
 
-        // Auto-exit check (don't write, just skip blocking)
-        if config.safety_valve_duration > 0
-            && current_slot
-                >= config
-                    .rebalancing_start_slot
-                    .saturating_add(config.safety_valve_duration)
-        {
-            return Ok(()); // Duration elapsed, will be formally exited on next crank
+        // Auto-exit check: if duration elapsed, allow trade through.
+        // PERC-322/LOW-1: The actual rebalancing_active flag is cleared
+        // in update_safety_valve_on_funding() during the next crank.
+        if config.safety_valve_duration > 0 {
+            let deadline = config
+                .rebalancing_start_slot
+                .checked_add(config.safety_valve_duration)
+                .unwrap_or(u64::MAX);
+            if current_slot >= deadline {
+                return Ok(()); // Duration elapsed, flag cleared on next crank
+            }
         }
 
         // Determine dominant side from net LP position.
@@ -5590,6 +5593,29 @@ pub mod processor {
     ) {
         if config.safety_valve_enabled == 0 || config.safety_valve_duration == 0 {
             return;
+        }
+
+        // PERC-322/LOW-1: Check duration-based auto-exit FIRST.
+        // If rebalancing is active and duration has elapsed, clear the flag immediately
+        // rather than leaving it dangling until skew resolves organically.
+        // This closes the gap where check_safety_valve() silently allowed trades
+        // but rebalancing_active remained set, causing inconsistent state.
+        if config.rebalancing_active != 0 && config.safety_valve_duration > 0 {
+            let deadline = config
+                .rebalancing_start_slot
+                .checked_add(config.safety_valve_duration)
+                .unwrap_or(u64::MAX);
+            if current_slot >= deadline {
+                config.rebalancing_active = 0;
+                config.rebalancing_start_slot = 0;
+                config.consecutive_max_funding_epochs = 0;
+                msg!(
+                    "PERC-312: Rebalancing auto-exited — duration expired at slot {} (deadline={})",
+                    current_slot,
+                    deadline
+                );
+                return;
+            }
         }
 
         let max_bps = config.funding_max_bps_per_slot;
@@ -8923,14 +8949,18 @@ pub mod processor {
             Instruction::UnresolveMarket { confirmation } => {
                 // PERC-273: Unresolve market — clear RESOLVED flag, re-enable trading.
                 // Admin only. Requires confirmation code to prevent accidental invocation.
+                // PERC-322/MEDIUM-2: Oracle recovery check — verify oracle is alive before
+                // re-enabling trading to prevent operating with stale/absent prices.
                 const UNRESOLVE_CONFIRMATION: u64 = 0xDEAD_BEEF_CAFE_1234;
                 if confirmation != UNRESOLVE_CONFIRMATION {
                     msg!("UnresolveMarket: invalid confirmation code");
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                accounts::expect_len(accounts, 2)?;
+                accounts::expect_len(accounts, 4)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
+                let a_clock = &accounts[2];
+                let a_oracle = &accounts[3];
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
@@ -8947,10 +8977,38 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
+                // PERC-322/MEDIUM-2: Verify oracle is alive before re-enabling trading.
+                // Prevents unresolving into a stale-oracle state where trades execute
+                // against outdated prices.
+                let mut config = state::read_config(&data);
+                let clock = Clock::from_account_info(a_clock)?;
+                let remaining_oracle_accounts = if accounts.len() > 4 { &accounts[4..] } else { &[] };
+                let oracle_price = oracle::read_price_with_authority(
+                    &config,
+                    a_oracle,
+                    clock.unix_timestamp,
+                    remaining_oracle_accounts,
+                )?;
+                if oracle_price == 0 {
+                    msg!("UnresolveMarket: oracle returned zero price — cannot unresolve");
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
+
+                // Update config with fresh oracle price so the first crank after unresolve
+                // operates on a known-good baseline
+                config.last_effective_price_e6 = oracle_price;
+                config.settlement_price_e6 = 0; // Clear settlement price
+                state::write_config(&mut data, &config);
+
                 // Clear the resolved flag
                 state::clear_resolved(&mut data);
 
-                msg!("UnresolveMarket: admin={} slab={}", a_admin.key, a_slab.key);
+                msg!(
+                    "UnresolveMarket: admin={} slab={} oracle_price={}",
+                    a_admin.key,
+                    a_slab.key,
+                    oracle_price
+                );
             }
 
             // ================================================================
@@ -9678,9 +9736,14 @@ pub mod processor {
                     return Err(PercolatorError::DisputeWindowClosed.into());
                 }
                 let clock = Clock::get()?;
+                // PERC-322/MEDIUM-3: Use checked_add to prevent overflow.
+                // If resolved_slot + dispute_window_slots overflows u64, the dispute
+                // window is treated as closed (fail-safe) rather than saturating to
+                // u64::MAX which would keep the window open indefinitely.
                 let window_end = config
                     .resolved_slot
-                    .saturating_add(config.dispute_window_slots);
+                    .checked_add(config.dispute_window_slots)
+                    .ok_or(PercolatorError::DisputeWindowClosed)?;
                 if clock.slot > window_end {
                     return Err(PercolatorError::DisputeWindowClosed.into());
                 }
