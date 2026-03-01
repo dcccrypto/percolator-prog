@@ -2735,7 +2735,6 @@ pub mod state {
         /// 0 = disabled. Trades rejected if pnl_pos_tot would exceed this.
         /// Set via UpdateRiskParams. Prevents LP capital exhaustion.
         pub max_pnl_cap: u64,
-
         // ========================================
         // Market Maturity OI Ramp (PERC-302)
         // ========================================
