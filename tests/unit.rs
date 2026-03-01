@@ -4688,6 +4688,97 @@ fn test_skew_adjusted_cap_reduces_with_imbalance() {
         effective,
         base_max_oi / 2,
         "100% skew with 50% factor should halve the cap"
+// PERC-304: Utilization-Curve Fee Multiplier Tests
+// ============================================================================
+
+#[test]
+fn test_fee_multiplier_segment1_flat() {
+    use percolator_prog::verify::compute_fee_multiplier_bps;
+    // 0% utilization → 1.0×
+    assert_eq!(compute_fee_multiplier_bps(0), 10_000);
+    // 25% utilization → 1.0×
+    assert_eq!(compute_fee_multiplier_bps(2_500), 10_000);
+    // 50% utilization (boundary) → 1.0×
+    assert_eq!(compute_fee_multiplier_bps(5_000), 10_000);
+}
+
+#[test]
+fn test_fee_multiplier_segment2_linear() {
+    use percolator_prog::verify::compute_fee_multiplier_bps;
+    // 50% → 1.0× (boundary, inclusive in segment 1)
+    assert_eq!(compute_fee_multiplier_bps(5_000), 10_000);
+    // 65% = midpoint of [50%, 80%] → midpoint of [1.0×, 2.5×] = 1.75×
+    assert_eq!(compute_fee_multiplier_bps(6_500), 17_500);
+    // 80% → 2.5× (boundary)
+    assert_eq!(compute_fee_multiplier_bps(8_000), 25_000);
+    // 51% → just above kink 1
+    // excess = 1, slope = 15_000 / 3_000 = 5 bps per util_bps
+    assert_eq!(compute_fee_multiplier_bps(5_001), 10_005);
+}
+
+#[test]
+fn test_fee_multiplier_segment3_steep() {
+    use percolator_prog::verify::compute_fee_multiplier_bps;
+    // 80% → 2.5× (boundary, inclusive in segment 2)
+    assert_eq!(compute_fee_multiplier_bps(8_000), 25_000);
+    // 90% = midpoint of [80%, 100%] → midpoint of [2.5×, 7.5×] = 5.0×
+    assert_eq!(compute_fee_multiplier_bps(9_000), 50_000);
+    // 100% → 7.5×
+    assert_eq!(compute_fee_multiplier_bps(10_000), 75_000);
+    // 81% → just above kink 2
+    // excess = 1, slope = 50_000 / 2_000 = 25 bps per util_bps
+    assert_eq!(compute_fee_multiplier_bps(8_001), 25_025);
+}
+
+#[test]
+fn test_fee_multiplier_cap_over_100() {
+    use percolator_prog::verify::compute_fee_multiplier_bps;
+    // > 100% utilization → capped at 7.5×
+    assert_eq!(compute_fee_multiplier_bps(10_001), 75_000);
+    assert_eq!(compute_fee_multiplier_bps(15_000), 75_000);
+    assert_eq!(compute_fee_multiplier_bps(u64::MAX), 75_000);
+}
+
+#[test]
+fn test_fee_multiplier_monotonic_brute_force() {
+    use percolator_prog::verify::compute_fee_multiplier_bps;
+    // Check monotonicity over the full range [0, 10_000]
+    let mut prev = compute_fee_multiplier_bps(0);
+    for u in 1..=10_001 {
+        let curr = compute_fee_multiplier_bps(u);
+        assert!(
+            curr >= prev,
+            "monotonicity violation at util_bps={}: {} < {}",
+            u,
+            curr,
+            prev
+        );
+        prev = curr;
+    }
+}
+
+#[test]
+fn test_compute_util_bps() {
+    use percolator_prog::verify::compute_util_bps;
+    // Zero max_oi → 0
+    assert_eq!(compute_util_bps(100, 0), 0);
+    // 50% utilization
+    assert_eq!(compute_util_bps(500, 1000), 5_000);
+    // 100% utilization
+    assert_eq!(compute_util_bps(1000, 1000), 10_000);
+    // 150% over-utilization
+    assert_eq!(compute_util_bps(1500, 1000), 15_000);
+    // Zero current_oi
+    assert_eq!(compute_util_bps(0, 1000), 0);
+}
+
+#[test]
+fn test_lp_vault_state_size_unchanged() {
+    // CRITICAL: LpVaultState must be exactly 128 bytes for account layout compatibility.
+    assert_eq!(
+        core::mem::size_of::<percolator_prog::lp_vault::LpVaultState>(),
+        128,
+        "LpVaultState layout changed — this breaks existing accounts!"
     );
 }
 
@@ -4724,4 +4815,11 @@ fn test_skew_adjusted_cap_zero_skew_factor_disables() {
     let effective = base_max_oi * (10_000 - reduction) / 10_000;
 
     assert_eq!(effective, base_max_oi);
+fn test_lp_vault_state_new_fields_zero_default() {
+    // Verify that zeroed LpVaultState has util curve disabled and mult at 0.
+    // This ensures backward compat: existing vaults (with zeroed reserved bytes)
+    // have the curve disabled and multiplier = 0 (treated as 1.0× by crank logic).
+    let state = percolator_prog::lp_vault::LpVaultState::new_zeroed();
+    assert_eq!(state.lp_util_curve_enabled, 0);
+    assert_eq!(state.current_fee_mult_bps, 0);
 }
