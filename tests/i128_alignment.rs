@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - haircut-ratio engine (no padding)
 // Updated for PERC-273: MarketConfig grew by 16 bytes (oi_cap_multiplier_bps + _oi_reserved)
-const SLAB_LEN: usize = 1025568;
+const SLAB_LEN: usize = 1025584;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

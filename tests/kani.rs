@@ -5057,6 +5057,80 @@ fn proof_oi_cap_no_overflow() {
     assert!(max_oi <= u128::MAX);
 }
 
+/// PERC-302: Prove ramp multiplier never exceeds configured oi_cap_multiplier_bps.
+/// For all valid inputs: compute_ramp_multiplier(…) <= oi_cap_multiplier_bps.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_ramp_never_exceeds_configured_multiplier() {
+    use percolator_prog::constants::RAMP_START_BPS;
+    use percolator_prog::verify::compute_ramp_multiplier;
+
+    let oi_cap_multiplier_bps: u64 = kani::any();
+    let market_created_slot: u64 = kani::any();
+    let current_slot: u64 = kani::any();
+    let oi_ramp_slots: u64 = kani::any();
+
+    // Preconditions: multiplier is reasonable (up to 100x = 1_000_000 bps)
+    kani::assume(oi_cap_multiplier_bps > 0);
+    kani::assume(oi_cap_multiplier_bps <= 1_000_000);
+    kani::assume(oi_ramp_slots <= 10_000_000); // ~46 days max ramp
+
+    let result = compute_ramp_multiplier(
+        oi_cap_multiplier_bps,
+        market_created_slot,
+        current_slot,
+        oi_ramp_slots,
+    );
+
+    // Core invariant: result never exceeds the configured target
+    assert!(result <= oi_cap_multiplier_bps);
+
+    // When ramp disabled (oi_ramp_slots == 0): result equals target
+    if oi_ramp_slots == 0 {
+        assert!(result == oi_cap_multiplier_bps);
+    }
+
+    // When target <= RAMP_START_BPS: result equals target (no ramp applied)
+    if oi_cap_multiplier_bps <= RAMP_START_BPS {
+        assert!(result == oi_cap_multiplier_bps);
+    }
+
+    // When ramp complete (elapsed >= oi_ramp_slots): result equals target
+    if oi_ramp_slots > 0 && current_slot.saturating_sub(market_created_slot) >= oi_ramp_slots {
+        assert!(result == oi_cap_multiplier_bps);
+    }
+
+    // Result is always >= RAMP_START_BPS when target > RAMP_START_BPS and ramp active
+    if oi_cap_multiplier_bps > RAMP_START_BPS && oi_ramp_slots > 0 {
+        assert!(result >= RAMP_START_BPS);
+    }
+}
+
+/// PERC-302: Prove ramp produces monotonically increasing multiplier as slots advance.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_ramp_monotonically_increases() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+
+    let oi_cap: u64 = kani::any();
+    let created: u64 = kani::any();
+    let slot_a: u64 = kani::any();
+    let slot_b: u64 = kani::any();
+    let ramp_slots: u64 = kani::any();
+
+    kani::assume(oi_cap > 0);
+    kani::assume(oi_cap <= 1_000_000);
+    kani::assume(ramp_slots > 0);
+    kani::assume(ramp_slots <= 10_000_000);
+    kani::assume(slot_a <= slot_b);
+
+    let result_a = compute_ramp_multiplier(oi_cap, created, slot_a, ramp_slots);
+    let result_b = compute_ramp_multiplier(oi_cap, created, slot_b, ramp_slots);
+
+    // Later slot => equal or higher multiplier (monotonic)
+    assert!(result_b >= result_a);
+}
+
 /// Prove: clear_resolved correctly clears the resolved flag.
 #[cfg(kani)]
 #[kani::proof]

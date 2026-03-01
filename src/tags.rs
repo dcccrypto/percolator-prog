@@ -68,6 +68,12 @@ pub const TAG_LP_VAULT_DEPOSIT: u8 = 38;
 pub const TAG_LP_VAULT_WITHDRAW: u8 = 39;
 /// Permissionless crank: distribute accrued fee revenue to LP vault capital (PERC-272).
 pub const TAG_LP_VAULT_CRANK_FEES: u8 = 40;
+/// Fund per-market isolated insurance balance (PERC-306).
+/// Admin deposits tokens into the market's isolated insurance reserve.
+pub const TAG_FUND_MARKET_INSURANCE: u8 = 41;
+/// Set insurance isolation BPS for a market (PERC-306).
+/// Admin configures max % of global fund this market can access.
+pub const TAG_SET_INSURANCE_ISOLATION: u8 = 42;
 
 #[cfg(test)]
 mod tests {
@@ -118,6 +124,8 @@ mod tests {
             TAG_LP_VAULT_DEPOSIT,
             TAG_LP_VAULT_WITHDRAW,
             TAG_LP_VAULT_CRANK_FEES,
+            TAG_FUND_MARKET_INSURANCE,
+            TAG_SET_INSURANCE_ISOLATION,
         ];
 
         for i in 0..tags.len() {
@@ -172,6 +180,8 @@ mod tests {
             TAG_LP_VAULT_DEPOSIT,
             TAG_LP_VAULT_WITHDRAW,
             TAG_LP_VAULT_CRANK_FEES,
+            TAG_FUND_MARKET_INSURANCE,
+            TAG_SET_INSURANCE_ISOLATION,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
