@@ -3089,6 +3089,15 @@ pub mod state {
         let dst = &mut data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
         dst.copy_from_slice(src);
     }
+
+    /// Write a single field into the config region of the slab data buffer.
+    /// `field_offset` is the byte offset of the field within MarketConfig (use `offset_of!`).
+    /// Data must already be zeroed for fields you don't write.
+    #[inline(always)]
+    pub fn write_config_bytes(data: &mut [u8], field_offset: usize, bytes: &[u8]) {
+        let start = HEADER_LEN + field_offset;
+        data[start..start + bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 // 7. mod units - base token/units conversion at instruction boundaries
@@ -6007,90 +6016,65 @@ pub mod processor {
                 engine.last_funding_slot = clock.slot;
                 engine.last_crank_slot = clock.slot;
 
-                let config = MarketConfig {
-                    collateral_mint: a_mint.key.to_bytes(),
-                    vault_pubkey: a_vault.key.to_bytes(),
-                    index_feed_id,
-                    max_staleness_secs,
-                    conf_filter_bps,
-                    vault_authority_bump: bump,
-                    invert,
-                    unit_scale,
+                // Write config fields directly into the zeroed slab buffer to avoid
+                // allocating a 496-byte MarketConfig on the SBF 4KB stack.
+                // Data is already zeroed above, so we only write non-zero fields.
+                {
+                    use core::mem::offset_of;
+                    use state::write_config_bytes as wcb;
+                    type MC = MarketConfig;
+
+                    wcb(&mut data, offset_of!(MC, collateral_mint), &a_mint.key.to_bytes());
+                    wcb(&mut data, offset_of!(MC, vault_pubkey), &a_vault.key.to_bytes());
+                    wcb(&mut data, offset_of!(MC, index_feed_id), &index_feed_id);
+                    wcb(&mut data, offset_of!(MC, max_staleness_secs), &max_staleness_secs.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, conf_filter_bps), &conf_filter_bps.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, vault_authority_bump), &[bump]);
+                    wcb(&mut data, offset_of!(MC, invert), &[invert]);
+                    wcb(&mut data, offset_of!(MC, unit_scale), &unit_scale.to_le_bytes());
                     // Funding parameters (defaults)
-                    funding_horizon_slots: DEFAULT_FUNDING_HORIZON_SLOTS,
-                    funding_k_bps: DEFAULT_FUNDING_K_BPS,
-                    funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-                    funding_max_premium_bps: DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-                    funding_max_bps_per_slot: DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+                    wcb(&mut data, offset_of!(MC, funding_horizon_slots), &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, funding_k_bps), &DEFAULT_FUNDING_K_BPS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, funding_inv_scale_notional_e6), &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, funding_max_premium_bps), &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, funding_max_bps_per_slot), &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes());
                     // PERC-121: Premium funding defaults (pure inventory-based)
-                    funding_premium_weight_bps: 0,
-                    funding_settlement_interval_slots: 0,
-                    funding_premium_dampening_e6: 1_000_000,
-                    funding_premium_max_bps_per_slot: 5,
+                    // funding_premium_weight_bps = 0 (already zeroed)
+                    // funding_settlement_interval_slots = 0 (already zeroed)
+                    wcb(&mut data, offset_of!(MC, funding_premium_dampening_e6), &1_000_000u64.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, funding_premium_max_bps_per_slot), &5i64.to_le_bytes());
                     // Threshold parameters (defaults)
-                    thresh_floor: DEFAULT_THRESH_FLOOR,
-                    thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
-                    thresh_update_interval_slots: DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-                    thresh_step_bps: DEFAULT_THRESH_STEP_BPS,
-                    thresh_alpha_bps: DEFAULT_THRESH_ALPHA_BPS,
-                    thresh_min: DEFAULT_THRESH_MIN,
-                    thresh_max: DEFAULT_THRESH_MAX,
-                    thresh_min_step: DEFAULT_THRESH_MIN_STEP,
-                    // Oracle authority (disabled by default - use Pyth/Chainlink)
+                    wcb(&mut data, offset_of!(MC, thresh_floor), &DEFAULT_THRESH_FLOOR.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_risk_bps), &DEFAULT_THRESH_RISK_BPS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_update_interval_slots), &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_step_bps), &DEFAULT_THRESH_STEP_BPS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_alpha_bps), &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_min), &DEFAULT_THRESH_MIN.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_max), &DEFAULT_THRESH_MAX.to_le_bytes());
+                    wcb(&mut data, offset_of!(MC, thresh_min_step), &DEFAULT_THRESH_MIN_STEP.to_le_bytes());
+                    // Oracle authority (disabled by default - all zeros, already zeroed)
                     // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
-                    oracle_authority: [0u8; 32],
-                    authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
+                    if is_hyperp {
+                        wcb(&mut data, offset_of!(MC, authority_price_e6), &initial_mark_price_e6.to_le_bytes());
+                    }
+                    // authority_timestamp = 0 (already zeroed)
                     // Oracle price circuit breaker
-                    // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
-                    // Non-Hyperp: 5% per slot cap protects against flash-loan manipulation on DEX oracles
-                    // (also harmless for Pyth/Chainlink which already have staleness/confidence checks)
-                    oracle_price_cap_e2bps: if is_hyperp {
-                        DEFAULT_HYPERP_PRICE_CAP_E2BPS
-                    } else {
-                        DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
-                    },
-                    last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    // PERC-273: OI cap disabled by default
-                    oi_cap_multiplier_bps: 0,
-                    max_pnl_cap: 0,
+                    let cap = if is_hyperp { DEFAULT_HYPERP_PRICE_CAP_E2BPS } else { DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS };
+                    wcb(&mut data, offset_of!(MC, oracle_price_cap_e2bps), &cap.to_le_bytes());
+                    if is_hyperp {
+                        wcb(&mut data, offset_of!(MC, last_effective_price_e6), &initial_mark_price_e6.to_le_bytes());
+                    }
+                    // PERC-273: OI cap disabled by default (0, already zeroed)
                     // PERC-302: Market maturity OI ramp
-                    market_created_slot: clock.slot,
-                    oi_ramp_slots: 0, // 0 = full cap immediately (backwards compat)
-                    // PERC-300: Adaptive funding disabled by default
-                    adaptive_funding_enabled: 0,
-                    _adaptive_pad: 0,
-                    adaptive_scale_bps: 0,
-                    _adaptive_pad2: 0,
-                    adaptive_max_funding_bps: 0,
-                    // PERC-306: Insurance isolation (disabled by default)
-                    insurance_isolation_bps: 0,
-                    _insurance_isolation_padding: [0u8; 14],
-                    // PERC-312: Safety valve disabled by default
-                    safety_valve_duration: 0,
-                    emergency_close_rebate_bps: 0,
-                    safety_valve_epochs: 5,
-                    safety_valve_enabled: 0,
-                    _safety_valve_pad: [0; 4],
-                    consecutive_max_funding_epochs: 0,
-                    rebalancing_active: 0,
-                    _rebalancing_pad: [0; 6],
-                    rebalancing_start_slot: 0,
-                    // PERC-307: Orphan penalty disabled by default
-                    orphan_threshold_slots: 0,
-                    orphan_penalty_bps_per_slot: 0,
-                    _orphan_pad: [0; 6],
-                    // PERC-314: Dispute disabled by default
-                    dispute_window_slots: 0,
-                    dispute_bond_amount: 0,
-                    resolved_slot: 0,
-                    settlement_price_e6: 0,
-                    // PERC-315: LP collateral disabled by default
-                    lp_collateral_enabled: 0,
-                    _lp_col_pad: [0; 7],
-                    lp_collateral_ltv_bps: 0,
-                };
-                state::write_config(&mut data, &config);
+                    wcb(&mut data, offset_of!(MC, market_created_slot), &clock.slot.to_le_bytes());
+                    // oi_ramp_slots = 0 (already zeroed)
+                    // PERC-300: Adaptive funding disabled by default (all zeros, already zeroed)
+                    // PERC-306: Insurance isolation disabled by default (0, already zeroed)
+                    // PERC-312: Safety valve
+                    wcb(&mut data, offset_of!(MC, safety_valve_epochs), &[5u8]);
+                    // All other safety valve fields default to 0 (already zeroed)
+                    // PERC-307, PERC-314, PERC-315: all disabled by default (0, already zeroed)
+                }
 
                 let new_header = SlabHeader {
                     magic: MAGIC,
