@@ -103,7 +103,7 @@ pub mod constants {
     #[cfg(feature = "test")]
     pub const MIN_INIT_MARKET_SEED: u64 = 0; // Allow zero seed in tests
     /// Alias for backwards compatibility with PERC-136 references.
-    pub const MIN_INIT_MARKET_SEED_LAMPORTS: u64 = 1_000_000;
+    pub const MIN_INIT_MARKET_SEED_LAMPORTS: u64 = MIN_INIT_MARKET_SEED;
 
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
