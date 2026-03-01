@@ -43,10 +43,10 @@ use percolator_prog::verify::{
     circuit_breaker_triggered,
     compute_fee_ceil,
     compute_fee_floor,
-    // PERC-302: OI ramp multiplier
-    compute_ramped_multiplier,
     // New: PERC-304 fee multiplier
     compute_fee_multiplier_bps,
+    // PERC-302: OI ramp multiplier
+    compute_ramped_multiplier,
     compute_util_bps,
     convert_decimals,
     cpi_trade_size,

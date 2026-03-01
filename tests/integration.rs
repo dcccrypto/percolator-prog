@@ -4926,7 +4926,12 @@ impl TradeCpiTestEnv {
     fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // ENGINE_OFF (SBF_ENGINE_OFF=600) + num_used offset (920) = 1520
-        u16::from_le_bytes(slab_data[1312..1314].try_into().unwrap())
+        const NUM_USED_OFFSET: usize = SBF_ENGINE_OFF + 920;
+        u16::from_le_bytes(
+            slab_data[NUM_USED_OFFSET..NUM_USED_OFFSET + 2]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read pnl_pos_tot aggregate from slab
