@@ -3719,6 +3719,78 @@ fn test_oi_cap_computation() {
     assert_eq!(max_oi2, 2_500);
 }
 
+// ========================================
+// PERC-302: OI Ramp Tests
+// ========================================
+
+#[test]
+fn test_ramp_disabled_returns_full_multiplier() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    // oi_ramp_slots = 0 means ramp disabled, full cap immediately
+    assert_eq!(compute_ramp_multiplier(100_000, 1000, 1001, 0), 100_000);
+    assert_eq!(compute_ramp_multiplier(50_000, 0, 0, 0), 50_000);
+}
+
+#[test]
+fn test_ramp_at_start() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    use percolator_prog::constants::RAMP_START_BPS;
+    // At market creation slot, ramp should return RAMP_START_BPS
+    let result = compute_ramp_multiplier(100_000, 1000, 1000, 432_000);
+    assert_eq!(result, RAMP_START_BPS);
+}
+
+#[test]
+fn test_ramp_at_halfway() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    use percolator_prog::constants::RAMP_START_BPS;
+    // Halfway: 216k slots into 432k ramp
+    let target = 100_000u64;
+    let result = compute_ramp_multiplier(target, 0, 216_000, 432_000);
+    let expected = RAMP_START_BPS + (target - RAMP_START_BPS) / 2;
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_ramp_complete() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    // After ramp complete, should return full multiplier
+    assert_eq!(compute_ramp_multiplier(100_000, 0, 432_000, 432_000), 100_000);
+    assert_eq!(compute_ramp_multiplier(100_000, 0, 500_000, 432_000), 100_000);
+}
+
+#[test]
+fn test_ramp_low_target_skips_ramp() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    use percolator_prog::constants::RAMP_START_BPS;
+    // If target <= RAMP_START_BPS, no ramp needed
+    assert_eq!(compute_ramp_multiplier(RAMP_START_BPS, 0, 0, 432_000), RAMP_START_BPS);
+    assert_eq!(compute_ramp_multiplier(500, 0, 0, 432_000), 500);
+}
+
+#[test]
+fn test_ramp_never_exceeds_target() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    // Test many points along the ramp
+    let target = 200_000u64; // 20x
+    for elapsed in (0..=500_000).step_by(1000) {
+        let result = compute_ramp_multiplier(target, 0, elapsed, 432_000);
+        assert!(result <= target, "elapsed={} result={}", elapsed, result);
+    }
+}
+
+#[test]
+fn test_ramp_monotonic() {
+    use percolator_prog::verify::compute_ramp_multiplier;
+    let target = 100_000u64;
+    let mut prev = 0u64;
+    for slot in (0..=500_000).step_by(100) {
+        let result = compute_ramp_multiplier(target, 0, slot, 432_000);
+        assert!(result >= prev, "slot={} result={} prev={}", slot, result, prev);
+        prev = result;
+    }
+}
+
 #[test]
 fn test_clear_resolved_flag() {
     use percolator_prog::state;

@@ -39,7 +39,7 @@ use std::path::PathBuf;
 // Note: struct layouts differ between BPF and native; these are BPF values.
 // Use `cargo build-sbf` (NOT --features test) — the test feature bypasses CPI
 // for token transfers, which fails in LiteSVM's BPF runtime.
-const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
+const SLAB_LEN: usize = 1025584; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

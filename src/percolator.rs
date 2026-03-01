@@ -154,6 +154,13 @@ pub mod constants {
     pub const DEFAULT_THRESH_MIN: u128 = 0;
     pub const DEFAULT_THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
     pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
+
+    // PERC-302: Market maturity OI ramp constants
+    /// Starting OI cap multiplier for new markets (0.1x LP vault = 1000 bps).
+    pub const RAMP_START_BPS: u64 = 1000;
+    /// Default ramp duration in slots (~2 days at ~2.5 slots/sec).
+    /// 0 = disabled (full cap immediately, backwards compat).
+    pub const DEFAULT_OI_RAMP_SLOTS: u64 = 432_000;
 }
 
 // 1b. Risk metric helpers (pure functions for anti-DoS threshold calculation)
@@ -1358,6 +1365,52 @@ pub mod verify {
         }
         (cursor + 1) % capacity
     }
+
+    /// PERC-302: Compute effective OI cap multiplier with market maturity ramp.
+    ///
+    /// New markets start at RAMP_START_BPS (0.1x vault) and ramp linearly to
+    /// `oi_cap_multiplier_bps` over `oi_ramp_slots` slots since `market_created_slot`.
+    ///
+    /// Invariant: result is always in [RAMP_START_BPS, oi_cap_multiplier_bps].
+    /// When oi_ramp_slots == 0: returns oi_cap_multiplier_bps immediately (backwards compat).
+    /// When oi_cap_multiplier_bps <= RAMP_START_BPS: returns oi_cap_multiplier_bps (no ramp needed).
+    #[inline]
+    pub fn compute_ramp_multiplier(
+        oi_cap_multiplier_bps: u64,
+        market_created_slot: u64,
+        current_slot: u64,
+        oi_ramp_slots: u64,
+    ) -> u64 {
+        use crate::constants::RAMP_START_BPS;
+
+        // Ramp disabled: use full multiplier immediately
+        if oi_ramp_slots == 0 {
+            return oi_cap_multiplier_bps;
+        }
+
+        // If target is already at or below ramp start, no ramp needed
+        if oi_cap_multiplier_bps <= RAMP_START_BPS {
+            return oi_cap_multiplier_bps;
+        }
+
+        // Elapsed slots since market creation (saturating to handle clock skew)
+        let elapsed = current_slot.saturating_sub(market_created_slot);
+
+        // Ramp complete: use full multiplier
+        if elapsed >= oi_ramp_slots {
+            return oi_cap_multiplier_bps;
+        }
+
+        // Linear interpolation: RAMP_START_BPS + (target - start) * elapsed / ramp_slots
+        let range = oi_cap_multiplier_bps - RAMP_START_BPS;
+        let ramp_add = (range as u128)
+            .saturating_mul(elapsed as u128)
+            / (oi_ramp_slots as u128);
+
+        // Clamp to target (should never exceed due to elapsed < oi_ramp_slots, but be safe)
+        let result = RAMP_START_BPS.saturating_add(ramp_add as u64);
+        core::cmp::min(result, oi_cap_multiplier_bps)
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -1776,6 +1829,9 @@ pub mod ix {
             /// Max total positive PnL cap. 0 = disabled.
             /// None = don't change (backwards compatible).
             max_pnl_cap: Option<u64>,
+            /// PERC-302: OI ramp duration in slots. 0 = full cap immediately.
+            /// None = don't change (backwards compatible).
+            oi_ramp_slots: Option<u64>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -2133,12 +2189,19 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // Optional: oi_ramp_slots (PERC-302, backwards compatible)
+                    let oi_ramp_slots = if rest.len() >= 8 {
+                        Some(read_u64(&mut rest)?)
+                    } else {
+                        None
+                    };
                     Ok(Instruction::UpdateRiskParams {
                         initial_margin_bps,
                         maintenance_margin_bps,
                         trading_fee_bps,
                         oi_cap_multiplier_bps,
                         max_pnl_cap,
+                        oi_ramp_slots,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2569,6 +2632,16 @@ pub mod state {
         /// 0 = disabled. Trades rejected if pnl_pos_tot would exceed this.
         /// Set via UpdateRiskParams. Prevents LP capital exhaustion.
         pub max_pnl_cap: u64,
+
+        // ========================================
+        // Market Maturity OI Ramp (PERC-302)
+        // ========================================
+        /// Slot when market was created (set once at InitMarket).
+        /// Used by OI ramp to compute elapsed slots since market birth.
+        pub market_created_slot: u64,
+        /// Number of slots over which OI cap ramps from RAMP_START_BPS to
+        /// oi_cap_multiplier_bps. 0 = disabled (full cap immediately).
+        pub oi_ramp_slots: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4485,12 +4558,19 @@ pub mod processor {
         data: &[u8],
     ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable)
-        // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
-        // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
+        // Accept old slabs from prior MarketConfig sizes:
+        //  - SLAB_LEN - 8:  pre-Account migration (4095 accounts)
+        //  - SLAB_LEN - 16: pre-PERC-302 (no market_created_slot/oi_ramp_slots)
+        //  - SLAB_LEN - 24: pre-PERC-302 + pre-Account migration
         const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
+        const PRE_302_SLAB_LEN: usize = SLAB_LEN - 16;
+        const PRE_302_OLD_SLAB_LEN: usize = SLAB_LEN - 24;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN
+                || data.len() == OLD_SLAB_LEN
+                || data.len() == PRE_302_SLAB_LEN
+                || data.len() == PRE_302_OLD_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -4532,23 +4612,39 @@ pub mod processor {
         Ok(())
     }
 
-    /// PERC-273: Check dynamic OI cap after trade execution.
-    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
-    fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
+    /// PERC-273 + PERC-302: Check dynamic OI cap after trade execution.
+    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * effective_multiplier / 10_000.
+    /// PERC-302: If oi_ramp_slots > 0, the effective multiplier ramps linearly from
+    /// RAMP_START_BPS to oi_cap_multiplier_bps over oi_ramp_slots since market creation.
+    fn check_oi_cap(
+        engine: &RiskEngine,
+        config: &state::MarketConfig,
+        current_slot: u64,
+    ) -> Result<(), ProgramError> {
         let multiplier = config.oi_cap_multiplier_bps;
         if multiplier == 0 {
             return Ok(()); // OI cap disabled
         }
+
+        // PERC-302: Compute effective multiplier with ramp
+        let effective_multiplier = crate::verify::compute_ramp_multiplier(
+            multiplier,
+            config.market_created_slot,
+            current_slot,
+            config.oi_ramp_slots,
+        );
+
         let vault = engine.vault.get();
-        let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+        let max_oi = vault.saturating_mul(effective_multiplier as u128) / 10_000;
         let current_oi = engine.total_open_interest.get();
         if current_oi > max_oi {
             msg!(
-                "OI cap exceeded: current={} max={} (vault={} multiplier={})",
+                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={})",
                 current_oi,
                 max_oi,
                 vault,
-                multiplier
+                multiplier,
+                effective_multiplier
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -4861,6 +4957,9 @@ pub mod processor {
                     // PERC-273: OI cap disabled by default
                     oi_cap_multiplier_bps: 0,
                     max_pnl_cap: 0,
+                    // PERC-302: Market maturity OI ramp
+                    market_created_slot: clock.slot,
+                    oi_ramp_slots: 0, // 0 = full cap immediately (backwards compat)
                 };
                 state::write_config(&mut data, &config);
 
@@ -5573,8 +5672,8 @@ pub mod processor {
                     .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error)?;
 
-                // PERC-273: Dynamic OI cap check after trade
-                check_oi_cap(engine, &config)?;
+                // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
+                check_oi_cap(engine, &config, clock.slot)?;
                 check_pnl_cap(engine, &config)?;
 
                 #[cfg(feature = "cu-audit")]
@@ -5888,8 +5987,8 @@ pub mod processor {
                         .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
                         .map_err(map_risk_error)?;
 
-                    // PERC-273: Dynamic OI cap check after trade
-                    check_oi_cap(engine, &config)?;
+                    // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
+                    check_oi_cap(engine, &config, clock.slot)?;
                     check_pnl_cap(engine, &config)?;
 
                     #[cfg(feature = "cu-audit")]
@@ -6620,6 +6719,7 @@ pub mod processor {
                 trading_fee_bps,
                 oi_cap_multiplier_bps,
                 max_pnl_cap,
+                oi_ramp_slots,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -6665,7 +6765,8 @@ pub mod processor {
 
                 // PERC-273: Update OI cap multiplier if provided
                 // PERC-272: Update max PnL cap if provided
-                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() {
+                // PERC-302: Update OI ramp slots if provided
+                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() || oi_ramp_slots.is_some() {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
                         config.oi_cap_multiplier_bps = oi_cap;
@@ -6673,11 +6774,15 @@ pub mod processor {
                     if let Some(pnl_cap) = max_pnl_cap {
                         config.max_pnl_cap = pnl_cap;
                     }
+                    if let Some(ramp) = oi_ramp_slots {
+                        config.oi_ramp_slots = ramp;
+                    }
                     state::write_config(&mut data, &config);
                     msg!(
-                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}",
+                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?} oi_ramp_slots={:?}",
                         oi_cap_multiplier_bps,
-                        max_pnl_cap
+                        max_pnl_cap,
+                        oi_ramp_slots
                     );
                 }
 
@@ -8034,15 +8139,22 @@ pub mod processor {
 
                 // OI reservation check: cannot withdraw if it would make vault
                 // too small to back current OI. After withdrawal:
-                //   remaining_capital >= total_oi / (oi_cap_multiplier / 10_000)
-                // Equivalently: remaining_capital * multiplier / 10_000 >= total_oi
+                //   remaining_capital >= total_oi / (effective_multiplier / 10_000)
+                // Equivalently: remaining_capital * effective_multiplier / 10_000 >= total_oi
+                // PERC-302: Use ramped multiplier for consistency with trade-time OI cap.
                 let oi_multiplier = config.oi_cap_multiplier_bps;
                 if oi_multiplier > 0 {
                     let remaining_capital = capital.saturating_sub(units_to_return);
                     let engine = zc::engine_ref(&slab_data)?;
                     let current_oi = engine.total_open_interest.get();
+                    let effective_multiplier = crate::verify::compute_ramp_multiplier(
+                        oi_multiplier,
+                        config.market_created_slot,
+                        engine.current_slot,
+                        config.oi_ramp_slots,
+                    );
                     let max_oi_after =
-                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+                        remaining_capital.saturating_mul(effective_multiplier as u128) / 10_000;
                     if current_oi > max_oi_after {
                         return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
                     }
