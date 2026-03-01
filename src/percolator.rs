@@ -6687,14 +6687,13 @@ pub mod processor {
                 // Copy stats before threshold update (avoid borrow conflict)
                 let liqs = engine.lifetime_liquidations;
                 let force = engine.lifetime_force_realize_closes;
-                // PERC-306: Report total insurance (global + isolated) as the low watermark
-                let _ins_low = engine
+                // PERC-306: Total insurance (global + isolated) as the low watermark
+                let ins_low = engine
                     .insurance_fund
                     .balance
                     .get()
                     .saturating_add(engine.insurance_fund.isolated_balance.get())
                     as u64;
-                let ins_low = engine.insurance_fund.balance.get() as u64;
 
                 // --- Threshold auto-update (rate-limited + EWMA smoothed + step-clamped)
                 if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
@@ -6821,12 +6820,11 @@ pub mod processor {
                 // O(1) check after single O(n) scan
                 // Gate activation via verify helper (Kani-provable)
                 // PERC-306: Use total insurance (global + isolated)
-                let _bal = engine
+                let bal = engine
                     .insurance_fund
                     .balance
                     .get()
                     .saturating_add(engine.insurance_fund.isolated_balance.get());
-                let bal = engine.insurance_fund.balance.get();
                 let thr = engine.risk_reduction_threshold();
                 if crate::verify::gate_active(thr, bal) {
                     #[cfg(feature = "cu-audit")]
@@ -7132,12 +7130,11 @@ pub mod processor {
                     // O(1) check after single O(n) scan
                     // Gate activation via verify helper (Kani-provable)
                     // PERC-306: Use total insurance (global + isolated)
-                    let _bal = engine
+                    let bal = engine
                         .insurance_fund
                         .balance
                         .get()
                         .saturating_add(engine.insurance_fund.isolated_balance.get());
-                    let bal = engine.insurance_fund.balance.get();
                     let thr = engine.risk_reduction_threshold();
                     if crate::verify::gate_active(thr, bal) {
                         #[cfg(feature = "cu-audit")]
@@ -9409,10 +9406,7 @@ pub mod processor {
                 //   remaining_capital >= total_oi / (effective_multiplier / 10_000)
                 // Equivalently: remaining_capital * effective_multiplier / 10_000 >= total_oi
                 // PERC-298: Unpack to get base multiplier. PERC-302: Use ramped multiplier.
-                let (_oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
-                //   remaining_capital >= total_oi / (oi_cap_multiplier / 10_000)
-                // Equivalently: remaining_capital * multiplier / 10_000 >= total_oi
-                let oi_multiplier = config.oi_cap_multiplier_bps;
+                let (oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
                 if oi_multiplier > 0 {
                     let remaining_capital = capital.saturating_sub(units_to_return);
                     let engine = zc::engine_ref(&slab_data)?;
@@ -9530,13 +9524,14 @@ pub mod processor {
                 }
 
                 // PERC-304: Compute utilization-based fee multiplier
+                let (oi_mult_for_util, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
                 let fee_mult_bps: u64 = if vault_state.lp_util_curve_enabled != 0
-                    && config.oi_cap_multiplier_bps > 0
+                    && oi_mult_for_util > 0
                 {
                     // Compute max OI from engine vault balance and config multiplier
                     let vault_balance = engine.vault.get();
                     let max_oi =
-                        vault_balance.saturating_mul(config.oi_cap_multiplier_bps as u128) / 10_000;
+                        vault_balance.saturating_mul(oi_mult_for_util as u128) / 10_000;
                     let current_oi = engine.total_open_interest.get();
 
                     // Utilization = current_oi / max_oi (in bps)
