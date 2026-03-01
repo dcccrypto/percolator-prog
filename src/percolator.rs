@@ -1403,9 +1403,7 @@ pub mod verify {
 
         // Linear interpolation: RAMP_START_BPS + (target - start) * elapsed / ramp_slots
         let range = oi_cap_multiplier_bps - RAMP_START_BPS;
-        let ramp_add = (range as u128)
-            .saturating_mul(elapsed as u128)
-            / (oi_ramp_slots as u128);
+        let ramp_add = (range as u128).saturating_mul(elapsed as u128) / (oi_ramp_slots as u128);
 
         // Clamp to target (should never exceed due to elapsed < oi_ramp_slots, but be safe)
         let result = RAMP_START_BPS.saturating_add(ramp_add as u64);
@@ -1978,11 +1976,15 @@ pub mod ix {
 
         /// PERC-306: Fund per-market isolated insurance balance.
         /// Accounts: [admin(signer, writable), slab(writable), user_ata(writable), vault(writable), token_program]
-        FundMarketInsurance { amount: u64 },
+        FundMarketInsurance {
+            amount: u64,
+        },
 
         /// PERC-306: Set insurance isolation BPS for a market.
         /// Accounts: [admin(signer), slab(writable)]
-        SetInsuranceIsolation { bps: u16 },
+        SetInsuranceIsolation {
+            bps: u16,
+        },
     }
 
     impl Instruction {
@@ -5559,8 +5561,12 @@ pub mod processor {
                 let liqs = engine.lifetime_liquidations;
                 let force = engine.lifetime_force_realize_closes;
                 // PERC-306: Report total insurance (global + isolated) as the low watermark
-                let ins_low = engine.insurance_fund.balance.get()
-                    .saturating_add(engine.insurance_fund.isolated_balance.get()) as u64;
+                let ins_low = engine
+                    .insurance_fund
+                    .balance
+                    .get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get())
+                    as u64;
 
                 // --- Threshold auto-update (rate-limited + EWMA smoothed + step-clamped)
                 if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
@@ -5676,7 +5682,10 @@ pub mod processor {
                 // O(1) check after single O(n) scan
                 // Gate activation via verify helper (Kani-provable)
                 // PERC-306: Use total insurance (global + isolated)
-                let bal = engine.insurance_fund.balance.get()
+                let bal = engine
+                    .insurance_fund
+                    .balance
+                    .get()
                     .saturating_add(engine.insurance_fund.isolated_balance.get());
                 let thr = engine.risk_reduction_threshold();
                 if crate::verify::gate_active(thr, bal) {
@@ -5991,7 +6000,10 @@ pub mod processor {
                     // O(1) check after single O(n) scan
                     // Gate activation via verify helper (Kani-provable)
                     // PERC-306: Use total insurance (global + isolated)
-                    let bal = engine.insurance_fund.balance.get()
+                    let bal = engine
+                        .insurance_fund
+                        .balance
+                        .get()
                         .saturating_add(engine.insurance_fund.isolated_balance.get());
                     let thr = engine.risk_reduction_threshold();
                     if crate::verify::gate_active(thr, bal) {
@@ -6805,7 +6817,10 @@ pub mod processor {
                 // PERC-273: Update OI cap multiplier if provided
                 // PERC-272: Update max PnL cap if provided
                 // PERC-302: Update OI ramp slots if provided
-                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() || oi_ramp_slots.is_some() {
+                if oi_cap_multiplier_bps.is_some()
+                    || max_pnl_cap.is_some()
+                    || oi_ramp_slots.is_some()
+                {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
                         config.oi_cap_multiplier_bps = oi_cap;
@@ -8343,7 +8358,6 @@ pub mod processor {
             // ========================================
             // PERC-306: Per-Market Insurance Isolation
             // ========================================
-
             Instruction::FundMarketInsurance { amount } => {
                 // PERC-306: Fund isolated insurance balance for this market.
                 // Same account layout as TopUpInsurance: [admin, slab, admin_ata, vault, token_program]

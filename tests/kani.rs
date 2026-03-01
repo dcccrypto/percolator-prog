@@ -5062,8 +5062,8 @@ fn proof_oi_cap_no_overflow() {
 #[cfg(kani)]
 #[kani::proof]
 fn proof_ramp_never_exceeds_configured_multiplier() {
-    use percolator_prog::verify::compute_ramp_multiplier;
     use percolator_prog::constants::RAMP_START_BPS;
+    use percolator_prog::verify::compute_ramp_multiplier;
 
     let oi_cap_multiplier_bps: u64 = kani::any();
     let market_created_slot: u64 = kani::any();

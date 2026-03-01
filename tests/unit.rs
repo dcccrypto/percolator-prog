@@ -3733,8 +3733,8 @@ fn test_ramp_disabled_returns_full_multiplier() {
 
 #[test]
 fn test_ramp_at_start() {
-    use percolator_prog::verify::compute_ramp_multiplier;
     use percolator_prog::constants::RAMP_START_BPS;
+    use percolator_prog::verify::compute_ramp_multiplier;
     // At market creation slot, ramp should return RAMP_START_BPS
     let result = compute_ramp_multiplier(100_000, 1000, 1000, 432_000);
     assert_eq!(result, RAMP_START_BPS);
@@ -3742,8 +3742,8 @@ fn test_ramp_at_start() {
 
 #[test]
 fn test_ramp_at_halfway() {
-    use percolator_prog::verify::compute_ramp_multiplier;
     use percolator_prog::constants::RAMP_START_BPS;
+    use percolator_prog::verify::compute_ramp_multiplier;
     // Halfway: 216k slots into 432k ramp
     let target = 100_000u64;
     let result = compute_ramp_multiplier(target, 0, 216_000, 432_000);
@@ -3755,16 +3755,25 @@ fn test_ramp_at_halfway() {
 fn test_ramp_complete() {
     use percolator_prog::verify::compute_ramp_multiplier;
     // After ramp complete, should return full multiplier
-    assert_eq!(compute_ramp_multiplier(100_000, 0, 432_000, 432_000), 100_000);
-    assert_eq!(compute_ramp_multiplier(100_000, 0, 500_000, 432_000), 100_000);
+    assert_eq!(
+        compute_ramp_multiplier(100_000, 0, 432_000, 432_000),
+        100_000
+    );
+    assert_eq!(
+        compute_ramp_multiplier(100_000, 0, 500_000, 432_000),
+        100_000
+    );
 }
 
 #[test]
 fn test_ramp_low_target_skips_ramp() {
-    use percolator_prog::verify::compute_ramp_multiplier;
     use percolator_prog::constants::RAMP_START_BPS;
+    use percolator_prog::verify::compute_ramp_multiplier;
     // If target <= RAMP_START_BPS, no ramp needed
-    assert_eq!(compute_ramp_multiplier(RAMP_START_BPS, 0, 0, 432_000), RAMP_START_BPS);
+    assert_eq!(
+        compute_ramp_multiplier(RAMP_START_BPS, 0, 0, 432_000),
+        RAMP_START_BPS
+    );
     assert_eq!(compute_ramp_multiplier(500, 0, 0, 432_000), 500);
 }
 
@@ -3786,7 +3795,13 @@ fn test_ramp_monotonic() {
     let mut prev = 0u64;
     for slot in (0..=500_000).step_by(100) {
         let result = compute_ramp_multiplier(target, 0, slot, 432_000);
-        assert!(result >= prev, "slot={} result={} prev={}", slot, result, prev);
+        assert!(
+            result >= prev,
+            "slot={} result={} prev={}",
+            slot,
+            result,
+            prev
+        );
         prev = result;
     }
 }
