@@ -1776,6 +1776,9 @@ pub mod ix {
             /// Max total positive PnL cap. 0 = disabled.
             /// None = don't change (backwards compatible).
             max_pnl_cap: Option<u64>,
+            /// PERC-298: Skew factor for OI cap tightening (bps, 0-10_000).
+            /// None = don't change (backwards compatible).
+            skew_factor_bps: Option<u16>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -2133,12 +2136,21 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // Optional: skew_factor_bps (PERC-298, backwards compatible)
+                    let skew_factor_bps = if rest.len() >= 2 {
+                        let val = u16::from_le_bytes([rest[0], rest[1]]);
+                        rest = &rest[2..];
+                        Some(val)
+                    } else {
+                        None
+                    };
                     Ok(Instruction::UpdateRiskParams {
                         initial_margin_bps,
                         maintenance_margin_bps,
                         trading_fee_bps,
                         oi_cap_multiplier_bps,
                         max_pnl_cap,
+                        skew_factor_bps,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2569,6 +2581,19 @@ pub mod state {
         /// 0 = disabled. Trades rejected if pnl_pos_tot would exceed this.
         /// Set via UpdateRiskParams. Prevents LP capital exhaustion.
         pub max_pnl_cap: u64,
+
+        // ========================================
+        // Skew-Adjusted OI Cap (PERC-298)
+        // ========================================
+        /// Skew factor in basis points for dynamic OI cap tightening.
+        /// When long/short OI is imbalanced, the effective OI cap is reduced:
+        /// effective_max_oi = max_oi * (1 - skew_ratio * skew_factor_bps / 10_000)
+        /// where skew_ratio = abs(long_oi - short_oi) / total_oi.
+        /// 0 = disabled (backwards compatible). Max 10_000 (full reduction at 100% skew).
+        /// Stored as u64 for Pod alignment (only lower 16 bits used).
+        pub skew_factor_bps: u64,
+        /// Reserved for future PERC-298 extensions (alignment padding for u128 fields).
+        pub _perc298_reserved: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4485,12 +4510,16 @@ pub mod processor {
         data: &[u8],
     ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable)
-        // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
-        // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
-        const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
+        // Accept old slabs that may be smaller due to struct growth migrations:
+        // - PERC-289: Account struct reordering (-8 bytes)
+        // - PERC-298: long_oi/short_oi + skew_factor_bps growth (-80 bytes from current)
+        const OLD_SLAB_LEN_V1: usize = SLAB_LEN - 8;  // Pre-PERC-289
+        const OLD_SLAB_LEN_V2: usize = SLAB_LEN - 80;  // Pre-PERC-298
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN
+                || data.len() == OLD_SLAB_LEN_V1
+                || data.len() == OLD_SLAB_LEN_V2,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -4532,23 +4561,55 @@ pub mod processor {
         Ok(())
     }
 
-    /// PERC-273: Check dynamic OI cap after trade execution.
-    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
+    /// PERC-273/298: Check dynamic OI cap after trade execution.
+    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= effective_max_oi.
+    /// PERC-298: When skew_factor_bps > 0, the effective cap is tightened based on
+    /// long/short OI imbalance: effective = base * (1 - skew_ratio * skew_factor / 10_000).
     fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
         let multiplier = config.oi_cap_multiplier_bps;
         if multiplier == 0 {
             return Ok(()); // OI cap disabled
         }
         let vault = engine.vault.get();
-        let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+        let base_max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+
+        // PERC-298: Apply skew-based tightening
+        let effective_max_oi = if config.skew_factor_bps > 0 {
+            let long = engine.long_oi.get();
+            let short = engine.short_oi.get();
+            let total = long.saturating_add(short);
+            if total > 0 {
+                let skew = if long >= short {
+                    long - short
+                } else {
+                    short - long
+                };
+                // reduction_bps = (skew * skew_factor_bps) / total_oi, capped at 10_000
+                let reduction_bps = skew
+                    .saturating_mul(config.skew_factor_bps as u128)
+                    .checked_div(total)
+                    .unwrap_or(0)
+                    .min(10_000);
+                base_max_oi
+                    .saturating_mul(10_000u128.saturating_sub(reduction_bps))
+                    / 10_000
+            } else {
+                base_max_oi
+            }
+        } else {
+            base_max_oi
+        };
+
         let current_oi = engine.total_open_interest.get();
-        if current_oi > max_oi {
+        if current_oi > effective_max_oi {
             msg!(
-                "OI cap exceeded: current={} max={} (vault={} multiplier={})",
+                "OI cap exceeded: current={} effective_max={} base_max={} (vault={} multiplier={} skew_factor={})",
                 current_oi,
-                max_oi,
+                effective_max_oi,
+                base_max_oi,
                 vault,
-                multiplier
+                multiplier,
+                config.skew_factor_bps
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -4861,6 +4922,9 @@ pub mod processor {
                     // PERC-273: OI cap disabled by default
                     oi_cap_multiplier_bps: 0,
                     max_pnl_cap: 0,
+                    // PERC-298: Skew-adjusted OI cap disabled by default
+                    skew_factor_bps: 0,
+                    _perc298_reserved: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -6620,6 +6684,7 @@ pub mod processor {
                 trading_fee_bps,
                 oi_cap_multiplier_bps,
                 max_pnl_cap,
+                skew_factor_bps,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -6665,7 +6730,11 @@ pub mod processor {
 
                 // PERC-273: Update OI cap multiplier if provided
                 // PERC-272: Update max PnL cap if provided
-                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() {
+                // PERC-298: Update skew factor if provided
+                if oi_cap_multiplier_bps.is_some()
+                    || max_pnl_cap.is_some()
+                    || skew_factor_bps.is_some()
+                {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
                         config.oi_cap_multiplier_bps = oi_cap;
@@ -6673,11 +6742,18 @@ pub mod processor {
                     if let Some(pnl_cap) = max_pnl_cap {
                         config.max_pnl_cap = pnl_cap;
                     }
+                    if let Some(skew) = skew_factor_bps {
+                        if skew > 10_000 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
+                        config.skew_factor_bps = skew as u64;
+                    }
                     state::write_config(&mut data, &config);
                     msg!(
-                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}",
+                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?} skew_factor={:?}",
                         oi_cap_multiplier_bps,
-                        max_pnl_cap
+                        max_pnl_cap,
+                        skew_factor_bps
                     );
                 }
 

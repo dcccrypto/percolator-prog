@@ -24,8 +24,9 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - haircut-ratio engine (no padding)
-// Updated for PERC-273: MarketConfig grew by 16 bytes (oi_cap_multiplier_bps + _oi_reserved)
-const SLAB_LEN: usize = 1025568;
+// Updated for PERC-298: MarketConfig grew by 16 bytes (skew_factor_bps + reserved)
+//                        RiskEngine grew by ~56 bytes (long_oi, short_oi U128 + alignment)
+const SLAB_LEN: usize = 1025648;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

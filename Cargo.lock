@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
-source = "git+https://github.com/dcccrypto/percolator.git?branch=master#87a83a834e7b0828665770740edd0f393836e078"
+source = "git+https://github.com/dcccrypto/percolator.git?branch=feature%2FPERC-298-skew-adjusted-oi-cap#f30736a7ea7a7514f32a4cc53cb3a4457c125643"
 
 [[package]]
 name = "percolator-prog"

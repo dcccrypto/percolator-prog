@@ -3719,6 +3719,149 @@ fn test_oi_cap_computation() {
     assert_eq!(max_oi2, 2_500);
 }
 
+// ================================================================
+// PERC-298: Skew-Adjusted OI Cap Tests
+// ================================================================
+
+#[test]
+fn test_skew_adjusted_cap_disabled_when_factor_zero() {
+    // When skew_factor_bps == 0, effective cap should equal base cap
+    let vault: u128 = 10_000;
+    let multiplier: u64 = 100_000; // 10x
+    let skew_factor_bps: u64 = 0;
+    let base_max = vault.saturating_mul(multiplier as u128) / 10_000;
+
+    // Skew factor 0 → no adjustment
+    let effective = if skew_factor_bps > 0 {
+        let long: u128 = 8_000;
+        let short: u128 = 2_000;
+        let total = long + short;
+        let skew = long - short;
+        let reduction = skew.saturating_mul(skew_factor_bps as u128) / total;
+        base_max.saturating_mul(10_000u128.saturating_sub(reduction.min(10_000))) / 10_000
+    } else {
+        base_max
+    };
+
+    assert_eq!(effective, base_max);
+    assert_eq!(effective, 100_000);
+}
+
+#[test]
+fn test_skew_adjusted_cap_reduces_with_imbalance() {
+    // vault=10_000, 10x → base_max=100_000
+    // long=80_000, short=20_000 → skew_ratio = 60_000/100_000 = 0.6
+    // skew_factor_bps=5000 (50%) → reduction = 0.6 * 5000 = 3000 bps
+    // effective = 100_000 * (10_000 - 3000) / 10_000 = 70_000
+    let vault: u128 = 10_000;
+    let multiplier: u64 = 100_000;
+    let base_max = vault.saturating_mul(multiplier as u128) / 10_000;
+
+    let long: u128 = 80_000;
+    let short: u128 = 20_000;
+    let total = long + short;
+    let skew = long - short; // 60_000
+
+    let skew_factor_bps: u64 = 5_000;
+    let reduction_bps = skew
+        .saturating_mul(skew_factor_bps as u128)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(10_000);
+    assert_eq!(reduction_bps, 3_000);
+
+    let effective = base_max
+        .saturating_mul(10_000u128.saturating_sub(reduction_bps))
+        / 10_000;
+    assert_eq!(effective, 70_000);
+}
+
+#[test]
+fn test_skew_adjusted_cap_balanced_market() {
+    // When long == short, skew = 0, so effective == base
+    let vault: u128 = 10_000;
+    let multiplier: u64 = 100_000;
+    let base_max = vault.saturating_mul(multiplier as u128) / 10_000;
+
+    let long: u128 = 50_000;
+    let short: u128 = 50_000;
+    let total = long + short;
+    let skew: u128 = 0;
+
+    let skew_factor_bps: u64 = 10_000; // max
+    let reduction_bps = skew
+        .saturating_mul(skew_factor_bps as u128)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(10_000);
+    assert_eq!(reduction_bps, 0);
+
+    let effective = base_max
+        .saturating_mul(10_000u128.saturating_sub(reduction_bps))
+        / 10_000;
+    assert_eq!(effective, base_max);
+}
+
+#[test]
+fn test_skew_adjusted_cap_fully_skewed() {
+    // 100% skew (all long, no short) with max factor
+    // reduction = 1.0 * 10_000 = 10_000 bps → effective = 0
+    let vault: u128 = 10_000;
+    let multiplier: u64 = 100_000;
+    let base_max = vault.saturating_mul(multiplier as u128) / 10_000;
+
+    let long: u128 = 100_000;
+    let short: u128 = 0;
+    let total = long + short;
+    let skew = long;
+
+    let skew_factor_bps: u64 = 10_000;
+    let reduction_bps = skew
+        .saturating_mul(skew_factor_bps as u128)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(10_000);
+    assert_eq!(reduction_bps, 10_000);
+
+    let effective = base_max
+        .saturating_mul(10_000u128.saturating_sub(reduction_bps))
+        / 10_000;
+    assert_eq!(effective, 0);
+}
+
+#[test]
+fn test_skew_adjusted_cap_zero_oi() {
+    // When total OI = 0, no skew adjustment (no positions yet)
+    let vault: u128 = 10_000;
+    let multiplier: u64 = 100_000;
+    let base_max = vault.saturating_mul(multiplier as u128) / 10_000;
+
+    let long: u128 = 0;
+    let short: u128 = 0;
+    let total = long + short;
+
+    let effective = if total > 0 {
+        let skew = 0u128;
+        let skew_factor_bps: u64 = 5_000;
+        let reduction_bps = skew
+            .saturating_mul(skew_factor_bps as u128)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(10_000);
+        base_max
+            .saturating_mul(10_000u128.saturating_sub(reduction_bps))
+            / 10_000
+    } else {
+        base_max
+    };
+
+    assert_eq!(effective, base_max);
+}
+
+// ================================================================
+// End PERC-298 Tests
+// ================================================================
+
 #[test]
 fn test_clear_resolved_flag() {
     use percolator_prog::state;
