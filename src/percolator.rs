@@ -2099,6 +2099,13 @@ pub mod ix {
         ClaimQueuedWithdrawal,
         /// PERC-309: Cancel queued withdrawal.
         CancelQueuedWithdrawal,
+        /// PERC-305: Keeper-triggered partial ADL.
+        /// Surgically close/reduce the most profitable position when
+        /// pnl_pos_tot exceeds max_pnl_cap. Permissionless.
+        /// Accounts: [caller(signer), slab(writable), clock, oracle]
+        ExecuteAdl {
+            target_idx: u16,
+        },
     }
 
     impl Instruction {
@@ -2502,6 +2509,10 @@ pub mod ix {
                 }
                 TAG_CLAIM_QUEUED_WITHDRAWAL => Ok(Instruction::ClaimQueuedWithdrawal),
                 TAG_CANCEL_QUEUED_WITHDRAWAL => Ok(Instruction::CancelQueuedWithdrawal),
+                TAG_EXECUTE_ADL => {
+                    let target_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::ExecuteAdl { target_idx })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -6515,9 +6526,12 @@ pub mod processor {
                                 };
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
-                                // SECURITY: Must use set_pnl() for correct haircut calculations
+                                // SECURITY: Use checked_add — saturating_add would silently
+                                // clamp on overflow, hiding accounting errors.
                                 let old_pnl = acc.pnl.get();
-                                let new_pnl = old_pnl.saturating_add(pnl_delta);
+                                let new_pnl = old_pnl
+                                    .checked_add(pnl_delta)
+                                    .ok_or(ProgramError::ArithmeticOverflow)?;
                                 engine.set_pnl(idx as usize, new_pnl);
 
                                 // Clear position
@@ -10479,6 +10493,154 @@ pub mod processor {
                 **queue_lamports = 0;
 
                 msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
+            }
+            // ========================================
+            // PERC-305: Partial Auto-Deleveraging
+            // ========================================
+            Instruction::ExecuteAdl { target_idx } => {
+                // Permissionless instruction: surgically close/reduce the most
+                // profitable position when pnl_pos_tot > max_pnl_cap.
+                // Accounts: [caller(signer), slab(writable), clock, oracle]
+                accounts::expect_len(accounts, 4)?;
+                let a_slab = &accounts[1];
+                let a_oracle = &accounts[3];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut config = state::read_config(&data);
+
+                // ADL requires max_pnl_cap to be set
+                if config.max_pnl_cap == 0 {
+                    msg!("ADL: max_pnl_cap not configured");
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                let clock = Clock::from_account_info(&accounts[2])?;
+
+                // Oracle price validates liveness. In hyperp mode, the keeper-pushed
+                // last_effective_price_e6 is the canonical mark; in oracle mode,
+                // read_price_clamped fetches and clamps from the feed.
+                // NOTE: price is intentionally unused for ADL settlement arithmetic —
+                // ADL reduces PnL proportionally, not at a mark price. The oracle
+                // read exists purely as a liveness / sanity gate.
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let _oracle_liveness_price = if is_hyperp {
+                    let idx = config.last_effective_price_e6;
+                    if idx == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    idx
+                } else {
+                    oracle::read_price_clamped(
+                        &mut config,
+                        a_oracle,
+                        clock.unix_timestamp,
+                        &accounts[4..],
+                    )?
+                };
+                state::write_config(&mut data, &config);
+
+                let engine = zc::engine_mut(&mut data)?;
+                check_idx(engine, target_idx)?;
+
+                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let cap = config.max_pnl_cap as u128;
+
+                // Precondition: PnL cap must be exceeded
+                if pnl_pos_tot <= cap {
+                    msg!(
+                        "ADL: pnl_pos_tot {} <= cap {}, not needed",
+                        pnl_pos_tot,
+                        cap
+                    );
+                    return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                }
+
+                let excess = pnl_pos_tot.saturating_sub(cap);
+                let idx = target_idx as usize;
+                let acc_pnl = engine.accounts[idx].pnl.get();
+                let pos = engine.accounts[idx].position_size.get();
+
+                // Target must have a profitable position
+                if acc_pnl <= 0 || pos == 0 {
+                    msg!("ADL: target {} has no profitable position", target_idx);
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // Determine how much PnL to reduce: min(target's PnL, excess)
+                let reduction = core::cmp::min(acc_pnl as u128, excess);
+
+                // Compute fraction of position to close: proportional to PnL reduction
+                let abs_pos = pos.unsigned_abs();
+                let closed_abs = if reduction as i128 >= acc_pnl {
+                    abs_pos // Full close
+                } else {
+                    // Partial: closed = abs_pos * reduction / acc_pnl
+                    (abs_pos as u128)
+                        .checked_mul(reduction)
+                        .and_then(|n| n.checked_div(acc_pnl as u128))
+                        .unwrap_or(abs_pos as u128) as u128
+                };
+
+                // Reduce position (checked to match rest of codebase — security review)
+                let new_pos = if pos > 0 {
+                    pos.checked_sub(closed_abs as i128)
+                        .ok_or(ProgramError::ArithmeticOverflow)?
+                } else {
+                    pos.checked_add(closed_abs as i128)
+                        .ok_or(ProgramError::ArithmeticOverflow)?
+                };
+                engine.accounts[idx].position_size = percolator::I128::new(new_pos);
+
+                // If fully closed, clear entry price
+                if new_pos == 0 {
+                    engine.accounts[idx].entry_price = 0;
+                }
+
+                // Reduce PnL: use checked_sub to fail explicitly on overflow
+                let new_pnl = acc_pnl
+                    .checked_sub(reduction as i128)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                engine.set_pnl(idx, new_pnl);
+
+                // Settle realized PnL to capital (checked_add for safety)
+                if reduction > 0 {
+                    let old_cap = engine.accounts[idx].capital.get();
+                    let new_cap = old_cap
+                        .checked_add(reduction)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    engine.set_capital(idx, new_cap);
+                }
+
+                // --- Update open interest counters (security review: MEDIUM) ---
+                // ADL reduces/closes positions; OI must reflect this to keep
+                // cap checks, funding rates, and risk decisions accurate.
+                // saturating_sub is correct here: OI should never go negative
+                // and in edge cases (stale counters) clamping to 0 is safe.
+                if pos > 0 {
+                    // Was long — reduce long OI
+                    let old_long_oi = engine.long_oi.get();
+                    engine.long_oi.set(old_long_oi.saturating_sub(closed_abs));
+                } else {
+                    // Was short — reduce short OI
+                    let old_short_oi = engine.short_oi.get();
+                    engine.short_oi.set(old_short_oi.saturating_sub(closed_abs));
+                }
+                let old_total_oi = engine.total_open_interest.get();
+                engine
+                    .total_open_interest
+                    .set(old_total_oi.saturating_sub(closed_abs));
+
+                msg!(
+                    "ADL: idx={} closed={} excess={} pnl_pos_tot_after={}",
+                    target_idx,
+                    closed_abs,
+                    excess,
+                    engine.pnl_pos_tot.get()
+                );
             }
             // Defense-in-depth: if a future tag routes here by mistake,
             // return an error instead of panicking (unreachable! aborts the tx).
