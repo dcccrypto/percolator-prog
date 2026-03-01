@@ -621,8 +621,11 @@ fn kani_nonce_wraps_at_max() {
     let old_nonce: u64 = kani::any();
     let new_nonce = nonce_on_success(old_nonce);
 
-    assert_eq!(new_nonce, old_nonce.wrapping_add(1),
-        "nonce_on_success must be wrapping increment");
+    assert_eq!(
+        new_nonce,
+        old_nonce.wrapping_add(1),
+        "nonce_on_success must be wrapping increment"
+    );
 }
 
 // =============================================================================
@@ -5697,28 +5700,50 @@ fn kani_decide_trade_cpi_universal() {
     let risk_increase: bool = kani::any();
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size,
+        old_nonce,
+        shape,
+        identity_ok,
+        pda_ok,
+        abi_ok,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
     let should_accept = matcher_shape_ok(shape)
-        && identity_ok && pda_ok && abi_ok
-        && user_auth_ok && lp_auth_ok
+        && identity_ok
+        && pda_ok
+        && abi_ok
+        && user_auth_ok
+        && lp_auth_ok
         && !(gate_active && risk_increase);
 
     if should_accept {
         match decision {
-            TradeCpiDecision::Accept { new_nonce, chosen_size } => {
-                assert_eq!(new_nonce, nonce_on_success(old_nonce),
-                    "accept nonce must be nonce_on_success(old_nonce)");
-                assert_eq!(chosen_size, exec_size,
-                    "accept chosen_size must equal exec_size");
+            TradeCpiDecision::Accept {
+                new_nonce,
+                chosen_size,
+            } => {
+                assert_eq!(
+                    new_nonce,
+                    nonce_on_success(old_nonce),
+                    "accept nonce must be nonce_on_success(old_nonce)"
+                );
+                assert_eq!(
+                    chosen_size, exec_size,
+                    "accept chosen_size must equal exec_size"
+                );
             }
             _ => panic!("all gates pass but got Reject"),
         }
     } else {
-        assert_eq!(decision, TradeCpiDecision::Reject,
-            "any gate failure must produce Reject");
+        assert_eq!(
+            decision,
+            TradeCpiDecision::Reject,
+            "any gate failure must produce Reject"
+        );
     }
 }
 
@@ -5749,7 +5774,10 @@ fn inductive_clamp_within_bounds() {
 
     let result = mark.clamp(lo, hi);
 
-    assert!(result >= lo && result <= hi, "clamp must stay within [lo, hi]");
+    assert!(
+        result >= lo && result <= hi,
+        "clamp must stay within [lo, hi]"
+    );
 }
 
 /// Universal: decide_trade_nocpi fully symbolic characterization.
@@ -5765,14 +5793,22 @@ fn kani_decide_trade_nocpi_universal() {
     let risk_increase: bool = kani::any();
 
     let decision = decide_trade_nocpi(
-        old_nonce, user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size,
+        old_nonce,
+        user_auth_ok,
+        lp_auth_ok,
+        gate_active,
+        risk_increase,
+        exec_size,
     );
 
     let should_accept = user_auth_ok && lp_auth_ok && !(gate_active && risk_increase);
 
     if should_accept {
         match decision {
-            TradeNoCpiDecision::Accept { new_nonce, chosen_size } => {
+            TradeNoCpiDecision::Accept {
+                new_nonce,
+                chosen_size,
+            } => {
                 assert_eq!(new_nonce, nonce_on_success(old_nonce));
                 assert_eq!(chosen_size, exec_size);
             }
