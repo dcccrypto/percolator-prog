@@ -5763,6 +5763,8 @@ pub mod processor {
         Ok(())
     }
 
+    // PERC-328: prevent SPL Account::unpack (~165 B) from inlining into caller
+    #[inline(never)]
     fn verify_vault(
         a_vault: &AccountInfo,
         expected_owner: &Pubkey,
@@ -5843,23 +5845,42 @@ pub mod processor {
         Ok(())
     }
 
-    /// PERC-331: InitMarket handler — extracted into its own `#[inline(never)]`
-    /// function so its large locals (RiskParams ~300 B, Pubkeys, feed_id) live on
-    /// a *separate* stack frame from the main 48-arm dispatch match.
-    ///
-    /// Config fields are written directly into the zeroed slab buffer via
-    /// `state::write_config_bytes`, avoiding a 496-byte `MarketConfig` on stack.
-    /// The main `process_instruction` never creates the `Instruction::InitMarket`
-    /// variant — it early-dispatches by tag byte, so the ~450-byte enum is also
-    /// avoided entirely.
+    // =========================================================================
+    // PERC-328: InitMarket — split into sub-functions for SBF 4 KiB frame limit
+    // =========================================================================
+    //
+    // The SBF runtime limits each call frame to 4096 bytes. LLVM allocates
+    // stack space for ALL locals at function entry (no scope-based reclaim),
+    // so a single large function with RiskParams (~304 B), Pubkeys (~96 B),
+    // SlabHeader (~104 B), SPL Mint/Account unpack (~247 B), Clock (~40 B),
+    // plus Result enums and temporaries easily exceeds 4 KiB.
+    //
+    // Fix: split into multiple #[inline(never)] sub-functions. Each gets its
+    // own 4 KiB frame. The orchestrator (process_init_market) holds only
+    // references and small scalars.
+    // =========================================================================
+
+    /// Parsed InitMarket instruction fields.
+    /// Kept as a flat struct so the orchestrator can pass a single reference
+    /// to sub-functions instead of 9+ arguments.
+    struct InitMarketIx {
+        admin: Pubkey,
+        collateral_mint: Pubkey,
+        index_feed_id: [u8; 32],
+        max_staleness_secs: u64,
+        conf_filter_bps: u16,
+        invert: u8,
+        unit_scale: u32,
+        initial_mark_price_e6: u64,
+        risk_params: percolator::RiskParams,
+    }
+
+    /// Phase 1: Parse instruction data into `InitMarketIx`.
+    /// Lives in its own frame so the ~304-byte RiskParams construction
+    /// and intermediate read_* temporaries don't bloat the caller.
     #[inline(never)]
-    fn process_init_market<'a, 'b>(
-        program_id: &Pubkey,
-        accounts: &'b [AccountInfo<'a>],
-        instruction_data: &[u8],
-    ) -> ProgramResult {
-        // Parse fields directly from raw bytes — skip tag byte (already checked)
-        let mut rest = &instruction_data[1..];
+    fn parse_init_market_ix(instruction_data: &[u8]) -> Result<InitMarketIx, ProgramError> {
+        let mut rest = &instruction_data[1..]; // skip tag byte
         let admin = ix::read_pubkey(&mut rest)?;
         let collateral_mint = ix::read_pubkey(&mut rest)?;
         let index_feed_id = ix::read_bytes32(&mut rest)?;
@@ -5869,26 +5890,23 @@ pub mod processor {
         let unit_scale = ix::read_u32(&mut rest)?;
         let initial_mark_price_e6 = ix::read_u64(&mut rest)?;
         let risk_params = ix::read_risk_params(&mut rest)?;
+        Ok(InitMarketIx {
+            admin,
+            collateral_mint,
+            index_feed_id,
+            max_staleness_secs,
+            conf_filter_bps,
+            invert,
+            unit_scale,
+            initial_mark_price_e6,
+            risk_params,
+        })
+    }
 
-        accounts::expect_len(accounts, 9)?;
-        let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
-        let a_mint = &accounts[2];
-        let a_vault = &accounts[3];
-
-        accounts::expect_signer(a_admin)?;
-        accounts::expect_writable(a_slab)?;
-
-        if admin != *a_admin.key {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        // SECURITY (H1): Enforce collateral_mint matches the account
-        if collateral_mint != *a_mint.key {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        // SECURITY (H2): Validate mint is a real SPL Token mint
+    /// Phase 2a: Validate SPL Mint account (own frame to isolate Mint::unpack).
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn validate_init_mint(a_mint: &AccountInfo) -> ProgramResult {
         #[cfg(not(feature = "test"))]
         {
             use solana_program::program_pack::Pack;
@@ -5902,37 +5920,289 @@ pub mod processor {
             let mint_data = a_mint.try_borrow_data()?;
             let _ = Mint::unpack(&mint_data)?;
         }
+        Ok(())
+    }
 
-        // SECURITY (#299): Enforce minimum seed deposit to prevent market spam.
-        {
-            let vault_data = a_vault.try_borrow_data()?;
-            if vault_data.len() >= 72 {
-                let amount = u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
-                if amount < crate::constants::MIN_INIT_MARKET_SEED {
-                    msg!(
-                        "InitMarket: seed deposit {} < minimum {}",
-                        amount,
-                        crate::constants::MIN_INIT_MARKET_SEED
-                    );
-                    return Err(PercolatorError::InsufficientSeed.into());
-                }
+    /// Phase 2b: Check minimum seed deposit in vault raw bytes.
+    #[inline(never)]
+    fn check_seed_deposit(a_vault: &AccountInfo) -> ProgramResult {
+        let vault_data = a_vault.try_borrow_data()?;
+        if vault_data.len() >= 72 {
+            let amount = u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
+            if amount < crate::constants::MIN_INIT_MARKET_SEED {
+                msg!(
+                    "InitMarket: seed deposit {} < minimum {}",
+                    amount,
+                    crate::constants::MIN_INIT_MARKET_SEED
+                );
+                return Err(PercolatorError::InsufficientSeed.into());
             }
         }
+        Ok(())
+    }
 
-        if !crate::verify::init_market_scale_ok(unit_scale) {
+    /// Phase 2c: Validate vault via SPL Account::unpack (own frame: ~165 B Account).
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn check_vault_balance(a_vault: &AccountInfo) -> ProgramResult {
+        #[cfg(not(feature = "test"))]
+        {
+            let vault_data = a_vault.try_borrow_data()?;
+            let vault_tok = spl_token::state::Account::unpack(&vault_data)?;
+            if vault_tok.amount < crate::constants::MIN_INIT_MARKET_SEED_LAMPORTS {
+                return Err(PercolatorError::InsufficientSeed.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 3a: Initialize engine in-place and set clock slots.
+    /// Isolates RiskParams copy (304 B) and Clock deser (~40 B) from caller.
+    #[inline(never)]
+    fn init_engine_and_clock<'a, 'b>(
+        data: &mut [u8],
+        risk_params: percolator::RiskParams,
+        a_clock: &'b AccountInfo<'a>,
+    ) -> Result<u64, ProgramError> {
+        let engine = zc::engine_mut(data)?;
+        engine
+            .init_in_place(risk_params)
+            .map_err(crate::error::map_risk_error)?;
+
+        let clock = Clock::from_account_info(a_clock)?;
+        engine.current_slot = clock.slot;
+        engine.last_funding_slot = clock.slot;
+        engine.last_crank_slot = clock.slot;
+        Ok(clock.slot)
+    }
+
+    /// Phase 3b: Write MarketConfig fields into the zeroed slab buffer.
+    /// Each wcb() call is tiny, but there are ~25 of them, and the many
+    /// `.to_le_bytes()` temporaries (8-byte arrays) add up.
+    #[inline(never)]
+    fn write_init_config(
+        data: &mut [u8],
+        a_mint_key: &Pubkey,
+        a_vault_key: &Pubkey,
+        ix: &InitMarketIx,
+        effective_mark_price_e6: u64,
+        bump: u8,
+        slot: u64,
+    ) -> ProgramResult {
+        use core::mem::offset_of;
+        use state::write_config_bytes as wcb;
+        type MC = MarketConfig;
+
+        let is_hyperp = ix.index_feed_id == [0u8; 32];
+
+        wcb(
+            data,
+            offset_of!(MC, collateral_mint),
+            &a_mint_key.to_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, vault_pubkey),
+            &a_vault_key.to_bytes(),
+        );
+        wcb(data, offset_of!(MC, index_feed_id), &ix.index_feed_id);
+        wcb(
+            data,
+            offset_of!(MC, max_staleness_secs),
+            &ix.max_staleness_secs.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, conf_filter_bps),
+            &ix.conf_filter_bps.to_le_bytes(),
+        );
+        wcb(data, offset_of!(MC, vault_authority_bump), &[bump]);
+        wcb(data, offset_of!(MC, invert), &[ix.invert]);
+        wcb(
+            data,
+            offset_of!(MC, unit_scale),
+            &ix.unit_scale.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_horizon_slots),
+            &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_k_bps),
+            &DEFAULT_FUNDING_K_BPS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_inv_scale_notional_e6),
+            &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_max_premium_bps),
+            &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_max_bps_per_slot),
+            &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_premium_dampening_e6),
+            &1_000_000u64.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, funding_premium_max_bps_per_slot),
+            &5i64.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_floor),
+            &DEFAULT_THRESH_FLOOR.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_risk_bps),
+            &DEFAULT_THRESH_RISK_BPS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_update_interval_slots),
+            &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_step_bps),
+            &DEFAULT_THRESH_STEP_BPS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_alpha_bps),
+            &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_min),
+            &DEFAULT_THRESH_MIN.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_max),
+            &DEFAULT_THRESH_MAX.to_le_bytes(),
+        );
+        wcb(
+            data,
+            offset_of!(MC, thresh_min_step),
+            &DEFAULT_THRESH_MIN_STEP.to_le_bytes(),
+        );
+        if is_hyperp {
+            wcb(
+                data,
+                offset_of!(MC, authority_price_e6),
+                &effective_mark_price_e6.to_le_bytes(),
+            );
+        }
+        let cap = if is_hyperp {
+            DEFAULT_HYPERP_PRICE_CAP_E2BPS
+        } else {
+            DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
+        };
+        wcb(
+            data,
+            offset_of!(MC, oracle_price_cap_e2bps),
+            &cap.to_le_bytes(),
+        );
+        if is_hyperp {
+            wcb(
+                data,
+                offset_of!(MC, last_effective_price_e6),
+                &effective_mark_price_e6.to_le_bytes(),
+            );
+        }
+        wcb(
+            data,
+            offset_of!(MC, market_created_slot),
+            &slot.to_le_bytes(),
+        );
+        wcb(data, offset_of!(MC, safety_valve_epochs), &[5u8]);
+        Ok(())
+    }
+
+    /// Phase 3c: Write slab header + nonce + threshold slot.
+    /// Isolates the 104-byte SlabHeader from the orchestrator frame.
+    #[inline(never)]
+    fn write_init_header(data: &mut [u8], admin_key: &Pubkey, bump: u8) -> ProgramResult {
+        let new_header = SlabHeader {
+            magic: MAGIC,
+            version: VERSION,
+            bump,
+            _padding: [0; 3],
+            admin: admin_key.to_bytes(),
+            pending_admin: [0; 32],
+            _reserved: [0; 24],
+        };
+        state::write_header(data, &new_header);
+        state::write_req_nonce(data, 0);
+        state::write_last_thr_update_slot(data, 0);
+        Ok(())
+    }
+
+    /// PERC-328 / PERC-331: InitMarket orchestrator.
+    ///
+    /// This is a thin dispatcher whose own stack frame holds only references
+    /// and small scalars (<512 bytes). All heavy lifting (parsing, SPL
+    /// validation, engine init, config writes) happens in dedicated
+    /// `#[inline(never)]` sub-functions, each with its own 4 KiB frame.
+    #[inline(never)]
+    fn process_init_market<'a, 'b>(
+        program_id: &Pubkey,
+        accounts: &'b [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        // Phase 1 — parse instruction (RiskParams + Pubkeys in callee frame)
+        let ix = parse_init_market_ix(instruction_data)?;
+
+        // Account setup (only references — 8 bytes each)
+        accounts::expect_len(accounts, 9)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_mint = &accounts[2];
+        let a_vault = &accounts[3];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        if ix.admin != *a_admin.key {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        let is_hyperp = index_feed_id == [0u8; 32];
-        if is_hyperp && initial_mark_price_e6 == 0 {
+        // SECURITY (H1): Enforce collateral_mint matches the account
+        if ix.collateral_mint != *a_mint.key {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        let initial_mark_price_e6 = if is_hyperp && invert != 0 {
-            crate::verify::invert_price_e6(initial_mark_price_e6, invert)
+        // Phase 2 — validation (SPL unpack in callee frames)
+        validate_init_mint(a_mint)?;
+        check_seed_deposit(a_vault)?;
+
+        if !crate::verify::init_market_scale_ok(ix.unit_scale) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let is_hyperp = ix.index_feed_id == [0u8; 32];
+        if is_hyperp && ix.initial_mark_price_e6 == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Compute effective mark price (only for inverted hyperp)
+        let effective_mark = if is_hyperp && ix.invert != 0 {
+            crate::verify::invert_price_e6(ix.initial_mark_price_e6, ix.invert)
                 .ok_or(PercolatorError::OracleInvalid)?
         } else {
-            initial_mark_price_e6
+            ix.initial_mark_price_e6
         };
 
         #[cfg(debug_assertions)]
@@ -5942,196 +6212,40 @@ pub mod processor {
             }
         }
 
+        // Slab access + pre-init checks
         let mut data = state::slab_data_mut(a_slab)?;
         slab_guard(program_id, a_slab, &data)?;
         let _ = zc::engine_mut(&mut data)?;
 
-        let header = state::read_header(&data);
-        if header.magic == MAGIC {
-            return Err(PercolatorError::AlreadyInitialized.into());
+        // Check not already initialized (reads 104-byte header into callee)
+        {
+            let header = state::read_header(&data);
+            if header.magic == MAGIC {
+                return Err(PercolatorError::AlreadyInitialized.into());
+            }
         }
 
         let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
         verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
+        check_vault_balance(a_vault)?;
 
-        #[cfg(not(feature = "test"))]
-        {
-            let vault_data = a_vault.try_borrow_data()?;
-            let vault_tok = spl_token::state::Account::unpack(&vault_data)?;
-            if vault_tok.amount < crate::constants::MIN_INIT_MARKET_SEED_LAMPORTS {
-                return Err(PercolatorError::InsufficientSeed.into());
-            }
-        }
-
+        // Zero the slab
         for b in data.iter_mut() {
             *b = 0;
         }
 
-        let engine = zc::engine_mut(&mut data)?;
-        engine
-            .init_in_place(risk_params)
-            .map_err(crate::error::map_risk_error)?;
-
-        let a_clock = &accounts[5];
-        let clock = Clock::from_account_info(a_clock)?;
-        engine.current_slot = clock.slot;
-        engine.last_funding_slot = clock.slot;
-        engine.last_crank_slot = clock.slot;
-
-        // Write config fields directly into the zeroed slab buffer.
-        // Avoids constructing a 496-byte MarketConfig on the stack.
-        {
-            use core::mem::offset_of;
-            use state::write_config_bytes as wcb;
-            type MC = MarketConfig;
-
-            wcb(
-                &mut data,
-                offset_of!(MC, collateral_mint),
-                &a_mint.key.to_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, vault_pubkey),
-                &a_vault.key.to_bytes(),
-            );
-            wcb(&mut data, offset_of!(MC, index_feed_id), &index_feed_id);
-            wcb(
-                &mut data,
-                offset_of!(MC, max_staleness_secs),
-                &max_staleness_secs.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, conf_filter_bps),
-                &conf_filter_bps.to_le_bytes(),
-            );
-            wcb(&mut data, offset_of!(MC, vault_authority_bump), &[bump]);
-            wcb(&mut data, offset_of!(MC, invert), &[invert]);
-            wcb(
-                &mut data,
-                offset_of!(MC, unit_scale),
-                &unit_scale.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_horizon_slots),
-                &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_k_bps),
-                &DEFAULT_FUNDING_K_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_inv_scale_notional_e6),
-                &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_max_premium_bps),
-                &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_max_bps_per_slot),
-                &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_premium_dampening_e6),
-                &1_000_000u64.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_premium_max_bps_per_slot),
-                &5i64.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_floor),
-                &DEFAULT_THRESH_FLOOR.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_risk_bps),
-                &DEFAULT_THRESH_RISK_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_update_interval_slots),
-                &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_step_bps),
-                &DEFAULT_THRESH_STEP_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_alpha_bps),
-                &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_min),
-                &DEFAULT_THRESH_MIN.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_max),
-                &DEFAULT_THRESH_MAX.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_min_step),
-                &DEFAULT_THRESH_MIN_STEP.to_le_bytes(),
-            );
-            if is_hyperp {
-                wcb(
-                    &mut data,
-                    offset_of!(MC, authority_price_e6),
-                    &initial_mark_price_e6.to_le_bytes(),
-                );
-            }
-            let cap = if is_hyperp {
-                DEFAULT_HYPERP_PRICE_CAP_E2BPS
-            } else {
-                DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
-            };
-            wcb(
-                &mut data,
-                offset_of!(MC, oracle_price_cap_e2bps),
-                &cap.to_le_bytes(),
-            );
-            if is_hyperp {
-                wcb(
-                    &mut data,
-                    offset_of!(MC, last_effective_price_e6),
-                    &initial_mark_price_e6.to_le_bytes(),
-                );
-            }
-            wcb(
-                &mut data,
-                offset_of!(MC, market_created_slot),
-                &clock.slot.to_le_bytes(),
-            );
-            wcb(&mut data, offset_of!(MC, safety_valve_epochs), &[5u8]);
-        }
-
-        let new_header = SlabHeader {
-            magic: MAGIC,
-            version: VERSION,
+        // Phase 3 — write engine, config, and header (each in own frame)
+        let slot = init_engine_and_clock(&mut data, ix.risk_params, &accounts[5])?;
+        write_init_config(
+            &mut data,
+            a_mint.key,
+            a_vault.key,
+            &ix,
+            effective_mark,
             bump,
-            _padding: [0; 3],
-            admin: a_admin.key.to_bytes(),
-            pending_admin: [0; 32],
-            _reserved: [0; 24],
-        };
-        state::write_header(&mut data, &new_header);
-        state::write_req_nonce(&mut data, 0);
-        state::write_last_thr_update_slot(&mut data, 0);
+            slot,
+        )?;
+        write_init_header(&mut data, a_admin.key, bump)?;
         Ok(())
     }
 
