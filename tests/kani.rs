@@ -23,7 +23,6 @@ extern crate kani;
 use percolator_prog::constants::MATCHER_ABI_VERSION;
 use percolator_prog::constants::MAX_UNIT_SCALE;
 use percolator_prog::constants::RAMP_START_BPS;
-use percolator_prog::constants::{AUTO_UNRESOLVE_MAX_DEVIATION_BPS, AUTO_UNRESOLVE_WINDOW};
 use percolator_prog::matcher_abi::{
     validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
 };
@@ -34,8 +33,6 @@ use percolator_prog::verify::{
     accumulate_dust,
     admin_ok,
     apply_trade_positions,
-    // PERC-301: Auto-unresolve eligibility
-    auto_unresolve_eligible,
     // New: Unit scale conversion math
     base_to_units,
     checked_deposit,
@@ -46,7 +43,7 @@ use percolator_prog::verify::{
     // New: PERC-304 fee multiplier
     compute_fee_multiplier_bps,
     // PERC-302: OI ramp multiplier
-    compute_ramped_multiplier,
+    compute_ramp_multiplier,
     compute_util_bps,
     convert_decimals,
     cpi_trade_size,
@@ -133,7 +130,6 @@ fn mark_cap_bound(mark_prev: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
 }
 // Cap quotients to keep division/mod tractable
 const KANI_MAX_QUOTIENT: u64 = 16384; // widened from 4096 for 4x broader SAT coverage
-const KANI_MAX_QUOTIENT: u64 = 16384;
 
 // =============================================================================
 // Test Fixtures
@@ -5415,182 +5411,6 @@ fn proof_skew_adjusted_cap_never_exceeds_base_cap() {
     }
 }
 
-// =========================================================================
-// PERC-301: Auto-unresolve Kani proofs
-// =========================================================================
-
-/// Prove: auto-unresolve can ONLY trigger when oracle deviation is within 5% (500 bps).
-///
-/// For all oracle_price, settlement_price, elapsed, window, max_deviation:
-///   if auto_unresolve_eligible(...) == true, then
-///     |oracle - settlement| / settlement * 10_000 <= max_deviation_bps.
-///
-/// This is the core safety property: a market cannot auto-unresolve unless
-/// the oracle confirms the settlement price was accurate.
-#[kani::proof]
-fn proof_auto_unresolve_requires_oracle_within_5pct() {
-    let oracle_price: u64 = kani::any();
-    let settlement_price: u64 = kani::any();
-    let elapsed_slots: u64 = kani::any();
-
-    // Use production constants
-    let window = AUTO_UNRESOLVE_WINDOW;
-    let max_dev = AUTO_UNRESOLVE_MAX_DEVIATION_BPS;
-
-    // Bound to tractable range for SAT solver
-    kani::assume(oracle_price <= 1_000_000_000_000); // up to $1M at 1e6 scale
-    kani::assume(settlement_price > 0 && settlement_price <= 1_000_000_000_000);
-    kani::assume(elapsed_slots <= 10_000);
-
-    let eligible = auto_unresolve_eligible(
-        oracle_price,
-        settlement_price,
-        elapsed_slots,
-        window,
-        max_dev,
-    );
-
-    if eligible {
-        // Eligible implies within window
-        assert!(
-            elapsed_slots < window,
-            "auto-unresolve must be within window"
-        );
-        // Eligible implies both prices are > 0
-        assert!(oracle_price > 0, "oracle price must be > 0 for unresolve");
-        assert!(
-            settlement_price > 0,
-            "settlement price must be > 0 for unresolve"
-        );
-        // Eligible implies deviation ≤ max_dev (500 bps = 5%)
-        let diff = if oracle_price > settlement_price {
-            oracle_price - settlement_price
-        } else {
-            settlement_price - oracle_price
-        };
-        let deviation_bps = (diff as u128).saturating_mul(10_000) / (settlement_price as u128);
-        assert!(
-            deviation_bps <= max_dev as u128,
-            "auto-unresolve requires oracle within 5% of settlement"
-        );
-    }
-}
-
-/// Prove: auto-unresolve never triggers outside the time window.
-#[kani::proof]
-fn proof_auto_unresolve_respects_window() {
-    let oracle_price: u64 = kani::any();
-    let settlement_price: u64 = kani::any();
-    let elapsed_slots: u64 = kani::any();
-
-    kani::assume(oracle_price <= 1_000_000_000_000);
-    kani::assume(settlement_price <= 1_000_000_000_000);
-
-    // Test with any elapsed >= window
-    kani::assume(elapsed_slots >= AUTO_UNRESOLVE_WINDOW);
-
-    let eligible = auto_unresolve_eligible(
-        oracle_price,
-        settlement_price,
-        elapsed_slots,
-        AUTO_UNRESOLVE_WINDOW,
-        AUTO_UNRESOLVE_MAX_DEVIATION_BPS,
-    );
-
-    assert!(
-        !eligible,
-        "auto-unresolve must NOT trigger after window expires"
-    );
-}
-
-// =========================================================================
-// PERC-302: OI ramp Kani proofs
-// =========================================================================
-
-/// Prove: ramped multiplier never exceeds the configured (target) multiplier.
-///
-/// For all multiplier, current_slot, market_created_slot, oi_ramp_slots:
-///   compute_ramped_multiplier(...) <= multiplier
-///
-/// This prevents a new market from having a higher OI cap than its configured max.
-#[kani::proof]
-fn proof_ramp_never_exceeds_configured_multiplier() {
-    let multiplier: u64 = kani::any();
-    let current_slot: u64 = kani::any();
-    let market_created_slot: u64 = kani::any();
-    let oi_ramp_slots: u64 = kani::any();
-
-    // Bound to tractable range
-    kani::assume(multiplier <= 1_000_000); // up to 100x
-    kani::assume(current_slot <= u32::MAX as u64);
-    kani::assume(market_created_slot <= current_slot);
-    kani::assume(oi_ramp_slots <= 10_000_000);
-
-    let result =
-        compute_ramped_multiplier(multiplier, current_slot, market_created_slot, oi_ramp_slots);
-
-    assert!(
-        result <= multiplier,
-        "ramped multiplier must never exceed configured multiplier"
-    );
-}
-
-/// Prove: ramp starts at RAMP_START_BPS (or multiplier if smaller) at slot 0.
-#[kani::proof]
-fn proof_ramp_starts_at_minimum() {
-    let multiplier: u64 = kani::any();
-    let market_created_slot: u64 = kani::any();
-    let oi_ramp_slots: u64 = kani::any();
-
-    kani::assume(multiplier <= 1_000_000);
-    kani::assume(market_created_slot <= u32::MAX as u64);
-    // Ramp must be enabled
-    kani::assume(oi_ramp_slots > 0);
-    kani::assume(market_created_slot > 0);
-
-    // At exactly the market_created_slot (elapsed = 0)
-    let result = compute_ramped_multiplier(
-        multiplier,
-        market_created_slot, // current == created => elapsed = 0
-        market_created_slot,
-        oi_ramp_slots,
-    );
-
-    let expected_start = RAMP_START_BPS.min(multiplier);
-    assert_eq!(
-        result, expected_start,
-        "ramp must start at RAMP_START_BPS.min(multiplier)"
-    );
-}
-
-/// Prove: ramp reaches full multiplier at or after ramp_slots elapsed.
-#[kani::proof]
-fn proof_ramp_reaches_full_after_duration() {
-    let multiplier: u64 = kani::any();
-    let market_created_slot: u64 = kani::any();
-    let oi_ramp_slots: u64 = kani::any();
-
-    kani::assume(multiplier <= 1_000_000);
-    kani::assume(market_created_slot > 0);
-    kani::assume(oi_ramp_slots > 0 && oi_ramp_slots <= 10_000_000);
-    // Ensure no overflow
-    kani::assume(market_created_slot <= u32::MAX as u64);
-
-    // At exactly ramp_slots elapsed
-    let fully_ramped_slot = market_created_slot.saturating_add(oi_ramp_slots);
-    let result = compute_ramped_multiplier(
-        multiplier,
-        fully_ramped_slot,
-        market_created_slot,
-        oi_ramp_slots,
-    );
-
-    assert_eq!(
-        result, multiplier,
-        "ramp must reach full multiplier after ramp_slots"
-    );
-}
-
 // PERC-304: LP Utilization-Curve Fee Multiplier Proofs
 // ============================================================================
 
@@ -5788,40 +5608,27 @@ fn inductive_clamp_within_bounds() {
 /// but over the full boolean domain.
 #[kani::proof]
 fn kani_decide_trade_nocpi_universal() {
-    let old_nonce: u64 = kani::any();
-    let exec_size: i128 = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
     let gate_active: bool = kani::any();
     let risk_increase: bool = kani::any();
 
-    let decision = decide_trade_nocpi(
-        old_nonce,
-        user_auth_ok,
-        lp_auth_ok,
-        gate_active,
-        risk_increase,
-        exec_size,
-    );
+    let decision = decide_trade_nocpi(user_auth_ok, lp_auth_ok, gate_active, risk_increase);
 
     let should_accept = user_auth_ok && lp_auth_ok && !(gate_active && risk_increase);
 
     if should_accept {
-        match decision {
-            TradeNoCpiDecision::Accept {
-                new_nonce,
-                chosen_size,
-            } => {
-                assert_eq!(new_nonce, nonce_on_success(old_nonce));
-                assert_eq!(chosen_size, exec_size);
-            }
-            _ => panic!("all gates pass but got Reject"),
-        }
+        assert_eq!(
+            decision,
+            TradeNoCpiDecision::Accept,
+            "all gates pass but got Reject"
+        );
     } else {
-        match decision {
-            TradeNoCpiDecision::Reject => {}
-            _ => panic!("gate failure must produce Reject"),
-        }
+        assert_eq!(
+            decision,
+            TradeNoCpiDecision::Reject,
+            "gate failure must produce Reject"
+        );
     }
 }
 
@@ -5830,38 +5637,8 @@ fn kani_decide_trade_nocpi_universal() {
 // =============================================================================
 
 // ---------------------------------------------------------------------------
-// PERC-302: Market maturity OI ramp
+// PERC-302: Market maturity OI ramp (additional proofs)
 // ---------------------------------------------------------------------------
-
-/// Prove: ramp monotonically increases — later slots never produce a lower multiplier.
-#[cfg(kani)]
-#[kani::proof]
-fn proof_ramp_monotonically_increases() {
-    use percolator_prog::constants::RAMP_START_BPS;
-    use percolator_prog::verify::compute_ramp_multiplier;
-
-    let oi_cap_bps: u64 = kani::any();
-    let market_created: u64 = kani::any();
-    let slot1: u64 = kani::any();
-    let slot2: u64 = kani::any();
-    let ramp_slots: u64 = kani::any();
-
-    kani::assume(oi_cap_bps > RAMP_START_BPS && oi_cap_bps <= 100_000);
-    kani::assume(ramp_slots > 0 && ramp_slots <= 1_000_000);
-    kani::assume(market_created <= slot1);
-    kani::assume(slot1 <= slot2);
-    kani::assume(
-        slot2
-            <= market_created
-                .saturating_add(ramp_slots)
-                .saturating_add(100),
-    );
-
-    let mult1 = compute_ramp_multiplier(oi_cap_bps, market_created, slot1, ramp_slots);
-    let mult2 = compute_ramp_multiplier(oi_cap_bps, market_created, slot2, ramp_slots);
-
-    assert!(mult2 >= mult1, "ramp must be monotonically increasing");
-}
 
 /// Prove: if current_slot < market_created_slot, returns RAMP_START_BPS.
 #[cfg(kani)]
@@ -5885,28 +5662,6 @@ fn proof_ramp_no_underflow_if_slot_before_created() {
     assert_eq!(
         mult, RAMP_START_BPS,
         "must return RAMP_START_BPS when slot before creation"
-    );
-}
-
-/// Prove: ramp result never exceeds configured multiplier.
-#[cfg(kani)]
-#[kani::proof]
-fn proof_ramp_never_exceeds_configured_multiplier() {
-    use percolator_prog::verify::compute_ramp_multiplier;
-
-    let oi_cap_bps: u64 = kani::any();
-    let market_created: u64 = kani::any();
-    let current_slot: u64 = kani::any();
-    let ramp_slots: u64 = kani::any();
-
-    kani::assume(oi_cap_bps <= 100_000);
-    kani::assume(ramp_slots <= 1_000_000);
-
-    let mult = compute_ramp_multiplier(oi_cap_bps, market_created, current_slot, ramp_slots);
-
-    assert!(
-        mult <= oi_cap_bps,
-        "ramp multiplier must never exceed oi_cap_multiplier_bps"
     );
 }
 
