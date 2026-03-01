@@ -74,6 +74,10 @@ pub const TAG_FUND_MARKET_INSURANCE: u8 = 41;
 /// Set insurance isolation BPS for a market (PERC-306).
 /// Admin configures max % of global fund this market can access.
 pub const TAG_SET_INSURANCE_ISOLATION: u8 = 42;
+/// PERC-314: Challenge settlement price during dispute window.
+pub const TAG_CHALLENGE_SETTLEMENT: u8 = 43;
+/// PERC-314: Resolve dispute (admin adjudication).
+pub const TAG_RESOLVE_DISPUTE: u8 = 44;
 
 #[cfg(test)]
 mod tests {
@@ -126,6 +130,8 @@ mod tests {
             TAG_LP_VAULT_CRANK_FEES,
             TAG_FUND_MARKET_INSURANCE,
             TAG_SET_INSURANCE_ISOLATION,
+            TAG_CHALLENGE_SETTLEMENT,
+            TAG_RESOLVE_DISPUTE,
         ];
 
         for i in 0..tags.len() {
@@ -182,6 +188,8 @@ mod tests {
             TAG_LP_VAULT_CRANK_FEES,
             TAG_FUND_MARKET_INSURANCE,
             TAG_SET_INSURANCE_ISOLATION,
+            TAG_CHALLENGE_SETTLEMENT,
+            TAG_RESOLVE_DISPUTE,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {

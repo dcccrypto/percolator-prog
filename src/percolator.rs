@@ -47,7 +47,7 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
-    const _: [(); 448] = [(); CONFIG_LEN];
+    const _: [(); 480] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -1671,6 +1671,14 @@ pub mod error {
         LpVaultNoNewFees,
         /// PERC-312: Safety valve — new position on dominant side blocked during rebalancing.
         SafetyValveDominantSideBlocked,
+        /// PERC-314: Dispute window has closed.
+        DisputeWindowClosed,
+        /// PERC-314: Dispute already exists for this market.
+        DisputeAlreadyExists,
+        /// PERC-314: Market not resolved — cannot dispute.
+        MarketNotResolved,
+        /// PERC-314: No active dispute to resolve.
+        NoActiveDispute,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1988,6 +1996,14 @@ pub mod ix {
         /// Accounts: [admin(signer), slab(writable)]
         SetInsuranceIsolation {
             bps: u16,
+        },
+        /// PERC-314: Challenge settlement price.
+        ChallengeSettlement {
+            proposed_price_e6: u64,
+        },
+        /// PERC-314: Resolve dispute (admin).
+        ResolveDispute {
+            accept: u8,
         },
     }
 
@@ -2344,6 +2360,14 @@ pub mod ix {
                     let bps = read_u16(&mut rest)?;
                     Ok(Instruction::SetInsuranceIsolation { bps })
                 }
+                TAG_CHALLENGE_SETTLEMENT => {
+                    let proposed_price_e6 = read_u64(&mut rest)?;
+                    Ok(Instruction::ChallengeSettlement { proposed_price_e6 })
+                }
+                TAG_RESOLVE_DISPUTE => {
+                    let accept = read_u8(&mut rest)?;
+                    Ok(Instruction::ResolveDispute { accept })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -2541,6 +2565,11 @@ pub mod accounts {
             program_id,
         )
     }
+
+    /// PERC-314: Derive settlement dispute PDA.
+    pub fn derive_dispute(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"dispute", slab_key.as_ref()], program_id)
+    }
 }
 
 // 6. mod state
@@ -2719,6 +2748,18 @@ pub mod state {
         /// Penalty rate in bps per slot applied to position funding when oracle stale.
         pub orphan_penalty_bps_per_slot: u16,
         pub _orphan_pad: [u8; 6],
+
+        // ========================================
+        // Settlement Dispute (PERC-314)
+        // ========================================
+        /// Dispute window in slots after resolution. 0 = disputes disabled.
+        pub dispute_window_slots: u64,
+        /// Bond amount in base tokens required to challenge settlement.
+        pub dispute_bond_amount: u64,
+        /// Slot when market was resolved (set by ResolveMarket).
+        pub resolved_slot: u64,
+        /// Settlement price at resolution (copied from authority_price_e6).
+        pub settlement_price_e6: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4681,6 +4722,87 @@ pub mod lp_vault {
     }
 }
 
+// 8b. Settlement Dispute (PERC-314)
+pub mod dispute {
+    use bytemuck::{Pod, Zeroable};
+
+    pub const DISPUTE_MAGIC: u64 = 0x5045_5243_4449_5350; // "PERCDISP"
+    pub const DISPUTE_LEN: usize = core::mem::size_of::<SettlementDispute>();
+
+    /// Settlement dispute PDA.
+    /// Seeds: `["dispute", slab_key]`.
+    /// Layout (96 bytes):
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct SettlementDispute {
+        pub magic: u64,
+        /// Challenger pubkey.
+        pub challenger: [u8; 32],
+        /// Proposed settlement price (e6).
+        pub proposed_price_e6: u64,
+        /// Slot of the Pyth proof used by challenger.
+        pub proof_slot: u64,
+        /// Bond amount deposited by challenger.
+        pub bond_amount: u64,
+        /// 0=pending, 1=accepted (challenger wins), 2=rejected (challenger loses).
+        pub outcome: u8,
+        pub _pad: [u8; 7],
+        /// Slot when dispute was submitted.
+        pub dispute_slot: u64,
+        pub _reserved: [u8; 16],
+    }
+
+    impl SettlementDispute {
+        #[inline]
+        pub fn is_initialized(&self) -> bool {
+            self.magic == DISPUTE_MAGIC
+        }
+    }
+
+    pub fn read_dispute(data: &[u8]) -> Option<SettlementDispute> {
+        if data.len() < DISPUTE_LEN {
+            return None;
+        }
+        Some(*bytemuck::from_bytes::<SettlementDispute>(
+            &data[..DISPUTE_LEN],
+        ))
+    }
+
+    pub fn write_dispute(data: &mut [u8], d: &SettlementDispute) {
+        data[..DISPUTE_LEN].copy_from_slice(bytemuck::bytes_of(d));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_dispute_size() {
+            assert_eq!(DISPUTE_LEN, 96);
+        }
+
+        #[test]
+        fn test_dispute_roundtrip() {
+            let d = SettlementDispute {
+                magic: DISPUTE_MAGIC,
+                challenger: [1; 32],
+                proposed_price_e6: 100_000_000,
+                proof_slot: 500,
+                bond_amount: 1000,
+                outcome: 0,
+                _pad: [0; 7],
+                dispute_slot: 400,
+                _reserved: [0; 16],
+            };
+            let mut buf = [0u8; DISPUTE_LEN];
+            write_dispute(&mut buf, &d);
+            let d2 = read_dispute(&buf).unwrap();
+            assert_eq!(d2.proposed_price_e6, 100_000_000);
+            assert_eq!(d2.challenger, [1; 32]);
+        }
+    }
+}
+
 // 9. mod processor
 pub mod processor {
     use crate::{
@@ -5385,6 +5507,11 @@ pub mod processor {
                     orphan_threshold_slots: 0,
                     orphan_penalty_bps_per_slot: 0,
                     _orphan_pad: [0; 6],
+                    // PERC-314: Dispute disabled by default
+                    dispute_window_slots: 0,
+                    dispute_bond_amount: 0,
+                    resolved_slot: 0,
+                    settlement_price_e6: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -8855,6 +8982,229 @@ pub mod processor {
                 state::write_config(&mut data, &config);
 
                 msg!("PERC-306: set insurance isolation to {} bps", bps);
+            }
+
+            // =============================================================
+            // PERC-314: Settlement Dispute
+            // =============================================================
+            Instruction::ChallengeSettlement { proposed_price_e6 } => {
+                // Accounts: [challenger(signer), slab(writable), dispute_pda(writable),
+                //            challenger_ata(writable), vault(writable), token_program, system_program]
+                accounts::expect_len(accounts, 7)?;
+                let a_challenger = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_dispute = &accounts[2];
+                let a_challenger_ata = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_token = &accounts[5];
+                let a_system = &accounts[6];
+
+                accounts::expect_signer(a_challenger)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_dispute)?;
+                accounts::expect_writable(a_challenger_ata)?;
+                accounts::expect_writable(a_vault)?;
+                verify_token_program(a_token)?;
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                // Must be resolved
+                if !state::is_resolved(&data) {
+                    return Err(PercolatorError::MarketNotResolved.into());
+                }
+
+                let config = state::read_config(&data);
+                drop(data);
+
+                // Check dispute window is open
+                if config.dispute_window_slots == 0 {
+                    return Err(PercolatorError::DisputeWindowClosed.into());
+                }
+                let clock = Clock::get()?;
+                let window_end = config
+                    .resolved_slot
+                    .saturating_add(config.dispute_window_slots);
+                if clock.slot > window_end {
+                    return Err(PercolatorError::DisputeWindowClosed.into());
+                }
+
+                // Verify and create dispute PDA
+                let (expected_dispute, dispute_bump) =
+                    accounts::derive_dispute(program_id, a_slab.key);
+                accounts::expect_key(a_dispute, &expected_dispute)?;
+
+                if a_dispute.data_len() > 0 {
+                    let d_data = a_dispute.try_borrow_data()?;
+                    if let Some(existing) = crate::dispute::read_dispute(&d_data) {
+                        if existing.is_initialized() {
+                            return Err(PercolatorError::DisputeAlreadyExists.into());
+                        }
+                    }
+                    drop(d_data);
+                }
+
+                // Transfer bond from challenger to vault
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_challenger_ata, a_challenger.key, &mint)?;
+
+                if config.dispute_bond_amount > 0 {
+                    collateral::deposit(
+                        a_token,
+                        a_challenger_ata,
+                        a_vault,
+                        a_challenger,
+                        config.dispute_bond_amount,
+                    )?;
+                }
+
+                // Create dispute PDA
+                let dispute_len = crate::dispute::DISPUTE_LEN;
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(dispute_len);
+
+                let seed1: &[u8] = b"dispute";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [dispute_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_challenger.key,
+                        a_dispute.key,
+                        lamports,
+                        dispute_len as u64,
+                        program_id,
+                    ),
+                    &[a_challenger.clone(), a_dispute.clone(), a_system.clone()],
+                    &signer_seeds,
+                )?;
+
+                let dispute = crate::dispute::SettlementDispute {
+                    magic: crate::dispute::DISPUTE_MAGIC,
+                    challenger: a_challenger.key.to_bytes(),
+                    proposed_price_e6,
+                    proof_slot: clock.slot,
+                    bond_amount: config.dispute_bond_amount,
+                    outcome: 0, // pending
+                    _pad: [0; 7],
+                    dispute_slot: clock.slot,
+                    _reserved: [0; 16],
+                };
+
+                let mut d_data = a_dispute.try_borrow_mut_data()?;
+                crate::dispute::write_dispute(&mut d_data, &dispute);
+
+                msg!(
+                    "PERC-314: Settlement challenged: proposed={} vs settlement={}",
+                    proposed_price_e6,
+                    config.settlement_price_e6
+                );
+            }
+
+            Instruction::ResolveDispute { accept } => {
+                // Admin resolves dispute. accept=1: challenger wins, accept=0: challenger loses.
+                // Accounts: [admin(signer), slab(writable), dispute_pda(writable),
+                //            challenger_ata(writable), vault(writable), vault_authority, token_program]
+                accounts::expect_len(accounts, 7)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_dispute = &accounts[2];
+                let a_challenger_ata = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_vault_authority = &accounts[5];
+                let a_token = &accounts[6];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_dispute)?;
+                accounts::expect_writable(a_challenger_ata)?;
+                accounts::expect_writable(a_vault)?;
+                verify_token_program(a_token)?;
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                let config = state::read_config(&data);
+                drop(data);
+
+                // Admin only
+                if !crate::verify::admin_ok(header.admin, a_admin.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let (expected_dispute, _) = accounts::derive_dispute(program_id, a_slab.key);
+                accounts::expect_key(a_dispute, &expected_dispute)?;
+
+                let mut d_data = a_dispute.try_borrow_mut_data()?;
+                let mut dispute = crate::dispute::read_dispute(&d_data)
+                    .ok_or(PercolatorError::NoActiveDispute)?;
+                if !dispute.is_initialized() || dispute.outcome != 0 {
+                    return Err(PercolatorError::NoActiveDispute.into());
+                }
+
+                if accept != 0 {
+                    // Challenger wins: update settlement price, return bond + bonus
+                    dispute.outcome = 1;
+
+                    let mut slab_data = state::slab_data_mut(a_slab)?;
+                    let mut config = state::read_config(&slab_data);
+                    config.settlement_price_e6 = dispute.proposed_price_e6;
+                    state::write_config(&mut slab_data, &config);
+                    drop(slab_data);
+
+                    // Return bond to challenger
+                    if dispute.bond_amount > 0 {
+                        let mint = Pubkey::new_from_array(config.collateral_mint);
+                        let (auth, vault_bump) =
+                            accounts::derive_vault_authority(program_id, a_slab.key);
+                        accounts::expect_key(a_vault_authority, &auth)?;
+                        verify_vault(
+                            a_vault,
+                            &auth,
+                            &mint,
+                            &Pubkey::new_from_array(config.vault_pubkey),
+                        )?;
+
+                        let seed1: &[u8] = b"vault";
+                        let seed2: &[u8] = a_slab.key.as_ref();
+                        let bump_arr: [u8; 1] = [vault_bump];
+                        let seed3: &[u8] = &bump_arr;
+                        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                        collateral::withdraw(
+                            a_token,
+                            a_vault,
+                            a_challenger_ata,
+                            a_vault_authority,
+                            dispute.bond_amount,
+                            &signer_seeds,
+                        )?;
+                    }
+
+                    msg!(
+                        "PERC-314: Dispute accepted — settlement updated to {}",
+                        dispute.proposed_price_e6
+                    );
+                } else {
+                    // Challenger loses: bond stays in vault (insurance fund)
+                    dispute.outcome = 2;
+                    msg!("PERC-314: Dispute rejected — bond forfeited");
+                }
+
+                crate::dispute::write_dispute(&mut d_data, &dispute);
             }
         }
         Ok(())
