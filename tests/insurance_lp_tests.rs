@@ -8,6 +8,10 @@ use percolator_prog::{
     processor::process_instruction,
     state, units, zc,
 };
+
+/// Pre-fund vault to meet PERC-299 minimum vault seed requirement.
+/// Mirrors unit.rs VAULT_SEED constant.
+const VAULT_SEED: u64 = 500_000_000;
 use solana_program::{
     account_info::AccountInfo, clock::Clock, program_error::ProgramError, program_pack::Pack,
     pubkey::Pubkey,
@@ -162,7 +166,7 @@ fn setup_market() -> MarketFixture {
             Pubkey::new_unique(),
             spl_token::ID,
             0,
-            make_token_account(mint_key, vault_pda, 0),
+            make_token_account(mint_key, vault_pda, VAULT_SEED),
         )
         .writable(),
         token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]).executable(),
@@ -222,19 +226,20 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u32(0, &mut data); // unit_scale
     encode_u64(0, &mut data); // initial_mark_price_e6
 
+    // RiskParams (must match read_risk_params order)
     encode_u64(0, &mut data); // warmup_period_slots
-    encode_u64(0, &mut data); // maintenance_margin_bps
-    encode_u64(0, &mut data);
-    encode_u64(0, &mut data);
-    encode_u64(64, &mut data);
-    encode_u128(0, &mut data);
-    encode_u128(0, &mut data);
-    encode_u128(0, &mut data);
-    encode_u64(crank_staleness, &mut data);
-    encode_u64(0, &mut data);
-    encode_u128(0, &mut data);
-    encode_u64(0, &mut data);
-    encode_u128(0, &mut data);
+    encode_u64(500, &mut data); // maintenance_margin_bps (5%) — must be > 0
+    encode_u64(1000, &mut data); // initial_margin_bps (10%) — must be >= maintenance
+    encode_u64(30, &mut data); // trading_fee_bps (0.3%)
+    encode_u64(64, &mut data); // max_accounts
+    encode_u128(0, &mut data); // new_account_fee
+    encode_u128(0, &mut data); // risk_reduction_threshold
+    encode_u128(0, &mut data); // maintenance_fee_per_slot
+    encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
+    encode_u64(0, &mut data); // liquidation_fee_bps
+    encode_u128(0, &mut data); // liquidation_fee_cap
+    encode_u64(0, &mut data); // liquidation_buffer_bps
+    encode_u128(0, &mut data); // min_liquidation_abs
     data
 }
 
@@ -569,8 +574,8 @@ fn test_deposit_first_deposit_1_to_1() {
     assert_eq!(read_token_balance(&depositor_lp_ata.data), deposit_amount);
     assert_eq!(read_mint_supply(&ins_mint.data), deposit_amount);
     assert_eq!(read_insurance_balance(&f.slab.data), deposit_amount as u128);
-    // Vault should have received the deposit
-    assert_eq!(read_token_balance(&f.vault.data), deposit_amount);
+    // Vault should have received the deposit (on top of VAULT_SEED)
+    assert_eq!(read_token_balance(&f.vault.data), VAULT_SEED + deposit_amount);
     // Depositor should have deposit_amount deducted
     assert_eq!(
         read_token_balance(&depositor_ata.data),
@@ -889,7 +894,8 @@ fn test_withdraw_proportional_redemption() {
     assert_eq!(read_insurance_balance(&f.slab.data), 0u128);
     // Got all collateral back
     assert_eq!(read_token_balance(&depositor_ata.data), 1_000_000);
-    assert_eq!(read_token_balance(&f.vault.data), 0);
+    // After full withdrawal, vault retains only the initial VAULT_SEED
+    assert_eq!(read_token_balance(&f.vault.data), VAULT_SEED);
 }
 
 #[test]

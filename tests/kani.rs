@@ -133,6 +133,7 @@ fn mark_cap_bound(mark_prev: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
 }
 // Cap quotients to keep division/mod tractable
 const KANI_MAX_QUOTIENT: u64 = 16384; // widened from 4096 for 4x broader SAT coverage
+const KANI_MAX_QUOTIENT: u64 = 16384;
 
 // =============================================================================
 // Test Fixtures
