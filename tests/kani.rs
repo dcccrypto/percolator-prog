@@ -5845,7 +5845,12 @@ fn proof_ramp_monotonically_increases() {
     kani::assume(ramp_slots > 0 && ramp_slots <= 1_000_000);
     kani::assume(market_created <= slot1);
     kani::assume(slot1 <= slot2);
-    kani::assume(slot2 <= market_created.saturating_add(ramp_slots).saturating_add(100));
+    kani::assume(
+        slot2
+            <= market_created
+                .saturating_add(ramp_slots)
+                .saturating_add(100),
+    );
 
     let mult1 = compute_ramp_multiplier(oi_cap_bps, market_created, slot1, ramp_slots);
     let mult2 = compute_ramp_multiplier(oi_cap_bps, market_created, slot2, ramp_slots);
@@ -5872,7 +5877,10 @@ fn proof_ramp_no_underflow_if_slot_before_created() {
     let mult = compute_ramp_multiplier(oi_cap_bps, market_created, current_slot, ramp_slots);
 
     // saturating_sub(market_created) => elapsed = 0, so should get RAMP_START_BPS
-    assert_eq!(mult, RAMP_START_BPS, "must return RAMP_START_BPS when slot before creation");
+    assert_eq!(
+        mult, RAMP_START_BPS,
+        "must return RAMP_START_BPS when slot before creation"
+    );
 }
 
 /// Prove: ramp result never exceeds configured multiplier.
@@ -5891,7 +5899,10 @@ fn proof_ramp_never_exceeds_configured_multiplier() {
 
     let mult = compute_ramp_multiplier(oi_cap_bps, market_created, current_slot, ramp_slots);
 
-    assert!(mult <= oi_cap_bps, "ramp multiplier must never exceed oi_cap_multiplier_bps");
+    assert!(
+        mult <= oi_cap_bps,
+        "ramp multiplier must never exceed oi_cap_multiplier_bps"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5922,7 +5933,9 @@ fn proof_orphan_penalty_no_overflow() {
 #[cfg(kani)]
 #[kani::proof]
 fn proof_loyalty_mult_never_exceeds_max_tier_strong() {
-    use percolator_prog::lp_vault::{loyalty_multiplier_bps, LOYALTY_MULT_BASE, LOYALTY_MULT_TIER2};
+    use percolator_prog::lp_vault::{
+        loyalty_multiplier_bps, LOYALTY_MULT_BASE, LOYALTY_MULT_TIER2,
+    };
 
     let delta: u64 = kani::any();
 
@@ -5955,7 +5968,10 @@ fn proof_loyalty_reset_on_zero_delta() {
     use percolator_prog::lp_vault::{loyalty_multiplier_bps, LOYALTY_MULT_BASE};
 
     let mult = loyalty_multiplier_bps(0);
-    assert_eq!(mult, LOYALTY_MULT_BASE, "zero delta must give base multiplier");
+    assert_eq!(
+        mult, LOYALTY_MULT_BASE,
+        "zero delta must give base multiplier"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6015,7 +6031,10 @@ fn proof_challenge_window_strictly_enforced() {
     let challenge_allowed = current_slot <= dispute_open_until_slot;
 
     if current_slot > dispute_open_until_slot {
-        assert!(!challenge_allowed, "challenge must be blocked after window closes");
+        assert!(
+            !challenge_allowed,
+            "challenge must be blocked after window closes"
+        );
     }
 }
 
@@ -6061,7 +6080,10 @@ fn proof_lp_collateral_value_bounded_by_vault_tvl() {
 
     // position_value <= vault_tvl * LTV_BPS / 10000
     let max_value = vault_tvl * (ltv_bps as u128) / 10_000;
-    assert!(value <= max_value, "LP collateral value must be bounded by vault_tvl * LTV");
+    assert!(
+        value <= max_value,
+        "LP collateral value must be bounded by vault_tvl * LTV"
+    );
 }
 
 /// Prove: liquidation triggers on TVL drop.
@@ -6081,7 +6103,10 @@ fn proof_lp_collateral_liquidation_triggers_on_tvl_drop() {
     let new_tvl = (old_tvl as u128).saturating_sub(drop_amount);
 
     let triggered = tvl_drawdown_exceeded(old_tvl, new_tvl, threshold_bps);
-    assert!(triggered, "TVL drop exceeding threshold must trigger liquidation");
+    assert!(
+        triggered,
+        "TVL drop exceeding threshold must trigger liquidation"
+    );
 }
 
 /// Prove: LP token price derived from vault, not user input.
@@ -6105,7 +6130,10 @@ fn proof_lp_token_price_from_vault_not_user_input() {
     let v2 = lp_token_value(lp_amount, vault_tvl, total_supply, ltv_bps);
 
     // Same inputs must yield same output (deterministic, derived from vault state)
-    assert_eq!(v1, v2, "LP token price must be deterministic from vault state");
+    assert_eq!(
+        v1, v2,
+        "LP token price must be deterministic from vault state"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6126,7 +6154,10 @@ fn proof_isolated_balance_never_negative() {
     let actual_draw = core::cmp::min(draw, balance);
     let new_balance = balance - actual_draw;
 
-    assert!(new_balance <= balance, "balance must not increase after draw");
+    assert!(
+        new_balance <= balance,
+        "balance must not increase after draw"
+    );
     // new_balance >= 0 is guaranteed by u128
 }
 
@@ -6142,7 +6173,10 @@ fn proof_global_draw_bounded_by_isolation_bps() {
 
     let max_draw = global_fund * (isolation_bps as u128) / 10_000;
 
-    assert!(max_draw <= global_fund, "isolation draw must not exceed global fund");
+    assert!(
+        max_draw <= global_fund,
+        "isolation draw must not exceed global fund"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6165,7 +6199,10 @@ fn proof_rebalancing_mode_never_permanent() {
     let elapsed = current_slot.saturating_sub(safety_valve_start_slot);
     let should_exit = elapsed >= safety_valve_duration;
 
-    assert!(should_exit, "rebalancing mode must clear after safety_valve_duration");
+    assert!(
+        should_exit,
+        "rebalancing mode must clear after safety_valve_duration"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6204,24 +6241,53 @@ fn proof_tag_no_collision() {
 
     // All tags that exist
     let tags: [u8; 47] = [
-        TAG_INIT_MARKET, TAG_INIT_USER, TAG_INIT_LP,
-        TAG_DEPOSIT_COLLATERAL, TAG_WITHDRAW_COLLATERAL,
-        TAG_KEEPER_CRANK, TAG_TRADE_NO_CPI, TAG_LIQUIDATE_AT_ORACLE,
-        TAG_CLOSE_ACCOUNT, TAG_TOP_UP_INSURANCE, TAG_TRADE_CPI,
-        TAG_SET_RISK_THRESHOLD, TAG_UPDATE_ADMIN, TAG_CLOSE_SLAB,
-        TAG_UPDATE_CONFIG, TAG_SET_MAINTENANCE_FEE, TAG_SET_ORACLE_AUTHORITY,
-        TAG_PUSH_ORACLE_PRICE, TAG_SET_ORACLE_PRICE_CAP, TAG_RESOLVE_MARKET,
-        TAG_WITHDRAW_INSURANCE, TAG_ADMIN_FORCE_CLOSE, TAG_UPDATE_RISK_PARAMS,
-        TAG_RENOUNCE_ADMIN, TAG_CREATE_INSURANCE_MINT, TAG_DEPOSIT_INSURANCE_LP,
-        TAG_WITHDRAW_INSURANCE_LP, TAG_PAUSE_MARKET, TAG_UNPAUSE_MARKET,
-        TAG_ACCEPT_ADMIN, TAG_SET_INSURANCE_WITHDRAW_POLICY,
-        TAG_WITHDRAW_INSURANCE_LIMITED, TAG_SET_PYTH_ORACLE,
-        TAG_UPDATE_MARK_PRICE, TAG_UPDATE_HYPERP_MARK, TAG_TRADE_CPI_V2,
-        TAG_UNRESOLVE_MARKET, TAG_CREATE_LP_VAULT, TAG_LP_VAULT_DEPOSIT,
-        TAG_LP_VAULT_WITHDRAW, TAG_LP_VAULT_CRANK_FEES,
-        TAG_FUND_MARKET_INSURANCE, TAG_SET_INSURANCE_ISOLATION,
-        TAG_CHALLENGE_SETTLEMENT, TAG_RESOLVE_DISPUTE,
-        TAG_DEPOSIT_LP_COLLATERAL, TAG_WITHDRAW_LP_COLLATERAL,
+        TAG_INIT_MARKET,
+        TAG_INIT_USER,
+        TAG_INIT_LP,
+        TAG_DEPOSIT_COLLATERAL,
+        TAG_WITHDRAW_COLLATERAL,
+        TAG_KEEPER_CRANK,
+        TAG_TRADE_NO_CPI,
+        TAG_LIQUIDATE_AT_ORACLE,
+        TAG_CLOSE_ACCOUNT,
+        TAG_TOP_UP_INSURANCE,
+        TAG_TRADE_CPI,
+        TAG_SET_RISK_THRESHOLD,
+        TAG_UPDATE_ADMIN,
+        TAG_CLOSE_SLAB,
+        TAG_UPDATE_CONFIG,
+        TAG_SET_MAINTENANCE_FEE,
+        TAG_SET_ORACLE_AUTHORITY,
+        TAG_PUSH_ORACLE_PRICE,
+        TAG_SET_ORACLE_PRICE_CAP,
+        TAG_RESOLVE_MARKET,
+        TAG_WITHDRAW_INSURANCE,
+        TAG_ADMIN_FORCE_CLOSE,
+        TAG_UPDATE_RISK_PARAMS,
+        TAG_RENOUNCE_ADMIN,
+        TAG_CREATE_INSURANCE_MINT,
+        TAG_DEPOSIT_INSURANCE_LP,
+        TAG_WITHDRAW_INSURANCE_LP,
+        TAG_PAUSE_MARKET,
+        TAG_UNPAUSE_MARKET,
+        TAG_ACCEPT_ADMIN,
+        TAG_SET_INSURANCE_WITHDRAW_POLICY,
+        TAG_WITHDRAW_INSURANCE_LIMITED,
+        TAG_SET_PYTH_ORACLE,
+        TAG_UPDATE_MARK_PRICE,
+        TAG_UPDATE_HYPERP_MARK,
+        TAG_TRADE_CPI_V2,
+        TAG_UNRESOLVE_MARKET,
+        TAG_CREATE_LP_VAULT,
+        TAG_LP_VAULT_DEPOSIT,
+        TAG_LP_VAULT_WITHDRAW,
+        TAG_LP_VAULT_CRANK_FEES,
+        TAG_FUND_MARKET_INSURANCE,
+        TAG_SET_INSURANCE_ISOLATION,
+        TAG_CHALLENGE_SETTLEMENT,
+        TAG_RESOLVE_DISPUTE,
+        TAG_DEPOSIT_LP_COLLATERAL,
+        TAG_WITHDRAW_LP_COLLATERAL,
     ];
 
     // Verify no duplicates by checking all pairs
@@ -6257,7 +6323,10 @@ fn proof_inductive_insurance_fund_nonnegative() {
     // u128 is always >= 0, and saturating_sub ensures no underflow
     assert!(after_draw <= balance, "draw must not increase balance");
     // Deposit increases balance
-    assert!(after_deposit >= after_draw, "deposit must not decrease balance");
+    assert!(
+        after_deposit >= after_draw,
+        "deposit must not decrease balance"
+    );
 }
 
 /// Inductive proof: LP vault conservation.
@@ -6312,6 +6381,9 @@ fn proof_inductive_oi_cap_invariant() {
     let accepted = new_oi <= oi_cap;
 
     if accepted {
-        assert!(new_oi <= oi_cap, "OI cap must remain enforced after accepted trade");
+        assert!(
+            new_oi <= oi_cap,
+            "OI cap must remain enforced after accepted trade"
+        );
     }
 }

@@ -575,7 +575,10 @@ fn test_deposit_first_deposit_1_to_1() {
     assert_eq!(read_mint_supply(&ins_mint.data), deposit_amount);
     assert_eq!(read_insurance_balance(&f.slab.data), deposit_amount as u128);
     // Vault should have received the deposit (on top of VAULT_SEED)
-    assert_eq!(read_token_balance(&f.vault.data), VAULT_SEED + deposit_amount);
+    assert_eq!(
+        read_token_balance(&f.vault.data),
+        VAULT_SEED + deposit_amount
+    );
     // Depositor should have deposit_amount deducted
     assert_eq!(
         read_token_balance(&depositor_ata.data),
