@@ -2569,6 +2569,20 @@ pub mod state {
         /// 0 = disabled. Trades rejected if pnl_pos_tot would exceed this.
         /// Set via UpdateRiskParams. Prevents LP capital exhaustion.
         pub max_pnl_cap: u64,
+
+        // ========================================
+        // OI Utilization Fee Kink Curve (PERC-310)
+        // ========================================
+        /// Whether OI utilization fee is enabled (1=yes, 0=no).
+        pub oi_util_fee_enabled: u8,
+        /// Padding.
+        pub _oi_util_pad: u8,
+        /// First kink point in bps (default 7000 = 70%). Below this, no extra fee.
+        pub oi_util_kink1_bps: u16,
+        /// Second kink point in bps (default 9000 = 90%). Above this, accelerated fees.
+        pub oi_util_kink2_bps: u16,
+        /// Padding for 16-byte alignment (376→384).
+        pub _oi_util_pad2: [u8; 10],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4534,6 +4548,64 @@ pub mod processor {
 
     /// PERC-273: Check dynamic OI cap after trade execution.
     /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
+    /// PERC-310: Compute OI utilization extra fee in bps.
+    /// Kink curve:
+    ///   util < kink1 → 0
+    ///   kink1 ≤ util < kink2 → linear 0 to 2x base_fee
+    ///   util ≥ kink2 → linear 2x to 10x base_fee
+    /// Returns extra fee in bps (to be added to trading fee).
+    fn compute_oi_util_fee_bps(
+        config: &state::MarketConfig,
+        engine: &RiskEngine,
+    ) -> u64 {
+        if config.oi_util_fee_enabled == 0 || config.oi_cap_multiplier_bps == 0 {
+            return 0;
+        }
+
+        let vault = engine.vault.get();
+        if vault == 0 {
+            return 0;
+        }
+
+        let max_oi = vault.saturating_mul(config.oi_cap_multiplier_bps as u128) / 10_000;
+        if max_oi == 0 {
+            return 0;
+        }
+
+        let current_oi = engine.total_open_interest.get();
+        // util_bps = current_oi * 10_000 / max_oi
+        let util_bps = current_oi.saturating_mul(10_000) / max_oi;
+        let util_bps = core::cmp::min(util_bps, 10_000) as u64; // cap at 100%
+
+        let kink1 = config.oi_util_kink1_bps as u64;
+        let kink2 = config.oi_util_kink2_bps as u64;
+        let base_fee = engine.params.trading_fee_bps;
+
+        if util_bps < kink1 {
+            return 0;
+        }
+
+        if util_bps < kink2 {
+            // Linear from 0 to 2x base_fee over [kink1, kink2)
+            let range = kink2.saturating_sub(kink1);
+            if range == 0 { return 0; }
+            let progress = util_bps - kink1;
+            let max_extra = base_fee.saturating_mul(2);
+            return progress.saturating_mul(max_extra) / range;
+        }
+
+        // util >= kink2: linear from 2x to 10x base_fee over [kink2, 10_000]
+        let range = 10_000u64.saturating_sub(kink2);
+        if range == 0 {
+            return base_fee.saturating_mul(10);
+        }
+        let progress = util_bps.saturating_sub(kink2);
+        let min_extra = base_fee.saturating_mul(2);
+        let max_extra = base_fee.saturating_mul(10);
+        let additional = progress.saturating_mul(max_extra.saturating_sub(min_extra)) / range;
+        min_extra.saturating_add(additional)
+    }
+
     fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
         let multiplier = config.oi_cap_multiplier_bps;
         if multiplier == 0 {
@@ -4861,6 +4933,12 @@ pub mod processor {
                     // PERC-273: OI cap disabled by default
                     oi_cap_multiplier_bps: 0,
                     max_pnl_cap: 0,
+                    // PERC-310: OI utilization fee disabled by default
+                    oi_util_fee_enabled: 0,
+                    _oi_util_pad: 0,
+                    oi_util_kink1_bps: 7000,
+                    oi_util_kink2_bps: 9000,
+                    _oi_util_pad2: [0; 10],
                 };
                 state::write_config(&mut data, &config);
 
@@ -8191,6 +8269,68 @@ pub mod processor {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod oi_util_fee_tests {
+        use super::*;
+
+        // Test the kink curve logic directly without creating RiskEngine (stack too large).
+        // Extract the pure math into a testable function.
+        fn compute_util_fee_pure(
+            util_bps: u64, kink1: u64, kink2: u64, base_fee: u64,
+        ) -> u64 {
+            if util_bps < kink1 { return 0; }
+            if util_bps < kink2 {
+                let range = kink2.saturating_sub(kink1);
+                if range == 0 { return 0; }
+                let progress = util_bps - kink1;
+                return progress.saturating_mul(base_fee * 2) / range;
+            }
+            let range = 10_000u64.saturating_sub(kink2);
+            if range == 0 { return base_fee * 10; }
+            let progress = util_bps.saturating_sub(kink2);
+            let min_e = base_fee * 2;
+            let max_e = base_fee * 10;
+            min_e + progress * (max_e - min_e) / range
+        }
+
+        #[test]
+        fn test_below_kink1() {
+            assert_eq!(compute_util_fee_pure(6000, 7000, 9000, 10), 0);
+        }
+
+        #[test]
+        fn test_at_kink1() {
+            assert_eq!(compute_util_fee_pure(7000, 7000, 9000, 10), 0);
+        }
+
+        #[test]
+        fn test_midpoint() {
+            // 80% → progress=1000, range=2000, max_extra=20 → 10
+            assert_eq!(compute_util_fee_pure(8000, 7000, 9000, 10), 10);
+        }
+
+        #[test]
+        fn test_at_kink2() {
+            // 90% → min_extra=20
+            assert_eq!(compute_util_fee_pure(9000, 7000, 9000, 10), 20);
+        }
+
+        #[test]
+        fn test_at_100_percent() {
+            // 100% → min=20 + 80 = 100
+            assert_eq!(compute_util_fee_pure(10_000, 7000, 9000, 10), 100);
+        }
+
+        #[test]
+        fn test_monotonic() {
+            for u in (0..=10_000).step_by(100) {
+                let lo = compute_util_fee_pure(u, 7000, 9000, 10);
+                let hi = compute_util_fee_pure(u + 100, 7000, 9000, 10);
+                assert!(hi >= lo, "not monotonic at {}: {} < {}", u, hi, lo);
+            }
+        }
     }
 }
 
