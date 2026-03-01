@@ -8982,7 +8982,11 @@ pub mod processor {
                 // against outdated prices.
                 let mut config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
-                let remaining_oracle_accounts = if accounts.len() > 4 { &accounts[4..] } else { &[] };
+                let remaining_oracle_accounts = if accounts.len() > 4 {
+                    &accounts[4..]
+                } else {
+                    &[]
+                };
                 let oracle_price = oracle::read_price_with_authority(
                     &config,
                     a_oracle,
