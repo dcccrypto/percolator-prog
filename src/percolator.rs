@@ -4781,6 +4781,24 @@ pub mod lp_vault {
         pub _padding304: [u8; 3],
         /// Reserved for future use (alignment + forward compat).
         pub _reserved: [u8; 40],
+
+        // ========================================
+        // PERC-313: High-Water Mark Protection
+        // ========================================
+        /// Max TVL (total_capital) seen in the current epoch.
+        /// Updated on every deposit. Reset to current TVL on epoch change.
+        pub epoch_high_water_tvl: u128,
+
+        /// Floor as BPS of epoch_high_water_tvl. Withdrawals that would push
+        /// total_capital below hwm_floor are blocked.
+        /// Default 5000 = 50%. 0 = disabled.
+        pub hwm_floor_bps: u16,
+
+        /// Padding for alignment after u16
+        pub _hwm_padding: [u8; 6],
+
+        /// Reserved for future use (alignment + forward compat).
+        pub _reserved: [u8; 24],
     }
 
     impl LpVaultState {
@@ -8875,6 +8893,8 @@ pub mod processor {
                     // PERC-304: Set util curve flag and initial multiplier
                     vault_state.lp_util_curve_enabled = if util_curve_enabled { 1 } else { 0 };
                     vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
+                    // PERC-313: Default HWM floor = 50%
+                    vault_state.hwm_floor_bps = 5000;
                     // Snapshot current fee_revenue so we only distribute NEW fees
                     let slab_data = a_slab.try_borrow_data()?;
                     let engine = zc::engine_ref(&slab_data)?;
@@ -9013,6 +9033,8 @@ pub mod processor {
                     if lp_supply > 0 && capital_before == 0 {
                         // Supply > 0 but capital == 0: vault was drained. Start fresh epoch.
                         vault_state.epoch = vault_state.epoch.saturating_add(1);
+                        // PERC-313: Reset HWM on new epoch
+                        vault_state.epoch_high_water_tvl = 0;
                         // Previous shares are worthless. Mint fresh for new depositor.
                         // NOTE: old share holders get nothing (vault was fully drained).
                     }
@@ -9038,6 +9060,11 @@ pub mod processor {
                     .total_capital
                     .checked_add(units as u128)
                     .ok_or(PercolatorError::EngineOverflow)?;
+
+                // PERC-313: Update epoch high-water mark
+                if vault_state.total_capital > vault_state.epoch_high_water_tvl {
+                    vault_state.epoch_high_water_tvl = vault_state.total_capital;
+                }
 
                 // Update engine vault balance (tokens are already in the vault token account)
                 let engine = zc::engine_mut(&mut slab_data)?;
@@ -9182,6 +9209,18 @@ pub mod processor {
                     let max_oi_after =
                         remaining_capital.saturating_mul(effective_multiplier as u128) / 10_000;
                     if current_oi > max_oi_after {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+
+                // PERC-313: High-water mark floor check
+                // Block withdrawal if it would push capital below hwm_floor
+                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+                    let remaining_capital = capital.saturating_sub(units_to_return);
+                    let hwm_floor = vault_state.epoch_high_water_tvl
+                        .saturating_mul(vault_state.hwm_floor_bps as u128)
+                        / 10_000;
+                    if remaining_capital < hwm_floor {
                         return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
                     }
                 }
