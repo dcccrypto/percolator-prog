@@ -46,6 +46,8 @@ pub mod constants {
 
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
+    // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
+    const _: [(); 432] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
