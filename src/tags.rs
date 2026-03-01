@@ -68,6 +68,10 @@ pub const TAG_LP_VAULT_DEPOSIT: u8 = 38;
 pub const TAG_LP_VAULT_WITHDRAW: u8 = 39;
 /// Permissionless crank: distribute accrued fee revenue to LP vault capital (PERC-272).
 pub const TAG_LP_VAULT_CRANK_FEES: u8 = 40;
+/// PERC-314: Challenge settlement price during dispute window.
+pub const TAG_CHALLENGE_SETTLEMENT: u8 = 41;
+/// PERC-314: Resolve dispute (admin adjudication).
+pub const TAG_RESOLVE_DISPUTE: u8 = 42;
 
 #[cfg(test)]
 mod tests {
@@ -118,6 +122,8 @@ mod tests {
             TAG_LP_VAULT_DEPOSIT,
             TAG_LP_VAULT_WITHDRAW,
             TAG_LP_VAULT_CRANK_FEES,
+            TAG_CHALLENGE_SETTLEMENT,
+            TAG_RESOLVE_DISPUTE,
         ];
 
         for i in 0..tags.len() {
@@ -172,6 +178,8 @@ mod tests {
             TAG_LP_VAULT_DEPOSIT,
             TAG_LP_VAULT_WITHDRAW,
             TAG_LP_VAULT_CRANK_FEES,
+            TAG_CHALLENGE_SETTLEMENT,
+            TAG_RESOLVE_DISPUTE,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
