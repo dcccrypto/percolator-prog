@@ -10023,8 +10023,15 @@ pub mod processor {
                     .withdraw(user_idx, collateral_units, clock.slot, 0)
                     .map_err(map_risk_error)?;
 
-                engine.vault =
-                    percolator::U128::new(engine.vault.get().saturating_sub(collateral_units));
+                // PERC-321: Use checked_sub to fail cleanly if vault underflows instead
+                // of silently setting vault to 0 (which breaks the conservation invariant).
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_sub(collateral_units)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
                 drop(slab_data);
 
                 let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
