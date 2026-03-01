@@ -78,6 +78,10 @@ pub const TAG_SET_INSURANCE_ISOLATION: u8 = 42;
 pub const TAG_CHALLENGE_SETTLEMENT: u8 = 43;
 /// PERC-314: Resolve dispute (admin adjudication).
 pub const TAG_RESOLVE_DISPUTE: u8 = 44;
+/// PERC-315: Deposit LP vault tokens as perp collateral.
+pub const TAG_DEPOSIT_LP_COLLATERAL: u8 = 45;
+/// PERC-315: Withdraw LP collateral (position must be closed).
+pub const TAG_WITHDRAW_LP_COLLATERAL: u8 = 46;
 
 #[cfg(test)]
 mod tests {
@@ -132,6 +136,8 @@ mod tests {
             TAG_SET_INSURANCE_ISOLATION,
             TAG_CHALLENGE_SETTLEMENT,
             TAG_RESOLVE_DISPUTE,
+            TAG_DEPOSIT_LP_COLLATERAL,
+            TAG_WITHDRAW_LP_COLLATERAL,
         ];
 
         for i in 0..tags.len() {
@@ -190,6 +196,8 @@ mod tests {
             TAG_SET_INSURANCE_ISOLATION,
             TAG_CHALLENGE_SETTLEMENT,
             TAG_RESOLVE_DISPUTE,
+            TAG_DEPOSIT_LP_COLLATERAL,
+            TAG_WITHDRAW_LP_COLLATERAL,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
