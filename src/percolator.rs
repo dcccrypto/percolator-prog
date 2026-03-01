@@ -4870,7 +4870,10 @@ pub mod processor {
 
         // Auto-exit check (don't write, just skip blocking)
         if config.safety_valve_duration > 0
-            && current_slot >= config.rebalancing_start_slot.saturating_add(config.safety_valve_duration)
+            && current_slot
+                >= config
+                    .rebalancing_start_slot
+                    .saturating_add(config.safety_valve_duration)
         {
             return Ok(()); // Duration elapsed, will be formally exited on next crank
         }
@@ -4891,7 +4894,9 @@ pub mod processor {
         if increases_dominant {
             msg!(
                 "PERC-312: Safety valve blocked trade: size={} dominant_long={} net_lp={}",
-                size, dominant_is_long, net_lp_pos
+                size,
+                dominant_is_long,
+                net_lp_pos
             );
             return Err(PercolatorError::SafetyValveDominantSideBlocked.into());
         }
@@ -4923,11 +4928,18 @@ pub mod processor {
             if config.rebalancing_active != 0 {
                 config.rebalancing_active = 0;
                 config.rebalancing_start_slot = 0;
-                msg!("PERC-312: Rebalancing exited — skew resolved at slot {}", current_slot);
+                msg!(
+                    "PERC-312: Rebalancing exited — skew resolved at slot {}",
+                    current_slot
+                );
             }
         }
 
-        let threshold = if config.safety_valve_epochs == 0 { 5 } else { config.safety_valve_epochs };
+        let threshold = if config.safety_valve_epochs == 0 {
+            5
+        } else {
+            config.safety_valve_epochs
+        };
         if config.consecutive_max_funding_epochs >= threshold && config.rebalancing_active == 0 {
             config.rebalancing_active = 1;
             config.rebalancing_start_slot = current_slot;
@@ -8845,7 +8857,10 @@ pub mod processor {
             c.funding_max_bps_per_slot = 10;
 
             let result = check_safety_valve(&c, net_lp_pos, size, old_user_pos, current_slot);
-            assert!(result.is_ok(), "trade must not be blocked after duration elapsed");
+            assert!(
+                result.is_ok(),
+                "trade must not be blocked after duration elapsed"
+            );
         }
     }
 }
