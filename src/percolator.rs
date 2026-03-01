@@ -7490,7 +7490,9 @@ pub mod processor {
                     .top_up_insurance_fund(units as u128)
                     .map_err(map_risk_error)?;
             }
-            _ => unreachable!(),
+            // Defense-in-depth: if a future tag routes here by mistake,
+            // return an error instead of panicking (unreachable! aborts the tx).
+            _ => return Err(ProgramError::InvalidInstructionData),
         }
         Ok(())
     }
@@ -8853,7 +8855,9 @@ pub mod processor {
                 msg!("WithdrawInsuranceLimited: withdrew {} base tokens, insurance_units_remaining={}",
                     actual_amount, new_ins_balance);
             }
-            _ => unreachable!(),
+            // Defense-in-depth: if a future tag routes here by mistake,
+            // return an error instead of panicking (unreachable! aborts the tx).
+            _ => return Err(ProgramError::InvalidInstructionData),
         }
         Ok(())
     }
@@ -10476,7 +10480,9 @@ pub mod processor {
 
                 msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
             }
-            _ => unreachable!(),
+            // Defense-in-depth: if a future tag routes here by mistake,
+            // return an error instead of panicking (unreachable! aborts the tx).
+            _ => return Err(ProgramError::InvalidInstructionData),
         }
         Ok(())
     }
