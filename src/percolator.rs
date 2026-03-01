@@ -1849,6 +1849,11 @@ pub mod ix {
             /// PERC-298: Skew factor for dynamic OI cap tightening (bps).
             /// 0 = disabled. None = don't change (backwards compatible).
             skew_factor_bps: Option<u64>,
+            /// PERC-300: Adaptive funding rate config.
+            /// None = don't change (backwards compatible).
+            adaptive_funding_enabled: Option<u8>,
+            adaptive_scale_bps: Option<u16>,
+            adaptive_max_funding_bps: Option<u64>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -2248,6 +2253,22 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // PERC-300: Optional adaptive funding params
+                    let adaptive_funding_enabled = if rest.len() >= 1 {
+                        Some(read_u8(&mut rest)?)
+                    } else {
+                        None
+                    };
+                    let adaptive_scale_bps = if rest.len() >= 2 {
+                        Some(read_u16(&mut rest)?)
+                    } else {
+                        None
+                    };
+                    let adaptive_max_funding_bps = if rest.len() >= 8 {
+                        Some(read_u64(&mut rest)?)
+                    } else {
+                        None
+                    };
                     Ok(Instruction::UpdateRiskParams {
                         initial_margin_bps,
                         maintenance_margin_bps,
@@ -2256,6 +2277,9 @@ pub mod ix {
                         max_pnl_cap,
                         oi_ramp_slots,
                         skew_factor_bps,
+                        adaptive_funding_enabled,
+                        adaptive_scale_bps,
+                        adaptive_max_funding_bps,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2744,6 +2768,23 @@ pub mod state {
         /// Number of slots over which OI cap ramps from RAMP_START_BPS to
         /// oi_cap_multiplier_bps. 0 = disabled (full cap immediately).
         pub oi_ramp_slots: u64,
+
+        // ========================================
+        // Adaptive Funding Rate (PERC-300)
+        // ========================================
+        /// Enable adaptive (OI-skew-based) funding rate.
+        /// 0 = disabled (use inventory/premium funding). 1 = enabled.
+        pub adaptive_funding_enabled: u8,
+        /// Padding for alignment
+        pub _adaptive_pad: u8,
+        /// Scale factor for skew adjustment (bps). Controls how aggressively
+        /// the rate adjusts to OI imbalance. Typical: 100-500.
+        pub adaptive_scale_bps: u16,
+        /// Padding for u64 alignment
+        pub _adaptive_pad2: u32,
+        /// Max adaptive funding rate (bps per slot, absolute value).
+        /// Rate clamped to [-max, +max]. 0 = use default max.
+        pub adaptive_max_funding_bps: u64,
 
         // ========================================
         // Per-Market Insurance Isolation (PERC-306)
@@ -5709,6 +5750,12 @@ pub mod processor {
                     // PERC-302: Market maturity OI ramp
                     market_created_slot: clock.slot,
                     oi_ramp_slots: 0, // 0 = full cap immediately (backwards compat)
+                    // PERC-300: Adaptive funding disabled by default
+                    adaptive_funding_enabled: 0,
+                    _adaptive_pad: 0,
+                    adaptive_scale_bps: 0,
+                    _adaptive_pad2: 0,
+                    adaptive_max_funding_bps: 0,
                     // PERC-306: Insurance isolation (disabled by default)
                     insurance_isolation_bps: 0,
                     _insurance_isolation_padding: [0u8; 14],
@@ -6258,6 +6305,26 @@ pub mod processor {
                     )
                 } else {
                     raw_funding_rate
+                };
+
+                // PERC-300: Adaptive funding rate (replaces inventory/premium when enabled)
+                let blended_funding_rate = if config.adaptive_funding_enabled != 0 {
+                    let prev_rate = engine.funding_rate_bps_per_slot_last;
+                    let max_bps = if config.adaptive_max_funding_bps > 0 {
+                        config.adaptive_max_funding_bps
+                    } else {
+                        config.funding_max_bps_per_slot.unsigned_abs()
+                    };
+                    percolator::RiskEngine::compute_adaptive_funding_rate(
+                        prev_rate,
+                        engine.long_oi.get(),
+                        engine.short_oi.get(),
+                        engine.total_open_interest.get(),
+                        config.adaptive_scale_bps,
+                        max_bps,
+                    )
+                } else {
+                    blended_funding_rate
                 };
 
                 // F5: Funding rate dampening on low-liquidity markets.
@@ -7544,6 +7611,9 @@ pub mod processor {
                 max_pnl_cap,
                 oi_ramp_slots,
                 skew_factor_bps,
+                adaptive_funding_enabled,
+                adaptive_scale_bps,
+                adaptive_max_funding_bps,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -7594,6 +7664,9 @@ pub mod processor {
                     || max_pnl_cap.is_some()
                     || oi_ramp_slots.is_some()
                     || skew_factor_bps.is_some()
+                    || adaptive_funding_enabled.is_some()
+                    || adaptive_scale_bps.is_some()
+                    || adaptive_max_funding_bps.is_some()
                 {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
@@ -7614,6 +7687,16 @@ pub mod processor {
                     }
                     if let Some(ramp) = oi_ramp_slots {
                         config.oi_ramp_slots = ramp;
+                    }
+                    // PERC-300: Adaptive funding rate params
+                    if let Some(enabled) = adaptive_funding_enabled {
+                        config.adaptive_funding_enabled = enabled;
+                    }
+                    if let Some(scale) = adaptive_scale_bps {
+                        config.adaptive_scale_bps = scale;
+                    }
+                    if let Some(max_bps) = adaptive_max_funding_bps {
+                        config.adaptive_max_funding_bps = max_bps;
                     }
                     state::write_config(&mut data, &config);
                     let (mult, skew) = unpack_oi_cap(config.oi_cap_multiplier_bps);
