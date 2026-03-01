@@ -47,7 +47,11 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
+    // Native (u128 align=16): 512; SBF (u128 align=8): 496
+    #[cfg(target_arch = "bpf")]
     const _: [(); 496] = [(); CONFIG_LEN];
+    #[cfg(not(target_arch = "bpf"))]
+    const _: [(); 512] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -65,6 +69,10 @@ pub mod constants {
 
     /// Sentinel value for permissionless crank (no caller account required)
     pub const CRANK_NO_CALLER: u16 = u16::MAX;
+
+    /// PERC-302: Ramp start point (0.1x vault = 1000 bps).
+    /// New markets start at this OI cap and ramp linearly to target.
+    pub const RAMP_START_BPS: u64 = 1_000;
 
     // ── Instruction tags (single source of truth) ──────────────────────────
     // Keep in sync with program/src/tags.rs when that file exists (PERC-112).
@@ -1403,6 +1411,8 @@ pub mod verify {
         // Clamp to target (should never exceed due to elapsed < oi_ramp_slots, but be safe)
         let result = RAMP_START_BPS.saturating_add(ramp_add as u64);
         core::cmp::min(result, oi_cap_multiplier_bps)
+    }
+
     // ========================================
     // PERC-304: LP Utilization-Curve Fee Multiplier
     // ========================================
@@ -4767,7 +4777,12 @@ pub mod lp_vault {
     ///   80..84 current_fee_mult_bps (u32) — PERC-304
     ///   84     lp_util_curve_enabled (u8) — PERC-304
     ///   85..88 _padding304 ([u8; 3])
-    ///   88..128 _reserved ([u8; 40])
+    ///   88..112 _reserved ([u8; 24])
+    ///   --- PERC-313: struct grows from 128 → 192 ---
+    ///   112..128 epoch_high_water_tvl (u128) — PERC-313
+    ///   128..130 hwm_floor_bps (u16) — PERC-313
+    ///   130..136 _hwm_padding ([u8; 6])
+    ///   136..176 _reserved2 ([u8; 40])
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
     pub struct LpVaultState {
@@ -4810,10 +4825,11 @@ pub mod lp_vault {
         /// Alignment padding (PERC-304).
         pub _padding304: [u8; 3],
         /// Reserved for future use (alignment + forward compat).
-        pub _reserved: [u8; 40],
+        /// Original 128-byte struct: 80 (base) + 8 (PERC-308) + 8 (PERC-309) + 8 (PERC-304) + 24 = 128.
+        pub _reserved: [u8; 24],
 
         // ========================================
-        // PERC-313: High-Water Mark Protection
+        // PERC-313: High-Water Mark Protection (grows struct from 128 → 192)
         // ========================================
         /// Max TVL (total_capital) seen in the current epoch.
         /// Updated on every deposit. Reset to current TVL on epoch change.
@@ -4828,8 +4844,8 @@ pub mod lp_vault {
         pub _hwm_padding: [u8; 6],
 
         /// Reserved for future use (alignment + forward compat).
-        pub _reserved: [u8; 48],
-        pub _reserved: [u8; 32],
+        /// 128 + 16 + 2 + 6 + 40 = 192 (16-byte aligned for u128).
+        pub _reserved2: [u8; 40],
     }
 
     impl LpVaultState {
@@ -5325,6 +5341,7 @@ pub mod processor {
         ix::Instruction,
         oracle,
         state::{self, MarketConfig, SlabHeader},
+        verify::compute_ramp_multiplier,
         zc,
     };
     #[allow(unused_imports)]
@@ -5445,16 +5462,20 @@ pub mod processor {
         current_slot: u64,
     ) -> Result<(), ProgramError> {
         let (multiplier, skew_factor_bps) = unpack_oi_cap(config.oi_cap_multiplier_bps);
-    /// PERC-273: Check dynamic OI cap after trade execution.
-    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
-    fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
-        let multiplier = config.oi_cap_multiplier_bps;
         if multiplier == 0 {
             return Ok(()); // OI cap disabled
         }
+
+        // PERC-302: Apply market maturity ramp
+        let effective_multiplier = compute_ramp_multiplier(
+            multiplier,
+            config.market_created_slot,
+            current_slot,
+            config.oi_ramp_slots,
+        );
+
         let vault = engine.vault.get();
         let base_max_oi = vault.saturating_mul(effective_multiplier as u128) / 10_000;
-        let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
         let current_oi = engine.total_open_interest.get();
 
         // PERC-299: Halve cap when emergency OI mode is active (circuit breaker fired)
@@ -5491,11 +5512,6 @@ pub mod processor {
                 multiplier,
                 effective_multiplier,
                 skew_factor_bps,
-                "OI cap exceeded: current={} max={} (vault={} multiplier={})",
-                current_oi,
-                max_oi,
-                vault,
-                multiplier
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -6856,8 +6872,8 @@ pub mod processor {
                     .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error)?;
 
-                // PERC-273: Dynamic OI cap check after trade
-                check_oi_cap(engine, &config)?;
+                // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
+                check_oi_cap(engine, &config, clock.slot)?;
                 check_pnl_cap(engine, &config)?;
 
                 #[cfg(feature = "cu-audit")]
@@ -7185,8 +7201,8 @@ pub mod processor {
                         .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
                         .map_err(map_risk_error)?;
 
-                    // PERC-273: Dynamic OI cap check after trade
-                    check_oi_cap(engine, &config)?;
+                    // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
+                    check_oi_cap(engine, &config, clock.slot)?;
                     check_pnl_cap(engine, &config)?;
 
                     #[cfg(feature = "cu-audit")]
@@ -7976,7 +7992,6 @@ pub mod processor {
                     || adaptive_scale_bps.is_some()
                     || adaptive_max_funding_bps.is_some()
                 {
-                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
                         // Preserve existing skew factor when only updating multiplier
@@ -8015,9 +8030,6 @@ pub mod processor {
                         max_pnl_cap,
                         skew,
                         oi_ramp_slots
-                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}",
-                        oi_cap_multiplier_bps,
-                        max_pnl_cap
                     );
                 }
 

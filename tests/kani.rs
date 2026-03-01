@@ -5589,6 +5589,8 @@ fn proof_ramp_reaches_full_after_duration() {
         result, multiplier,
         "ramp must reach full multiplier after ramp_slots"
     );
+}
+
 // PERC-304: LP Utilization-Curve Fee Multiplier Proofs
 // ============================================================================
 
@@ -5820,6 +5822,9 @@ fn kani_decide_trade_nocpi_universal() {
             TradeNoCpiDecision::Reject => {}
             _ => panic!("gate failure must produce Reject"),
         }
+    }
+}
+
 // =============================================================================
 // PERC-320: New Kani proof harnesses for PERC-298 through PERC-316
 // =============================================================================

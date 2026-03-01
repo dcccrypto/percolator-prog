@@ -82,15 +82,12 @@ pub const TAG_RESOLVE_DISPUTE: u8 = 44;
 pub const TAG_DEPOSIT_LP_COLLATERAL: u8 = 45;
 /// PERC-315: Withdraw LP collateral (position must be closed).
 pub const TAG_WITHDRAW_LP_COLLATERAL: u8 = 46;
-<<<<<<< HEAD
-=======
 /// PERC-309: Queue a large LP withdrawal.
 pub const TAG_QUEUE_WITHDRAWAL: u8 = 47;
 /// PERC-309: Claim one epoch tranche from queued withdrawal.
 pub const TAG_CLAIM_QUEUED_WITHDRAWAL: u8 = 48;
 /// PERC-309: Cancel queued withdrawal, refund remaining.
 pub const TAG_CANCEL_QUEUED_WITHDRAWAL: u8 = 49;
->>>>>>> 53dfd27 (feat(PERC-309): Drip withdrawal queue — anti-bank-run LP exit throttle)
 
 #[cfg(test)]
 mod tests {
@@ -147,12 +144,9 @@ mod tests {
             TAG_RESOLVE_DISPUTE,
             TAG_DEPOSIT_LP_COLLATERAL,
             TAG_WITHDRAW_LP_COLLATERAL,
-<<<<<<< HEAD
-=======
             TAG_QUEUE_WITHDRAWAL,
             TAG_CLAIM_QUEUED_WITHDRAWAL,
             TAG_CANCEL_QUEUED_WITHDRAWAL,
->>>>>>> 53dfd27 (feat(PERC-309): Drip withdrawal queue — anti-bank-run LP exit throttle)
         ];
 
         for i in 0..tags.len() {
@@ -213,12 +207,9 @@ mod tests {
             TAG_RESOLVE_DISPUTE,
             TAG_DEPOSIT_LP_COLLATERAL,
             TAG_WITHDRAW_LP_COLLATERAL,
-<<<<<<< HEAD
-=======
             TAG_QUEUE_WITHDRAWAL,
             TAG_CLAIM_QUEUED_WITHDRAWAL,
             TAG_CANCEL_QUEUED_WITHDRAWAL,
->>>>>>> 53dfd27 (feat(PERC-309): Drip withdrawal queue — anti-bank-run LP exit throttle)
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
