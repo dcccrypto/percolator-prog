@@ -43,10 +43,10 @@ use percolator_prog::verify::{
     circuit_breaker_triggered,
     compute_fee_ceil,
     compute_fee_floor,
-    // PERC-302: OI ramp multiplier
-    compute_ramped_multiplier,
     // New: PERC-304 fee multiplier
     compute_fee_multiplier_bps,
+    // PERC-302: OI ramp multiplier
+    compute_ramped_multiplier,
     compute_util_bps,
     convert_decimals,
     cpi_trade_size,
@@ -5589,6 +5589,8 @@ fn proof_ramp_reaches_full_after_duration() {
         result, multiplier,
         "ramp must reach full multiplier after ramp_slots"
     );
+}
+
 // PERC-304: LP Utilization-Curve Fee Multiplier Proofs
 // ============================================================================
 
@@ -5820,6 +5822,9 @@ fn kani_decide_trade_nocpi_universal() {
             TradeNoCpiDecision::Reject => {}
             _ => panic!("gate failure must produce Reject"),
         }
+    }
+}
+
 // =============================================================================
 // PERC-320: New Kani proof harnesses for PERC-298 through PERC-316
 // =============================================================================

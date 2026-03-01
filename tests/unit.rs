@@ -4688,6 +4688,9 @@ fn test_skew_adjusted_cap_reduces_with_imbalance() {
         effective,
         base_max_oi / 2,
         "100% skew with 50% factor should halve the cap"
+    );
+}
+
 // PERC-304: Utilization-Curve Fee Multiplier Tests
 // ============================================================================
 
@@ -4774,10 +4777,11 @@ fn test_compute_util_bps() {
 
 #[test]
 fn test_lp_vault_state_size_unchanged() {
-    // CRITICAL: LpVaultState must be exactly 128 bytes for account layout compatibility.
+    // CRITICAL: LpVaultState must be exactly 192 bytes for account layout compatibility.
+    // PERC-313: Grew from 128 → 192 for high-water mark protection fields.
     assert_eq!(
         core::mem::size_of::<percolator_prog::lp_vault::LpVaultState>(),
-        128,
+        192,
         "LpVaultState layout changed — this breaks existing accounts!"
     );
 }
@@ -4815,6 +4819,9 @@ fn test_skew_adjusted_cap_zero_skew_factor_disables() {
     let effective = base_max_oi * (10_000 - reduction) / 10_000;
 
     assert_eq!(effective, base_max_oi);
+}
+
+#[test]
 fn test_lp_vault_state_new_fields_zero_default() {
     // Verify that zeroed LpVaultState has util curve disabled and mult at 0.
     // This ensures backward compat: existing vaults (with zeroed reserved bytes)
