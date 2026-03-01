@@ -9297,14 +9297,12 @@ pub mod processor {
                 {
                     // Compute max OI from engine vault balance and config multiplier
                     let vault_balance = engine.vault.get();
-                    let max_oi = vault_balance
-                        .saturating_mul(config.oi_cap_multiplier_bps as u128)
-                        / 10_000;
+                    let max_oi =
+                        vault_balance.saturating_mul(config.oi_cap_multiplier_bps as u128) / 10_000;
                     let current_oi = engine.total_open_interest.get();
 
                     // Utilization = current_oi / max_oi (in bps)
-                    let util_bps =
-                        crate::verify::compute_util_bps(current_oi, max_oi);
+                    let util_bps = crate::verify::compute_util_bps(current_oi, max_oi);
                     let mult = crate::verify::compute_fee_multiplier_bps(util_bps);
 
                     // Store the computed multiplier for off-chain readers
@@ -9312,8 +9310,7 @@ pub mod processor {
                     mult
                 } else {
                     // Curve disabled or no OI cap — 1.0× multiplier
-                    vault_state.current_fee_mult_bps =
-                        crate::verify::FEE_MULT_BASE_BPS as u32;
+                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
                     crate::verify::FEE_MULT_BASE_BPS
                 };
 

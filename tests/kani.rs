@@ -45,6 +45,9 @@ use percolator_prog::verify::{
     compute_fee_floor,
     // PERC-302: OI ramp multiplier
     compute_ramped_multiplier,
+    // New: PERC-304 fee multiplier
+    compute_fee_multiplier_bps,
+    compute_util_bps,
     convert_decimals,
     cpi_trade_size,
     decide_admin_op,
@@ -61,9 +64,6 @@ use percolator_prog::verify::{
     gate_active,
     // New: InitMarket scale validation
     init_market_scale_ok,
-    // New: PERC-304 fee multiplier
-    compute_fee_multiplier_bps,
-    compute_util_bps,
     // New: Oracle inversion math
     invert_price_e6,
     is_hyperp_mode_verify,
@@ -5621,8 +5621,14 @@ fn proof_fee_mult_bounded() {
 
     let mult = compute_fee_multiplier_bps(util_bps);
 
-    assert!(mult >= 10_000, "fee multiplier must be >= 1.0× (10_000 bps)");
-    assert!(mult <= 75_000, "fee multiplier must be <= 7.5× (75_000 bps)");
+    assert!(
+        mult >= 10_000,
+        "fee multiplier must be >= 1.0× (10_000 bps)"
+    );
+    assert!(
+        mult <= 75_000,
+        "fee multiplier must be <= 7.5× (75_000 bps)"
+    );
 }
 
 /// Prove: fee multiplier hits exact boundary values at kink points.
