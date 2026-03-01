@@ -893,7 +893,7 @@ pub mod verify {
         if scale == 0 {
             return true;
         }
-        amount.is_multiple_of(scale as u64)
+        amount % (scale as u64) == 0
     }
 
     // =========================================================================
@@ -1496,7 +1496,7 @@ pub mod zc {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_ptr().add(ENGINE_OFF) };
-        if !(ptr as usize).is_multiple_of(ENGINE_ALIGN) {
+        if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(unsafe { &*(ptr as *const RiskEngine) })
@@ -1509,7 +1509,7 @@ pub mod zc {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
-        if !(ptr as usize).is_multiple_of(ENGINE_ALIGN) {
+        if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
