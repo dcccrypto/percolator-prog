@@ -2503,7 +2503,10 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/dcccrypto/percolator.git?branch=master#30748219a03436d68013a566715c2758e29a225e"
+=======
+>>>>>>> 6826cb4 (feat(PERC-306): per-market insurance fund isolation wrapper)
 
 [[package]]
 name = "percolator-prog"
