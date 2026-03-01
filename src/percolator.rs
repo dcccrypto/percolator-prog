@@ -1920,9 +1920,13 @@ pub mod ix {
         /// Accounts: [slab(writable), lp_vault_state(writable)]
         LpVaultCrankFees,
         /// PERC-303: Deposit into junior tranche. Same accounts as LpVaultDeposit.
-        LpVaultDepositJunior { amount: u64 },
+        LpVaultDepositJunior {
+            amount: u64,
+        },
         /// PERC-303: Deposit into senior tranche. Same accounts as LpVaultDeposit.
-        LpVaultDepositSenior { amount: u64 },
+        LpVaultDepositSenior {
+            amount: u64,
+        },
     }
 
     impl Instruction {
@@ -4423,7 +4427,9 @@ pub mod lp_vault {
         /// Returns amount actually absorbed.
         #[inline]
         pub fn apply_loss(&mut self, loss: u64) -> u64 {
-            if loss == 0 { return 0; }
+            if loss == 0 {
+                return 0;
+            }
             let mut remaining = loss;
             let junior_absorb = core::cmp::min(remaining, self.junior_balance);
             self.junior_balance -= junior_absorb;
@@ -4443,11 +4449,17 @@ pub mod lp_vault {
             if total_fee == 0 || (self.junior_total_lp == 0 && self.senior_total_lp == 0) {
                 return (0, 0);
             }
-            let mult = if self.junior_fee_mult_bps == 0 { 10_000u128 } else { self.junior_fee_mult_bps as u128 };
+            let mult = if self.junior_fee_mult_bps == 0 {
+                10_000u128
+            } else {
+                self.junior_fee_mult_bps as u128
+            };
             let jr_w = (self.junior_total_lp as u128) * mult;
             let sr_w = (self.senior_total_lp as u128) * 10_000;
             let total_w = jr_w + sr_w;
-            if total_w == 0 { return (0, 0); }
+            if total_w == 0 {
+                return (0, 0);
+            }
             let jr = (total_fee as u128) * jr_w / total_w;
             let sr = (total_fee as u128) - jr;
             (jr as u64, sr as u64)
@@ -4455,8 +4467,12 @@ pub mod lp_vault {
     }
 
     pub fn read_lp_vault_state(data: &[u8]) -> Option<LpVaultState> {
-        if data.len() < LP_VAULT_STATE_LEN { return None; }
-        Some(*bytemuck::from_bytes::<LpVaultState>(&data[..LP_VAULT_STATE_LEN]))
+        if data.len() < LP_VAULT_STATE_LEN {
+            return None;
+        }
+        Some(*bytemuck::from_bytes::<LpVaultState>(
+            &data[..LP_VAULT_STATE_LEN],
+        ))
     }
 
     pub fn write_lp_vault_state(data: &mut [u8], state: &LpVaultState) {
@@ -4478,17 +4494,29 @@ pub mod lp_vault {
             kani::assume(loss <= 1_000_000_000_000);
 
             let mut s = LpVaultState {
-                magic: LP_VAULT_MAGIC, fee_share_bps: 5000,
+                magic: LP_VAULT_MAGIC,
+                fee_share_bps: 5000,
                 total_capital: (jb as u128) + (sb as u128),
-                epoch: 0, last_crank_slot: 0, last_fee_snapshot: 0, total_fees_distributed: 0,
-                junior_total_lp: jb, senior_total_lp: sb,
-                junior_balance: jb, senior_balance: sb,
-                junior_fee_mult_bps: 20_000, _tranche_pad: [0;6], _reserved: [0;8],
+                epoch: 0,
+                last_crank_slot: 0,
+                last_fee_snapshot: 0,
+                total_fees_distributed: 0,
+                junior_total_lp: jb,
+                senior_total_lp: sb,
+                junior_balance: jb,
+                senior_balance: sb,
+                junior_fee_mult_bps: 20_000,
+                _tranche_pad: [0; 6],
+                _reserved: [0; 8],
             };
             let sb_before = s.senior_balance;
             s.apply_loss(loss);
-            if jb >= loss { assert!(s.senior_balance == sb_before); }
-            if s.senior_balance < sb_before { assert!(s.junior_balance == 0); }
+            if jb >= loss {
+                assert!(s.senior_balance == sb_before);
+            }
+            if s.senior_balance < sb_before {
+                assert!(s.junior_balance == 0);
+            }
         }
     }
 
@@ -4498,12 +4526,20 @@ pub mod lp_vault {
 
         fn make(jr: u64, sr: u64) -> LpVaultState {
             LpVaultState {
-                magic: LP_VAULT_MAGIC, fee_share_bps: 5000,
+                magic: LP_VAULT_MAGIC,
+                fee_share_bps: 5000,
                 total_capital: (jr as u128) + (sr as u128),
-                epoch: 0, last_crank_slot: 0, last_fee_snapshot: 0, total_fees_distributed: 0,
-                junior_total_lp: jr, senior_total_lp: sr,
-                junior_balance: jr, senior_balance: sr,
-                junior_fee_mult_bps: 20_000, _tranche_pad: [0;6], _reserved: [0;8],
+                epoch: 0,
+                last_crank_slot: 0,
+                last_fee_snapshot: 0,
+                total_fees_distributed: 0,
+                junior_total_lp: jr,
+                senior_total_lp: sr,
+                junior_balance: jr,
+                senior_balance: sr,
+                junior_fee_mult_bps: 20_000,
+                _tranche_pad: [0; 6],
+                _reserved: [0; 8],
             }
         }
 
@@ -4511,13 +4547,19 @@ pub mod lp_vault {
         fn loss_junior_only() {
             let mut s = make(100, 200);
             s.apply_loss(50);
-            assert_eq!((s.junior_balance, s.senior_balance, s.total_capital), (50, 200, 250));
+            assert_eq!(
+                (s.junior_balance, s.senior_balance, s.total_capital),
+                (50, 200, 250)
+            );
         }
         #[test]
         fn loss_spills_to_senior() {
             let mut s = make(100, 200);
             s.apply_loss(150);
-            assert_eq!((s.junior_balance, s.senior_balance, s.total_capital), (0, 150, 150));
+            assert_eq!(
+                (s.junior_balance, s.senior_balance, s.total_capital),
+                (0, 150, 150)
+            );
         }
         #[test]
         fn loss_exceeds_total() {
@@ -8315,7 +8357,8 @@ pub mod processor {
             // =============================================================
             // PERC-303: Senior/Junior tranche deposits
             // =============================================================
-            Instruction::LpVaultDepositJunior { amount } | Instruction::LpVaultDepositSenior { amount } => {
+            Instruction::LpVaultDepositJunior { amount }
+            | Instruction::LpVaultDepositSenior { amount } => {
                 let is_junior = matches!(instruction, Instruction::LpVaultDepositJunior { .. });
 
                 accounts::expect_len(accounts, 9)?;
@@ -8354,7 +8397,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_depositor_ata, a_depositor.key, &mint)?;
 
                 let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
@@ -8399,7 +8447,9 @@ pub mod processor {
                         .checked_mul(lp_supply as u128)
                         .ok_or(PercolatorError::EngineOverflow)?;
                     let r = n / capital_before;
-                    if r > u64::MAX as u128 { return Err(PercolatorError::EngineOverflow.into()); }
+                    if r > u64::MAX as u128 {
+                        return Err(PercolatorError::EngineOverflow.into());
+                    }
                     r as u64
                 };
 
@@ -8407,20 +8457,29 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
                 }
 
-                vault_state.total_capital = vault_state.total_capital
+                vault_state.total_capital = vault_state
+                    .total_capital
                     .checked_add(units as u128)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
                 if is_junior {
-                    vault_state.junior_total_lp = vault_state.junior_total_lp
-                        .checked_add(lp_tokens_to_mint).ok_or(PercolatorError::EngineOverflow)?;
-                    vault_state.junior_balance = vault_state.junior_balance
-                        .checked_add(units).ok_or(PercolatorError::EngineOverflow)?;
+                    vault_state.junior_total_lp = vault_state
+                        .junior_total_lp
+                        .checked_add(lp_tokens_to_mint)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    vault_state.junior_balance = vault_state
+                        .junior_balance
+                        .checked_add(units)
+                        .ok_or(PercolatorError::EngineOverflow)?;
                 } else {
-                    vault_state.senior_total_lp = vault_state.senior_total_lp
-                        .checked_add(lp_tokens_to_mint).ok_or(PercolatorError::EngineOverflow)?;
-                    vault_state.senior_balance = vault_state.senior_balance
-                        .checked_add(units).ok_or(PercolatorError::EngineOverflow)?;
+                    vault_state.senior_total_lp = vault_state
+                        .senior_total_lp
+                        .checked_add(lp_tokens_to_mint)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    vault_state.senior_balance = vault_state
+                        .senior_balance
+                        .checked_add(units)
+                        .ok_or(PercolatorError::EngineOverflow)?;
                 }
 
                 if vault_state.junior_fee_mult_bps == 0 {
@@ -8429,8 +8488,12 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut slab_data)?;
                 engine.vault = percolator::U128::new(
-                    engine.vault.get().checked_add(units as u128)
-                        .ok_or(PercolatorError::EngineOverflow)?);
+                    engine
+                        .vault
+                        .get()
+                        .checked_add(units as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
                 drop(slab_data);
 
                 crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
@@ -8444,15 +8507,22 @@ pub mod processor {
                 let signer_seeds: [&[&[u8]]; 1] = [&seeds];
 
                 crate::insurance_lp::mint_to(
-                    a_token, a_lp_vault_mint, a_depositor_lp_ata,
-                    a_vault_authority, lp_tokens_to_mint, &signer_seeds,
+                    a_token,
+                    a_lp_vault_mint,
+                    a_depositor_lp_ata,
+                    a_vault_authority,
+                    lp_tokens_to_mint,
+                    &signer_seeds,
                 )?;
 
                 let tranche = if is_junior { "junior" } else { "senior" };
                 msg!(
                     "LP vault {} deposit: {} tokens, {} LP, jr={} sr={}",
-                    tranche, amount, lp_tokens_to_mint,
-                    vault_state.junior_balance, vault_state.senior_balance
+                    tranche,
+                    amount,
+                    lp_tokens_to_mint,
+                    vault_state.junior_balance,
+                    vault_state.senior_balance
                 );
             }
         }
