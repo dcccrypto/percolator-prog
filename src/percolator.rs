@@ -47,7 +47,7 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
-    const _: [(); 496] = [(); CONFIG_LEN];
+    const _: [(); 512] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -2794,11 +2794,16 @@ pub mod state {
         // ========================================
         // LP Token Collateral (PERC-315)
         // ========================================
-        /// 1 = LP vault tokens accepted as perp collateral, 0 = disabled.
+        /// Whether LP vault tokens can be used as perp collateral.
+        /// 0 = disabled, 1 = enabled.
         pub lp_collateral_enabled: u8,
         pub _lp_col_pad: [u8; 7],
-        /// Loan-to-value ratio in basis points for LP tokens (e.g., 8000 = 80%).
+        /// LTV for LP token collateral in bps (default 5000 = 50%).
         pub lp_collateral_ltv_bps: u64,
+        /// Vault TVL at time of last LP collateral price update (for drawdown detection).
+        pub lp_col_last_tvl_e6: u64,
+        /// Padding for 16-byte alignment (struct contains u128 fields).
+        pub _lp_col_tail_pad: [u8; 8],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -5668,7 +5673,9 @@ pub mod processor {
                     // PERC-315: LP collateral disabled by default
                     lp_collateral_enabled: 0,
                     _lp_col_pad: [0; 7],
-                    lp_collateral_ltv_bps: 0,
+                    lp_collateral_ltv_bps: 5000, // 50% LTV
+                    lp_col_last_tvl_e6: 0,
+                    _lp_col_tail_pad: [0; 8],
                 };
                 state::write_config(&mut data, &config);
 
@@ -9371,6 +9378,12 @@ pub mod processor {
                 user_idx,
                 lp_amount,
             } => {
+                // Deposit LP vault tokens as collateral for perp positions.
+                // LP tokens are transferred to a program-owned escrow.
+                // Value = (lp_amount * vault_tvl / supply) * ltv_bps / 10_000
+                // Accounts: [user(signer), slab(writable), user_lp_ata(writable),
+                //            lp_vault_mint, lp_vault_state, token_program,
+                //            lp_escrow(writable)]
                 accounts::expect_len(accounts, 7)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
@@ -9400,6 +9413,7 @@ pub mod processor {
                     return Err(PercolatorError::LpCollateralDisabled.into());
                 }
 
+                // Read vault state for TVL
                 let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_state, &expected_state)?;
 
@@ -9409,10 +9423,12 @@ pub mod processor {
                 let vault_tvl = vault_state.total_capital;
                 drop(vs_data);
 
+                // Read LP supply
                 let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
                 let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
 
+                // Compute collateral value with LTV
                 let collateral_units = crate::lp_collateral::lp_token_value(
                     lp_amount,
                     vault_tvl,
@@ -9434,10 +9450,12 @@ pub mod processor {
 
                 let clock = Clock::get()?;
 
+                // Credit collateral to user's account
                 engine
                     .deposit(user_idx, collateral_units, clock.slot)
                     .map_err(map_risk_error)?;
 
+                // Update engine vault balance
                 engine.vault = percolator::U128::new(
                     engine
                         .vault
@@ -9447,6 +9465,8 @@ pub mod processor {
                 );
                 drop(slab_data);
 
+                // Transfer LP tokens from user to escrow
+                // (escrow is a token account owned by vault authority PDA)
                 collateral::deposit(a_token, a_user_lp_ata, a_lp_escrow, a_user, lp_amount)?;
 
                 msg!(
@@ -9461,6 +9481,10 @@ pub mod processor {
                 user_idx,
                 lp_amount,
             } => {
+                // Withdraw LP collateral. Position must be fully closed.
+                // Accounts: [user(signer), slab(writable), user_lp_ata(writable),
+                //            lp_vault_mint, lp_vault_state, token_program,
+                //            lp_escrow(writable), vault_authority]
                 accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
@@ -9490,6 +9514,7 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
+                // Position must be closed
                 let pos = engine.accounts[user_idx as usize].position_size.get();
                 if pos != 0 {
                     return Err(PercolatorError::LpCollateralPositionOpen.into());
@@ -9498,6 +9523,11 @@ pub mod processor {
                 let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_state, &expected_state)?;
 
+                // Compute collateral units to debit
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                // We need to drop slab borrow to read vault state
                 drop(slab_data);
 
                 let vs_data = a_lp_vault_state.try_borrow_data()?;
@@ -9517,10 +9547,12 @@ pub mod processor {
                     config.lp_collateral_ltv_bps,
                 );
 
+                // Withdraw collateral from engine
                 let mut slab_data = state::slab_data_mut(a_slab)?;
                 let engine = zc::engine_mut(&mut slab_data)?;
 
                 let clock = Clock::get()?;
+                // Use 0 for oracle price — position is already closed (checked above)
                 engine
                     .withdraw(user_idx, collateral_units, clock.slot, 0)
                     .map_err(map_risk_error)?;
@@ -9529,6 +9561,7 @@ pub mod processor {
                     percolator::U128::new(engine.vault.get().saturating_sub(collateral_units));
                 drop(slab_data);
 
+                // Transfer LP tokens from escrow back to user
                 let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
                 accounts::expect_key(a_vault_authority, &auth)?;
 
