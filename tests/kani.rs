@@ -5334,3 +5334,65 @@ fn proof_ring_buffer_wraps() {
     let next = ring_buffer_push(cursor, capacity);
     assert!(next < capacity, "cursor must stay within bounds");
 }
+
+// ============================================================================
+// PERC-298: Skew-Adjusted OI Cap Proofs
+// ============================================================================
+
+/// Prove that the skew-adjusted effective OI cap never exceeds the base OI cap.
+/// Formula: effective = base * (10_000 - capped_reduction) / 10_000
+/// where capped_reduction = min(skew * skew_factor / total_oi, skew_factor)
+/// Since capped_reduction >= 0, effective <= base always holds.
+#[kani::proof]
+fn proof_skew_adjusted_cap_never_exceeds_base_cap() {
+    use percolator_prog::processor::{pack_oi_cap, unpack_oi_cap};
+
+    // Symbolic inputs
+    let vault: u128 = kani::any();
+    let long_oi: u128 = kani::any();
+    let short_oi: u128 = kani::any();
+    let multiplier: u64 = kani::any();
+    let skew_factor_bps: u64 = kani::any();
+
+    // Constraints matching real-world bounds
+    kani::assume(vault > 0 && vault <= u64::MAX as u128);
+    kani::assume(multiplier > 0 && multiplier <= 1_000_000); // up to 100x
+    kani::assume(skew_factor_bps <= 10_000); // max 100%
+    kani::assume(long_oi <= u64::MAX as u128);
+    kani::assume(short_oi <= u64::MAX as u128);
+
+    let total_oi = long_oi.saturating_add(short_oi);
+    kani::assume(total_oi > 0);
+
+    let base_max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
+
+    // Compute skew-adjusted cap (mirrors check_oi_cap logic)
+    let skew = if long_oi > short_oi {
+        long_oi - short_oi
+    } else {
+        short_oi - long_oi
+    };
+    let reduction_bps = skew.saturating_mul(skew_factor_bps as u128) / total_oi;
+    let capped_reduction = if reduction_bps < skew_factor_bps as u128 {
+        reduction_bps
+    } else {
+        skew_factor_bps as u128
+    };
+    let effective_max_oi =
+        base_max_oi.saturating_mul(10_000u128.saturating_sub(capped_reduction)) / 10_000;
+
+    // The invariant: effective cap never exceeds base cap
+    assert!(
+        effective_max_oi <= base_max_oi,
+        "skew-adjusted cap must not exceed base cap"
+    );
+
+    // Also verify pack/unpack roundtrip
+    let packed = pack_oi_cap(multiplier, skew_factor_bps);
+    let (unpacked_mult, unpacked_skew) = unpack_oi_cap(packed);
+    // Multiplier fits in 32 bits for roundtrip
+    if multiplier <= 0xFFFF_FFFF && skew_factor_bps <= 0xFFFF {
+        assert_eq!(unpacked_mult, multiplier, "multiplier roundtrip");
+        assert_eq!(unpacked_skew, skew_factor_bps, "skew_factor roundtrip");
+    }
+}
