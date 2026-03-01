@@ -32,7 +32,7 @@ use std::path::PathBuf;
 // ExternalAccountDataModified errors in LiteSVM's BPF runtime).
 // Build with: cargo build-sbf   (no --features test)
 // Note: BPF struct layout differs from native; these are BPF values.
-const SLAB_LEN: usize = 1025600; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth, PERC-306 +16)
+const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
