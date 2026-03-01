@@ -1745,6 +1745,12 @@ pub mod error {
         LpCollateralDisabled,
         /// PERC-315: Position still open — cannot withdraw LP collateral.
         LpCollateralPositionOpen,
+        /// PERC-309: Withdraw queue already exists.
+        WithdrawQueueAlreadyExists,
+        /// PERC-309: No queued withdrawal found.
+        WithdrawQueueNotFound,
+        /// PERC-309: Nothing claimable this epoch.
+        WithdrawQueueNothingClaimable,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2093,6 +2099,14 @@ pub mod ix {
             user_idx: u16,
             lp_amount: u64,
         },
+        /// PERC-309: Queue large LP withdrawal.
+        QueueWithdrawal {
+            lp_amount: u64,
+        },
+        /// PERC-309: Claim one epoch tranche.
+        ClaimQueuedWithdrawal,
+        /// PERC-309: Cancel queued withdrawal.
+        CancelQueuedWithdrawal,
     }
 
     impl Instruction {
@@ -2507,6 +2521,12 @@ pub mod ix {
                         lp_amount,
                     })
                 }
+                TAG_QUEUE_WITHDRAWAL => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::QueueWithdrawal { lp_amount })
+                }
+                TAG_CLAIM_QUEUED_WITHDRAWAL => Ok(Instruction::ClaimQueuedWithdrawal),
+                TAG_CANCEL_QUEUED_WITHDRAWAL => Ok(Instruction::CancelQueuedWithdrawal),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -2708,6 +2728,18 @@ pub mod accounts {
     /// PERC-314: Derive settlement dispute PDA.
     pub fn derive_dispute(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[b"dispute", slab_key.as_ref()], program_id)
+    }
+
+    /// PERC-309: Derive withdraw queue PDA.
+    pub fn derive_withdraw_queue(
+        program_id: &Pubkey,
+        slab_key: &Pubkey,
+        user_key: &Pubkey,
+    ) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[b"withdraw_queue", slab_key.as_ref(), user_key.as_ref()],
+            program_id,
+        )
     }
 }
 
@@ -4761,6 +4793,11 @@ pub mod lp_vault {
         /// PERC-308: Whether loyalty multiplier is enabled (1=yes, 0=no).
         pub loyalty_enabled: u8,
         pub _loyalty_pad: [u8; 7],
+        /// PERC-309: Withdrawal threshold in bps of TVL. 0 = disabled.
+        pub queue_threshold_bps: u16,
+        /// PERC-309: Number of epochs for queued withdrawals (default 5).
+        pub queue_epochs: u8,
+        pub _drip_pad: [u8; 5],
         /// Reserved for future use.
         /// PERC-304: Current fee multiplier in basis points (10_000 = 1.0×).
         /// Updated on every LpVaultCrankFees when util curve is enabled.
@@ -4792,6 +4829,7 @@ pub mod lp_vault {
 
         /// Reserved for future use (alignment + forward compat).
         pub _reserved: [u8; 48],
+        pub _reserved: [u8; 32],
     }
 
     impl LpVaultState {
@@ -4821,6 +4859,149 @@ pub mod lp_vault {
     pub fn write_lp_vault_state(data: &mut [u8], state: &LpVaultState) {
         let bytes = bytemuck::bytes_of(state);
         data[..LP_VAULT_STATE_LEN].copy_from_slice(bytes);
+    }
+
+    // =========================================================================
+    // PERC-309: Withdraw Queue
+    // =========================================================================
+    pub const WITHDRAW_QUEUE_MAGIC: u64 = 0x5045_5243_5155_4555;
+    pub const WITHDRAW_QUEUE_LEN: usize = core::mem::size_of::<WithdrawQueue>();
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct WithdrawQueue {
+        pub magic: u64,
+        pub queued_lp_amount: u64,
+        pub queue_start_slot: u64,
+        pub epochs_remaining: u8,
+        pub total_epochs: u8,
+        pub _pad: [u8; 6],
+        pub claimed_so_far: u64,
+        pub _reserved: [u8; 24],
+    }
+
+    impl WithdrawQueue {
+        #[inline]
+        pub fn is_initialized(&self) -> bool {
+            self.magic == WITHDRAW_QUEUE_MAGIC
+        }
+        #[inline]
+        pub fn claimable_this_epoch(&self) -> u64 {
+            if self.epochs_remaining == 0 {
+                return 0;
+            }
+            let remaining_lp = self.queued_lp_amount.saturating_sub(self.claimed_so_far);
+            if self.epochs_remaining == 1 {
+                remaining_lp
+            } else {
+                remaining_lp / (self.epochs_remaining as u64)
+            }
+        }
+    }
+
+    pub fn read_withdraw_queue(data: &[u8]) -> Option<WithdrawQueue> {
+        if data.len() < WITHDRAW_QUEUE_LEN {
+            return None;
+        }
+        Some(*bytemuck::from_bytes::<WithdrawQueue>(
+            &data[..WITHDRAW_QUEUE_LEN],
+        ))
+    }
+
+    pub fn write_withdraw_queue(data: &mut [u8], q: &WithdrawQueue) {
+        data[..WITHDRAW_QUEUE_LEN].copy_from_slice(bytemuck::bytes_of(q));
+    }
+
+    #[cfg(kani)]
+    mod withdraw_queue_proofs {
+        use super::*;
+        #[kani::proof]
+        #[kani::unwind(6)]
+        fn proof_queued_withdrawal_total_never_exceeds_original_amount() {
+            let queued_lp: u64 = kani::any();
+            let total_epochs: u8 = kani::any();
+            kani::assume(queued_lp > 0 && queued_lp <= 1_000_000_000_000);
+            kani::assume(total_epochs > 0 && total_epochs <= 5);
+            let mut q = WithdrawQueue {
+                magic: WITHDRAW_QUEUE_MAGIC,
+                queued_lp_amount: queued_lp,
+                queue_start_slot: 100,
+                epochs_remaining: total_epochs,
+                total_epochs,
+                _pad: [0; 6],
+                claimed_so_far: 0,
+                _reserved: [0; 24],
+            };
+            let mut total_claimed: u64 = 0;
+            for _ in 0..total_epochs {
+                let c = q.claimable_this_epoch();
+                total_claimed = total_claimed.saturating_add(c);
+                q.claimed_so_far = q.claimed_so_far.saturating_add(c);
+                q.epochs_remaining = q.epochs_remaining.saturating_sub(1);
+            }
+            assert!(total_claimed == queued_lp);
+            assert!(total_claimed <= queued_lp);
+        }
+    }
+
+    #[cfg(test)]
+    mod withdraw_queue_tests {
+        use super::*;
+        fn make_queue(amount: u64, epochs: u8) -> WithdrawQueue {
+            WithdrawQueue {
+                magic: WITHDRAW_QUEUE_MAGIC,
+                queued_lp_amount: amount,
+                queue_start_slot: 0,
+                epochs_remaining: epochs,
+                total_epochs: epochs,
+                _pad: [0; 6],
+                claimed_so_far: 0,
+                _reserved: [0; 24],
+            }
+        }
+        #[test]
+        fn test_claimable_5_epochs() {
+            let mut q = make_queue(100, 5);
+            let mut total = 0u64;
+            for _ in 0..5 {
+                let c = q.claimable_this_epoch();
+                assert_eq!(c, 20);
+                total += c;
+                q.claimed_so_far += c;
+                q.epochs_remaining -= 1;
+            }
+            assert_eq!(total, 100);
+        }
+        #[test]
+        fn test_claimable_indivisible() {
+            let mut q = make_queue(7, 3);
+            let c1 = q.claimable_this_epoch();
+            assert_eq!(c1, 2);
+            q.claimed_so_far += c1;
+            q.epochs_remaining -= 1;
+            let c2 = q.claimable_this_epoch();
+            assert_eq!(c2, 2);
+            q.claimed_so_far += c2;
+            q.epochs_remaining -= 1;
+            let c3 = q.claimable_this_epoch();
+            assert_eq!(c3, 3); // last epoch gets remainder
+            assert_eq!(c1 + c2 + c3, 7);
+        }
+        #[test]
+        fn test_claimable_zero_remaining() {
+            let mut q = make_queue(100, 1);
+            q.epochs_remaining = 0;
+            assert_eq!(q.claimable_this_epoch(), 0);
+        }
+        #[test]
+        fn test_queue_roundtrip() {
+            let q = make_queue(500, 5);
+            let mut buf = [0u8; WITHDRAW_QUEUE_LEN];
+            write_withdraw_queue(&mut buf, &q);
+            let q2 = read_withdraw_queue(&buf).unwrap();
+            assert_eq!(q2.queued_lp_amount, 500);
+            assert_eq!(q2.total_epochs, 5);
+        }
     }
 
     // =========================================================================
@@ -9870,6 +10051,273 @@ pub mod processor {
                     lp_amount,
                     collateral_units
                 );
+            }
+
+            Instruction::QueueWithdrawal { lp_amount } => {
+                accounts::expect_len(accounts, 5)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_lp_vault_state = &accounts[2];
+                let a_queue = &accounts[3];
+                let a_system = &accounts[4];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_queue)?;
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                require_not_paused(&data)?;
+                drop(data);
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let vs_data = a_lp_vault_state.try_borrow_data()?;
+                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+                let queue_epochs = if vault_state.queue_epochs == 0 {
+                    5u8
+                } else {
+                    vault_state.queue_epochs
+                };
+                drop(vs_data);
+
+                let (expected_queue, queue_bump) =
+                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+                accounts::expect_key(a_queue, &expected_queue)?;
+
+                if a_queue.data_len() > 0 {
+                    let q_data = a_queue.try_borrow_data()?;
+                    if let Some(existing) = crate::lp_vault::read_withdraw_queue(&q_data) {
+                        if existing.is_initialized() {
+                            return Err(PercolatorError::WithdrawQueueAlreadyExists.into());
+                        }
+                    }
+                    drop(q_data);
+                }
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                let queue_len = crate::lp_vault::WITHDRAW_QUEUE_LEN;
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(queue_len);
+
+                let seed1: &[u8] = b"withdraw_queue";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let seed3: &[u8] = a_user.key.as_ref();
+                let bump_arr: [u8; 1] = [queue_bump];
+                let seed4: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 4] = [seed1, seed2, seed3, seed4];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_user.key,
+                        a_queue.key,
+                        lamports,
+                        queue_len as u64,
+                        program_id,
+                    ),
+                    &[a_user.clone(), a_queue.clone(), a_system.clone()],
+                    &signer_seeds,
+                )?;
+
+                let clock = Clock::get()?;
+                let queue = crate::lp_vault::WithdrawQueue {
+                    magic: crate::lp_vault::WITHDRAW_QUEUE_MAGIC,
+                    queued_lp_amount: lp_amount,
+                    queue_start_slot: clock.slot,
+                    epochs_remaining: queue_epochs,
+                    total_epochs: queue_epochs,
+                    _pad: [0; 6],
+                    claimed_so_far: 0,
+                    _reserved: [0; 24],
+                };
+
+                let mut q_data = a_queue.try_borrow_mut_data()?;
+                crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
+
+                msg!(
+                    "PERC-309: Queued {} LP over {} epochs",
+                    lp_amount,
+                    queue_epochs
+                );
+            }
+
+            Instruction::ClaimQueuedWithdrawal => {
+                accounts::expect_len(accounts, 10)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_queue = &accounts[2];
+                let a_lp_vault_mint = &accounts[3];
+                let a_user_lp_ata = &accounts[4];
+                let a_vault = &accounts[5];
+                let a_user_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+                let a_token = &accounts[8];
+                let a_lp_vault_state = &accounts[9];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_queue)?;
+                accounts::expect_writable(a_lp_vault_mint)?;
+                accounts::expect_writable(a_user_lp_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_user_ata)?;
+                accounts::expect_writable(a_lp_vault_state)?;
+                verify_token_program(a_token)?;
+
+                let (expected_queue, _) =
+                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+                accounts::expect_key(a_queue, &expected_queue)?;
+
+                let mut q_data = a_queue.try_borrow_mut_data()?;
+                let mut queue = crate::lp_vault::read_withdraw_queue(&q_data)
+                    .ok_or(PercolatorError::WithdrawQueueNotFound)?;
+                if !queue.is_initialized() {
+                    return Err(PercolatorError::WithdrawQueueNotFound.into());
+                }
+
+                let claimable = queue.claimable_this_epoch();
+                if claimable == 0 {
+                    return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
+                }
+
+                queue.claimed_so_far = queue.claimed_so_far.saturating_add(claimable);
+                queue.epochs_remaining = queue.epochs_remaining.saturating_sub(1);
+                crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
+                drop(q_data);
+
+                let slab_data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                drop(slab_data);
+
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                accounts::expect_key(a_vault_authority, &auth)?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+
+                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+                accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+                    .ok_or(PercolatorError::LpVaultNotCreated)?;
+                if !vault_state.is_initialized() {
+                    return Err(PercolatorError::LpVaultNotCreated.into());
+                }
+
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+                if lp_supply == 0 || vault_state.total_capital == 0 {
+                    return Err(PercolatorError::LpVaultSupplyMismatch.into());
+                }
+
+                let capital_units =
+                    (claimable as u128) * vault_state.total_capital / (lp_supply as u128);
+                let slab_data = a_slab.try_borrow_data()?;
+                let config = state::read_config(&slab_data);
+                let base_amount =
+                    crate::units::units_to_base(capital_units as u64, config.unit_scale);
+                drop(slab_data);
+
+                vault_state.total_capital = vault_state.total_capital.saturating_sub(capital_units);
+                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+                drop(vs_data);
+
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let engine = zc::engine_mut(&mut slab_data)?;
+                engine.vault =
+                    percolator::U128::new(engine.vault.get().saturating_sub(capital_units));
+                drop(slab_data);
+
+                crate::insurance_lp::burn(
+                    a_token,
+                    a_lp_vault_mint,
+                    a_user_lp_ata,
+                    a_user,
+                    claimable,
+                )?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_user_ata,
+                    a_vault_authority,
+                    base_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "PERC-309: Claimed {} LP ({} tokens), {} epochs left",
+                    claimable,
+                    base_amount,
+                    queue.epochs_remaining
+                );
+            }
+
+            Instruction::CancelQueuedWithdrawal => {
+                accounts::expect_len(accounts, 3)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_queue = &accounts[2];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_queue)?;
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                drop(data);
+
+                let (expected_queue, _) =
+                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+                accounts::expect_key(a_queue, &expected_queue)?;
+
+                let q_data = a_queue.try_borrow_data()?;
+                let queue = crate::lp_vault::read_withdraw_queue(&q_data)
+                    .ok_or(PercolatorError::WithdrawQueueNotFound)?;
+                if !queue.is_initialized() {
+                    return Err(PercolatorError::WithdrawQueueNotFound.into());
+                }
+                let remaining = queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
+                drop(q_data);
+
+                let mut q_data = a_queue.try_borrow_mut_data()?;
+                q_data.fill(0);
+                drop(q_data);
+
+                let mut queue_lamports = a_queue.try_borrow_mut_lamports()?;
+                let mut user_lamports = a_user.try_borrow_mut_lamports()?;
+                **user_lamports = user_lamports
+                    .checked_add(**queue_lamports)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                **queue_lamports = 0;
+
+                msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
             }
         }
         Ok(())
