@@ -103,7 +103,7 @@ pub mod constants {
     #[cfg(feature = "test")]
     pub const MIN_INIT_MARKET_SEED: u64 = 0; // Allow zero seed in tests
     /// Alias for backwards compatibility with PERC-136 references.
-    pub const MIN_INIT_MARKET_SEED_LAMPORTS: u64 = 1_000_000;
+    pub const MIN_INIT_MARKET_SEED_LAMPORTS: u64 = MIN_INIT_MARKET_SEED;
 
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
@@ -1787,23 +1787,11 @@ pub mod ix {
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
     pub enum Instruction {
-        InitMarket {
-            admin: Pubkey,
-            collateral_mint: Pubkey,
-            /// Pyth feed ID for the index price (32 bytes).
-            /// If all zeros, enables Hyperp mode (internal mark/index, no external oracle).
-            index_feed_id: [u8; 32],
-            /// Maximum staleness in seconds
-            max_staleness_secs: u64,
-            conf_filter_bps: u16,
-            /// If non-zero, invert oracle price (raw -> 1e12/raw)
-            invert: u8,
-            /// Lamports per Unit for boundary conversion (0 = no scaling)
-            unit_scale: u32,
-            /// Initial mark price in e6 format. Required (non-zero) if Hyperp mode.
-            initial_mark_price_e6: u64,
-            risk_params: RiskParams,
-        },
+        /// PERC-331: InitMarket is early-dispatched in process_instruction before
+        /// Instruction::decode() is called, so this variant is never constructed.
+        /// Fields removed to shrink the enum (RiskParams ~300 B was the largest variant,
+        /// bloating every other variant's stack allocation and causing SBF stack overflow).
+        InitMarket,
         InitUser {
             fee_payment: u64,
         },
@@ -2122,27 +2110,10 @@ pub mod ix {
             use crate::tags::*;
             match tag {
                 TAG_INIT_MARKET => {
-                    // InitMarket
-                    let admin = read_pubkey(&mut rest)?;
-                    let collateral_mint = read_pubkey(&mut rest)?;
-                    let index_feed_id = read_bytes32(&mut rest)?;
-                    let max_staleness_secs = read_u64(&mut rest)?;
-                    let conf_filter_bps = read_u16(&mut rest)?;
-                    let invert = read_u8(&mut rest)?;
-                    let unit_scale = read_u32(&mut rest)?;
-                    let initial_mark_price_e6 = read_u64(&mut rest)?;
-                    let risk_params = read_risk_params(&mut rest)?;
-                    Ok(Instruction::InitMarket {
-                        admin,
-                        collateral_mint,
-                        index_feed_id,
-                        max_staleness_secs,
-                        conf_filter_bps,
-                        invert,
-                        unit_scale,
-                        initial_mark_price_e6,
-                        risk_params,
-                    })
+                    // PERC-331: InitMarket is early-dispatched in process_instruction
+                    // before decode() is called. If we reach here, it's a logic error.
+                    // Return the fieldless variant (fields parsed in process_init_market).
+                    Ok(Instruction::InitMarket)
                 }
                 TAG_INIT_USER => {
                     // InitUser
@@ -6169,19 +6140,43 @@ pub mod processor {
         accounts: &'b [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        // PERC-331: Early-dispatch InitMarket to a separate stack frame.
-        // The InitMarket variant of Instruction contains RiskParams (~300 B)
-        // + 3 Pubkeys + feed_id — constructing it on the same frame as the
-        // 48-arm match exhausts the SBF 4 KiB stack on small tier builds.
-        if instruction_data.first() == Some(&crate::tags::TAG_INIT_MARKET) {
-            return process_init_market(program_id, accounts, instruction_data);
-        }
+        // PERC-331: Tag-based dispatch to #[inline(never)] sub-dispatchers.
+        // The SBF 4 KiB per-frame stack limit is easily exceeded by the
+        // monolithic 50-arm match (each arm allocates MarketConfig ~512 B,
+        // Pubkeys, RefMut, etc.). Splitting by tag range gives each
+        // sub-dispatcher its own 4 KiB frame.
+        let tag = *instruction_data
+            .first()
+            .ok_or(ProgramError::InvalidInstructionData)?;
 
+        use crate::tags::*;
+        match tag {
+            TAG_INIT_MARKET => process_init_market(program_id, accounts, instruction_data),
+            // Core user-facing ops (tags 1-10 + 35 for TradeCpiV2)
+            TAG_INIT_USER..=TAG_TRADE_CPI | TAG_TRADE_CPI_V2 => {
+                dispatch_core_ops(program_id, accounts, instruction_data)
+            }
+            // Admin + insurance ops (tags 11-31)
+            TAG_SET_RISK_THRESHOLD..=TAG_WITHDRAW_INSURANCE_LIMITED => {
+                dispatch_admin_ops(program_id, accounts, instruction_data)
+            }
+            // Extended ops (tags 32+, except 35 which routes to core)
+            _ => dispatch_extended_ops(program_id, accounts, instruction_data),
+        }
+    }
+
+    /// Core user-facing operations: InitUser, InitLP, Deposit, Withdraw,
+    /// KeeperCrank, TradeNoCpi, Liquidate, Close, TopUpInsurance, TradeCpi.
+    #[inline(never)]
+    fn dispatch_core_ops<'a, 'b>(
+        program_id: &Pubkey,
+        accounts: &'b [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
         let instruction = Instruction::decode(instruction_data)?;
 
         match instruction {
-            Instruction::InitMarket { .. } => {
-                // Unreachable — handled by early dispatch above.
+            Instruction::InitMarket => {
                 unreachable!()
             }
             Instruction::InitUser { fee_payment } => {
@@ -7495,6 +7490,23 @@ pub mod processor {
                     .top_up_insurance_fund(units as u128)
                     .map_err(map_risk_error)?;
             }
+            // Defense-in-depth: if a future tag routes here by mistake,
+            // return an error instead of panicking (unreachable! aborts the tx).
+            _ => return Err(ProgramError::InvalidInstructionData),
+        }
+        Ok(())
+    }
+
+    /// Admin + insurance operations: SetRiskThreshold through WithdrawInsuranceLimited (tags 11-31).
+    #[inline(never)]
+    fn dispatch_admin_ops<'a, 'b>(
+        program_id: &Pubkey,
+        accounts: &'b [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        let instruction = Instruction::decode(instruction_data)?;
+
+        match instruction {
             Instruction::SetRiskThreshold { new_threshold } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
@@ -8843,7 +8855,24 @@ pub mod processor {
                 msg!("WithdrawInsuranceLimited: withdrew {} base tokens, insurance_units_remaining={}",
                     actual_amount, new_ins_balance);
             }
+            // Defense-in-depth: if a future tag routes here by mistake,
+            // return an error instead of panicking (unreachable! aborts the tx).
+            _ => return Err(ProgramError::InvalidInstructionData),
+        }
+        Ok(())
+    }
 
+    /// Extended operations: SetPythOracle through CancelQueuedWithdrawal (tags 32+).
+    /// TradeCpiV2 (tag 35) is routed to dispatch_core_ops instead.
+    #[inline(never)]
+    fn dispatch_extended_ops<'a, 'b>(
+        program_id: &Pubkey,
+        accounts: &'b [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        let instruction = Instruction::decode(instruction_data)?;
+
+        match instruction {
             Instruction::SetPythOracle {
                 feed_id,
                 max_staleness_secs,
@@ -10451,6 +10480,9 @@ pub mod processor {
 
                 msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
             }
+            // Defense-in-depth: if a future tag routes here by mistake,
+            // return an error instead of panicking (unreachable! aborts the tx).
+            _ => return Err(ProgramError::InvalidInstructionData),
         }
         Ok(())
     }

@@ -32,7 +32,7 @@ use std::path::PathBuf;
 // ExternalAccountDataModified errors in LiteSVM's BPF runtime).
 // Build with: cargo build-sbf   (no --features test)
 // Note: BPF struct layout differs from native; these are BPF values.
-const SLAB_LEN: usize = 1025568; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
+const SLAB_LEN: usize = 1025832; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -467,13 +467,14 @@ impl TestEnv {
     }
 
     fn trade(&mut self, user: &Keypair, lp: &Keypair, lp_idx: u16, user_idx: u16, size: i128) {
+        // PERC-199: Clock sysvar removed from TradeNoCpi accounts.
+        // Oracle is now at index 3 (was 4). Clock::get() syscall is used instead.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(lp.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_trade(lp_idx, user_idx, size),
