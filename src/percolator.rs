@@ -889,10 +889,12 @@ pub mod verify {
     /// If scale == 0: always aligned.
     /// Otherwise: amount must be divisible by scale.
     #[inline]
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn withdraw_amount_aligned(amount: u64, scale: u32) -> bool {
         if scale == 0 {
             return true;
         }
+        // Use modulo instead of .is_multiple_of() for SBF toolchain compatibility
         amount % (scale as u64) == 0
     }
 
@@ -1490,12 +1492,14 @@ pub mod zc {
     const OLD_ENGINE_LEN: usize = ENGINE_LEN - 8;
 
     #[inline]
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn engine_ref(data: &[u8]) -> Result<&RiskEngine, ProgramError> {
         // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
         if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_ptr().add(ENGINE_OFF) };
+        // Use modulo instead of .is_multiple_of() for SBF toolchain compatibility
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -1503,12 +1507,14 @@ pub mod zc {
     }
 
     #[inline]
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn engine_mut(data: &mut [u8]) -> Result<&mut RiskEngine, ProgramError> {
         // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
         if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
+        // Use modulo instead of .is_multiple_of() for SBF toolchain compatibility
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
