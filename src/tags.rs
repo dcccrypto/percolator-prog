@@ -74,7 +74,6 @@ pub const TAG_FUND_MARKET_INSURANCE: u8 = 41;
 /// Set insurance isolation BPS for a market (PERC-306).
 /// Admin configures max % of global fund this market can access.
 pub const TAG_SET_INSURANCE_ISOLATION: u8 = 42;
-<<<<<<< HEAD
 /// PERC-314: Challenge settlement price during dispute window.
 pub const TAG_CHALLENGE_SETTLEMENT: u8 = 43;
 /// PERC-314: Resolve dispute (admin adjudication).
@@ -83,8 +82,15 @@ pub const TAG_RESOLVE_DISPUTE: u8 = 44;
 pub const TAG_DEPOSIT_LP_COLLATERAL: u8 = 45;
 /// PERC-315: Withdraw LP collateral (position must be closed).
 pub const TAG_WITHDRAW_LP_COLLATERAL: u8 = 46;
+<<<<<<< HEAD
 =======
->>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
+/// PERC-309: Queue a large LP withdrawal.
+pub const TAG_QUEUE_WITHDRAWAL: u8 = 47;
+/// PERC-309: Claim one epoch tranche from queued withdrawal.
+pub const TAG_CLAIM_QUEUED_WITHDRAWAL: u8 = 48;
+/// PERC-309: Cancel queued withdrawal, refund remaining.
+pub const TAG_CANCEL_QUEUED_WITHDRAWAL: u8 = 49;
+>>>>>>> 53dfd27 (feat(PERC-309): Drip withdrawal queue — anti-bank-run LP exit throttle)
 
 #[cfg(test)]
 mod tests {
@@ -137,13 +143,16 @@ mod tests {
             TAG_LP_VAULT_CRANK_FEES,
             TAG_FUND_MARKET_INSURANCE,
             TAG_SET_INSURANCE_ISOLATION,
-<<<<<<< HEAD
             TAG_CHALLENGE_SETTLEMENT,
             TAG_RESOLVE_DISPUTE,
             TAG_DEPOSIT_LP_COLLATERAL,
             TAG_WITHDRAW_LP_COLLATERAL,
+<<<<<<< HEAD
 =======
->>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
+            TAG_QUEUE_WITHDRAWAL,
+            TAG_CLAIM_QUEUED_WITHDRAWAL,
+            TAG_CANCEL_QUEUED_WITHDRAWAL,
+>>>>>>> 53dfd27 (feat(PERC-309): Drip withdrawal queue — anti-bank-run LP exit throttle)
         ];
 
         for i in 0..tags.len() {
@@ -200,13 +209,16 @@ mod tests {
             TAG_LP_VAULT_CRANK_FEES,
             TAG_FUND_MARKET_INSURANCE,
             TAG_SET_INSURANCE_ISOLATION,
-<<<<<<< HEAD
             TAG_CHALLENGE_SETTLEMENT,
             TAG_RESOLVE_DISPUTE,
             TAG_DEPOSIT_LP_COLLATERAL,
             TAG_WITHDRAW_LP_COLLATERAL,
+<<<<<<< HEAD
 =======
->>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
+            TAG_QUEUE_WITHDRAWAL,
+            TAG_CLAIM_QUEUED_WITHDRAWAL,
+            TAG_CANCEL_QUEUED_WITHDRAWAL,
+>>>>>>> 53dfd27 (feat(PERC-309): Drip withdrawal queue — anti-bank-run LP exit throttle)
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
