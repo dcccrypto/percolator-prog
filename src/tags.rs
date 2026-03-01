@@ -84,7 +84,7 @@ pub const TAG_DEPOSIT_LP_COLLATERAL: u8 = 45;
 /// PERC-315: Withdraw LP collateral (position must be closed).
 pub const TAG_WITHDRAW_LP_COLLATERAL: u8 = 46;
 =======
->>>>>>> 6826cb4 (feat(PERC-306): per-market insurance fund isolation wrapper)
+>>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
 
 #[cfg(test)]
 mod tests {
@@ -143,7 +143,7 @@ mod tests {
             TAG_DEPOSIT_LP_COLLATERAL,
             TAG_WITHDRAW_LP_COLLATERAL,
 =======
->>>>>>> 6826cb4 (feat(PERC-306): per-market insurance fund isolation wrapper)
+>>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
         ];
 
         for i in 0..tags.len() {
@@ -206,7 +206,7 @@ mod tests {
             TAG_DEPOSIT_LP_COLLATERAL,
             TAG_WITHDRAW_LP_COLLATERAL,
 =======
->>>>>>> 6826cb4 (feat(PERC-306): per-market insurance fund isolation wrapper)
+>>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
         ];
 
         for (i, &tag) in tags.iter().enumerate() {

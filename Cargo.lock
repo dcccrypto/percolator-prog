@@ -2504,9 +2504,13 @@ dependencies = [
 name = "percolator"
 version = "0.1.0"
 <<<<<<< HEAD
+<<<<<<< HEAD
 source = "git+https://github.com/dcccrypto/percolator.git?branch=master#30748219a03436d68013a566715c2758e29a225e"
 =======
 >>>>>>> 6826cb4 (feat(PERC-306): per-market insurance fund isolation wrapper)
+=======
+source = "git+https://github.com/dcccrypto/percolator.git?branch=master#87a83a834e7b0828665770740edd0f393836e078"
+>>>>>>> 1b7c3f7 (tests(PERC-317): strengthen Kani proofs — universal characterizations + widen SAT domain)
 
 [[package]]
 name = "percolator-prog"

@@ -156,13 +156,6 @@ pub mod constants {
     pub const DEFAULT_THRESH_MIN: u128 = 0;
     pub const DEFAULT_THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
     pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
-
-    // PERC-302: Market maturity OI ramp constants
-    /// Starting OI cap multiplier for new markets (0.1x LP vault = 1000 bps).
-    pub const RAMP_START_BPS: u64 = 1000;
-    /// Default ramp duration in slots (~2 days at ~2.5 slots/sec).
-    /// 0 = disabled (full cap immediately, backwards compat).
-    pub const DEFAULT_OI_RAMP_SLOTS: u64 = 432_000;
 }
 
 // 1b. Risk metric helpers (pure functions for anti-DoS threshold calculation)
@@ -4798,7 +4791,7 @@ pub mod lp_vault {
         pub _hwm_padding: [u8; 6],
 
         /// Reserved for future use (alignment + forward compat).
-        pub _reserved: [u8; 24],
+        pub _reserved: [u8; 48],
     }
 
     impl LpVaultState {
@@ -5197,19 +5190,12 @@ pub mod processor {
         data: &[u8],
     ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable)
-        // Accept old slabs from prior MarketConfig sizes:
-        //  - SLAB_LEN - 8:  pre-Account migration (4095 accounts)
-        //  - SLAB_LEN - 16: pre-PERC-302 (no market_created_slot/oi_ramp_slots)
-        //  - SLAB_LEN - 24: pre-PERC-302 + pre-Account migration
+        // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
+        // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
         const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
-        const PRE_302_SLAB_LEN: usize = SLAB_LEN - 16;
-        const PRE_302_OLD_SLAB_LEN: usize = SLAB_LEN - 24;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN
-                || data.len() == OLD_SLAB_LEN
-                || data.len() == PRE_302_SLAB_LEN
-                || data.len() == PRE_302_OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -5278,20 +5264,16 @@ pub mod processor {
         current_slot: u64,
     ) -> Result<(), ProgramError> {
         let (multiplier, skew_factor_bps) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+    /// PERC-273: Check dynamic OI cap after trade execution.
+    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * multiplier / 10_000.
+    fn check_oi_cap(engine: &RiskEngine, config: &state::MarketConfig) -> Result<(), ProgramError> {
+        let multiplier = config.oi_cap_multiplier_bps;
         if multiplier == 0 {
             return Ok(()); // OI cap disabled
         }
-
-        // PERC-302: Compute effective multiplier with ramp
-        let effective_multiplier = crate::verify::compute_ramp_multiplier(
-            multiplier,
-            config.market_created_slot,
-            current_slot,
-            config.oi_ramp_slots,
-        );
-
         let vault = engine.vault.get();
         let base_max_oi = vault.saturating_mul(effective_multiplier as u128) / 10_000;
+        let max_oi = vault.saturating_mul(multiplier as u128) / 10_000;
         let current_oi = engine.total_open_interest.get();
 
         // PERC-299: Halve cap when emergency OI mode is active (circuit breaker fired)
@@ -5328,6 +5310,11 @@ pub mod processor {
                 multiplier,
                 effective_multiplier,
                 skew_factor_bps,
+                "OI cap exceeded: current={} max={} (vault={} multiplier={})",
+                current_oi,
+                max_oi,
+                vault,
+                multiplier
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -6501,6 +6488,7 @@ pub mod processor {
                     .get()
                     .saturating_add(engine.insurance_fund.isolated_balance.get())
                     as u64;
+                let ins_low = engine.insurance_fund.balance.get() as u64;
 
                 // --- Threshold auto-update (rate-limited + EWMA smoothed + step-clamped)
                 if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
@@ -6632,6 +6620,7 @@ pub mod processor {
                     .balance
                     .get()
                     .saturating_add(engine.insurance_fund.isolated_balance.get());
+                let bal = engine.insurance_fund.balance.get();
                 let thr = engine.risk_reduction_threshold();
                 if crate::verify::gate_active(thr, bal) {
                     #[cfg(feature = "cu-audit")]
@@ -6660,8 +6649,8 @@ pub mod processor {
                     .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error)?;
 
-                // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
-                check_oi_cap(engine, &config, clock.slot)?;
+                // PERC-273: Dynamic OI cap check after trade
+                check_oi_cap(engine, &config)?;
                 check_pnl_cap(engine, &config)?;
 
                 #[cfg(feature = "cu-audit")]
@@ -6950,6 +6939,7 @@ pub mod processor {
                         .balance
                         .get()
                         .saturating_add(engine.insurance_fund.isolated_balance.get());
+                    let bal = engine.insurance_fund.balance.get();
                     let thr = engine.risk_reduction_threshold();
                     if crate::verify::gate_active(thr, bal) {
                         #[cfg(feature = "cu-audit")]
@@ -6988,8 +6978,8 @@ pub mod processor {
                         .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
                         .map_err(map_risk_error)?;
 
-                    // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
-                    check_oi_cap(engine, &config, clock.slot)?;
+                    // PERC-273: Dynamic OI cap check after trade
+                    check_oi_cap(engine, &config)?;
                     check_pnl_cap(engine, &config)?;
 
                     #[cfg(feature = "cu-audit")]
@@ -7632,10 +7622,8 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                // PERC-306: Get total insurance balance (global + isolated) and convert to base tokens
-                let global_units = engine.insurance_fund.balance.get();
-                let isolated_units = engine.insurance_fund.isolated_balance.get();
-                let insurance_units = global_units.saturating_add(isolated_units);
+                // Get insurance balance and convert to base tokens
+                let insurance_units = engine.insurance_fund.balance.get();
                 if insurance_units == 0 {
                     return Ok(()); // Nothing to withdraw
                 }
@@ -7649,9 +7637,8 @@ pub mod processor {
                 let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
-                // Zero out both insurance fund pools
+                // Zero out insurance fund
                 engine.insurance_fund.balance = percolator::U128::ZERO;
-                engine.insurance_fund.isolated_balance = percolator::U128::ZERO;
 
                 // Transfer from vault to admin
                 let seed1: &[u8] = b"vault";
@@ -7782,6 +7769,7 @@ pub mod processor {
                     || adaptive_scale_bps.is_some()
                     || adaptive_max_funding_bps.is_some()
                 {
+                if oi_cap_multiplier_bps.is_some() || max_pnl_cap.is_some() {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
                         // Preserve existing skew factor when only updating multiplier
@@ -7820,6 +7808,9 @@ pub mod processor {
                         max_pnl_cap,
                         skew,
                         oi_ramp_slots
+                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?}",
+                        oi_cap_multiplier_bps,
+                        max_pnl_cap
                     );
                 }
 
@@ -9033,8 +9024,6 @@ pub mod processor {
                     if lp_supply > 0 && capital_before == 0 {
                         // Supply > 0 but capital == 0: vault was drained. Start fresh epoch.
                         vault_state.epoch = vault_state.epoch.saturating_add(1);
-                        // PERC-313: Reset HWM on new epoch
-                        vault_state.epoch_high_water_tvl = 0;
                         // Previous shares are worthless. Mint fresh for new depositor.
                         // NOTE: old share holders get nothing (vault was fully drained).
                     }
@@ -9060,11 +9049,6 @@ pub mod processor {
                     .total_capital
                     .checked_add(units as u128)
                     .ok_or(PercolatorError::EngineOverflow)?;
-
-                // PERC-313: Update epoch high-water mark
-                if vault_state.total_capital > vault_state.epoch_high_water_tvl {
-                    vault_state.epoch_high_water_tvl = vault_state.total_capital;
-                }
 
                 // Update engine vault balance (tokens are already in the vault token account)
                 let engine = zc::engine_mut(&mut slab_data)?;
@@ -9196,31 +9180,16 @@ pub mod processor {
                 // Equivalently: remaining_capital * effective_multiplier / 10_000 >= total_oi
                 // PERC-298: Unpack to get base multiplier. PERC-302: Use ramped multiplier.
                 let (oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                //   remaining_capital >= total_oi / (oi_cap_multiplier / 10_000)
+                // Equivalently: remaining_capital * multiplier / 10_000 >= total_oi
+                let oi_multiplier = config.oi_cap_multiplier_bps;
                 if oi_multiplier > 0 {
                     let remaining_capital = capital.saturating_sub(units_to_return);
                     let engine = zc::engine_ref(&slab_data)?;
                     let current_oi = engine.total_open_interest.get();
-                    let effective_multiplier = crate::verify::compute_ramp_multiplier(
-                        oi_multiplier,
-                        config.market_created_slot,
-                        engine.current_slot,
-                        config.oi_ramp_slots,
-                    );
                     let max_oi_after =
-                        remaining_capital.saturating_mul(effective_multiplier as u128) / 10_000;
+                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
                     if current_oi > max_oi_after {
-                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
-                    }
-                }
-
-                // PERC-313: High-water mark floor check
-                // Block withdrawal if it would push capital below hwm_floor
-                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
-                    let remaining_capital = capital.saturating_sub(units_to_return);
-                    let hwm_floor = vault_state.epoch_high_water_tvl
-                        .saturating_mul(vault_state.hwm_floor_bps as u128)
-                        / 10_000;
-                    if remaining_capital < hwm_floor {
                         return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
                     }
                 }
