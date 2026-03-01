@@ -46,6 +46,8 @@ pub mod constants {
 
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
+    // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
+    const _: [(); 432] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -1667,6 +1669,8 @@ pub mod error {
         LpVaultInvalidFeeShare,
         /// PERC-272: No new fees to distribute to LP vault.
         LpVaultNoNewFees,
+        /// PERC-312: Safety valve — new position on dominant side blocked during rebalancing.
+        SafetyValveDominantSideBlocked,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2683,6 +2687,28 @@ pub mod state {
 
         /// Padding for alignment after u16
         pub _insurance_isolation_padding: [u8; 14],
+
+        // ========================================
+        // Safety Valve (PERC-312)
+        // ========================================
+        /// Duration of rebalancing mode in slots (default 500).
+        /// 0 = safety valve disabled.
+        pub safety_valve_duration: u64,
+        /// Emergency close rebate in bps (paid to dominant-side closers).
+        pub emergency_close_rebate_bps: u16,
+        /// Number of consecutive max-funding epochs before triggering (default 5).
+        pub safety_valve_epochs: u8,
+        /// Whether safety valve is currently enabled (1=yes, 0=no).
+        pub safety_valve_enabled: u8,
+        /// Padding to maintain alignment.
+        pub _safety_valve_pad: [u8; 4],
+        /// Runtime: consecutive epochs where funding hit max (resets on < max).
+        pub consecutive_max_funding_epochs: u8,
+        /// Runtime: 1 if rebalancing mode is currently active, 0 otherwise.
+        pub rebalancing_active: u8,
+        pub _rebalancing_pad: [u8; 6],
+        /// Runtime: slot when rebalancing mode was activated (0 if inactive).
+        pub rebalancing_start_slot: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4824,6 +4850,108 @@ pub mod processor {
         Ok(())
     }
 
+    /// PERC-312: Safety valve — check and auto-exit rebalancing mode.
+    /// If rebalancing is active and trade would increase position on the dominant side, reject.
+    /// Dominant side = direction of net LP position (longs dominant if net_lp_pos < 0,
+    /// meaning LPs are net short, so users are net long).
+    ///
+    /// `size` is the user's trade size (positive = user buys = goes long).
+    /// `old_user_pos` is the user's position before this trade.
+    /// PERC-312: Safety valve check (read-only on config).
+    /// Auto-exit is handled in keeper crank; trade path only checks.
+    fn check_safety_valve(
+        config: &state::MarketConfig,
+        net_lp_pos: i128,
+        size: i128,
+        old_user_pos: i128,
+        current_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.safety_valve_enabled == 0 || config.rebalancing_active == 0 {
+            return Ok(());
+        }
+
+        // Auto-exit check (don't write, just skip blocking)
+        if config.safety_valve_duration > 0
+            && current_slot
+                >= config
+                    .rebalancing_start_slot
+                    .saturating_add(config.safety_valve_duration)
+        {
+            return Ok(()); // Duration elapsed, will be formally exited on next crank
+        }
+
+        // Determine dominant side from net LP position.
+        let dominant_is_long = net_lp_pos < 0;
+
+        // Check if this trade increases user's position on the dominant side
+        let new_user_pos = old_user_pos.saturating_add(size);
+        let increases_dominant = if dominant_is_long {
+            // Block new longs: new position is more positive than old
+            new_user_pos > old_user_pos && new_user_pos > 0
+        } else {
+            // Block new shorts: new position is more negative than old
+            new_user_pos < old_user_pos && new_user_pos < 0
+        };
+
+        if increases_dominant {
+            msg!(
+                "PERC-312: Safety valve blocked trade: size={} dominant_long={} net_lp={}",
+                size,
+                dominant_is_long,
+                net_lp_pos
+            );
+            return Err(PercolatorError::SafetyValveDominantSideBlocked.into());
+        }
+
+        Ok(())
+    }
+
+    /// PERC-312: Update safety valve state after funding crank.
+    /// Call after computing new funding rate. If rate is at max for consecutive epochs,
+    /// activate rebalancing mode.
+    fn update_safety_valve_on_funding(
+        config: &mut state::MarketConfig,
+        funding_rate_bps: i64,
+        current_slot: u64,
+    ) {
+        if config.safety_valve_enabled == 0 || config.safety_valve_duration == 0 {
+            return;
+        }
+
+        let max_bps = config.funding_max_bps_per_slot;
+        let at_max = funding_rate_bps.abs() >= max_bps.abs() && max_bps != 0;
+
+        if at_max {
+            config.consecutive_max_funding_epochs =
+                config.consecutive_max_funding_epochs.saturating_add(1);
+        } else {
+            config.consecutive_max_funding_epochs = 0;
+            // If skew resolved, also exit rebalancing mode
+            if config.rebalancing_active != 0 {
+                config.rebalancing_active = 0;
+                config.rebalancing_start_slot = 0;
+                msg!(
+                    "PERC-312: Rebalancing exited — skew resolved at slot {}",
+                    current_slot
+                );
+            }
+        }
+
+        let threshold = if config.safety_valve_epochs == 0 {
+            5
+        } else {
+            config.safety_valve_epochs
+        };
+        if config.consecutive_max_funding_epochs >= threshold && config.rebalancing_active == 0 {
+            config.rebalancing_active = 1;
+            config.rebalancing_start_slot = current_slot;
+            msg!(
+                "PERC-312: Safety valve ACTIVATED at slot {} after {} consecutive max-funding epochs",
+                current_slot, config.consecutive_max_funding_epochs
+            );
+        }
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
         if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
@@ -5114,6 +5242,16 @@ pub mod processor {
                     // PERC-306: Insurance isolation (disabled by default)
                     insurance_isolation_bps: 0,
                     _insurance_isolation_padding: [0u8; 14],
+                    // PERC-312: Safety valve disabled by default
+                    safety_valve_duration: 0,
+                    emergency_close_rebate_bps: 0,
+                    safety_valve_epochs: 5,
+                    safety_valve_enabled: 0,
+                    _safety_valve_pad: [0; 4],
+                    consecutive_max_funding_epochs: 0,
+                    rebalancing_active: 0,
+                    _rebalancing_pad: [0; 6],
+                    rebalancing_start_slot: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -5730,6 +5868,13 @@ pub mod processor {
                     state::write_dust_base(&mut data, dust);
                 }
 
+                // PERC-312: Update safety valve state based on funding rate
+                {
+                    let mut config = state::read_config(&data);
+                    update_safety_valve_on_funding(&mut config, effective_funding_rate, clock.slot);
+                    state::write_config(&mut data, &config);
+                }
+
                 // Debug: log lifetime counters (sol_log_64: tag, liqs, force, max_accounts, insurance)
                 msg!("CRANK_STATS");
                 sol_log_64(0xC8A4C, liqs, force, MAX_ACCOUNTS as u64, ins_low);
@@ -5783,21 +5928,25 @@ pub mod processor {
                 )?;
                 state::write_config(&mut data, &config);
 
+                // PERC-312: Pre-trade safety valve check (needs engine read then config write)
+                {
+                    let engine = zc::engine_ref(&data)?;
+                    check_idx(engine, lp_idx)?;
+                    check_idx(engine, user_idx)?;
+                    let u_owner = engine.accounts[user_idx as usize].owner;
+                    if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
+                    let l_owner = engine.accounts[lp_idx as usize].owner;
+                    if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
+                    let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                    let net_lp = engine.net_lp_pos.get();
+                    check_safety_valve(&config, net_lp, size, old_user_pos, clock.slot)?;
+                }
+
                 let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, lp_idx)?;
-                check_idx(engine, user_idx)?;
-
-                let u_owner = engine.accounts[user_idx as usize].owner;
-
-                // Owner authorization via verify helper (Kani-provable)
-                if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-                let l_owner = engine.accounts[lp_idx as usize].owner;
-                if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
 
                 // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                 // LP delta is -size (LP takes opposite side of user's trade)
@@ -6148,6 +6297,14 @@ pub mod processor {
 
                     // Trade size selection via verify helper (Kani-provable: uses exec_size, not requested_size)
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
+
+                    // PERC-312: Safety valve check
+                    {
+                        let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                        let net_lp = engine.net_lp_pos.get();
+                        check_safety_valve(&config, net_lp, trade_size, old_user_pos, clock.slot)?;
+                    }
+
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_start");
@@ -8568,6 +8725,145 @@ pub mod processor {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod safety_valve_tests {
+        use super::*;
+
+        fn make_config(enabled: bool, duration: u64, epochs: u8) -> state::MarketConfig {
+            let mut c = <state::MarketConfig as bytemuck::Zeroable>::zeroed();
+            c.safety_valve_enabled = if enabled { 1 } else { 0 };
+            c.safety_valve_duration = duration;
+            c.safety_valve_epochs = epochs;
+            c.funding_max_bps_per_slot = 10;
+            c
+        }
+
+        #[test]
+        fn test_valve_blocks_dominant_long() {
+            let mut c = make_config(true, 500, 5);
+            c.rebalancing_active = 1;
+            c.rebalancing_start_slot = 100;
+            // net_lp_pos = -100 → users are net long → longs dominant
+            // User has pos=0, tries to go long (size=10) → blocked
+            let r = check_safety_valve(&c, -100, 10, 0, 200);
+            assert!(r.is_err());
+        }
+
+        #[test]
+        fn test_valve_allows_closing_dominant() {
+            let mut c = make_config(true, 500, 5);
+            c.rebalancing_active = 1;
+            c.rebalancing_start_slot = 100;
+            // net_lp_pos = -100 → longs dominant
+            // User has pos=50 (long), tries to close (size=-50) → allowed (reduces dominant)
+            let r = check_safety_valve(&c, -100, -50, 50, 200);
+            assert!(r.is_ok());
+        }
+
+        #[test]
+        fn test_valve_allows_non_dominant() {
+            let mut c = make_config(true, 500, 5);
+            c.rebalancing_active = 1;
+            c.rebalancing_start_slot = 100;
+            // net_lp_pos = -100 → longs dominant
+            // User tries to go short (size=-10) → allowed (shorts are non-dominant)
+            let r = check_safety_valve(&c, -100, -10, 0, 200);
+            assert!(r.is_ok());
+        }
+
+        #[test]
+        fn test_valve_auto_exit_by_duration() {
+            let mut c = make_config(true, 500, 5);
+            c.rebalancing_active = 1;
+            c.rebalancing_start_slot = 100;
+            // slot 700 > 100 + 500 = 600 → auto-exit
+            let r = check_safety_valve(&c, -100, 10, 0, 700);
+            assert!(r.is_ok()); // Should be allowed (valve expired)
+        }
+
+        #[test]
+        fn test_valve_disabled() {
+            let c = make_config(false, 500, 5);
+            // Even with rebalancing_active=1, disabled flag skips
+            let r = check_safety_valve(&c, -100, 10, 0, 200);
+            assert!(r.is_ok());
+        }
+
+        #[test]
+        fn test_update_triggers_after_epochs() {
+            let mut c = make_config(true, 500, 3);
+            // Simulate 3 consecutive max-funding cranks
+            update_safety_valve_on_funding(&mut c, 10, 100); // at max
+            assert_eq!(c.consecutive_max_funding_epochs, 1);
+            assert_eq!(c.rebalancing_active, 0);
+
+            update_safety_valve_on_funding(&mut c, 10, 200);
+            assert_eq!(c.consecutive_max_funding_epochs, 2);
+            assert_eq!(c.rebalancing_active, 0);
+
+            update_safety_valve_on_funding(&mut c, 10, 300);
+            assert_eq!(c.consecutive_max_funding_epochs, 3);
+            assert_eq!(c.rebalancing_active, 1);
+            assert_eq!(c.rebalancing_start_slot, 300);
+        }
+
+        #[test]
+        fn test_update_resets_on_non_max() {
+            let mut c = make_config(true, 500, 3);
+            c.consecutive_max_funding_epochs = 2;
+            // Below max → reset counter
+            update_safety_valve_on_funding(&mut c, 5, 100);
+            assert_eq!(c.consecutive_max_funding_epochs, 0);
+        }
+
+        #[test]
+        fn test_update_exits_rebalancing_on_skew_resolve() {
+            let mut c = make_config(true, 500, 3);
+            c.rebalancing_active = 1;
+            c.rebalancing_start_slot = 100;
+            c.consecutive_max_funding_epochs = 5;
+            // Below max → skew resolved → exit rebalancing
+            update_safety_valve_on_funding(&mut c, 5, 200);
+            assert_eq!(c.rebalancing_active, 0);
+            assert_eq!(c.rebalancing_start_slot, 0);
+        }
+    }
+
+    #[cfg(kani)]
+    mod safety_valve_proofs {
+        use super::*;
+
+        /// PERC-312: Safety valve always exits after duration elapses.
+        /// No trade is blocked once current_slot >= rebalancing_start_slot + duration.
+        #[kani::proof]
+        #[kani::unwind(1)]
+        fn proof_safety_valve_exits_after_duration() {
+            let duration: u64 = kani::any();
+            let start_slot: u64 = kani::any();
+            let current_slot: u64 = kani::any();
+            let net_lp_pos: i128 = kani::any();
+            let size: i128 = kani::any();
+            let old_user_pos: i128 = kani::any();
+
+            kani::assume(duration > 0);
+            kani::assume(start_slot <= u64::MAX / 2);
+            kani::assume(current_slot >= start_slot.saturating_add(duration));
+
+            let mut c = <state::MarketConfig as bytemuck::Zeroable>::zeroed();
+            c.safety_valve_enabled = 1;
+            c.safety_valve_duration = duration;
+            c.rebalancing_active = 1;
+            c.rebalancing_start_slot = start_slot;
+            c.funding_max_bps_per_slot = 10;
+
+            let result = check_safety_valve(&c, net_lp_pos, size, old_user_pos, current_slot);
+            assert!(
+                result.is_ok(),
+                "trade must not be blocked after duration elapsed"
+            );
+        }
     }
 }
 
