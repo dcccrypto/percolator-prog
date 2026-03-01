@@ -1975,6 +1975,14 @@ pub mod ix {
         /// Reads fee_revenue delta since last snapshot, credits LP portion to vault capital.
         /// Accounts: [slab(writable), lp_vault_state(writable)]
         LpVaultCrankFees,
+
+        /// PERC-306: Fund per-market isolated insurance balance.
+        /// Accounts: [admin(signer, writable), slab(writable), user_ata(writable), vault(writable), token_program]
+        FundMarketInsurance { amount: u64 },
+
+        /// PERC-306: Set insurance isolation BPS for a market.
+        /// Accounts: [admin(signer), slab(writable)]
+        SetInsuranceIsolation { bps: u16 },
     }
 
     impl Instruction {
@@ -2322,6 +2330,14 @@ pub mod ix {
                     Ok(Instruction::LpVaultWithdraw { lp_amount })
                 }
                 TAG_LP_VAULT_CRANK_FEES => Ok(Instruction::LpVaultCrankFees),
+                TAG_FUND_MARKET_INSURANCE => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::FundMarketInsurance { amount })
+                }
+                TAG_SET_INSURANCE_ISOLATION => {
+                    let bps = read_u16(&mut rest)?;
+                    Ok(Instruction::SetInsuranceIsolation { bps })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -2642,6 +2658,17 @@ pub mod state {
         /// Number of slots over which OI cap ramps from RAMP_START_BPS to
         /// oi_cap_multiplier_bps. 0 = disabled (full cap immediately).
         pub oi_ramp_slots: u64,
+
+        // ========================================
+        // Per-Market Insurance Isolation (PERC-306)
+        // ========================================
+        /// Max basis points of global insurance fund this market can access.
+        /// 0 = disabled (unlimited access, legacy behavior).
+        /// E.g., 1000 = 10% of global fund.
+        pub insurance_isolation_bps: u16,
+
+        /// Padding for alignment after u16
+        pub _insurance_isolation_padding: [u8; 14],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -4960,6 +4987,9 @@ pub mod processor {
                     // PERC-302: Market maturity OI ramp
                     market_created_slot: clock.slot,
                     oi_ramp_slots: 0, // 0 = full cap immediately (backwards compat)
+                    // PERC-306: Insurance isolation (disabled by default)
+                    insurance_isolation_bps: 0,
+                    _insurance_isolation_padding: [0u8; 14],
                 };
                 state::write_config(&mut data, &config);
 
@@ -5528,7 +5558,9 @@ pub mod processor {
                 // Copy stats before threshold update (avoid borrow conflict)
                 let liqs = engine.lifetime_liquidations;
                 let force = engine.lifetime_force_realize_closes;
-                let ins_low = engine.insurance_fund.balance.get() as u64;
+                // PERC-306: Report total insurance (global + isolated) as the low watermark
+                let ins_low = engine.insurance_fund.balance.get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get()) as u64;
 
                 // --- Threshold auto-update (rate-limited + EWMA smoothed + step-clamped)
                 if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
@@ -5643,7 +5675,9 @@ pub mod processor {
                 // LP delta is -size (LP takes opposite side of user's trade)
                 // O(1) check after single O(n) scan
                 // Gate activation via verify helper (Kani-provable)
-                let bal = engine.insurance_fund.balance.get();
+                // PERC-306: Use total insurance (global + isolated)
+                let bal = engine.insurance_fund.balance.get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get());
                 let thr = engine.risk_reduction_threshold();
                 if crate::verify::gate_active(thr, bal) {
                     #[cfg(feature = "cu-audit")]
@@ -5956,7 +5990,9 @@ pub mod processor {
                     // Use actual exec_size from matcher (LP delta is -exec_size)
                     // O(1) check after single O(n) scan
                     // Gate activation via verify helper (Kani-provable)
-                    let bal = engine.insurance_fund.balance.get();
+                    // PERC-306: Use total insurance (global + isolated)
+                    let bal = engine.insurance_fund.balance.get()
+                        .saturating_add(engine.insurance_fund.isolated_balance.get());
                     let thr = engine.risk_reduction_threshold();
                     if crate::verify::gate_active(thr, bal) {
                         #[cfg(feature = "cu-audit")]
@@ -6631,8 +6667,10 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                // Get insurance balance and convert to base tokens
-                let insurance_units = engine.insurance_fund.balance.get();
+                // PERC-306: Get total insurance balance (global + isolated) and convert to base tokens
+                let global_units = engine.insurance_fund.balance.get();
+                let isolated_units = engine.insurance_fund.isolated_balance.get();
+                let insurance_units = global_units.saturating_add(isolated_units);
                 if insurance_units == 0 {
                     return Ok(()); // Nothing to withdraw
                 }
@@ -6646,8 +6684,9 @@ pub mod processor {
                 let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
-                // Zero out insurance fund
+                // Zero out both insurance fund pools
                 engine.insurance_fund.balance = percolator::U128::ZERO;
+                engine.insurance_fund.isolated_balance = percolator::U128::ZERO;
 
                 // Transfer from vault to admin
                 let seed1: &[u8] = b"vault";
@@ -8300,6 +8339,96 @@ pub mod processor {
                     vault_state.total_capital,
                     clock.slot
                 );
+            }
+            // ========================================
+            // PERC-306: Per-Market Insurance Isolation
+            // ========================================
+
+            Instruction::FundMarketInsurance { amount } => {
+                // PERC-306: Fund isolated insurance balance for this market.
+                // Same account layout as TopUpInsurance: [admin, slab, admin_ata, vault, token_program]
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_admin_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Block when market is resolved
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
+
+                // Transfer tokens to vault
+                collateral::deposit(a_token, a_admin_ata, a_vault, a_admin, amount)?;
+
+                // Convert to units
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+                // Fund isolated insurance (not global)
+                let engine = zc::engine_mut(&mut data)?;
+                engine
+                    .fund_market_insurance(units as u128)
+                    .map_err(map_risk_error)?;
+
+                msg!("PERC-306: funded market insurance with {} units", units);
+            }
+
+            Instruction::SetInsuranceIsolation { bps } => {
+                // PERC-306: Set insurance isolation BPS for this market. Admin only.
+                // Accounts: [admin(signer), slab(writable)]
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Validate BPS range (0 = disabled, max 10000 = 100%)
+                if bps > 10_000 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // Update engine's insurance isolation BPS
+                let engine = zc::engine_mut(&mut data)?;
+                engine.set_insurance_isolation_bps(bps);
+
+                // Also write to MarketConfig for persistence
+                let mut config = state::read_config(&data);
+                config.insurance_isolation_bps = bps;
+                state::write_config(&mut data, &config);
+
+                msg!("PERC-306: set insurance isolation to {} bps", bps);
             }
         }
         Ok(())
