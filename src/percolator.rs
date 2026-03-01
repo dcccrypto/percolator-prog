@@ -9530,8 +9530,7 @@ pub mod processor {
                 {
                     // Compute max OI from engine vault balance and config multiplier
                     let vault_balance = engine.vault.get();
-                    let max_oi =
-                        vault_balance.saturating_mul(oi_mult_for_util as u128) / 10_000;
+                    let max_oi = vault_balance.saturating_mul(oi_mult_for_util as u128) / 10_000;
                     let current_oi = engine.total_open_interest.get();
 
                     // Utilization = current_oi / max_oi (in bps)
