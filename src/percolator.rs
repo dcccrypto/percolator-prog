@@ -1846,6 +1846,9 @@ pub mod ix {
             /// PERC-302: OI ramp duration in slots. 0 = full cap immediately.
             /// None = don't change (backwards compatible).
             oi_ramp_slots: Option<u64>,
+            /// PERC-298: Skew factor for dynamic OI cap tightening (bps).
+            /// 0 = disabled. None = don't change (backwards compatible).
+            skew_factor_bps: Option<u64>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -2239,6 +2242,12 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // Optional: skew_factor_bps (PERC-298, backwards compatible)
+                    let skew_factor_bps = if rest.len() >= 8 {
+                        Some(read_u64(&mut rest)?)
+                    } else {
+                        None
+                    };
                     Ok(Instruction::UpdateRiskParams {
                         initial_margin_bps,
                         maintenance_margin_bps,
@@ -2246,6 +2255,7 @@ pub mod ix {
                         oi_cap_multiplier_bps,
                         max_pnl_cap,
                         oi_ramp_slots,
+                        skew_factor_bps,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -5074,16 +5084,33 @@ pub mod processor {
         Ok(())
     }
 
-    /// PERC-273 + PERC-302: Check dynamic OI cap after trade execution.
-    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= vault * effective_multiplier / 10_000.
-    /// PERC-302: If oi_ramp_slots > 0, the effective multiplier ramps linearly from
-    /// RAMP_START_BPS to oi_cap_multiplier_bps over oi_ramp_slots since market creation.
+    /// PERC-298: Unpack oi_cap_multiplier_bps field.
+    /// Lower 32 bits = OI cap multiplier. Bits 32..47 = skew_factor_bps.
+    /// Backwards compatible: existing markets have upper bits = 0 (skew disabled).
+    #[inline]
+    pub fn unpack_oi_cap(packed: u64) -> (u64, u64) {
+        let multiplier = packed & 0xFFFF_FFFF;
+        let skew_factor = (packed >> 32) & 0xFFFF;
+        (multiplier, skew_factor)
+    }
+
+    /// PERC-298: Pack OI cap multiplier and skew factor into a single u64.
+    #[inline]
+    pub fn pack_oi_cap(multiplier: u64, skew_factor: u64) -> u64 {
+        (multiplier & 0xFFFF_FFFF) | ((skew_factor & 0xFFFF) << 32)
+    }
+
+    /// PERC-273 + PERC-298 + PERC-302: Check dynamic OI cap after trade execution.
+    /// If oi_cap_multiplier_bps > 0, enforce: total_open_interest <= effective_max_oi.
+    /// PERC-302: If oi_ramp_slots > 0, the effective multiplier ramps linearly.
+    /// PERC-298: When skew_factor > 0, the effective cap tightens with OI skew:
+    ///   effective_max_oi = base_max_oi * (1 - |long_oi - short_oi| / total_oi * skew_factor / 10_000)
     fn check_oi_cap(
         engine: &RiskEngine,
         config: &state::MarketConfig,
         current_slot: u64,
     ) -> Result<(), ProgramError> {
-        let multiplier = config.oi_cap_multiplier_bps;
+        let (multiplier, skew_factor_bps) = unpack_oi_cap(config.oi_cap_multiplier_bps);
         if multiplier == 0 {
             return Ok(()); // OI cap disabled
         }
@@ -5097,16 +5124,36 @@ pub mod processor {
         );
 
         let vault = engine.vault.get();
-        let max_oi = vault.saturating_mul(effective_multiplier as u128) / 10_000;
+        let base_max_oi = vault.saturating_mul(effective_multiplier as u128) / 10_000;
         let current_oi = engine.total_open_interest.get();
+
+        // PERC-298: Apply skew-based tightening
+        let max_oi = if skew_factor_bps > 0 && current_oi > 0 {
+            let long = engine.long_oi.get();
+            let short = engine.short_oi.get();
+            let skew = if long > short {
+                long - short
+            } else {
+                short - long
+            };
+            // reduction_bps = (skew / total_oi) * skew_factor_bps
+            let reduction_bps = skew.saturating_mul(skew_factor_bps as u128) / current_oi;
+            // Cap at skew_factor_bps to prevent underflow
+            let capped_reduction = reduction_bps.min(skew_factor_bps as u128);
+            base_max_oi.saturating_mul(10_000u128.saturating_sub(capped_reduction)) / 10_000
+        } else {
+            base_max_oi
+        };
+
         if current_oi > max_oi {
             msg!(
-                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={})",
+                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={} skew_factor={})",
                 current_oi,
                 max_oi,
                 vault,
                 multiplier,
-                effective_multiplier
+                effective_multiplier,
+                skew_factor_bps,
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -7467,6 +7514,7 @@ pub mod processor {
                 oi_cap_multiplier_bps,
                 max_pnl_cap,
                 oi_ramp_slots,
+                skew_factor_bps,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -7512,14 +7560,25 @@ pub mod processor {
 
                 // PERC-273: Update OI cap multiplier if provided
                 // PERC-272: Update max PnL cap if provided
-                // PERC-302: Update OI ramp slots if provided
+                // PERC-298 + PERC-302: Update OI cap, skew factor, ramp slots if provided
                 if oi_cap_multiplier_bps.is_some()
                     || max_pnl_cap.is_some()
                     || oi_ramp_slots.is_some()
+                    || skew_factor_bps.is_some()
                 {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
-                        config.oi_cap_multiplier_bps = oi_cap;
+                        // Preserve existing skew factor when only updating multiplier
+                        let (_, existing_skew) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                        config.oi_cap_multiplier_bps = pack_oi_cap(oi_cap, existing_skew);
+                    }
+                    if let Some(skew) = skew_factor_bps {
+                        // PERC-298: validate skew_factor_bps <= 10_000 (100%)
+                        if skew > 10_000 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
+                        let (existing_mult, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                        config.oi_cap_multiplier_bps = pack_oi_cap(existing_mult, skew);
                     }
                     if let Some(pnl_cap) = max_pnl_cap {
                         config.max_pnl_cap = pnl_cap;
@@ -7528,10 +7587,12 @@ pub mod processor {
                         config.oi_ramp_slots = ramp;
                     }
                     state::write_config(&mut data, &config);
+                    let (mult, skew) = unpack_oi_cap(config.oi_cap_multiplier_bps);
                     msg!(
-                        "UpdateRiskParams: oi_cap={:?} max_pnl_cap={:?} oi_ramp_slots={:?}",
-                        oi_cap_multiplier_bps,
+                        "UpdateRiskParams: oi_cap={} max_pnl_cap={:?} skew_factor={} oi_ramp_slots={:?}",
+                        mult,
                         max_pnl_cap,
+                        skew,
                         oi_ramp_slots
                     );
                 }
@@ -8891,8 +8952,8 @@ pub mod processor {
                 // too small to back current OI. After withdrawal:
                 //   remaining_capital >= total_oi / (effective_multiplier / 10_000)
                 // Equivalently: remaining_capital * effective_multiplier / 10_000 >= total_oi
-                // PERC-302: Use ramped multiplier for consistency with trade-time OI cap.
-                let oi_multiplier = config.oi_cap_multiplier_bps;
+                // PERC-298: Unpack to get base multiplier. PERC-302: Use ramped multiplier.
+                let (oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
                 if oi_multiplier > 0 {
                     let remaining_capital = capital.saturating_sub(units_to_return);
                     let engine = zc::engine_ref(&slab_data)?;

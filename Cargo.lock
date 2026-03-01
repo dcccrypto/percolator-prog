@@ -2547,7 +2547,7 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
-source = "git+https://github.com/dcccrypto/percolator.git?branch=feature%2FPERC-306-insurance-isolation#395bdb78ac6aa7ba5a649c236e4983d80da7495e"
+source = "git+https://github.com/dcccrypto/percolator.git?branch=feature%2FPERC-306-insurance-isolation#03ec0d51f8bbe0cabc02a20723f1ae23ab02d31e"
 
 [[package]]
 name = "percolator-prog"

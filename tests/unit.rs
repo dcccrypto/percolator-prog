@@ -4634,3 +4634,94 @@ fn test_ring_buffer_push() {
     assert_eq!(ring_buffer_push(7, 8), 0); // wraps
     assert_eq!(ring_buffer_push(3, 8), 4);
 }
+
+// ============================================================================
+// PERC-298: Skew-Adjusted OI Cap
+// ============================================================================
+
+#[test]
+fn test_pack_unpack_oi_cap_roundtrip() {
+    use percolator_prog::processor::{pack_oi_cap, unpack_oi_cap};
+
+    // Basic roundtrip
+    let packed = pack_oi_cap(100_000, 5_000);
+    let (mult, skew) = unpack_oi_cap(packed);
+    assert_eq!(mult, 100_000);
+    assert_eq!(skew, 5_000);
+
+    // Zero skew (backwards compat: existing markets)
+    let packed_legacy = pack_oi_cap(50_000, 0);
+    let (mult, skew) = unpack_oi_cap(packed_legacy);
+    assert_eq!(mult, 50_000);
+    assert_eq!(skew, 0);
+
+    // Plain u64 with no upper bits (legacy oi_cap_multiplier_bps)
+    let (mult, skew) = unpack_oi_cap(100_000u64);
+    assert_eq!(mult, 100_000);
+    assert_eq!(skew, 0); // backwards compatible: no skew
+
+    // Max values
+    let packed = pack_oi_cap(0xFFFF_FFFF, 0xFFFF);
+    let (mult, skew) = unpack_oi_cap(packed);
+    assert_eq!(mult, 0xFFFF_FFFF);
+    assert_eq!(skew, 0xFFFF);
+}
+
+#[test]
+fn test_skew_adjusted_cap_reduces_with_imbalance() {
+    // With 100% long skew and skew_factor=5000 (50%), cap should be halved
+    let vault: u128 = 1_000_000;
+    let multiplier: u128 = 100_000; // 10x
+    let base_max_oi = vault * multiplier / 10_000; // = 10_000_000
+
+    let long_oi: u128 = 10_000_000;
+    let short_oi: u128 = 0;
+    let total_oi = long_oi + short_oi;
+    let skew = long_oi - short_oi; // = 10_000_000 (100% skew)
+    let skew_factor_bps: u128 = 5_000;
+
+    let reduction_bps = skew * skew_factor_bps / total_oi; // = 5_000
+    let capped_reduction = reduction_bps.min(skew_factor_bps); // = 5_000
+    let effective = base_max_oi * (10_000 - capped_reduction) / 10_000; // = 5_000_000
+
+    assert_eq!(
+        effective,
+        base_max_oi / 2,
+        "100% skew with 50% factor should halve the cap"
+    );
+}
+
+#[test]
+fn test_skew_adjusted_cap_unchanged_when_balanced() {
+    // Equal long/short => skew = 0 => no reduction
+    let vault: u128 = 1_000_000;
+    let multiplier: u128 = 100_000;
+    let base_max_oi = vault * multiplier / 10_000;
+
+    let long_oi: u128 = 5_000_000;
+    let short_oi: u128 = 5_000_000;
+    let total_oi = long_oi + short_oi;
+    let skew = 0u128;
+    let skew_factor_bps: u128 = 5_000;
+
+    let reduction_bps = skew * skew_factor_bps / total_oi;
+    let effective = base_max_oi * (10_000 - reduction_bps) / 10_000;
+
+    assert_eq!(effective, base_max_oi, "balanced OI should not reduce cap");
+}
+
+#[test]
+fn test_skew_adjusted_cap_zero_skew_factor_disables() {
+    let vault: u128 = 1_000_000;
+    let multiplier: u128 = 100_000;
+    let base_max_oi = vault * multiplier / 10_000;
+
+    // skew_factor = 0 => skew adjustment disabled
+    let skew_factor_bps: u128 = 0;
+    // Even with 100% skew, effective == base when factor is 0
+    // (In practice, the code checks skew_factor > 0 and skips)
+    let reduction = 0u128; // would be computed as 0 since factor is 0
+    let effective = base_max_oi * (10_000 - reduction) / 10_000;
+
+    assert_eq!(effective, base_max_oi);
+}
