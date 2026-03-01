@@ -10520,19 +10520,15 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(&accounts[2])?;
 
-                // Oracle price validates liveness. In hyperp mode, the keeper-pushed
-                // last_effective_price_e6 is the canonical mark; in oracle mode,
-                // read_price_clamped fetches and clamps from the feed.
-                // NOTE: price is intentionally unused for ADL settlement arithmetic —
-                // ADL reduces PnL proportionally, not at a mark price. The oracle
-                // read exists purely as a liveness / sanity gate.
+                // Oracle price — used for inline funding settlement and
+                // as a liveness gate.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
-                let _oracle_liveness_price = if is_hyperp {
-                    let idx = config.last_effective_price_e6;
-                    if idx == 0 {
+                let oracle_price = if is_hyperp {
+                    let p = config.last_effective_price_e6;
+                    if p == 0 {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
-                    idx
+                    p
                 } else {
                     oracle::read_price_clamped(
                         &mut config,
@@ -10545,6 +10541,19 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
                 check_idx(engine, target_idx)?;
+
+                // --- PERC-334: Inline funding settlement ---
+                // Settle accumulated funding payments and mark-to-oracle PnL
+                // BEFORE reading PnL. Without this, the target's PnL may be
+                // stale (missing funding debits/credits since last touch),
+                // causing ADL to over- or under-deleverage.
+                //
+                // We use best-effort (ignore errors) because the target is
+                // profitable and we don't want settlement edge cases to block
+                // the ADL safety mechanism.
+                engine.current_slot = clock.slot;
+                let _ = engine.touch_account(target_idx);
+                let _ = engine.settle_mark_to_oracle(target_idx, oracle_price);
 
                 let pnl_pos_tot = engine.pnl_pos_tot.get();
                 let cap = config.max_pnl_cap as u128;
