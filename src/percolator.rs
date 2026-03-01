@@ -27,7 +27,6 @@ compile_error!("devnet feature MUST NOT be enabled on mainnet builds!");
 extern crate alloc;
 
 use solana_program::declare_id;
-use solana_program::pubkey::Pubkey;
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
@@ -803,10 +802,8 @@ pub mod verify {
         stored_owner: [u8; 32],
     ) -> SimpleDecision {
         // If allow_panic is requested, must have admin authorization
-        if allow_panic != 0 {
-            if !admin_ok(admin, signer) {
-                return SimpleDecision::Reject;
-            }
+        if allow_panic != 0 && !admin_ok(admin, signer) {
+            return SimpleDecision::Reject;
         }
         // Normal crank logic
         decide_crank(permissionless, idx_exists, stored_owner, signer)
@@ -896,7 +893,7 @@ pub mod verify {
         if scale == 0 {
             return true;
         }
-        amount % (scale as u64) == 0
+        amount.is_multiple_of(scale as u64)
     }
 
     // =========================================================================
@@ -1167,11 +1164,7 @@ pub mod verify {
     ) -> u64 {
         let new_mark =
             crate::oracle::compute_ema_mark_price(prev_mark, oracle, dt_slots, alpha_e6, cap_e2bps);
-        if new_mark > oracle {
-            new_mark - oracle
-        } else {
-            oracle - new_mark
-        }
+        new_mark.abs_diff(oracle)
     }
 
     // ---- 6. FEE ROUNDING DIRECTION ----
@@ -1220,7 +1213,7 @@ pub mod verify {
     /// Returns true if the liquidation is safe (no profit for the liquidated).
     /// close_pnl is the PnL from closing at oracle price.
     #[inline]
-    pub fn liquidation_no_profit(equity_before: u128, equity_after: u128, fee_paid: u128) -> bool {
+    pub fn liquidation_no_profit(equity_before: u128, equity_after: u128, _fee_paid: u128) -> bool {
         // After liquidation, equity should decrease by at least the fee
         // (no gaming via self-liquidation)
         equity_after <= equity_before
@@ -1342,11 +1335,7 @@ pub mod verify {
         if last_price == 0 || max_deviation_bps == 0 {
             return false; // First price or check disabled
         }
-        let diff = if new_price > last_price {
-            new_price - last_price
-        } else {
-            last_price - new_price
-        };
+        let diff = new_price.abs_diff(last_price);
         // deviation = diff * 10_000 / last_price
         let deviation_bps = (diff as u128) * 10_000 / (last_price as u128);
         deviation_bps > max_deviation_bps as u128
@@ -1501,26 +1490,26 @@ pub mod zc {
     const OLD_ENGINE_LEN: usize = ENGINE_LEN - 8;
 
     #[inline]
-    pub fn engine_ref<'a>(data: &'a [u8]) -> Result<&'a RiskEngine, ProgramError> {
+    pub fn engine_ref(data: &[u8]) -> Result<&RiskEngine, ProgramError> {
         // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
         if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_ptr().add(ENGINE_OFF) };
-        if (ptr as usize) % ENGINE_ALIGN != 0 {
+        if !(ptr as usize).is_multiple_of(ENGINE_ALIGN) {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(unsafe { &*(ptr as *const RiskEngine) })
     }
 
     #[inline]
-    pub fn engine_mut<'a>(data: &'a mut [u8]) -> Result<&'a mut RiskEngine, ProgramError> {
+    pub fn engine_mut(data: &mut [u8]) -> Result<&mut RiskEngine, ProgramError> {
         // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
         if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
-        if (ptr as usize) % ENGINE_ALIGN != 0 {
+        if !(ptr as usize).is_multiple_of(ENGINE_ALIGN) {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
@@ -1667,10 +1656,8 @@ pub mod matcher_abi {
         if ret.exec_size.unsigned_abs() > req_size.unsigned_abs() {
             return Err(ProgramError::InvalidAccountData);
         }
-        if req_size != 0 {
-            if ret.exec_size.signum() != req_size.signum() {
-                return Err(ProgramError::InvalidAccountData);
-            }
+        if req_size != 0 && ret.exec_size.signum() != req_size.signum() {
+            return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
     }
@@ -2344,7 +2331,7 @@ pub mod ix {
                         None
                     };
                     // PERC-300: Optional adaptive funding params
-                    let adaptive_funding_enabled = if rest.len() >= 1 {
+                    let adaptive_funding_enabled = if !rest.is_empty() {
                         Some(read_u8(&mut rest)?)
                     } else {
                         None
@@ -2971,7 +2958,7 @@ pub mod state {
     pub fn slab_data_mut<'a, 'b>(
         ai: &'b AccountInfo<'a>,
     ) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
-        Ok(ai.try_borrow_mut_data()?)
+        ai.try_borrow_mut_data()
     }
 
     pub fn read_header(data: &[u8]) -> SlabHeader {
@@ -4184,7 +4171,7 @@ pub mod oracle {
         // Try additional oracle accounts from remaining_accounts
         // Convention: after any PumpSwap vault accounts, additional oracles start
         // We try each remaining account as a potential oracle
-        for (i, extra) in remaining_accounts.iter().enumerate() {
+        for extra in remaining_accounts.iter() {
             if source_count as usize >= MAX_ORACLE_SOURCES {
                 break;
             }
@@ -4535,7 +4522,7 @@ pub mod insurance_lp {
     #[allow(unused_imports)]
     use alloc::format;
     use solana_program::{
-        account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, system_instruction,
+        account_info::AccountInfo, program_error::ProgramError, system_instruction,
     };
 
     #[cfg(not(feature = "test"))]
@@ -5334,8 +5321,7 @@ pub mod processor {
             DEFAULT_HYPERP_PRICE_CAP_E2BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR,
             DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MIN_STEP,
             DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-            MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, MATCHER_CONTEXT_LEN,
-            MATCHER_CONTEXT_PREFIX_LEN, SLAB_LEN, VERSION,
+            MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN, VERSION,
         },
         error::{map_risk_error, PercolatorError},
         ix::Instruction,
@@ -5353,7 +5339,7 @@ pub mod processor {
     use solana_program::{
         account_info::AccountInfo,
         entrypoint::ProgramResult,
-        log::{sol_log_64, sol_log_compute_units},
+        log::sol_log_64,
         msg,
         program_error::ProgramError,
         program_pack::Pack,
@@ -5489,11 +5475,7 @@ pub mod processor {
         let max_oi = if skew_factor_bps > 0 && current_oi > 0 {
             let long = engine.long_oi.get();
             let short = engine.short_oi.get();
-            let skew = if long > short {
-                long - short
-            } else {
-                short - long
-            };
+            let skew = long.abs_diff(short);
             // reduction_bps = (skew / total_oi) * skew_factor_bps
             let reduction_bps = skew.saturating_mul(skew_factor_bps as u128) / current_oi;
             // Cap at skew_factor_bps to prevent underflow
@@ -5566,8 +5548,7 @@ pub mod processor {
         if config.safety_valve_duration > 0 {
             let deadline = config
                 .rebalancing_start_slot
-                .checked_add(config.safety_valve_duration)
-                .unwrap_or(u64::MAX);
+                .saturating_add(config.safety_valve_duration);
             if current_slot >= deadline {
                 return Ok(()); // Duration elapsed, flag cleared on next crank
             }
@@ -5619,8 +5600,7 @@ pub mod processor {
         if config.rebalancing_active != 0 && config.safety_valve_duration > 0 {
             let deadline = config
                 .rebalancing_start_slot
-                .checked_add(config.safety_valve_duration)
-                .unwrap_or(u64::MAX);
+                .saturating_add(config.safety_valve_duration);
             if current_slot >= deadline {
                 config.rebalancing_active = 0;
                 config.rebalancing_start_slot = 0;
@@ -6705,7 +6685,7 @@ pub mod processor {
                 let liqs = engine.lifetime_liquidations;
                 let force = engine.lifetime_force_realize_closes;
                 // PERC-306: Report total insurance (global + isolated) as the low watermark
-                let ins_low = engine
+                let _ins_low = engine
                     .insurance_fund
                     .balance
                     .get()
@@ -6838,7 +6818,7 @@ pub mod processor {
                 // O(1) check after single O(n) scan
                 // Gate activation via verify helper (Kani-provable)
                 // PERC-306: Use total insurance (global + isolated)
-                let bal = engine
+                let _bal = engine
                     .insurance_fund
                     .balance
                     .get()
@@ -6978,23 +6958,23 @@ pub mod processor {
                 // Nonce write is deferred until after execute_trade
                 let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx) = {
                     let data = a_slab.try_borrow_data()?;
-                    slab_guard(program_id, a_slab, &*data)?;
-                    require_initialized(&*data)?;
-                    require_not_paused(&*data)?;
+                    slab_guard(program_id, a_slab, &data)?;
+                    require_initialized(&data)?;
+                    require_not_paused(&data)?;
 
                     // Block trading when market is resolved
-                    if state::is_resolved(&*data) {
+                    if state::is_resolved(&data) {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
-                    let config = state::read_config(&*data);
+                    let config = state::read_config(&data);
 
                     // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
                     // Nonce advancement via verify helper (Kani-provable)
-                    let nonce = state::read_req_nonce(&*data);
+                    let nonce = state::read_req_nonce(&data);
                     let req_id = crate::verify::nonce_on_success(nonce);
 
-                    let engine = zc::engine_ref(&*data)?;
+                    let engine = zc::engine_ref(&data)?;
 
                     check_idx(engine, lp_idx)?;
                     check_idx(engine, user_idx)?;
@@ -7132,16 +7112,8 @@ pub mod processor {
                         // (b) new mark is closer to index than current mark.
                         let index = config.last_effective_price_e6;
                         let current_mark = config.authority_price_e6;
-                        let new_dist = if clamped_mark > index {
-                            clamped_mark - index
-                        } else {
-                            index - clamped_mark
-                        };
-                        let old_dist = if current_mark > index {
-                            current_mark - index
-                        } else {
-                            index - current_mark
-                        };
+                        let new_dist = clamped_mark.abs_diff(index);
+                        let old_dist = current_mark.abs_diff(index);
                         // Allow update only if it moves mark closer to index (convergent)
                         // or if current mark is 0 (uninitialized)
                         if current_mark == 0 || new_dist <= old_dist {
@@ -7157,7 +7129,7 @@ pub mod processor {
                     // O(1) check after single O(n) scan
                     // Gate activation via verify helper (Kani-provable)
                     // PERC-306: Use total insurance (global + isolated)
-                    let bal = engine
+                    let _bal = engine
                         .insurance_fund
                         .balance
                         .get()
@@ -9207,7 +9179,7 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
                 }
 
-                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let slab_data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &slab_data)?;
                 require_initialized(&slab_data)?;
 
@@ -9434,7 +9406,7 @@ pub mod processor {
                 //   remaining_capital >= total_oi / (effective_multiplier / 10_000)
                 // Equivalently: remaining_capital * effective_multiplier / 10_000 >= total_oi
                 // PERC-298: Unpack to get base multiplier. PERC-302: Use ramped multiplier.
-                let (oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                let (_oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
                 //   remaining_capital >= total_oi / (oi_cap_multiplier / 10_000)
                 // Equivalently: remaining_capital * multiplier / 10_000 >= total_oi
                 let oi_multiplier = config.oi_cap_multiplier_bps;
@@ -9870,7 +9842,7 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let header = state::read_header(&data);
-                let config = state::read_config(&data);
+                let _config = state::read_config(&data);
                 drop(data);
 
                 // Admin only
