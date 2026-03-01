@@ -3961,6 +3961,18 @@ pub mod oracle {
         now_unix_ts: i64,
         remaining_accounts: &[AccountInfo],
     ) -> Result<u64, ProgramError> {
+        let (price, _was_clamped) =
+            read_price_clamped_ext(config, price_ai, now_unix_ts, remaining_accounts)?;
+        Ok(price)
+    }
+
+    /// PERC-299: Extended version that also reports whether the circuit breaker fired.
+    pub fn read_price_clamped_ext(
+        config: &mut super::state::MarketConfig,
+        price_ai: &AccountInfo,
+        now_unix_ts: i64,
+        remaining_accounts: &[AccountInfo],
+    ) -> Result<(u64, bool), ProgramError> {
         let raw = read_price_with_authority(config, price_ai, now_unix_ts, remaining_accounts)?;
         // For DEX oracles, enforce minimum circuit breaker cap to mitigate flash-loan attacks.
         // This protects existing markets that were initialized with cap=0 (pre-fix default).
@@ -3972,8 +3984,9 @@ pub mod oracle {
             config.oracle_price_cap_e2bps
         };
         let clamped = clamp_oracle_price(config.last_effective_price_e6, raw, effective_cap);
+        let was_clamped = clamped != raw && config.last_effective_price_e6 != 0;
         config.last_effective_price_e6 = clamped;
-        Ok(clamped)
+        Ok((clamped, was_clamped))
     }
 
     // =========================================================================
@@ -5126,6 +5139,13 @@ pub mod processor {
         let base_max_oi = vault.saturating_mul(effective_multiplier as u128) / 10_000;
         let current_oi = engine.total_open_interest.get();
 
+        // PERC-299: Halve cap when emergency OI mode is active (circuit breaker fired)
+        let base_max_oi = if engine.is_emergency_oi_mode() {
+            base_max_oi / 2
+        } else {
+            base_max_oi
+        };
+
         // PERC-298: Apply skew-based tightening
         let max_oi = if skew_factor_bps > 0 && current_oi > 0 {
             let long = engine.long_oi.get();
@@ -6122,18 +6142,21 @@ pub mod processor {
                 };
 
                 let remaining_oracle_accounts = &accounts[4..];
-                let price = if is_hyperp {
+                // PERC-299: Track whether circuit breaker fired for emergency OI mode
+                let (price, breaker_fired) = if is_hyperp {
                     // Hyperp mode: update index toward mark with rate limiting
-                    oracle::get_engine_oracle_price_e6(
+                    // Hyperp clamping is internal — treat as non-breaker for OI purposes
+                    let p = oracle::get_engine_oracle_price_e6(
                         engine_last_slot,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
                         a_oracle,
                         remaining_oracle_accounts,
-                    )?
+                    )?;
+                    (p, false)
                 } else {
-                    oracle::read_price_clamped(
+                    oracle::read_price_clamped_ext(
                         &mut config,
                         a_oracle,
                         clock.unix_timestamp,
@@ -6170,6 +6193,13 @@ pub mod processor {
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
+
+                // PERC-299: Update emergency OI mode based on circuit breaker status
+                if breaker_fired {
+                    engine.enter_emergency_oi_mode(clock.slot);
+                } else {
+                    engine.check_emergency_recovery(clock.slot);
+                }
 
                 // Crank authorization:
                 // - Permissionless mode (caller_idx == u16::MAX): anyone can crank
