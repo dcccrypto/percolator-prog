@@ -6569,7 +6569,14 @@ pub mod processor {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     // PERC-365: Reject trades if Hyperp oracle is stale
-                    { let eng = zc::engine_ref(&data)?; oracle::check_hyperp_staleness(eng.current_slot, eng.max_crank_staleness_slots, clock.slot)?; }
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
                     idx
                 } else {
                     oracle::read_price_clamped(
@@ -7210,7 +7217,15 @@ pub mod processor {
                 // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
                 // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
                 // Nonce write is deferred until after execute_trade
-                let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx, eng_current_slot, eng_max_stale) = {
+                let (
+                    lp_account_id,
+                    mut config,
+                    req_id,
+                    lp_matcher_prog,
+                    lp_matcher_ctx,
+                    eng_current_slot,
+                    eng_max_stale,
+                ) = {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
@@ -7463,7 +7478,14 @@ pub mod processor {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     // PERC-365: Reject liquidations if Hyperp oracle is stale
-                    { let eng = zc::engine_ref(&data)?; oracle::check_hyperp_staleness(eng.current_slot, eng.max_crank_staleness_slots, clock.slot)?; }
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
                     idx
                 } else {
                     oracle::read_price_clamped(
@@ -7571,7 +7593,14 @@ pub mod processor {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     // PERC-365: Reject if Hyperp oracle is stale
-                    { let eng = zc::engine_ref(&data)?; oracle::check_hyperp_staleness(eng.current_slot, eng.max_crank_staleness_slots, clock.slot)?; }
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
                     idx
                 } else {
                     oracle::read_price_clamped(
@@ -8159,7 +8188,14 @@ pub mod processor {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     // PERC-365: Reject ADL if Hyperp oracle is stale
-                    { let eng = zc::engine_ref(&data)?; oracle::check_hyperp_staleness(eng.current_slot, eng.max_crank_staleness_slots, clock.slot)?; }
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
                     idx
                 } else {
                     oracle::read_price_clamped(
@@ -10797,7 +10833,14 @@ pub mod processor {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     // PERC-365: Reject if Hyperp oracle is stale
-                    { let eng = zc::engine_ref(&data)?; oracle::check_hyperp_staleness(eng.current_slot, eng.max_crank_staleness_slots, clock.slot)?; }
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
                     idx
                 } else {
                     oracle::read_price_clamped(
