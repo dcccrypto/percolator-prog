@@ -5903,19 +5903,25 @@ pub mod processor {
         is_hyperp: bool,
     }
 
+    /// PERC-328: Context for `init_market_write_slab` — bundles account
+    /// keys and the vault-authority bump to stay within clippy's 7-arg limit.
+    struct WriteSlabContext<'a, 'b> {
+        bump: u8,
+        admin_key: &'a Pubkey,
+        mint_key: &'a Pubkey,
+        vault_key: &'a Pubkey,
+        a_clock: &'b AccountInfo<'a>,
+    }
+
     /// PERC-328: Write config fields + header to the slab in its own frame.
     /// This isolates the SlabHeader (~98 B), all the wcb temporaries, and
     /// the Clock struct from the parent's frame.
     #[inline(never)]
-    fn init_market_write_slab(
+    fn init_market_write_slab<'a, 'b>(
         data: &mut [u8],
         fields: &InitMarketFields,
         risk_params: RiskParams,
-        bump: u8,
-        admin_key: &Pubkey,
-        mint_key: &Pubkey,
-        vault_key: &Pubkey,
-        a_clock: &AccountInfo,
+        ctx: &WriteSlabContext<'a, 'b>,
     ) -> ProgramResult {
         // Zero the slab
         for b in data.iter_mut() {
@@ -5928,7 +5934,7 @@ pub mod processor {
             .init_in_place(risk_params)
             .map_err(crate::error::map_risk_error)?;
 
-        let clock = Clock::from_account_info(a_clock)?;
+        let clock = Clock::from_account_info(ctx.a_clock)?;
         engine.current_slot = clock.slot;
         engine.last_funding_slot = clock.slot;
         engine.last_crank_slot = clock.slot;
@@ -5940,8 +5946,16 @@ pub mod processor {
             use state::write_config_bytes as wcb;
             type MC = MarketConfig;
 
-            wcb(data, offset_of!(MC, collateral_mint), &mint_key.to_bytes());
-            wcb(data, offset_of!(MC, vault_pubkey), &vault_key.to_bytes());
+            wcb(
+                data,
+                offset_of!(MC, collateral_mint),
+                &ctx.mint_key.to_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, vault_pubkey),
+                &ctx.vault_key.to_bytes(),
+            );
             wcb(data, offset_of!(MC, index_feed_id), &fields.index_feed_id);
             wcb(
                 data,
@@ -5953,7 +5967,7 @@ pub mod processor {
                 offset_of!(MC, conf_filter_bps),
                 &fields.conf_filter_bps.to_le_bytes(),
             );
-            wcb(data, offset_of!(MC, vault_authority_bump), &[bump]);
+            wcb(data, offset_of!(MC, vault_authority_bump), &[ctx.bump]);
             wcb(data, offset_of!(MC, invert), &[fields.invert]);
             wcb(
                 data,
@@ -6070,9 +6084,9 @@ pub mod processor {
         let new_header = SlabHeader {
             magic: MAGIC,
             version: VERSION,
-            bump,
+            bump: ctx.bump,
             _padding: [0; 3],
-            admin: admin_key.to_bytes(),
+            admin: ctx.admin_key.to_bytes(),
             pending_admin: [0; 32],
             _reserved: [0; 24],
         };
@@ -6161,6 +6175,7 @@ pub mod processor {
 
         #[cfg(debug_assertions)]
         {
+            use crate::constants::CONFIG_LEN;
             if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
                 return Err(ProgramError::InvalidAccountData);
             }
@@ -6194,16 +6209,14 @@ pub mod processor {
 
         // PERC-328: Write phase in its own frame — isolates SlabHeader,
         // Clock, RiskParams init, and all config field writes.
-        init_market_write_slab(
-            &mut data,
-            &fields,
-            *risk_params,
+        let write_ctx = WriteSlabContext {
             bump,
-            a_admin.key,
-            a_mint.key,
-            a_vault.key,
-            &accounts[5],
-        )
+            admin_key: a_admin.key,
+            mint_key: a_mint.key,
+            vault_key: a_vault.key,
+            a_clock: &accounts[5],
+        };
+        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)
     }
 
     pub fn process_instruction<'a, 'b>(
