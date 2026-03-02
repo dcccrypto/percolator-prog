@@ -6116,10 +6116,7 @@ pub mod processor {
     /// ~200 B hash state can be inlined into the caller, contributing to frame
     /// overflow. Isolating it prevents that.
     #[inline(never)]
-    fn derive_vault_authority_isolated(
-        program_id: &Pubkey,
-        slab_key: &Pubkey,
-    ) -> (Pubkey, u8) {
+    fn derive_vault_authority_isolated(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
         accounts::derive_vault_authority(program_id, slab_key)
     }
 
