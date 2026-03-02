@@ -1222,7 +1222,11 @@ fn test_bug3_close_slab_with_dust_should_fail() {
 
     // Check vault has the full amount (includes VAULT_SEED_AMOUNT from initialization)
     let vault_balance = env.vault_balance();
-    assert_eq!(vault_balance, VAULT_SEED_AMOUNT + 10_000_500, "Vault should have seed + full deposit");
+    assert_eq!(
+        vault_balance,
+        VAULT_SEED_AMOUNT + 10_000_500,
+        "Vault should have seed + full deposit"
+    );
 
     // Advance slot and crank to ensure state is updated
     env.set_slot(200);
@@ -4638,9 +4642,9 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.slab, false),    // 2: slab
                 // PERC-199: Clock sysvar removed — TradeCpi uses Clock::get() syscall
                 AccountMeta::new_readonly(self.pyth_index, false), // 3: oracle
-                AccountMeta::new_readonly(*matcher_prog, false), // 4: matcher program
-                AccountMeta::new(*matcher_ctx, false), // 5: matcher context (writable)
-                AccountMeta::new_readonly(lp_pda, false), // 6: lp_pda
+                AccountMeta::new_readonly(*matcher_prog, false),   // 4: matcher program
+                AccountMeta::new(*matcher_ctx, false),             // 5: matcher context (writable)
+                AccountMeta::new_readonly(lp_pda, false),          // 6: lp_pda
             ],
             data: encode_trade_cpi(lp_idx, user_idx, size),
         };
@@ -8890,4 +8894,3 @@ fn test_attack_conservation_invariant() {
         vault_after_reversal
     );
 }
-
