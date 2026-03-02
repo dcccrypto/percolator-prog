@@ -5303,7 +5303,7 @@ pub mod processor {
     use crate::{
         accounts, collateral,
         constants::{
-            CONFIG_LEN, DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS, DEFAULT_FUNDING_HORIZON_SLOTS,
+            DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS, DEFAULT_FUNDING_HORIZON_SLOTS,
             DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6, DEFAULT_FUNDING_K_BPS,
             DEFAULT_FUNDING_MAX_BPS_PER_SLOT, DEFAULT_FUNDING_MAX_PREMIUM_BPS,
             DEFAULT_HYPERP_PRICE_CAP_E2BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR,
@@ -6140,21 +6140,8 @@ pub mod processor {
         // SECURITY (H2): Validate mint — isolated in its own frame (PERC-328)
         validate_spl_mint(a_mint)?;
 
-        // SECURITY (#299): Enforce minimum seed deposit to prevent market spam.
-        {
-            let vault_data = a_vault.try_borrow_data()?;
-            if vault_data.len() >= 72 {
-                let amount = u64::from_le_bytes(vault_data[64..72].try_into().unwrap_or([0u8; 8]));
-                if amount < crate::constants::MIN_INIT_MARKET_SEED {
-                    msg!(
-                        "InitMarket: seed deposit {} < minimum {}",
-                        amount,
-                        crate::constants::MIN_INIT_MARKET_SEED
-                    );
-                    return Err(PercolatorError::InsufficientSeed.into());
-                }
-            }
-        }
+        // SECURITY (#299): Seed deposit validated in validate_vault_seed_lamports()
+        // (isolated frame, typed Account::unpack — single source of truth).
 
         if !crate::verify::init_market_scale_ok(unit_scale) {
             return Err(ProgramError::InvalidInstructionData);
