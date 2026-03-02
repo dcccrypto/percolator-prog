@@ -9492,6 +9492,15 @@ pub mod processor {
                     .checked_add(units as u128)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
+                // PERC-313: Update epoch high-water mark after deposit
+                // Track the peak TVL within each epoch so withdrawals can be
+                // bounded to a floor percentage of that peak.
+                if vault_state.hwm_floor_bps > 0 {
+                    if vault_state.total_capital > vault_state.epoch_high_water_tvl {
+                        vault_state.epoch_high_water_tvl = vault_state.total_capital;
+                    }
+                }
+
                 // Update engine vault balance (tokens are already in the vault token account)
                 let engine = zc::engine_mut(&mut slab_data)?;
                 engine.vault = percolator::U128::new(
@@ -9614,6 +9623,30 @@ pub mod processor {
 
                 if units_to_return == 0 {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
+                // PERC-313: High-water mark floor enforcement.
+                // Block withdrawals that would push total_capital below
+                // hwm_floor_bps % of the epoch's peak TVL.
+                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+                    let remaining = capital
+                        .checked_sub(units_to_return)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let floor = vault_state
+                        .epoch_high_water_tvl
+                        .checked_mul(vault_state.hwm_floor_bps as u128)
+                        .unwrap_or(u128::MAX)
+                        / 10_000;
+                    if remaining < floor {
+                        msg!(
+                            "HWM block: remaining={} < floor={} (hwm={}, bps={})",
+                            remaining,
+                            floor,
+                            vault_state.epoch_high_water_tvl,
+                            vault_state.hwm_floor_bps
+                        );
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
                 }
 
                 // OI reservation check: cannot withdraw if it would make vault
@@ -10501,20 +10534,71 @@ pub mod processor {
 
                 let capital_units =
                     (claimable as u128) * vault_state.total_capital / (lp_supply as u128);
+
+                if capital_units == 0 {
+                    return Err(PercolatorError::LpVaultZeroAmount.into());
+                }
+
                 let slab_data = a_slab.try_borrow_data()?;
                 let config = state::read_config(&slab_data);
                 let base_amount =
                     crate::units::units_to_base(capital_units as u64, config.unit_scale);
+
+                // PERC-313: HWM floor enforcement (same as LpVaultWithdraw)
+                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+                    let remaining = vault_state
+                        .total_capital
+                        .checked_sub(capital_units)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let floor = vault_state
+                        .epoch_high_water_tvl
+                        .checked_mul(vault_state.hwm_floor_bps as u128)
+                        .unwrap_or(u128::MAX)
+                        / 10_000;
+                    if remaining < floor {
+                        msg!(
+                            "ClaimQueued HWM block: remaining={} < floor={}",
+                            remaining,
+                            floor
+                        );
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
+
+                // #555: OI reservation check (was missing from ClaimQueuedWithdrawal)
+                let (oi_multiplier, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                if oi_multiplier > 0 {
+                    let remaining_capital = vault_state
+                        .total_capital
+                        .checked_sub(capital_units)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let engine = zc::engine_ref(&slab_data)?;
+                    let current_oi = engine.total_open_interest.get();
+                    let max_oi_after =
+                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+                    if current_oi > max_oi_after {
+                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+                    }
+                }
                 drop(slab_data);
 
-                vault_state.total_capital = vault_state.total_capital.saturating_sub(capital_units);
+                // #555: Use checked_sub instead of saturating_sub for accounting safety
+                vault_state.total_capital = vault_state
+                    .total_capital
+                    .checked_sub(capital_units)
+                    .ok_or(PercolatorError::EngineOverflow)?;
                 crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
                 drop(vs_data);
 
                 let mut slab_data = state::slab_data_mut(a_slab)?;
                 let engine = zc::engine_mut(&mut slab_data)?;
-                engine.vault =
-                    percolator::U128::new(engine.vault.get().saturating_sub(capital_units));
+                engine.vault = percolator::U128::new(
+                    engine
+                        .vault
+                        .get()
+                        .checked_sub(capital_units)
+                        .ok_or(PercolatorError::EngineOverflow)?,
+                );
                 drop(slab_data);
 
                 crate::insurance_lp::burn(
