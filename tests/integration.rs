@@ -28,8 +28,12 @@ use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-const SLAB_LEN: usize = 1025712; // MAX_ACCOUNTS=4096 (PERC-324: CONFIG_LEN 368→496, ENGINE_OFF 472→600)
+const SLAB_LEN: usize = 1025832; // MAX_ACCOUNTS=4096 (PERC-328: updated to match SBF .so output)
 const MAX_ACCOUNTS: usize = 4096;
+
+// PERC-328: Minimum seed deposit required by production binary (non-test feature).
+// Must match constants::MIN_INIT_MARKET_SEED in percolator-prog.
+const VAULT_SEED_AMOUNT: u64 = 500_000_000;
 
 // SBF ENGINE_OFF = align_up(HEADER_LEN + CONFIG_LEN, 8) = align_up(104 + 496, 8) = 600
 // PERC-324: Updated from 392 → 600 to match CONFIG_LEN growth (368→496).
@@ -247,7 +251,7 @@ impl TestEnv {
             vault,
             Account {
                 lamports: 1_000_000,
-                data: make_token_account_data(&mint, &vault_pda, 0),
+                data: make_token_account_data(&mint, &vault_pda, 500_000_000),
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -512,7 +516,7 @@ impl TestEnv {
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(lp.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // PERC-199: Clock sysvar removed — TradeNoCpi uses Clock::get() syscall
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_trade(lp_idx, user_idx, size),
@@ -984,9 +988,9 @@ impl TestEnv {
         // ENGINE_OFF = SBF_ENGINE_OFF (600, from constants, checked via test_struct_sizes)
         // offset of RiskEngine.used = 408 (bitmap array)
         // used is [u64; 64] = 512 bytes
-        // num_used_accounts follows used at offset 408 + 512 = 920 within RiskEngine
-        // Total offset = SBF_ENGINE_OFF + 920 = 1520
-        const NUM_USED_OFFSET: usize = SBF_ENGINE_OFF + 920;
+        // num_used_accounts follows used at offset 696 + 512 = 1208 within RiskEngine
+        // Total offset = SBF_ENGINE_OFF + 1208 = 1808
+        const NUM_USED_OFFSET: usize = SBF_ENGINE_OFF + 1208;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -1001,8 +1005,8 @@ impl TestEnv {
     fn is_slot_used(&self, idx: u16) -> bool {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = SBF_ENGINE_OFF (600), offset of RiskEngine.used = 408
-        // Bitmap is [u64; 64] at offset SBF_ENGINE_OFF + 408 = 1008
-        const BITMAP_OFFSET: usize = SBF_ENGINE_OFF + 408;
+        // Bitmap is [u64; 64] at offset SBF_ENGINE_OFF + 696 = 1296
+        const BITMAP_OFFSET: usize = SBF_ENGINE_OFF + 696;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -1020,10 +1024,10 @@ impl TestEnv {
     /// Read account capital for a slot (to verify it's zeroed after GC)
     fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = SBF_ENGINE_OFF (600), accounts array at offset 9136 within RiskEngine
-        // Account size = 240 bytes, capital at offset 8 within Account (after account_id u64)
-        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        // ENGINE_OFF = SBF_ENGINE_OFF (600), accounts array at offset 9424 within RiskEngine
+        // Account size = 248 bytes, capital at offset 8 within Account (after account_id u64)
+        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9424;
+        const ACCOUNT_SIZE: usize = 248;
         const CAPITAL_OFFSET_IN_ACCOUNT: usize = 8; // After account_id (u64)
         let account_offset =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -1040,13 +1044,13 @@ impl TestEnv {
     /// Read account position_size for a slot
     fn read_account_position(&self, idx: u16) -> i128 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = SBF_ENGINE_OFF (600), accounts array at offset 9136 within RiskEngine
-        // Account size = 240 bytes
+        // ENGINE_OFF = SBF_ENGINE_OFF (600), accounts array at offset 9424 within RiskEngine
+        // Account size = 248 bytes
         // Account layout: account_id(8) + capital(16) + kind(1) + padding(7) + pnl(16) + reserved_pnl(8) +
         //                 warmup_started_at_slot(8) + warmup_slope_per_step(16) + position_size(16) + ...
         // position_size is at offset: 8 + 16 + 1 + 7 + 16 + 8 + 8 + 16 = 80
-        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9424;
+        const ACCOUNT_SIZE: usize = 248;
         const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
         let account_offset =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
@@ -1130,7 +1134,7 @@ impl TestEnv {
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(lp.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // PERC-199: Clock sysvar removed — TradeNoCpi uses Clock::get() syscall
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_trade(lp_idx, user_idx, size),
@@ -1216,9 +1220,9 @@ fn test_bug3_close_slab_with_dust_should_fail() {
     // - 10_000_500 % 1000 = 500 dust stored in dust_base
     env.deposit(&user, user_idx, 10_000_500);
 
-    // Check vault has the full amount
+    // Check vault has the full amount (includes VAULT_SEED_AMOUNT from initialization)
     let vault_balance = env.vault_balance();
-    assert_eq!(vault_balance, 10_000_500, "Vault should have full deposit");
+    assert_eq!(vault_balance, VAULT_SEED_AMOUNT + 10_000_500, "Vault should have seed + full deposit");
 
     // Advance slot and crank to ensure state is updated
     env.set_slot(200);
@@ -1809,7 +1813,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
         vault,
         Account {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
+            data: make_token_account_data(&mint, &vault_pda, 500_000_000),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
@@ -2058,7 +2062,7 @@ fn test_hyperp_init_market_with_valid_price() {
         vault,
         Account {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
+            data: make_token_account_data(&mint, &vault_pda, 500_000_000),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
@@ -2188,7 +2192,7 @@ fn test_hyperp_init_market_with_inverted_price() {
         vault,
         Account {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
+            data: make_token_account_data(&mint, &vault_pda, 500_000_000),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
@@ -2821,7 +2825,7 @@ impl TestEnv {
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(user.pubkey(), false), // LP not signing
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // PERC-199: Clock sysvar removed — TradeNoCpi uses Clock::get() syscall
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_trade(lp_idx, user_idx, size),
@@ -3443,6 +3447,28 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    /// Two-step admin transfer: step 2 — new admin accepts.
+    fn try_accept_admin(&mut self, new_admin: &Keypair) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(new_admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: vec![29], // TAG_ACCEPT_ADMIN = 29
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&new_admin.pubkey()),
+            &[new_admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
     /// Try SetRiskThreshold instruction
     fn try_set_risk_threshold(
         &mut self,
@@ -3737,14 +3763,24 @@ fn test_critical_update_admin_authorization() {
     );
     println!("UpdateAdmin by non-admin: REJECTED (correct)");
 
-    // Real admin changes admin - should succeed
+    // Real admin proposes new admin (two-step transfer: step 1)
     let result = env.try_update_admin(&admin, &new_admin.pubkey());
     assert!(
         result.is_ok(),
-        "Admin should be able to change admin: {:?}",
+        "Admin should be able to propose new admin: {:?}",
         result
     );
-    println!("UpdateAdmin by admin: ACCEPTED (correct)");
+    println!("UpdateAdmin (propose) by admin: ACCEPTED (correct)");
+
+    // New admin accepts (two-step transfer: step 2)
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    let result = env.try_accept_admin(&new_admin);
+    assert!(
+        result.is_ok(),
+        "New admin should be able to accept: {:?}",
+        result
+    );
+    println!("AcceptAdmin by new admin: ACCEPTED (correct)");
 
     // Old admin tries again - should now fail
     let result = env.try_update_admin(&admin, &admin.pubkey());
@@ -4327,7 +4363,7 @@ impl TradeCpiTestEnv {
             vault,
             Account {
                 lamports: 1_000_000,
-                data: make_token_account_data(&mint, &vault_pda, 0),
+                data: make_token_account_data(&mint, &vault_pda, 500_000_000),
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -4600,11 +4636,11 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(user.pubkey(), true), // 0: user (signer)
                 AccountMeta::new(*lp_owner, false),    // 1: lp_owner (NOT signer!)
                 AccountMeta::new(self.slab, false),    // 2: slab
-                AccountMeta::new_readonly(sysvar::clock::ID, false), // 3: clock
-                AccountMeta::new_readonly(self.pyth_index, false), // 4: oracle
-                AccountMeta::new_readonly(*matcher_prog, false), // 5: matcher program
-                AccountMeta::new(*matcher_ctx, false), // 6: matcher context (writable)
-                AccountMeta::new_readonly(lp_pda, false), // 7: lp_pda
+                // PERC-199: Clock sysvar removed — TradeCpi uses Clock::get() syscall
+                AccountMeta::new_readonly(self.pyth_index, false), // 3: oracle
+                AccountMeta::new_readonly(*matcher_prog, false), // 4: matcher program
+                AccountMeta::new(*matcher_ctx, false), // 5: matcher context (writable)
+                AccountMeta::new_readonly(lp_pda, false), // 6: lp_pda
             ],
             data: encode_trade_cpi(lp_idx, user_idx, size),
         };
@@ -4640,7 +4676,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(*lp_owner, false),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // PERC-199: Clock sysvar removed — TradeCpi uses Clock::get() syscall
                 AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(*matcher_prog, false),
                 AccountMeta::new(*matcher_ctx, false),
@@ -4864,10 +4900,10 @@ impl TradeCpiTestEnv {
 
     fn read_account_position(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF = SBF_ENGINE_OFF (600), accounts array at offset 9136 within RiskEngine
-        // Account size = 240 bytes, position at offset 80 within Account
-        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        // ENGINE_OFF = SBF_ENGINE_OFF (600), accounts array at offset 9424 within RiskEngine
+        // Account size = 248 bytes, position at offset 80 within Account
+        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9424;
+        const ACCOUNT_SIZE: usize = 248;
         const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
         let account_off =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
@@ -4925,8 +4961,8 @@ impl TradeCpiTestEnv {
 
     fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF (SBF_ENGINE_OFF=600) + num_used offset (920) = 1520
-        const NUM_USED_OFFSET: usize = SBF_ENGINE_OFF + 920;
+        // ENGINE_OFF (SBF_ENGINE_OFF=600) + num_used offset (1208) = 1808
+        const NUM_USED_OFFSET: usize = SBF_ENGINE_OFF + 1208;
         u16::from_le_bytes(
             slab_data[NUM_USED_OFFSET..NUM_USED_OFFSET + 2]
                 .try_into()
@@ -4988,8 +5024,8 @@ impl TradeCpiTestEnv {
         //   warmup_started_at_slot: u64 (8), offset 56
         //   warmup_slope_per_step: U128 (16), offset 64
         //   position_size: I128 (16), offset 80 (confirmed in other tests)
-        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9424;
+        const ACCOUNT_SIZE: usize = 248;
         const PNL_OFFSET_IN_ACCOUNT: usize = 32; // pnl is at offset 32 within Account
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -5867,7 +5903,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
         vault,
         Account {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &vault_pda, 0),
+            data: make_token_account_data(&mint, &vault_pda, 500_000_000),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
@@ -7143,8 +7179,8 @@ impl TestEnv {
     /// Read account PnL for a slot
     fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9424;
+        const ACCOUNT_SIZE: usize = 248;
         const PNL_OFFSET_IN_ACCOUNT: usize = 32;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -7543,8 +7579,9 @@ fn test_attack_admin_op_as_user() {
     );
 }
 
-/// ATTACK: After admin is burned (set to [0;32]), verify no one can act as admin.
-/// Expected: All admin ops fail since nobody can sign as the zero address.
+/// ATTACK: After admin transfer completes, verify old admin and random attacker
+/// cannot act as admin. Two-step admin transfer prevents zero-address burn
+/// (UpdateAdmin rejects zero pubkey), so we transfer to a throwaway key.
 #[test]
 fn test_attack_burned_admin_cannot_act() {
     let path = program_path();
@@ -7557,26 +7594,29 @@ fn test_attack_burned_admin_cannot_act() {
     env.init_market_with_invert(0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
+    let throwaway = Keypair::new();
+    env.svm.airdrop(&throwaway.pubkey(), 1_000_000_000).unwrap();
 
-    // Burn admin by transferring to zero address
-    let result = env.try_update_admin(&admin, &zero_pubkey);
-    assert!(result.is_ok(), "Admin should be able to burn admin key");
+    // Two-step admin transfer to throwaway key
+    let result = env.try_update_admin(&admin, &throwaway.pubkey());
+    assert!(result.is_ok(), "Admin should be able to propose new admin");
+    let result = env.try_accept_admin(&throwaway);
+    assert!(result.is_ok(), "New admin should accept");
 
     // Now old admin can no longer act
     let result = env.try_set_risk_threshold(&admin, 999);
     assert!(
         result.is_err(),
-        "ATTACK: Burned admin - old admin should not work"
+        "ATTACK: Transferred admin - old admin should not work"
     );
 
-    // Random attacker also can't act (no one can sign as [0;32])
+    // Random attacker also can't act
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_set_risk_threshold(&attacker, 999);
     assert!(
         result.is_err(),
-        "ATTACK: Burned admin - attacker should not work"
+        "ATTACK: Transferred admin - attacker should not work"
     );
 }
 
@@ -8805,12 +8845,13 @@ fn test_attack_conservation_invariant() {
     env.deposit(&user2, user2_idx, 10_000_000_000);
 
     let total_deposited: u64 = 120_000_000_000; // 100 + 10 + 10 SOL
+    let total_in_vault: u64 = VAULT_SEED_AMOUNT + total_deposited; // seed + deposits
 
-    // Vault should have all deposited funds
+    // Vault should have seed + all deposited funds
     let vault_after_deposits = env.vault_balance();
     assert_eq!(
-        vault_after_deposits, total_deposited,
-        "Vault should have exactly the deposited amount"
+        vault_after_deposits, total_in_vault,
+        "Vault should have seed + deposited amount"
     );
 
     // User1 goes long, user2 goes short
@@ -8820,7 +8861,7 @@ fn test_attack_conservation_invariant() {
     // Trading doesn't move tokens in/out of vault
     let vault_after_trades = env.vault_balance();
     assert_eq!(
-        vault_after_trades, total_deposited,
+        vault_after_trades, total_in_vault,
         "Trading should not change vault token balance"
     );
 
@@ -8830,7 +8871,7 @@ fn test_attack_conservation_invariant() {
 
     let vault_after_crank = env.vault_balance();
     assert_eq!(
-        vault_after_crank, total_deposited,
+        vault_after_crank, total_in_vault,
         "Crank should not change vault token balance"
     );
 
@@ -8840,7 +8881,7 @@ fn test_attack_conservation_invariant() {
 
     let vault_after_reversal = env.vault_balance();
     assert_eq!(
-        vault_after_reversal, total_deposited,
+        vault_after_reversal, total_in_vault,
         "Price reversal+crank should not change vault token balance"
     );
 
@@ -8849,3 +8890,4 @@ fn test_attack_conservation_invariant() {
         vault_after_reversal
     );
 }
+
