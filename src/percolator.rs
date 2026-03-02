@@ -9634,8 +9634,7 @@ pub mod processor {
                         .ok_or(PercolatorError::EngineOverflow)?;
                     let floor = vault_state
                         .epoch_high_water_tvl
-                        .checked_mul(vault_state.hwm_floor_bps as u128)
-                        .unwrap_or(u128::MAX)
+                        .saturating_mul(vault_state.hwm_floor_bps as u128)
                         / 10_000;
                     if remaining < floor {
                         msg!(
@@ -10552,8 +10551,7 @@ pub mod processor {
                         .ok_or(PercolatorError::EngineOverflow)?;
                     let floor = vault_state
                         .epoch_high_water_tvl
-                        .checked_mul(vault_state.hwm_floor_bps as u128)
-                        .unwrap_or(u128::MAX)
+                        .saturating_mul(vault_state.hwm_floor_bps as u128)
                         / 10_000;
                     if remaining < floor {
                         msg!(
