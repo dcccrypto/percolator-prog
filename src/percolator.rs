@@ -5318,10 +5318,12 @@ pub mod processor {
         verify::compute_ramp_multiplier,
         zc,
     };
+    use alloc::boxed::Box;
     #[allow(unused_imports)]
     use alloc::format;
     use percolator::{
-        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, TradeExecution, MAX_ACCOUNTS,
+        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, RiskParams, TradeExecution,
+        MAX_ACCOUNTS,
     };
     use solana_program::instruction::{AccountMeta, Instruction as SolInstruction};
     use solana_program::{
@@ -5356,6 +5358,7 @@ pub mod processor {
         }
     }
 
+    #[inline(never)]
     fn slab_guard(
         program_id: &Pubkey,
         slab: &AccountInfo,
@@ -5763,6 +5766,7 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline(never)]
     fn verify_vault(
         a_vault: &AccountInfo,
         expected_owner: &Pubkey,
@@ -5843,15 +5847,259 @@ pub mod processor {
         Ok(())
     }
 
-    /// PERC-331: InitMarket handler — extracted into its own `#[inline(never)]`
-    /// function so its large locals (RiskParams ~300 B, Pubkeys, feed_id) live on
-    /// a *separate* stack frame from the main 48-arm dispatch match.
+    /// PERC-328: Validate SPL mint account in its own stack frame.
+    /// `Mint::unpack` creates an 82-byte struct on the stack; keeping it in
+    /// the caller's frame (process_init_market) contributed to SBF 4 KiB
+    /// frame overflow.
+    #[inline(never)]
+    fn validate_spl_mint(a_mint: &AccountInfo) -> ProgramResult {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token::state::Mint;
+            if *a_mint.owner != spl_token::ID {
+                return Err(ProgramError::IllegalOwner);
+            }
+            if a_mint.data_len() != Mint::LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let mint_data = a_mint.try_borrow_data()?;
+            let _ = Mint::unpack(&mint_data)?;
+        }
+        #[cfg(feature = "test")]
+        let _ = a_mint;
+        Ok(())
+    }
+
+    /// PERC-328: Validate vault has sufficient seed lamports in its own frame.
+    /// `Account::unpack` creates a 165-byte struct; isolated to prevent stack
+    /// overflow in the parent frame.
+    #[inline(never)]
+    fn validate_vault_seed_lamports(a_vault: &AccountInfo) -> ProgramResult {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program_pack::Pack;
+            let vault_data = a_vault.try_borrow_data()?;
+            let vault_tok = spl_token::state::Account::unpack(&vault_data)?;
+            if vault_tok.amount < crate::constants::MIN_INIT_MARKET_SEED_LAMPORTS {
+                return Err(PercolatorError::InsufficientSeed.into());
+            }
+        }
+        #[cfg(feature = "test")]
+        let _ = a_vault;
+        Ok(())
+    }
+
+    /// PERC-328: Compact struct for passing parsed InitMarket fields between
+    /// stack-isolated phases. Only scalars and small arrays — RiskParams is
+    /// passed separately via Box to stay on the heap.
+    struct InitMarketFields {
+        index_feed_id: [u8; 32],
+        max_staleness_secs: u64,
+        conf_filter_bps: u16,
+        invert: u8,
+        unit_scale: u32,
+        initial_mark_price_e6: u64,
+        is_hyperp: bool,
+    }
+
+    /// PERC-328: Write config fields + header to the slab in its own frame.
+    /// This isolates the SlabHeader (~98 B), all the wcb temporaries, and
+    /// the Clock struct from the parent's frame.
+    #[inline(never)]
+    fn init_market_write_slab(
+        data: &mut [u8],
+        fields: &InitMarketFields,
+        risk_params: RiskParams,
+        bump: u8,
+        admin_key: &Pubkey,
+        mint_key: &Pubkey,
+        vault_key: &Pubkey,
+        a_clock: &AccountInfo,
+    ) -> ProgramResult {
+        // Zero the slab
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+
+        // Initialize risk engine
+        let engine = zc::engine_mut(data)?;
+        engine
+            .init_in_place(risk_params)
+            .map_err(crate::error::map_risk_error)?;
+
+        let clock = Clock::from_account_info(a_clock)?;
+        engine.current_slot = clock.slot;
+        engine.last_funding_slot = clock.slot;
+        engine.last_crank_slot = clock.slot;
+
+        // Write config fields directly into the zeroed slab buffer.
+        // Avoids constructing a 496-byte MarketConfig on the stack.
+        {
+            use core::mem::offset_of;
+            use state::write_config_bytes as wcb;
+            type MC = MarketConfig;
+
+            wcb(data, offset_of!(MC, collateral_mint), &mint_key.to_bytes());
+            wcb(data, offset_of!(MC, vault_pubkey), &vault_key.to_bytes());
+            wcb(data, offset_of!(MC, index_feed_id), &fields.index_feed_id);
+            wcb(
+                data,
+                offset_of!(MC, max_staleness_secs),
+                &fields.max_staleness_secs.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, conf_filter_bps),
+                &fields.conf_filter_bps.to_le_bytes(),
+            );
+            wcb(data, offset_of!(MC, vault_authority_bump), &[bump]);
+            wcb(data, offset_of!(MC, invert), &[fields.invert]);
+            wcb(
+                data,
+                offset_of!(MC, unit_scale),
+                &fields.unit_scale.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_horizon_slots),
+                &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_k_bps),
+                &DEFAULT_FUNDING_K_BPS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_inv_scale_notional_e6),
+                &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_max_premium_bps),
+                &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_max_bps_per_slot),
+                &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_premium_dampening_e6),
+                &1_000_000u64.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, funding_premium_max_bps_per_slot),
+                &5i64.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_floor),
+                &DEFAULT_THRESH_FLOOR.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_risk_bps),
+                &DEFAULT_THRESH_RISK_BPS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_update_interval_slots),
+                &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_step_bps),
+                &DEFAULT_THRESH_STEP_BPS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_alpha_bps),
+                &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_min),
+                &DEFAULT_THRESH_MIN.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_max),
+                &DEFAULT_THRESH_MAX.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, thresh_min_step),
+                &DEFAULT_THRESH_MIN_STEP.to_le_bytes(),
+            );
+            if fields.is_hyperp {
+                wcb(
+                    data,
+                    offset_of!(MC, authority_price_e6),
+                    &fields.initial_mark_price_e6.to_le_bytes(),
+                );
+            }
+            let cap = if fields.is_hyperp {
+                DEFAULT_HYPERP_PRICE_CAP_E2BPS
+            } else {
+                DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
+            };
+            wcb(
+                data,
+                offset_of!(MC, oracle_price_cap_e2bps),
+                &cap.to_le_bytes(),
+            );
+            if fields.is_hyperp {
+                wcb(
+                    data,
+                    offset_of!(MC, last_effective_price_e6),
+                    &fields.initial_mark_price_e6.to_le_bytes(),
+                );
+            }
+            wcb(
+                data,
+                offset_of!(MC, market_created_slot),
+                &clock.slot.to_le_bytes(),
+            );
+            wcb(data, offset_of!(MC, safety_valve_epochs), &[5u8]);
+        }
+
+        let new_header = SlabHeader {
+            magic: MAGIC,
+            version: VERSION,
+            bump,
+            _padding: [0; 3],
+            admin: admin_key.to_bytes(),
+            pending_admin: [0; 32],
+            _reserved: [0; 24],
+        };
+        state::write_header(data, &new_header);
+        state::write_req_nonce(data, 0);
+        state::write_last_thr_update_slot(data, 0);
+        Ok(())
+    }
+
+    /// PERC-328 / PERC-331: InitMarket handler — stack-split architecture.
     ///
-    /// Config fields are written directly into the zeroed slab buffer via
-    /// `state::write_config_bytes`, avoiding a 496-byte `MarketConfig` on stack.
-    /// The main `process_instruction` never creates the `Instruction::InitMarket`
-    /// variant — it early-dispatches by tag byte, so the ~450-byte enum is also
-    /// avoided entirely.
+    /// SBF enforces a hard 4 KiB per-frame stack limit. The original monolithic
+    /// handler accumulated ~4.5 KiB of locals (RiskParams 300 B, 3× Pubkey 96 B,
+    /// SlabHeader 98 B, Clock 40 B, SPL Mint::unpack 82 B, SPL Account::unpack
+    /// 165 B × 2, plus compiler spill slots) causing "Access violation in stack
+    /// frame 1" at only 1341 CU.
+    ///
+    /// Fix: split into 4 `#[inline(never)]` functions, each with its own 4 KiB
+    /// frame:
+    ///   1. `process_init_market` — thin coordinator (~200 B locals)
+    ///   2. `validate_spl_mint` — isolates Mint::unpack (82 B)
+    ///   3. `validate_vault_seed_lamports` — isolates Account::unpack (165 B)
+    ///   4. `init_market_write_slab` — isolates SlabHeader, Clock, RiskParams,
+    ///      and all config writes
+    ///
+    /// Additionally `verify_vault` and `slab_guard` are marked `#[inline(never)]`
+    /// to prevent their locals from being folded into any caller's frame.
     #[inline(never)]
     fn process_init_market<'a, 'b>(
         program_id: &Pubkey,
@@ -5868,7 +6116,8 @@ pub mod processor {
         let invert = ix::read_u8(&mut rest)?;
         let unit_scale = ix::read_u32(&mut rest)?;
         let initial_mark_price_e6 = ix::read_u64(&mut rest)?;
-        let risk_params = ix::read_risk_params(&mut rest)?;
+        // PERC-328: Box the ~300 B RiskParams to move it from stack to heap.
+        let risk_params = Box::new(ix::read_risk_params(&mut rest)?);
 
         accounts::expect_len(accounts, 9)?;
         let a_admin = &accounts[0];
@@ -5888,20 +6137,8 @@ pub mod processor {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        // SECURITY (H2): Validate mint is a real SPL Token mint
-        #[cfg(not(feature = "test"))]
-        {
-            use solana_program::program_pack::Pack;
-            use spl_token::state::Mint;
-            if *a_mint.owner != spl_token::ID {
-                return Err(ProgramError::IllegalOwner);
-            }
-            if a_mint.data_len() != Mint::LEN {
-                return Err(ProgramError::InvalidAccountData);
-            }
-            let mint_data = a_mint.try_borrow_data()?;
-            let _ = Mint::unpack(&mint_data)?;
-        }
+        // SECURITY (H2): Validate mint — isolated in its own frame (PERC-328)
+        validate_spl_mint(a_mint)?;
 
         // SECURITY (#299): Enforce minimum seed deposit to prevent market spam.
         {
@@ -5954,185 +6191,32 @@ pub mod processor {
         let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
         verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
 
-        #[cfg(not(feature = "test"))]
-        {
-            let vault_data = a_vault.try_borrow_data()?;
-            let vault_tok = spl_token::state::Account::unpack(&vault_data)?;
-            if vault_tok.amount < crate::constants::MIN_INIT_MARKET_SEED_LAMPORTS {
-                return Err(PercolatorError::InsufficientSeed.into());
-            }
-        }
+        // PERC-328: Isolated SPL Account::unpack in its own frame
+        validate_vault_seed_lamports(a_vault)?;
 
-        for b in data.iter_mut() {
-            *b = 0;
-        }
-
-        let engine = zc::engine_mut(&mut data)?;
-        engine
-            .init_in_place(risk_params)
-            .map_err(crate::error::map_risk_error)?;
-
-        let a_clock = &accounts[5];
-        let clock = Clock::from_account_info(a_clock)?;
-        engine.current_slot = clock.slot;
-        engine.last_funding_slot = clock.slot;
-        engine.last_crank_slot = clock.slot;
-
-        // Write config fields directly into the zeroed slab buffer.
-        // Avoids constructing a 496-byte MarketConfig on the stack.
-        {
-            use core::mem::offset_of;
-            use state::write_config_bytes as wcb;
-            type MC = MarketConfig;
-
-            wcb(
-                &mut data,
-                offset_of!(MC, collateral_mint),
-                &a_mint.key.to_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, vault_pubkey),
-                &a_vault.key.to_bytes(),
-            );
-            wcb(&mut data, offset_of!(MC, index_feed_id), &index_feed_id);
-            wcb(
-                &mut data,
-                offset_of!(MC, max_staleness_secs),
-                &max_staleness_secs.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, conf_filter_bps),
-                &conf_filter_bps.to_le_bytes(),
-            );
-            wcb(&mut data, offset_of!(MC, vault_authority_bump), &[bump]);
-            wcb(&mut data, offset_of!(MC, invert), &[invert]);
-            wcb(
-                &mut data,
-                offset_of!(MC, unit_scale),
-                &unit_scale.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_horizon_slots),
-                &DEFAULT_FUNDING_HORIZON_SLOTS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_k_bps),
-                &DEFAULT_FUNDING_K_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_inv_scale_notional_e6),
-                &DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_max_premium_bps),
-                &DEFAULT_FUNDING_MAX_PREMIUM_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_max_bps_per_slot),
-                &DEFAULT_FUNDING_MAX_BPS_PER_SLOT.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_premium_dampening_e6),
-                &1_000_000u64.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, funding_premium_max_bps_per_slot),
-                &5i64.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_floor),
-                &DEFAULT_THRESH_FLOOR.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_risk_bps),
-                &DEFAULT_THRESH_RISK_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_update_interval_slots),
-                &DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_step_bps),
-                &DEFAULT_THRESH_STEP_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_alpha_bps),
-                &DEFAULT_THRESH_ALPHA_BPS.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_min),
-                &DEFAULT_THRESH_MIN.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_max),
-                &DEFAULT_THRESH_MAX.to_le_bytes(),
-            );
-            wcb(
-                &mut data,
-                offset_of!(MC, thresh_min_step),
-                &DEFAULT_THRESH_MIN_STEP.to_le_bytes(),
-            );
-            if is_hyperp {
-                wcb(
-                    &mut data,
-                    offset_of!(MC, authority_price_e6),
-                    &initial_mark_price_e6.to_le_bytes(),
-                );
-            }
-            let cap = if is_hyperp {
-                DEFAULT_HYPERP_PRICE_CAP_E2BPS
-            } else {
-                DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS
-            };
-            wcb(
-                &mut data,
-                offset_of!(MC, oracle_price_cap_e2bps),
-                &cap.to_le_bytes(),
-            );
-            if is_hyperp {
-                wcb(
-                    &mut data,
-                    offset_of!(MC, last_effective_price_e6),
-                    &initial_mark_price_e6.to_le_bytes(),
-                );
-            }
-            wcb(
-                &mut data,
-                offset_of!(MC, market_created_slot),
-                &clock.slot.to_le_bytes(),
-            );
-            wcb(&mut data, offset_of!(MC, safety_valve_epochs), &[5u8]);
-        }
-
-        let new_header = SlabHeader {
-            magic: MAGIC,
-            version: VERSION,
-            bump,
-            _padding: [0; 3],
-            admin: a_admin.key.to_bytes(),
-            pending_admin: [0; 32],
-            _reserved: [0; 24],
+        // Pack parsed fields into a compact struct for the write phase
+        let fields = InitMarketFields {
+            index_feed_id,
+            max_staleness_secs,
+            conf_filter_bps,
+            invert,
+            unit_scale,
+            initial_mark_price_e6,
+            is_hyperp,
         };
-        state::write_header(&mut data, &new_header);
-        state::write_req_nonce(&mut data, 0);
-        state::write_last_thr_update_slot(&mut data, 0);
-        Ok(())
+
+        // PERC-328: Write phase in its own frame — isolates SlabHeader,
+        // Clock, RiskParams init, and all config field writes.
+        init_market_write_slab(
+            &mut data,
+            &fields,
+            *risk_params,
+            bump,
+            a_admin.key,
+            a_mint.key,
+            a_vault.key,
+            &accounts[5],
+        )
     }
 
     pub fn process_instruction<'a, 'b>(
