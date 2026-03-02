@@ -24,10 +24,9 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-// Updated for PERC-298: RiskEngine grew by 32 bytes (long_oi + short_oi U128 fields)
-// Also includes PERC-306 insurance isolation, PERC-311 rebate reserve, PERC-302 ramp fields
-// TODO: verify against BPF build (cargo build-sbf) before deployment
-const SLAB_LEN: usize = 1025616;
+// Updated for PERC-328: matches SBF .so output after MarketConfig grew
+// (PERC-312 safety valve, PERC-314 dispute, PERC-315 LP collateral fields)
+const SLAB_LEN: usize = 1025832;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -370,6 +369,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for Pyth-mode markets)
                                                  // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -737,16 +737,17 @@ fn test_bpf_i128_alignment() {
     println!("   Deposited {} to user", user_deposit);
 
     // Execute a trade to create position values
-    let trade_size: i128 = 1_000_000_000i128; // 1B units
+    let trade_size: i128 = 100_000_000i128; // 100M units (~10B notional at $100 price)
     println!("6. Executing trade: user buys {} from LP...", trade_size);
 
+    // PERC-199: TradeNoCpi uses Clock::get() syscall — clock sysvar removed
+    // from accounts. Account layout: [user, lp, slab, oracle]
     let ix = Instruction {
         program_id,
         accounts: vec![
             AccountMeta::new(user.pubkey(), true),
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(slab, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_trade(0, 1, trade_size),
