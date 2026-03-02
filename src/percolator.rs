@@ -5358,6 +5358,8 @@ pub mod processor {
         }
     }
 
+    /// PERC-328: #[inline(never)] prevents slab-shape locals from merging
+    /// into the caller's 4 KiB SBF frame.
     #[inline(never)]
     fn slab_guard(
         program_id: &Pubkey,
@@ -5766,6 +5768,8 @@ pub mod processor {
         Ok(())
     }
 
+    /// PERC-328: #[inline(never)] keeps Account::unpack (165 B) in its own
+    /// 4 KiB SBF frame, preventing stack overflow in process_init_market.
     #[inline(never)]
     fn verify_vault(
         a_vault: &AccountInfo,
@@ -6096,6 +6100,29 @@ pub mod processor {
         Ok(())
     }
 
+    /// PERC-328: Reject already-initialized slabs in its own frame.
+    /// Keeps the 104-byte SlabHeader off the caller's stack.
+    #[inline(never)]
+    fn reject_if_initialized(data: &[u8]) -> ProgramResult {
+        let header = state::read_header(data);
+        if header.magic == MAGIC {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        Ok(())
+    }
+
+    /// PERC-328: PDA derivation in its own frame.
+    /// `Pubkey::find_program_address` hashes SHA-256 in a loop; under LTO the
+    /// ~200 B hash state can be inlined into the caller, contributing to frame
+    /// overflow. Isolating it prevents that.
+    #[inline(never)]
+    fn derive_vault_authority_isolated(
+        program_id: &Pubkey,
+        slab_key: &Pubkey,
+    ) -> (Pubkey, u8) {
+        accounts::derive_vault_authority(program_id, slab_key)
+    }
+
     /// PERC-328 / PERC-331: InitMarket handler — stack-split architecture.
     ///
     /// SBF enforces a hard 4 KiB per-frame stack limit. The original monolithic
@@ -6185,12 +6212,13 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         let _ = zc::engine_mut(&mut data)?;
 
-        let header = state::read_header(&data);
-        if header.magic == MAGIC {
-            return Err(PercolatorError::AlreadyInitialized.into());
-        }
+        // PERC-328: check magic in its own frame to keep 104-byte SlabHeader
+        // off process_init_market's stack.
+        reject_if_initialized(&data)?;
 
-        let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+        // PERC-328: PDA derivation in its own frame — find_program_address
+        // allocates SHA-256 state (~200 B) that LTO can inline into the caller.
+        let (auth, bump) = derive_vault_authority_isolated(program_id, a_slab.key);
         verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
 
         // PERC-328: Isolated SPL Account::unpack in its own frame
