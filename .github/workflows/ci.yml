@@ -62,11 +62,15 @@ jobs:
   kani:
     name: Kani Proofs
     runs-on: ubuntu-latest
+    # Slow harnesses (nightly_* prefix) are excluded here and run in nightly.yml.
+    # The most expensive harness (nightly_fee_monotone_in_bps) took 2h29m+ and
+    # previously caused this job to hit the 3h wall. PR CI now runs only
+    # harnesses prefixed with `kani_` (fast proofs, each <30 min).
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Run Kani proofs
+      - name: Run Kani proofs (PR — fast harnesses only)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
-          args: --tests --output-format terse --jobs 4
+          args: --tests --output-format terse --jobs 4 --harness kani_
         timeout-minutes: 175

@@ -4621,8 +4621,12 @@ fn kani_fee_monotone_in_notional() {
 }
 
 /// Prove: fee is monotone in fee_bps (higher rate → higher fee).
+/// NOTE: Moved to nightly CI — this proof takes ~2.5h+ (SAT search over all
+/// (notional, bps1, bps2) triples with symbolic division). Tagged `nightly_`
+/// so ci.yml PR filter `--harness kani_` skips it; nightly.yml runs it with
+/// a 5h timeout via `--harness nightly_`.
 #[kani::proof]
-fn kani_fee_monotone_in_bps() {
+fn nightly_fee_monotone_in_bps() {
     let notional: u128 = kani::any();
     let bps1: u64 = kani::any();
     let bps2: u64 = kani::any();
