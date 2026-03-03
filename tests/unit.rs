@@ -4341,7 +4341,11 @@ fn test_lp_vault_fee_crank() {
     // Run fee crank
     {
         let data = encode_lp_vault_crank_fees();
-        let accounts = vec![f.slab.to_info(), lp_vault_state_acct.to_info()];
+        let accounts = vec![
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            f.clock.to_info(),
+        ];
         process_instruction(&program_id, &accounts, &data).unwrap();
     }
 
@@ -4405,7 +4409,11 @@ fn test_lp_vault_crank_no_new_fees_rejected() {
     // Try crank with no new fees
     {
         let data = encode_lp_vault_crank_fees();
-        let accounts = vec![f.slab.to_info(), lp_vault_state_acct.to_info()];
+        let accounts = vec![
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            f.clock.to_info(),
+        ];
         let result = process_instruction(&program_id, &accounts, &data);
         assert!(result.is_err()); // Should fail: no new fees
     }
@@ -4507,7 +4515,11 @@ fn test_lp_vault_proportional_shares() {
     // Crank fees: 50% of 100_000 = 50_000 goes to LP vault
     {
         let data = encode_lp_vault_crank_fees();
-        let accounts = vec![f.slab.to_info(), lp_vault_state_acct.to_info()];
+        let accounts = vec![
+            f.slab.to_info(),
+            lp_vault_state_acct.to_info(),
+            f.clock.to_info(),
+        ];
         process_instruction(&program_id, &accounts, &data).unwrap();
     }
 
@@ -4842,7 +4854,11 @@ fn encode_update_mark_price() -> Vec<u8> {
 
 /// Encode SetPythOracle instruction (Tag 32).
 /// Switches market to Pyth-pinned mode (oracle_authority = [0;32]).
-fn encode_set_pyth_oracle(feed_id: &[u8; 32], max_staleness_secs: u64, conf_filter_bps: u16) -> Vec<u8> {
+fn encode_set_pyth_oracle(
+    feed_id: &[u8; 32],
+    max_staleness_secs: u64,
+    conf_filter_bps: u16,
+) -> Vec<u8> {
     let mut data = vec![percolator_prog::tags::TAG_SET_PYTH_ORACLE];
     data.extend_from_slice(feed_id);
     data.extend_from_slice(&max_staleness_secs.to_le_bytes());
@@ -4873,7 +4889,10 @@ fn setup_pyth_pinned_market() -> MarketFixture {
     }
     // Confirm Pyth-pinned mode: oracle_authority == [0;32], index_feed_id != [0;32]
     let config = state::read_config(&f.slab.data);
-    assert!(!oracle::is_hyperp_mode(&config), "Should NOT be Hyperp mode");
+    assert!(
+        !oracle::is_hyperp_mode(&config),
+        "Should NOT be Hyperp mode"
+    );
     assert!(
         percolator_prog::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id),
         "Should be Pyth-pinned mode"
@@ -4888,27 +4907,32 @@ fn test_update_mark_price_bootstrap_from_pyth() {
 
     // Verify initial state: authority_price_e6 == 0 (no cached mark yet)
     let config_before = state::read_config(&f.slab.data);
-    assert_eq!(config_before.authority_price_e6, 0, "Initial mark should be 0");
+    assert_eq!(
+        config_before.authority_price_e6, 0,
+        "Initial mark should be 0"
+    );
 
     // UpdateMarkPrice with valid Pyth account
     // Clock slot must be > MIN_PYTH_MARK_UPDATE_INTERVAL_SLOTS (5) from engine.current_slot (0)
     f.clock.data = make_clock(200, 200);
 
-    let accounts = [
-        f.slab.to_info(),
-        f.pyth_index.to_info(),
-        f.clock.to_info(),
-    ];
+    let accounts = [f.slab.to_info(), f.pyth_index.to_info(), f.clock.to_info()];
     let res = process_instruction(&f.program_id, &accounts, &encode_update_mark_price());
-    assert!(res.is_ok(), "UpdateMarkPrice bootstrap should succeed: {:?}", res);
+    assert!(
+        res.is_ok(),
+        "UpdateMarkPrice bootstrap should succeed: {:?}",
+        res
+    );
 
     // Verify mark price was set from Pyth (bootstrap: ema returns oracle directly when prev==0)
     let config_after = state::read_config(&f.slab.data);
     // Pyth data: price=100_000_000, expo=-6 → e6 price = 100_000_000
-    assert_ne!(config_after.authority_price_e6, 0, "Mark price should be set after bootstrap");
+    assert_ne!(
+        config_after.authority_price_e6, 0,
+        "Mark price should be set after bootstrap"
+    );
     assert_eq!(
-        config_after.authority_price_e6,
-        100_000_000,
+        config_after.authority_price_e6, 100_000_000,
         "Bootstrap mark should equal Pyth price (no EMA when prev==0)"
     );
 }
@@ -4980,10 +5004,7 @@ fn test_update_mark_price_rejects_hyperp_market() {
     f.clock.data = make_clock(200, 200);
     let accounts = [f.slab.to_info(), f.pyth_index.to_info(), f.clock.to_info()];
     let res = process_instruction(&f.program_id, &accounts, &encode_update_mark_price());
-    assert!(
-        res.is_err(),
-        "UpdateMarkPrice should reject Hyperp market"
-    );
+    assert!(res.is_err(), "UpdateMarkPrice should reject Hyperp market");
     assert_eq!(
         res.unwrap_err(),
         ProgramError::InvalidAccountData,
@@ -5017,7 +5038,10 @@ fn test_update_mark_price_skips_same_slot() {
     // The call must succeed (already verified above).
 
     // Verify the mark was bootstrapped correctly
-    assert_ne!(mark_after_bootstrap, 0, "Mark should be set after bootstrap");
+    assert_ne!(
+        mark_after_bootstrap, 0,
+        "Mark should be set after bootstrap"
+    );
 }
 
 /// Test: UpdateMarkPrice rejects if Pyth oracle account is not owned by Pyth program.
@@ -5055,10 +5079,7 @@ fn test_update_mark_price_rejects_paused_market() {
     f.clock.data = make_clock(200, 200);
     let accounts = [f.slab.to_info(), f.pyth_index.to_info(), f.clock.to_info()];
     let res = process_instruction(&f.program_id, &accounts, &encode_update_mark_price());
-    assert!(
-        res.is_err(),
-        "UpdateMarkPrice should reject paused market"
-    );
+    assert!(res.is_err(), "UpdateMarkPrice should reject paused market");
 }
 
 /// Test: SetPythOracle switches an admin-oracle market to Pyth-pinned mode.
@@ -5113,14 +5134,15 @@ fn test_set_pyth_oracle_then_update_mark_price() {
     f.clock.data = make_clock(200, 300);
     let accounts = [f.slab.to_info(), f.pyth_index.to_info(), f.clock.to_info()];
     let res = process_instruction(&f.program_id, &accounts, &encode_update_mark_price());
-    assert!(res.is_ok(), "UpdateMarkPrice should succeed after SetPythOracle: {:?}", res);
+    assert!(
+        res.is_ok(),
+        "UpdateMarkPrice should succeed after SetPythOracle: {:?}",
+        res
+    );
 
     let config_after = state::read_config(&f.slab.data);
     assert_ne!(
-        config_after.authority_price_e6,
-        0,
+        config_after.authority_price_e6, 0,
         "Mark price should be set after UpdateMarkPrice"
     );
 }
-
-

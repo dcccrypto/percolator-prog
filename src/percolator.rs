@@ -9193,7 +9193,10 @@ pub mod processor {
 
                 // Only Pyth-pinned markets can use this instruction.
                 // Pyth-pinned: oracle_authority == [0;32] AND index_feed_id != [0;32].
-                if !crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id) {
+                if !crate::verify::is_pyth_pinned_mode(
+                    config.oracle_authority,
+                    config.index_feed_id,
+                ) {
                     msg!("UpdateMarkPrice: not a Pyth-pinned market");
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -9991,8 +9994,10 @@ pub mod processor {
                 // Permissionless crank: distribute accrued fee revenue to LP vault.
                 // Reads fee_revenue delta since last snapshot, credits LP portion.
                 // PERC-304: If util curve enabled, applies utilization-based fee multiplier.
-                // Accounts: [slab(writable), lp_vault_state(writable)]
-                accounts::expect_len(accounts, 2)?;
+                // Accounts: [slab(writable), lp_vault_state(writable), clock(optional)]
+                if accounts.len() < 2 {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
                 let a_slab = &accounts[0];
                 let a_lp_vault_state = &accounts[1];
 
@@ -10083,8 +10088,14 @@ pub mod processor {
 
                 // Update snapshot and last crank slot
                 vault_state.last_fee_snapshot = current_fee_revenue;
-                let clock = Clock::get()?;
-                vault_state.last_crank_slot = clock.slot;
+                // Read clock: prefer explicit account (index 2) for testability,
+                // fall back to Clock::get() syscall for backward compatibility.
+                let clock_slot = if accounts.len() > 2 {
+                    Clock::from_account_info(&accounts[2])?.slot
+                } else {
+                    Clock::get()?.slot
+                };
+                vault_state.last_crank_slot = clock_slot;
                 drop(slab_data);
 
                 crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
@@ -10095,7 +10106,7 @@ pub mod processor {
                     fee_mult_bps,
                     lp_portion,
                     vault_state.total_capital,
-                    clock.slot
+                    clock_slot
                 );
             }
             // ========================================
