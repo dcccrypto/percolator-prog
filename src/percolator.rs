@@ -48,9 +48,9 @@ pub mod constants {
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
     // Native (u128 align=16): 512; SBF (u128 align=8): 496
     #[cfg(target_arch = "bpf")]
-    const _: [(); 496] = [(); CONFIG_LEN];
+    const _: [(); 504] = [(); CONFIG_LEN];
     #[cfg(not(target_arch = "bpf"))]
-    const _: [(); 512] = [(); CONFIG_LEN];
+    const _: [(); 528] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -1915,6 +1915,10 @@ pub mod ix {
             adaptive_funding_enabled: Option<u8>,
             adaptive_scale_bps: Option<u16>,
             adaptive_max_funding_bps: Option<u64>,
+            /// PERC-118: Mark price blend weight (oracle %).
+            /// 10_000 = 100% oracle. 7_000 = 70% oracle + 30% TWAP.
+            /// None = don't change (backwards compatible).
+            mark_oracle_weight_bps: Option<u16>,
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
@@ -2347,6 +2351,12 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // PERC-118: Optional mark blend weight
+                    let mark_oracle_weight_bps = if rest.len() >= 2 {
+                        Some(read_u16(&mut rest)?)
+                    } else {
+                        None
+                    };
                     Ok(Instruction::UpdateRiskParams {
                         initial_margin_bps,
                         maintenance_margin_bps,
@@ -2358,6 +2368,7 @@ pub mod ix {
                         adaptive_funding_enabled,
                         adaptive_scale_bps,
                         adaptive_max_funding_bps,
+                        mark_oracle_weight_bps,
                     })
                 }
                 TAG_RENOUNCE_ADMIN => {
@@ -2904,7 +2915,13 @@ pub mod state {
         /// E.g., 1000 = 10% of global fund.
         pub insurance_isolation_bps: u16,
 
-        /// Padding for alignment after u16
+        /// Padding / reserved bytes (PERC-306 layout preservation).
+        ///
+        /// PERC-118: bytes [0..2] are interpreted as `mark_oracle_weight_bps: u16 LE`
+        /// (oracle weight for the Hyperp EMA blend, 0..=10_000 bps).
+        /// 0 (default) = 100% impact_mid — backward-compatible with existing markets.
+        /// Read/write via `state::get_mark_oracle_weight_bps` /
+        /// `state::set_mark_oracle_weight_bps` to avoid struct layout changes.
         pub _insurance_isolation_padding: [u8; 14],
 
         // ========================================
@@ -2959,6 +2976,17 @@ pub mod state {
         pub _lp_col_pad: [u8; 7],
         /// Loan-to-value ratio in basis points for LP tokens (e.g., 8000 = 80%).
         pub lp_collateral_ltv_bps: u64,
+
+        // ========================================
+        // Mark Price Blend (PERC-118)
+        // ========================================
+        /// Oracle weight in basis points for blended mark price.
+        /// 10_000 = 100% oracle (legacy, no TWAP blend).
+        /// 7_000 = 70% oracle + 30% trade TWAP.
+        /// 0 = 100% trade TWAP (not recommended).
+        /// Default: 10_000 (backwards compatible — pure oracle mark).
+        pub mark_oracle_weight_bps: u16,
+        pub _mark_weight_pad: [u8; 14],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -3102,6 +3130,29 @@ pub mod state {
     pub fn write_config_bytes(data: &mut [u8], field_offset: usize, bytes: &[u8]) {
         let start = HEADER_LEN + field_offset;
         data[start..start + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// PERC-118: Read the mark oracle weight from the `_insurance_isolation_padding` bytes.
+    ///
+    /// The weight is stored at padding bytes [0..2] as a little-endian u16.
+    /// 0 = 100% impact_mid (backward-compatible default for existing markets).
+    /// 10_000 = 100% oracle.
+    #[inline]
+    pub fn get_mark_oracle_weight_bps(config: &MarketConfig) -> u16 {
+        u16::from_le_bytes([
+            config._insurance_isolation_padding[0],
+            config._insurance_isolation_padding[1],
+        ])
+    }
+
+    /// PERC-118: Write the mark oracle weight into the `_insurance_isolation_padding` bytes.
+    /// Clamps the value to [0, 10_000] before storing.
+    #[inline]
+    pub fn set_mark_oracle_weight_bps(config: &mut MarketConfig, weight_bps: u16) {
+        let clamped = weight_bps.min(10_000);
+        let bytes = clamped.to_le_bytes();
+        config._insurance_isolation_padding[0] = bytes[0];
+        config._insurance_isolation_padding[1] = bytes[1];
     }
 }
 
@@ -4350,6 +4401,35 @@ pub mod oracle {
 
         // Non-Hyperp: existing behavior (authority -> Pyth/Chainlink) + circuit breaker
         read_price_clamped(config, a_oracle, now_unix_ts, remaining_accounts)
+    }
+
+    /// Compute the Hyperp EMA blend mark price input (PERC-118).
+    ///
+    /// Blends a stable oracle price with a real-time impact mid price using a
+    /// configurable oracle weight:
+    ///
+    /// ```text
+    /// blend = (oracle_weight * oracle_e6 + (10_000 - oracle_weight) * impact_mid_e6) / 10_000
+    /// ```
+    ///
+    /// The blend is then fed into `compute_ema_mark_price` as the target price,
+    /// creating a mark that:
+    /// - Tracks real-time market movements (impact_mid component)
+    /// - Stays anchored to the oracle reference (oracle component)
+    /// - Enables non-zero mark premium when impact_mid diverges from oracle
+    ///
+    /// # Arguments
+    /// - `oracle_e6`: Reference oracle price (e.g., last_effective_price_e6 for Hyperp markets).
+    ///   If zero, returns `impact_mid_e6` directly (unblended).
+    /// - `impact_mid_e6`: Real-time market price (e.g., DEX pool spot price).
+    /// - `oracle_weight_bps`: Oracle weight in basis points (0..=10_000).
+    ///   0 = 100% impact_mid (backward-compatible, no blend).
+    ///   10_000 = 100% oracle (mark anchored to oracle, premium always 0).
+    ///
+    /// # Returns
+    /// Blended price in e6 units, saturating at u64::MAX.
+    pub fn compute_blend_mark_price(oracle_e6: u64, impact_mid_e6: u64, oracle_weight_bps: u16) -> u64 {
+        percolator::RiskEngine::compute_blended_mark_price(oracle_e6, impact_mid_e6, oracle_weight_bps as u64)
     }
 
     /// Compute premium-based funding rate (Hyperp funding model).
@@ -6873,8 +6953,17 @@ pub mod processor {
                     )
                 };
 
-                // PERC-121: Sync mark price into engine for premium funding
-                engine.mark_price_e6 = config.authority_price_e6;
+                // PERC-118: Blended mark price (oracle + trade TWAP).
+                // When mark_oracle_weight_bps == 0 (default/legacy), use
+                // pure oracle (10000 weight). Otherwise blend with trade TWAP.
+                {
+                    let w = if config.mark_oracle_weight_bps == 0 {
+                        10_000u64 // backwards compatible: treat 0 as "not configured" = 100% oracle
+                    } else {
+                        config.mark_oracle_weight_bps as u64
+                    };
+                    engine.set_mark_price_blended(config.authority_price_e6, w);
+                }
 
                 // PERC-121: Blend inventory + premium funding rates
                 let blended_funding_rate = if config.funding_premium_weight_bps > 0 {
@@ -8245,6 +8334,7 @@ pub mod processor {
                 adaptive_funding_enabled,
                 adaptive_scale_bps,
                 adaptive_max_funding_bps,
+                mark_oracle_weight_bps,
             } => {
                 // Update margin + fee parameters. Admin only.
                 // Accounts: [admin(signer), slab(writable)]
@@ -8298,6 +8388,7 @@ pub mod processor {
                     || adaptive_funding_enabled.is_some()
                     || adaptive_scale_bps.is_some()
                     || adaptive_max_funding_bps.is_some()
+                    || mark_oracle_weight_bps.is_some()
                 {
                     let mut config = state::read_config(&data);
                     if let Some(oi_cap) = oi_cap_multiplier_bps {
@@ -8328,6 +8419,13 @@ pub mod processor {
                     }
                     if let Some(max_bps) = adaptive_max_funding_bps {
                         config.adaptive_max_funding_bps = max_bps;
+                    }
+                    // PERC-118: Mark blend weight
+                    if let Some(w) = mark_oracle_weight_bps {
+                        if w > 10_000 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
+                        config.mark_oracle_weight_bps = w;
                     }
                     state::write_config(&mut data, &config);
                     let (mult, skew) = unpack_oi_cap(config.oi_cap_multiplier_bps);
@@ -9378,31 +9476,73 @@ pub mod processor {
 
                 let dex_price = dex_result.price_e6;
 
+                // PERC-118: Hyperp EMA Blend — compute blend input from oracle + impact_mid.
+                //
+                // oracle      = last_effective_price_e6 (the rate-limited index price that
+                //               lags behind the mark — stable reference component).
+                // impact_mid  = dex_price (real-time DEX pool spot price).
+                //
+                // blend = (oracle_weight * oracle + (10_000 - oracle_weight) * impact_mid) / 10_000
+                //
+                // When mark_oracle_weight_bps == 0 (default / existing markets), blend == dex_price
+                // (fully backward-compatible — pure DEX price tracking as before).
+                //
+                // When mark_oracle_weight_bps > 0, the blend anchors the mark toward the stable
+                // oracle component, creating a non-trivial mark_premium that can drive funding.
+                //
+                // Use prev_mark as oracle fallback if last_effective_price_e6 is not yet seeded.
+                let prev_mark = config.authority_price_e6;
+                let oracle_for_blend = if config.last_effective_price_e6 > 0 {
+                    config.last_effective_price_e6
+                } else {
+                    prev_mark
+                };
+                let oracle_weight_bps = state::get_mark_oracle_weight_bps(&config);
+                let blend_input = oracle::compute_blend_mark_price(
+                    oracle_for_blend,
+                    dex_price,
+                    oracle_weight_bps,
+                );
+
                 // SECURITY (#297 Fix 2): Circuit breaker BEFORE EMA update.
-                // The DEX spot price must be clamped before it propagates into the EMA.
+                // The blended input price must be clamped before it propagates into the EMA.
                 // Enforce a minimum cap — even if admin set oracle_price_cap_e2bps to 0,
                 // Hyperp markets always use at least DEFAULT_HYPERP_PRICE_CAP_E2BPS.
-                let prev_mark = config.authority_price_e6;
                 let effective_cap = core::cmp::max(
                     config.oracle_price_cap_e2bps,
                     crate::constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
                 );
                 let new_mark = oracle::compute_ema_mark_price(
                     prev_mark,
-                    dex_price,
+                    blend_input,
                     dt_slots,
                     crate::constants::MARK_PRICE_EMA_ALPHA_E6,
                     effective_cap,
                 );
 
+                // Update last_effective_price_e6 toward new_mark (rate-limited).
+                // This keeps the oracle-for-blend current so subsequent UpdateHyperpMark
+                // calls have a fresh reference, and PERC-119 can compute mark_premium from it.
+                let new_index = oracle::clamp_toward_with_dt(
+                    oracle_for_blend.max(1),
+                    new_mark,
+                    effective_cap,
+                    dt_slots,
+                );
+
                 config.authority_price_e6 = new_mark;
+                config.last_effective_price_e6 = new_index;
                 state::write_config(&mut data, &config);
 
                 msg!(
-                    "UpdateHyperpMark: dex_price={} prev_mark={} new_mark={} dt={}",
+                    "UpdateHyperpMark: dex_price={} oracle={} blend={} prev_mark={} new_mark={} index={} weight_bps={} dt={}",
                     dex_price,
+                    oracle_for_blend,
+                    blend_input,
                     prev_mark,
                     new_mark,
+                    new_index,
+                    oracle_weight_bps,
                     dt_slots
                 );
             }
