@@ -4517,7 +4517,7 @@ fn kani_cb_recovery_distance_decreases() {
 
 /// Sub-proof (c2): At equilibrium (prev == oracle), distance stays zero.
 #[kani::proof]
-fn kani_cb_recovery_equilibrium_stable() {
+fn nightly_cb_recovery_equilibrium_stable() {
     let price: u64 = kani::any();
     kani::assume(price > 0 && price <= 1_000_000_000);
 
@@ -4591,7 +4591,7 @@ fn kani_fee_zero_iff_zero_input() {
 
 /// Prove: fee does not exceed notional (fee <= 100% of trade value).
 #[kani::proof]
-fn kani_fee_bounded_by_notional() {
+fn nightly_fee_bounded_by_notional() {
     let notional: u128 = kani::any();
     let fee_bps: u64 = kani::any();
     kani::assume(notional <= u64::MAX as u128);
