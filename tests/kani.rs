@@ -4605,8 +4605,11 @@ fn kani_fee_bounded_by_notional() {
 }
 
 /// Prove: fee is monotone in notional (larger trade → larger fee).
+/// NOTE: Moved to nightly CI — this proof times out in PR CI (175-min ceiling).
+/// Tagged `nightly_` so ci.yml PR filter `--harness kani_` skips it;
+/// nightly.yml runs it with a 5h timeout via `--harness nightly_`.
 #[kani::proof]
-fn kani_fee_monotone_in_notional() {
+fn nightly_fee_monotone_in_notional() {
     let n1: u128 = kani::any();
     let n2: u128 = kani::any();
     let fee_bps: u64 = kani::any();
