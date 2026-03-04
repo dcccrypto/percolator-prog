@@ -10,6 +10,9 @@ on:
     - cron: "0 2 * * *"   # 02:00 UTC every day
   workflow_dispatch:       # manual trigger from Actions tab
 
+permissions:
+  contents: read
+
 concurrency:
   group: nightly-kani
   cancel-in-progress: false  # Never cancel nightly; let it finish
