@@ -67,11 +67,16 @@ jobs:
     # previously caused this job to hit the 3h wall. PR CI excludes only
     # nightly_* harnesses; all kani_*, proof_*, and inductive_* harnesses
     # (225 + 41 + 1 = 267 total) run here — each expected <30 min.
+    #
+    # Note: --harness takes a single Rust regex. Using alternation ("a|b|c")
+    # inside a quoted YAML value can cause shell pipe interpretation when the
+    # action expands args. Use separate --harness flags instead — one per
+    # prefix — which are OR'd together by Kani and avoids the pipe issue.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run Kani proofs (PR — all fast harnesses, exclude nightly_*)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
-          args: --tests --output-format terse --jobs 4 --harness "kani_.*|proof_.*|inductive_.*"
+          args: --tests --output-format terse --jobs 4 --harness kani_.* --harness proof_.* --harness inductive_.*
         timeout-minutes: 175
