@@ -4537,8 +4537,11 @@ fn kani_cb_recovery_equilibrium_stable() {
 
 /// Prove: ceiling fee >= floor fee for all inputs.
 /// Protocol always rounds UP (in its own favour).
+/// NOTE: Moved to nightly CI — SAT search over all (notional, bps) pairs with
+/// two division calls times out at ~175 min in PR CI. Tagged `nightly_` so
+/// ci.yml `--harness kani_` skips it; nightly.yml runs it with a 5h timeout.
 #[kani::proof]
-fn kani_fee_ceil_geq_floor() {
+fn nightly_fee_ceil_geq_floor() {
     let notional: u128 = kani::any();
     let fee_bps: u64 = kani::any();
     kani::assume(notional <= u64::MAX as u128);
