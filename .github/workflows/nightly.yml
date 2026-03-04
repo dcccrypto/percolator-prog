@@ -3,7 +3,7 @@ name: Nightly Kani (Slow Proofs)
 # Runs expensive Kani harnesses that are too slow for PR CI.
 # Triggered nightly at 02:00 UTC and on manual dispatch.
 # Harnesses prefixed with `nightly_` live in tests/kani.rs and are excluded
-# from ci.yml (which runs only `kani_` prefixed harnesses).
+# from ci.yml (which runs kani_*, proof_*, and inductive_* harnesses).
 
 on:
   schedule:
