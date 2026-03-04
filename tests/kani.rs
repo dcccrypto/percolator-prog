@@ -5083,9 +5083,11 @@ fn proof_oi_cap_no_overflow() {
 
 /// PERC-302: Prove ramp multiplier never exceeds configured oi_cap_multiplier_bps.
 /// For all valid inputs: compute_ramp_multiplier(…) <= oi_cap_multiplier_bps.
+/// NOTE: SAT-hard (symbolic division in compute_ramp_multiplier). Tagged `nightly_` so
+/// ci.yml `--harness proof_` skips it; nightly.yml runs it with a 5h timeout.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_ramp_never_exceeds_configured_multiplier() {
+fn nightly_ramp_never_exceeds_configured_multiplier() {
     use percolator_prog::constants::RAMP_START_BPS;
     use percolator_prog::verify::compute_ramp_multiplier;
 
@@ -5131,9 +5133,11 @@ fn proof_ramp_never_exceeds_configured_multiplier() {
 }
 
 /// PERC-302: Prove ramp produces monotonically increasing multiplier as slots advance.
+/// NOTE: SAT-hard (symbolic division in compute_ramp_multiplier). Tagged `nightly_` so
+/// ci.yml `--harness proof_` skips it; nightly.yml runs it with a 5h timeout.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_ramp_monotonically_increases() {
+fn nightly_ramp_monotonically_increases() {
     use percolator_prog::verify::compute_ramp_multiplier;
 
     let oi_cap: u64 = kani::any();
@@ -5367,8 +5371,10 @@ fn proof_ring_buffer_wraps() {
 /// Formula: effective = base * (10_000 - capped_reduction) / 10_000
 /// where capped_reduction = min(skew * skew_factor / total_oi, skew_factor)
 /// Since capped_reduction >= 0, effective <= base always holds.
+/// NOTE: SAT-hard (u128 division with symbolic inputs). Tagged `nightly_` so
+/// ci.yml `--harness proof_` skips it; nightly.yml runs it with a 5h timeout.
 #[kani::proof]
-fn proof_skew_adjusted_cap_never_exceeds_base_cap() {
+fn nightly_skew_adjusted_cap_never_exceeds_base_cap() {
     use percolator_prog::processor::{pack_oi_cap, unpack_oi_cap};
 
     // Symbolic inputs
