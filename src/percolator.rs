@@ -2695,7 +2695,7 @@ pub mod ix {
         fn urp_bytes(rest: &[u8]) -> Vec<u8> {
             let mut v = vec![crate::tags::TAG_UPDATE_RISK_PARAMS];
             v.extend_from_slice(&100u64.to_le_bytes()); // initial_margin_bps
-            v.extend_from_slice(&50u64.to_le_bytes());  // maintenance_margin_bps
+            v.extend_from_slice(&50u64.to_le_bytes()); // maintenance_margin_bps
             v.extend_from_slice(rest);
             v
         }
@@ -2768,10 +2768,12 @@ pub mod ix {
         fn test_urp_all_u64s_plus_full_adaptive_tail_ok() {
             // rest = 5×u64(40) + adaptive_tail(11) = 51 → after greedy reads residual=11 ✓
             let mut rest = Vec::new();
-            for _ in 0..5 { rest.extend_from_slice(&1u64.to_le_bytes()); } // 5 optional u64s
-            rest.push(0x01);                                                 // adaptive_enabled
-            rest.extend_from_slice(&500u16.to_le_bytes());                   // adaptive_scale
-            rest.extend_from_slice(&100u64.to_le_bytes());                   // adaptive_max
+            for _ in 0..5 {
+                rest.extend_from_slice(&1u64.to_le_bytes());
+            } // 5 optional u64s
+            rest.push(0x01); // adaptive_enabled
+            rest.extend_from_slice(&500u16.to_le_bytes()); // adaptive_scale
+            rest.extend_from_slice(&100u64.to_le_bytes()); // adaptive_max
             assert_eq!(rest.len(), 51);
             let data = urp_bytes(&rest);
             assert!(Instruction::decode(&data).is_ok());
@@ -2782,11 +2784,13 @@ pub mod ix {
             // rest = 5×u64(40) + adaptive_tail(11) + mark_oracle_weight(2) = 53
             // after greedy reads residual = 13 ∈ {0,1,3,11,13} ✓
             let mut rest = Vec::new();
-            for _ in 0..5 { rest.extend_from_slice(&1u64.to_le_bytes()); }  // 5 optional u64s
-            rest.push(0x01);                                                  // adaptive_enabled
-            rest.extend_from_slice(&500u16.to_le_bytes());                    // adaptive_scale
-            rest.extend_from_slice(&100u64.to_le_bytes());                    // adaptive_max
-            rest.extend_from_slice(&7_000u16.to_le_bytes());                  // mark weight 70%
+            for _ in 0..5 {
+                rest.extend_from_slice(&1u64.to_le_bytes());
+            } // 5 optional u64s
+            rest.push(0x01); // adaptive_enabled
+            rest.extend_from_slice(&500u16.to_le_bytes()); // adaptive_scale
+            rest.extend_from_slice(&100u64.to_le_bytes()); // adaptive_max
+            rest.extend_from_slice(&7_000u16.to_le_bytes()); // mark weight 70%
             assert_eq!(rest.len(), 53);
             let data = urp_bytes(&rest);
             match Instruction::decode(&data).expect("full payload should decode") {
