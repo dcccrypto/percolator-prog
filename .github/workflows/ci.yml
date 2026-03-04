@@ -68,16 +68,17 @@ jobs:
     # nightly_* harnesses; all kani_*, proof_*, and inductive_* harnesses
     # (225 + 41 + 1 = 267 total) run here — each expected <30 min.
     #
-    # Harness path: tests/kani.rs compiles as a test crate named "kani", so
-    # Kani's full harness path is "kani::<fn_name>". The --harness regex is a
-    # FULL-STRING match against that path. Patterns must start with ".*" to
-    # match the module prefix before the function-name prefix.
-    # E.g. ".*kani_.*" matches "kani::kani_matcher_rejects_wrong_abi_version".
+    # --harness filter: kani_metadata find_proof_harnesses() uses SUBSTRING
+    # matching (not regex). The filter "kani_" matches any harness whose
+    # pretty_name contains "kani_" as a substring — this includes both the
+    # bare function name (kani_foo) and the qualified path (kani::kani_foo).
+    # "nightly_" harnesses do NOT contain "kani_" in their name and are skipped.
+    # "proof_" and "inductive_" filters similarly cover remaining fast harnesses.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run Kani proofs (PR — all fast harnesses, exclude nightly_*)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
-          args: --tests --output-format terse --jobs 4 --harness .*kani_.* --harness .*proof_.* --harness .*inductive_.*
+          args: --tests --output-format terse --jobs 4 --harness kani_ --harness proof_ --harness inductive_
         timeout-minutes: 175
