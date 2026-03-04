@@ -2335,6 +2335,21 @@ pub mod ix {
                     } else {
                         None
                     };
+                    // PERC-649: Strict tail-length guard.
+                    // After the five optional u64 fields the only valid remaining
+                    // byte-counts are:
+                    //   0  — no adaptive or mark params
+                    //   1  — adaptive_funding_enabled only          (u8)
+                    //   3  — + adaptive_scale_bps                   (+u16)
+                    //  11  — + adaptive_max_funding_bps             (+u64)
+                    //  13  — + mark_oracle_weight_bps               (+u16)
+                    // Any other length (e.g. 2 — an isolated u16 that looks like
+                    // mark_oracle_weight_bps) would be mis-decoded as
+                    // adaptive_funding_enabled, silently corrupting state.
+                    const VALID_TAIL_LENS: &[usize] = &[0, 1, 3, 11, 13];
+                    if !VALID_TAIL_LENS.contains(&rest.len()) {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     // PERC-300: Optional adaptive funding params
                     let adaptive_funding_enabled = if !rest.is_empty() {
                         Some(read_u8(&mut rest)?)
@@ -2662,6 +2677,130 @@ pub mod ix {
             fee_split_creator_bps: 0,
             fee_utilization_surge_bps: 0,
         })
+    }
+
+    #[cfg(test)]
+    mod decode_tests {
+        use super::*;
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        /// Build an UpdateRiskParams instruction payload.
+        ///
+        /// Layout: TAG(1) | initial_margin_bps(8) | maintenance_margin_bps(8) | rest
+        ///
+        /// The `rest` slice is appended verbatim after the two required u64 fields.
+        /// NOTE: The PERC-649 guard checks `rest.len()` *after* greedy u64 reads,
+        /// so "rest" here must include optional u64 fields (8 bytes each) + adaptive tail.
+        fn urp_bytes(rest: &[u8]) -> Vec<u8> {
+            let mut v = vec![crate::tags::TAG_UPDATE_RISK_PARAMS];
+            v.extend_from_slice(&100u64.to_le_bytes()); // initial_margin_bps
+            v.extend_from_slice(&50u64.to_le_bytes());  // maintenance_margin_bps
+            v.extend_from_slice(rest);
+            v
+        }
+
+        // ── PERC-649: invalid tail lengths must be rejected ──────────────────────
+        // The greedy-u64 readers consume 8-byte chunks; the guard then checks the
+        // residual against {0, 1, 3, 11, 13}.
+
+        #[test]
+        fn test_urp_bug_2byte_tail_rejected() {
+            // THE BUG: a 2-byte payload intended for mark_oracle_weight_bps was
+            // previously silently mis-decoded as adaptive_funding_enabled.
+            // After the guard, residual = 2 ∉ {0,1,3,11,13} → Err.
+            let data = urp_bytes(&[0x70, 0x1B]); // 7_000u16 LE
+            assert_eq!(
+                Instruction::decode(&data).unwrap_err(),
+                solana_program::program_error::ProgramError::InvalidInstructionData,
+                "2-byte tail (mark_oracle_weight_bps-only) must be rejected (PERC-649)"
+            );
+        }
+
+        #[test]
+        fn test_urp_residual_4_rejected() {
+            // rest = 4 bytes: trading_fee_bps(8) would NOT be consumed (4 < 8),
+            // guard sees residual=4 ∉ {0,1,3,11,13} → Err.
+            let data = urp_bytes(&[0x01, 0x00, 0x00, 0x00]);
+            assert_eq!(
+                Instruction::decode(&data).unwrap_err(),
+                solana_program::program_error::ProgramError::InvalidInstructionData
+            );
+        }
+
+        #[test]
+        fn test_urp_residual_5_rejected() {
+            // rest = 12 bytes: trading_fee_bps(8) consumed → residual = 4 ∉ valid.
+            let data = urp_bytes(&[0u8; 12]);
+            assert_eq!(
+                Instruction::decode(&data).unwrap_err(),
+                solana_program::program_error::ProgramError::InvalidInstructionData
+            );
+        }
+
+        // ── PERC-649: valid payloads must decode without error ───────────────────
+        // residual = rest after all greedy u64 reads; must be in {0, 1, 3, 11, 13}.
+
+        #[test]
+        fn test_urp_required_only_ok() {
+            // rest = 0 → residual = 0 ∈ {0,1,3,11,13} ✓
+            let data = urp_bytes(&[]);
+            assert!(Instruction::decode(&data).is_ok());
+        }
+
+        #[test]
+        fn test_urp_adaptive_enabled_only_ok() {
+            // rest = 1 → residual = 1 ∈ {0,1,3,11,13} ✓
+            let data = urp_bytes(&[0x01]);
+            assert!(Instruction::decode(&data).is_ok());
+        }
+
+        #[test]
+        fn test_urp_adaptive_enabled_and_scale_ok() {
+            // rest = 3 → residual = 3 ∈ {0,1,3,11,13} ✓
+            let mut rest = vec![0x01];
+            rest.extend_from_slice(&500u16.to_le_bytes());
+            let data = urp_bytes(&rest);
+            assert!(Instruction::decode(&data).is_ok());
+        }
+
+        #[test]
+        fn test_urp_all_u64s_plus_full_adaptive_tail_ok() {
+            // rest = 5×u64(40) + adaptive_tail(11) = 51 → after greedy reads residual=11 ✓
+            let mut rest = Vec::new();
+            for _ in 0..5 { rest.extend_from_slice(&1u64.to_le_bytes()); } // 5 optional u64s
+            rest.push(0x01);                                                 // adaptive_enabled
+            rest.extend_from_slice(&500u16.to_le_bytes());                   // adaptive_scale
+            rest.extend_from_slice(&100u64.to_le_bytes());                   // adaptive_max
+            assert_eq!(rest.len(), 51);
+            let data = urp_bytes(&rest);
+            assert!(Instruction::decode(&data).is_ok());
+        }
+
+        #[test]
+        fn test_urp_full_payload_mark_oracle_weight_decoded() {
+            // rest = 5×u64(40) + adaptive_tail(11) + mark_oracle_weight(2) = 53
+            // after greedy reads residual = 13 ∈ {0,1,3,11,13} ✓
+            let mut rest = Vec::new();
+            for _ in 0..5 { rest.extend_from_slice(&1u64.to_le_bytes()); }  // 5 optional u64s
+            rest.push(0x01);                                                  // adaptive_enabled
+            rest.extend_from_slice(&500u16.to_le_bytes());                    // adaptive_scale
+            rest.extend_from_slice(&100u64.to_le_bytes());                    // adaptive_max
+            rest.extend_from_slice(&7_000u16.to_le_bytes());                  // mark weight 70%
+            assert_eq!(rest.len(), 53);
+            let data = urp_bytes(&rest);
+            match Instruction::decode(&data).expect("full payload should decode") {
+                Instruction::UpdateRiskParams {
+                    mark_oracle_weight_bps,
+                    adaptive_funding_enabled,
+                    ..
+                } => {
+                    assert_eq!(mark_oracle_weight_bps, Some(7_000), "mark weight");
+                    assert_eq!(adaptive_funding_enabled, Some(0x01), "adaptive enabled");
+                }
+                other => panic!("unexpected variant: {other:?}"),
+            }
+        }
     }
 }
 
