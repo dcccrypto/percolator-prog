@@ -63,10 +63,17 @@ jobs:
     name: Kani Proofs
     runs-on: ubuntu-latest
     # Slow harnesses (nightly_* prefix) are excluded here and run in nightly.yml.
-    # The most expensive harness (nightly_fee_monotone_in_bps) took 2h29m+ and
-    # previously caused this job to hit the 3h wall. PR CI excludes only
-    # nightly_* harnesses; all kani_*, proof_*, and inductive_* harnesses run
-    # here via separate --harness flags (substring match) — each expected <30 min.
+    # Currently excluded (renamed to nightly_*):
+    #   nightly_fee_monotone_in_bps                     (~2h29m — SAT-hard u128)
+    #   nightly_cb_recovery_equilibrium_stable          (~97m+ — SAT-hard CB proof)
+    #   nightly_cb_recovery_distance_decreases          (~slow CB convergence)
+    #   nightly_fee_bounded_by_notional                 (~29m — u128 SAT)
+    #   nightly_sandwich_full_cap_allows_double         (~slow OI cap proof)
+    #   nightly_ramp_never_exceeds_configured_multiplier (~slow ramp SAT)
+    #   nightly_ramp_monotonically_increases            (~slow ramp proof)
+    #   nightly_skew_adjusted_cap_never_exceeds_base_cap (~slow OI cap)
+    #   nightly_median_single_price                     (~2h45m — symbolic sort, 5-element array)
+    # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
