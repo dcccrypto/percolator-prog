@@ -5239,7 +5239,7 @@ fn proof_margin_always_requires_positive_collateral() {
 /// Prove: median is always within [min, max] of valid inputs.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_median_within_bounds() {
+fn nightly_proof_median_within_bounds() {
     use percolator_prog::verify::median_price;
 
     let a: u64 = kani::any();
