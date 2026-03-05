@@ -5237,9 +5237,11 @@ fn proof_margin_always_requires_positive_collateral() {
 // ============================================================================
 
 /// Prove: median is always within [min, max] of valid inputs.
+/// NOTE: Renamed to nightly_median_within_bounds (from nightly_proof_median_within_bounds) because
+/// the `proof_` substring was matched by the PR CI `--harness proof_` filter, causing timeout.
 #[cfg(kani)]
 #[kani::proof]
-fn nightly_proof_median_within_bounds() {
+fn nightly_median_within_bounds() {
     use percolator_prog::verify::median_price;
 
     let a: u64 = kani::any();
