@@ -4489,8 +4489,9 @@ fn kani_cb_trigger_disabled_when_cap_zero() {
 
 /// Sub-proof (c): Recovery — mark converges toward oracle after clamped EMA step.
 /// Distance must not increase when moving toward oracle.
+/// SAT-hard (4 symbolic u64 inputs through mul/div) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_cb_recovery_distance_decreases() {
+fn nightly_cb_recovery_distance_decreases() {
     let prev_mark: u64 = kani::any();
     let oracle: u64 = kani::any();
     let alpha_e6: u64 = kani::any();
@@ -4878,8 +4879,9 @@ fn kani_sandwich_zero_cap_no_movement() {
 }
 
 /// Prove: cap=1_000_000 (100%) allows any movement up to doubling.
+/// SAT-hard in practice (1255s observed in CI) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_sandwich_full_cap_allows_double() {
+fn nightly_sandwich_full_cap_allows_double() {
     let price: u64 = kani::any();
     kani::assume(price > 0 && price <= 500_000_000); // Keep sum < u64::MAX
 
