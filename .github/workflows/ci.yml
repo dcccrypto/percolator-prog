@@ -65,6 +65,8 @@ jobs:
     # Slow harnesses (nightly_* prefix) are excluded here and run in nightly.yml.
     # Currently excluded (renamed to nightly_*):
     #   nightly_fee_monotone_in_bps                     (~2h29m — SAT-hard u128)
+    #   nightly_fee_ceil_geq_floor                      (~slow fee SAT)
+    #   nightly_fee_monotone_in_notional                (~slow fee SAT)
     #   nightly_cb_recovery_equilibrium_stable          (~97m+ — SAT-hard CB proof)
     #   nightly_cb_recovery_distance_decreases          (~slow CB convergence)
     #   nightly_fee_bounded_by_notional                 (~29m — u128 SAT)
