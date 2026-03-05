@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - haircut-ratio engine (no padding)
-const SLAB_LEN: usize = 992560;
+const SLAB_LEN: usize = 1058152;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -256,6 +256,7 @@ fn test_account_struct_alignment() {
         owner: [0xCC; 32],
         fee_credits: I128::new(-999),
         last_fee_slot: 888888,
+        fees_earned_total: U128::new(0),
     };
 
     // Verify all fields round-trip correctly
@@ -371,7 +372,11 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
-                                                 // RiskParams
+    // Per-market admin limits (uncapped defaults for tests)
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps

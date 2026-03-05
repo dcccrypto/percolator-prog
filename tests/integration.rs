@@ -28,7 +28,7 @@ use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-const SLAB_LEN: usize = 992616; // MAX_ACCOUNTS=4096 + per-market admin limits
+const SLAB_LEN: usize = 1058152; // MAX_ACCOUNTS=4096 + per-market admin limits + fees_earned_total
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -1118,7 +1118,7 @@ impl TestEnv {
         // ENGINE_OFF = 440, accounts array at offset 9136 within RiskEngine
         // Account size = 240 bytes, capital at offset 8 within Account (after account_id u64)
         const ACCOUNTS_OFFSET: usize = 440 + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNT_SIZE: usize = 256;
         const CAPITAL_OFFSET_IN_ACCOUNT: usize = 8; // After account_id (u64)
         let account_offset =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -1141,7 +1141,7 @@ impl TestEnv {
         //                 warmup_started_at_slot(8) + warmup_slope_per_step(16) + position_size(16) + ...
         // position_size is at offset: 8 + 16 + 1 + 7 + 16 + 8 + 8 + 16 = 80
         const ACCOUNTS_OFFSET: usize = 440 + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNT_SIZE: usize = 256;
         const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
         let account_offset =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
@@ -4918,7 +4918,7 @@ impl TradeCpiTestEnv {
         // ENGINE_OFF = 440, accounts array at offset 9136 within RiskEngine
         // Account size = 240 bytes, position at offset 80 within Account
         const ACCOUNTS_OFFSET: usize = 440 + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNT_SIZE: usize = 256;
         const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
         let account_off =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
@@ -5021,7 +5021,7 @@ impl TradeCpiTestEnv {
         //   warmup_slope_per_step: U128 (16), offset 64
         //   position_size: I128 (16), offset 80 (confirmed in other tests)
         const ACCOUNTS_OFFSET: usize = 440 + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNT_SIZE: usize = 256;
         const PNL_OFFSET_IN_ACCOUNT: usize = 32; // pnl is at offset 32 within Account
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -5177,7 +5177,7 @@ impl TradeCpiTestEnv {
     fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 440 + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNT_SIZE: usize = 256;
         const CAPITAL_OFFSET_IN_ACCOUNT: usize = 8;
         let account_off =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -8569,7 +8569,7 @@ impl TestEnv {
     fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 440 + 9136;
-        const ACCOUNT_SIZE: usize = 240;
+        const ACCOUNT_SIZE: usize = 256;
         const PNL_OFFSET_IN_ACCOUNT: usize = 32;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -9184,8 +9184,8 @@ fn test_attack_admin_op_as_user() {
     );
 }
 
-/// ATTACK: UpdateAdmin to zero address is now rejected (foot-gun guard).
-/// Expected: UpdateAdmin to zero fails with InvalidConfigParam.
+/// UpdateAdmin to zero address permanently burns admin authority.
+/// After burning, all admin instructions must fail.
 #[test]
 fn test_attack_burned_admin_cannot_act() {
     program_path();
@@ -9196,18 +9196,18 @@ fn test_attack_burned_admin_cannot_act() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
 
-    // Attempt to burn admin by transferring to zero address - now rejected
+    // Burn admin by setting to zero address (spec §7 step [3])
     let result = env.try_update_admin(&admin, &zero_pubkey);
     assert!(
-        result.is_err(),
-        "UpdateAdmin to zero should be rejected (foot-gun guard)"
+        result.is_ok(),
+        "UpdateAdmin to zero should succeed (admin burn)"
     );
 
-    // Admin still works because update was rejected
+    // Admin instructions should now permanently fail
     let result = env.try_set_risk_threshold(&admin, 999);
     assert!(
-        result.is_ok(),
-        "Admin should still work after rejected zero update"
+        result.is_err(),
+        "Admin operations must fail after admin burn"
     );
 }
 
@@ -16664,7 +16664,7 @@ fn test_attack_update_admin_to_zero_locks_out() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Attempt to set admin to zero - should be rejected
+    // Set admin to zero - now allowed for admin burn (spec §7)
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
     let ix = Instruction {
         program_id: env.program_id,
@@ -16685,17 +16685,16 @@ fn test_attack_update_admin_to_zero_locks_out() {
         env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
-    // UpdateAdmin to zero is now rejected (foot-gun guard)
-    assert!(
-        result.is_err(),
-        "UpdateAdmin to zero should be rejected (foot-gun guard)"
-    );
-
-    // Admin still works because the update was rejected
-    let result = env.try_set_maintenance_fee(&admin, 100);
     assert!(
         result.is_ok(),
-        "Admin should still work after rejected zero update"
+        "UpdateAdmin to zero should succeed (admin burn)"
+    );
+
+    // Admin is now burned - all admin instructions must fail
+    let result = env.try_set_maintenance_fee(&admin, 100);
+    assert!(
+        result.is_err(),
+        "Admin operations must fail after admin burn"
     );
 }
 
@@ -29447,17 +29446,17 @@ fn test_property_authorization_exhaustive() {
     let r = env.try_set_maintenance_fee(&new_admin, 200);
     assert!(r.is_ok(), "A8: New admin should work after transfer");
 
-    // --- Zero admin rejected (foot-gun guard) ---
+    // --- Zero admin burn (spec §7) ---
     let zero = Pubkey::default();
     let r = env.try_update_admin(&new_admin, &zero);
     assert!(
-        r.is_err(),
-        "A9: UpdateAdmin to zero should be rejected (foot-gun guard)"
+        r.is_ok(),
+        "A9: UpdateAdmin to zero should succeed (admin burn)"
     );
 
-    // New admin still works after rejected zero update
+    // Admin must be locked out after burn
     let r = env.try_set_maintenance_fee(&new_admin, 300);
-    assert!(r.is_ok(), "A10: New admin should still work after rejected zero update");
+    assert!(r.is_err(), "A10: Admin operations must fail after admin burn");
 }
 
 /// PROPERTY TEST: Account lifecycle invariants across create/use/close/GC cycles.
@@ -31541,7 +31540,7 @@ fn test_init_market_zero_limits_rejected() {
 
 /// Verify that UpdateAdmin to zero address is rejected.
 #[test]
-fn test_update_admin_zero_rejected() {
+fn test_update_admin_zero_accepted_for_burn() {
     program_path();
 
     let mut env = TestEnv::new();
@@ -31550,25 +31549,21 @@ fn test_update_admin_zero_rejected() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
 
+    // Admin burn to zero is now allowed (spec §7 step [3])
     let result = env.try_update_admin(&admin, &zero_pubkey);
     assert!(
-        result.is_err(),
-        "UpdateAdmin to zero address should be rejected"
-    );
-
-    // Valid admin transfer should still work
-    let new_admin = Keypair::new();
-    env.svm
-        .airdrop(&new_admin.pubkey(), 1_000_000_000)
-        .unwrap();
-    let result = env.try_update_admin(&admin, &new_admin.pubkey());
-    assert!(
         result.is_ok(),
-        "Valid admin transfer should succeed: {:?}",
-        result
+        "UpdateAdmin to zero should succeed for admin burn"
     );
 
-    println!("UPDATE ADMIN ZERO REJECTED: PASSED");
+    // After burn, admin instructions must fail
+    let result = env.try_set_risk_threshold(&admin, 999);
+    assert!(
+        result.is_err(),
+        "Admin operations must fail after admin burn"
+    );
+
+    println!("UPDATE ADMIN ZERO BURN: PASSED");
 }
 
 /// Verify that UpdateConfig's thresh_max cannot exceed max_risk_threshold.
@@ -31795,11 +31790,12 @@ fn test_crank_threshold_ewma_bounded_by_limit() {
     assert_eq!(read_engine_threshold(&env), 0, "Initial threshold should be 0");
 
     // Set oracle price and advance slot so crank can run
-    env.set_slot_and_price(10, 100_000_000); // $100
+    // Note: market created at slot 100, so use slots > 100 for threshold updates
+    env.set_slot_and_price(110, 100_000_000); // $100
     env.crank();
 
     // Crank multiple times — EWMA target is thresh_floor=1_000_000 but clamped to 50_000
-    for slot in (12..30).step_by(2) {
+    for slot in (112..130).step_by(2) {
         env.set_slot_and_price(slot, 100_000_000);
         env.crank();
         let thr = read_engine_threshold(&env);

@@ -29,10 +29,10 @@ use std::path::PathBuf;
 
 // SLAB_LEN for SBF - differs between test and production
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 16312; // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 17336; // MAX_ACCOUNTS=64 - haircut-ratio engine + oracle circuit breaker (no padding)
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 992560; // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
+const SLAB_LEN: usize = 1058152; // MAX_ACCOUNTS=4096 - haircut-ratio engine + oracle circuit breaker (no padding)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -126,7 +126,11 @@ fn encode_init_market_with_params(
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
-                                                 // RiskParams
+    // Per-market admin limits (uncapped defaults for tests)
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
+    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)

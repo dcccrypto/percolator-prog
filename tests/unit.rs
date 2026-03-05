@@ -1627,10 +1627,10 @@ fn test_crank_updates_threshold_from_risk_metric() {
     }
 
     // Now call crank - this should update threshold based on risk metric
-    // Clock slot defaults to 0 in test, but last_thr_slot is also 0,
-    // so update won't trigger unless slot >= 0 + THRESH_UPDATE_INTERVAL_SLOTS
-    // We need to advance the clock
-    f.clock.data = make_clock(100, 100); // Advance past rate limit
+    // market_start_slot is written to _reserved[8..16] during InitMarket (slot=100).
+    // last_thr_update_slot reads from the same bytes, so it starts at 100.
+    // We need slot >= 100 + THRESH_UPDATE_INTERVAL_SLOTS (10) = 110.
+    f.clock.data = make_clock(110, 110);
     {
         let accs = vec![
             user.to_info(),
@@ -1644,7 +1644,7 @@ fn test_crank_updates_threshold_from_risk_metric() {
     // Verify threshold update ran by checking last_thr_update_slot
     let last_thr_slot_after = state::read_last_thr_update_slot(&f.slab.data);
     assert_eq!(
-        last_thr_slot_after, 100,
+        last_thr_slot_after, 110,
         "last_thr_update_slot should be set to clock.slot after crank"
     );
 
@@ -2212,18 +2212,18 @@ fn test_burn_admin_to_zero() {
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
     }
 
-    // Attempt to burn admin to zero (Pubkey::default()) - now rejected
+    // Admin burn to zero is now allowed (spec §7 step [3])
     let zero_admin = Pubkey::default();
     {
         let accounts = vec![f.admin.to_info(), f.slab.to_info()];
         let res =
             process_instruction(&f.program_id, &accounts, &encode_update_admin(&zero_admin));
-        assert_eq!(res, Err(PercolatorError::InvalidConfigParam.into()));
+        assert!(res.is_ok(), "Admin burn to zero should succeed");
     }
 
-    // Verify admin is still the original (not zeroed)
+    // Verify admin is now zeroed
     let header = state::read_header(&f.slab.data);
-    assert_eq!(header.admin, f.admin.key.to_bytes());
+    assert_eq!(header.admin, [0u8; 32]);
 }
 
 #[test]
@@ -2248,23 +2248,24 @@ fn test_after_burn_admin_ops_disabled() {
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
     }
 
-    // Attempt to burn admin to zero - now rejected (foot-gun guard)
+    // Burn admin to zero (spec §7 step [3])
     let zero_admin = Pubkey::default();
     {
         let accounts = vec![f.admin.to_info(), f.slab.to_info()];
         let res =
             process_instruction(&f.program_id, &accounts, &encode_update_admin(&zero_admin));
-        assert_eq!(res, Err(PercolatorError::InvalidConfigParam.into()));
+        assert!(res.is_ok(), "Admin burn to zero should succeed");
     }
 
-    // Admin still works after rejected zero update
+    // After burn, admin ops must fail
     {
         let accounts = vec![f.admin.to_info(), f.slab.to_info()];
         let res = process_instruction(&f.program_id, &accounts, &encode_set_risk_threshold(12345));
-        assert!(res.is_ok(), "Admin should still work after rejected zero update");
+        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()),
+            "Admin operations must fail after admin burn");
     }
 
-    // Non-admin still cannot act
+    // Non-admin also cannot act
     let anyone = Pubkey::new_unique();
     let mut anyone_account =
         TestAccount::new(anyone, solana_program::system_program::id(), 0, vec![]).signer();

@@ -1239,6 +1239,11 @@ pub mod ix {
         AdminForceCloseAccount {
             user_idx: u16,
         },
+        /// Query cumulative fees earned by an LP position (§2.2).
+        /// Returns fees_earned_total via set_return_data. No state mutation.
+        QueryLpFees {
+            lp_idx: u16,
+        },
     }
 
     impl Instruction {
@@ -1441,6 +1446,10 @@ pub mod ix {
                 23 => {
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::WithdrawInsuranceLimited { amount })
+                }
+                24 => {
+                    let lp_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::QueryLpFees { lp_idx })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -1754,6 +1763,23 @@ pub mod state {
     /// Write the last threshold update slot to _reserved[8..16].
     pub fn write_last_thr_update_slot(data: &mut [u8], slot: u64) {
         data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
+    }
+
+    /// Write market_start_slot into _reserved[8..16] at InitMarket time.
+    /// Shares storage with last_thr_update_slot — written once at creation,
+    /// then captured by rewards::init_market_rewards in the same atomic tx.
+    pub fn write_market_start_slot(data: &mut [u8], slot: u64) {
+        data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
+    }
+
+    /// Read market_start_slot from _reserved[8..16].
+    /// Only valid immediately after InitMarket (before any crank overwrites it).
+    pub fn read_market_start_slot(data: &[u8]) -> u64 {
+        u64::from_le_bytes(
+            data[RESERVED_OFF + 8..RESERVED_OFF + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Read accumulated dust (base token remainder) from _reserved[16..24].
@@ -2845,8 +2871,9 @@ pub mod processor {
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
                 state::write_req_nonce(&mut data, 0);
-                // Initialize threshold update slot to 0
-                state::write_last_thr_update_slot(&mut data, 0);
+                // Write market_start_slot (§2.1): captures creation slot for rewards program.
+                // Shares _reserved[8..16] with last_thr_update_slot (initialized to same value).
+                state::write_market_start_slot(&mut data, clock.slot);
             }
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 5)?;
@@ -4018,10 +4045,9 @@ pub mod processor {
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
 
-                // Reject zero-address admin (irreversible lockout)
-                if new_admin == Pubkey::default() {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
+                // Zero-address admin permanently burns admin authority (§7 step [3]).
+                // require_admin rejects [0u8;32] so all admin instructions become
+                // permanently inaccessible once set.
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -4736,12 +4762,29 @@ pub mod processor {
                     &signer_seeds,
                 )?;
             }
+
+            Instruction::QueryLpFees { lp_idx } => {
+                // §2.2: Read-only query of LP cumulative fees. No state mutation.
+                accounts::expect_len(accounts, 1)?;
+                let a_slab = &accounts[0];
+
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let engine = zc::engine_ref(&data)?;
+                check_idx(engine, lp_idx)?;
+
+                let fees = engine.accounts[lp_idx as usize].fees_earned_total.get();
+                solana_program::program::set_return_data(&fees.to_le_bytes());
+            }
         }
         Ok(())
     }
 }
 
 // 10. mod entrypoint
+#[cfg(not(feature = "no-entrypoint"))]
 pub mod entrypoint {
     use crate::processor;
     #[allow(unused_imports)]
