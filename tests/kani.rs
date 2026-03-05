@@ -4489,8 +4489,9 @@ fn kani_cb_trigger_disabled_when_cap_zero() {
 
 /// Sub-proof (c): Recovery — mark converges toward oracle after clamped EMA step.
 /// Distance must not increase when moving toward oracle.
+/// SAT-hard (4 symbolic u64 inputs through mul/div) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_cb_recovery_distance_decreases() {
+fn nightly_cb_recovery_distance_decreases() {
     let prev_mark: u64 = kani::any();
     let oracle: u64 = kani::any();
     let alpha_e6: u64 = kani::any();
@@ -4517,7 +4518,7 @@ fn kani_cb_recovery_distance_decreases() {
 
 /// Sub-proof (c2): At equilibrium (prev == oracle), distance stays zero.
 #[kani::proof]
-fn kani_cb_recovery_equilibrium_stable() {
+fn nightly_cb_recovery_equilibrium_stable() {
     let price: u64 = kani::any();
     kani::assume(price > 0 && price <= 1_000_000_000);
 
@@ -4591,7 +4592,7 @@ fn kani_fee_zero_iff_zero_input() {
 
 /// Prove: fee does not exceed notional (fee <= 100% of trade value).
 #[kani::proof]
-fn kani_fee_bounded_by_notional() {
+fn nightly_fee_bounded_by_notional() {
     let notional: u128 = kani::any();
     let fee_bps: u64 = kani::any();
     kani::assume(notional <= u64::MAX as u128);
@@ -4878,8 +4879,9 @@ fn kani_sandwich_zero_cap_no_movement() {
 }
 
 /// Prove: cap=1_000_000 (100%) allows any movement up to doubling.
+/// SAT-hard in practice (1255s observed in CI) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_sandwich_full_cap_allows_double() {
+fn nightly_sandwich_full_cap_allows_double() {
     let price: u64 = kani::any();
     kani::assume(price > 0 && price <= 500_000_000); // Keep sum < u64::MAX
 
@@ -5083,9 +5085,11 @@ fn proof_oi_cap_no_overflow() {
 
 /// PERC-302: Prove ramp multiplier never exceeds configured oi_cap_multiplier_bps.
 /// For all valid inputs: compute_ramp_multiplier(…) <= oi_cap_multiplier_bps.
+/// NOTE: SAT-hard (symbolic division in compute_ramp_multiplier). Tagged `nightly_` so
+/// ci.yml `--harness proof_` skips it; nightly.yml runs it with a 5h timeout.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_ramp_never_exceeds_configured_multiplier() {
+fn nightly_ramp_never_exceeds_configured_multiplier() {
     use percolator_prog::constants::RAMP_START_BPS;
     use percolator_prog::verify::compute_ramp_multiplier;
 
@@ -5131,9 +5135,11 @@ fn proof_ramp_never_exceeds_configured_multiplier() {
 }
 
 /// PERC-302: Prove ramp produces monotonically increasing multiplier as slots advance.
+/// NOTE: SAT-hard (symbolic division in compute_ramp_multiplier). Tagged `nightly_` so
+/// ci.yml `--harness proof_` skips it; nightly.yml runs it with a 5h timeout.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_ramp_monotonically_increases() {
+fn nightly_ramp_monotonically_increases() {
     use percolator_prog::verify::compute_ramp_multiplier;
 
     let oi_cap: u64 = kani::any();
@@ -5233,7 +5239,7 @@ fn proof_margin_always_requires_positive_collateral() {
 /// Prove: median is always within [min, max] of valid inputs.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_median_within_bounds() {
+fn nightly_proof_median_within_bounds() {
     use percolator_prog::verify::median_price;
 
     let a: u64 = kani::any();
@@ -5254,9 +5260,11 @@ fn proof_median_within_bounds() {
 }
 
 /// Prove: median of single price returns that price.
+/// NOTE: Renamed to nightly_ — this proof takes ~2h45m (symbolic sort over 5-element array);
+/// excluded from PR CI (--harness proof_ filter), runs in nightly.yml.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_median_single_price() {
+fn nightly_median_single_price() {
     use percolator_prog::verify::median_price;
 
     let p: u64 = kani::any();
@@ -5367,8 +5375,10 @@ fn proof_ring_buffer_wraps() {
 /// Formula: effective = base * (10_000 - capped_reduction) / 10_000
 /// where capped_reduction = min(skew * skew_factor / total_oi, skew_factor)
 /// Since capped_reduction >= 0, effective <= base always holds.
+/// NOTE: SAT-hard (u128 division with symbolic inputs). Tagged `nightly_` so
+/// ci.yml `--harness proof_` skips it; nightly.yml runs it with a 5h timeout.
 #[kani::proof]
-fn proof_skew_adjusted_cap_never_exceeds_base_cap() {
+fn nightly_skew_adjusted_cap_never_exceeds_base_cap() {
     use percolator_prog::processor::{pack_oi_cap, unpack_oi_cap};
 
     // Symbolic inputs
