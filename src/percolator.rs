@@ -5582,7 +5582,7 @@ pub mod processor {
             DEFAULT_HYPERP_PRICE_CAP_E2BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR,
             DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MIN_STEP,
             DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-            MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN, VERSION,
+            ENGINE_LEN, ENGINE_OFF, MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN, VERSION,
         },
         error::{map_risk_error, PercolatorError},
         ix::{self, Instruction},
@@ -7057,6 +7057,7 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
+                let slab_len = data.len();
                 let engine = zc::engine_mut(&mut data)?;
 
                 // PERC-299: Update emergency OI mode based on circuit breaker status
@@ -7111,7 +7112,12 @@ pub mod processor {
                 // engine TWAP is 0 for new markets, so set_mark_price_blended
                 // falls back to oracle anyway). For configured markets, the
                 // blend weight controls oracle vs TWAP proportions.
-                {
+                //
+                // Safety: set_mark_price_blended writes trade_twap_e6 + twap_last_slot
+                // at the tail of RiskEngine. On pre-PERC-118 slabs (data.len() <
+                // ENGINE_OFF + ENGINE_LEN), those fields are beyond the allocated data.
+                // Skip the TWAP write for undersized slabs — they get pure oracle mark.
+                if slab_len >= ENGINE_OFF + ENGINE_LEN {
                     let w = state::get_mark_oracle_weight_bps(&config) as u64;
                     engine.set_mark_price_blended(config.authority_price_e6, w);
                 }
