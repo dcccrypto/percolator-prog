@@ -33,7 +33,8 @@ jobs:
           # The `.*` suffix broke matching — kani-github-action uses prefix/substring matching, not full regex.
           # Currently 13 slow harnesses: nightly_fee_monotone_in_bps (~2.5h), nightly_fee_monotone_in_notional,
           # nightly_fee_ceil_geq_floor, nightly_cb_recovery_*, nightly_fee_bounded_by_notional,
-          # nightly_sandwich_full_cap_allows_double, nightly_ramp_*, nightly_skew_adjusted_cap_*,
+          # nightly_sandwich_impact_proportional, nightly_sandwich_full_cap_allows_double,
+          # nightly_ramp_*, nightly_skew_adjusted_cap_*,
           # nightly_median_within_bounds, nightly_median_single_price, nightly_circuit_breaker_before_ema
           args: --tests --output-format terse --jobs 2 --harness nightly_
         timeout-minutes: 295
