@@ -77,6 +77,7 @@ jobs:
     #   nightly_median_single_price                     (~2h45m — symbolic sort, 5-element array)
     #   nightly_median_within_bounds                    (~slow — SAT-hard symbolic median, was nightly_proof_median_within_bounds)
     #   nightly_circuit_breaker_before_ema              (~3h+ — circuit breaker EMA proof timeout)
+    #   nightly_kani_decimals_9_to_0_scales_down        (~2h41m — full u64 range SAT)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 180
     steps:

@@ -4036,8 +4036,9 @@ fn kani_decimals_0_to_9_scales_up() {
 }
 
 /// Prove: convert_decimals 9-decimal to 0-decimal scales down by 10^9.
+/// Moved to nightly_ — full u64 symbolic range makes SAT solver run >2h on PR CI.
 #[kani::proof]
-fn kani_decimals_9_to_0_scales_down() {
+fn nightly_kani_decimals_9_to_0_scales_down() {
     let amount: u64 = kani::any();
 
     let result = convert_decimals(amount, 9, 0);
