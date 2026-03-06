@@ -9608,6 +9608,27 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
+                // SECURITY (MEDIUM #2): for PumpSwap pools, verify pool.base_mint matches
+                // the market's collateral_mint. Without this check, a caller could pass
+                // any valid PumpSwap pool (e.g., a pool for a different token pair) and
+                // the program would compute prices from that unrelated pool.
+                // This applies only to PumpSwap — Raydium/Meteora use different layouts.
+                if *a_dex_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID {
+                    let pool_data = a_dex_pool.try_borrow_data()?;
+                    const PUMPSWAP_OFF_BASE_MINT_HYPERP: usize = 35;
+                    if pool_data.len() < PUMPSWAP_OFF_BASE_MINT_HYPERP + 32 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let pool_base_mint: [u8; 32] = pool_data
+                        [PUMPSWAP_OFF_BASE_MINT_HYPERP..PUMPSWAP_OFF_BASE_MINT_HYPERP + 32]
+                        .try_into()
+                        .unwrap();
+                    if pool_base_mint != config.collateral_mint {
+                        msg!("UpdateHyperpMark: pool base_mint does not match market collateral_mint");
+                        return Err(PercolatorError::InvalidOracleKey.into());
+                    }
+                }
+
                 // Read spot price AND liquidity from the DEX pool (#297 Fix 1).
                 // Rejects thin pools where an attacker can cheaply manipulate spot price.
                 let remaining = &accounts[3..];
