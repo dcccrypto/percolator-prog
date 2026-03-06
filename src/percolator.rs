@@ -11453,7 +11453,7 @@ pub mod processor {
         /// No trade is blocked once current_slot >= rebalancing_start_slot + duration.
         #[kani::proof]
         #[kani::unwind(1)]
-        fn proof_safety_valve_exits_after_duration() {
+        fn nightly_proof_safety_valve_exits_after_duration() {
             let duration: u64 = kani::any();
             let start_slot: u64 = kani::any();
             let current_slot: u64 = kani::any();
