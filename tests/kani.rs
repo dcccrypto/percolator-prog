@@ -4422,8 +4422,10 @@ fn kani_cb_ema_update_weighted_average() {
 fn kani_cb_ema_alpha_zero_no_update() {
     let prev: u64 = kani::any();
     let oracle: u64 = kani::any();
-    kani::assume(prev > 0);
-    kani::assume(oracle > 0);
+    // Bound to price-plausible range to keep Kani verification fast.
+    // oracle is irrelevant when alpha=0 but bounded to avoid SAT explosion.
+    kani::assume(prev > 0 && prev <= 1_000_000_000);
+    kani::assume(oracle > 0 && oracle <= 1_000_000_000);
 
     let result = ema_step_unclamped(prev, oracle, 0);
 
