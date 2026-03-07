@@ -4025,8 +4025,10 @@ fn kani_decimals_convert_identity() {
 }
 
 /// Prove: convert_decimals 0-decimal to 9-decimal scales up by 10^9.
+/// Moved to nightly_ — saturating_pow(9) + saturating_mul over full u64 range
+/// makes the SAT solver run >2h on PR CI (same pattern as nightly_decimals_9_to_0_scales_down).
 #[kani::proof]
-fn kani_decimals_0_to_9_scales_up() {
+fn nightly_decimals_0_to_9_scales_up() {
     let amount: u64 = kani::any();
     kani::assume(amount <= u64::MAX / 1_000_000_000); // Avoid saturation
 
