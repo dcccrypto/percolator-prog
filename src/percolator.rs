@@ -11418,9 +11418,14 @@ pub mod processor {
 
                 require_admin(admin_bytes, a_dest.key)?;
 
-                // Drain all lamports to dest (same as CloseSlab, no zeroing needed
-                // because the slab layout is already invalid and the runtime will
-                // garbage-collect the account once lamports hit zero).
+                // Zero account data before draining lamports to prevent residual
+                // data exposure (Solana best practice for account closure).
+                {
+                    let mut data = a_slab.try_borrow_mut_data()?;
+                    data.fill(0);
+                }
+
+                // Drain all lamports to dest.
                 let slab_lamports = a_slab.lamports();
                 **a_slab.lamports.borrow_mut() = 0;
                 **a_dest.lamports.borrow_mut() = a_dest
