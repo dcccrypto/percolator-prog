@@ -9615,9 +9615,15 @@ pub mod processor {
                 // This applies only to PumpSwap — Raydium/Meteora use different layouts.
                 if *a_dex_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID {
                     let pool_data = a_dex_pool.try_borrow_data()?;
-                    // PumpSwap pool layout (no Anchor discriminator):
-                    // bytes 0..2 = bump+index, 3..35 = creator, 35..67 = base_mint
-                    // See also: PUMPSWAP_OFF_BASE_MINT at l.3758
+                    // PumpSwap pool account layout (no Anchor discriminator):
+                    //   [0..3]    header — pool_bump (u8), index (u8), and 1 byte flags
+                    //   [3..35]   creator Pubkey (32 bytes)
+                    //   [35..67]  base_mint Pubkey (32 bytes)  ← PUMPSWAP_OFF_BASE_MINT_HYPERP
+                    //   [67..99]  quote_mint Pubkey (32 bytes)
+                    //   [131..163] base_vault Pubkey, [163..195] quote_vault Pubkey
+                    // Canonical constant: oracle::PUMPSWAP_OFF_BASE_MINT = 35 (private to
+                    // oracle mod; duplicated here). Layout cross-referenced with
+                    // PUMPSWAP_MIN_LEN = 195 enforced in oracle::read_pumpswap_price_e6.
                     const PUMPSWAP_OFF_BASE_MINT_HYPERP: usize = 35;
                     if pool_data.len() < PUMPSWAP_OFF_BASE_MINT_HYPERP + 32 {
                         return Err(ProgramError::InvalidAccountData);
