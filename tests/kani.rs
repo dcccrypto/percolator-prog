@@ -4418,8 +4418,9 @@ fn kani_cb_ema_update_weighted_average() {
 }
 
 /// Sub-proof (a2): EMA alpha=0 means no update (stay at prev).
+/// Moved to nightly_ prefix — bounded range still causes SAT-hard MUL explosion >2h.
 #[kani::proof]
-fn kani_cb_ema_alpha_zero_no_update() {
+fn nightly_cb_ema_alpha_zero_no_update() {
     let prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     // Bound to price-plausible range to keep Kani verification fast.
