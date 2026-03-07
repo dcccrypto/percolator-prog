@@ -3677,8 +3677,10 @@ fn kani_mark_price_bounded_by_cap() {
 ///
 /// Simpler verifiable form: after ONE step with alpha=1_000_000 (full),
 /// mark == oracle (exact convergence in one step).
+/// SAT-hard (identical structure to nightly_ema_mark_no_cap_full_oracle — symbolic MUL/DIV, ~2h46m).
+/// Moved to nightly_.
 #[kani::proof]
-fn kani_hyperp_ema_converges_full_alpha() {
+fn nightly_hyperp_ema_converges_full_alpha() {
     let mark_prev: u64 = kani::any();
     let oracle: u64 = kani::any();
 
