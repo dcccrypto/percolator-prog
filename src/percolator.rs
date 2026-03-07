@@ -9615,6 +9615,9 @@ pub mod processor {
                 // This applies only to PumpSwap — Raydium/Meteora use different layouts.
                 if *a_dex_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID {
                     let pool_data = a_dex_pool.try_borrow_data()?;
+                    // PumpSwap pool layout (no Anchor discriminator):
+                    // bytes 0..2 = bump+index, 3..35 = creator, 35..67 = base_mint
+                    // See also: PUMPSWAP_OFF_BASE_MINT at l.3758
                     const PUMPSWAP_OFF_BASE_MINT_HYPERP: usize = 35;
                     if pool_data.len() < PUMPSWAP_OFF_BASE_MINT_HYPERP + 32 {
                         return Err(ProgramError::InvalidAccountData);
