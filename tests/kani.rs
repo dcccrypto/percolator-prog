@@ -3746,7 +3746,7 @@ fn kani_hyperp_ema_monotone_down() {
 /// EMA identity: when oracle == mark_prev, mark stays unchanged.
 /// Prevents spurious drift when price is stable.
 #[kani::proof]
-fn kani_ema_mark_identity_at_equilibrium() {
+fn nightly_kani_ema_mark_identity_at_equilibrium() {
     let price: u64 = kani::any();
     let alpha_e6: u64 = kani::any();
     let dt_slots: u64 = kani::any();
