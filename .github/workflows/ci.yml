@@ -80,6 +80,7 @@ jobs:
     #   nightly_decimals_9_to_0_scales_down              (~2h41m — full u64 range SAT)
     #   nightly_sv_exits_after_duration                  (~3h+ — safety valve symbolic proof)
     #   nightly_cb_ema_alpha_zero_no_update              (~>2h — bounded range still SAT-hard MUL)
+    #   nightly_ema_mark_no_cap_full_oracle              (~2h46m — compute_ema_mark_price symbolic MUL/DIV)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 180
     steps:

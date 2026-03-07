@@ -3806,8 +3806,9 @@ fn kani_ema_mark_bootstrap() {
 }
 
 /// Circuit breaker disabled (cap=0): oracle price passes through clamping unchanged.
+/// SAT-hard (symbolic u64 mul/div in compute_ema_mark_price, 2h46m observed in PR CI). Moved to nightly_.
 #[kani::proof]
-fn kani_ema_mark_no_cap_full_oracle() {
+fn nightly_ema_mark_no_cap_full_oracle() {
     let mark_prev: u64 = kani::any();
     let oracle: u64 = kani::any();
 
