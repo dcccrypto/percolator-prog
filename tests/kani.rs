@@ -4981,7 +4981,7 @@ fn kani_oracle_adversarial_zero_clamped() {
 
 /// Prove: adversarial u64::MAX oracle is clamped by circuit breaker.
 #[kani::proof]
-fn kani_oracle_adversarial_max_clamped() {
+fn nightly_oracle_adversarial_max_clamped() {
     let prev_mark: u64 = kani::any();
     let cap: u64 = kani::any();
 
