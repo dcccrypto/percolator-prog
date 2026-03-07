@@ -36,6 +36,7 @@ jobs:
           # nightly_sandwich_impact_proportional, nightly_sandwich_full_cap_allows_double,
           # nightly_ramp_*, nightly_skew_adjusted_cap_*,
           # nightly_median_within_bounds, nightly_median_single_price, nightly_circuit_breaker_before_ema,
-          # nightly_kani_decimals_9_to_0_scales_down (~2h41m — full u64 range SAT)
+          # nightly_decimals_9_to_0_scales_down (~2h41m — full u64 range SAT)
+          # nightly_sv_exits_after_duration (~3h+ — safety valve symbolic proof)
           args: --tests --output-format terse --jobs 2 --harness nightly_
         timeout-minutes: 295
