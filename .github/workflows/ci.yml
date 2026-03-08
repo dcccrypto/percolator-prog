@@ -71,6 +71,7 @@ jobs:
     #   nightly_cb_recovery_distance_decreases          (~slow CB convergence)
     #   nightly_fee_bounded_by_notional                 (~29m — u128 SAT)
     #   nightly_sandwich_full_cap_allows_double         (~slow OI cap proof)
+    #   nightly_sandwich_impact_proportional            (~2.5h — u128 mul+div SAT-hard)
     #   nightly_ramp_never_exceeds_configured_multiplier (~slow ramp SAT)
     #   nightly_ramp_monotonically_increases            (~slow ramp proof)
     #   nightly_skew_adjusted_cap_never_exceeds_base_cap (~slow OI cap)
