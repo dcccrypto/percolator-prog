@@ -86,11 +86,16 @@ jobs:
     #   nightly_hyperp_ema_converges_full_alpha          (~2h46m — identical structure, same SAT-hard path)
     #   nightly_ema_mark_identity_at_equilibrium         (~2h55m+ — symbolic MUL/DIV SAT-hard; was nightly_kani_ema_mark_identity_at_equilibrium, renamed to drop kani_ substring)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
-    timeout-minutes: 180
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run Kani proofs (PR — all fast harnesses, exclude nightly_*)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --tests --output-format terse --jobs 4 --harness kani_ --harness proof_ --harness inductive_
-        timeout-minutes: 175
+        # Fast harnesses complete in ~35min. Reduced from 175min to catch
+        # the post-completion hang sooner. If proofs pass but the action
+        # hangs, the 45min step timeout kills it — check logs for
+        # "VERIFICATION:- SUCCESSFUL" on all harnesses before treating
+        # timeout as failure.
+        timeout-minutes: 45
