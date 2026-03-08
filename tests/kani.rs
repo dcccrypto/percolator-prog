@@ -4827,8 +4827,9 @@ fn kani_selfliq_zero_position_zero_fee() {
 // =============================================================================
 
 /// Prove: max_price_impact is proportional to price and cap.
+/// SAT-hard (u128 mul+div with symbolic u64 inputs, ~2.5h observed in CI). Moved to nightly_.
 #[kani::proof]
-fn kani_sandwich_impact_proportional() {
+fn nightly_sandwich_impact_proportional() {
     let price: u64 = kani::any();
     let cap: u64 = kani::any();
     kani::assume(price > 0 && price <= 1_000_000_000);
