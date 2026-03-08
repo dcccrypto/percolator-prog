@@ -12359,12 +12359,11 @@ pub mod processor {
                 // Seeds: ["cmor_pair", min(slab_a, slab_b), max(slab_a, slab_b)]
                 // Keys are ordered lexicographically so the PDA is symmetric.
                 {
-                    let (slab_min, slab_max) =
-                        if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                            (a_slab_a.key, a_slab_b.key)
-                        } else {
-                            (a_slab_b.key, a_slab_a.key)
-                        };
+                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
                     let (expected_pda, _bump) = Pubkey::find_program_address(
                         &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
                         program_id,
@@ -12458,12 +12457,11 @@ pub mod processor {
                 // from passing an arbitrary account in place of the canonical pair PDA.
                 // Seeds: ["cmor_pair", min(slab_a, slab_b), max(slab_a, slab_b)]
                 {
-                    let (slab_min, slab_max) =
-                        if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                            (a_slab_a.key, a_slab_b.key)
-                        } else {
-                            (a_slab_b.key, a_slab_a.key)
-                        };
+                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
                     let (expected_pair_pda, _bump) = Pubkey::find_program_address(
                         &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
                         program_id,
@@ -12478,12 +12476,11 @@ pub mod processor {
                 // rather than the canonical per-user attestation PDA.
                 // Seeds: ["cmor", owner, slab_a, slab_b]  (keys in canonical order)
                 {
-                    let (slab_min, slab_max) =
-                        if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                            (a_slab_a.key, a_slab_b.key)
-                        } else {
-                            (a_slab_b.key, a_slab_a.key)
-                        };
+                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
                     let owner_key = Pubkey::from(owner_a);
                     let (expected_att_pda, _bump) = Pubkey::find_program_address(
                         &[
