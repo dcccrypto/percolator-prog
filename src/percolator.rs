@@ -3633,6 +3633,24 @@ pub mod state {
         config._orphan_pad[0] = bytes[0];
         config._orphan_pad[1] = bytes[1];
     }
+
+    /// Read the slot at which AuditCrank last paused the market from
+    /// `_rebalancing_pad[0..6]` (48-bit little-endian u64 — sufficient for
+    /// centuries of Solana slots).
+    /// 0 = never paused via AuditCrank.
+    #[inline]
+    pub fn read_last_audit_pause_slot(config: &MarketConfig) -> u64 {
+        let mut buf = [0u8; 8];
+        buf[..6].copy_from_slice(&config._rebalancing_pad[..6]);
+        u64::from_le_bytes(buf)
+    }
+
+    /// Write the last AuditCrank pause slot into `_rebalancing_pad[0..6]`.
+    #[inline]
+    pub fn write_last_audit_pause_slot(config: &mut MarketConfig, slot: u64) {
+        let bytes = slot.to_le_bytes();
+        config._rebalancing_pad[..6].copy_from_slice(&bytes[..6]);
+    }
 }
 
 // 7. mod units - base token/units conversion at instruction boundaries
@@ -12257,10 +12275,30 @@ pub mod processor {
                     violation = true;
                 }
 
-                // Write audit result and optionally pause
+                // Write audit result and optionally pause.
+                // #959: Cooldown guard — AuditCrank may not re-pause a market
+                // within AUDIT_CRANK_COOLDOWN_SLOTS of the previous pause to
+                // prevent a permissionless DoS via false/transient invariant
+                // triggers. 150 slots ≈ 60 s on mainnet (400 ms/slot).
+                const AUDIT_CRANK_COOLDOWN_SLOTS: u64 = 150;
+                let current_slot = Clock::get()?.slot;
                 let mut config = state::read_config(&data);
                 if violation {
+                    let last_pause = state::read_last_audit_pause_slot(&config);
+                    if current_slot.saturating_sub(last_pause) < AUDIT_CRANK_COOLDOWN_SLOTS {
+                        // Cooldown active — log violation but do not pause.
+                        // Prevents rapid repeated DoS via marginal invariant drift.
+                        msg!(
+                            "AUDIT_CRANK: violation detected but cooldown active \
+                             (last_pause={} current={} cooldown={})",
+                            last_pause,
+                            current_slot,
+                            AUDIT_CRANK_COOLDOWN_SLOTS,
+                        );
+                        return Err(PercolatorError::AuditViolation.into());
+                    }
                     state::write_audit_status(&mut config, 0xFFFF);
+                    state::write_last_audit_pause_slot(&mut config, current_slot);
                     state::set_paused(&mut data, true);
                     state::write_config(&mut data, &config);
                     msg!("AUDIT_CRANK: VIOLATION DETECTED — market paused");
@@ -12281,14 +12319,14 @@ pub mod processor {
                 accounts::expect_len(accounts, 5)?;
                 let a_admin = &accounts[0];
                 let a_slab_a = &accounts[1];
-                let _a_slab_b = &accounts[2];
+                let a_slab_b = &accounts[2]; // #958: was incorrectly prefixed with _ (unused)
                 let a_pair_pda = &accounts[3];
                 let _a_system = &accounts[4];
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_pair_pda)?;
 
-                // Verify admin on slab_a
+                // Verify admin on slab_a (#958: slab_a admin check)
                 {
                     let data_a = a_slab_a.try_borrow_data()?;
                     if data_a.len() < HEADER_LEN {
@@ -12299,6 +12337,41 @@ pub mod processor {
                         return Err(PercolatorError::InvalidMagic.into());
                     }
                     require_admin(header.admin, a_admin.key)?;
+                }
+
+                // #958: Verify admin on slab_b — prevents cross-admin pair manipulation
+                // where slab_a admin could register a pair with an unrelated slab_b.
+                {
+                    let data_b = a_slab_b.try_borrow_data()?;
+                    if data_b.len() < HEADER_LEN {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let header_b = state::read_header(&data_b);
+                    if header_b.magic != MAGIC {
+                        return Err(PercolatorError::InvalidMagic.into());
+                    }
+                    require_admin(header_b.admin, a_admin.key)?;
+                }
+
+                // #957: Verify PDA derivation of a_pair_pda — prevents account
+                // substitution attacks where an attacker passes an arbitrary
+                // writable account instead of the canonical PDA.
+                // Seeds: ["cmor_pair", min(slab_a, slab_b), max(slab_a, slab_b)]
+                // Keys are ordered lexicographically so the PDA is symmetric.
+                {
+                    let (slab_min, slab_max) =
+                        if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                            (a_slab_a.key, a_slab_b.key)
+                        } else {
+                            (a_slab_b.key, a_slab_a.key)
+                        };
+                    let (expected_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
+                        program_id,
+                    );
+                    if a_pair_pda.key != &expected_pda {
+                        return Err(ProgramError::InvalidSeeds);
+                    }
                 }
 
                 // Validate offset_bps (0..=10_000)
@@ -12379,6 +12452,51 @@ pub mod processor {
                 // Verify both positions belong to the same user
                 if owner_a != owner_b {
                     return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // #957: Verify PDA derivation of a_pair_pda — prevents an attacker
+                // from passing an arbitrary account in place of the canonical pair PDA.
+                // Seeds: ["cmor_pair", min(slab_a, slab_b), max(slab_a, slab_b)]
+                {
+                    let (slab_min, slab_max) =
+                        if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                            (a_slab_a.key, a_slab_b.key)
+                        } else {
+                            (a_slab_b.key, a_slab_a.key)
+                        };
+                    let (expected_pair_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
+                        program_id,
+                    );
+                    if a_pair_pda.key != &expected_pair_pda {
+                        return Err(ProgramError::InvalidSeeds);
+                    }
+                }
+
+                // #957: Verify PDA derivation of a_attestation — prevents account
+                // substitution where the caller writes to an arbitrary writable account
+                // rather than the canonical per-user attestation PDA.
+                // Seeds: ["cmor", owner, slab_a, slab_b]  (keys in canonical order)
+                {
+                    let (slab_min, slab_max) =
+                        if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                            (a_slab_a.key, a_slab_b.key)
+                        } else {
+                            (a_slab_b.key, a_slab_a.key)
+                        };
+                    let owner_key = Pubkey::from(owner_a);
+                    let (expected_att_pda, _bump) = Pubkey::find_program_address(
+                        &[
+                            b"cmor",
+                            owner_key.as_ref(),
+                            slab_min.as_ref(),
+                            slab_max.as_ref(),
+                        ],
+                        program_id,
+                    );
+                    if a_attestation.key != &expected_att_pda {
+                        return Err(ProgramError::InvalidSeeds);
+                    }
                 }
 
                 // Write attestation
