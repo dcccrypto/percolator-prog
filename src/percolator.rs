@@ -3633,6 +3633,28 @@ pub mod state {
         config._orphan_pad[0] = bytes[0];
         config._orphan_pad[1] = bytes[1];
     }
+
+    /// Read last audit slot (truncated to u32) from `_orphan_pad[2..6]`.
+    /// Used for AuditCrank cooldown to prevent permissionless DoS (#959).
+    #[inline]
+    pub fn read_last_audit_slot(config: &MarketConfig) -> u32 {
+        u32::from_le_bytes([
+            config._orphan_pad[2],
+            config._orphan_pad[3],
+            config._orphan_pad[4],
+            config._orphan_pad[5],
+        ])
+    }
+
+    /// Write last audit slot (truncated to u32) into `_orphan_pad[2..6]`.
+    #[inline]
+    pub fn write_last_audit_slot(config: &mut MarketConfig, slot: u32) {
+        let bytes = slot.to_le_bytes();
+        config._orphan_pad[2] = bytes[0];
+        config._orphan_pad[3] = bytes[1];
+        config._orphan_pad[4] = bytes[2];
+        config._orphan_pad[5] = bytes[3];
+    }
 }
 
 // 7. mod units - base token/units conversion at instruction boundaries
@@ -12192,6 +12214,19 @@ pub mod processor {
 
                 let engine = zc::engine_ref(&data)?;
 
+                // Cooldown: prevent audit spam / DoS (#959)
+                // Minimum 150 slots (~1 minute at 400ms) between audits.
+                const AUDIT_COOLDOWN_SLOTS: u32 = 150;
+                let current_slot_trunc = engine.current_slot as u32;
+                let config = state::read_config(&data);
+                let last_audit = state::read_last_audit_slot(&config);
+                if current_slot_trunc.wrapping_sub(last_audit) < AUDIT_COOLDOWN_SLOTS
+                    && last_audit != 0
+                {
+                    msg!("AUDIT_CRANK: cooldown active, try again later");
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
                 // Walk all accounts and compute running aggregates
                 let mut sum_capital: i128 = 0;
                 let mut sum_pnl_pos: u128 = 0;
@@ -12258,7 +12293,8 @@ pub mod processor {
                 }
 
                 // Write audit result and optionally pause
-                let mut config = state::read_config(&data);
+                let mut config = state::read_config(&data);  // re-read for mutation
+                state::write_last_audit_slot(&mut config, current_slot_trunc);
                 if violation {
                     state::write_audit_status(&mut config, 0xFFFF);
                     state::set_paused(&mut data, true);
@@ -12281,7 +12317,7 @@ pub mod processor {
                 accounts::expect_len(accounts, 5)?;
                 let a_admin = &accounts[0];
                 let a_slab_a = &accounts[1];
-                let _a_slab_b = &accounts[2];
+                let a_slab_b = &accounts[2];
                 let a_pair_pda = &accounts[3];
                 let _a_system = &accounts[4];
 
@@ -12299,6 +12335,36 @@ pub mod processor {
                         return Err(PercolatorError::InvalidMagic.into());
                     }
                     require_admin(header.admin, a_admin.key)?;
+                }
+
+                // Verify admin on slab_b (#958)
+                {
+                    let data_b = a_slab_b.try_borrow_data()?;
+                    if data_b.len() < HEADER_LEN {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let header_b = state::read_header(&data_b);
+                    if header_b.magic != MAGIC {
+                        return Err(PercolatorError::InvalidMagic.into());
+                    }
+                    require_admin(header_b.admin, a_admin.key)?;
+                }
+
+                // Verify pair_pda derivation (#957/#958)
+                {
+                    let (lo, hi) = if a_slab_a.key.as_ref() < a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
+                    let (expected_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor_pair", lo.as_ref(), hi.as_ref()],
+                        program_id,
+                    );
+                    if *a_pair_pda.key != expected_pda {
+                        msg!("SetOffsetPair: pair_pda derivation mismatch");
+                        return Err(ProgramError::InvalidSeeds);
+                    }
                 }
 
                 // Validate offset_bps (0..=10_000)
@@ -12343,6 +12409,23 @@ pub mod processor {
                 accounts::expect_signer(_a_payer)?;
                 accounts::expect_writable(a_attestation)?;
 
+                // Verify pair_pda derivation (#957)
+                {
+                    let (lo, hi) = if a_slab_a.key.as_ref() < a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
+                    let (expected_pair_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor_pair", lo.as_ref(), hi.as_ref()],
+                        program_id,
+                    );
+                    if *a_pair_pda.key != expected_pair_pda {
+                        msg!("AttestCrossMargin: pair_pda derivation mismatch");
+                        return Err(ProgramError::InvalidSeeds);
+                    }
+                }
+
                 // Read pair config to get offset_bps
                 let pair_data = a_pair_pda.try_borrow_data()?;
                 let pair_cfg = cross_margin::read_offset_pair(&pair_data)
@@ -12379,6 +12462,19 @@ pub mod processor {
                 // Verify both positions belong to the same user
                 if owner_a != owner_b {
                     return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // Verify attestation PDA derivation (#957)
+                {
+                    let user_key = Pubkey::new_from_array(owner_a);
+                    let (expected_att_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor", user_key.as_ref(), a_slab_a.key.as_ref(), a_slab_b.key.as_ref()],
+                        program_id,
+                    );
+                    if *a_attestation.key != expected_att_pda {
+                        msg!("AttestCrossMargin: attestation_pda derivation mismatch");
+                        return Err(ProgramError::InvalidSeeds);
+                    }
                 }
 
                 // Write attestation
