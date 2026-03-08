@@ -6,3 +6,7 @@
 # Security research (gitignored)
 /research/
 /research/**
+
+# Compiled Solana program binaries — never commit .so artifacts to source control.
+# Deploy from target/deploy/ (built by scripts/rebuild-deploy-devnet.sh), not from here.
+deploy-artifacts/*.so
