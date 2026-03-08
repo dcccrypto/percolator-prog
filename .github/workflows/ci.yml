@@ -77,6 +77,13 @@ jobs:
     #   nightly_median_single_price                     (~2h45m — symbolic sort, 5-element array)
     #   nightly_median_within_bounds                    (~slow — SAT-hard symbolic median, was nightly_proof_median_within_bounds)
     #   nightly_circuit_breaker_before_ema              (~3h+ — circuit breaker EMA proof timeout)
+    #   nightly_decimals_9_to_0_scales_down              (~2h41m — full u64 range SAT)
+    #   nightly_decimals_0_to_9_scales_up                (~2h32m — saturating_pow(9)+mul, same SAT pattern)
+    #   nightly_sv_exits_after_duration                  (~3h+ — safety valve symbolic proof)
+    #   nightly_cb_ema_alpha_zero_no_update              (~>2h — bounded range still SAT-hard MUL)
+    #   nightly_ema_mark_no_cap_full_oracle              (~2h46m — compute_ema_mark_price symbolic MUL/DIV)
+    #   nightly_hyperp_ema_converges_full_alpha          (~2h46m — identical structure, same SAT-hard path)
+    #   nightly_ema_mark_identity_at_equilibrium         (~2h55m+ — symbolic MUL/DIV SAT-hard; was nightly_kani_ema_mark_identity_at_equilibrium, renamed to drop kani_ substring)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 180
     steps:

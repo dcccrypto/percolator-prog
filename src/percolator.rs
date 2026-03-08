@@ -9608,6 +9608,36 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
+                // SECURITY (MEDIUM #2): for PumpSwap pools, verify pool.base_mint matches
+                // the market's collateral_mint. Without this check, a caller could pass
+                // any valid PumpSwap pool (e.g., a pool for a different token pair) and
+                // the program would compute prices from that unrelated pool.
+                // This applies only to PumpSwap — Raydium/Meteora use different layouts.
+                if *a_dex_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID {
+                    let pool_data = a_dex_pool.try_borrow_data()?;
+                    // PumpSwap pool account layout (no Anchor discriminator):
+                    //   [0..3]    header — pool_bump (u8), index (u8), and 1 byte flags
+                    //   [3..35]   creator Pubkey (32 bytes)
+                    //   [35..67]  base_mint Pubkey (32 bytes)  ← PUMPSWAP_OFF_BASE_MINT_HYPERP
+                    //   [67..99]  quote_mint Pubkey (32 bytes)
+                    //   [131..163] base_vault Pubkey, [163..195] quote_vault Pubkey
+                    // Canonical constant: oracle::PUMPSWAP_OFF_BASE_MINT = 35 (private to
+                    // oracle mod; duplicated here). Layout cross-referenced with
+                    // PUMPSWAP_MIN_LEN = 195 enforced in oracle::read_pumpswap_price_e6.
+                    const PUMPSWAP_OFF_BASE_MINT_HYPERP: usize = 35;
+                    if pool_data.len() < PUMPSWAP_OFF_BASE_MINT_HYPERP + 32 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let pool_base_mint: [u8; 32] = pool_data
+                        [PUMPSWAP_OFF_BASE_MINT_HYPERP..PUMPSWAP_OFF_BASE_MINT_HYPERP + 32]
+                        .try_into()
+                        .unwrap();
+                    if pool_base_mint != config.collateral_mint {
+                        msg!("UpdateHyperpMark: pool base_mint does not match market collateral_mint");
+                        return Err(PercolatorError::InvalidOracleKey.into());
+                    }
+                }
+
                 // Read spot price AND liquidity from the DEX pool (#297 Fix 1).
                 // Rejects thin pools where an attacker can cheaply manipulate spot price.
                 let remaining = &accounts[3..];
@@ -11453,7 +11483,7 @@ pub mod processor {
         /// No trade is blocked once current_slot >= rebalancing_start_slot + duration.
         #[kani::proof]
         #[kani::unwind(1)]
-        fn proof_safety_valve_exits_after_duration() {
+        fn nightly_sv_exits_after_duration() {
             let duration: u64 = kani::any();
             let start_slot: u64 = kani::any();
             let current_slot: u64 = kani::any();
