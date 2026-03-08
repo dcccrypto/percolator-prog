@@ -6074,7 +6074,7 @@ pub mod cross_margin {
     }
 
     /// Per-user attestation of positions across two slabs.
-    /// PDA seeds: ["cmor", user_pubkey, slab_a, slab_b].
+    /// PDA seeds: ["cmor", user_pubkey, min(slab_a, slab_b), max(slab_a, slab_b)].
     /// Written by permissionless keeper after reading both slabs.
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
@@ -12465,10 +12465,16 @@ pub mod processor {
                 }
 
                 // Verify attestation PDA derivation (#957)
+                // Sort slab keys to ensure canonical PDA regardless of account order
                 {
                     let user_key = Pubkey::new_from_array(owner_a);
+                    let (lo, hi) = if a_slab_a.key.as_ref() < a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
                     let (expected_att_pda, _bump) = Pubkey::find_program_address(
-                        &[b"cmor", user_key.as_ref(), a_slab_a.key.as_ref(), a_slab_b.key.as_ref()],
+                        &[b"cmor", user_key.as_ref(), lo.as_ref(), hi.as_ref()],
                         program_id,
                     );
                     if *a_attestation.key != expected_att_pda {
