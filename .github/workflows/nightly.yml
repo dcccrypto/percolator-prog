@@ -29,7 +29,10 @@ jobs:
       - name: Run slow Kani harnesses (nightly_ prefix)
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
-          # --harness nightly_.* matches all slow harnesses (full-string regex).
-          # Currently: nightly_fee_monotone_in_bps (~2.5h), nightly_fee_monotone_in_notional, nightly_fee_ceil_geq_floor
-          args: --tests --output-format terse --jobs 2 --harness nightly_.*
+          # --harness nightly_ uses Kani's substring filter to match all slow harnesses.
+          # NOTE: Kani --harness does substring matching, NOT regex. Using nightly_.* (with .*)
+          # causes "no harnesses matched" because no function name contains a literal ".*".
+          # Currently: nightly_fee_monotone_in_bps (~2.5h), nightly_fee_monotone_in_notional,
+          # nightly_fee_ceil_geq_floor, nightly_cb_*, nightly_sandwich_*, nightly_ramp_*, etc.
+          args: --tests --output-format terse --jobs 2 --harness nightly_
         timeout-minutes: 295
