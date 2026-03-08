@@ -93,6 +93,10 @@ pub const TAG_EXECUTE_ADL: u8 = 50;
 /// Close a stale slab (wrong size from old program layout) and recover rent SOL.
 /// Skips slab_guard; verifies header magic + admin authority. Admin only.
 pub const TAG_CLOSE_STALE_SLAB: u8 = 51;
+/// Reclaim rent from an uninitialised slab (magic = 0) when market creation fails mid-flow.
+/// The slab account must sign (proves the caller holds the slab keypair).
+/// Cannot close an initialised slab (magic == MAGIC) — use CloseSlab (tag 13) for those.
+pub const TAG_RECLAIM_SLAB_RENT: u8 = 52;
 
 #[cfg(test)]
 mod tests {
@@ -154,6 +158,7 @@ mod tests {
             TAG_CANCEL_QUEUED_WITHDRAWAL,
             TAG_EXECUTE_ADL,
             TAG_CLOSE_STALE_SLAB,
+            TAG_RECLAIM_SLAB_RENT,
         ];
 
         for i in 0..tags.len() {
@@ -219,6 +224,7 @@ mod tests {
             TAG_CANCEL_QUEUED_WITHDRAWAL,
             TAG_EXECUTE_ADL,
             TAG_CLOSE_STALE_SLAB,
+            TAG_RECLAIM_SLAB_RENT,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {

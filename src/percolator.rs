@@ -2150,6 +2150,22 @@ pub mod ix {
         ///
         /// Accounts: [dest(signer,writable), slab(writable)]
         CloseStaleSlabs,
+
+        /// PERC-511: Reclaim rent from an uninitialised slab when market creation fails mid-flow.
+        ///
+        /// This is the self-service recovery path for users whose market creation tx failed
+        /// after the slab account was funded for rent but before InitMarket completed.
+        /// It allows the market creator to reclaim their SOL without admin intervention.
+        ///
+        /// Safety guards:
+        ///   1. slab.owner == program_id
+        ///   2. Slab must be uninitialised: first 8 bytes MUST NOT equal MAGIC ("PERCOLAT").
+        ///      → If magic IS present, the market was initialised; use CloseSlab (tag 13) instead.
+        ///   3. Slab account must be a signer (proves the caller holds the slab keypair).
+        ///   4. Destination must be a signer and writable (receives the reclaimed lamports).
+        ///
+        /// Accounts: [dest(signer,writable), slab(signer,writable)]
+        ReclaimSlabRent,
     }
 
     impl Instruction {
@@ -2581,6 +2597,7 @@ pub mod ix {
                     Ok(Instruction::ExecuteAdl { target_idx })
                 }
                 TAG_CLOSE_STALE_SLAB => Ok(Instruction::CloseStaleSlabs),
+                TAG_RECLAIM_SLAB_RENT => Ok(Instruction::ReclaimSlabRent),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -11467,6 +11484,71 @@ pub mod processor {
                     "CloseStaleSlabs: closed stale slab (size={}) reclaimed {} lamports",
                     slab_len,
                     slab_lamports,
+                );
+            }
+
+            // PERC-511: Reclaim rent from an uninitialised slab.
+            //
+            // Accounts: [dest(signer,writable), slab(signer,writable)]
+            //
+            // This is the self-service recovery path for a market creator whose
+            // CreateMarket tx failed after the slab was funded but before InitMarket
+            // completed. The slab has no stored authority, so ownership is proven
+            // by requiring the slab account itself to sign (the creator retains the
+            // slab keypair in localStorage and includes it as a tx signer).
+            Instruction::ReclaimSlabRent => {
+                accounts::expect_len(accounts, 2)?;
+                let a_dest = &accounts[0];
+                let a_slab = &accounts[1];
+
+                // dest: signer + writable (receives lamports)
+                accounts::expect_signer(a_dest)?;
+                accounts::expect_writable(a_dest)?;
+
+                // slab: signer + writable (proves keypair ownership)
+                accounts::expect_signer(a_slab)?;
+                accounts::expect_writable(a_slab)?;
+
+                // 1. Slab must be owned by this program.
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                // 2. Slab must be uninitialised (magic != MAGIC).
+                //    If magic is present the market was initialised — use CloseSlab (tag 13).
+                let slab_data = a_slab.try_borrow_data()?;
+                let slab_len = slab_data.len();
+                if slab_len >= 8 {
+                    let magic = u64::from_le_bytes(
+                        slab_data[0..8]
+                            .try_into()
+                            .map_err(|_| PercolatorError::InvalidMagic)?,
+                    );
+                    if magic == MAGIC {
+                        // Market was successfully initialised — cannot reclaim this way.
+                        return Err(PercolatorError::AlreadyInitialized.into());
+                    }
+                }
+                drop(slab_data); // release borrow before mutations
+
+                // Zero the slab data to prevent data residue exposure.
+                {
+                    let mut data = a_slab.try_borrow_mut_data()?;
+                    data.fill(0);
+                }
+
+                // Drain all lamports from the slab to the destination.
+                let slab_lamports = a_slab.lamports();
+                **a_slab.lamports.borrow_mut() = 0;
+                **a_dest.lamports.borrow_mut() = a_dest
+                    .lamports()
+                    .checked_add(slab_lamports)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                msg!(
+                    "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab (size={})",
+                    slab_lamports,
+                    slab_len,
                 );
             }
 
