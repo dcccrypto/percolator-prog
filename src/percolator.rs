@@ -3634,22 +3634,26 @@ pub mod state {
         config._orphan_pad[1] = bytes[1];
     }
 
-    /// Read the slot at which AuditCrank last paused the market from
-    /// `_rebalancing_pad[0..6]` (48-bit little-endian u64 — sufficient for
-    /// centuries of Solana slots).
-    /// 0 = never paused via AuditCrank.
+    /// Read last audit slot (truncated to u32) from `_orphan_pad[2..6]`.
+    /// Used for AuditCrank cooldown to prevent permissionless DoS (#959).
     #[inline]
-    pub fn read_last_audit_pause_slot(config: &MarketConfig) -> u64 {
-        let mut buf = [0u8; 8];
-        buf[..6].copy_from_slice(&config._rebalancing_pad[..6]);
-        u64::from_le_bytes(buf)
+    pub fn read_last_audit_slot(config: &MarketConfig) -> u32 {
+        u32::from_le_bytes([
+            config._orphan_pad[2],
+            config._orphan_pad[3],
+            config._orphan_pad[4],
+            config._orphan_pad[5],
+        ])
     }
 
-    /// Write the last AuditCrank pause slot into `_rebalancing_pad[0..6]`.
+    /// Write last audit slot (truncated to u32) into `_orphan_pad[2..6]`.
     #[inline]
-    pub fn write_last_audit_pause_slot(config: &mut MarketConfig, slot: u64) {
+    pub fn write_last_audit_slot(config: &mut MarketConfig, slot: u32) {
         let bytes = slot.to_le_bytes();
-        config._rebalancing_pad[..6].copy_from_slice(&bytes[..6]);
+        config._orphan_pad[2] = bytes[0];
+        config._orphan_pad[3] = bytes[1];
+        config._orphan_pad[4] = bytes[2];
+        config._orphan_pad[5] = bytes[3];
     }
 }
 
@@ -12210,6 +12214,19 @@ pub mod processor {
 
                 let engine = zc::engine_ref(&data)?;
 
+                // Cooldown: prevent audit spam / DoS (#959)
+                // Minimum 150 slots (~1 minute at 400ms) between audits.
+                const AUDIT_COOLDOWN_SLOTS: u32 = 150;
+                let current_slot_trunc = engine.current_slot as u32;
+                let config = state::read_config(&data);
+                let last_audit = state::read_last_audit_slot(&config);
+                if current_slot_trunc.wrapping_sub(last_audit) < AUDIT_COOLDOWN_SLOTS
+                    && last_audit != 0
+                {
+                    msg!("AUDIT_CRANK: cooldown active, try again later");
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
                 // Walk all accounts and compute running aggregates
                 let mut sum_capital: i128 = 0;
                 let mut sum_pnl_pos: u128 = 0;
@@ -12276,29 +12293,11 @@ pub mod processor {
                 }
 
                 // Write audit result and optionally pause.
-                // #959: Cooldown guard — AuditCrank may not re-pause a market
-                // within AUDIT_CRANK_COOLDOWN_SLOTS of the previous pause to
-                // prevent a permissionless DoS via false/transient invariant
-                // triggers. 150 slots ≈ 60 s on mainnet (400 ms/slot).
-                const AUDIT_CRANK_COOLDOWN_SLOTS: u64 = 150;
-                let current_slot = Clock::get()?.slot;
-                let mut config = state::read_config(&data);
+                // Cooldown was already checked early above (#959); just update slot.
+                let mut config = state::read_config(&data);  // re-read for mutation
+                state::write_last_audit_slot(&mut config, current_slot_trunc);
                 if violation {
-                    let last_pause = state::read_last_audit_pause_slot(&config);
-                    if current_slot.saturating_sub(last_pause) < AUDIT_CRANK_COOLDOWN_SLOTS {
-                        // Cooldown active — log violation but do not pause.
-                        // Prevents rapid repeated DoS via marginal invariant drift.
-                        msg!(
-                            "AUDIT_CRANK: violation detected but cooldown active \
-                             (last_pause={} current={} cooldown={})",
-                            last_pause,
-                            current_slot,
-                            AUDIT_CRANK_COOLDOWN_SLOTS,
-                        );
-                        return Err(PercolatorError::AuditViolation.into());
-                    }
                     state::write_audit_status(&mut config, 0xFFFF);
-                    state::write_last_audit_pause_slot(&mut config, current_slot);
                     state::set_paused(&mut data, true);
                     state::write_config(&mut data, &config);
                     msg!("AUDIT_CRANK: VIOLATION DETECTED — market paused");
@@ -12339,8 +12338,7 @@ pub mod processor {
                     require_admin(header.admin, a_admin.key)?;
                 }
 
-                // #958: Verify admin on slab_b — prevents cross-admin pair manipulation
-                // where slab_a admin could register a pair with an unrelated slab_b.
+                // #958: Verify admin on slab_b — prevents cross-admin pair manipulation where slab_a admin could register a pair with an unrelated slab_b.
                 {
                     let data_b = a_slab_b.try_borrow_data()?;
                     if data_b.len() < HEADER_LEN {
@@ -12370,6 +12368,7 @@ pub mod processor {
                         program_id,
                     );
                     if a_pair_pda.key != &expected_pda {
+                        msg!("SetOffsetPair: pair_pda derivation mismatch");
                         return Err(ProgramError::InvalidSeeds);
                     }
                 }
@@ -12415,6 +12414,23 @@ pub mod processor {
 
                 accounts::expect_signer(_a_payer)?;
                 accounts::expect_writable(a_attestation)?;
+
+                // Verify pair_pda derivation (#957)
+                {
+                    let (lo, hi) = if a_slab_a.key.as_ref() < a_slab_b.key.as_ref() {
+                        (a_slab_a.key, a_slab_b.key)
+                    } else {
+                        (a_slab_b.key, a_slab_a.key)
+                    };
+                    let (expected_pair_pda, _bump) = Pubkey::find_program_address(
+                        &[b"cmor_pair", lo.as_ref(), hi.as_ref()],
+                        program_id,
+                    );
+                    if *a_pair_pda.key != expected_pair_pda {
+                        msg!("AttestCrossMargin: pair_pda derivation mismatch");
+                        return Err(ProgramError::InvalidSeeds);
+                    }
+                }
 
                 // Read pair config to get offset_bps
                 let pair_data = a_pair_pda.try_borrow_data()?;
@@ -12476,7 +12492,8 @@ pub mod processor {
                 // #957: Verify PDA derivation of a_attestation — prevents account
                 // substitution where the caller writes to an arbitrary writable account
                 // rather than the canonical per-user attestation PDA.
-                // Seeds: ["cmor", owner, slab_a, slab_b]  (keys in canonical order)
+                // Seeds: ["cmor", owner, min(slab_a, slab_b), max(slab_a, slab_b)]
+                // Sort ensures canonical derivation regardless of account order.
                 {
                     let (slab_min, slab_max) =
                         if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
@@ -12495,6 +12512,7 @@ pub mod processor {
                         program_id,
                     );
                     if a_attestation.key != &expected_att_pda {
+                        msg!("AttestCrossMargin: attestation_pda derivation mismatch");
                         return Err(ProgramError::InvalidSeeds);
                     }
                 }
