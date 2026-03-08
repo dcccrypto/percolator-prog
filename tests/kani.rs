@@ -3702,8 +3702,10 @@ fn nightly_hyperp_ema_converges_full_alpha() {
 }
 
 /// EMA monotone convergence: if oracle > mark, each step increases mark.
+/// Moved to nightly_ — symbolic alpha + mark + oracle triple causes SAT solver
+/// to explore exponential state space in compute_ema_mark_price, timing out >2h on PR CI.
 #[kani::proof]
-fn kani_hyperp_ema_monotone_up() {
+fn nightly_hyperp_ema_monotone_up() {
     let mark_prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     let alpha_e6: u64 = kani::any();
@@ -3724,8 +3726,10 @@ fn kani_hyperp_ema_monotone_up() {
 }
 
 /// EMA monotone convergence: if oracle < mark, each step decreases mark.
+/// Moved to nightly_ — same SAT-hard pattern as nightly_hyperp_ema_monotone_up,
+/// confirmed timeout >2h on PR CI run 22812336002.
 #[kani::proof]
-fn kani_hyperp_ema_monotone_down() {
+fn nightly_hyperp_ema_monotone_down() {
     let mark_prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     let alpha_e6: u64 = kani::any();
