@@ -83,6 +83,7 @@ jobs:
     #   nightly_cb_ema_alpha_zero_no_update              (~>2h — bounded range still SAT-hard MUL)
     #   nightly_ema_mark_no_cap_full_oracle              (~2h46m — compute_ema_mark_price symbolic MUL/DIV)
     #   nightly_hyperp_ema_converges_full_alpha          (~2h46m — identical structure, same SAT-hard path)
+    #   nightly_ema_mark_identity_at_equilibrium         (~2h55m+ — symbolic MUL/DIV SAT-hard; was nightly_kani_ema_mark_identity_at_equilibrium, renamed to drop kani_ substring)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 180
     steps:
