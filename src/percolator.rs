@@ -281,14 +281,17 @@ pub fn compute_inventory_funding_bps_per_slot(
     let linear_bps_u: u128 = notional_e6.saturating_mul(funding_k_bps as u128) / scale;
 
     // Quadratic component: k2 * (notional / scale)^2
-    // skew_ratio = notional / scale (dimensionless, in e6-ish range)
+    // #982: Use fixed-point to avoid precision loss on small skew ratios.
+    // Scale up by 1e6 before dividing, then normalize after squaring.
+    const QUAD_PRECISION: u128 = 1_000_000;
     let quadratic_bps_u: u128 = if funding_k2_bps > 0 {
-        let skew_ratio = notional_e6 / scale;
-        // k2 * skew_ratio^2, with overflow protection
-        skew_ratio
-            .saturating_mul(skew_ratio)
+        // skew_ratio_fp = notional * PRECISION / scale (fixed-point, ~e6 range)
+        let skew_ratio_fp = notional_e6.saturating_mul(QUAD_PRECISION) / scale;
+        // k2 * (skew_ratio_fp)^2 / (PRECISION^2 * 10_000)
+        skew_ratio_fp
+            .saturating_mul(skew_ratio_fp)
             .saturating_mul(funding_k2_bps as u128)
-            / 10_000 // normalize k2 from bps
+            / (QUAD_PRECISION.saturating_mul(QUAD_PRECISION).saturating_mul(10_000))
     } else {
         0
     };
@@ -2523,6 +2526,14 @@ pub mod ix {
                     let thresh_min = read_u128(&mut rest)?;
                     let thresh_max = read_u128(&mut rest)?;
                     let thresh_min_step = read_u128(&mut rest)?;
+                    // #983: Validate optional tail length to prevent partial config
+                    // corruption from truncated payloads.
+                    // Valid tail sizes: 0 (no optional), 8+8+8+8=32 (premium params),
+                    // 32+2=34 (premium + k2).
+                    const VALID_CONFIG_TAIL_LENS: &[usize] = &[0, 32, 34];
+                    if !VALID_CONFIG_TAIL_LENS.contains(&rest.len()) {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     // PERC-121: Premium funding params (optional for backward compat)
                     let funding_premium_weight_bps = read_u64(&mut rest).unwrap_or(0);
                     let funding_settlement_interval_slots = read_u64(&mut rest).unwrap_or(0);
@@ -3649,9 +3660,11 @@ pub mod state {
     }
 
     /// Read last volatility oracle price from `_insurance_isolation_padding[8..12]`.
-    /// Stored as u32 in e6 format. 0 = no previous price.
+    /// Stored as u32 in **e3** format (price_e6 / 1000). Max ~$4.29M.
+    /// 0 = no previous price.
+    /// (#980: changed from e6 to e3 to support BTC/ETH-priced markets)
     #[inline]
-    pub fn get_last_vol_price_e6(config: &MarketConfig) -> u32 {
+    pub fn get_last_vol_price_e3(config: &MarketConfig) -> u32 {
         u32::from_le_bytes([
             config._insurance_isolation_padding[8],
             config._insurance_isolation_padding[9],
@@ -3661,9 +3674,10 @@ pub mod state {
     }
 
     /// Write last volatility oracle price into `_insurance_isolation_padding[8..12]`.
+    /// Stores in **e3** format (price_e6 / 1000).
     #[inline]
-    pub fn set_last_vol_price_e6(config: &mut MarketConfig, price: u32) {
-        let bytes = price.to_le_bytes();
+    pub fn set_last_vol_price_e3(config: &mut MarketConfig, price_e3: u32) {
+        let bytes = price_e3.to_le_bytes();
         config._insurance_isolation_padding[8] = bytes[0];
         config._insurance_isolation_padding[9] = bytes[1];
         config._insurance_isolation_padding[10] = bytes[2];
@@ -7793,16 +7807,19 @@ pub mod processor {
                 {
                     let vol_scale = state::get_vol_margin_scale_bps(&config);
                     if vol_scale > 0 && price > 0 {
-                        let prev_price = state::get_last_vol_price_e6(&config);
-                        if prev_price > 0 {
-                            // r_t = (price - prev_price) * 1e6 / prev_price
-                            let p = price as i64;
-                            let pp = prev_price as i64;
+                        let prev_price_e3 = state::get_last_vol_price_e3(&config);
+                        if prev_price_e3 > 0 {
+                            // #980: Use e3-scaled prices for return calculation.
+                            // r_t = (p - pp) * 1e6 / pp — ratio is scale-invariant.
+                            let price_e3 = (price / 1000) as i64; // price is e6, divide to e3
+                            let p = price_e3;
+                            let pp = prev_price_e3 as i64;
                             let return_e6 =
                                 ((p - pp) as i128).saturating_mul(1_000_000) / (pp as i128).max(1);
-                            // r_t^2 in e12 units
-                            let r_sq_e12 = (return_e6.saturating_mul(return_e6)) as u64;
-                            let r_sq_e12_u32 = r_sq_e12.min(u32::MAX as u64) as u32;
+                            // r_t^2 in e12 units — clamp in i128 before downcast (#979)
+                            let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
+                            let r_sq_e12_u32 =
+                                r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
                             let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
                             let old_ewmv = state::get_ewmv_e12(&config);
                             // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
@@ -7814,11 +7831,9 @@ pub mod processor {
                                     .min(u32::MAX as u64) as u32;
                             state::set_ewmv_e12(&mut config, new_ewmv);
                         }
-                        // Store current price for next return calculation
-                        state::set_last_vol_price_e6(
-                            &mut config,
-                            (price as u64).min(u32::MAX as u64) as u32,
-                        );
+                        // Store current price for next return calculation (e3 format)
+                        let price_e3_store = (price / 1000).min(u32::MAX as u64) as u32;
+                        state::set_last_vol_price_e3(&mut config, price_e3_store);
                     }
                 }
 
@@ -12459,9 +12474,14 @@ pub mod processor {
                     violation = true;
                 }
 
-                // Invariant 5: vault >= c_tot + insurance_fund.balance (solvency)
+                // Invariant 5: vault >= c_tot + insurance (global + isolated) (solvency)
+                // #981: Include isolated_balance in solvency check
                 let vault = engine.vault.get();
-                let insurance_balance = engine.insurance_fund.balance.get();
+                let insurance_balance = engine
+                    .insurance_fund
+                    .balance
+                    .get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get());
                 let required = (c_tot as u128).saturating_add(insurance_balance);
                 if (vault as u128) < required {
                     msg!("AUDIT_VIOLATION: solvency");
