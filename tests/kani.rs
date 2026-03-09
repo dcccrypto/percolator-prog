@@ -3771,7 +3771,7 @@ fn nightly_ema_mark_identity_at_equilibrium() {
 /// EMA cap bound is monotone in dt_slots: more time allows more movement.
 #[kani::proof]
 #[kani::unwind(1)]
-fn kani_mark_cap_bound_monotone_in_dt() {
+fn nightly_mark_cap_bound_monotone_in_dt() {
     let mark_prev: u64 = kani::any();
     let cap_e2bps: u64 = kani::any();
     let dt_a: u64 = kani::any();
