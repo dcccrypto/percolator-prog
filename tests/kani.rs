@@ -4460,8 +4460,9 @@ fn kani_cb_ema_alpha_full_jumps_to_oracle() {
 }
 
 /// Sub-proof (b): Trigger threshold check — breaker fires for out-of-bound oracle.
+/// SAT-hard (4 symbolic u64 inputs + u128 mul/div chain) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_cb_trigger_fires_correctly() {
+fn nightly_cb_trigger_fires_correctly() {
     let prev_mark: u64 = kani::any();
     let raw_oracle: u64 = kani::any();
     let cap_e2bps: u64 = kani::any();
