@@ -3548,7 +3548,12 @@ pub mod state {
     /// Read last volatility oracle price from `_insurance_isolation_padding[8..12]`.
     /// Stored as u32 in e6 format. 0 = no previous price.
     #[inline]
-    pub fn get_last_vol_price_e6(config: &MarketConfig) -> u32 {
+    /// Read last volatility oracle price from `_insurance_isolation_padding[8..12]`.
+    ///
+    /// #980: Price is stored as u32 in **e2** units (price_e6 / 10_000) to support
+    /// assets up to ~$429,496. The return calculation r_t = (p-pp)/pp is scale-invariant,
+    /// so using e2 vs e6 doesn't affect VRAM correctness.
+    pub fn get_last_vol_price_e2(config: &MarketConfig) -> u32 {
         u32::from_le_bytes([
             config._insurance_isolation_padding[8],
             config._insurance_isolation_padding[9],
@@ -3558,9 +3563,10 @@ pub mod state {
     }
 
     /// Write last volatility oracle price into `_insurance_isolation_padding[8..12]`.
+    /// Stores price_e6 / 10_000 (e2 units) for u32 range.
     #[inline]
-    pub fn set_last_vol_price_e6(config: &mut MarketConfig, price: u32) {
-        let bytes = price.to_le_bytes();
+    pub fn set_last_vol_price_e2(config: &mut MarketConfig, price_e2: u32) {
+        let bytes = price_e2.to_le_bytes();
         config._insurance_isolation_padding[8] = bytes[0];
         config._insurance_isolation_padding[9] = bytes[1];
         config._insurance_isolation_padding[10] = bytes[2];
@@ -7669,16 +7675,21 @@ pub mod processor {
                 {
                     let vol_scale = state::get_vol_margin_scale_bps(&config);
                     if vol_scale > 0 && price > 0 {
-                        let prev_price = state::get_last_vol_price_e6(&config);
+                        // #980: Use e2 scaling (price_e6 / 10_000) for u32 storage
+                        // supports assets up to ~$429,496. Return calc is scale-invariant.
+                        let price_e2 = (price as u64 / 10_000).min(u32::MAX as u64) as u32;
+                        let prev_price = state::get_last_vol_price_e2(&config);
                         if prev_price > 0 {
                             // r_t = (price - prev_price) * 1e6 / prev_price
-                            let p = price as i64;
+                            let p = price_e2 as i64;
                             let pp = prev_price as i64;
                             let return_e6 =
                                 ((p - pp) as i128).saturating_mul(1_000_000) / (pp as i128).max(1);
                             // r_t^2 in e12 units
-                            let r_sq_e12 = (return_e6.saturating_mul(return_e6)) as u64;
-                            let r_sq_e12_u32 = r_sq_e12.min(u32::MAX as u64) as u32;
+                            // #979: Clamp in i128 before downcast to avoid u64 wrap on extreme vol
+                            let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
+                            let r_sq_e12_u32 =
+                                r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
                             let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
                             let old_ewmv = state::get_ewmv_e12(&config);
                             // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
@@ -7691,10 +7702,7 @@ pub mod processor {
                             state::set_ewmv_e12(&mut config, new_ewmv);
                         }
                         // Store current price for next return calculation
-                        state::set_last_vol_price_e6(
-                            &mut config,
-                            (price as u64).min(u32::MAX as u64) as u32,
-                        );
+                        state::set_last_vol_price_e2(&mut config, price_e2);
                     }
                 }
 
