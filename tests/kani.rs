@@ -4446,8 +4446,23 @@ fn nightly_cb_ema_alpha_zero_no_update() {
 }
 
 /// Sub-proof (a3): EMA alpha=1_000_000 means full jump to oracle.
+/// Tightened bounds for CI budget — full-range version in nightly.
 #[kani::proof]
+#[kani::unwind(1)]
 fn kani_cb_ema_alpha_full_jumps_to_oracle() {
+    let prev: u64 = kani::any();
+    let oracle: u64 = kani::any();
+    kani::assume(prev > 0 && prev <= 10_000_000);
+    kani::assume(oracle > 0 && oracle <= 10_000_000);
+
+    let result = ema_step_unclamped(prev, oracle, 1_000_000);
+
+    assert_eq!(result, oracle, "alpha=1.0 must jump to oracle");
+}
+
+/// Full-range version of alpha=1 jump proof — SAT-heavy, nightly only.
+#[kani::proof]
+fn nightly_cb_ema_alpha_full_jumps_to_oracle() {
     let prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     kani::assume(prev > 0 && prev <= 1_000_000_000);
@@ -4459,8 +4474,9 @@ fn kani_cb_ema_alpha_full_jumps_to_oracle() {
 }
 
 /// Sub-proof (b): Trigger threshold check — breaker fires for out-of-bound oracle.
+/// SAT-hard (4 symbolic u64 inputs through mul/div) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_cb_trigger_fires_correctly() {
+fn nightly_cb_trigger_fires_correctly() {
     let prev_mark: u64 = kani::any();
     let raw_oracle: u64 = kani::any();
     let cap_e2bps: u64 = kani::any();
