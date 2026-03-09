@@ -279,14 +279,25 @@ pub fn compute_inventory_funding_bps_per_slot(
     let linear_bps_u: u128 = notional_e6.saturating_mul(funding_k_bps as u128) / scale;
 
     // Quadratic component: k2 * (notional / scale)^2
-    // skew_ratio = notional / scale (dimensionless, in e6-ish range)
+    // #982: Avoid integer division before squaring — compute in higher precision
+    // Formula: k2_bps * notional^2 / (scale^2 * 10_000)
     let quadratic_bps_u: u128 = if funding_k2_bps > 0 {
-        let skew_ratio = notional_e6 / scale;
-        // k2 * skew_ratio^2, with overflow protection
-        skew_ratio
-            .saturating_mul(skew_ratio)
-            .saturating_mul(funding_k2_bps as u128)
-            / 10_000 // normalize k2 from bps
+        // Use u128 saturating ops; notional^2 / scale^2 can't overflow u128 in practice
+        // because notional and scale are both <= ~2^64
+        let n_over_s_hi = notional_e6 / scale; // high part for overflow guard
+        if n_over_s_hi < (1u128 << 50) {
+            // Safe to compute notional^2 without overflow
+            notional_e6.saturating_mul(notional_e6) / scale.saturating_mul(scale).max(1)
+                * (funding_k2_bps as u128)
+                / 10_000
+        } else {
+            // Fallback: split to avoid u128 overflow
+            let skew_ratio = notional_e6 / scale;
+            skew_ratio
+                .saturating_mul(skew_ratio)
+                .saturating_mul(funding_k2_bps as u128)
+                / 10_000
+        }
     } else {
         0
     };
@@ -2420,13 +2431,41 @@ pub mod ix {
                     let thresh_min = read_u128(&mut rest)?;
                     let thresh_max = read_u128(&mut rest)?;
                     let thresh_min_step = read_u128(&mut rest)?;
+                    // #983: Validate tail length to prevent partial/corrupted updates.
+                    // Tail fields: premium_weight(8) + settlement_interval(8) +
+                    //   dampening(8) + premium_max(8) + k2(2) = 34 bytes total.
+                    // Valid: 0 (none), 8, 16, 24, 32 (all u64s), 34 (+ k2).
+                    const VALID_CONFIG_TAIL_LENS: &[usize] = &[0, 8, 16, 24, 32, 34];
+                    if !VALID_CONFIG_TAIL_LENS.contains(&rest.len()) {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     // PERC-121: Premium funding params (optional for backward compat)
-                    let funding_premium_weight_bps = read_u64(&mut rest).unwrap_or(0);
-                    let funding_settlement_interval_slots = read_u64(&mut rest).unwrap_or(0);
-                    let funding_premium_dampening_e6 = read_u64(&mut rest).unwrap_or(1_000_000);
-                    let funding_premium_max_bps_per_slot = read_i64(&mut rest).unwrap_or(5);
+                    let funding_premium_weight_bps = if rest.is_empty() {
+                        0
+                    } else {
+                        read_u64(&mut rest)?
+                    };
+                    let funding_settlement_interval_slots = if rest.is_empty() {
+                        0
+                    } else {
+                        read_u64(&mut rest)?
+                    };
+                    let funding_premium_dampening_e6 = if rest.is_empty() {
+                        1_000_000
+                    } else {
+                        read_u64(&mut rest)?
+                    };
+                    let funding_premium_max_bps_per_slot = if rest.is_empty() {
+                        5
+                    } else {
+                        read_i64(&mut rest)?
+                    };
                     // Quadratic funding convexity k2 (optional, backward compatible)
-                    let funding_k2_bps = read_u16(&mut rest).unwrap_or(0);
+                    let funding_k2_bps = if rest.is_empty() {
+                        0
+                    } else {
+                        read_u16(&mut rest)?
+                    };
                     Ok(Instruction::UpdateConfig {
                         funding_horizon_slots,
                         funding_k_bps,
@@ -12266,8 +12305,13 @@ pub mod processor {
                 }
 
                 // Invariant 5: vault >= c_tot + insurance_fund.balance (solvency)
+                // #981: Include isolated_balance in solvency check
                 let vault = engine.vault.get();
-                let insurance_balance = engine.insurance_fund.balance.get();
+                let insurance_balance = engine
+                    .insurance_fund
+                    .balance
+                    .get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get());
                 let required = (c_tot as u128).saturating_add(insurance_balance);
                 if (vault as u128) < required {
                     msg!("AUDIT_VIOLATION: solvency");
