@@ -12552,24 +12552,47 @@ pub mod processor {
                 // writable account instead of the canonical PDA.
                 // Seeds: ["cmor_pair", min(slab_a, slab_b), max(slab_a, slab_b)]
                 // Keys are ordered lexicographically so the PDA is symmetric.
-                {
-                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                let (slab_min_pair, slab_max_pair) =
+                    if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
                         (a_slab_a.key, a_slab_b.key)
                     } else {
                         (a_slab_b.key, a_slab_a.key)
                     };
-                    let (expected_pda, _bump) = Pubkey::find_program_address(
-                        &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
-                        program_id,
-                    );
-                    if a_pair_pda.key != &expected_pda {
-                        return Err(ProgramError::InvalidSeeds);
-                    }
+                let (expected_pda, pair_bump) = Pubkey::find_program_address(
+                    &[b"cmor_pair", slab_min_pair.as_ref(), slab_max_pair.as_ref()],
+                    program_id,
+                );
+                if a_pair_pda.key != &expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
                 }
 
                 // Validate offset_bps (0..=10_000)
                 if offset_bps > 10_000 {
                     return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
+                // #977: Create PDA if it doesn't exist yet
+                if a_pair_pda.data_is_empty() {
+                    let lamports = solana_program::rent::Rent::get()?
+                        .minimum_balance(cross_margin::OFFSET_PAIR_LEN);
+                    let bump_bytes = [pair_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        b"cmor_pair",
+                        slab_min_pair.as_ref(),
+                        slab_max_pair.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_admin.key,
+                            &expected_pda,
+                            lamports,
+                            cross_margin::OFFSET_PAIR_LEN as u64,
+                            program_id,
+                        ),
+                        &[a_admin.clone(), a_pair_pda.clone()],
+                        &[signer_seeds],
+                    )?;
                 }
 
                 // Write pair config
@@ -12669,25 +12692,50 @@ pub mod processor {
                 // substitution where the caller writes to an arbitrary writable account
                 // rather than the canonical per-user attestation PDA.
                 // Seeds: ["cmor", owner, slab_a, slab_b]  (keys in canonical order)
+                let (slab_min_att, slab_max_att) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref()
                 {
-                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                        (a_slab_a.key, a_slab_b.key)
-                    } else {
-                        (a_slab_b.key, a_slab_a.key)
-                    };
-                    let owner_key = Pubkey::from(owner_a);
-                    let (expected_att_pda, _bump) = Pubkey::find_program_address(
-                        &[
-                            b"cmor",
-                            owner_key.as_ref(),
-                            slab_min.as_ref(),
-                            slab_max.as_ref(),
-                        ],
-                        program_id,
-                    );
-                    if a_attestation.key != &expected_att_pda {
-                        return Err(ProgramError::InvalidSeeds);
-                    }
+                    (a_slab_a.key, a_slab_b.key)
+                } else {
+                    (a_slab_b.key, a_slab_a.key)
+                };
+                let owner_key = Pubkey::from(owner_a);
+                let (expected_att_pda, att_bump) = Pubkey::find_program_address(
+                    &[
+                        b"cmor",
+                        owner_key.as_ref(),
+                        slab_min_att.as_ref(),
+                        slab_max_att.as_ref(),
+                    ],
+                    program_id,
+                );
+                if a_attestation.key != &expected_att_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // #977: Create attestation PDA if it doesn't exist yet
+                if a_attestation.data_is_empty() {
+                    let a_payer = &accounts[0];
+                    let lamports = solana_program::rent::Rent::get()?
+                        .minimum_balance(cross_margin::ATTESTATION_LEN);
+                    let bump_bytes = [att_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        b"cmor",
+                        owner_key.as_ref(),
+                        slab_min_att.as_ref(),
+                        slab_max_att.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_payer.key,
+                            &expected_att_pda,
+                            lamports,
+                            cross_margin::ATTESTATION_LEN as u64,
+                            program_id,
+                        ),
+                        &[a_payer.clone(), a_attestation.clone()],
+                        &[signer_seeds],
+                    )?;
                 }
 
                 // Write attestation
