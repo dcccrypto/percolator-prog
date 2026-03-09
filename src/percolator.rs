@@ -279,14 +279,17 @@ pub fn compute_inventory_funding_bps_per_slot(
     let linear_bps_u: u128 = notional_e6.saturating_mul(funding_k_bps as u128) / scale;
 
     // Quadratic component: k2 * (notional / scale)^2
-    // skew_ratio = notional / scale (dimensionless, in e6-ish range)
+    // #982: Use fixed-point arithmetic to avoid precision loss when notional < scale.
+    // Scale by 1e6 before dividing, then square, then normalize back.
+    const QUAD_PRECISION: u128 = 1_000_000;
     let quadratic_bps_u: u128 = if funding_k2_bps > 0 {
-        let skew_ratio = notional_e6 / scale;
-        // k2 * skew_ratio^2, with overflow protection
-        skew_ratio
-            .saturating_mul(skew_ratio)
+        // skew_ratio_fp = notional * PRECISION / scale  (in PRECISION units)
+        let skew_ratio_fp = notional_e6.saturating_mul(QUAD_PRECISION) / scale;
+        // quad = k2 * skew_ratio_fp^2 / (10_000 * PRECISION^2)
+        skew_ratio_fp
+            .saturating_mul(skew_ratio_fp)
             .saturating_mul(funding_k2_bps as u128)
-            / 10_000 // normalize k2 from bps
+            / (10_000u128.saturating_mul(QUAD_PRECISION).saturating_mul(QUAD_PRECISION))
     } else {
         0
     };
@@ -2420,13 +2423,45 @@ pub mod ix {
                     let thresh_min = read_u128(&mut rest)?;
                     let thresh_max = read_u128(&mut rest)?;
                     let thresh_min_step = read_u128(&mut rest)?;
+                    // #983: Validate tail length to prevent partial/malformed config updates.
+                    // Valid optional tail lengths (bytes remaining after required fields):
+                    //   0  — base config only
+                    //   8  — + funding_premium_weight_bps (u64)
+                    //  16  — + funding_settlement_interval_slots (u64)
+                    //  24  — + funding_premium_dampening_e6 (u64)
+                    //  32  — + funding_premium_max_bps_per_slot (i64)
+                    //  34  — + funding_k2_bps (u16)
+                    const VALID_CONFIG_TAIL_LENS: &[usize] = &[0, 8, 16, 24, 32, 34];
+                    if !VALID_CONFIG_TAIL_LENS.contains(&rest.len()) {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     // PERC-121: Premium funding params (optional for backward compat)
-                    let funding_premium_weight_bps = read_u64(&mut rest).unwrap_or(0);
-                    let funding_settlement_interval_slots = read_u64(&mut rest).unwrap_or(0);
-                    let funding_premium_dampening_e6 = read_u64(&mut rest).unwrap_or(1_000_000);
-                    let funding_premium_max_bps_per_slot = read_i64(&mut rest).unwrap_or(5);
+                    let funding_premium_weight_bps = if !rest.is_empty() {
+                        read_u64(&mut rest)?
+                    } else {
+                        0
+                    };
+                    let funding_settlement_interval_slots = if !rest.is_empty() {
+                        read_u64(&mut rest)?
+                    } else {
+                        0
+                    };
+                    let funding_premium_dampening_e6 = if !rest.is_empty() {
+                        read_u64(&mut rest)?
+                    } else {
+                        1_000_000
+                    };
+                    let funding_premium_max_bps_per_slot = if !rest.is_empty() {
+                        read_i64(&mut rest)?
+                    } else {
+                        5
+                    };
                     // Quadratic funding convexity k2 (optional, backward compatible)
-                    let funding_k2_bps = read_u16(&mut rest).unwrap_or(0);
+                    let funding_k2_bps = if !rest.is_empty() {
+                        read_u16(&mut rest)?
+                    } else {
+                        0
+                    };
                     Ok(Instruction::UpdateConfig {
                         funding_horizon_slots,
                         funding_k_bps,
