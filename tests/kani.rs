@@ -5915,9 +5915,11 @@ fn proof_lp_collateral_liquidation_triggers_on_tvl_drop() {
 
 /// Prove: LP token price derived from vault, not user input.
 /// (lp_token_value reads vault_tvl/total_supply, never instruction data)
+/// NOTE: Renamed to nightly_ — lp_token_value symbolic reasoning over three u64/u128
+/// variables exceeds the PR CI 45-min budget; moved to nightly.yml only.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_lp_token_price_from_vault_not_user_input() {
+fn nightly_lp_token_price_from_vault_not_user_input() {
     use percolator_prog::lp_collateral::lp_token_value;
 
     let lp_amount: u64 = kani::any();
@@ -5966,9 +5968,11 @@ fn proof_isolated_balance_never_negative() {
 }
 
 /// Prove: global fund draw bounded by isolation BPS.
+/// NOTE: Renamed to nightly_ — u128 * u128 / 10_000 symbolic reasoning takes ~617s on
+/// the CI runner; too slow for PR CI 45-min budget. Moved to nightly.yml only.
 #[cfg(kani)]
 #[kani::proof]
-fn proof_global_draw_bounded_by_isolation_bps() {
+fn nightly_global_draw_bounded_by_isolation_bps() {
     let global_fund: u128 = kani::any();
     let isolation_bps: u16 = kani::any();
 
