@@ -5546,7 +5546,10 @@ fn test_tranche_waterfall_updates_total_capital_junior_absorbs() {
     assert_eq!(realized, 100_000);
     assert_eq!(state.junior_capital(), 300_000);
     assert_eq!(state.senior_capital(), 600_000);
-    assert_eq!(state.total_capital, 900_000, "total_capital must decrease by realized loss");
+    assert_eq!(
+        state.total_capital, 900_000,
+        "total_capital must decrease by realized loss"
+    );
 }
 
 #[test]
@@ -5562,7 +5565,10 @@ fn test_tranche_waterfall_updates_total_capital_cascades_to_senior() {
     assert_eq!(realized, 500_000);
     assert_eq!(state.junior_capital(), 0);
     assert_eq!(state.senior_capital(), 500_000);
-    assert_eq!(state.total_capital, 500_000, "total_capital must decrease by realized loss");
+    assert_eq!(
+        state.total_capital, 500_000,
+        "total_capital must decrease by realized loss"
+    );
 }
 
 #[test]
