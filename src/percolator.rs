@@ -7669,16 +7669,19 @@ pub mod processor {
                 {
                     let vol_scale = state::get_vol_margin_scale_bps(&config);
                     if vol_scale > 0 && price > 0 {
-                        let prev_price = state::get_last_vol_price_e6(&config);
-                        if prev_price > 0 {
+                        // #980: Store price / 1000 to fit u32 (max ~$4.29M e3 vs ~$4295 e6)
+                        let prev_price_e3 = state::get_last_vol_price_e6(&config);
+                        let price_e3 = (price as u64 / 1000).min(u32::MAX as u64) as u32;
+                        if prev_price_e3 > 0 {
                             // r_t = (price - prev_price) * 1e6 / prev_price
-                            let p = price as i64;
-                            let pp = prev_price as i64;
+                            // (e3 units cancel in the division, return is still e6)
+                            let p = price_e3 as i64;
+                            let pp = prev_price_e3 as i64;
                             let return_e6 =
                                 ((p - pp) as i128).saturating_mul(1_000_000) / (pp as i128).max(1);
-                            // r_t^2 in e12 units
-                            let r_sq_e12 = (return_e6.saturating_mul(return_e6)) as u64;
-                            let r_sq_e12_u32 = r_sq_e12.min(u32::MAX as u64) as u32;
+                            // r_t^2 in e12 units — clamp in i128 to avoid u64 wrap (#979)
+                            let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
+                            let r_sq_e12_u32 = r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
                             let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
                             let old_ewmv = state::get_ewmv_e12(&config);
                             // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
@@ -7690,11 +7693,8 @@ pub mod processor {
                                     .min(u32::MAX as u64) as u32;
                             state::set_ewmv_e12(&mut config, new_ewmv);
                         }
-                        // Store current price for next return calculation
-                        state::set_last_vol_price_e6(
-                            &mut config,
-                            (price as u64).min(u32::MAX as u64) as u32,
-                        );
+                        // Store current price (e3) for next return calculation
+                        state::set_last_vol_price_e6(&mut config, price_e3);
                     }
                 }
 
