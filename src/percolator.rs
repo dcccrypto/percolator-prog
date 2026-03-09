@@ -12265,9 +12265,14 @@ pub mod processor {
                     violation = true;
                 }
 
-                // Invariant 5: vault >= c_tot + insurance_fund.balance (solvency)
+                // Invariant 5: vault >= c_tot + insurance_fund.balance + isolated_balance (solvency)
+                // #981: Include isolated_balance in solvency check (consistent with PERC-306)
                 let vault = engine.vault.get();
-                let insurance_balance = engine.insurance_fund.balance.get();
+                let insurance_balance = engine
+                    .insurance_fund
+                    .balance
+                    .get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get());
                 let required = (c_tot as u128).saturating_add(insurance_balance);
                 if (vault as u128) < required {
                     msg!("AUDIT_VIOLATION: solvency");
