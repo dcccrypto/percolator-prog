@@ -3666,14 +3666,27 @@ pub mod state {
     /// Stored as u32 in **e3** format (price_e6 / 1000). Max ~$4.29M.
     /// 0 = no previous price.
     /// (#980: changed from e6 to e3 to support BTC/ETH-priced markets)
+    ///
+    /// Migration: pre-#980 slabs stored price in e6 format (up to u32::MAX ≈ $4295 in e6).
+    /// Any stored value that exceeds MAX_SANE_PRICE_E3 is implausible as an e3 price and
+    /// indicates a legacy e6 value. We return 0 to restart VRAM cleanly rather than spike.
+    /// MAX_SANE_PRICE_E3 = 4_294_000 ≈ $4294 in e3 (the old u32 clip ceiling in e6 terms).
+    /// This is idempotent: returns 0 until a valid post-migration e3 value is written.
     #[inline]
     pub fn get_last_vol_price_e3(config: &MarketConfig) -> u32 {
-        u32::from_le_bytes([
+        let raw = u32::from_le_bytes([
             config._insurance_isolation_padding[8],
             config._insurance_isolation_padding[9],
             config._insurance_isolation_padding[10],
             config._insurance_isolation_padding[11],
-        ])
+        ]);
+        // Migration guard: any value > 4_294_000 (> $4294 in e3, which was the old e6 clip
+        // ceiling for u32 overflow) is a legacy e6 value. Reset to 0 to avoid 1000x VRAM spike.
+        if raw > 4_294_000 {
+            0
+        } else {
+            raw
+        }
     }
 
     /// Write last volatility oracle price into `_insurance_isolation_padding[8..12]`.
@@ -3770,6 +3783,60 @@ pub mod state {
     pub fn write_last_audit_pause_slot(config: &mut MarketConfig, slot: u64) {
         let bytes = slot.to_le_bytes();
         config._rebalancing_pad[..6].copy_from_slice(&bytes[..6]);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn empty_config() -> MarketConfig {
+            bytemuck::Zeroable::zeroed()
+        }
+
+        // ── #980 migration guard ──────────────────────────────────────────────
+        #[test]
+        fn get_last_vol_price_e3_returns_zero_for_legacy_e6_value() {
+            let mut cfg = empty_config();
+            // Simulate a pre-#980 slab: SOL at $200 stored as e6 = 200_000_000
+            let legacy_e6: u32 = 200_000_000;
+            let bytes = legacy_e6.to_le_bytes();
+            cfg._insurance_isolation_padding[8] = bytes[0];
+            cfg._insurance_isolation_padding[9] = bytes[1];
+            cfg._insurance_isolation_padding[10] = bytes[2];
+            cfg._insurance_isolation_padding[11] = bytes[3];
+            // Migration guard must return 0 (value > 4_294_000 is implausible as e3)
+            assert_eq!(get_last_vol_price_e3(&cfg), 0);
+        }
+
+        #[test]
+        fn get_last_vol_price_e3_returns_valid_e3_value() {
+            let mut cfg = empty_config();
+            // SOL at $200 in e3 format = 200_000
+            let valid_e3: u32 = 200_000;
+            set_last_vol_price_e3(&mut cfg, valid_e3);
+            assert_eq!(get_last_vol_price_e3(&cfg), valid_e3);
+        }
+
+        #[test]
+        fn get_last_vol_price_e3_boundary_at_migration_threshold() {
+            let mut cfg = empty_config();
+            // 4_294_000 is exactly at the threshold — should pass through
+            set_last_vol_price_e3(&mut cfg, 4_294_000);
+            assert_eq!(get_last_vol_price_e3(&cfg), 4_294_000);
+            // 4_294_001 is above threshold — legacy e6, return 0
+            set_last_vol_price_e3(&mut cfg, 4_294_001);
+            assert_eq!(get_last_vol_price_e3(&cfg), 0);
+        }
+
+        // ── #980 sub-mill price clamp ─────────────────────────────────────────
+        #[test]
+        fn set_last_vol_price_e3_stores_nonzero_for_submil_price() {
+            // Caller must clamp: (price_e6 / 1000).max(1) for price_e6 in 1..999
+            // This test verifies the storage round-trip for the clamped value
+            let mut cfg = empty_config();
+            set_last_vol_price_e3(&mut cfg, 1); // sub-mill clamped to 1
+            assert_eq!(get_last_vol_price_e3(&cfg), 1);
+        }
     }
 }
 
@@ -7811,30 +7878,48 @@ pub mod processor {
                     let vol_scale = state::get_vol_margin_scale_bps(&config);
                     if vol_scale > 0 && price > 0 {
                         let prev_price_e3 = state::get_last_vol_price_e3(&config);
-                        if prev_price_e3 > 0 {
-                            // #980: Use e3-scaled prices for return calculation.
-                            // r_t = (p - pp) * 1e6 / pp — ratio is scale-invariant.
-                            let price_e3 = (price / 1000) as i64; // price is e6, divide to e3
-                            let p = price_e3;
-                            let pp = prev_price_e3 as i64;
-                            let return_e6 =
-                                ((p - pp) as i128).saturating_mul(1_000_000) / (pp as i128).max(1);
-                            // r_t^2 in e12 units — clamp in i128 before downcast (#979)
-                            let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
-                            let r_sq_e12_u32 = r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
-                            let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
-                            let old_ewmv = state::get_ewmv_e12(&config);
-                            // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
-                            let new_ewmv =
-                                ((alpha_e6 as u64).saturating_mul(r_sq_e12_u32 as u64) / 1_000_000
+                        // #980 sub-mill guard: price_e6 < 1000 → price_e3 == 0 → skip EWMV
+                        // (avoids -100% phantom return and EWMV lockout for micro-cap assets)
+                        let price_e3_cur = price / 1000; // price is e6
+                        if prev_price_e3 > 0 && price_e3_cur > 0 {
+                            // #980: Migration guard for legacy e6 values. If the stored
+                            // prev_price is >1000× the current e3 price, it's a legacy
+                            // e6 value. Skip this update and overwrite with e3 below.
+                            let ratio = (prev_price_e3 as u64)
+                                .checked_div(price_e3_cur.max(1))
+                                .unwrap_or(0);
+                            if ratio > 1000 {
+                                // Legacy e6→e3 transition: discard stale EWMV sample.
+                                // The price store below will write the correct e3 value.
+                            } else {
+                                // #980: Use e3-scaled prices for return calculation.
+                                // r_t = (p - pp) * 1e6 / pp — ratio is scale-invariant.
+                                let price_e3 = price_e3_cur as i64;
+                                let p = price_e3;
+                                let pp = prev_price_e3 as i64;
+                                let return_e6 = ((p - pp) as i128).saturating_mul(1_000_000)
+                                    / (pp as i128).max(1);
+                                // r_t^2 in e12 units — clamp in i128 before downcast (#979)
+                                let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
+                                let r_sq_e12_u32 = r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
+                                let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
+                                let old_ewmv = state::get_ewmv_e12(&config);
+                                // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
+                                let new_ewmv = ((alpha_e6 as u64)
+                                    .saturating_mul(r_sq_e12_u32 as u64)
+                                    / 1_000_000
                                     + (1_000_000u64.saturating_sub(alpha_e6 as u64))
                                         .saturating_mul(old_ewmv as u64)
                                         / 1_000_000)
-                                    .min(u32::MAX as u64) as u32;
-                            state::set_ewmv_e12(&mut config, new_ewmv);
+                                    .min(u32::MAX as u64)
+                                    as u32;
+                                state::set_ewmv_e12(&mut config, new_ewmv);
+                            } // else (non-migration path)
                         }
-                        // Store current price for next return calculation (e3 format)
-                        let price_e3_store = (price / 1000).min(u32::MAX as u64) as u32;
+                        // Store current price for next return calculation (e3 format).
+                        // Clamp sub-mill prices (price_e6 < 1000) to min 1 e3 so that EWMV
+                        // resumes updating once the price rises above $0.001 again.
+                        let price_e3_store = price_e3_cur.min(u32::MAX as u64).max(1) as u32;
                         state::set_last_vol_price_e3(&mut config, price_e3_store);
                     }
                 }
