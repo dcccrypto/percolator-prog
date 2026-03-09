@@ -4410,8 +4410,11 @@ fn kani_concurrency_zero_sum_detection() {
 // =============================================================================
 
 /// Sub-proof (a): EMA update correctness — unclamped EMA is weighted average.
+/// Moved to nightly_ prefix — symbolic u128 mul (oracle*alpha + prev*(1e6-alpha)) / 1e6
+/// creates wide bit-vector arithmetic that exhausts SAT solver budget on PR CI (>45m).
+/// See issue #975.
 #[kani::proof]
-fn kani_cb_ema_update_weighted_average() {
+fn nightly_cb_ema_update_weighted_average() {
     let prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     let alpha: u64 = kani::any();
@@ -4445,9 +4448,9 @@ fn nightly_cb_ema_alpha_zero_no_update() {
     assert_eq!(result, prev, "alpha=0 must keep prev unchanged");
 }
 
-/// Sub-proof (a3): EMA alpha=1_000_000 means full jump to oracle.
+/// Full-range version of alpha=1 jump proof — SAT-heavy, nightly only.
 #[kani::proof]
-fn kani_cb_ema_alpha_full_jumps_to_oracle() {
+fn nightly_cb_ema_alpha_full_jumps_to_oracle() {
     let prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     kani::assume(prev > 0 && prev <= 1_000_000_000);
@@ -4459,8 +4462,9 @@ fn kani_cb_ema_alpha_full_jumps_to_oracle() {
 }
 
 /// Sub-proof (b): Trigger threshold check — breaker fires for out-of-bound oracle.
+/// SAT-hard (4 symbolic u64 inputs through mul/div) — moved to nightly_ budget.
 #[kani::proof]
-fn kani_cb_trigger_fires_correctly() {
+fn nightly_cb_trigger_fires_correctly() {
     let prev_mark: u64 = kani::any();
     let raw_oracle: u64 = kani::any();
     let cap_e2bps: u64 = kani::any();
