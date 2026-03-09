@@ -88,6 +88,7 @@ jobs:
     #   nightly_ema_mark_identity_at_equilibrium         (~2h55m+ — symbolic MUL/DIV SAT-hard; was nightly_kani_ema_mark_identity_at_equilibrium, renamed to drop kani_ substring)
     #   nightly_cb_ema_alpha_full_jumps_to_oracle        (~timeout — full 1B-range SAT on MUL/DIV; PR CI uses tightened 10M bounds)
     #   nightly_cb_trigger_fires_correctly               (~24m — 4 symbolic u64 through mul/div)
+    #   nightly_cb_ema_update_weighted_average           (~>45m — symbolic u128 mul oracle*alpha + prev*(1e6-alpha) exhausts SAT budget; confirmed timeout in CI)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 50
     steps:
