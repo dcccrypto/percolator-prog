@@ -5671,6 +5671,8 @@ pub mod lp_vault {
             if loss <= junior {
                 // Junior absorbs all
                 self.set_junior_capital(junior - loss);
+                // #978: Keep total_capital in sync with tranche balances
+                self.total_capital = self.total_capital.saturating_sub(loss);
                 return loss;
             }
             // Junior wiped out, remainder hits senior
@@ -5679,7 +5681,10 @@ pub mod lp_vault {
             let senior = self.senior_capital();
             let senior_loss = remainder.min(senior);
             self.set_senior_capital(senior - senior_loss);
-            junior + senior_loss
+            let realized = junior + senior_loss;
+            // #978: Keep total_capital in sync with tranche balances
+            self.total_capital = self.total_capital.saturating_sub(realized);
+            realized
         }
     }
 
