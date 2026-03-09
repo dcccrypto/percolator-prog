@@ -12555,10 +12555,15 @@ pub mod processor {
                 let a_slab_a = &accounts[1];
                 let a_slab_b = &accounts[2]; // #958: was incorrectly prefixed with _ (unused)
                 let a_pair_pda = &accounts[3];
-                let _a_system = &accounts[4];
+                let a_system = &accounts[4];
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_pair_pda)?;
+
+                // #983: Validate system program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 // Verify admin on slab_a (#958: slab_a admin check)
                 {
@@ -12630,7 +12635,7 @@ pub mod processor {
                             cross_margin::OFFSET_PAIR_LEN as u64,
                             program_id,
                         ),
-                        &[a_admin.clone(), a_pair_pda.clone()],
+                        &[a_admin.clone(), a_pair_pda.clone(), a_system.clone()],
                         &[signer_seeds],
                     )?;
                 }
@@ -12672,16 +12677,21 @@ pub mod processor {
                 //   [5] system_program — needed for PDA creation when attestation doesn't
                 //                        exist yet (create_account_signed path in PR #82)
                 accounts::expect_len(accounts, 6)?;
-                // accounts[0]: fee-payer / signer — see layout comment above.
-                let _a_payer = &accounts[0];
+                let a_payer = &accounts[0];
                 let a_slab_a = &accounts[1];
                 let a_slab_b = &accounts[2];
                 let a_attestation = &accounts[3];
                 let a_pair_pda = &accounts[4];
-                let _a_system = &accounts[5];
+                let a_system = &accounts[5];
 
-                accounts::expect_signer(_a_payer)?;
+                accounts::expect_signer(a_payer)?;
+                accounts::expect_writable(a_payer)?;
                 accounts::expect_writable(a_attestation)?;
+
+                // #983: Validate system program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 // Read pair config to get offset_bps
                 let pair_data = a_pair_pda.try_borrow_data()?;
@@ -12784,7 +12794,7 @@ pub mod processor {
                             cross_margin::ATTESTATION_LEN as u64,
                             program_id,
                         ),
-                        &[a_payer.clone(), a_attestation.clone()],
+                        &[a_payer.clone(), a_attestation.clone(), a_system.clone()],
                         &[signer_seeds],
                     )?;
                 }
