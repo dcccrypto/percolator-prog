@@ -3641,7 +3641,7 @@ fn kani_pyth_price_invert_zero_price_rejected() {
 /// For all oracle prices and any dt_slots, when cap_e2bps > 0:
 ///   |mark_new - mark_prev| <= mark_prev * cap_e2bps * dt_slots / 1_000_000
 #[kani::proof]
-fn kani_mark_price_bounded_by_cap() {
+fn nightly_mark_price_bounded_by_cap() {
     let mark_prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     let dt_slots: u64 = kani::any();
@@ -3877,7 +3877,7 @@ fn kani_hyperp_pipeline_bounded_when_bootstrapped() {
     // The circuit breaker clamps oracle before EMA, so the mark moves at most
     // cap_e2bps * dt_slots per-slot-equivalent toward the clamped oracle.
     // With EMA smoothing on top, it moves even less. The mark is always bounded.
-    // (Detailed bound proof in kani_mark_price_bounded_by_cap from PERC-118)
+    // (Detailed bound proof in nightly_mark_price_bounded_by_cap from PERC-118)
 }
 
 /// Prove: Hyperp gate correctly rejects non-Hyperp markets.
