@@ -279,14 +279,17 @@ pub fn compute_inventory_funding_bps_per_slot(
     let linear_bps_u: u128 = notional_e6.saturating_mul(funding_k_bps as u128) / scale;
 
     // Quadratic component: k2 * (notional / scale)^2
-    // skew_ratio = notional / scale (dimensionless, in e6-ish range)
+    // #982: Use fixed-point to avoid precision loss when notional < scale.
+    // Scale up by 1e6 before division, square, then normalize.
+    const QUAD_PRECISION: u128 = 1_000_000;
     let quadratic_bps_u: u128 = if funding_k2_bps > 0 {
-        let skew_ratio = notional_e6 / scale;
-        // k2 * skew_ratio^2, with overflow protection
-        skew_ratio
-            .saturating_mul(skew_ratio)
+        // skew_ratio_fp = notional * PRECISION / scale (fixed-point, ~1e6 range)
+        let skew_ratio_fp = notional_e6.saturating_mul(QUAD_PRECISION) / scale;
+        // k2 * (skew_ratio_fp)^2 / (PRECISION^2 * 10_000)
+        skew_ratio_fp
+            .saturating_mul(skew_ratio_fp)
             .saturating_mul(funding_k2_bps as u128)
-            / 10_000 // normalize k2 from bps
+            / (QUAD_PRECISION.saturating_mul(QUAD_PRECISION).saturating_mul(10_000))
     } else {
         0
     };
@@ -2407,6 +2410,17 @@ pub mod ix {
                 }
                 TAG_UPDATE_CONFIG => {
                     // UpdateConfig
+                    // #983: Validate tail length to prevent silent partial updates
+                    // Required: 144 bytes. Optional tail: 0, 8, 16, 24, 32, or 34 bytes.
+                    const VALID_CONFIG_TAIL_LENS: &[usize] = &[0, 8, 16, 24, 32, 34];
+                    let required_len = 8 + 8 + 16 + 8 + 8 + 16 + 8 + 8 + 8 + 8 + 16 + 16 + 16; // 144
+                    if rest.len() < required_len {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let tail_len = rest.len() - required_len;
+                    if !VALID_CONFIG_TAIL_LENS.contains(&tail_len) {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
                     let funding_inv_scale_notional_e6 = read_u128(&mut rest)?;
@@ -7677,8 +7691,10 @@ pub mod processor {
                             let return_e6 =
                                 ((p - pp) as i128).saturating_mul(1_000_000) / (pp as i128).max(1);
                             // r_t^2 in e12 units
-                            let r_sq_e12 = (return_e6.saturating_mul(return_e6)) as u64;
-                            let r_sq_e12_u32 = r_sq_e12.min(u32::MAX as u64) as u32;
+                            // #979: Clamp in i128 before downcast to avoid u64 wrap on extreme vol
+                            let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
+                            let r_sq_e12_u32 =
+                                r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
                             let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
                             let old_ewmv = state::get_ewmv_e12(&config);
                             // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
@@ -12265,10 +12281,14 @@ pub mod processor {
                     violation = true;
                 }
 
-                // Invariant 5: vault >= c_tot + insurance_fund.balance (solvency)
+                // Invariant 5: vault >= c_tot + insurance_fund.balance + isolated_balance (solvency)
+                // #981: Include isolated_balance in solvency check (matches PERC-306 pattern)
                 let vault = engine.vault.get();
                 let insurance_balance = engine.insurance_fund.balance.get();
-                let required = (c_tot as u128).saturating_add(insurance_balance);
+                let isolated_balance = engine.insurance_fund.isolated_balance.get();
+                let required = (c_tot as u128)
+                    .saturating_add(insurance_balance)
+                    .saturating_add(isolated_balance);
                 if (vault as u128) < required {
                     msg!("AUDIT_VIOLATION: solvency");
                     sol_log_64(vault as u64, required as u64, 0, 0, 0xAD05);
