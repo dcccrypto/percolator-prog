@@ -12564,11 +12564,7 @@ pub mod processor {
                         (a_slab_b.key, a_slab_a.key)
                     };
                 let (expected_pda, pair_bump) = Pubkey::find_program_address(
-                    &[
-                        b"cmor_pair",
-                        slab_min_pair.as_ref(),
-                        slab_max_pair.as_ref(),
-                    ],
+                    &[b"cmor_pair", slab_min_pair.as_ref(), slab_max_pair.as_ref()],
                     program_id,
                 );
                 if a_pair_pda.key != &expected_pda {
@@ -12701,12 +12697,12 @@ pub mod processor {
                 // substitution where the caller writes to an arbitrary writable account
                 // rather than the canonical per-user attestation PDA.
                 // Seeds: ["cmor", owner, slab_a, slab_b]  (keys in canonical order)
-                let (slab_min_att, slab_max_att) =
-                    if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                        (a_slab_a.key, a_slab_b.key)
-                    } else {
-                        (a_slab_b.key, a_slab_a.key)
-                    };
+                let (slab_min_att, slab_max_att) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref()
+                {
+                    (a_slab_a.key, a_slab_b.key)
+                } else {
+                    (a_slab_b.key, a_slab_a.key)
+                };
                 let owner_key = Pubkey::from(owner_a);
                 let (expected_att_pda, att_bump) = Pubkey::find_program_address(
                     &[
