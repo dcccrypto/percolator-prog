@@ -258,6 +258,7 @@ fn compute_net_lp_pos(engine: &percolator::RiskEngine) -> i128 {
 /// Policy: rate sign follows LP inventory sign to push net_lp_pos toward 0.
 ///   - If LP net long (net_lp_pos > 0), rate > 0 => longs pay => discourages longs => pushes inventory toward 0.
 ///   - If LP net short (net_lp_pos < 0), rate < 0 => shorts pay => discourages shorts => pushes inventory toward 0.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_inventory_funding_bps_per_slot(
     net_lp_pos: i128,
     price_e6: u64,
@@ -291,7 +292,9 @@ pub fn compute_inventory_funding_bps_per_slot(
         skew_ratio_fp
             .saturating_mul(skew_ratio_fp)
             .saturating_mul(funding_k2_bps as u128)
-            / (QUAD_PRECISION.saturating_mul(QUAD_PRECISION).saturating_mul(10_000))
+            / (QUAD_PRECISION
+                .saturating_mul(QUAD_PRECISION)
+                .saturating_mul(10_000))
     } else {
         0
     };
@@ -7818,8 +7821,7 @@ pub mod processor {
                                 ((p - pp) as i128).saturating_mul(1_000_000) / (pp as i128).max(1);
                             // r_t^2 in e12 units — clamp in i128 before downcast (#979)
                             let r_sq_e12_i128 = return_e6.saturating_mul(return_e6);
-                            let r_sq_e12_u32 =
-                                r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
+                            let r_sq_e12_u32 = r_sq_e12_i128.min(i128::from(u32::MAX)) as u32;
                             let alpha_e6 = state::get_vol_alpha_e6(&config) as u32;
                             let old_ewmv = state::get_ewmv_e12(&config);
                             // ewmv = alpha * r_t^2 + (1 - alpha) * ewmv_prev
