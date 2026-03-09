@@ -42,5 +42,6 @@ jobs:
           # nightly_hwm_floor_correct_math (was proof_hwm_floor_correct_math — renamed to exclude from PR CI)
           # nightly_dust_single_deposit_conservation (~19min+ — symbolic u64×u128 mul SAT),
           # nightly_dust_two_deposits_conservation (~24min — three-variable u128 mul SAT)
+          # nightly_proof_loyalty_applies_only_to_fee_income (~35min+ — symbolic u64 delta_epochs SAT)
           args: --tests --output-format terse --jobs 2 --harness nightly_
         timeout-minutes: 295

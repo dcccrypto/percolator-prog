@@ -5758,9 +5758,11 @@ fn proof_loyalty_mult_never_exceeds_max_tier_strong() {
 }
 
 /// Prove: loyalty multiplier applies only to fee income (principal unchanged).
+/// Renamed to nightly_ — symbolic u64 kani::any() for delta_epochs (range 0..1_000_000)
+/// is SAT-hard in CBMC; proof ran >35min in PR CI (Thread 0 timeout in run 22878313887).
 #[cfg(kani)]
 #[kani::proof]
-fn proof_loyalty_applies_only_to_fee_income() {
+fn nightly_proof_loyalty_applies_only_to_fee_income() {
     use percolator_prog::lp_vault::apply_loyalty_mult;
 
     let fee: u64 = kani::any();
