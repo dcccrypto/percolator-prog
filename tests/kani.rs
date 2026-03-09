@@ -4410,8 +4410,11 @@ fn kani_concurrency_zero_sum_detection() {
 // =============================================================================
 
 /// Sub-proof (a): EMA update correctness — unclamped EMA is weighted average.
+/// Moved to nightly_ prefix — symbolic u128 mul (oracle*alpha + prev*(1e6-alpha)) / 1e6
+/// creates wide bit-vector arithmetic that exhausts SAT solver budget on PR CI (>45m).
+/// See issue #975.
 #[kani::proof]
-fn kani_cb_ema_update_weighted_average() {
+fn nightly_cb_ema_update_weighted_average() {
     let prev: u64 = kani::any();
     let oracle: u64 = kani::any();
     let alpha: u64 = kani::any();
