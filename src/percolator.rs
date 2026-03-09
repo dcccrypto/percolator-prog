@@ -12643,7 +12643,11 @@ pub mod processor {
                 let a_system = &accounts[4];
 
                 accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_admin)?;
                 accounts::expect_writable(a_pair_pda)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 // #983: Validate system program
                 if *a_system.key != solana_program::system_program::id() {
@@ -12772,6 +12776,9 @@ pub mod processor {
                 accounts::expect_signer(a_payer)?;
                 accounts::expect_writable(a_payer)?;
                 accounts::expect_writable(a_attestation)?;
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 // #983: Validate system program
                 if *a_system.key != solana_program::system_program::id() {
@@ -12860,7 +12867,6 @@ pub mod processor {
 
                 // #977: Create attestation PDA if it doesn't exist yet
                 if a_attestation.data_is_empty() {
-                    let a_payer = &accounts[0];
                     let lamports = solana_program::rent::Rent::get()?
                         .minimum_balance(cross_margin::ATTESTATION_LEN);
                     let bump_bytes = [att_bump];
