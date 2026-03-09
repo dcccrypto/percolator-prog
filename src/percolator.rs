@@ -475,6 +475,7 @@ pub fn try_apply_cmor_from_accounts(
     accounts: &[AccountInfo],
     program_id: &Pubkey,
     user_key: &Pubkey,
+    current_slab_key: &Pubkey,
     current_slot: u64,
 ) -> u16 {
     if accounts.is_empty() {
@@ -497,6 +498,12 @@ pub fn try_apply_cmor_from_accounts(
         _ => return 0,
     };
     if att.owner != user_key.to_bytes() {
+        return 0;
+    }
+    // #986: Verify attestation is bound to the current slab pair.
+    // The attestation must reference the slab being traded on as either slab_a or slab_b.
+    let slab_bytes = current_slab_key.to_bytes();
+    if att.slab_a != slab_bytes && att.slab_b != slab_bytes {
         return 0;
     }
     apply_cmor_credit(engine, &cmor_data, current_slot)
@@ -6193,6 +6200,12 @@ pub mod cross_margin {
         /// Owner pubkey — the user whose positions are attested.
         /// Used to verify the attestation belongs to the current trader.
         pub owner: [u8; 32],
+        /// Slab A pubkey (the lesser of the two, lexicographically sorted).
+        /// Used to verify the attestation is bound to the correct market pair.
+        /// (#986: prevents cross-market attestation reuse)
+        pub slab_a: [u8; 32],
+        /// Slab B pubkey (the greater of the two, lexicographically sorted).
+        pub slab_b: [u8; 32],
     }
 
     impl OffsetPairConfig {
@@ -7584,7 +7597,7 @@ pub mod processor {
                 // restore_margins(vram_orig) will undo both VRAM and CMOR adjustments
                 if has_cmor {
                     crate::try_apply_cmor_from_accounts(
-                        engine, accounts, program_id, a_user.key, clock.slot,
+                        engine, accounts, program_id, a_user.key, a_slab.key, clock.slot,
                     );
                 }
 
@@ -8158,7 +8171,7 @@ pub mod processor {
                 );
                 if has_cmor {
                     crate::try_apply_cmor_from_accounts(
-                        engine, accounts, program_id, a_user.key, clock.slot,
+                        engine, accounts, program_id, a_user.key, a_slab.key, clock.slot,
                     );
                 }
 
@@ -8513,7 +8526,7 @@ pub mod processor {
                     );
                     if has_cmor_cpi {
                         crate::try_apply_cmor_from_accounts(
-                            engine, accounts, program_id, a_user.key, clock.slot,
+                            engine, accounts, program_id, a_user.key, a_slab.key, clock.slot,
                         );
                     }
 
@@ -8633,6 +8646,7 @@ pub mod processor {
                         accounts,
                         program_id,
                         &target_owner,
+                        a_slab.key,
                         clock.slot,
                     );
                 }
@@ -12704,6 +12718,16 @@ pub mod processor {
                     offset_bps,
                     _pad: [0; 6],
                     owner: owner_a,
+                    slab_a: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        a_slab_a.key.to_bytes()
+                    } else {
+                        a_slab_b.key.to_bytes()
+                    },
+                    slab_b: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                        a_slab_b.key.to_bytes()
+                    } else {
+                        a_slab_a.key.to_bytes()
+                    },
                 };
                 cross_margin::write_attestation(&mut att_data, &att);
                 msg!(

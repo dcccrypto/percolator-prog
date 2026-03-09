@@ -5437,6 +5437,8 @@ fn test_cmor_compute_margin_credit_hedged() {
         offset_bps: 3000,
         _pad: [0; 6],
         owner: [0; 32],
+        slab_a: [1; 32],
+        slab_b: [2; 32],
     };
     assert_eq!(att.compute_margin_credit_bps(), 3000);
 }
@@ -5454,6 +5456,8 @@ fn test_cmor_compute_margin_credit_partial_hedge() {
         offset_bps: 3000,
         _pad: [0; 6],
         owner: [0; 32],
+        slab_a: [1; 32],
+        slab_b: [2; 32],
     };
     assert_eq!(att.compute_margin_credit_bps(), 1500);
 }
@@ -5471,6 +5475,8 @@ fn test_cmor_compute_margin_credit_same_direction() {
         offset_bps: 3000,
         _pad: [0; 6],
         owner: [0; 32],
+        slab_a: [1; 32],
+        slab_b: [2; 32],
     };
     assert_eq!(att.compute_margin_credit_bps(), 0);
 }
@@ -5488,6 +5494,8 @@ fn test_cmor_compute_margin_credit_zero_position() {
         offset_bps: 3000,
         _pad: [0; 6],
         owner: [0; 32],
+        slab_a: [1; 32],
+        slab_b: [2; 32],
     };
     assert_eq!(att.compute_margin_credit_bps(), 0);
 }
@@ -5506,6 +5514,8 @@ fn test_cmor_attestation_freshness() {
         offset_bps: 3000,
         _pad: [0; 6],
         owner: [0; 32],
+        slab_a: [1; 32],
+        slab_b: [2; 32],
     };
 
     assert!(att.is_fresh(100 + CMOR_MAX_AGE_SLOTS, CMOR_MAX_AGE_SLOTS));
@@ -5525,6 +5535,8 @@ fn test_cmor_disabled_offset_returns_zero() {
         offset_bps: 0, // disabled
         _pad: [0; 6],
         owner: [0; 32],
+        slab_a: [1; 32],
+        slab_b: [2; 32],
     };
     assert_eq!(att.compute_margin_credit_bps(), 0);
 }
