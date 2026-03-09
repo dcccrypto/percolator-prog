@@ -26,7 +26,9 @@ compile_error!("devnet feature MUST NOT be enabled on mainnet builds!");
 
 extern crate alloc;
 
+use solana_program::account_info::AccountInfo;
 use solana_program::declare_id;
+use solana_program::pubkey::Pubkey;
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
@@ -397,6 +399,107 @@ pub fn apply_vram_scaling(
 pub fn restore_margins(engine: &mut percolator::RiskEngine, orig: (u64, u64)) {
     engine.params.initial_margin_bps = orig.0;
     engine.params.maintenance_margin_bps = orig.1;
+}
+
+/// Maximum age (in slots) for a CMOR attestation to be considered fresh.
+/// ~2 minutes at 400ms slots = 300 slots.
+pub const CMOR_MAX_AGE_SLOTS: u64 = 300;
+
+/// Apply CMOR cross-margin credit to engine margin params if attestation is
+/// present, fresh, and yields a nonzero credit. Returns the credit_bps applied
+/// (0 if no attestation or stale). Caller must call `restore_margins` after the
+/// engine operation (VRAM restore already handles this — CMOR modifies the same
+/// fields so a single restore suffices as long as CMOR is applied *after* VRAM).
+#[inline]
+pub fn apply_cmor_credit(
+    engine: &mut percolator::RiskEngine,
+    attestation_data: &[u8],
+    current_slot: u64,
+) -> u16 {
+    let att = match cross_margin::read_attestation(attestation_data) {
+        Some(a) if a.is_initialized() => a,
+        _ => return 0,
+    };
+    if !att.is_fresh(current_slot, CMOR_MAX_AGE_SLOTS) {
+        return 0;
+    }
+    let credit_bps = att.compute_margin_credit_bps();
+    if credit_bps == 0 {
+        return 0;
+    }
+    // Reduce margin requirements by credit_bps, flooring at 1 bps (never zero margin)
+    let reduce = |m: u64| -> u64 {
+        let reduction = (m as u128).saturating_mul(credit_bps as u128) / 10_000;
+        (m as u128).saturating_sub(reduction).max(1) as u64
+    };
+    engine.params.initial_margin_bps = reduce(engine.params.initial_margin_bps);
+    engine.params.maintenance_margin_bps = reduce(engine.params.maintenance_margin_bps);
+    // Maintain invariant: initial >= maintenance
+    if engine.params.initial_margin_bps < engine.params.maintenance_margin_bps {
+        engine.params.initial_margin_bps = engine.params.maintenance_margin_bps;
+    }
+    credit_bps
+}
+
+/// Check if the last account in the slice is a CMOR attestation PDA (owned by
+/// this program, with valid CMOR magic). Returns true if so.
+#[inline]
+pub fn last_account_is_cmor(accounts: &[AccountInfo], program_id: &Pubkey) -> bool {
+    if accounts.is_empty() {
+        return false;
+    }
+    let last = &accounts[accounts.len() - 1];
+    if last.owner != program_id {
+        return false;
+    }
+    let data = match last.try_borrow_data() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if data.len() < cross_margin::ATTESTATION_LEN {
+        return false;
+    }
+    match cross_margin::read_attestation(&data) {
+        Some(a) => a.is_initialized(),
+        None => false,
+    }
+}
+
+/// Try to read and apply CMOR credit from the last account in the accounts
+/// array. Validates that the account is owned by this program, contains a
+/// valid initialized CMOR attestation, and the attestation belongs to the
+/// given user. Returns credit_bps applied (0 if no valid attestation found).
+#[inline]
+pub fn try_apply_cmor_from_accounts(
+    engine: &mut percolator::RiskEngine,
+    accounts: &[AccountInfo],
+    program_id: &Pubkey,
+    user_key: &Pubkey,
+    current_slot: u64,
+) -> u16 {
+    if accounts.is_empty() {
+        return 0;
+    }
+    let last = &accounts[accounts.len() - 1];
+    if last.owner != program_id {
+        return 0;
+    }
+    let cmor_data = match last.try_borrow_data() {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    if cmor_data.len() < cross_margin::ATTESTATION_LEN {
+        return 0;
+    }
+    // Verify attestation belongs to the current user
+    let att = match cross_margin::read_attestation(&cmor_data) {
+        Some(a) if a.is_initialized() => a,
+        _ => return 0,
+    };
+    if att.owner != user_key.to_bytes() {
+        return 0;
+    }
+    apply_cmor_credit(engine, &cmor_data, current_slot)
 }
 
 // =============================================================================
@@ -6087,6 +6190,9 @@ pub mod cross_margin {
         /// Margin offset bps (copied from OffsetPairConfig at attestation time).
         pub offset_bps: u16,
         pub _pad: [u8; 6],
+        /// Owner pubkey — the user whose positions are attested.
+        /// Used to verify the attestation belongs to the current trader.
+        pub owner: [u8; 32],
     }
 
     impl OffsetPairConfig {
@@ -7417,6 +7523,15 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
+
+                // CMOR: detect trailing attestation PDA to exclude from oracle slice
+                let has_cmor = crate::last_account_is_cmor(accounts, program_id);
+                let oracle_end = if has_cmor {
+                    accounts.len() - 1
+                } else {
+                    accounts.len()
+                };
+
                 // Read oracle price: Hyperp mode uses index directly, otherwise circuit-breaker clamping
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
@@ -7439,7 +7554,7 @@ pub mod processor {
                         &mut config,
                         a_oracle_idx,
                         clock.unix_timestamp,
-                        &accounts[8..],
+                        &accounts[8..oracle_end],
                     )?
                 };
                 state::write_config(&mut data, &config);
@@ -7464,6 +7579,15 @@ pub mod processor {
 
                 // VRAM: scale margins before withdrawal (margin check is inside engine.withdraw)
                 let vram_orig = crate::apply_vram_scaling(engine, &config);
+
+                // CMOR: apply cross-margin credit after VRAM scaling (stacks on top)
+                // restore_margins(vram_orig) will undo both VRAM and CMOR adjustments
+                if has_cmor {
+                    crate::try_apply_cmor_from_accounts(
+                        engine, accounts, program_id, a_user.key, clock.slot,
+                    );
+                }
+
                 let withdraw_result = engine
                     .withdraw(user_idx, units_requested as u128, clock.slot, price)
                     .map_err(map_risk_error);
@@ -7955,12 +8079,20 @@ pub mod processor {
                     return Err(PercolatorError::HyperpTradeNoCpiDisabled.into());
                 }
 
+                // CMOR: detect trailing attestation PDA to exclude it from oracle slice
+                let has_cmor = crate::last_account_is_cmor(accounts, program_id);
+                let oracle_end = if has_cmor {
+                    accounts.len() - 1
+                } else {
+                    accounts.len()
+                };
+
                 // Read oracle price with circuit-breaker clamping
                 let price = oracle::read_price_clamped(
                     &mut config,
                     a_oracle,
                     clock.unix_timestamp,
-                    &accounts[4..],
+                    &accounts[4..oracle_end],
                 )?;
                 state::write_config(&mut data, &config);
 
@@ -8018,9 +8150,23 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
                     sol_log_compute_units();
                 }
-                engine
+
+                // CMOR: save original margins, apply cross-margin credit, restore after trade
+                let margin_orig = (
+                    engine.params.initial_margin_bps,
+                    engine.params.maintenance_margin_bps,
+                );
+                if has_cmor {
+                    crate::try_apply_cmor_from_accounts(
+                        engine, accounts, program_id, a_user.key, clock.slot,
+                    );
+                }
+
+                let trade_result = engine
                     .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
-                    .map_err(map_risk_error)?;
+                    .map_err(map_risk_error);
+                crate::restore_margins(engine, margin_orig);
+                trade_result?;
 
                 // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                 check_oi_cap(engine, &config, clock.slot)?;
@@ -8191,6 +8337,15 @@ pub mod processor {
 
                 // PERC-199: Clock::get() saves ~50-100 CU vs from_account_info deserialization
                 let clock = Clock::get()?;
+
+                // CMOR: detect trailing attestation PDA to exclude from oracle slice
+                let has_cmor_cpi = crate::last_account_is_cmor(accounts, program_id);
+                let oracle_end_cpi = if has_cmor_cpi {
+                    accounts.len() - 1
+                } else {
+                    accounts.len()
+                };
+
                 // Read oracle price: Hyperp mode uses index directly, otherwise circuit-breaker clamping
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
@@ -8207,7 +8362,7 @@ pub mod processor {
                         &mut config,
                         a_oracle,
                         clock.unix_timestamp,
-                        &accounts[7..],
+                        &accounts[7..oracle_end_cpi],
                     )?
                 };
 
@@ -8350,9 +8505,23 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_start");
                         sol_log_compute_units();
                     }
-                    engine
+
+                    // CMOR: save margins, apply credit, restore after trade
+                    let margin_orig_cpi = (
+                        engine.params.initial_margin_bps,
+                        engine.params.maintenance_margin_bps,
+                    );
+                    if has_cmor_cpi {
+                        crate::try_apply_cmor_from_accounts(
+                            engine, accounts, program_id, a_user.key, clock.slot,
+                        );
+                    }
+
+                    let trade_result_cpi = engine
                         .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
-                        .map_err(map_risk_error)?;
+                        .map_err(map_risk_error);
+                    crate::restore_margins(engine, margin_orig_cpi);
+                    trade_result_cpi?;
 
                     // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                     check_oi_cap(engine, &config, clock.slot)?;
@@ -8379,6 +8548,15 @@ pub mod processor {
                 let mut config = state::read_config(&data);
 
                 let clock = Clock::from_account_info(&accounts[2])?;
+
+                // CMOR: detect trailing attestation PDA to exclude from oracle slice
+                let has_cmor_liq_detect = crate::last_account_is_cmor(accounts, program_id);
+                let oracle_end_liq = if has_cmor_liq_detect {
+                    accounts.len() - 1
+                } else {
+                    accounts.len()
+                };
+
                 // Read oracle price: Hyperp mode uses index directly, otherwise circuit-breaker clamping
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
@@ -8401,7 +8579,7 @@ pub mod processor {
                         &mut config,
                         a_oracle,
                         clock.unix_timestamp,
-                        &accounts[4..],
+                        &accounts[4..oracle_end_liq],
                     )?
                 };
                 state::write_config(&mut data, &config);
@@ -8443,6 +8621,22 @@ pub mod processor {
                 let pre_pos = engine.accounts[target_idx as usize].position_size.get();
                 // VRAM: scale margins before liquidation check
                 let vram_orig = crate::apply_vram_scaling(engine, &config);
+
+                // CMOR: apply cross-margin credit — hedged users get reduced margin
+                // requirement, making them harder to liquidate (correctly reflecting
+                // their lower portfolio risk)
+                let has_cmor_liq = crate::last_account_is_cmor(accounts, program_id);
+                if has_cmor_liq {
+                    let target_owner = Pubkey::from(engine.accounts[target_idx as usize].owner);
+                    crate::try_apply_cmor_from_accounts(
+                        engine,
+                        accounts,
+                        program_id,
+                        &target_owner,
+                        clock.slot,
+                    );
+                }
+
                 let liq_result = engine
                     .liquidate_at_oracle(target_idx, clock.slot, price)
                     .map_err(map_risk_error);
@@ -12509,6 +12703,7 @@ pub mod processor {
                     attested_slot: slot,
                     offset_bps,
                     _pad: [0; 6],
+                    owner: owner_a,
                 };
                 cross_margin::write_attestation(&mut att_data, &att);
                 msg!(

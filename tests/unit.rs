@@ -5419,3 +5419,112 @@ fn test_mark_oracle_weight_bps_clamps() {
         "weight > 10_000 should clamp to 10_000"
     );
 }
+
+// =============================================================================
+// CMOR (Cross-Margin) Tests
+// =============================================================================
+
+#[test]
+fn test_cmor_compute_margin_credit_hedged() {
+    use percolator_prog::cross_margin::{CrossMarginAttestation, ATTESTATION_MAGIC};
+
+    let att = CrossMarginAttestation {
+        magic: ATTESTATION_MAGIC,
+        _align_pad: [0; 8],
+        user_pos_a: 1000,
+        user_pos_b: -1000,
+        attested_slot: 100,
+        offset_bps: 3000,
+        _pad: [0; 6],
+        owner: [0; 32],
+    };
+    assert_eq!(att.compute_margin_credit_bps(), 3000);
+}
+
+#[test]
+fn test_cmor_compute_margin_credit_partial_hedge() {
+    use percolator_prog::cross_margin::{CrossMarginAttestation, ATTESTATION_MAGIC};
+
+    let att = CrossMarginAttestation {
+        magic: ATTESTATION_MAGIC,
+        _align_pad: [0; 8],
+        user_pos_a: 500,
+        user_pos_b: -1000,
+        attested_slot: 100,
+        offset_bps: 3000,
+        _pad: [0; 6],
+        owner: [0; 32],
+    };
+    assert_eq!(att.compute_margin_credit_bps(), 1500);
+}
+
+#[test]
+fn test_cmor_compute_margin_credit_same_direction() {
+    use percolator_prog::cross_margin::{CrossMarginAttestation, ATTESTATION_MAGIC};
+
+    let att = CrossMarginAttestation {
+        magic: ATTESTATION_MAGIC,
+        _align_pad: [0; 8],
+        user_pos_a: 1000,
+        user_pos_b: 500,
+        attested_slot: 100,
+        offset_bps: 3000,
+        _pad: [0; 6],
+        owner: [0; 32],
+    };
+    assert_eq!(att.compute_margin_credit_bps(), 0);
+}
+
+#[test]
+fn test_cmor_compute_margin_credit_zero_position() {
+    use percolator_prog::cross_margin::{CrossMarginAttestation, ATTESTATION_MAGIC};
+
+    let att = CrossMarginAttestation {
+        magic: ATTESTATION_MAGIC,
+        _align_pad: [0; 8],
+        user_pos_a: 0,
+        user_pos_b: -1000,
+        attested_slot: 100,
+        offset_bps: 3000,
+        _pad: [0; 6],
+        owner: [0; 32],
+    };
+    assert_eq!(att.compute_margin_credit_bps(), 0);
+}
+
+#[test]
+fn test_cmor_attestation_freshness() {
+    use percolator_prog::cross_margin::{CrossMarginAttestation, ATTESTATION_MAGIC};
+    use percolator_prog::CMOR_MAX_AGE_SLOTS;
+
+    let att = CrossMarginAttestation {
+        magic: ATTESTATION_MAGIC,
+        _align_pad: [0; 8],
+        user_pos_a: 1000,
+        user_pos_b: -1000,
+        attested_slot: 100,
+        offset_bps: 3000,
+        _pad: [0; 6],
+        owner: [0; 32],
+    };
+
+    assert!(att.is_fresh(100 + CMOR_MAX_AGE_SLOTS, CMOR_MAX_AGE_SLOTS));
+    assert!(!att.is_fresh(100 + CMOR_MAX_AGE_SLOTS + 1, CMOR_MAX_AGE_SLOTS));
+}
+
+#[test]
+fn test_cmor_disabled_offset_returns_zero() {
+    use percolator_prog::cross_margin::{CrossMarginAttestation, ATTESTATION_MAGIC};
+
+    let att = CrossMarginAttestation {
+        magic: ATTESTATION_MAGIC,
+        _align_pad: [0; 8],
+        user_pos_a: 1000,
+        user_pos_b: -1000,
+        attested_slot: 100,
+        offset_bps: 0, // disabled
+        _pad: [0; 6],
+        owner: [0; 32],
+    };
+    assert_eq!(att.compute_margin_credit_bps(), 0);
+}
