@@ -31,7 +31,7 @@ jobs:
         with:
           # --harness nightly_ uses prefix matching (same pattern as kani_, proof_, inductive_ in ci.yml).
           # The `.*` suffix broke matching — kani-github-action uses prefix/substring matching, not full regex.
-          # Currently 16 slow harnesses: nightly_fee_monotone_in_bps (~2.5h), nightly_fee_monotone_in_notional,
+          # Currently 18 slow harnesses: nightly_fee_monotone_in_bps (~2.5h), nightly_fee_monotone_in_notional,
           # nightly_fee_ceil_geq_floor, nightly_cb_recovery_*, nightly_fee_bounded_by_notional,
           # nightly_sandwich_impact_proportional, nightly_sandwich_full_cap_allows_double,
           # nightly_ramp_*, nightly_skew_adjusted_cap_*,
@@ -40,5 +40,7 @@ jobs:
           # nightly_sv_exits_after_duration (~3h+ — safety valve symbolic proof),
           # nightly_oracle_adversarial_max_clamped (~2h36m — circuit breaker SAT),
           # nightly_hwm_floor_correct_math (was proof_hwm_floor_correct_math — renamed to exclude from PR CI)
+          # nightly_dust_single_deposit_conservation (~19min+ — symbolic u64×u128 mul SAT),
+          # nightly_dust_two_deposits_conservation (~24min — three-variable u128 mul SAT)
           args: --tests --output-format terse --jobs 2 --harness nightly_
         timeout-minutes: 295

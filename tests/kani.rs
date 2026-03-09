@@ -4672,8 +4672,9 @@ fn nightly_fee_monotone_in_bps() {
 // =============================================================================
 
 /// Prove: single deposit dust conservation holds exactly.
+/// SAT-hard: symbolic u64×u128 multiplication in conservation check.
 #[kani::proof]
-fn kani_dust_single_deposit_conservation() {
+fn nightly_dust_single_deposit_conservation() {
     let amount: u64 = kani::any();
     let scale: u32 = kani::any();
     kani::assume(scale > 0);
@@ -4690,8 +4691,9 @@ fn kani_dust_single_deposit_conservation() {
 }
 
 /// Prove: two deposits with same scale conserve total value.
+/// SAT-hard: three-variable symbolic u128 multiplication (1411s in CI). Moved to nightly.
 #[kani::proof]
-fn kani_dust_two_deposits_conservation() {
+fn nightly_dust_two_deposits_conservation() {
     let a1: u64 = kani::any();
     let a2: u64 = kani::any();
     let scale: u32 = kani::any();
