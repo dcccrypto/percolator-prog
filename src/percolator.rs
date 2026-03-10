@@ -6609,6 +6609,7 @@ mod creator_history_kani {
 
     /// Multiplier monotonically increases with failures.
     #[kani::proof]
+    #[kani::unwind(2)]
     fn proof_multiplier_monotone() {
         let a: u16 = kani::any();
         let b: u16 = kani::any();
@@ -6625,7 +6626,8 @@ mod creator_history_kani {
 
     /// Required deposit >= floor (50% of base).
     #[kani::proof]
-    fn proof_deposit_floor() {
+    #[kani::unwind(2)]
+    fn nightly_proof_deposit_floor() {
         let failed: u16 = kani::any();
         let successful: u16 = kani::any();
         let base: u64 = kani::any();
@@ -6636,7 +6638,7 @@ mod creator_history_kani {
 
     /// Slash conservation: slash + remainder == deposit.
     #[kani::proof]
-    fn proof_slash_conservation() {
+    fn nightly_proof_slash_conservation() {
         let deposit: u64 = kani::any();
         let (slash, remainder) = compute_slash(deposit);
         assert!(slash + remainder == deposit);
@@ -6644,7 +6646,7 @@ mod creator_history_kani {
 
     /// OI threshold is monotone: more OI → more likely to pass.
     #[kani::proof]
-    fn proof_oi_threshold_monotone() {
+    fn nightly_proof_oi_threshold_monotone() {
         let deposit: u64 = kani::any();
         let oi_a: u64 = kani::any();
         let oi_b: u64 = kani::any();
