@@ -6758,10 +6758,10 @@ pub mod shared_vault {
             let req = WithdrawalRequest {
                 magic: WITHDRAW_REQ_MAGIC,
                 bump: 1,
-                _pad: [0; 7],
-                lp_amount: 1_000,
                 claimed: 0,
-                _reserved: [0; 7],
+                _pad: [0; 6],
+                lp_amount: 1_000,
+                epoch_number: 5,
             };
             assert_eq!(req.claimed, 0, "initially unclaimed");
             let mut buf = [0u8; WITHDRAW_REQ_LEN];
