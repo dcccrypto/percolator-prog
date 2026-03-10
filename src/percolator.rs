@@ -7648,7 +7648,90 @@ pub mod processor {
             vault_key: a_vault.key,
             a_clock: &accounts[5],
         };
-        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)
+        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)?;
+
+        // PERC-629: Optional CreatorHistory PDA initialization.
+        // accounts[9] = creator_history PDA (writable), accounts[10] = system_program
+        // Creates or updates the creator's market history.
+        // Backward compatible: callers with only 9 accounts skip this.
+        if accounts.len() >= 11 {
+            let a_creator_history = &accounts[9];
+            let a_system_program = &accounts[10];
+            accounts::expect_writable(a_creator_history)?;
+
+            if *a_system_program.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                &[
+                    crate::creator_history::CREATOR_HISTORY_SEED,
+                    a_admin.key.as_ref(),
+                ],
+                program_id,
+            );
+            if *a_creator_history.key != expected_pda {
+                return Err(ProgramError::InvalidSeeds);
+            }
+
+            if a_creator_history.data_is_empty() {
+                // Create the PDA
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(crate::creator_history::CREATOR_HISTORY_LEN);
+                let bump_bytes = [pda_bump];
+                let signer_seeds: &[&[u8]] = &[
+                    crate::creator_history::CREATOR_HISTORY_SEED,
+                    a_admin.key.as_ref(),
+                    &bump_bytes,
+                ];
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_admin.key,
+                        &expected_pda,
+                        lamports,
+                        crate::creator_history::CREATOR_HISTORY_LEN as u64,
+                        program_id,
+                    ),
+                    &[
+                        a_admin.clone(),
+                        a_creator_history.clone(),
+                        a_system_program.clone(),
+                    ],
+                    &[signer_seeds],
+                )?;
+
+                let state = crate::creator_history::CreatorHistory {
+                    magic: crate::creator_history::CREATOR_HISTORY_MAGIC,
+                    bump: pda_bump,
+                    _pad: [0; 3],
+                    total_markets: 1,
+                    successful_markets: 0,
+                    failed_markets: 0,
+                    _reserved: [0; 14],
+                };
+                let mut hist_data = a_creator_history
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::creator_history::write_state(&mut hist_data, &state);
+                msg!("PERC-629: CreatorHistory initialized — total_markets=1");
+            } else {
+                // PDA exists — just increment total_markets
+                let mut hist_data = a_creator_history
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                if let Some(hist) = crate::creator_history::read_state(&hist_data) {
+                    let mut new_hist = *hist;
+                    new_hist.total_markets = new_hist.total_markets.saturating_add(1);
+                    crate::creator_history::write_state(&mut hist_data, &new_hist);
+                    msg!(
+                        "PERC-629: CreatorHistory updated — total_markets={}",
+                        new_hist.total_markets
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn process_instruction<'a, 'b>(
@@ -13203,13 +13286,27 @@ pub mod processor {
             // accounts: [0] caller (signer), [1] slab, [2] creator_history PDA (writable),
             //           [3] insurance vault (writable — receives slash)
             Instruction::SlashCreationDeposit => {
-                accounts::expect_len(accounts, 3)?;
+                // Permissionless slash crank. Evaluates a market after 30 days.
+                // accounts: [0] caller (signer), [1] slab (writable),
+                //           [2] creator_history PDA (writable),
+                //           [3] vault (writable — source of slash),
+                //           [4] insurance_ata (writable — receives slash),
+                //           [5] vault_authority, [6] token_program
+                accounts::expect_len(accounts, 7)?;
                 let a_caller = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_creator_history = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_insurance_ata = &accounts[4];
+                let a_vault_authority = &accounts[5];
+                let a_token = &accounts[6];
 
                 accounts::expect_signer(a_caller)?;
+                accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_creator_history)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_insurance_ata)?;
+                verify_token_program(a_token)?;
 
                 let slab_data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &slab_data)?;
@@ -13218,7 +13315,10 @@ pub mod processor {
                 let header = state::read_header(&slab_data);
                 let config = state::read_config(&slab_data);
 
-                // Verify creator_history PDA
+                // Use admin as creator. Note: if admin was transferred via
+                // UpdateAdmin/AcceptAdmin, the new admin inherits the market's
+                // reputation outcome. This is by design — the current admin
+                // is responsible for the market's health.
                 let admin_key = Pubkey::new_from_array(header.admin);
                 let (expected_pda, _) = Pubkey::find_program_address(
                     &[
@@ -13230,6 +13330,17 @@ pub mod processor {
                 if *a_creator_history.key != expected_pda {
                     return Err(ProgramError::InvalidSeeds);
                 }
+
+                // Verify vault
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                accounts::expect_key(a_vault_authority, &auth)?;
 
                 // Check evaluation period has passed
                 let clock = solana_program::clock::Clock::get()?;
@@ -13247,8 +13358,7 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
-                // Check OI vs threshold.
-                // Use the vault balance as proxy for original deposit size.
+                // Check OI vs threshold
                 let engine = zc::engine_ref(&slab_data)?;
                 let current_oi = engine.total_open_interest.get() as u64;
                 let vault_balance = engine.vault.get() as u64;
@@ -13261,24 +13371,80 @@ pub mod processor {
                     let mut new_hist = *hist;
 
                     if crate::creator_history::oi_threshold_met(vault_balance, current_oi) {
-                        // Market succeeded
                         new_hist.successful_markets = new_hist.successful_markets.saturating_add(1);
                         msg!(
                             "SLASH: market passed OI threshold — successful_markets={}",
                             new_hist.successful_markets
                         );
                     } else {
-                        // Market failed — slash 50% and increment failures
                         new_hist.failed_markets = new_hist.failed_markets.saturating_add(1);
                         let (slash_amount, _remainder) =
                             crate::creator_history::compute_slash(vault_balance);
 
-                        // The slash transfers lamports from the slab to insurance
-                        // (simplified: just log for now, actual transfer needs
-                        //  insurance vault account which we'll wire in follow-up)
+                        if slash_amount > 0 {
+                            // Convert slash to base tokens
+                            let base_slash = crate::units::units_to_base_checked(
+                                slash_amount,
+                                config.unit_scale,
+                            )
+                            .unwrap_or(0);
+
+                            if base_slash > 0 {
+                                // Transfer slash from vault to insurance ATA
+                                drop(hist_data);
+                                drop(slab_data);
+                                let seed1: &[u8] = b"vault";
+                                let seed2: &[u8] = a_slab.key.as_ref();
+                                let bump_arr: [u8; 1] = [vault_bump];
+                                let seed3: &[u8] = &bump_arr;
+                                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                                collateral::withdraw(
+                                    a_token,
+                                    a_vault,
+                                    a_insurance_ata,
+                                    a_vault_authority,
+                                    base_slash,
+                                    &signer_seeds,
+                                )?;
+
+                                // Update engine vault balance
+                                let mut slab_data = state::slab_data_mut(a_slab)?;
+                                let engine = zc::engine_mut(&mut slab_data)?;
+                                engine.vault = percolator::U128::new(
+                                    engine.vault.get().saturating_sub(slash_amount as u128),
+                                );
+                                // Credit insurance fund
+                                engine.insurance_fund.balance = percolator::U128::new(
+                                    engine
+                                        .insurance_fund
+                                        .balance
+                                        .get()
+                                        .saturating_add(slash_amount as u128),
+                                );
+                                drop(slab_data);
+
+                                // Re-borrow for history write
+                                let mut hist_data = a_creator_history
+                                    .try_borrow_mut_data()
+                                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                                if let Some(_) = crate::creator_history::read_state(&hist_data) {
+                                    crate::creator_history::write_state(&mut hist_data, &new_hist);
+                                }
+
+                                msg!(
+                                    "SLASH: transferred {} base tokens to insurance — failed_markets={}",
+                                    base_slash,
+                                    new_hist.failed_markets
+                                );
+                                // Early return since we already wrote hist
+                                return Ok(());
+                            }
+                        }
+
                         msg!(
-                            "SLASH: market failed OI threshold — slash={} failed_markets={}",
-                            slash_amount,
+                            "SLASH: market failed OI threshold — slash=0 (no vault balance) failed_markets={}",
                             new_hist.failed_markets
                         );
                     }
