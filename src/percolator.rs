@@ -3645,11 +3645,11 @@ pub mod state {
 
     /// Phase 1 caps.
     pub const PHASE1_OI_CAP_E6: u64 = 10_000_000_000; // $10K in e6
-    pub const PHASE1_MAX_LEVERAGE_BPS: u64 = 20_000;   // 2x
+    pub const PHASE1_MAX_LEVERAGE_BPS: u64 = 20_000; // 2x
 
     /// Phase 2 caps.
     pub const PHASE2_OI_CAP_E6: u64 = 100_000_000_000; // $100K in e6
-    pub const PHASE2_MAX_LEVERAGE_BPS: u64 = 50_000;    // 5x
+    pub const PHASE2_MAX_LEVERAGE_BPS: u64 = 50_000; // 5x
 
     /// Read oracle phase from config padding[2].
     #[inline]
@@ -13202,8 +13202,10 @@ pub mod processor {
                 let old_phase = state::get_oracle_phase(&config);
 
                 // Pyth-pinned markets auto-promote to Phase 3
-                let has_mature_oracle =
-                    crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id);
+                let has_mature_oracle = crate::verify::is_pyth_pinned_mode(
+                    config.oracle_authority,
+                    config.index_feed_id,
+                );
 
                 // Lazy-init market_created_slot for legacy markets
                 let created = state::effective_created_slot(config.market_created_slot, clock.slot);
@@ -13444,12 +13446,26 @@ mod oracle_phase_tests {
         assert!(!trans);
 
         // Volume met but under 4h floor → still Phase 1
-        let (phase, trans) = check_phase_transition(PHASE1_VOLUME_MIN_SLOTS - 1, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
+        let (phase, trans) = check_phase_transition(
+            PHASE1_VOLUME_MIN_SLOTS - 1,
+            0,
+            0,
+            PHASE2_VOLUME_THRESHOLD,
+            0,
+            false,
+        );
         assert_eq!(phase, 0);
         assert!(!trans);
 
         // Path B: 4h elapsed + volume met → Phase 2
-        let (phase, trans) = check_phase_transition(PHASE1_VOLUME_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
+        let (phase, trans) = check_phase_transition(
+            PHASE1_VOLUME_MIN_SLOTS,
+            0,
+            0,
+            PHASE2_VOLUME_THRESHOLD,
+            0,
+            false,
+        );
         assert_eq!(phase, 1);
         assert!(trans);
 
@@ -13459,7 +13475,8 @@ mod oracle_phase_tests {
         assert!(trans);
 
         // Both conditions met
-        let (phase, trans) = check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
+        let (phase, trans) =
+            check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
         assert_eq!(phase, 1);
         assert!(trans);
     }
@@ -13575,7 +13592,8 @@ mod oracle_phase_kani {
         let delta: u32 = kani::any();
         let has_oracle: bool = kani::any();
 
-        let (new_phase, _) = check_phase_transition(slot, created, old_phase, vol, delta, has_oracle);
+        let (new_phase, _) =
+            check_phase_transition(slot, created, old_phase, vol, delta, has_oracle);
         assert!(new_phase >= old_phase, "phase must never decrease");
         assert!(new_phase <= 2, "phase must be 0, 1, or 2");
     }
@@ -13606,7 +13624,8 @@ mod oracle_phase_kani {
         let delta: u32 = kani::any();
         let has_oracle: bool = kani::any();
 
-        let (new_phase, transitioned) = check_phase_transition(slot, created, 2, vol, delta, has_oracle);
+        let (new_phase, transitioned) =
+            check_phase_transition(slot, created, 2, vol, delta, has_oracle);
         assert!(new_phase == 2, "Phase 3 is terminal");
         assert!(!transitioned, "Phase 3 never transitions");
     }
