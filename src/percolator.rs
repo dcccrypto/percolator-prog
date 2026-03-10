@@ -6651,7 +6651,7 @@ pub mod keeper_fund {
         fn test_split_deposit_ratios() {
             let (lp, fund) = split_deposit(10_000, 3_000);
             assert_eq!(fund, 3_000); // 30%
-            assert_eq!(lp, 7_000);   // 70%
+            assert_eq!(lp, 7_000); // 70%
         }
 
         #[test]
@@ -8617,6 +8617,48 @@ pub mod processor {
                 // Debug: log lifetime counters (sol_log_64: tag, liqs, force, max_accounts, insurance)
                 msg!("CRANK_STATS");
                 sol_log_64(0xC8A4C, liqs, force, MAX_ACCOUNTS as u64, ins_low);
+
+                // PERC-623: Optional keeper fund reward — if 5th account is a valid
+                // KeeperFund PDA, pay crank reward to caller. Backward compatible:
+                // callers passing only 4 accounts skip this entirely.
+                if accounts.len() >= 5 {
+                    let a_keeper_fund = &accounts[4];
+                    if a_keeper_fund.is_writable {
+                        // Verify PDA derivation: seeds = ["keeper_fund", slab_key]
+                        let (expected_pda, _bump) = Pubkey::find_program_address(
+                            &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+                            program_id,
+                        );
+                        if *a_keeper_fund.key == expected_pda {
+                            let mut fund_data = a_keeper_fund
+                                .try_borrow_mut_data()
+                                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                            if let Some(fund_state) = crate::keeper_fund::read_state(&fund_data) {
+                                let (new_bal, reward) = crate::keeper_fund::pay_crank_reward(
+                                    fund_state.balance,
+                                    fund_state.reward_per_crank,
+                                );
+                                if reward > 0 {
+                                    let mut new_state = *fund_state;
+                                    new_state.balance = new_bal;
+                                    new_state.total_rewarded =
+                                        new_state.total_rewarded.saturating_add(reward);
+                                    crate::keeper_fund::write_state(&mut fund_data, &new_state);
+
+                                    // Transfer lamports from KeeperFund PDA to caller
+                                    **a_keeper_fund.try_borrow_mut_lamports()? -= reward;
+                                    **a_caller.try_borrow_mut_lamports()? += reward;
+
+                                    // If fund depleted, market auto-pause
+                                    if crate::keeper_fund::is_depleted(new_bal) {
+                                        state::set_paused(&mut data, true);
+                                        msg!("KEEPER_FUND_DEPLETED: market paused");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Instruction::TradeNoCpi {
                 lp_idx,
