@@ -7044,15 +7044,14 @@ fn kani_new_tags_sequential() {
 #[cfg(kani_sketch)]
 mod perc_622_oracle_phase_proofs {
     use super::*;
+    use bytemuck::Zeroable;
     use percolator_prog::oracle_phase::{
-        maybe_advance_phase, effective_min_margin_bps,
-        PHASE1_OI_CAP_DEFAULT_E6, PHASE2_OI_CAP_DEFAULT_E6,
-        PHASE2_SLOTS, PHASE3_SLOTS,
-        PHASE2_VOL_THRESHOLD_E6, PHASE3_VOL_THRESHOLD_E6,
-        PHASE1_MAX_LEVERAGE_MARGIN_BPS, PHASE2_MAX_LEVERAGE_MARGIN_BPS,
+        effective_min_margin_bps, maybe_advance_phase, MIN_PHASE1_SLOTS,
+        PHASE1_MAX_LEVERAGE_MARGIN_BPS, PHASE1_OI_CAP_DEFAULT_E6, PHASE2_MAX_LEVERAGE_MARGIN_BPS,
+        PHASE2_OI_CAP_DEFAULT_E6, PHASE2_SLOTS, PHASE2_VOL_THRESHOLD_E6, PHASE3_SLOTS,
+        PHASE3_VOL_THRESHOLD_E6,
     };
     use percolator_prog::state::MarketConfig;
-    use bytemuck::Zeroable;
 
     // ── Harness 1: Phase is monotone non-decreasing ───────────────────────
     #[kani::proof]
@@ -7064,8 +7063,14 @@ mod perc_622_oracle_phase_proofs {
         let initial_phase = config.oracle_phase;
         maybe_advance_phase(&mut config, current_slot);
 
-        assert!(config.oracle_phase >= initial_phase, "phase must never decrease");
-        assert!(config.oracle_phase <= 2, "phase never exceeds 2 (max state)");
+        assert!(
+            config.oracle_phase >= initial_phase,
+            "phase must never decrease"
+        );
+        assert!(
+            config.oracle_phase <= 2,
+            "phase never exceeds 2 (max state)"
+        );
     }
 
     // ── Harness 2: Phase 3 is terminal ───────────────────────────────────
@@ -7098,11 +7103,19 @@ mod perc_622_oracle_phase_proofs {
         let margin_p2 = effective_min_margin_bps(&config_p2, base_margin);
         let margin_p3 = effective_min_margin_bps(&config_p3, base_margin);
 
-        assert!(margin_p1 >= margin_p2, "phase 1 >= phase 2 min margin (more conservative)");
-        assert!(margin_p2 >= margin_p3, "phase 2 >= phase 3 min margin (more conservative)");
+        assert!(
+            margin_p1 >= margin_p2,
+            "phase 1 >= phase 2 min margin (more conservative)"
+        );
+        assert!(
+            margin_p2 >= margin_p3,
+            "phase 2 >= phase 3 min margin (more conservative)"
+        );
     }
 
-    // ── Harness 4: Phase 1 → 2 triggers exactly when conditions met ──────
+    // ── Harness 4a: Phase 1 → 2 triggers exactly when conditions met ─────
+    // Verifies the combined (time OR time-floor-protected-volume) trigger logic.
+    // Addresses security finding: "Phase 1→2 volume-only bypass (no minimum time floor)".
     #[kani::proof]
     fn proof_phase1_to_phase2_correct_trigger() {
         let mut config: MarketConfig = kani::any();
@@ -7111,17 +7124,50 @@ mod perc_622_oracle_phase_proofs {
         kani::assume(config.market_created_slot <= current_slot);
 
         let elapsed = current_slot.saturating_sub(config.market_created_slot);
-        let vol_trigger = config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6;
+        // Volume trigger only eligible after the 4h floor
+        let vol_trigger_eligible = elapsed >= MIN_PHASE1_SLOTS;
+        let vol_trigger =
+            vol_trigger_eligible && config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6;
         let time_trigger = elapsed >= PHASE2_SLOTS;
 
         maybe_advance_phase(&mut config, current_slot);
 
         if !vol_trigger && !time_trigger {
-            assert_eq!(config.oracle_phase, 0, "phase 1 must NOT advance without trigger");
+            assert_eq!(
+                config.oracle_phase, 0,
+                "phase 1 must NOT advance without trigger"
+            );
         }
         if vol_trigger || time_trigger {
-            assert!(config.oracle_phase >= 1, "phase MUST advance when trigger fires");
+            assert!(
+                config.oracle_phase >= 1,
+                "phase MUST advance when trigger fires"
+            );
         }
+    }
+
+    // ── Harness 4b: Volume trigger alone cannot fire before MIN_PHASE1_SLOTS ──
+    // Symbolic proof that the 4h time floor is enforced: no matter how large
+    // cumulative_volume_e6 is, Phase 1 never advances before the floor.
+    #[kani::proof]
+    fn proof_phase1_vol_trigger_respects_time_floor() {
+        let mut config: MarketConfig = kani::any();
+        let current_slot: u64 = kani::any();
+        kani::assume(config.oracle_phase == 0);
+        kani::assume(config.market_created_slot <= current_slot);
+
+        let elapsed = current_slot.saturating_sub(config.market_created_slot);
+        // Constrain: elapsed < MIN_PHASE1_SLOTS (below the floor) AND below 72h
+        kani::assume(elapsed < MIN_PHASE1_SLOTS);
+        kani::assume(elapsed < PHASE2_SLOTS);
+
+        // Volume can be anything — even MAX — but floor not met
+        maybe_advance_phase(&mut config, current_slot);
+
+        assert_eq!(
+            config.oracle_phase, 0,
+            "volume trigger must NOT fire before MIN_PHASE1_SLOTS floor"
+        );
     }
 
     // ── Harness 5: Phase 2 → 3 requires BOTH time AND volume ────────────
@@ -7140,10 +7186,16 @@ mod perc_622_oracle_phase_proofs {
 
         if !vol_trigger || !time_trigger {
             // Only one trigger: should NOT advance to phase 3
-            assert!(config.oracle_phase <= 1, "phase 2 must NOT advance without BOTH triggers");
+            assert!(
+                config.oracle_phase <= 1,
+                "phase 2 must NOT advance without BOTH triggers"
+            );
         }
         if vol_trigger && time_trigger {
-            assert_eq!(config.oracle_phase, 2, "phase 3 MUST be reached when both triggers fire");
+            assert_eq!(
+                config.oracle_phase, 2,
+                "phase 3 MUST be reached when both triggers fire"
+            );
         }
     }
 
@@ -7168,6 +7220,9 @@ mod perc_622_oracle_phase_proofs {
         // Sanity check constants
         assert_eq!(PHASE2_SLOTS, 72 * 9_000, "72h at 9000 slots/hour");
         assert_eq!(PHASE3_SLOTS, 14 * 24 * 9_000, "14 days in slots");
-        assert!(PHASE2_VOL_THRESHOLD_E6 < PHASE3_VOL_THRESHOLD_E6, "phase 3 vol threshold > phase 2");
+        assert!(
+            PHASE2_VOL_THRESHOLD_E6 < PHASE3_VOL_THRESHOLD_E6,
+            "phase 3 vol threshold > phase 2"
+        );
     }
 }

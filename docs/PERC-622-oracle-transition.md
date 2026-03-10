@@ -33,7 +33,7 @@ Oracle: DEX TWAP   Oracle: median(3 feeds)  Oracle: Pyth/Switchboard
 
 | Transition | Trigger Condition | Action |
 |------------|-------------------|--------|
-| Phase 1 → Phase 2 | `elapsed_slots ≥ PHASE2_SLOTS` OR `cumulative_volume_e6 ≥ PHASE2_VOL_THRESHOLD_E6` | Update `oracle_phase`, set `phase2_start_slot` |
+| Phase 1 → Phase 2 | `elapsed_slots ≥ PHASE2_SLOTS` OR (`elapsed_slots ≥ MIN_PHASE1_SLOTS` AND `cumulative_volume_e6 ≥ PHASE2_VOL_THRESHOLD_E6`) | Update `oracle_phase`, set `phase2_start_slot` |
 | Phase 2 → Phase 3 | `elapsed_slots ≥ PHASE3_SLOTS` AND `cumulative_volume_e6 ≥ PHASE3_VOL_THRESHOLD_E6` | Update `oracle_phase`, unlock full params |
 
 **One-way transitions only.** A market can never regress to an earlier phase.
@@ -98,6 +98,12 @@ pub const PHASE1_MAX_LEVERAGE_MARGIN_BPS: u64 = 5_000; // 50% = 2x
 
 /// Phase 2 max leverage (5x = 20% min margin = 2_000 bps).
 pub const PHASE2_MAX_LEVERAGE_MARGIN_BPS: u64 = 2_000; // 20% = 5x
+
+/// Minimum elapsed slots before the volume trigger can fire for Phase 1 → 2.
+/// 4 hours at ~400ms/slot = 36_000 slots.
+/// Prevents a wash-trader from immediately buying up to Phase 2 at market creation.
+/// The time trigger (PHASE2_SLOTS = 72h) is unaffected.
+pub const MIN_PHASE1_SLOTS: u64 = 4 * SLOTS_PER_HOUR; // 36_000
 ```
 
 ---
@@ -173,8 +179,14 @@ pub fn maybe_advance_phase(config: &mut MarketConfig, current_slot: u64) {
     let elapsed = current_slot.saturating_sub(config.market_created_slot);
     match config.oracle_phase {
         0 => {
-            // Phase 1 → 2: time trigger OR volume trigger
-            if elapsed >= PHASE2_SLOTS || config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6 {
+            // Phase 1 → 2: time trigger OR (time-floor-protected) volume trigger.
+            // The volume-only path requires elapsed >= MIN_PHASE1_SLOTS (4h floor) to prevent
+            // a wash-trader from advancing to Phase 2 immediately at market creation.
+            // See security finding: "Phase 1→2 volume-only bypass (no minimum time floor)".
+            let vol_trigger_eligible = elapsed >= MIN_PHASE1_SLOTS;
+            if elapsed >= PHASE2_SLOTS
+                || (vol_trigger_eligible && config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6)
+            {
                 config.oracle_phase = 1;
                 // Tighten circuit breaker on oracle price cap
                 if config.oracle_price_cap_e2bps == 0 || config.oracle_price_cap_e2bps > 25_000 {
@@ -325,7 +337,8 @@ fn proof_phase1_to_phase2_correct_trigger() {
     kani::assume(config.market_created_slot <= current_slot);
 
     let elapsed = current_slot.saturating_sub(config.market_created_slot);
-    let vol_trigger = config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6;
+    let vol_trigger_eligible = elapsed >= MIN_PHASE1_SLOTS;
+    let vol_trigger = vol_trigger_eligible && config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6;
     let time_trigger = elapsed >= PHASE2_SLOTS;
 
     maybe_advance_phase(&mut config, current_slot);
@@ -373,7 +386,7 @@ fn proof_phase1_to_phase2_correct_trigger() {
 
 | Risk | Mitigation |
 |------|------------|
-| Volume gaming (wash trades to skip Phase 1) | Phase 1 → Phase 2 also requires time (72h) OR volume. Wash trading costs gas + carry. Phase 2 still has conservative $100K OI cap. |
+| Volume gaming (wash trades to skip Phase 1) | Volume trigger requires `elapsed ≥ MIN_PHASE1_SLOTS` (4h floor) AND $100K notional. Even after 4h, Phase 2 OI cap is $100K — the wash-trade cost exceeds the marginal leverage gain. Time trigger (72h) is the primary path. |
 | Oracle manipulation in Phase 1 | Admin oracle authority is trusted (keeper-controlled). Circuit breaker at 5%/slot prevents flash oracle attacks. |
 | Frozen markets (volume never reaches threshold) | Time trigger is primary: 72h always triggers Phase 2 regardless of volume. |
 | CONFIG_LEN increase breaks existing slabs | Slabs are fixed-size accounts. SLAB_LEN must be checked: all 3 tiers (65KB / 257KB / 1MB) are large enough to absorb 32 bytes of config growth. |
