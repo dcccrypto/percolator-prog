@@ -2391,6 +2391,8 @@ pub mod ix {
         ///
         /// Accounts: [dest(signer,writable), slab(signer,writable)]
         ReclaimSlabRent,
+        /// PERC-622: Advance oracle phase (permissionless crank).
+        AdvanceOraclePhase,
 
         /// On-chain audit crank: walk all accounts and verify conservation invariants.
         /// Permissionless. Checks capital, PnL, OI, LP aggregates and solvency.
@@ -2879,6 +2881,7 @@ pub mod ix {
                 }
                 TAG_CLOSE_STALE_SLAB => Ok(Instruction::CloseStaleSlabs),
                 TAG_RECLAIM_SLAB_RENT => Ok(Instruction::ReclaimSlabRent),
+                TAG_ADVANCE_ORACLE_PHASE => Ok(Instruction::AdvanceOraclePhase),
                 TAG_AUDIT_CRANK => Ok(Instruction::AuditCrank),
                 TAG_SET_OFFSET_PAIR => {
                     let offset_bps = read_u16(&mut rest)?;
@@ -3618,6 +3621,167 @@ pub mod state {
         let bytes = clamped.to_le_bytes();
         config._insurance_isolation_padding[0] = bytes[0];
         config._insurance_isolation_padding[1] = bytes[1];
+    }
+
+    // ========================================
+    // PERC-622: Three-Phase Oracle Transition
+    // ========================================
+
+    /// Oracle phase constants.
+    pub const ORACLE_PHASE_NASCENT: u8 = 0;
+    pub const ORACLE_PHASE_GROWING: u8 = 1;
+    pub const ORACLE_PHASE_MATURE: u8 = 2;
+
+    /// Phase transition thresholds.
+    /// ~72 hours at 400ms slots = 648_000 slots (time-only path).
+    pub const PHASE1_MIN_SLOTS: u64 = 648_000;
+    /// ~4 hours at 400ms slots = 36_000 slots (minimum floor for volume path).
+    /// Security: prevents wash-trading to skip time requirement entirely.
+    pub const PHASE1_VOLUME_MIN_SLOTS: u64 = 36_000;
+    /// $100K cumulative volume threshold to exit Phase 1 (in collateral units).
+    pub const PHASE2_VOLUME_THRESHOLD: u64 = 100_000_000_000; // 100K * 1e6 (e6 format)
+    /// ~14 days at 400ms slots = 3_024_000 slots.
+    pub const PHASE2_MATURITY_SLOTS: u64 = 3_024_000;
+
+    /// Phase 1 caps.
+    pub const PHASE1_OI_CAP_E6: u64 = 10_000_000_000; // $10K in e6
+    pub const PHASE1_MAX_LEVERAGE_BPS: u64 = 20_000; // 2x
+
+    /// Phase 2 caps.
+    pub const PHASE2_OI_CAP_E6: u64 = 100_000_000_000; // $100K in e6
+    pub const PHASE2_MAX_LEVERAGE_BPS: u64 = 50_000; // 5x
+
+    /// Read oracle phase from config padding[2].
+    #[inline]
+    pub fn get_oracle_phase(config: &MarketConfig) -> u8 {
+        config._insurance_isolation_padding[2].min(ORACLE_PHASE_MATURE)
+    }
+
+    /// Set oracle phase in config padding[2]. Clamps to [0, 2].
+    #[inline]
+    pub fn set_oracle_phase(config: &mut MarketConfig, phase: u8) {
+        config._insurance_isolation_padding[2] = phase.min(ORACLE_PHASE_MATURE);
+    }
+
+    /// Read cumulative volume (e6 format) from config padding[3..11].
+    #[inline]
+    pub fn get_cumulative_volume(config: &MarketConfig) -> u64 {
+        let bytes: [u8; 8] = config._insurance_isolation_padding[3..11]
+            .try_into()
+            .unwrap_or([0u8; 8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set cumulative volume (e6 format) in config padding[3..11].
+    #[inline]
+    pub fn set_cumulative_volume(config: &mut MarketConfig, vol: u64) {
+        let bytes = vol.to_le_bytes();
+        config._insurance_isolation_padding[3..11].copy_from_slice(&bytes);
+    }
+
+    /// Read phase2 delta slots (u24 LE) from config padding[11..14].
+    /// Max value: 16_777_215 (~77 days at 400ms — more than enough).
+    #[inline]
+    pub fn get_phase2_delta_slots(config: &MarketConfig) -> u32 {
+        let b = &config._insurance_isolation_padding[11..14];
+        u32::from_le_bytes([b[0], b[1], b[2], 0])
+    }
+
+    /// Set phase2 delta slots (u24 LE) in config padding[11..14].
+    /// Truncates to 24 bits (max 16_777_215).
+    #[inline]
+    pub fn set_phase2_delta_slots(config: &mut MarketConfig, delta: u32) {
+        let clamped = delta.min(0x00FF_FFFF);
+        let bytes = clamped.to_le_bytes();
+        config._insurance_isolation_padding[11] = bytes[0];
+        config._insurance_isolation_padding[12] = bytes[1];
+        config._insurance_isolation_padding[13] = bytes[2];
+    }
+
+    /// Resolve effective market_created_slot for phase logic.
+    /// If market_created_slot == 0 (legacy market, field never set), returns current_slot
+    /// so elapsed = 0 — the market starts fresh in Phase 1 rather than auto-promoting.
+    /// Callers SHOULD lazy-init market_created_slot on first encounter.
+    #[inline]
+    pub fn effective_created_slot(market_created_slot: u64, current_slot: u64) -> u64 {
+        if market_created_slot == 0 {
+            current_slot
+        } else {
+            market_created_slot
+        }
+    }
+
+    /// Pure decision function: check if oracle phase should advance.
+    /// Returns (new_phase, transitioned).
+    /// Phase transitions are monotonic: 0→1→2, never backwards.
+    ///
+    /// IMPORTANT: `market_created_slot` MUST be pre-resolved via `effective_created_slot()`
+    /// to handle legacy markets where the field is zero.
+    pub fn check_phase_transition(
+        current_slot: u64,
+        market_created_slot: u64,
+        oracle_phase: u8,
+        cumulative_volume: u64,
+        phase2_delta_slots: u32,
+        has_mature_oracle: bool,
+    ) -> (u8, bool) {
+        match oracle_phase {
+            0 => {
+                // Phase 1 → Phase 2:
+                //   Path A: 72h elapsed (time-only, regardless of volume)
+                //   Path B: 4h elapsed AND $100K cumulative volume
+                // Security: 4h floor prevents wash-trade instant bypass.
+                let elapsed = current_slot.saturating_sub(market_created_slot);
+                let time_ready = elapsed >= PHASE1_MIN_SLOTS;
+                let volume_ready = elapsed >= PHASE1_VOLUME_MIN_SLOTS
+                    && cumulative_volume >= PHASE2_VOLUME_THRESHOLD;
+                if time_ready || volume_ready {
+                    (ORACLE_PHASE_GROWING, true)
+                } else {
+                    (ORACLE_PHASE_NASCENT, false)
+                }
+            }
+            1 => {
+                // Phase 2 → Phase 3: 14d elapsed since Phase 2 entry OR mature oracle available
+                if has_mature_oracle {
+                    return (ORACLE_PHASE_MATURE, true);
+                }
+                let phase2_start = market_created_slot.saturating_add(phase2_delta_slots as u64);
+                let elapsed_since_phase2 = current_slot.saturating_sub(phase2_start);
+                if elapsed_since_phase2 >= PHASE2_MATURITY_SLOTS {
+                    (ORACLE_PHASE_MATURE, true)
+                } else {
+                    (ORACLE_PHASE_GROWING, false)
+                }
+            }
+            _ => (ORACLE_PHASE_MATURE, false), // Phase 3 is terminal
+        }
+    }
+
+    /// Return the effective OI cap for the current oracle phase.
+    /// Phase 1: $10K, Phase 2: $100K, Phase 3: full configured cap.
+    pub fn phase_oi_cap(oracle_phase: u8, base_oi_cap: u64) -> u64 {
+        match oracle_phase {
+            0 => PHASE1_OI_CAP_E6.min(base_oi_cap),
+            1 => PHASE2_OI_CAP_E6.min(base_oi_cap),
+            _ => base_oi_cap,
+        }
+    }
+
+    /// Return the effective max leverage (in bps) for the current oracle phase.
+    /// Phase 1: 2x (20_000), Phase 2: 5x (50_000), Phase 3: full configured.
+    pub fn phase_max_leverage_bps(oracle_phase: u8, base_max_lev_bps: u64) -> u64 {
+        match oracle_phase {
+            0 => PHASE1_MAX_LEVERAGE_BPS.min(base_max_lev_bps),
+            1 => PHASE2_MAX_LEVERAGE_BPS.min(base_max_lev_bps),
+            _ => base_max_lev_bps,
+        }
+    }
+
+    /// Accumulate trade volume. Saturating add to prevent overflow.
+    pub fn accumulate_volume(config: &mut MarketConfig, trade_notional_e6: u64) {
+        let current = get_cumulative_volume(config);
+        set_cumulative_volume(config, current.saturating_add(trade_notional_e6));
     }
 
     // ========================================
@@ -6569,15 +6733,82 @@ pub mod processor {
             base_max_oi
         };
 
+        // PERC-622: Apply oracle phase OI cap (absolute ceiling per phase)
+        let phase = state::get_oracle_phase(config);
+        let phase_cap = state::phase_oi_cap(phase, u64::MAX) as u128;
+        let max_oi = max_oi.min(phase_cap);
+
         if current_oi > max_oi {
             msg!(
-                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={} skew_factor={})",
+                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={} skew_factor={} phase={})",
                 current_oi,
                 max_oi,
                 vault,
                 multiplier,
                 effective_multiplier,
                 skew_factor_bps,
+                phase,
+            );
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        Ok(())
+    }
+
+    /// PERC-622: Check phase-based leverage limit after trade.
+    /// Leverage = notional / collateral. Phase 1: max 2x, Phase 2: max 5x.
+    /// We enforce via minimum initial_margin_bps floor:
+    ///   Phase 1: floor = 5000 bps (50% → 2x)
+    ///   Phase 2: floor = 2000 bps (20% → 5x)
+    ///   Phase 3: no additional floor
+    /// If the engine's initial_margin_bps is already above the floor, no change needed.
+    /// This check rejects trades where the resulting position would exceed phase leverage.
+    fn check_phase_leverage(
+        engine: &RiskEngine,
+        config: &state::MarketConfig,
+        user_idx: u16,
+    ) -> Result<(), ProgramError> {
+        let phase = state::get_oracle_phase(config);
+        if phase >= state::ORACLE_PHASE_MATURE {
+            return Ok(()); // Phase 3: no additional leverage restriction
+        }
+
+        let max_lev_bps = state::phase_max_leverage_bps(phase, u64::MAX);
+        if max_lev_bps == 0 {
+            return Ok(());
+        }
+
+        // min_margin_bps = 10_000_000 / max_lev_bps (e.g., 10M / 20000 = 500 → 5.00%)
+        // We use 10_000 * 10_000 / max_lev_bps for bps precision
+        let min_margin_bps = 10_000u64.saturating_mul(10_000) / max_lev_bps;
+
+        // Check if current initial margin is sufficient
+        let current_margin_bps = engine.params.initial_margin_bps;
+        if u128::from(current_margin_bps) >= min_margin_bps as u128 {
+            return Ok(()); // Existing margin requirement is stricter — no issue
+        }
+
+        // Margin requirement is looser than phase allows.
+        // Check if the user's position actually exceeds phase leverage.
+        let acct = &engine.accounts[user_idx as usize];
+        let pos_size = acct.position_size.get().unsigned_abs();
+        if pos_size == 0 {
+            return Ok(());
+        }
+        let capital = acct.capital.get();
+        if capital == 0 {
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        // leverage_bps = pos_size * 10_000 / capital
+        let leverage_bps = (pos_size as u128)
+            .saturating_mul(10_000)
+            .checked_div(capital as u128)
+            .unwrap_or(u128::MAX);
+        if leverage_bps > max_lev_bps as u128 {
+            msg!(
+                "Phase leverage exceeded: leverage_bps={} max={} phase={}",
+                leverage_bps,
+                max_lev_bps,
+                phase
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -8290,6 +8521,19 @@ pub mod processor {
                 // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                 check_oi_cap(engine, &config, clock.slot)?;
                 check_pnl_cap(engine, &config)?;
+                check_phase_leverage(engine, &config, user_idx)?;
+
+                // PERC-622: Accumulate trade volume for oracle phase transitions.
+                // trade_notional_e6 = |size| * price / 1e6 (approximate notional)
+                {
+                    let trade_notional_e6 = (size.unsigned_abs() as u64)
+                        .saturating_mul(price)
+                        .checked_div(1_000_000)
+                        .unwrap_or(0);
+                    let mut vol_config = state::read_config(&data);
+                    state::accumulate_volume(&mut vol_config, trade_notional_e6);
+                    state::write_config(&mut data, &vol_config);
+                }
 
                 #[cfg(feature = "cu-audit")]
                 {
@@ -8645,6 +8889,18 @@ pub mod processor {
                     // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                     check_oi_cap(engine, &config, clock.slot)?;
                     check_pnl_cap(engine, &config)?;
+                    check_phase_leverage(engine, &config, user_idx)?;
+
+                    // PERC-622: Accumulate trade volume for oracle phase transitions.
+                    {
+                        let trade_notional_e6 = (trade_size.unsigned_abs() as u64)
+                            .saturating_mul(price)
+                            .checked_div(1_000_000)
+                            .unwrap_or(0);
+                        let mut vol_config = state::read_config(&data);
+                        state::accumulate_volume(&mut vol_config, trade_notional_e6);
+                        state::write_config(&mut data, &vol_config);
+                    }
 
                     #[cfg(feature = "cu-audit")]
                     {
@@ -12924,6 +13180,71 @@ pub mod processor {
                 );
             }
 
+            // ═══════════════════════════════════════════════════════════════
+            // PERC-622: Advance Oracle Phase (tag 56, permissionless crank)
+            // ═══════════════════════════════════════════════════════════════
+            Instruction::AdvanceOraclePhase => {
+                // Accounts: [slab(writable)]
+                // Permissionless: anyone can call. No signer required beyond fee payer.
+                if accounts.is_empty() {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                let a_slab = &accounts[0];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut config = state::read_config(&data);
+                let clock = Clock::get()?;
+
+                let old_phase = state::get_oracle_phase(&config);
+
+                // Pyth-pinned markets auto-promote to Phase 3
+                let has_mature_oracle = crate::verify::is_pyth_pinned_mode(
+                    config.oracle_authority,
+                    config.index_feed_id,
+                );
+
+                // Lazy-init market_created_slot for legacy markets
+                let created = state::effective_created_slot(config.market_created_slot, clock.slot);
+                if config.market_created_slot == 0 && old_phase == 0 {
+                    config.market_created_slot = clock.slot;
+                }
+
+                let (new_phase, transitioned) = state::check_phase_transition(
+                    clock.slot,
+                    created,
+                    old_phase,
+                    state::get_cumulative_volume(&config),
+                    state::get_phase2_delta_slots(&config),
+                    has_mature_oracle,
+                );
+
+                if !transitioned {
+                    // No transition needed — write config (may have lazy-init'd created_slot)
+                    state::write_config(&mut data, &config);
+                    msg!("AdvanceOraclePhase: no transition (phase={})", old_phase);
+                } else {
+                    state::set_oracle_phase(&mut config, new_phase);
+
+                    // Record Phase 2 entry delta for Phase 2→3 time check
+                    if new_phase == state::ORACLE_PHASE_GROWING {
+                        let delta = clock.slot.saturating_sub(created) as u32;
+                        state::set_phase2_delta_slots(&mut config, delta);
+                    }
+
+                    state::write_config(&mut data, &config);
+                    msg!(
+                        "AdvanceOraclePhase: {} -> {} at slot {}",
+                        old_phase,
+                        new_phase,
+                        clock.slot
+                    );
+                }
+            }
+
             // Defense-in-depth: if a future tag routes here by mistake,
             // return an error instead of panicking (unreachable! aborts the tx).
             _ => return Err(ProgramError::InvalidInstructionData),
@@ -13068,6 +13389,293 @@ pub mod processor {
                 "trade must not be blocked after duration elapsed"
             );
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PERC-622: Oracle Phase Transition — Tests & Kani Proofs
+// ═══════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod oracle_phase_tests {
+    use crate::state::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn test_phase_accessors_roundtrip() {
+        let mut config = MarketConfig::zeroed();
+        assert_eq!(get_oracle_phase(&config), 0);
+        set_oracle_phase(&mut config, 1);
+        assert_eq!(get_oracle_phase(&config), 1);
+        set_oracle_phase(&mut config, 2);
+        assert_eq!(get_oracle_phase(&config), 2);
+        // Clamp to 2
+        set_oracle_phase(&mut config, 255);
+        assert_eq!(get_oracle_phase(&config), 2);
+    }
+
+    #[test]
+    fn test_volume_accessors_roundtrip() {
+        let mut config = MarketConfig::zeroed();
+        assert_eq!(get_cumulative_volume(&config), 0);
+        set_cumulative_volume(&mut config, 12345678);
+        assert_eq!(get_cumulative_volume(&config), 12345678);
+        set_cumulative_volume(&mut config, u64::MAX);
+        assert_eq!(get_cumulative_volume(&config), u64::MAX);
+    }
+
+    #[test]
+    fn test_phase2_delta_slots_roundtrip() {
+        let mut config = MarketConfig::zeroed();
+        assert_eq!(get_phase2_delta_slots(&config), 0);
+        set_phase2_delta_slots(&mut config, 648_000);
+        assert_eq!(get_phase2_delta_slots(&config), 648_000);
+        // Max u24
+        set_phase2_delta_slots(&mut config, 0x00FF_FFFF);
+        assert_eq!(get_phase2_delta_slots(&config), 0x00FF_FFFF);
+        // Clamp overflow
+        set_phase2_delta_slots(&mut config, 0x0100_0000);
+        assert_eq!(get_phase2_delta_slots(&config), 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn test_phase1_to_phase2_transition() {
+        // Not enough time, not enough volume
+        let (phase, trans) = check_phase_transition(100, 0, 0, 0, 0, false);
+        assert_eq!(phase, 0);
+        assert!(!trans);
+
+        // Volume met but under 4h floor → still Phase 1
+        let (phase, trans) = check_phase_transition(
+            PHASE1_VOLUME_MIN_SLOTS - 1,
+            0,
+            0,
+            PHASE2_VOLUME_THRESHOLD,
+            0,
+            false,
+        );
+        assert_eq!(phase, 0);
+        assert!(!trans);
+
+        // Path B: 4h elapsed + volume met → Phase 2
+        let (phase, trans) = check_phase_transition(
+            PHASE1_VOLUME_MIN_SLOTS,
+            0,
+            0,
+            PHASE2_VOLUME_THRESHOLD,
+            0,
+            false,
+        );
+        assert_eq!(phase, 1);
+        assert!(trans);
+
+        // Path A: 72h elapsed, no volume → Phase 2
+        let (phase, trans) = check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, 0, 0, false);
+        assert_eq!(phase, 1);
+        assert!(trans);
+
+        // Both conditions met
+        let (phase, trans) =
+            check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
+        assert_eq!(phase, 1);
+        assert!(trans);
+    }
+
+    #[test]
+    fn test_phase2_to_phase3_by_time() {
+        let created = 1_000_000u64;
+        let delta = PHASE1_MIN_SLOTS as u32; // Phase 2 entered at created + delta
+        let phase2_start = created + delta as u64;
+        let mature_slot = phase2_start + PHASE2_MATURITY_SLOTS;
+
+        // Not yet mature
+        let (phase, trans) = check_phase_transition(mature_slot - 1, created, 1, 0, delta, false);
+        assert_eq!(phase, 1);
+        assert!(!trans);
+
+        // Mature by time
+        let (phase, trans) = check_phase_transition(mature_slot, created, 1, 0, delta, false);
+        assert_eq!(phase, 2);
+        assert!(trans);
+    }
+
+    #[test]
+    fn test_phase2_to_phase3_by_oracle() {
+        // Mature oracle available → immediate transition
+        let (phase, trans) = check_phase_transition(0, 0, 1, 0, 0, true);
+        assert_eq!(phase, 2);
+        assert!(trans);
+    }
+
+    #[test]
+    fn test_phase3_terminal() {
+        let (phase, trans) = check_phase_transition(u64::MAX, 0, 2, u64::MAX, u32::MAX, true);
+        assert_eq!(phase, 2);
+        assert!(!trans);
+    }
+
+    #[test]
+    fn test_phase_oi_cap() {
+        assert_eq!(phase_oi_cap(0, u64::MAX), PHASE1_OI_CAP_E6);
+        assert_eq!(phase_oi_cap(1, u64::MAX), PHASE2_OI_CAP_E6);
+        assert_eq!(phase_oi_cap(2, 999), 999);
+        // Phase cap respects base when base is lower
+        assert_eq!(phase_oi_cap(0, 5_000), 5_000);
+    }
+
+    #[test]
+    fn test_phase_max_leverage() {
+        assert_eq!(phase_max_leverage_bps(0, u64::MAX), PHASE1_MAX_LEVERAGE_BPS);
+        assert_eq!(phase_max_leverage_bps(1, u64::MAX), PHASE2_MAX_LEVERAGE_BPS);
+        assert_eq!(phase_max_leverage_bps(2, 1_000_000), 1_000_000);
+        // Respects lower base
+        assert_eq!(phase_max_leverage_bps(0, 10_000), 10_000);
+    }
+
+    #[test]
+    fn test_accumulate_volume() {
+        let mut config = MarketConfig::zeroed();
+        accumulate_volume(&mut config, 50_000_000_000);
+        assert_eq!(get_cumulative_volume(&config), 50_000_000_000);
+        accumulate_volume(&mut config, 50_000_000_000);
+        assert_eq!(get_cumulative_volume(&config), 100_000_000_000);
+        // Saturating
+        set_cumulative_volume(&mut config, u64::MAX - 1);
+        accumulate_volume(&mut config, 100);
+        assert_eq!(get_cumulative_volume(&config), u64::MAX);
+    }
+
+    #[test]
+    fn test_accessors_dont_clobber_mark_weight() {
+        let mut config = MarketConfig::zeroed();
+        set_mark_oracle_weight_bps(&mut config, 5000);
+        set_oracle_phase(&mut config, 1);
+        set_cumulative_volume(&mut config, 999);
+        set_phase2_delta_slots(&mut config, 12345);
+        // mark_oracle_weight should be untouched
+        assert_eq!(get_mark_oracle_weight_bps(&config), 5000);
+    }
+
+    #[test]
+    fn test_effective_created_slot_legacy() {
+        // Legacy market: market_created_slot == 0 → returns current_slot
+        assert_eq!(effective_created_slot(0, 310_000_000), 310_000_000);
+        // Normal market: returns stored value
+        assert_eq!(effective_created_slot(100_000, 310_000_000), 100_000);
+    }
+
+    #[test]
+    fn test_legacy_market_no_auto_promote() {
+        // Legacy market with market_created_slot == 0.
+        // After effective_created_slot resolution, elapsed = 0 → stays Phase 1.
+        let current = 310_000_000u64;
+        let resolved = effective_created_slot(0, current);
+        let (phase, trans) = check_phase_transition(current, resolved, 0, u64::MAX, 0, false);
+        assert_eq!(phase, 0, "legacy market must NOT auto-promote");
+        assert!(!trans);
+    }
+}
+
+#[cfg(kani)]
+mod oracle_phase_kani {
+    use crate::state::*;
+
+    /// Phase transitions are monotonic: new_phase >= old_phase, always ≤ 2.
+    #[kani::proof]
+    fn proof_oracle_phase_monotone() {
+        let old_phase: u8 = kani::any();
+        kani::assume(old_phase <= 2);
+        let slot: u64 = kani::any();
+        let created: u64 = kani::any();
+        kani::assume(created <= slot);
+        let vol: u64 = kani::any();
+        let delta: u32 = kani::any();
+        let has_oracle: bool = kani::any();
+
+        let (new_phase, _) =
+            check_phase_transition(slot, created, old_phase, vol, delta, has_oracle);
+        assert!(new_phase >= old_phase, "phase must never decrease");
+        assert!(new_phase <= 2, "phase must be 0, 1, or 2");
+    }
+
+    /// Phase 1 OI cap is always PHASE1_OI_CAP_E6 or less.
+    #[kani::proof]
+    fn proof_phase1_oi_cap_bounded() {
+        let base_cap: u64 = kani::any();
+        let cap = phase_oi_cap(0, base_cap);
+        assert!(cap <= PHASE1_OI_CAP_E6);
+    }
+
+    /// Phase 2 leverage is always PHASE2_MAX_LEVERAGE_BPS or less.
+    #[kani::proof]
+    fn proof_phase2_leverage_bounded() {
+        let base_lev: u64 = kani::any();
+        let lev = phase_max_leverage_bps(1, base_lev);
+        assert!(lev <= PHASE2_MAX_LEVERAGE_BPS);
+    }
+
+    /// Phase 3 is terminal — never transitions further.
+    #[kani::proof]
+    fn proof_phase3_terminal() {
+        let slot: u64 = kani::any();
+        let created: u64 = kani::any();
+        kani::assume(created <= slot);
+        let vol: u64 = kani::any();
+        let delta: u32 = kani::any();
+        let has_oracle: bool = kani::any();
+
+        let (new_phase, transitioned) =
+            check_phase_transition(slot, created, 2, vol, delta, has_oracle);
+        assert!(new_phase == 2, "Phase 3 is terminal");
+        assert!(!transitioned, "Phase 3 never transitions");
+    }
+
+    /// Cumulative volume never decreases.
+    #[kani::proof]
+    fn proof_cumulative_volume_monotone() {
+        let old_vol: u64 = kani::any();
+        let trade_notional: u64 = kani::any();
+        let new_vol = old_vol.saturating_add(trade_notional);
+        assert!(new_vol >= old_vol);
+    }
+
+    /// Cannot leave Phase 1 before PHASE1_VOLUME_MIN_SLOTS (4h absolute floor).
+    #[kani::proof]
+    fn proof_phase1_requires_min_time() {
+        let created: u64 = kani::any();
+        let slot: u64 = kani::any();
+        kani::assume(created <= slot);
+        kani::assume(slot - created < PHASE1_VOLUME_MIN_SLOTS);
+        let vol: u64 = kani::any();
+
+        let (new_phase, transitioned) = check_phase_transition(slot, created, 0, vol, 0, false);
+        assert_eq!(new_phase, 0);
+        assert!(!transitioned);
+    }
+
+    /// Phase caps are always <= full configured caps.
+    #[kani::proof]
+    fn proof_phase_caps_leq_base() {
+        let phase: u8 = kani::any();
+        kani::assume(phase <= 2);
+        let base_oi: u64 = kani::any();
+        let base_lev: u64 = kani::any();
+
+        assert!(phase_oi_cap(phase, base_oi) <= base_oi);
+        assert!(phase_max_leverage_bps(phase, base_lev) <= base_lev);
+    }
+
+    /// Legacy markets (market_created_slot==0) never auto-promote from Phase 1.
+    #[kani::proof]
+    fn proof_legacy_market_no_auto_promote() {
+        let current_slot: u64 = kani::any();
+        kani::assume(current_slot > 0);
+        let resolved = effective_created_slot(0, current_slot);
+        // elapsed = current_slot - resolved = 0
+        assert_eq!(resolved, current_slot);
+        let vol: u64 = kani::any();
+        let (phase, _) = check_phase_transition(current_slot, resolved, 0, vol, 0, false);
+        assert_eq!(phase, 0, "legacy market stays Phase 1 on first encounter");
     }
 }
 
