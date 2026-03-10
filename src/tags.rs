@@ -97,6 +97,9 @@ pub const TAG_CLOSE_STALE_SLAB: u8 = 51;
 /// The slab account must sign (proves the caller holds the slab keypair).
 /// Cannot close an initialised slab (magic == MAGIC) — use CloseSlab (tag 13) for those.
 pub const TAG_RECLAIM_SLAB_RENT: u8 = 52;
+/// PERC-622: Advance oracle phase (permissionless crank).
+/// Transitions market through Phase 1→2→3 based on time + volume milestones.
+pub const TAG_ADVANCE_ORACLE_PHASE: u8 = 53;
 
 /// Permissionless on-chain audit crank: walk all accounts and verify conservation invariants.
 /// Checks capital, PnL, OI, LP aggregates and solvency. Pauses market on violation.
