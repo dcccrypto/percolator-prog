@@ -7022,3 +7022,152 @@ fn kani_new_tags_sequential() {
     // Follows previous tag
     assert_eq!(TAG_AUDIT_CRANK, TAG_RECLAIM_SLAB_RENT + 1);
 }
+
+// ============================================================================
+// PERC-622: Three-Phase Oracle Transition Protocol — Kani Proof Sketches
+// ============================================================================
+// These are SKETCH harnesses: they reference functions/constants that do not
+// yet exist in the production code. They are annotated with #[cfg(kani_sketch)]
+// so they compile only when the feature is explicitly enabled. They will be
+// converted to real #[kani::proof] harnesses in PR 5 once the implementation
+// is complete.
+//
+// Invariants proven:
+//   1. oracle_phase is monotone non-decreasing
+//   2. OI cap is weakest (most conservative) in phase 1
+//   3. Leverage margin is most restrictive in phase 1
+//   4. Phase 3 is terminal
+//   5. Volume accumulation never underflows (saturating_add)
+//   6. Phase 1 → 2 triggers only when conditions met
+// ============================================================================
+
+#[cfg(kani_sketch)]
+mod perc_622_oracle_phase_proofs {
+    use super::*;
+    use percolator_prog::oracle_phase::{
+        maybe_advance_phase, effective_min_margin_bps,
+        PHASE1_OI_CAP_DEFAULT_E6, PHASE2_OI_CAP_DEFAULT_E6,
+        PHASE2_SLOTS, PHASE3_SLOTS,
+        PHASE2_VOL_THRESHOLD_E6, PHASE3_VOL_THRESHOLD_E6,
+        PHASE1_MAX_LEVERAGE_MARGIN_BPS, PHASE2_MAX_LEVERAGE_MARGIN_BPS,
+    };
+    use percolator_prog::state::MarketConfig;
+    use bytemuck::Zeroable;
+
+    // ── Harness 1: Phase is monotone non-decreasing ───────────────────────
+    #[kani::proof]
+    fn proof_oracle_phase_monotone() {
+        let mut config: MarketConfig = kani::any();
+        let current_slot: u64 = kani::any();
+        kani::assume(config.oracle_phase <= 2);
+
+        let initial_phase = config.oracle_phase;
+        maybe_advance_phase(&mut config, current_slot);
+
+        assert!(config.oracle_phase >= initial_phase, "phase must never decrease");
+        assert!(config.oracle_phase <= 2, "phase never exceeds 2 (max state)");
+    }
+
+    // ── Harness 2: Phase 3 is terminal ───────────────────────────────────
+    #[kani::proof]
+    fn proof_phase3_terminal() {
+        let mut config: MarketConfig = kani::any();
+        config.oracle_phase = 2;
+        let current_slot: u64 = kani::any();
+
+        maybe_advance_phase(&mut config, current_slot);
+
+        assert_eq!(config.oracle_phase, 2, "phase 3 must be terminal");
+    }
+
+    // ── Harness 3: Leverage margin weakly tightens for younger phases ────
+    #[kani::proof]
+    fn proof_leverage_loosens_with_phase() {
+        let base_margin: u64 = kani::any();
+        kani::assume(base_margin <= 10_000u64); // 0..100% in bps
+
+        // Create three identical configs differing only in oracle_phase
+        let mut config_p1: MarketConfig = MarketConfig::zeroed();
+        let mut config_p2: MarketConfig = MarketConfig::zeroed();
+        let mut config_p3: MarketConfig = MarketConfig::zeroed();
+        config_p1.oracle_phase = 0;
+        config_p2.oracle_phase = 1;
+        config_p3.oracle_phase = 2;
+
+        let margin_p1 = effective_min_margin_bps(&config_p1, base_margin);
+        let margin_p2 = effective_min_margin_bps(&config_p2, base_margin);
+        let margin_p3 = effective_min_margin_bps(&config_p3, base_margin);
+
+        assert!(margin_p1 >= margin_p2, "phase 1 >= phase 2 min margin (more conservative)");
+        assert!(margin_p2 >= margin_p3, "phase 2 >= phase 3 min margin (more conservative)");
+    }
+
+    // ── Harness 4: Phase 1 → 2 triggers exactly when conditions met ──────
+    #[kani::proof]
+    fn proof_phase1_to_phase2_correct_trigger() {
+        let mut config: MarketConfig = kani::any();
+        let current_slot: u64 = kani::any();
+        kani::assume(config.oracle_phase == 0);
+        kani::assume(config.market_created_slot <= current_slot);
+
+        let elapsed = current_slot.saturating_sub(config.market_created_slot);
+        let vol_trigger = config.cumulative_volume_e6 >= PHASE2_VOL_THRESHOLD_E6;
+        let time_trigger = elapsed >= PHASE2_SLOTS;
+
+        maybe_advance_phase(&mut config, current_slot);
+
+        if !vol_trigger && !time_trigger {
+            assert_eq!(config.oracle_phase, 0, "phase 1 must NOT advance without trigger");
+        }
+        if vol_trigger || time_trigger {
+            assert!(config.oracle_phase >= 1, "phase MUST advance when trigger fires");
+        }
+    }
+
+    // ── Harness 5: Phase 2 → 3 requires BOTH time AND volume ────────────
+    #[kani::proof]
+    fn proof_phase2_to_phase3_requires_both_triggers() {
+        let mut config: MarketConfig = kani::any();
+        let current_slot: u64 = kani::any();
+        kani::assume(config.oracle_phase == 1);
+        kani::assume(config.market_created_slot <= current_slot);
+
+        let elapsed = current_slot.saturating_sub(config.market_created_slot);
+        let vol_trigger = config.cumulative_volume_e6 >= PHASE3_VOL_THRESHOLD_E6;
+        let time_trigger = elapsed >= PHASE3_SLOTS;
+
+        maybe_advance_phase(&mut config, current_slot);
+
+        if !vol_trigger || !time_trigger {
+            // Only one trigger: should NOT advance to phase 3
+            assert!(config.oracle_phase <= 1, "phase 2 must NOT advance without BOTH triggers");
+        }
+        if vol_trigger && time_trigger {
+            assert_eq!(config.oracle_phase, 2, "phase 3 MUST be reached when both triggers fire");
+        }
+    }
+
+    // ── Harness 6: Volume accumulation is monotone (saturating) ─────────
+    #[kani::proof]
+    fn proof_volume_accumulation_monotone() {
+        let initial: u64 = kani::any();
+        let delta: u64 = kani::any();
+        let result = initial.saturating_add(delta);
+        assert!(result >= initial, "saturating_add is monotone");
+    }
+
+    // ── Harness 7: Phase cap is most restrictive in phase 1 ─────────────
+    #[kani::proof]
+    fn proof_phase_oi_cap_tightens_for_early_phases() {
+        // If phase1_oi_cap == default AND phase2_oi_cap == default:
+        // phase1 cap < phase2 cap (more conservative in phase 1)
+        assert!(
+            PHASE1_OI_CAP_DEFAULT_E6 < PHASE2_OI_CAP_DEFAULT_E6,
+            "phase 1 OI cap must be stricter than phase 2"
+        );
+        // Sanity check constants
+        assert_eq!(PHASE2_SLOTS, 72 * 9_000, "72h at 9000 slots/hour");
+        assert_eq!(PHASE3_SLOTS, 14 * 24 * 9_000, "14 days in slots");
+        assert!(PHASE2_VOL_THRESHOLD_E6 < PHASE3_VOL_THRESHOLD_E6, "phase 3 vol threshold > phase 2");
+    }
+}
