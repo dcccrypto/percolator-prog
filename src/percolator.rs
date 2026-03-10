@@ -6098,7 +6098,7 @@ pub mod lp_collateral {
 
         #[kani::proof]
         #[kani::unwind(1)]
-        fn nightly_proof_drawdown_monotone() {
+        fn nightly_drawdown_monotone() {
             let old_tvl: u64 = kani::any();
             let new_tvl_high: u128 = kani::any();
             let new_tvl_low: u128 = kani::any();

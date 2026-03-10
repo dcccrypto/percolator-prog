@@ -5762,7 +5762,7 @@ fn proof_loyalty_mult_never_exceeds_max_tier_strong() {
 /// is SAT-hard in CBMC; proof ran >35min in PR CI (Thread 0 timeout in run 22878313887).
 #[cfg(kani)]
 #[kani::proof]
-fn nightly_proof_loyalty_applies_only_to_fee_income() {
+fn nightly_loyalty_applies_only_to_fee_income() {
     use percolator_prog::lp_vault::apply_loyalty_mult;
 
     let fee: u64 = kani::any();
@@ -5856,7 +5856,7 @@ fn proof_challenge_window_strictly_enforced() {
 /// Prove: oracle proof slot within bounds.
 #[cfg(kani)]
 #[kani::proof]
-fn nightly_proof_oracle_proof_slot_within_bounds() {
+fn nightly_oracle_slot_within_bounds() {
     let pyth_proof_slot: u64 = kani::any();
     let resolved_slot: u64 = kani::any();
 
@@ -5878,7 +5878,7 @@ fn nightly_proof_oracle_proof_slot_within_bounds() {
 /// Prove: LP collateral value bounded by vault TVL.
 #[cfg(kani)]
 #[kani::proof]
-fn nightly_proof_lp_collateral_value_bounded_by_vault_tvl() {
+fn nightly_lp_collateral_value_bounded_by_vault_tvl() {
     use percolator_prog::lp_collateral::lp_token_value;
 
     let lp_amount: u64 = kani::any();
@@ -5904,7 +5904,7 @@ fn nightly_proof_lp_collateral_value_bounded_by_vault_tvl() {
 /// Prove: liquidation triggers on TVL drop.
 #[cfg(kani)]
 #[kani::proof]
-fn nightly_proof_lp_collateral_liquidation_triggers_on_tvl_drop() {
+fn nightly_lp_collateral_liquidation_triggers_on_tvl_drop() {
     use percolator_prog::lp_collateral::tvl_drawdown_exceeded;
 
     let old_tvl: u64 = kani::any();
