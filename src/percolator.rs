@@ -2391,6 +2391,8 @@ pub mod ix {
         ///
         /// Accounts: [dest(signer,writable), slab(signer,writable)]
         ReclaimSlabRent,
+        /// PERC-622: Advance oracle phase (permissionless crank).
+        AdvanceOraclePhase,
 
         /// On-chain audit crank: walk all accounts and verify conservation invariants.
         /// Permissionless. Checks capital, PnL, OI, LP aggregates and solvency.
@@ -2879,6 +2881,7 @@ pub mod ix {
                 }
                 TAG_CLOSE_STALE_SLAB => Ok(Instruction::CloseStaleSlabs),
                 TAG_RECLAIM_SLAB_RENT => Ok(Instruction::ReclaimSlabRent),
+                TAG_ADVANCE_ORACLE_PHASE => Ok(Instruction::AdvanceOraclePhase),
                 TAG_AUDIT_CRANK => Ok(Instruction::AuditCrank),
                 TAG_SET_OFFSET_PAIR => {
                     let offset_bps = read_u16(&mut rest)?;
@@ -8452,6 +8455,18 @@ pub mod processor {
                 check_oi_cap(engine, &config, clock.slot)?;
                 check_pnl_cap(engine, &config)?;
 
+                // PERC-622: Accumulate trade volume for oracle phase transitions.
+                // trade_notional_e6 = |size| * price / 1e6 (approximate notional)
+                {
+                    let trade_notional_e6 = (size.unsigned_abs() as u64)
+                        .saturating_mul(price)
+                        .checked_div(1_000_000)
+                        .unwrap_or(0);
+                    let mut vol_config = state::read_config(&data);
+                    state::accumulate_volume(&mut vol_config, trade_notional_e6);
+                    state::write_config(&mut data, &vol_config);
+                }
+
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
@@ -8806,6 +8821,17 @@ pub mod processor {
                     // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                     check_oi_cap(engine, &config, clock.slot)?;
                     check_pnl_cap(engine, &config)?;
+
+                    // PERC-622: Accumulate trade volume for oracle phase transitions.
+                    {
+                        let trade_notional_e6 = (trade_size.unsigned_abs() as u64)
+                            .saturating_mul(price)
+                            .checked_div(1_000_000)
+                            .unwrap_or(0);
+                        let mut vol_config = state::read_config(&data);
+                        state::accumulate_volume(&mut vol_config, trade_notional_e6);
+                        state::write_config(&mut data, &vol_config);
+                    }
 
                     #[cfg(feature = "cu-audit")]
                     {
@@ -13083,6 +13109,69 @@ pub mod processor {
                     pos_b as i64,
                     offset_bps
                 );
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // PERC-622: Advance Oracle Phase (tag 56, permissionless crank)
+            // ═══════════════════════════════════════════════════════════════
+            Instruction::AdvanceOraclePhase => {
+                // Accounts: [slab(writable)]
+                // Permissionless: anyone can call. No signer required beyond fee payer.
+                if accounts.is_empty() {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                let a_slab = &accounts[0];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut config = state::read_config(&data);
+                let clock = Clock::get()?;
+
+                let old_phase = state::get_oracle_phase(&config);
+
+                // Pyth-pinned markets auto-promote to Phase 3
+                let has_mature_oracle =
+                    crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id);
+
+                // Lazy-init market_created_slot for legacy markets
+                let created = state::effective_created_slot(config.market_created_slot, clock.slot);
+                if config.market_created_slot == 0 && old_phase == 0 {
+                    config.market_created_slot = clock.slot;
+                }
+
+                let (new_phase, transitioned) = state::check_phase_transition(
+                    clock.slot,
+                    created,
+                    old_phase,
+                    state::get_cumulative_volume(&config),
+                    state::get_phase2_delta_slots(&config),
+                    has_mature_oracle,
+                );
+
+                if !transitioned {
+                    // No transition needed — write config (may have lazy-init'd created_slot)
+                    state::write_config(&mut data, &config);
+                    msg!("AdvanceOraclePhase: no transition (phase={})", old_phase);
+                } else {
+                    state::set_oracle_phase(&mut config, new_phase);
+
+                    // Record Phase 2 entry delta for Phase 2→3 time check
+                    if new_phase == state::ORACLE_PHASE_GROWING {
+                        let delta = clock.slot.saturating_sub(created) as u32;
+                        state::set_phase2_delta_slots(&mut config, delta);
+                    }
+
+                    state::write_config(&mut data, &config);
+                    msg!(
+                        "AdvanceOraclePhase: {} -> {} at slot {}",
+                        old_phase,
+                        new_phase,
+                        clock.slot
+                    );
+                }
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,
