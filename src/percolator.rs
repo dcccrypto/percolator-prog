@@ -6425,7 +6425,9 @@ pub mod creator_lock {
         pub cumulative_extracted: u64,
         /// Total value deposited into LP vault by creator (monotonically increasing).
         pub cumulative_deposited: u64,
-        /// 1 = creator fee share redirected to insurance fund.
+        /// Non-zero = creator fee share redirected to insurance fund.
+        /// IMPORTANT: processors MUST check `!= 0`, NOT `== 1`.
+        /// Any future canonical value besides 0 must be treated as active.
         pub fee_redirect_active: u8,
         /// Reserved for future use.
         pub _reserved: [u8; 7],
@@ -6433,6 +6435,13 @@ pub mod creator_lock {
 
     // Compile-time size assert
     const _: () = assert!(CREATOR_LOCK_STATE_LEN == 96);
+
+    /// Return true if the fee redirect flag is set.
+    /// Uses `!= 0` — NEVER check `== 1` directly on the raw u8 field.
+    #[inline]
+    pub fn is_fee_redirect_active(lock: &CreatorStakeLock) -> bool {
+        lock.fee_redirect_active != 0
+    }
 
     /// Check if the creator lock has expired.
     #[inline]
@@ -6584,6 +6593,31 @@ pub mod creator_lock {
             assert_eq!(a + b, 12345);
             let (a, b) = compute_fee_redirect(12345, false);
             assert_eq!(a + b, 12345);
+        }
+
+        #[test]
+        fn test_is_fee_redirect_active_zero_is_inactive() {
+            let mut state = CreatorStakeLock {
+                magic: CREATOR_LOCK_MAGIC,
+                bump: 1,
+                _pad: [0; 7],
+                creator: [0u8; 32],
+                lock_start_slot: 0,
+                lock_duration_slots: DEFAULT_LOCK_DURATION_SLOTS,
+                lp_amount_locked: 0,
+                cumulative_extracted: 0,
+                cumulative_deposited: 0,
+                fee_redirect_active: 0,
+                _reserved: [0; 7],
+            };
+            assert!(!is_fee_redirect_active(&state));
+            // Any non-zero value must be treated as active (not just == 1)
+            state.fee_redirect_active = 1;
+            assert!(is_fee_redirect_active(&state));
+            state.fee_redirect_active = 2;
+            assert!(is_fee_redirect_active(&state));
+            state.fee_redirect_active = 255;
+            assert!(is_fee_redirect_active(&state));
         }
 
         #[test]
