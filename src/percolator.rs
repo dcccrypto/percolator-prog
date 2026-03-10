@@ -6381,6 +6381,310 @@ pub mod cross_margin {
     }
 }
 
+// 8c. mod creator_lock — PERC-627: Creator Stake Lock + Adversarial Wallet Tracking
+pub mod creator_lock {
+    use bytemuck::{Pod, Zeroable};
+
+    /// Magic bytes: "CRTRLOCK"
+    pub const CREATOR_LOCK_MAGIC: u64 = 0x4352_5452_4C4F_434B;
+
+    /// Size of the CreatorStakeLock account data.
+    pub const CREATOR_LOCK_STATE_LEN: usize = core::mem::size_of::<CreatorStakeLock>();
+
+    /// Default lock duration: ~90 days in slots (1 slot ≈ 400ms, 216_000 slots/day).
+    pub const DEFAULT_LOCK_DURATION_SLOTS: u64 = 19_440_000;
+
+    /// Extraction limit in bps: 15_000 = 150% (creator extracted 50% more than deposited).
+    pub const EXTRACTION_LIMIT_BPS: u64 = 15_000;
+
+    /// PDA seed prefix.
+    pub const CREATOR_LOCK_SEED: &[u8] = b"creator_lock";
+
+    /// On-chain state for creator's locked LP position + extraction tracking.
+    ///
+    /// Seeds: `["creator_lock", slab_pubkey]`
+    /// Size: 96 bytes.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct CreatorStakeLock {
+        /// Magic identifier: CREATOR_LOCK_MAGIC when initialized.
+        pub magic: u64,
+        /// PDA bump seed.
+        pub bump: u8,
+        /// Padding for alignment.
+        pub _pad: [u8; 7],
+        /// Creator wallet pubkey (32 bytes).
+        pub creator: [u8; 32],
+        /// Slot when the lock began.
+        pub lock_start_slot: u64,
+        /// Minimum lock duration in slots.
+        pub lock_duration_slots: u64,
+        /// LP tokens locked (cannot withdraw until lock expires).
+        pub lp_amount_locked: u64,
+        /// Total value extracted from LP vault by creator (monotonically increasing).
+        pub cumulative_extracted: u64,
+        /// Total value deposited into LP vault by creator (monotonically increasing).
+        pub cumulative_deposited: u64,
+        /// 1 = creator fee share redirected to insurance fund.
+        pub fee_redirect_active: u8,
+        /// Reserved for future use.
+        pub _reserved: [u8; 7],
+    }
+
+    // Compile-time size assert
+    const _: () = assert!(CREATOR_LOCK_STATE_LEN == 96);
+
+    /// Check if the creator lock has expired.
+    #[inline]
+    pub fn is_lock_expired(current_slot: u64, lock_start: u64, duration: u64) -> bool {
+        current_slot >= lock_start.saturating_add(duration)
+    }
+
+    /// Maximum LP tokens the creator can withdraw.
+    /// If lock is active, they can only withdraw excess above the locked amount.
+    /// If lock expired, they can withdraw everything.
+    #[inline]
+    pub fn max_withdrawable(total_lp: u64, locked_lp: u64, lock_expired: bool) -> u64 {
+        if lock_expired {
+            total_lp
+        } else {
+            total_lp.saturating_sub(locked_lp)
+        }
+    }
+
+    /// Check if creator has exceeded the extraction threshold.
+    /// Returns true if extraction ratio exceeds limit_bps / 10_000 of deposited.
+    /// Safe against zero-deposit (returns false — no deposit means no extraction check).
+    #[inline]
+    pub fn check_extraction_exceeded(extracted: u64, deposited: u64, limit_bps: u64) -> bool {
+        if deposited == 0 {
+            return false;
+        }
+        // extracted > deposited * limit_bps / 10_000
+        // Rearranged to avoid overflow: extracted * 10_000 > deposited * limit_bps
+        let lhs = (extracted as u128).saturating_mul(10_000);
+        let rhs = (deposited as u128).saturating_mul(limit_bps as u128);
+        lhs > rhs
+    }
+
+    /// Compute fee split when redirect is active.
+    /// Returns (to_creator, to_insurance). Conservation: sum == fee_amount.
+    #[inline]
+    pub fn compute_fee_redirect(fee_amount: u64, redirect_active: bool) -> (u64, u64) {
+        if redirect_active {
+            (0, fee_amount)
+        } else {
+            (fee_amount, 0)
+        }
+    }
+
+    /// Read CreatorStakeLock from account data. Returns None if magic doesn't match.
+    pub fn read_state(data: &[u8]) -> Option<&CreatorStakeLock> {
+        if data.len() < CREATOR_LOCK_STATE_LEN {
+            return None;
+        }
+        let state: &CreatorStakeLock = bytemuck::from_bytes(&data[..CREATOR_LOCK_STATE_LEN]);
+        if state.magic != CREATOR_LOCK_MAGIC {
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Write CreatorStakeLock to account data.
+    pub fn write_state(data: &mut [u8], state: &CreatorStakeLock) {
+        data[..CREATOR_LOCK_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_lock_not_expired() {
+            assert!(!is_lock_expired(100, 50, 100));
+        }
+
+        #[test]
+        fn test_lock_expired_exact() {
+            assert!(is_lock_expired(150, 50, 100));
+        }
+
+        #[test]
+        fn test_lock_expired_past() {
+            assert!(is_lock_expired(200, 50, 100));
+        }
+
+        #[test]
+        fn test_lock_saturating_overflow() {
+            // lock_start near u64::MAX — saturating_add prevents overflow
+            assert!(!is_lock_expired(100, u64::MAX - 10, 100));
+        }
+
+        #[test]
+        fn test_max_withdrawable_locked() {
+            assert_eq!(max_withdrawable(1000, 800, false), 200);
+        }
+
+        #[test]
+        fn test_max_withdrawable_all_locked() {
+            assert_eq!(max_withdrawable(800, 800, false), 0);
+        }
+
+        #[test]
+        fn test_max_withdrawable_expired() {
+            assert_eq!(max_withdrawable(1000, 800, true), 1000);
+        }
+
+        #[test]
+        fn test_max_withdrawable_more_locked_than_total() {
+            // Edge case: locked > total (shouldn't happen, but saturating_sub handles)
+            assert_eq!(max_withdrawable(500, 800, false), 0);
+        }
+
+        #[test]
+        fn test_extraction_not_exceeded() {
+            // extracted 100, deposited 100, limit 150% → ratio 100% < 150%
+            assert!(!check_extraction_exceeded(100, 100, 15_000));
+        }
+
+        #[test]
+        fn test_extraction_exceeded() {
+            // extracted 160, deposited 100, limit 150% → ratio 160% > 150%
+            assert!(check_extraction_exceeded(160, 100, 15_000));
+        }
+
+        #[test]
+        fn test_extraction_exact_boundary() {
+            // extracted 150, deposited 100, limit 150% → ratio 150% == 150% → NOT exceeded (>)
+            assert!(!check_extraction_exceeded(150, 100, 15_000));
+        }
+
+        #[test]
+        fn test_extraction_zero_deposit() {
+            assert!(!check_extraction_exceeded(100, 0, 15_000));
+        }
+
+        #[test]
+        fn test_fee_redirect_active() {
+            let (to_creator, to_insurance) = compute_fee_redirect(1000, true);
+            assert_eq!(to_creator, 0);
+            assert_eq!(to_insurance, 1000);
+        }
+
+        #[test]
+        fn test_fee_redirect_inactive() {
+            let (to_creator, to_insurance) = compute_fee_redirect(1000, false);
+            assert_eq!(to_creator, 1000);
+            assert_eq!(to_insurance, 0);
+        }
+
+        #[test]
+        fn test_fee_redirect_conservation() {
+            let (a, b) = compute_fee_redirect(12345, true);
+            assert_eq!(a + b, 12345);
+            let (a, b) = compute_fee_redirect(12345, false);
+            assert_eq!(a + b, 12345);
+        }
+
+        #[test]
+        fn test_state_roundtrip() {
+            let state = CreatorStakeLock {
+                magic: CREATOR_LOCK_MAGIC,
+                bump: 253,
+                _pad: [0; 7],
+                creator: [42u8; 32],
+                lock_start_slot: 1000,
+                lock_duration_slots: DEFAULT_LOCK_DURATION_SLOTS,
+                lp_amount_locked: 5000,
+                cumulative_extracted: 100,
+                cumulative_deposited: 200,
+                fee_redirect_active: 0,
+                _reserved: [0; 7],
+            };
+            let mut buf = [0u8; CREATOR_LOCK_STATE_LEN];
+            write_state(&mut buf, &state);
+            let read = read_state(&buf).unwrap();
+            assert_eq!(read.bump, 253);
+            assert_eq!(read.creator, [42u8; 32]);
+            assert_eq!(read.lp_amount_locked, 5000);
+            assert_eq!(read.lock_duration_slots, DEFAULT_LOCK_DURATION_SLOTS);
+        }
+
+        #[test]
+        fn test_read_state_bad_magic() {
+            let mut buf = [0u8; CREATOR_LOCK_STATE_LEN];
+            buf[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+            assert!(read_state(&buf).is_none());
+        }
+
+        #[test]
+        fn test_state_size() {
+            assert_eq!(CREATOR_LOCK_STATE_LEN, 96);
+        }
+    }
+}
+
+#[cfg(kani)]
+mod creator_lock_kani {
+    use crate::creator_lock::*;
+
+    /// Lock never expires early: if current_slot < start + duration, not expired.
+    #[kani::proof]
+    fn proof_lock_never_expires_early() {
+        let start: u64 = kani::any();
+        let duration: u64 = kani::any();
+        let current: u64 = kani::any();
+        // Avoid saturating_add masking the invariant
+        kani::assume(start <= u64::MAX - duration);
+        if current < start + duration {
+            assert!(!is_lock_expired(current, start, duration));
+        }
+    }
+
+    /// Max withdrawable never exceeds total LP.
+    #[kani::proof]
+    fn proof_max_withdrawable_bounded() {
+        let total: u64 = kani::any();
+        let locked: u64 = kani::any();
+        let expired: bool = kani::any();
+        let result = max_withdrawable(total, locked, expired);
+        assert!(result <= total);
+    }
+
+    /// Max withdrawable == 0 when fully locked and not expired.
+    #[kani::proof]
+    fn proof_fully_locked_zero_withdraw() {
+        let total: u64 = kani::any();
+        let locked: u64 = kani::any();
+        kani::assume(locked >= total);
+        let result = max_withdrawable(total, locked, false);
+        assert!(result == 0);
+    }
+
+    /// Extraction check is monotone: more extraction → more likely to trigger.
+    #[kani::proof]
+    fn proof_extraction_monotone() {
+        let extracted_a: u64 = kani::any();
+        let extracted_b: u64 = kani::any();
+        let deposited: u64 = kani::any();
+        let limit: u64 = kani::any();
+        kani::assume(extracted_a <= extracted_b);
+        kani::assume(limit <= 100_000); // reasonable upper bound
+        if check_extraction_exceeded(extracted_a, deposited, limit) {
+            assert!(check_extraction_exceeded(extracted_b, deposited, limit));
+        }
+    }
+
+    /// Fee redirect conservation: to_creator + to_insurance == fee_amount.
+    #[kani::proof]
+    fn proof_fee_redirect_conservation() {
+        let fee: u64 = kani::any();
+        let active: bool = kani::any();
+        let (a, b) = compute_fee_redirect(fee, active);
+        assert!(a + b == fee);
+    }
+}
+
 // 9. mod processor
 pub mod processor {
     use crate::{
