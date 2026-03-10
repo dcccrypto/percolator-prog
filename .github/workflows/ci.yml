@@ -87,6 +87,8 @@ jobs:
     #   nightly_hyperp_ema_converges_full_alpha          (~2h46m — identical structure, same SAT-hard path)
     #   nightly_ema_mark_identity_at_equilibrium         (~2h55m+ — symbolic MUL/DIV SAT-hard; was nightly_kani_ema_mark_identity_at_equilibrium, renamed to drop kani_ substring)
     #   nightly_cb_ema_update_weighted_average           (~>45m — symbolic u128 mul oracle*alpha + prev*(1e6-alpha) exhausts SAT budget; confirmed timeout in CI)
+    #   nightly_lp_collateral_value_never_exceeds_raw_share (~45m+ — u128 mul/div SAT-hard LP collateral; was nightly_proof_lp_collateral_value_never_exceeds_raw_share, dropped proof_ substring to avoid CI filter match)
+    #   nightly_fee_mult_monotonically_increases_with_utilization (~slow — was nightly_proof_fee_mult_monotonically_increases_with_utilization, dropped proof_ substring)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here — each expected <30 min.
     timeout-minutes: 50
     steps:
