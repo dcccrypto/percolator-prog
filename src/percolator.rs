@@ -6619,6 +6619,7 @@ mod creator_history_kani {
 
     /// Discount bounded by MAX_DISCOUNT_BPS.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_discount_bounded() {
         let s: u16 = kani::any();
         assert!(success_discount_bps(s) <= MAX_DISCOUNT_BPS);
@@ -6638,6 +6639,7 @@ mod creator_history_kani {
 
     /// Slash conservation: slash + remainder == deposit.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn nightly_proof_slash_conservation() {
         let deposit: u64 = kani::any();
         let (slash, remainder) = compute_slash(deposit);
@@ -6646,6 +6648,7 @@ mod creator_history_kani {
 
     /// OI threshold is monotone: more OI → more likely to pass.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn nightly_proof_oi_threshold_monotone() {
         let deposit: u64 = kani::any();
         let oi_a: u64 = kani::any();
@@ -13325,6 +13328,7 @@ pub mod processor {
                 if *a_creator_history.key != expected_pda {
                     return Err(ProgramError::InvalidSeeds);
                 }
+
 
                 // Check evaluation period has passed
                 let clock = solana_program::clock::Clock::get()?;
