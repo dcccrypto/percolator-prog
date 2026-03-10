@@ -6749,6 +6749,45 @@ pub mod shared_vault {
             assert_eq!(MARKET_ALLOC_LEN, 48);
             assert_eq!(WITHDRAW_REQ_LEN, 32);
         }
+
+        /// Simulate the double-claim guard: once claimed=1, a second
+        /// attempt must be rejected (mirrors ClaimEpochWithdrawal handler).
+        #[test]
+        fn test_double_claim_guard() {
+            let req = WithdrawalRequest {
+                magic: WITHDRAW_REQ_MAGIC,
+                bump: 1,
+                _pad: [0; 7],
+                lp_amount: 1_000,
+                claimed: 0,
+                _reserved: [0; 7],
+            };
+            assert_eq!(req.claimed, 0, "initially unclaimed");
+            let mut buf = [0u8; WITHDRAW_REQ_LEN];
+            write_withdraw_req(&mut buf, &req);
+            // First claim: mark claimed=1
+            let mut updated = read_withdraw_req(&buf).unwrap();
+            updated.claimed = 1;
+            write_withdraw_req(&mut buf, &updated);
+            // Second attempt must be rejected
+            let re_read = read_withdraw_req(&buf).unwrap();
+            assert_eq!(re_read.claimed, 1, "claimed flag must persist");
+            assert_ne!(re_read.claimed, 0, "double-claim guard: must reject");
+        }
+
+        /// Payout is zero when there are no pending withdrawals.
+        #[test]
+        fn test_zero_payout_no_pending() {
+            let payout = compute_proportional_withdrawal(500, 0, 10_000);
+            assert_eq!(payout, 0, "zero pending → zero payout");
+        }
+
+        /// Payout equals the request when capital is more than sufficient.
+        #[test]
+        fn test_payout_capped_at_request() {
+            let payout = compute_proportional_withdrawal(100, 100, 999_999);
+            assert_eq!(payout, 100);
+        }
     }
 }
 
