@@ -6630,7 +6630,7 @@ mod creator_lock_kani {
 
     /// Lock never expires early: if current_slot < start + duration, not expired.
     #[kani::proof]
-    fn proof_lock_never_expires_early() {
+    fn nightly_proof_lock_never_expires_early() {
         let start: u64 = kani::any();
         let duration: u64 = kani::any();
         let current: u64 = kani::any();
@@ -6663,7 +6663,7 @@ mod creator_lock_kani {
 
     /// Extraction check is monotone: more extraction → more likely to trigger.
     #[kani::proof]
-    fn proof_extraction_monotone() {
+    fn nightly_proof_extraction_monotone() {
         let extracted_a: u64 = kani::any();
         let extracted_b: u64 = kani::any();
         let deposited: u64 = kani::any();
