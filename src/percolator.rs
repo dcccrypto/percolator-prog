@@ -6567,9 +6567,19 @@ pub mod keeper_fund {
     /// Default split: 30% of creation deposit goes to keeper fund.
     pub const KEEPER_FUND_SPLIT_BPS: u64 = 3_000;
 
-    /// Default reward per successful KeeperCrank (in base token lamports).
-    /// ~0.001 SOL equivalent. Configurable per market at init.
-    pub const DEFAULT_REWARD_PER_CRANK: u64 = 1_000_000; // 0.001 SOL in lamports
+    /// Default reward per successful KeeperCrank, in **base token atoms** (NOT SOL lamports).
+    ///
+    /// The keeper fund holds the market's collateral token (e.g., BTC atoms, USDC micro-units).
+    /// `1_000_000` means:
+    /// - SOL-margined market (9 decimals): 0.001 SOL (1e6 lamports)
+    /// - USDC-margined market (6 decimals): 1.000000 USDC  ← much larger!
+    /// - BTC-margined market (8 decimals): 0.01 BTC        ← enormous!
+    ///
+    /// **Processor MUST read `reward_per_crank` from KeeperFundState and scale it at
+    /// InitMarket time based on `config.collateral_decimals` (or equivalent unit_scale).**
+    /// Do NOT use this constant directly as a SOL amount. This default is suitable only
+    /// for SOL-collateral markets and should be re-evaluated per collateral type.
+    pub const DEFAULT_REWARD_PER_CRANK: u64 = 1_000_000; // base token atoms — see comment above
 
     /// Fee percentage diverted to keeper fund top-up (in bps).
     pub const KEEPER_FEE_TOPUP_BPS: u64 = 500; // 5% of fees
@@ -6583,9 +6593,11 @@ pub mod keeper_fund {
         pub magic: u64,
         pub bump: u8,
         pub _pad: [u8; 7],
-        /// Current fund balance (base token lamports).
+        /// Current fund balance in base token atoms (same unit as vault balance).
         pub balance: u64,
-        /// Reward paid to crank caller per successful KeeperCrank.
+        /// Reward paid to crank caller per successful KeeperCrank, in base token atoms.
+        /// Unit matches the market's collateral token decimals, NOT SOL lamports.
+        /// See DEFAULT_REWARD_PER_CRANK for scaling guidance.
         pub reward_per_crank: u64,
         /// Lifetime total rewards paid out.
         pub total_rewarded: u64,
