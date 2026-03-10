@@ -13727,15 +13727,27 @@ pub mod processor {
             // Security: MUST gate on is_epoch_elapsed() and set claimed=1
             // BEFORE transfer (not after). No mid-epoch claims.
             Instruction::ClaimEpochWithdrawal => {
-                // accounts: [0] user (signer), [1] shared_vault PDA,
-                //           [2] withdraw_req PDA (writable)
-                accounts::expect_len(accounts, 3)?;
+                // accounts: [0] user (signer), [1] shared_vault PDA (writable),
+                //           [2] withdraw_req PDA (writable),
+                //           [3] slab (for vault derivation),
+                //           [4] vault (writable), [5] user_ata (writable),
+                //           [6] vault_authority, [7] token_program
+                accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
                 let a_shared_vault = &accounts[1];
                 let a_withdraw_req = &accounts[2];
+                let a_slab = &accounts[3];
+                let a_vault = &accounts[4];
+                let a_user_ata = &accounts[5];
+                let a_vault_authority = &accounts[6];
+                let a_token = &accounts[7];
 
                 accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_shared_vault)?;
                 accounts::expect_writable(a_withdraw_req)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_user_ata)?;
+                verify_token_program(a_token)?;
 
                 let (expected_sv, _) = Pubkey::find_program_address(
                     &[crate::shared_vault::SHARED_VAULT_SEED],
@@ -13743,20 +13755,28 @@ pub mod processor {
                 );
                 accounts::expect_key(a_shared_vault, &expected_sv)?;
 
-                let sv_data = a_shared_vault
-                    .try_borrow_data()
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
                     .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                let vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
                     .ok_or(ProgramError::UninitializedAccount)?;
 
-                // The withdrawal was queued in a previous epoch.
-                // We can only claim after that epoch has elapsed (i.e., current
-                // epoch > request epoch). The request PDA encodes the epoch in
-                // its seeds, so we verify the current epoch has advanced.
-                // Since AdvanceEpoch already checks is_epoch_elapsed, we just
-                // need epoch_number > request's epoch. The request PDA seeds
-                // contain the epoch_number at queue time. If the vault has
-                // advanced, the current epoch_number is higher.
+                // Verify slab + vault
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let config = state::read_config(&slab_data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                accounts::expect_key(a_vault_authority, &auth)?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
+                drop(slab_data);
 
                 // Read request
                 let mut req_data = a_withdraw_req
@@ -13783,14 +13803,42 @@ pub mod processor {
                     vault_state.total_capital,
                 );
 
-                // TODO: Actual token transfer from vault to user.
-                // This requires vault + vault_authority + user_ata + token_program
-                // accounts. Will be wired when integrated with LP vault token flow.
-                msg!(
-                    "PERC-628: Claim: {} LP → {} payout (proportional)",
-                    req.lp_amount,
-                    payout
-                );
+                if payout > 0 {
+                    // Convert units to base tokens
+                    let base_payout =
+                        crate::units::units_to_base_checked(payout, config.unit_scale)
+                            .ok_or(PercolatorError::EngineOverflow)?;
+
+                    // Transfer from vault to user
+                    let seed1: &[u8] = b"vault";
+                    let seed2: &[u8] = a_slab.key.as_ref();
+                    let bump_arr: [u8; 1] = [vault_bump];
+                    let seed3: &[u8] = &bump_arr;
+                    let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                    let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                    collateral::withdraw(
+                        a_token,
+                        a_vault,
+                        a_user_ata,
+                        a_vault_authority,
+                        base_payout,
+                        &signer_seeds,
+                    )?;
+
+                    // Update shared vault accounting
+                    vault_state.total_capital =
+                        vault_state.total_capital.saturating_sub(payout as u128);
+                    crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                    msg!(
+                        "PERC-628: Claim: {} LP → {} base tokens transferred",
+                        req.lp_amount,
+                        base_payout
+                    );
+                } else {
+                    msg!("PERC-628: Claim: {} LP → 0 payout", req.lp_amount);
+                }
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,
