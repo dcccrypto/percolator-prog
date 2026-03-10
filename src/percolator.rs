@@ -6733,15 +6733,82 @@ pub mod processor {
             base_max_oi
         };
 
+        // PERC-622: Apply oracle phase OI cap (absolute ceiling per phase)
+        let phase = state::get_oracle_phase(config);
+        let phase_cap = state::phase_oi_cap(phase, u64::MAX) as u128;
+        let max_oi = max_oi.min(phase_cap);
+
         if current_oi > max_oi {
             msg!(
-                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={} skew_factor={})",
+                "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={} skew_factor={} phase={})",
                 current_oi,
                 max_oi,
                 vault,
                 multiplier,
                 effective_multiplier,
                 skew_factor_bps,
+                phase,
+            );
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        Ok(())
+    }
+
+    /// PERC-622: Check phase-based leverage limit after trade.
+    /// Leverage = notional / collateral. Phase 1: max 2x, Phase 2: max 5x.
+    /// We enforce via minimum initial_margin_bps floor:
+    ///   Phase 1: floor = 5000 bps (50% → 2x)
+    ///   Phase 2: floor = 2000 bps (20% → 5x)
+    ///   Phase 3: no additional floor
+    /// If the engine's initial_margin_bps is already above the floor, no change needed.
+    /// This check rejects trades where the resulting position would exceed phase leverage.
+    fn check_phase_leverage(
+        engine: &RiskEngine,
+        config: &state::MarketConfig,
+        user_idx: u16,
+    ) -> Result<(), ProgramError> {
+        let phase = state::get_oracle_phase(config);
+        if phase >= state::ORACLE_PHASE_MATURE {
+            return Ok(()); // Phase 3: no additional leverage restriction
+        }
+
+        let max_lev_bps = state::phase_max_leverage_bps(phase, u64::MAX);
+        if max_lev_bps == 0 {
+            return Ok(());
+        }
+
+        // min_margin_bps = 10_000_000 / max_lev_bps (e.g., 10M / 20000 = 500 → 5.00%)
+        // We use 10_000 * 10_000 / max_lev_bps for bps precision
+        let min_margin_bps = 10_000u64.saturating_mul(10_000) / max_lev_bps;
+
+        // Check if current initial margin is sufficient
+        let current_margin_bps = engine.params.initial_margin_bps;
+        if u128::from(current_margin_bps) >= min_margin_bps as u128 {
+            return Ok(()); // Existing margin requirement is stricter — no issue
+        }
+
+        // Margin requirement is looser than phase allows.
+        // Check if the user's position actually exceeds phase leverage.
+        let acct = &engine.accounts[user_idx as usize];
+        let pos_size = acct.position_size.get().unsigned_abs();
+        if pos_size == 0 {
+            return Ok(());
+        }
+        let capital = acct.capital.get();
+        if capital == 0 {
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        // leverage_bps = pos_size * 10_000 / capital
+        let leverage_bps = (pos_size as u128)
+            .saturating_mul(10_000)
+            .checked_div(capital as u128)
+            .unwrap_or(u128::MAX);
+        if leverage_bps > max_lev_bps as u128 {
+            msg!(
+                "Phase leverage exceeded: leverage_bps={} max={} phase={}",
+                leverage_bps,
+                max_lev_bps,
+                phase
             );
             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
         }
@@ -8454,6 +8521,7 @@ pub mod processor {
                 // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                 check_oi_cap(engine, &config, clock.slot)?;
                 check_pnl_cap(engine, &config)?;
+                check_phase_leverage(engine, &config, user_idx)?;
 
                 // PERC-622: Accumulate trade volume for oracle phase transitions.
                 // trade_notional_e6 = |size| * price / 1e6 (approximate notional)
@@ -8821,6 +8889,7 @@ pub mod processor {
                     // PERC-273 + PERC-302: Dynamic OI cap check after trade (with ramp)
                     check_oi_cap(engine, &config, clock.slot)?;
                     check_pnl_cap(engine, &config)?;
+                    check_phase_leverage(engine, &config, user_idx)?;
 
                     // PERC-622: Accumulate trade volume for oracle phase transitions.
                     {
