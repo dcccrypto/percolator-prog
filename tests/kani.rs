@@ -5474,7 +5474,7 @@ fn nightly_skew_adjusted_cap_never_exceeds_base_cap() {
 ///
 /// This guarantees LP yield never decreases as utilization increases.
 #[kani::proof]
-fn proof_fee_mult_monotonically_increases_with_utilization() {
+fn nightly_proof_fee_mult_monotonically_increases_with_utilization() {
     let u1: u64 = kani::any();
     let u2: u64 = kani::any();
     kani::assume(u1 <= 10_000);

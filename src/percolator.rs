@@ -6080,7 +6080,7 @@ pub mod lp_collateral {
 
         #[kani::proof]
         #[kani::unwind(1)]
-        fn proof_lp_collateral_value_never_exceeds_raw_share() {
+        fn nightly_proof_lp_collateral_value_never_exceeds_raw_share() {
             let lp_amount: u64 = kani::any();
             let vault_tvl: u128 = kani::any();
             let total_supply: u64 = kani::any();
