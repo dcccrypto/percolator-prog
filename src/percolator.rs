@@ -3695,9 +3695,25 @@ pub mod state {
         config._insurance_isolation_padding[13] = bytes[2];
     }
 
+    /// Resolve effective market_created_slot for phase logic.
+    /// If market_created_slot == 0 (legacy market, field never set), returns current_slot
+    /// so elapsed = 0 — the market starts fresh in Phase 1 rather than auto-promoting.
+    /// Callers SHOULD lazy-init market_created_slot on first encounter.
+    #[inline]
+    pub fn effective_created_slot(market_created_slot: u64, current_slot: u64) -> u64 {
+        if market_created_slot == 0 {
+            current_slot
+        } else {
+            market_created_slot
+        }
+    }
+
     /// Pure decision function: check if oracle phase should advance.
     /// Returns (new_phase, transitioned).
     /// Phase transitions are monotonic: 0→1→2, never backwards.
+    ///
+    /// IMPORTANT: `market_created_slot` MUST be pre-resolved via `effective_created_slot()`
+    /// to handle legacy markets where the field is zero.
     pub fn check_phase_transition(
         current_slot: u64,
         market_created_slot: u64,
@@ -13364,6 +13380,25 @@ mod oracle_phase_tests {
         // mark_oracle_weight should be untouched
         assert_eq!(get_mark_oracle_weight_bps(&config), 5000);
     }
+
+    #[test]
+    fn test_effective_created_slot_legacy() {
+        // Legacy market: market_created_slot == 0 → returns current_slot
+        assert_eq!(effective_created_slot(0, 310_000_000), 310_000_000);
+        // Normal market: returns stored value
+        assert_eq!(effective_created_slot(100_000, 310_000_000), 100_000);
+    }
+
+    #[test]
+    fn test_legacy_market_no_auto_promote() {
+        // Legacy market with market_created_slot == 0.
+        // After effective_created_slot resolution, elapsed = 0 → stays Phase 1.
+        let current = 310_000_000u64;
+        let resolved = effective_created_slot(0, current);
+        let (phase, trans) = check_phase_transition(current, resolved, 0, u64::MAX, 0, false);
+        assert_eq!(phase, 0, "legacy market must NOT auto-promote");
+        assert!(!trans);
+    }
 }
 
 #[cfg(kani)]
@@ -13451,6 +13486,19 @@ mod oracle_phase_kani {
 
         assert!(phase_oi_cap(phase, base_oi) <= base_oi);
         assert!(phase_max_leverage_bps(phase, base_lev) <= base_lev);
+    }
+
+    /// Legacy markets (market_created_slot==0) never auto-promote from Phase 1.
+    #[kani::proof]
+    fn proof_legacy_market_no_auto_promote() {
+        let current_slot: u64 = kani::any();
+        kani::assume(current_slot > 0);
+        let resolved = effective_created_slot(0, current_slot);
+        // elapsed = current_slot - resolved = 0
+        assert_eq!(resolved, current_slot);
+        let vol: u64 = kani::any();
+        let (phase, _) = check_phase_transition(current_slot, resolved, 0, vol, 0, false);
+        assert_eq!(phase, 0, "legacy market stays Phase 1 on first encounter");
     }
 }
 
