@@ -11445,6 +11445,67 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
                 }
 
+                // PERC-627: Creator stake lock enforcement.
+                // If accounts[9] is present and is the creator_lock PDA, enforce
+                // lock duration and track extraction. Backward compatible.
+                if accounts.len() >= 10 {
+                    let a_creator_lock = &accounts[9];
+                    let (expected_lock_pda, _) = Pubkey::find_program_address(
+                        &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                        program_id,
+                    );
+                    if *a_creator_lock.key == expected_lock_pda {
+                        accounts::expect_writable(a_creator_lock)?;
+                        let mut lock_data = a_creator_lock
+                            .try_borrow_mut_data()
+                            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                        if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                            let creator_key = Pubkey::new_from_array(lock_state.creator);
+                            if *a_withdrawer.key == creator_key {
+                                let clock = solana_program::clock::Clock::get()?;
+                                let expired = crate::creator_lock::is_lock_expired(
+                                    clock.slot,
+                                    lock_state.lock_start_slot,
+                                    lock_state.lock_duration_slots,
+                                );
+                                let max_withdraw = crate::creator_lock::max_withdrawable(
+                                    lp_amount,
+                                    lock_state.lp_amount_locked,
+                                    expired,
+                                );
+                                if lp_amount > max_withdraw {
+                                    msg!(
+                                        "CREATOR_LOCK: withdraw {} > max {} (locked={}, expired={})",
+                                        lp_amount,
+                                        max_withdraw,
+                                        lock_state.lp_amount_locked,
+                                        expired
+                                    );
+                                    return Err(ProgramError::InvalidArgument);
+                                }
+
+                                // Track extraction
+                                let mut new_lock = *lock_state;
+                                new_lock.cumulative_extracted = new_lock
+                                    .cumulative_extracted
+                                    .saturating_add(lp_amount as u64);
+
+                                // Check extraction threshold
+                                if crate::creator_lock::check_extraction_exceeded(
+                                    new_lock.cumulative_extracted,
+                                    new_lock.cumulative_deposited,
+                                    crate::creator_lock::EXTRACTION_LIMIT_BPS,
+                                ) {
+                                    new_lock.fee_redirect_active = 1;
+                                    msg!("CREATOR_LOCK: extraction threshold exceeded — fee redirect activated");
+                                }
+
+                                crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                            }
+                        }
+                    }
+                }
+
                 let mut slab_data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &slab_data)?;
                 require_initialized(&slab_data)?;
