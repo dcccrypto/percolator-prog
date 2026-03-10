@@ -6473,10 +6473,10 @@ pub mod shared_vault {
     pub struct WithdrawalRequest {
         pub magic: u64,
         pub bump: u8,
-        pub _pad: [u8; 7],
-        pub lp_amount: u64,
         pub claimed: u8,
-        pub _reserved: [u8; 7],
+        pub _pad: [u8; 6],
+        pub lp_amount: u64,
+        pub epoch_number: u64,
     }
 
     const _: () = assert!(WITHDRAW_REQ_LEN == 32);
@@ -6724,15 +6724,16 @@ pub mod shared_vault {
             let req = WithdrawalRequest {
                 magic: WITHDRAW_REQ_MAGIC,
                 bump: 253,
-                _pad: [0; 7],
-                lp_amount: 5_000,
                 claimed: 0,
-                _reserved: [0; 7],
+                _pad: [0; 6],
+                lp_amount: 5_000,
+                epoch_number: 42,
             };
             let mut buf = [0u8; WITHDRAW_REQ_LEN];
             write_withdraw_req(&mut buf, &req);
             let read = read_withdraw_req(&buf).unwrap();
             assert_eq!(read.lp_amount, 5_000);
+            assert_eq!(read.epoch_number, 42);
             assert_eq!(read.claimed, 0);
         }
 
@@ -13738,10 +13739,10 @@ pub mod processor {
                 let req = crate::shared_vault::WithdrawalRequest {
                     magic: crate::shared_vault::WITHDRAW_REQ_MAGIC,
                     bump: req_bump,
-                    _pad: [0; 7],
-                    lp_amount,
                     claimed: 0,
-                    _reserved: [0; 7],
+                    _pad: [0; 6],
+                    lp_amount,
+                    epoch_number: vault_state.epoch_number,
                 };
                 let mut req_data = a_withdraw_req
                     .try_borrow_mut_data()
@@ -13800,6 +13801,17 @@ pub mod processor {
                 let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
                     .ok_or(ProgramError::UninitializedAccount)?;
 
+                // Security HIGH #1: Gate on epoch elapsed — no mid-epoch claims
+                let clock = solana_program::clock::Clock::get()?;
+                if !crate::shared_vault::is_epoch_elapsed(
+                    clock.slot,
+                    vault_state.epoch_start_slot,
+                    vault_state.epoch_duration_slots,
+                ) {
+                    msg!("PERC-628: epoch not yet elapsed — cannot claim mid-epoch");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 // Verify slab + vault
                 let slab_data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &slab_data)?;
@@ -13826,6 +13838,30 @@ pub mod processor {
 
                 if req.claimed != 0 {
                     msg!("PERC-628: withdrawal already claimed");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Security HIGH #2: Verify request epoch < current epoch.
+                // Re-derive PDA from stored epoch to confirm authenticity.
+                let req_epoch_bytes = req.epoch_number.to_le_bytes();
+                let (expected_req_pda, _) = Pubkey::find_program_address(
+                    &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &req_epoch_bytes,
+                    ],
+                    program_id,
+                );
+                if *a_withdraw_req.key != expected_req_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                if req.epoch_number >= vault_state.epoch_number {
+                    msg!(
+                        "PERC-628: request epoch {} >= current {} — must wait for epoch advance",
+                        req.epoch_number,
+                        vault_state.epoch_number
+                    );
                     return Err(ProgramError::InvalidArgument);
                 }
 
