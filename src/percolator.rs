@@ -7678,7 +7678,79 @@ pub mod processor {
             vault_key: a_vault.key,
             a_clock: &accounts[5],
         };
-        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)
+        init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)?;
+
+        // PERC-627: Optional creator stake lock PDA initialization.
+        // accounts[9] = creator_lock PDA (writable), accounts[10] = system_program
+        // Creates a lock requiring the creator to hold their LP position for 90 days.
+        // Backward compatible: callers with only 9 accounts skip this.
+        if accounts.len() >= 11 {
+            let a_creator_lock = &accounts[9];
+            let a_system_program = &accounts[10];
+            accounts::expect_writable(a_creator_lock)?;
+
+            if *a_system_program.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            if *a_creator_lock.key != expected_pda {
+                return Err(ProgramError::InvalidSeeds);
+            }
+
+            let rent = solana_program::rent::Rent::get()?;
+            let lamports = rent.minimum_balance(crate::creator_lock::CREATOR_LOCK_STATE_LEN);
+            let bump_bytes = [pda_bump];
+            let signer_seeds: &[&[u8]] = &[
+                crate::creator_lock::CREATOR_LOCK_SEED,
+                a_slab.key.as_ref(),
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_admin.key,
+                    &expected_pda,
+                    lamports,
+                    crate::creator_lock::CREATOR_LOCK_STATE_LEN as u64,
+                    program_id,
+                ),
+                &[
+                    a_admin.clone(),
+                    a_creator_lock.clone(),
+                    a_system_program.clone(),
+                ],
+                &[signer_seeds],
+            )?;
+
+            let clock = solana_program::clock::Clock::get()?;
+            let state = crate::creator_lock::CreatorStakeLock {
+                magic: crate::creator_lock::CREATOR_LOCK_MAGIC,
+                bump: pda_bump,
+                _pad: [0u8; 7],
+                creator: a_admin.key.to_bytes(),
+                lock_start_slot: clock.slot,
+                lock_duration_slots: crate::creator_lock::DEFAULT_LOCK_DURATION_SLOTS,
+                lp_amount_locked: 0, // Set when creator deposits LP (LpVaultDeposit)
+                cumulative_extracted: 0,
+                cumulative_deposited: 0,
+                fee_redirect_active: 0,
+                _reserved: [0u8; 7],
+            };
+            let mut lock_data = a_creator_lock
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::creator_lock::write_state(&mut lock_data, &state);
+
+            msg!(
+                "PERC-627: CreatorStakeLock initialized — lock_duration={}",
+                crate::creator_lock::DEFAULT_LOCK_DURATION_SLOTS
+            );
+        }
+
+        Ok(())
     }
 
     pub fn process_instruction<'a, 'b>(
@@ -11406,6 +11478,37 @@ pub mod processor {
                     lp_tokens_to_mint,
                     &signer_seeds,
                 )?;
+
+                // PERC-627: Track creator deposit in CreatorStakeLock PDA.
+                // If accounts[9] is the creator_lock PDA and depositor is the
+                // creator, update lp_amount_locked and cumulative_deposited.
+                if accounts.len() >= 10 {
+                    let a_creator_lock = &accounts[9];
+                    let (expected_lock_pda, _) = Pubkey::find_program_address(
+                        &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                        program_id,
+                    );
+                    if *a_creator_lock.key == expected_lock_pda && a_creator_lock.is_writable {
+                        if let Ok(mut lock_data) = a_creator_lock.try_borrow_mut_data() {
+                            if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                                let creator_key = Pubkey::new_from_array(lock_state.creator);
+                                if *a_depositor.key == creator_key {
+                                    let mut new_lock = *lock_state;
+                                    new_lock.lp_amount_locked =
+                                        new_lock.lp_amount_locked.saturating_add(lp_tokens_to_mint);
+                                    new_lock.cumulative_deposited = new_lock
+                                        .cumulative_deposited
+                                        .saturating_add(lp_tokens_to_mint as u64);
+                                    crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                                    msg!(
+                                        "CREATOR_LOCK: deposit tracked — locked={}",
+                                        new_lock.lp_amount_locked
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
 
                 msg!(
                     "LP vault deposit: {} tokens, {} LP shares minted, epoch={}",
