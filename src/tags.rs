@@ -109,6 +109,12 @@ pub const TAG_SET_OFFSET_PAIR: u8 = 54;
 /// Permissionless: attest user positions across two slabs for portfolio margin credit.
 /// Creates/updates a CrossMarginAttestation PDA at ["cmor", user, slab_a, slab_b].
 pub const TAG_ATTEST_CROSS_MARGIN: u8 = 55;
+/// Tag 56 reserved for PERC-622 AdvanceOraclePhase.
+pub const TAG_ADVANCE_ORACLE_PHASE: u8 = 56;
+/// Tag 57 reserved for PERC-623 TopUpKeeperFund.
+pub const TAG_TOPUP_KEEPER_FUND: u8 = 57;
+/// PERC-629: Slash underperforming market's creation deposit.
+pub const TAG_SLASH_CREATION_DEPOSIT: u8 = 58;
 
 #[cfg(test)]
 mod tests {
@@ -174,6 +180,9 @@ mod tests {
             TAG_AUDIT_CRANK,
             TAG_SET_OFFSET_PAIR,
             TAG_ATTEST_CROSS_MARGIN,
+            TAG_ADVANCE_ORACLE_PHASE,
+            TAG_TOPUP_KEEPER_FUND,
+            TAG_SLASH_CREATION_DEPOSIT,
         ];
 
         for i in 0..tags.len() {
@@ -243,6 +252,9 @@ mod tests {
             TAG_AUDIT_CRANK,
             TAG_SET_OFFSET_PAIR,
             TAG_ATTEST_CROSS_MARGIN,
+            TAG_ADVANCE_ORACLE_PHASE,
+            TAG_TOPUP_KEEPER_FUND,
+            TAG_SLASH_CREATION_DEPOSIT,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
