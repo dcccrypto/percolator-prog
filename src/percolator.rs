@@ -3630,8 +3630,11 @@ pub mod state {
     pub const ORACLE_PHASE_MATURE: u8 = 2;
 
     /// Phase transition thresholds.
-    /// ~72 hours at 400ms slots = 648_000 slots.
+    /// ~72 hours at 400ms slots = 648_000 slots (time-only path).
     pub const PHASE1_MIN_SLOTS: u64 = 648_000;
+    /// ~4 hours at 400ms slots = 36_000 slots (minimum floor for volume path).
+    /// Security: prevents wash-trading to skip time requirement entirely.
+    pub const PHASE1_VOLUME_MIN_SLOTS: u64 = 36_000;
     /// $100K cumulative volume threshold to exit Phase 1 (in collateral units).
     pub const PHASE2_VOLUME_THRESHOLD: u64 = 100_000_000_000; // 100K * 1e6 (e6 format)
     /// ~14 days at 400ms slots = 3_024_000 slots.
@@ -3705,9 +3708,15 @@ pub mod state {
     ) -> (u8, bool) {
         match oracle_phase {
             0 => {
-                // Phase 1 → Phase 2: need both 72h elapsed AND $100K volume
+                // Phase 1 → Phase 2:
+                //   Path A: 72h elapsed (time-only, regardless of volume)
+                //   Path B: 4h elapsed AND $100K cumulative volume
+                // Security: 4h floor prevents wash-trade instant bypass.
                 let elapsed = current_slot.saturating_sub(market_created_slot);
-                if elapsed >= PHASE1_MIN_SLOTS && cumulative_volume >= PHASE2_VOLUME_THRESHOLD {
+                let time_ready = elapsed >= PHASE1_MIN_SLOTS;
+                let volume_ready = elapsed >= PHASE1_VOLUME_MIN_SLOTS
+                    && cumulative_volume >= PHASE2_VOLUME_THRESHOLD;
+                if time_ready || volume_ready {
                     (ORACLE_PHASE_GROWING, true)
                 } else {
                     (ORACLE_PHASE_NASCENT, false)
@@ -13255,15 +13264,25 @@ mod oracle_phase_tests {
 
     #[test]
     fn test_phase1_to_phase2_transition() {
-        // Not enough time
-        let (phase, trans) = check_phase_transition(100_000, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
+        // Not enough time, not enough volume
+        let (phase, trans) = check_phase_transition(100, 0, 0, 0, 0, false);
         assert_eq!(phase, 0);
         assert!(!trans);
 
-        // Enough time but not enough volume
-        let (phase, trans) = check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD - 1, 0, false);
+        // Volume met but under 4h floor → still Phase 1
+        let (phase, trans) = check_phase_transition(PHASE1_VOLUME_MIN_SLOTS - 1, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
         assert_eq!(phase, 0);
         assert!(!trans);
+
+        // Path B: 4h elapsed + volume met → Phase 2
+        let (phase, trans) = check_phase_transition(PHASE1_VOLUME_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
+        assert_eq!(phase, 1);
+        assert!(trans);
+
+        // Path A: 72h elapsed, no volume → Phase 2
+        let (phase, trans) = check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, 0, 0, false);
+        assert_eq!(phase, 1);
+        assert!(trans);
 
         // Both conditions met
         let (phase, trans) = check_phase_transition(PHASE1_MIN_SLOTS, 0, 0, PHASE2_VOLUME_THRESHOLD, 0, false);
@@ -13408,13 +13427,13 @@ mod oracle_phase_kani {
         assert!(new_vol >= old_vol);
     }
 
-    /// Cannot leave Phase 1 before PHASE1_MIN_SLOTS elapsed.
+    /// Cannot leave Phase 1 before PHASE1_VOLUME_MIN_SLOTS (4h absolute floor).
     #[kani::proof]
     fn proof_phase1_requires_min_time() {
         let created: u64 = kani::any();
         let slot: u64 = kani::any();
         kani::assume(created <= slot);
-        kani::assume(slot - created < PHASE1_MIN_SLOTS);
+        kani::assume(slot - created < PHASE1_VOLUME_MIN_SLOTS);
         let vol: u64 = kani::any();
 
         let (new_phase, transitioned) = check_phase_transition(slot, created, 0, vol, 0, false);
