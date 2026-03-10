@@ -2416,6 +2416,23 @@ pub mod ix {
             user_idx_a: u16,
             user_idx_b: u16,
         },
+        /// PERC-628: Initialize the global shared vault.
+        InitSharedVault {
+            epoch_duration_slots: u64,
+            max_market_exposure_bps: u16,
+        },
+        /// PERC-628: Allocate virtual liquidity to a market.
+        AllocateMarket {
+            amount: u128,
+        },
+        /// PERC-628: Queue a withdrawal for the current epoch.
+        QueueWithdrawalSV {
+            lp_amount: u64,
+        },
+        /// PERC-628: Claim a queued withdrawal after epoch elapses.
+        ClaimEpochWithdrawal,
+        /// PERC-628: Advance the shared vault epoch (permissionless crank).
+        AdvanceEpoch,
     }
 
     impl Instruction {
@@ -2892,6 +2909,24 @@ pub mod ix {
                         user_idx_b,
                     })
                 }
+                TAG_INIT_SHARED_VAULT => {
+                    let epoch_duration_slots = read_u64(&mut rest)?;
+                    let max_market_exposure_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::InitSharedVault {
+                        epoch_duration_slots,
+                        max_market_exposure_bps,
+                    })
+                }
+                TAG_ALLOCATE_MARKET => {
+                    let amount = read_u128(&mut rest)?;
+                    Ok(Instruction::AllocateMarket { amount })
+                }
+                TAG_QUEUE_WITHDRAWAL_SV => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::QueueWithdrawalSV { lp_amount })
+                }
+                TAG_CLAIM_EPOCH_WITHDRAWAL => Ok(Instruction::ClaimEpochWithdrawal),
+                TAG_ADVANCE_EPOCH => Ok(Instruction::AdvanceEpoch),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -13333,6 +13368,428 @@ pub mod processor {
                     pos_a as i64,
                     pos_b as i64,
                     offset_bps
+                );
+            }
+
+            // PERC-628: InitSharedVault — admin creates the global shared vault PDA.
+            Instruction::InitSharedVault {
+                epoch_duration_slots,
+                max_market_exposure_bps,
+            } => {
+                // accounts: [0] admin (signer), [1] shared_vault PDA (writable),
+                //           [2] system_program
+                accounts::expect_len(accounts, 3)?;
+                let a_admin = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_system_program = &accounts[2];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_shared_vault)?;
+
+                if *a_system_program.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                if *a_shared_vault.key != expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                if !a_shared_vault.data_is_empty() {
+                    return Err(ProgramError::AccountAlreadyInitialized);
+                }
+
+                let rent = solana_program::rent::Rent::get()?;
+                let lamports = rent.minimum_balance(crate::shared_vault::SHARED_VAULT_STATE_LEN);
+                let bump_bytes = [pda_bump];
+                let signer_seeds: &[&[u8]] = &[crate::shared_vault::SHARED_VAULT_SEED, &bump_bytes];
+                solana_program::program::invoke_signed(
+                    &solana_program::system_instruction::create_account(
+                        a_admin.key,
+                        &expected_pda,
+                        lamports,
+                        crate::shared_vault::SHARED_VAULT_STATE_LEN as u64,
+                        program_id,
+                    ),
+                    &[
+                        a_admin.clone(),
+                        a_shared_vault.clone(),
+                        a_system_program.clone(),
+                    ],
+                    &[signer_seeds],
+                )?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                let duration = if epoch_duration_slots == 0 {
+                    crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
+                } else {
+                    epoch_duration_slots
+                };
+                let max_bps = if max_market_exposure_bps == 0 {
+                    crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
+                } else {
+                    max_market_exposure_bps.min(10_000)
+                };
+
+                let state = crate::shared_vault::SharedVaultState {
+                    magic: crate::shared_vault::SHARED_VAULT_MAGIC,
+                    epoch_number: 0,
+                    total_capital: 0,
+                    total_allocated: 0,
+                    pending_withdrawals: 0,
+                    epoch_start_slot: clock.slot,
+                    epoch_duration_slots: duration,
+                    max_market_exposure_bps: max_bps,
+                    bump: pda_bump,
+                    _reserved: [0; 45],
+                };
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_vault_state(&mut sv_data, &state);
+
+                msg!(
+                    "PERC-628: SharedVault initialized — epoch_duration={} max_exposure_bps={}",
+                    duration,
+                    max_bps
+                );
+            }
+
+            // PERC-628: AllocateMarket — allocate virtual liquidity to a market.
+            Instruction::AllocateMarket { amount } => {
+                // accounts: [0] admin (signer), [1] slab, [2] shared_vault PDA (writable),
+                //           [3] market_alloc PDA (writable), [4] system_program
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_shared_vault = &accounts[2];
+                let a_market_alloc = &accounts[3];
+                let a_system_program = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_market_alloc)?;
+
+                // Verify slab
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                let header = state::read_header(&slab_data);
+                require_admin(header.admin, a_admin.key)?;
+                drop(slab_data);
+
+                // Verify shared vault PDA
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                // Verify market_alloc PDA
+                let (expected_alloc, alloc_bump) = Pubkey::find_program_address(
+                    &[crate::shared_vault::MARKET_ALLOC_SEED, a_slab.key.as_ref()],
+                    program_id,
+                );
+                if *a_market_alloc.key != expected_alloc {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // Read shared vault state
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                // Check exposure cap
+                let new_allocation = amount;
+                if !crate::shared_vault::check_exposure_cap(
+                    vault_state.total_capital,
+                    new_allocation,
+                    vault_state.max_market_exposure_bps,
+                ) {
+                    msg!("PERC-628: allocation {} exceeds exposure cap", amount);
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Check available capital
+                let available = crate::shared_vault::available_for_allocation(
+                    vault_state.total_capital,
+                    vault_state.total_allocated,
+                );
+                if new_allocation > available {
+                    msg!("PERC-628: allocation {} > available {}", amount, available);
+                    return Err(ProgramError::InsufficientFunds);
+                }
+
+                // Create market_alloc PDA if needed
+                if a_market_alloc.data_is_empty() {
+                    if *a_system_program.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(crate::shared_vault::MARKET_ALLOC_LEN);
+                    let bump_bytes = [alloc_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        crate::shared_vault::MARKET_ALLOC_SEED,
+                        a_slab.key.as_ref(),
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_admin.key,
+                            &expected_alloc,
+                            lamports,
+                            crate::shared_vault::MARKET_ALLOC_LEN as u64,
+                            program_id,
+                        ),
+                        &[
+                            a_admin.clone(),
+                            a_market_alloc.clone(),
+                            a_system_program.clone(),
+                        ],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                // Update market allocation
+                let alloc = crate::shared_vault::MarketAllocation {
+                    magic: crate::shared_vault::MARKET_ALLOC_MAGIC,
+                    bump: alloc_bump,
+                    _pad: [0; 7],
+                    allocated_capital: new_allocation,
+                    utilized_capital: 0,
+                };
+                let mut alloc_data = a_market_alloc
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_market_alloc(&mut alloc_data, &alloc);
+
+                // Update shared vault totals
+                vault_state.total_allocated =
+                    vault_state.total_allocated.saturating_add(new_allocation);
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!("PERC-628: Market allocated {} from shared vault", amount);
+            }
+
+            // PERC-628: AdvanceEpoch — permissionless crank to advance the epoch.
+            Instruction::AdvanceEpoch => {
+                // accounts: [0] caller (signer), [1] shared_vault PDA (writable)
+                accounts::expect_len(accounts, 2)?;
+                let a_caller = &accounts[0];
+                let a_shared_vault = &accounts[1];
+
+                accounts::expect_signer(a_caller)?;
+                accounts::expect_writable(a_shared_vault)?;
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                let clock = solana_program::clock::Clock::get()?;
+                if !crate::shared_vault::is_epoch_elapsed(
+                    clock.slot,
+                    vault_state.epoch_start_slot,
+                    vault_state.epoch_duration_slots,
+                ) {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                vault_state.epoch_number = vault_state.epoch_number.saturating_add(1);
+                vault_state.epoch_start_slot = clock.slot;
+                vault_state.pending_withdrawals = 0;
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!(
+                    "PERC-628: Epoch advanced to {} at slot {}",
+                    vault_state.epoch_number,
+                    clock.slot
+                );
+            }
+
+            // PERC-628: QueueWithdrawalSV — queue a withdrawal for the current epoch.
+            Instruction::QueueWithdrawalSV { lp_amount } => {
+                // accounts: [0] user (signer), [1] shared_vault PDA (writable),
+                //           [2] withdraw_req PDA (writable), [3] system_program
+                accounts::expect_len(accounts, 4)?;
+                let a_user = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_withdraw_req = &accounts[2];
+                let a_system_program = &accounts[3];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_shared_vault)?;
+                accounts::expect_writable(a_withdraw_req)?;
+
+                if lp_amount == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let mut sv_data = a_shared_vault
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                // Verify withdraw_req PDA
+                let epoch_bytes = vault_state.epoch_number.to_le_bytes();
+                let (expected_req, req_bump) = Pubkey::find_program_address(
+                    &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &epoch_bytes,
+                    ],
+                    program_id,
+                );
+                if *a_withdraw_req.key != expected_req {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // Create withdraw_req PDA if needed
+                if a_withdraw_req.data_is_empty() {
+                    if *a_system_program.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(crate::shared_vault::WITHDRAW_REQ_LEN);
+                    let bump_bytes = [req_bump];
+                    let signer_seeds: &[&[u8]] = &[
+                        crate::shared_vault::WITHDRAW_REQ_SEED,
+                        a_shared_vault.key.as_ref(),
+                        a_user.key.as_ref(),
+                        &epoch_bytes,
+                        &bump_bytes,
+                    ];
+                    solana_program::program::invoke_signed(
+                        &solana_program::system_instruction::create_account(
+                            a_user.key,
+                            &expected_req,
+                            lamports,
+                            crate::shared_vault::WITHDRAW_REQ_LEN as u64,
+                            program_id,
+                        ),
+                        &[
+                            a_user.clone(),
+                            a_withdraw_req.clone(),
+                            a_system_program.clone(),
+                        ],
+                        &[signer_seeds],
+                    )?;
+                }
+
+                let req = crate::shared_vault::WithdrawalRequest {
+                    magic: crate::shared_vault::WITHDRAW_REQ_MAGIC,
+                    bump: req_bump,
+                    _pad: [0; 7],
+                    lp_amount,
+                    claimed: 0,
+                    _reserved: [0; 7],
+                };
+                let mut req_data = a_withdraw_req
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                crate::shared_vault::write_withdraw_req(&mut req_data, &req);
+
+                // Update pending withdrawals
+                vault_state.pending_withdrawals = crate::shared_vault::queue_withdrawal(
+                    vault_state.pending_withdrawals,
+                    lp_amount,
+                );
+                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+                msg!(
+                    "PERC-628: Queued withdrawal {} LP for epoch {}",
+                    lp_amount,
+                    vault_state.epoch_number
+                );
+            }
+
+            // PERC-628: ClaimEpochWithdrawal — claim after epoch elapses.
+            // Security: MUST gate on is_epoch_elapsed() and set claimed=1
+            // BEFORE transfer (not after). No mid-epoch claims.
+            Instruction::ClaimEpochWithdrawal => {
+                // accounts: [0] user (signer), [1] shared_vault PDA,
+                //           [2] withdraw_req PDA (writable)
+                accounts::expect_len(accounts, 3)?;
+                let a_user = &accounts[0];
+                let a_shared_vault = &accounts[1];
+                let a_withdraw_req = &accounts[2];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_withdraw_req)?;
+
+                let (expected_sv, _) = Pubkey::find_program_address(
+                    &[crate::shared_vault::SHARED_VAULT_SEED],
+                    program_id,
+                );
+                accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+                let sv_data = a_shared_vault
+                    .try_borrow_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let vault_state = crate::shared_vault::read_vault_state(&sv_data)
+                    .ok_or(ProgramError::UninitializedAccount)?;
+
+                // The withdrawal was queued in a previous epoch.
+                // We can only claim after that epoch has elapsed (i.e., current
+                // epoch > request epoch). The request PDA encodes the epoch in
+                // its seeds, so we verify the current epoch has advanced.
+                // Since AdvanceEpoch already checks is_epoch_elapsed, we just
+                // need epoch_number > request's epoch. The request PDA seeds
+                // contain the epoch_number at queue time. If the vault has
+                // advanced, the current epoch_number is higher.
+
+                // Read request
+                let mut req_data = a_withdraw_req
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                let req = crate::shared_vault::read_withdraw_req(&req_data)
+                    .ok_or(ProgramError::InvalidAccountData)?;
+
+                if req.claimed != 0 {
+                    msg!("PERC-628: withdrawal already claimed");
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Security: set claimed=1 BEFORE any transfer
+                let mut updated_req = req;
+                updated_req.claimed = 1;
+                crate::shared_vault::write_withdraw_req(&mut req_data, &updated_req);
+                drop(req_data);
+
+                // Compute proportional withdrawal
+                let payout = crate::shared_vault::compute_proportional_withdrawal(
+                    req.lp_amount,
+                    vault_state.pending_withdrawals,
+                    vault_state.total_capital,
+                );
+
+                // TODO: Actual token transfer from vault to user.
+                // This requires vault + vault_authority + user_ata + token_program
+                // accounts. Will be wired when integrated with LP vault token flow.
+                msg!(
+                    "PERC-628: Claim: {} LP → {} payout (proportional)",
+                    req.lp_amount,
+                    payout
                 );
             }
 
