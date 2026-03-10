@@ -6545,6 +6545,235 @@ pub mod cross_margin {
     }
 }
 
+// 8b. mod keeper_fund — PERC-623: Self-Funding Keeper
+pub mod keeper_fund {
+    use bytemuck::{Pod, Zeroable};
+
+    /// Magic bytes for KeeperFundState PDA: "KEEPFUND"
+    pub const KEEPER_FUND_MAGIC: u64 = 0x4B454550_46554E44;
+
+    /// Size of the KeeperFundState account data.
+    pub const KEEPER_FUND_STATE_LEN: usize = core::mem::size_of::<KeeperFundState>();
+
+    /// Default split: 30% of creation deposit goes to keeper fund.
+    pub const KEEPER_FUND_SPLIT_BPS: u64 = 3_000;
+
+    /// Default reward per successful KeeperCrank (in base token lamports).
+    /// ~0.001 SOL equivalent. Configurable per market at init.
+    pub const DEFAULT_REWARD_PER_CRANK: u64 = 1_000_000; // 0.001 SOL in lamports
+
+    /// Fee percentage diverted to keeper fund top-up (in bps).
+    pub const KEEPER_FEE_TOPUP_BPS: u64 = 500; // 5% of fees
+
+    /// PDA seed prefix.
+    pub const KEEPER_FUND_SEED: &[u8] = b"keeper_fund";
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct KeeperFundState {
+        pub magic: u64,
+        pub bump: u8,
+        pub _pad: [u8; 7],
+        /// Current fund balance (base token lamports).
+        pub balance: u64,
+        /// Reward paid to crank caller per successful KeeperCrank.
+        pub reward_per_crank: u64,
+        /// Lifetime total rewards paid out.
+        pub total_rewarded: u64,
+        /// Lifetime total topped up from fees.
+        pub total_topped_up: u64,
+    }
+
+    // Compile-time size check
+    const _: [(); 48] = [(); KEEPER_FUND_STATE_LEN];
+
+    /// Compute the deposit split: (lp_amount, keeper_fund_amount).
+    /// keeper_fund_amount = deposit * split_bps / 10_000
+    /// lp_amount = deposit - keeper_fund_amount (remainder, avoids rounding loss)
+    ///
+    /// Invariant: lp_amount + keeper_fund_amount == deposit (exact).
+    pub fn split_deposit(deposit: u64, split_bps: u64) -> (u64, u64) {
+        let capped_bps = split_bps.min(10_000);
+        let keeper_amount = deposit.saturating_mul(capped_bps) / 10_000;
+        let lp_amount = deposit.saturating_sub(keeper_amount);
+        (lp_amount, keeper_amount)
+    }
+
+    /// Pay crank reward from fund. Returns (new_balance, actual_reward).
+    /// If balance < reward_per_crank, pays the remaining balance (partial reward).
+    pub fn pay_crank_reward(balance: u64, reward_per_crank: u64) -> (u64, u64) {
+        let actual = balance.min(reward_per_crank);
+        (balance.saturating_sub(actual), actual)
+    }
+
+    /// Top up keeper fund from fees. Returns (new_balance, topped_up_amount).
+    pub fn topup_from_fees(balance: u64, fee_amount: u64, topup_bps: u64) -> (u64, u64) {
+        let topup = fee_amount.saturating_mul(topup_bps.min(10_000)) / 10_000;
+        (balance.saturating_add(topup), topup)
+    }
+
+    /// Check if fund is depleted (balance == 0 after paying reward).
+    pub fn is_depleted(balance: u64) -> bool {
+        balance == 0
+    }
+
+    /// Read KeeperFundState from account data.
+    pub fn read_state(data: &[u8]) -> Option<&KeeperFundState> {
+        if data.len() < KEEPER_FUND_STATE_LEN {
+            return None;
+        }
+        let state: &KeeperFundState = bytemuck::from_bytes(&data[..KEEPER_FUND_STATE_LEN]);
+        if state.magic != KEEPER_FUND_MAGIC {
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Write KeeperFundState to account data.
+    pub fn write_state(data: &mut [u8], state: &KeeperFundState) {
+        data[..KEEPER_FUND_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_split_deposit_conservation() {
+            // Exact conservation for various deposits
+            for deposit in [0, 1, 100, 999, 1_000_000, u64::MAX / 10_000] {
+                let (lp, fund) = split_deposit(deposit, KEEPER_FUND_SPLIT_BPS);
+                assert_eq!(lp + fund, deposit, "conservation failed for {}", deposit);
+            }
+        }
+
+        #[test]
+        fn test_split_deposit_ratios() {
+            let (lp, fund) = split_deposit(10_000, 3_000);
+            assert_eq!(fund, 3_000); // 30%
+            assert_eq!(lp, 7_000);   // 70%
+        }
+
+        #[test]
+        fn test_split_deposit_zero() {
+            let (lp, fund) = split_deposit(0, 3_000);
+            assert_eq!(lp, 0);
+            assert_eq!(fund, 0);
+        }
+
+        #[test]
+        fn test_split_deposit_cap_bps() {
+            // split_bps > 10_000 capped to 10_000
+            let (lp, fund) = split_deposit(1_000, 20_000);
+            assert_eq!(fund, 1_000); // capped to 100%
+            assert_eq!(lp, 0);
+        }
+
+        #[test]
+        fn test_pay_crank_reward_normal() {
+            let (new_bal, reward) = pay_crank_reward(10_000, 1_000);
+            assert_eq!(new_bal, 9_000);
+            assert_eq!(reward, 1_000);
+        }
+
+        #[test]
+        fn test_pay_crank_reward_insufficient() {
+            let (new_bal, reward) = pay_crank_reward(500, 1_000);
+            assert_eq!(new_bal, 0);
+            assert_eq!(reward, 500); // partial
+        }
+
+        #[test]
+        fn test_pay_crank_reward_zero_balance() {
+            let (new_bal, reward) = pay_crank_reward(0, 1_000);
+            assert_eq!(new_bal, 0);
+            assert_eq!(reward, 0);
+        }
+
+        #[test]
+        fn test_topup_from_fees() {
+            let (new_bal, topped) = topup_from_fees(1_000, 10_000, 500);
+            assert_eq!(topped, 500); // 5% of 10_000
+            assert_eq!(new_bal, 1_500);
+        }
+
+        #[test]
+        fn test_state_roundtrip() {
+            let state = KeeperFundState {
+                magic: KEEPER_FUND_MAGIC,
+                bump: 254,
+                _pad: [0; 7],
+                balance: 12345,
+                reward_per_crank: 1000,
+                total_rewarded: 5000,
+                total_topped_up: 3000,
+            };
+            let mut buf = [0u8; KEEPER_FUND_STATE_LEN];
+            write_state(&mut buf, &state);
+            let read = read_state(&buf).unwrap();
+            assert_eq!(read.balance, 12345);
+            assert_eq!(read.bump, 254);
+            assert_eq!(read.total_rewarded, 5000);
+        }
+
+        #[test]
+        fn test_read_state_bad_magic() {
+            let mut buf = [0u8; KEEPER_FUND_STATE_LEN];
+            buf[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+            assert!(read_state(&buf).is_none());
+        }
+    }
+}
+
+#[cfg(kani)]
+mod keeper_fund_kani {
+    use crate::keeper_fund::*;
+
+    /// Deposit split conserves total: lp + fund == deposit.
+    #[kani::proof]
+    fn proof_split_deposit_conservation() {
+        let deposit: u64 = kani::any();
+        let split_bps: u64 = kani::any();
+        kani::assume(split_bps <= 10_000);
+        // Only check deposits that won't overflow in multiply
+        kani::assume(deposit <= u64::MAX / 10_000);
+        let (lp, fund) = split_deposit(deposit, split_bps);
+        assert!(lp + fund == deposit, "split must conserve deposit");
+    }
+
+    /// Crank reward never exceeds balance.
+    #[kani::proof]
+    fn proof_reward_bounded() {
+        let balance: u64 = kani::any();
+        let reward_per_crank: u64 = kani::any();
+        let (new_bal, actual) = pay_crank_reward(balance, reward_per_crank);
+        assert!(actual <= balance, "reward must not exceed balance");
+        assert!(new_bal <= balance, "new balance must not increase");
+        assert!(new_bal + actual == balance, "conservation");
+    }
+
+    /// Fund balance monotonically decreases from rewards.
+    #[kani::proof]
+    fn proof_reward_monotone_decrease() {
+        let balance: u64 = kani::any();
+        let reward: u64 = kani::any();
+        let (new_bal, _) = pay_crank_reward(balance, reward);
+        assert!(new_bal <= balance);
+    }
+
+    /// Topup never decreases balance.
+    #[kani::proof]
+    fn proof_topup_monotone_increase() {
+        let balance: u64 = kani::any();
+        let fee: u64 = kani::any();
+        let bps: u64 = kani::any();
+        kani::assume(bps <= 10_000);
+        kani::assume(fee <= u64::MAX / 10_000);
+        let (new_bal, _) = topup_from_fees(balance, fee, bps);
+        assert!(new_bal >= balance);
+    }
+}
+
 // 9. mod processor
 pub mod processor {
     use crate::{

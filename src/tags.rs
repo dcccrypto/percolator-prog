@@ -112,6 +112,9 @@ pub const TAG_SET_OFFSET_PAIR: u8 = 54;
 /// Permissionless: attest user positions across two slabs for portfolio margin credit.
 /// Creates/updates a CrossMarginAttestation PDA at ["cmor", user, slab_a, slab_b].
 pub const TAG_ATTEST_CROSS_MARGIN: u8 = 55;
+/// PERC-623: Top up keeper fund (permissionless).
+/// Tag 56 reserved for PERC-622 AdvanceOraclePhase.
+pub const TAG_TOPUP_KEEPER_FUND: u8 = 57;
 
 #[cfg(test)]
 mod tests {
