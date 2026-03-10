@@ -7735,7 +7735,16 @@ pub mod processor {
                 lock_duration_slots: crate::creator_lock::DEFAULT_LOCK_DURATION_SLOTS,
                 lp_amount_locked: 0, // Set when creator deposits LP (LpVaultDeposit)
                 cumulative_extracted: 0,
-                cumulative_deposited: 0,
+                // Security: initialize to seed deposit so extraction check
+                // is never evaluated against zero-deposit.
+                cumulative_deposited: {
+                    let vault_data = a_vault
+                        .try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    spl_token::state::Account::unpack(&vault_data)
+                        .map(|a| a.amount)
+                        .unwrap_or(0)
+                },
                 fee_redirect_active: 0,
                 _reserved: [0u8; 7],
             };
