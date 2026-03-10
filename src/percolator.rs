@@ -13287,28 +13287,21 @@ pub mod processor {
             //           [3] insurance vault (writable — receives slash)
             Instruction::SlashCreationDeposit => {
                 // Permissionless slash crank. Evaluates a market after 30 days.
+                // Slash is internal accounting: tokens stay in the vault,
+                // balance moves from vault to insurance_fund in the engine.
+                // No external transfer needed — eliminates unvalidated ATA risk.
                 // accounts: [0] caller (signer), [1] slab (writable),
-                //           [2] creator_history PDA (writable),
-                //           [3] vault (writable — source of slash),
-                //           [4] insurance_ata (writable — receives slash),
-                //           [5] vault_authority, [6] token_program
-                accounts::expect_len(accounts, 7)?;
+                //           [2] creator_history PDA (writable)
+                accounts::expect_len(accounts, 3)?;
                 let a_caller = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_creator_history = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_insurance_ata = &accounts[4];
-                let a_vault_authority = &accounts[5];
-                let a_token = &accounts[6];
 
                 accounts::expect_signer(a_caller)?;
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_creator_history)?;
-                accounts::expect_writable(a_vault)?;
-                accounts::expect_writable(a_insurance_ata)?;
-                verify_token_program(a_token)?;
 
-                let slab_data = state::slab_data_mut(a_slab)?;
+                let mut slab_data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &slab_data)?;
                 require_initialized(&slab_data)?;
 
@@ -13330,17 +13323,6 @@ pub mod processor {
                 if *a_creator_history.key != expected_pda {
                     return Err(ProgramError::InvalidSeeds);
                 }
-
-                // Verify vault
-                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                accounts::expect_key(a_vault_authority, &auth)?;
 
                 // Check evaluation period has passed
                 let clock = solana_program::clock::Clock::get()?;
@@ -13382,65 +13364,36 @@ pub mod processor {
                             crate::creator_history::compute_slash(vault_balance);
 
                         if slash_amount > 0 {
-                            // Convert slash to base tokens
-                            let base_slash = crate::units::units_to_base_checked(
+                            // Internal accounting: move from vault to insurance fund.
+                            // Tokens stay in the same SPL vault account — only the
+                            // engine's internal ledger changes. This eliminates the
+                            // unvalidated insurance_ata vulnerability (issue #1014).
+                            drop(hist_data);
+                            let engine = zc::engine_mut(&mut slab_data)?;
+                            engine.vault = percolator::U128::new(
+                                engine.vault.get().saturating_sub(slash_amount as u128),
+                            );
+                            engine.insurance_fund.balance = percolator::U128::new(
+                                engine
+                                    .insurance_fund
+                                    .balance
+                                    .get()
+                                    .saturating_add(slash_amount as u128),
+                            );
+                            drop(slab_data);
+
+                            // Re-borrow for history write
+                            let mut hist_data = a_creator_history
+                                .try_borrow_mut_data()
+                                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                            crate::creator_history::write_state(&mut hist_data, &new_hist);
+
+                            msg!(
+                                "SLASH: {} units moved vault→insurance — failed_markets={}",
                                 slash_amount,
-                                config.unit_scale,
-                            )
-                            .unwrap_or(0);
-
-                            if base_slash > 0 {
-                                // Transfer slash from vault to insurance ATA
-                                drop(hist_data);
-                                drop(slab_data);
-                                let seed1: &[u8] = b"vault";
-                                let seed2: &[u8] = a_slab.key.as_ref();
-                                let bump_arr: [u8; 1] = [vault_bump];
-                                let seed3: &[u8] = &bump_arr;
-                                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                                collateral::withdraw(
-                                    a_token,
-                                    a_vault,
-                                    a_insurance_ata,
-                                    a_vault_authority,
-                                    base_slash,
-                                    &signer_seeds,
-                                )?;
-
-                                // Update engine vault balance
-                                let mut slab_data = state::slab_data_mut(a_slab)?;
-                                let engine = zc::engine_mut(&mut slab_data)?;
-                                engine.vault = percolator::U128::new(
-                                    engine.vault.get().saturating_sub(slash_amount as u128),
-                                );
-                                // Credit insurance fund
-                                engine.insurance_fund.balance = percolator::U128::new(
-                                    engine
-                                        .insurance_fund
-                                        .balance
-                                        .get()
-                                        .saturating_add(slash_amount as u128),
-                                );
-                                drop(slab_data);
-
-                                // Re-borrow for history write
-                                let mut hist_data = a_creator_history
-                                    .try_borrow_mut_data()
-                                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                                if let Some(_) = crate::creator_history::read_state(&hist_data) {
-                                    crate::creator_history::write_state(&mut hist_data, &new_hist);
-                                }
-
-                                msg!(
-                                    "SLASH: transferred {} base tokens to insurance — failed_markets={}",
-                                    base_slash,
-                                    new_hist.failed_markets
-                                );
-                                // Early return since we already wrote hist
-                                return Ok(());
-                            }
+                                new_hist.failed_markets
+                            );
+                            return Ok(());
                         }
 
                         msg!(
