@@ -15897,6 +15897,141 @@ mod oracle_phase_tests {
         assert_eq!(phase, 0, "legacy market must NOT auto-promote");
         assert!(!trans);
     }
+
+    // ── PERC-642: phase2_delta_slots correctness on Phase 2 entry ──────────────
+    //
+    // Security MEDIUM: if AdvanceOraclePhase does not call set_phase2_delta_slots
+    // on Phase 1→2 transition, phase2_start collapses to market_created_slot and
+    // Phase 3 can be promoted 14d after market CREATION instead of 14d after
+    // Phase 2 ENTRY.  These tests prove the invariant end-to-end.
+
+    /// Verify that the delta recorded at Phase 2 entry is non-zero and that it
+    /// anchors Phase 3 promotion to Phase 2 entry time, not creation time.
+    #[test]
+    fn test_phase2_delta_slots_set_correctly_on_phase2_entry() {
+        // Market created at slot 1_000_000; Phase 2 enters exactly at the 72-hour
+        // (PHASE1_MIN_SLOTS) threshold.
+        let market_created_slot = 1_000_000u64;
+        let phase2_entry_slot = market_created_slot + PHASE1_MIN_SLOTS;
+
+        // Confirm transition fires.
+        let (new_phase, transitioned) =
+            check_phase_transition(phase2_entry_slot, market_created_slot, 0, 0, 0, false);
+        assert_eq!(new_phase, ORACLE_PHASE_GROWING);
+        assert!(transitioned);
+
+        // Replicate the processor: compute delta and store it.
+        let delta = phase2_entry_slot.saturating_sub(market_created_slot) as u32;
+        assert!(
+            delta > 0,
+            "delta must be non-zero; zero would collapse phase2_start to creation"
+        );
+        assert_eq!(delta, PHASE1_MIN_SLOTS as u32);
+
+        let mut config = MarketConfig::zeroed();
+        config.market_created_slot = market_created_slot;
+        set_oracle_phase(&mut config, new_phase);
+        set_phase2_delta_slots(&mut config, delta);
+
+        // phase2_start must equal the ENTRY slot, not the creation slot.
+        let stored_delta = get_phase2_delta_slots(&config);
+        let phase2_start = market_created_slot.saturating_add(stored_delta as u64);
+        assert_eq!(
+            phase2_start, phase2_entry_slot,
+            "Phase 3 timer must begin at Phase 2 entry, not at market creation"
+        );
+
+        // Phase 3 must NOT fire until PHASE2_MATURITY_SLOTS after Phase 2 entry.
+        let (phase, trans) = check_phase_transition(
+            phase2_start + PHASE2_MATURITY_SLOTS - 1,
+            market_created_slot,
+            ORACLE_PHASE_GROWING,
+            0,
+            stored_delta,
+            false,
+        );
+        assert_eq!(phase, ORACLE_PHASE_GROWING, "premature Phase 3 promotion");
+        assert!(!trans);
+
+        // Phase 3 fires exactly at maturity.
+        let (phase, trans) = check_phase_transition(
+            phase2_start + PHASE2_MATURITY_SLOTS,
+            market_created_slot,
+            ORACLE_PHASE_GROWING,
+            0,
+            stored_delta,
+            false,
+        );
+        assert_eq!(phase, ORACLE_PHASE_MATURE);
+        assert!(trans);
+    }
+
+    /// Show the exploit that would occur if phase2_delta_slots were left at 0:
+    /// a market that just entered Phase 2 (with only PHASE1_MIN_SLOTS elapsed)
+    /// would immediately be eligible for Phase 3 if PHASE2_MATURITY_SLOTS <=
+    /// total elapsed since creation.
+    #[test]
+    fn test_zero_phase2_delta_causes_premature_phase3() {
+        // Imagine a market with Phase 1 lasting exactly PHASE1_MIN_SLOTS.
+        // Total elapsed = PHASE1_MIN_SLOTS + PHASE2_MATURITY_SLOTS.
+        // With delta=0 the Phase 3 clock is market_created_slot + 0, so the entire
+        // elapsed time counts toward Phase 2 maturity.
+        let market_created_slot = 1_000_000u64;
+        let phase2_entry_slot = market_created_slot + PHASE1_MIN_SLOTS;
+
+        // A slot just past combined Phase 1 + Phase 2 maturity duration.
+        let exploit_slot = phase2_entry_slot + PHASE2_MATURITY_SLOTS;
+
+        // With bug: delta=0 → phase2_start = market_created_slot
+        //   elapsed_since_phase2 = exploit_slot - market_created_slot
+        //                        = PHASE1_MIN_SLOTS + PHASE2_MATURITY_SLOTS >= PHASE2_MATURITY_SLOTS
+        //   → Phase 3 fires (WRONG).
+        let (phase_bug, trans_bug) = check_phase_transition(
+            exploit_slot,
+            market_created_slot,
+            ORACLE_PHASE_GROWING,
+            0,
+            0, // bug: delta not set
+            false,
+        );
+        assert_eq!(
+            phase_bug, ORACLE_PHASE_MATURE,
+            "confirms the exploit scenario"
+        );
+        assert!(trans_bug, "confirms premature Phase 3 with zero delta");
+
+        // With fix: delta=PHASE1_MIN_SLOTS → phase2_start = phase2_entry_slot
+        //   elapsed_since_phase2 = PHASE2_MATURITY_SLOTS → exactly at boundary, fires.
+        let correct_delta = PHASE1_MIN_SLOTS as u32;
+        let (phase_fix, trans_fix) = check_phase_transition(
+            exploit_slot,
+            market_created_slot,
+            ORACLE_PHASE_GROWING,
+            0,
+            correct_delta,
+            false,
+        );
+        assert_eq!(
+            phase_fix, ORACLE_PHASE_MATURE,
+            "with correct delta, Phase 3 fires at expected time (not prematurely)"
+        );
+        assert!(trans_fix);
+
+        // One slot BEFORE the threshold: must still be Phase 2 with correct delta.
+        let (phase_early, trans_early) = check_phase_transition(
+            exploit_slot - 1,
+            market_created_slot,
+            ORACLE_PHASE_GROWING,
+            0,
+            correct_delta,
+            false,
+        );
+        assert_eq!(
+            phase_early, ORACLE_PHASE_GROWING,
+            "must not promote before maturity"
+        );
+        assert!(!trans_early);
+    }
 }
 
 #[cfg(kani)]
