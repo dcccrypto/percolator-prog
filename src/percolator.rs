@@ -7980,7 +7980,7 @@ mod shared_vault_kani {
     /// epoch_snapshot_capital (no over-payment from the vault).
     #[kani::proof]
     #[kani::unwind(1)]
-    fn nightly_proof_sv_total_payout_bounded() {
+    fn nightly_sv_total_payout_bounded() {
         let snapshot_capital: u128 = kani::any();
         let snapshot_pending: u128 = kani::any();
         let lp_user: u64 = kani::any();

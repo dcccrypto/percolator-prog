@@ -89,6 +89,7 @@ jobs:
     #   nightly_cb_ema_update_weighted_average           (~>45m — symbolic u128 mul oracle*alpha + prev*(1e6-alpha) exhausts SAT budget; confirmed timeout in CI)
     #   nightly_lp_collateral_value_never_exceeds_raw_share (~45m+ — u128 mul/div SAT-hard LP collateral; was nightly_proof_lp_collateral_value_never_exceeds_raw_share, dropped proof_ substring to avoid CI filter match)
     #   nightly_fee_mult_monotonically_increases_with_utilization (~slow — was nightly_proof_fee_mult_monotonically_increases_with_utilization, dropped proof_ substring)
+    #   nightly_sv_total_payout_bounded                  (~67min+ — u128 mul/div proportional withdrawal SAT-hard; was nightly_proof_sv_total_payout_bounded, dropped proof_ substring to avoid CI --harness proof_ filter match)
     # All remaining kani_*, proof_*, and inductive_* harnesses run here.
     # As of Mar 2026, the full fast harness suite takes ~55-60min with --jobs 4
     # after PERC-628 elastic-vault and PERC-642 delta-slot additions.
