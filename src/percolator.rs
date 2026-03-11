@@ -6798,6 +6798,7 @@ mod shared_vault_kani {
 
     /// Exposure cap: if check_exposure_cap passes, allocation <= max % of total.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_exposure_cap_bounded() {
         let total: u128 = kani::any();
         let alloc: u128 = kani::any();
@@ -6812,6 +6813,7 @@ mod shared_vault_kani {
 
     /// Available for allocation never exceeds total capital.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_available_bounded() {
         let total: u128 = kani::any();
         let allocated: u128 = kani::any();
@@ -6821,6 +6823,7 @@ mod shared_vault_kani {
 
     /// Proportional withdrawal is fair: result <= request.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_proportional_bounded() {
         let req: u64 = kani::any();
         let total_pending: u128 = kani::any();
@@ -6833,6 +6836,7 @@ mod shared_vault_kani {
 
     /// Epoch monotonically increases with slot.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_epoch_monotone() {
         let slot_a: u64 = kani::any();
         let slot_b: u64 = kani::any();
@@ -6850,6 +6854,7 @@ mod shared_vault_kani {
 
     /// Queue withdrawal monotonically increases pending.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_queue_monotone() {
         let pending: u128 = kani::any();
         let amount: u64 = kani::any();
@@ -6859,6 +6864,7 @@ mod shared_vault_kani {
 
     /// Max single market allocation never exceeds total capital.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_max_alloc_bounded() {
         let total: u128 = kani::any();
         let max_bps: u16 = kani::any();
