@@ -6797,9 +6797,11 @@ mod shared_vault_kani {
     use crate::shared_vault::*;
 
     /// Exposure cap: if check_exposure_cap passes, allocation <= max % of total.
+    /// Renamed to nightly_sv_* — two u128 saturating_mul calls are SAT-hard even with
+    /// bounded assumes; timed out at 45min in CI (#107). Runs in nightly.yml instead.
     #[kani::proof]
     #[kani::unwind(1)]
-    fn proof_exposure_cap_bounded() {
+    fn nightly_sv_exposure_cap_bounded() {
         let total: u128 = kani::any();
         let alloc: u128 = kani::any();
         let max_bps: u16 = kani::any();
@@ -6812,6 +6814,7 @@ mod shared_vault_kani {
     }
 
     /// Available for allocation never exceeds total capital.
+    /// Fast (saturating_sub only) — kept in PR CI with proof_ prefix.
     #[kani::proof]
     #[kani::unwind(1)]
     fn proof_available_bounded() {
@@ -6822,9 +6825,11 @@ mod shared_vault_kani {
     }
 
     /// Proportional withdrawal is fair: result <= request.
+    /// Renamed to nightly_sv_* — symbolic u64×u128 mul + u128 division is SAT-hard;
+    /// timed out at 45min in CI (#107). Runs in nightly.yml instead.
     #[kani::proof]
     #[kani::unwind(1)]
-    fn proof_proportional_bounded() {
+    fn nightly_sv_proportional_bounded() {
         let req: u64 = kani::any();
         let total_pending: u128 = kani::any();
         let available: u128 = kani::any();
@@ -6835,9 +6840,11 @@ mod shared_vault_kani {
     }
 
     /// Epoch monotonically increases with slot.
+    /// Renamed to nightly_sv_* — symbolic u64 division is SAT-hard;
+    /// timed out at 45min in CI (#107). Runs in nightly.yml instead.
     #[kani::proof]
     #[kani::unwind(1)]
-    fn proof_epoch_monotone() {
+    fn nightly_sv_epoch_monotone() {
         let slot_a: u64 = kani::any();
         let slot_b: u64 = kani::any();
         let genesis: u64 = kani::any();
@@ -6853,6 +6860,7 @@ mod shared_vault_kani {
     }
 
     /// Queue withdrawal monotonically increases pending.
+    /// Fast (saturating_add only) — kept in PR CI with proof_ prefix.
     #[kani::proof]
     #[kani::unwind(1)]
     fn proof_queue_monotone() {
@@ -6863,9 +6871,11 @@ mod shared_vault_kani {
     }
 
     /// Max single market allocation never exceeds total capital.
+    /// Renamed to nightly_sv_* — saturating_mul + u128 division is SAT-hard;
+    /// timed out at 45min in CI (#107). Runs in nightly.yml instead.
     #[kani::proof]
     #[kani::unwind(1)]
-    fn proof_max_alloc_bounded() {
+    fn nightly_sv_max_alloc_bounded() {
         let total: u128 = kani::any();
         let max_bps: u16 = kani::any();
         kani::assume(max_bps <= 10_000);

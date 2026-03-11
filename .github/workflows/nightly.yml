@@ -43,5 +43,9 @@ jobs:
           # nightly_dust_single_deposit_conservation (~19min+ — symbolic u64×u128 mul SAT),
           # nightly_dust_two_deposits_conservation (~24min — three-variable u128 mul SAT)
           # nightly_proof_loyalty_applies_only_to_fee_income (~35min+ — symbolic u64 delta_epochs SAT)
+          # nightly_sv_exposure_cap_bounded (~slow — two u128 saturating_mul SAT-hard, PERC-628)
+          # nightly_sv_proportional_bounded (~slow — u64×u128 mul + u128 division SAT-hard, PERC-628)
+          # nightly_sv_epoch_monotone (~slow — symbolic u64 division SAT-hard, PERC-628)
+          # nightly_sv_max_alloc_bounded (~slow — u128 mul + division SAT-hard, PERC-628)
           args: --tests --output-format terse --jobs 2 --harness nightly_
         timeout-minutes: 295
