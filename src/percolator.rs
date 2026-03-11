@@ -2416,9 +2416,30 @@ pub mod ix {
             user_idx_a: u16,
             user_idx_b: u16,
         },
-        /// PERC-629: Slash underperforming market's creation deposit.
-        /// Permissionless crank — anyone can trigger after evaluation period.
+        /// PERC-623: Anyone can top up a market's keeper fund by transferring
+        /// lamports. The amount is read from instruction data (u64).
+        TopUpKeeperFund {
+            amount: u64,
+        },
+        /// PERC-629: Slash an underperforming market's creation deposit (tag 58).
         SlashCreationDeposit,
+        /// PERC-628: Initialize the global shared vault.
+        InitSharedVault {
+            epoch_duration_slots: u64,
+            max_market_exposure_bps: u16,
+        },
+        /// PERC-628: Allocate virtual liquidity to a market.
+        AllocateMarket {
+            amount: u128,
+        },
+        /// PERC-628: Queue a withdrawal for the current epoch.
+        QueueWithdrawalSV {
+            lp_amount: u64,
+        },
+        /// PERC-628: Claim a queued withdrawal after epoch elapses.
+        ClaimEpochWithdrawal,
+        /// PERC-628: Advance the shared vault epoch (permissionless crank).
+        AdvanceEpoch,
     }
 
     impl Instruction {
@@ -2895,7 +2916,29 @@ pub mod ix {
                         user_idx_b,
                     })
                 }
+                TAG_TOPUP_KEEPER_FUND => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::TopUpKeeperFund { amount })
+                }
                 TAG_SLASH_CREATION_DEPOSIT => Ok(Instruction::SlashCreationDeposit),
+                TAG_INIT_SHARED_VAULT => {
+                    let epoch_duration_slots = read_u64(&mut rest)?;
+                    let max_market_exposure_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::InitSharedVault {
+                        epoch_duration_slots,
+                        max_market_exposure_bps,
+                    })
+                }
+                TAG_ALLOCATE_MARKET => {
+                    let amount = read_u128(&mut rest)?;
+                    Ok(Instruction::AllocateMarket { amount })
+                }
+                TAG_QUEUE_WITHDRAWAL_SV => {
+                    let lp_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::QueueWithdrawalSV { lp_amount })
+                }
+                TAG_CLAIM_EPOCH_WITHDRAWAL => Ok(Instruction::ClaimEpochWithdrawal),
+                TAG_ADVANCE_EPOCH => Ok(Instruction::AdvanceEpoch),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -13396,6 +13439,144 @@ pub mod processor {
 
                             msg!(
                                 "SLASH: {} units moved vault→insurance — failed_markets={}",
+                                slash_amount,
+                                new_hist.failed_markets
+                            );
+                            return Ok(());
+                        }
+
+                        msg!(
+                            "SLASH: market failed OI threshold — slash=0 (no vault balance) failed_markets={}",
+                            new_hist.failed_markets
+                        );
+                    }
+
+                    crate::creator_history::write_state(&mut hist_data, &new_hist);
+                } else {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+
+            // PERC-629: Slash underperforming market's creation deposit.
+            // Permissionless — anyone can trigger after the evaluation period.
+            //
+            // Security: insurance fund tokens are physically held in the market vault
+            // (same token account as LP capital). The slash is a pure accounting
+            // operation: vault -= slash, insurance_fund.balance += slash. No external
+            // CPI transfer is performed — doing so would allow a caller to redirect
+            // slash tokens to an attacker-controlled ATA (SECURITY HIGH #1014).
+            //
+            // accounts: [0] caller (signer), [1] slab (writable),
+            //           [2] creator_history PDA (writable)
+            Instruction::SlashCreationDeposit => {
+                // Permissionless slash crank. Evaluates a market after 30 days.
+                // accounts: [0] caller (signer), [1] slab (writable),
+                //           [2] creator_history PDA (writable)
+                accounts::expect_len(accounts, 3)?;
+                let a_caller = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_creator_history = &accounts[2];
+
+                accounts::expect_signer(a_caller)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_creator_history)?;
+
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                let header = state::read_header(&slab_data);
+                let config = state::read_config(&slab_data);
+
+                // Use admin as creator. The current admin is responsible for
+                // the market's health regardless of admin transfers.
+                let admin_key = Pubkey::new_from_array(header.admin);
+                let (expected_pda, _) = Pubkey::find_program_address(
+                    &[
+                        crate::creator_history::CREATOR_HISTORY_SEED,
+                        admin_key.as_ref(),
+                    ],
+                    program_id,
+                );
+                if *a_creator_history.key != expected_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // No external vault account needed — slash is pure accounting
+                // (tokens stay in the market vault; only sub-balances change).
+
+                // Check evaluation period has passed
+                let clock = solana_program::clock::Clock::get()?;
+                let created_slot = config.market_created_slot;
+                if clock.slot
+                    < created_slot.saturating_add(crate::creator_history::EVALUATION_PERIOD_SLOTS)
+                {
+                    msg!(
+                        "SLASH: evaluation period not yet elapsed (created={}, now={}, need={})",
+                        created_slot,
+                        clock.slot,
+                        created_slot
+                            .saturating_add(crate::creator_history::EVALUATION_PERIOD_SLOTS)
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Check OI vs threshold
+                let engine = zc::engine_ref(&slab_data)?;
+                let current_oi = engine.total_open_interest.get() as u64;
+                let vault_balance = engine.vault.get() as u64;
+
+                let mut hist_data = a_creator_history
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+
+                if let Some(hist) = crate::creator_history::read_state(&hist_data) {
+                    let mut new_hist = *hist;
+
+                    if crate::creator_history::oi_threshold_met(vault_balance, current_oi) {
+                        new_hist.successful_markets = new_hist.successful_markets.saturating_add(1);
+                        msg!(
+                            "SLASH: market passed OI threshold — successful_markets={}",
+                            new_hist.successful_markets
+                        );
+                    } else {
+                        new_hist.failed_markets = new_hist.failed_markets.saturating_add(1);
+                        let (slash_amount, _remainder) =
+                            crate::creator_history::compute_slash(vault_balance);
+
+                        if slash_amount > 0 {
+                            // SECURITY FIX (#1014): Insurance fund tokens are physically stored
+                            // in the market vault. The slash is a pure accounting operation —
+                            // move `slash_amount` units from LP capital to insurance sub-balance.
+                            // No SPL token transfer is performed; no caller-supplied ATA is
+                            // accepted, eliminating the redirect-to-attacker attack vector.
+                            drop(hist_data);
+
+                            {
+                                let mut slab_data = state::slab_data_mut(a_slab)?;
+                                let engine = zc::engine_mut(&mut slab_data)?;
+                                engine.vault = percolator::U128::new(
+                                    engine.vault.get().saturating_sub(slash_amount as u128),
+                                );
+                                engine.insurance_fund.balance = percolator::U128::new(
+                                    engine
+                                        .insurance_fund
+                                        .balance
+                                        .get()
+                                        .saturating_add(slash_amount as u128),
+                                );
+                            }
+
+                            // Write history update
+                            let mut hist_data = a_creator_history
+                                .try_borrow_mut_data()
+                                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                            if let Some(_) = crate::creator_history::read_state(&hist_data) {
+                                crate::creator_history::write_state(&mut hist_data, &new_hist);
+                            }
+
+                            msg!(
+                                "SLASH: {} units reclassified vault→insurance — failed_markets={}",
                                 slash_amount,
                                 new_hist.failed_markets
                             );
