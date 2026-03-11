@@ -7378,7 +7378,6 @@ mod creator_history_kani {
     }
 }
 
-
 // 9. mod processor
 pub mod processor {
     use crate::{
@@ -14413,8 +14412,8 @@ pub mod processor {
                     crate::keeper_fund::write_state(&mut fund_data, &new_state);
 
                     // #1015: Only unpause if market was auto-paused due to keeper fund
-                    // depletion (depleted_pause == 1). Never clear admin-initiated pauses.
-                    if new_state.depleted_pause == 1
+                    // depletion (depleted_pause != 0). Never clear admin-initiated pauses.
+                    if new_state.depleted_pause != 0
                         && !crate::keeper_fund::is_depleted(new_state.balance)
                     {
                         new_state.depleted_pause = 0;
