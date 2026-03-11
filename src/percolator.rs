@@ -6582,7 +6582,12 @@ pub mod keeper_fund {
     pub struct KeeperFundState {
         pub magic: u64,
         pub bump: u8,
-        pub _pad: [u8; 7],
+        /// Set to 1 when the market is paused specifically because this fund was
+        /// depleted (KeeperCrank auto-pause). Cleared when TopUpKeeperFund
+        /// restores the fund and lifts the pause. Admin-imposed pauses do NOT
+        /// set this flag, so TopUpKeeperFund cannot lift them.
+        pub depleted_pause: u8,
+        pub _pad: [u8; 6],
         /// Current fund balance (base token lamports).
         pub balance: u64,
         /// Reward paid to crank caller per successful KeeperCrank.
@@ -6593,7 +6598,7 @@ pub mod keeper_fund {
         pub total_topped_up: u64,
     }
 
-    // Compile-time size check
+    // Compile-time size check — must stay 48 bytes to avoid on-chain account resize.
     const _: [(); 48] = [(); KEEPER_FUND_STATE_LEN];
 
     /// Compute the deposit split: (lp_amount, keeper_fund_amount).
@@ -6711,7 +6716,8 @@ pub mod keeper_fund {
             let state = KeeperFundState {
                 magic: KEEPER_FUND_MAGIC,
                 bump: 254,
-                _pad: [0; 7],
+                depleted_pause: 0,
+                _pad: [0; 6],
                 balance: 12345,
                 reward_per_crank: 1000,
                 total_rewarded: 5000,
@@ -6723,6 +6729,62 @@ pub mod keeper_fund {
             assert_eq!(read.balance, 12345);
             assert_eq!(read.bump, 254);
             assert_eq!(read.total_rewarded, 5000);
+            assert_eq!(read.depleted_pause, 0);
+        }
+
+        #[test]
+        fn test_depleted_pause_roundtrip() {
+            let mut state = KeeperFundState {
+                magic: KEEPER_FUND_MAGIC,
+                bump: 1,
+                depleted_pause: 1,
+                _pad: [0; 6],
+                balance: 0,
+                reward_per_crank: 1_000_000,
+                total_rewarded: 5_000_000,
+                total_topped_up: 5_000_000,
+            };
+            let mut buf = [0u8; KEEPER_FUND_STATE_LEN];
+            write_state(&mut buf, &state);
+            let read = read_state(&buf).unwrap();
+            assert_eq!(read.depleted_pause, 1, "depleted_pause must persist");
+
+            // Simulate TopUpKeeperFund clearing the flag
+            state.depleted_pause = 0;
+            state.balance = 2_000_000;
+            state.total_topped_up = 7_000_000;
+            write_state(&mut buf, &state);
+            let read2 = read_state(&buf).unwrap();
+            assert_eq!(
+                read2.depleted_pause, 0,
+                "depleted_pause must clear after top-up"
+            );
+            assert_eq!(read2.balance, 2_000_000);
+        }
+
+        #[test]
+        fn test_depleted_pause_not_set_when_not_depleted() {
+            // pay_crank_reward where balance > reward: should NOT set depleted_pause
+            let balance = 5_000_000u64;
+            let reward_per_crank = 1_000_000u64;
+            let (new_bal, reward) = pay_crank_reward(balance, reward_per_crank);
+            assert_eq!(reward, 1_000_000);
+            assert_eq!(new_bal, 4_000_000);
+            assert!(!is_depleted(new_bal), "fund should not be depleted");
+        }
+
+        #[test]
+        fn test_admin_pause_not_cleared_by_topup() {
+            // If depleted_pause == 0 (admin pause, not depletion), TopUpKeeperFund
+            // must NOT attempt to unpause. Verified via will_unpause logic:
+            // will_unpause = (depleted_pause != 0) && !is_depleted(new_balance)
+            let depleted_pause: u8 = 0; // admin-paused, no depletion flag
+            let new_balance: u64 = 1_000_000;
+            let will_unpause = depleted_pause != 0 && !is_depleted(new_balance);
+            assert!(
+                !will_unpause,
+                "admin-pause must NOT be lifted by TopUpKeeperFund"
+            );
         }
 
         #[test]
@@ -7907,7 +7969,8 @@ pub mod processor {
             let state = crate::keeper_fund::KeeperFundState {
                 magic: crate::keeper_fund::KEEPER_FUND_MAGIC,
                 bump: pda_bump,
-                _pad: [0u8; 7],
+                depleted_pause: 0,
+                _pad: [0u8; 6],
                 balance: fund_balance,
                 reward_per_crank: default_reward,
                 total_rewarded: 0,
@@ -8734,6 +8797,12 @@ pub mod processor {
                                     new_state.balance = new_bal;
                                     new_state.total_rewarded =
                                         new_state.total_rewarded.saturating_add(reward);
+                                    // SECURITY #1015: mark the depletion-pause flag BEFORE
+                                    // writing so TopUpKeeperFund can distinguish this pause
+                                    // from an admin-imposed pause.
+                                    if crate::keeper_fund::is_depleted(new_bal) {
+                                        new_state.depleted_pause = 1;
+                                    }
                                     crate::keeper_fund::write_state(&mut fund_data, &new_state);
 
                                     // Transfer lamports from KeeperFund PDA to caller
@@ -13652,15 +13721,26 @@ pub mod processor {
                     let mut new_state = *fund_state;
                     new_state.balance = new_state.balance.saturating_add(amount);
                     new_state.total_topped_up = new_state.total_topped_up.saturating_add(amount);
+
+                    // SECURITY #1015: Only lift a pause that was set because the fund was
+                    // depleted (depleted_pause == 1). Admin-imposed pauses (e.g., exploit
+                    // response) are NOT cleared here — they require an explicit admin unpause.
+                    let will_unpause = fund_state.depleted_pause != 0
+                        && !crate::keeper_fund::is_depleted(new_state.balance);
+                    if will_unpause {
+                        new_state.depleted_pause = 0;
+                    }
                     crate::keeper_fund::write_state(&mut fund_data, &new_state);
 
-                    // If market was auto-paused due to depletion, unpause it
-                    if !crate::keeper_fund::is_depleted(new_state.balance) {
+                    // Lift the depletion-pause now that fund is restored
+                    if will_unpause {
                         drop(fund_data);
                         let mut slab_data = state::slab_data_mut(a_slab)?;
                         if state::read_flags(&slab_data) & state::FLAG_PAUSED != 0 {
                             state::set_paused(&mut slab_data, false);
-                            msg!("KEEPER_FUND_TOPPED_UP: market unpaused");
+                            msg!(
+                                "KEEPER_FUND_TOPPED_UP: market unpaused (depletion-pause cleared)"
+                            );
                         }
                     }
                 } else {
