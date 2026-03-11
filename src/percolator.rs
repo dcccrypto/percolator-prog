@@ -6664,6 +6664,7 @@ mod creator_lock_kani {
 
     /// Lock never expires early: if current_slot < start + duration, not expired.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_lock_never_expires_early() {
         let start: u64 = kani::any();
         let duration: u64 = kani::any();
@@ -6677,6 +6678,7 @@ mod creator_lock_kani {
 
     /// Max withdrawable never exceeds total LP.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_max_withdrawable_bounded() {
         let total: u64 = kani::any();
         let locked: u64 = kani::any();
@@ -6687,6 +6689,7 @@ mod creator_lock_kani {
 
     /// Max withdrawable == 0 when fully locked and not expired.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_fully_locked_zero_withdraw() {
         let total: u64 = kani::any();
         let locked: u64 = kani::any();
@@ -6697,6 +6700,7 @@ mod creator_lock_kani {
 
     /// Extraction check is monotone: more extraction → more likely to trigger.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_extraction_monotone() {
         let extracted_a: u64 = kani::any();
         let extracted_b: u64 = kani::any();
@@ -6711,6 +6715,7 @@ mod creator_lock_kani {
 
     /// Fee redirect conservation: to_creator + to_insurance == fee_amount.
     #[kani::proof]
+    #[kani::unwind(1)]
     fn proof_fee_redirect_conservation() {
         let fee: u64 = kani::any();
         let active: bool = kani::any();
