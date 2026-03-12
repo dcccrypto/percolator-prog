@@ -436,8 +436,9 @@ Recovery is “by design impossible” (this is a one-way governance lock).
 # unit tests / program-test style
 cargo test
 
-# Kani harnesses (requires kani toolchain)
-cargo kani --tests
+# Kani harnesses (local-only — not run in CI; see .github/workflows/kani-manual.yml for on-demand runs)
+# One-time setup: cargo install --locked kani-verifier && cargo kani setup
+cargo kani --tests --harness proof_
 ```
 
 ---
