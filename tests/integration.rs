@@ -5008,8 +5008,13 @@ impl TradeCpiTestEnv {
         if epoch_snap != epoch_side { return 0; }
 
         let abs_basis = if is_negative { (basis_lo as u128).wrapping_neg() } else { basis_lo as u128 };
-        let effective_q = abs_basis.checked_mul(a_side).unwrap_or(u128::MAX) / a_basis;
-        let effective = effective_q / POS_SCALE;
+        // Compute effective position in instruction-level units (e6-denominated).
+        const SCALE_FACTOR: u128 = POS_SCALE / 1_000_000;
+        let effective = if a_side == a_basis {
+            abs_basis / SCALE_FACTOR
+        } else {
+            (abs_basis / SCALE_FACTOR).checked_mul(a_side / a_basis.max(1)).unwrap_or(u128::MAX)
+        };
         if is_negative { -(effective as i128) } else { effective as i128 }
     }
 
