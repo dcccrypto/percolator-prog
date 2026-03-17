@@ -1093,7 +1093,7 @@ fn benchmark_worst_case_scenarios() {
 
     // Scenario 8: 🔥🔥 Full 4096 sweep - worst single crank across 16 calls
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Scenario 8: 🔥🔥 Full sweep worst-case (16 cranks, 256 each)");
+    println!("Scenario 8: 🔥🔥 Full sweep worst-case (32 cranks, 128 each)");
     println!("  Testing worst single crank CU across 16-crank full sweep");
     println!("  8a: Healthy accounts with positions (no liquidations)");
     {
@@ -1548,7 +1548,7 @@ fn benchmark_worst_case_scenarios() {
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("=== SUMMARY ===");
-    println!("• Crank sweeps 256 accounts max per call (16 cranks for full 4096)");
+    println!("• Crank sweeps 128 accounts max per call (32 cranks for full 4096)");
     println!(
         "• With MAX_ACCOUNTS={}, baseline scan alone is ~194K CU",
         MAX_ACCOUNTS
