@@ -3221,7 +3221,7 @@ pub mod processor {
                     // 1. accrue_market_to updates mark to settlement price
                     // 2. touch_account_full settles mark-to-market PnL for each account
                     // 3. attach_effective_position zeros the position
-                    const BATCH_SIZE: u16 = 64;
+                    const BATCH_SIZE: u16 = 8;
                     let start = engine.crank_cursor;
                     let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
 

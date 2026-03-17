@@ -505,7 +505,7 @@ impl TestEnv {
     }
 
     fn trade(&mut self, user: &Keypair, lp: &Keypair, lp_idx: u16, user_idx: u16, size: i128) {
-        let cu_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let cu_ix = cu_ix();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -531,7 +531,7 @@ impl TestEnv {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
 
-        let cu_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let cu_ix = cu_ix();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -556,7 +556,7 @@ impl TestEnv {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
 
-        let cu_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let cu_ix = cu_ix();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -4815,7 +4815,7 @@ impl TradeCpiTestEnv {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
 
-        let cu_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let cu_ix = cu_ix();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -22422,7 +22422,8 @@ fn test_attack_set_risk_threshold_enables_trades() {
         .unwrap();
 
     // Trades still succeed (insurance_floor does not gate trades)
-    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 100_000);
+    // Use different size to avoid duplicate transaction hash
+    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 200_000);
     assert!(
         result.is_ok(),
         "Insurance floor does not gate trades in spec v10.5: {:?}",
