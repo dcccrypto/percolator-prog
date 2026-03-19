@@ -1090,6 +1090,7 @@ pub mod ix {
         KeeperCrank {
             caller_idx: u16,
             allow_panic: u8,
+            candidates: alloc::vec::Vec<u16>,
         },
         TradeNoCpi {
             lp_idx: u16,
@@ -1250,12 +1251,18 @@ pub mod ix {
                     Ok(Instruction::WithdrawCollateral { user_idx, amount })
                 }
                 5 => {
-                    // KeeperCrank
+                    // KeeperCrank — two-phase: candidates computed off-chain
                     let caller_idx = read_u16(&mut rest)?;
                     let allow_panic = read_u8(&mut rest)?;
+                    // Parse candidate list: remaining bytes are u16 account indices
+                    let mut candidates = alloc::vec::Vec::new();
+                    while rest.len() >= 2 {
+                        candidates.push(read_u16(&mut rest)?);
+                    }
                     Ok(Instruction::KeeperCrank {
                         caller_idx,
                         allow_panic,
+                        candidates,
                     })
                 }
                 6 => {
@@ -1503,6 +1510,7 @@ pub mod ix {
             liquidation_fee_cap,
             liquidation_buffer_bps,
             min_liquidation_abs,
+            min_initial_deposit: U128::ZERO,
         };
         Ok((params, insurance_floor))
     }
@@ -3173,6 +3181,7 @@ pub mod processor {
             Instruction::KeeperCrank {
                 caller_idx,
                 allow_panic,
+                candidates,
             } => {
                 use crate::constants::CRANK_NO_CALLER;
 
@@ -3225,8 +3234,6 @@ pub mod processor {
                             if eff != 0 {
                                 // Zero the position
                                 engine.attach_effective_position(idx as usize, 0i128);
-                                // Update warmup for any positive PnL
-                                engine.update_warmup_slope(idx as usize);
                             }
                         }
                     }
@@ -3360,12 +3367,16 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
+                // Set funding rate before crank (anti-retroactivity: stored rate used next interval)
+                engine.set_funding_rate_for_next_interval(effective_funding_rate);
+
+                // Two-phase crank: candidates computed off-chain, passed in instruction data
                 let _outcome = engine
                     .keeper_crank(
-                        effective_caller_idx,
                         clock.slot,
                         price,
-                        effective_funding_rate,
+                        &candidates,
+                        percolator::LIQ_BUDGET_PER_CRANK,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
@@ -4672,7 +4683,7 @@ pub mod processor {
                 let pnl = engine.accounts[user_idx as usize].pnl;
                 let capital = engine.accounts[user_idx as usize].capital.get();
                 if pnl > 0 {
-                    let haircutted = engine.effective_pos_pnl(pnl);
+                    let haircutted = engine.effective_matured_pnl(user_idx as usize);
                     engine.set_capital(user_idx as usize, capital.saturating_add(haircutted));
                     engine.set_pnl(user_idx as usize, 0i128);
                 } else if pnl < 0 {

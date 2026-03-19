@@ -28,7 +28,7 @@ use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-const SLAB_LEN: usize = 1156592; // MAX_ACCOUNTS=4096 + native 128-bit fields
+const SLAB_LEN: usize = 1156624; // MAX_ACCOUNTS=4096 + native 128-bit fields
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -181,9 +181,25 @@ fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
 }
 
 fn encode_crank_permissionless() -> Vec<u8> {
+    // Two-phase crank: pass all account indices as candidates
+    // (simulates off-chain keeper that shortlists everything)
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes()); // caller_idx = permissionless
+    data.push(0u8); // allow_panic = false
+    // Append all possible account indices as candidates
+    for i in 0..MAX_ACCOUNTS as u16 {
+        data.extend_from_slice(&i.to_le_bytes());
+    }
+    data
+}
+
+fn encode_crank_with_candidates(candidates: &[u16]) -> Vec<u8> {
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes());
-    data.push(0u8); // allow_panic = false
+    data.push(0u8);
+    for &idx in candidates {
+        data.extend_from_slice(&idx.to_le_bytes());
+    }
     data
 }
 
@@ -11215,6 +11231,9 @@ fn encode_crank_with_panic(allow_panic: u8) -> Vec<u8> {
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes()); // permissionless
     data.push(allow_panic);
+    for i in 0..MAX_ACCOUNTS as u16 {
+        data.extend_from_slice(&i.to_le_bytes());
+    }
     data
 }
 
@@ -11222,6 +11241,9 @@ fn encode_crank_self(caller_idx: u16) -> Vec<u8> {
     let mut data = vec![5u8];
     data.extend_from_slice(&caller_idx.to_le_bytes());
     data.push(0u8); // allow_panic = false
+    for i in 0..MAX_ACCOUNTS as u16 {
+        data.extend_from_slice(&i.to_le_bytes());
+    }
     data
 }
 
