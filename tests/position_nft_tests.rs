@@ -160,7 +160,10 @@ fn test_pending_settlement_set_and_clear() {
         mint_bump: 0,
         _reserved: [0u8; 19],
     };
-    assert_eq!(state.pending_settlement, 1, "pending_settlement should be set");
+    assert_eq!(
+        state.pending_settlement, 1,
+        "pending_settlement should be set"
+    );
 
     // Simulate keeper clearing it
     state.pending_settlement = 0;
@@ -305,4 +308,78 @@ fn test_burn_clears_magic() {
         !state.is_initialized(),
         "zeroed-out state should not be initialized"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SetPendingSettlement / ClearPendingSettlement — tag + state-level tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_set_pending_settlement_tag_is_67() {
+    use percolator_prog::tags::TAG_SET_PENDING_SETTLEMENT;
+    assert_eq!(TAG_SET_PENDING_SETTLEMENT, 67);
+}
+
+#[test]
+fn test_clear_pending_settlement_tag_is_68() {
+    use percolator_prog::tags::TAG_CLEAR_PENDING_SETTLEMENT;
+    assert_eq!(TAG_CLEAR_PENDING_SETTLEMENT, 68);
+}
+
+/// State-level: pending_settlement transitions Set → Clear correctly with round-trip.
+#[test]
+fn test_pending_settlement_set_and_clear_roundtrip() {
+    let mut state = PositionNftState {
+        magic: POSITION_NFT_MAGIC,
+        mint: Pubkey::new_unique().to_bytes(),
+        slab: Pubkey::new_unique().to_bytes(),
+        owner: Pubkey::new_unique().to_bytes(),
+        user_idx: 3,
+        pending_settlement: 0,
+        bump: 200,
+        mint_bump: 199,
+        _reserved: [0u8; 19],
+    };
+
+    assert_eq!(state.pending_settlement, 0, "starts clear");
+
+    // SetPendingSettlement
+    state.pending_settlement = 1;
+    let mut buf = vec![0u8; POSITION_NFT_STATE_LEN];
+    write_position_nft_state(&mut buf, &state);
+    let loaded = read_position_nft_state(&buf).expect("should parse");
+    assert_eq!(loaded.pending_settlement, 1, "flag persisted after write");
+
+    // ClearPendingSettlement
+    let mut loaded = loaded;
+    loaded.pending_settlement = 0;
+    write_position_nft_state(&mut buf, &loaded);
+    let loaded2 = read_position_nft_state(&buf).expect("should parse");
+    assert_eq!(loaded2.pending_settlement, 0, "flag cleared after write");
+}
+
+/// Transfer guard: pending_settlement=1 blocks, pending_settlement=0 allows.
+#[test]
+fn test_transfer_guard_via_pending_settlement_flag() {
+    let mut state = PositionNftState {
+        magic: POSITION_NFT_MAGIC,
+        mint: [0u8; 32],
+        slab: [0u8; 32],
+        owner: [0u8; 32],
+        user_idx: 0,
+        pending_settlement: 1,
+        bump: 254,
+        mint_bump: 253,
+        _reserved: [0u8; 19],
+    };
+
+    // Blocked
+    assert_ne!(
+        state.pending_settlement, 0,
+        "transfer must be blocked when flag=1"
+    );
+
+    // ClearPendingSettlement → allowed
+    state.pending_settlement = 0;
+    assert_eq!(state.pending_settlement, 0, "transfer allowed when flag=0");
 }

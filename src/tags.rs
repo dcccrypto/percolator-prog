@@ -141,6 +141,13 @@ pub const TAG_TRANSFER_POSITION_OWNERSHIP: u8 = 65;
 /// PERC-608: Burn Position NFT when closing a position.
 /// Called internally at end of CloseAccount.
 pub const TAG_BURN_POSITION_NFT: u8 = 66;
+/// PERC-608: Set pending_settlement flag on a PositionNft PDA (keeper-only).
+/// Keeper calls this before a transfer when funding is outstanding.
+/// Permissionless (caller_idx == u16::MAX) or caller-indexed like KeeperCrank.
+pub const TAG_SET_PENDING_SETTLEMENT: u8 = 67;
+/// PERC-608: Clear pending_settlement flag after keeper has settled funding.
+/// Called after KeeperCrank settles outstanding funding for the position.
+pub const TAG_CLEAR_PENDING_SETTLEMENT: u8 = 68;
 
 #[cfg(test)]
 mod tests {
@@ -217,6 +224,8 @@ mod tests {
             TAG_MINT_POSITION_NFT,
             TAG_TRANSFER_POSITION_OWNERSHIP,
             TAG_BURN_POSITION_NFT,
+            TAG_SET_PENDING_SETTLEMENT,
+            TAG_CLEAR_PENDING_SETTLEMENT,
         ];
 
         for i in 0..tags.len() {
@@ -297,6 +306,8 @@ mod tests {
             TAG_MINT_POSITION_NFT,
             TAG_TRANSFER_POSITION_OWNERSHIP,
             TAG_BURN_POSITION_NFT,
+            TAG_SET_PENDING_SETTLEMENT,
+            TAG_CLEAR_PENDING_SETTLEMENT,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
