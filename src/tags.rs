@@ -128,6 +128,20 @@ pub const TAG_CLAIM_EPOCH_WITHDRAWAL: u8 = 62;
 /// PERC-628: Advance the shared vault epoch (permissionless crank).
 pub const TAG_ADVANCE_EPOCH: u8 = 63;
 
+// ═══════════════════════════════════════════════════════════════
+// Position NFT instructions (PERC-608)
+// ═══════════════════════════════════════════════════════════════
+/// PERC-608: Mint a Position NFT (Token-2022 + TokenMetadata extension) for an open position.
+pub const TAG_MINT_POSITION_NFT: u8 = 64;
+/// PERC-608: Transfer position ownership via the NFT.
+pub const TAG_TRANSFER_POSITION_OWNERSHIP: u8 = 65;
+/// PERC-608: Burn the Position NFT when a position is closed.
+pub const TAG_BURN_POSITION_NFT: u8 = 66;
+/// PERC-608: Keeper sets pending_settlement flag before funding transfer.
+pub const TAG_SET_PENDING_SETTLEMENT: u8 = 67;
+/// PERC-608: Keeper clears pending_settlement flag after settlement crank.
+pub const TAG_CLEAR_PENDING_SETTLEMENT: u8 = 68;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +214,11 @@ mod tests {
             TAG_QUEUE_WITHDRAWAL_SV,
             TAG_CLAIM_EPOCH_WITHDRAWAL,
             TAG_ADVANCE_EPOCH,
+            TAG_MINT_POSITION_NFT,
+            TAG_TRANSFER_POSITION_OWNERSHIP,
+            TAG_BURN_POSITION_NFT,
+            TAG_SET_PENDING_SETTLEMENT,
+            TAG_CLEAR_PENDING_SETTLEMENT,
         ];
 
         for i in 0..tags.len() {
@@ -277,6 +296,11 @@ mod tests {
             TAG_QUEUE_WITHDRAWAL_SV,
             TAG_CLAIM_EPOCH_WITHDRAWAL,
             TAG_ADVANCE_EPOCH,
+            TAG_MINT_POSITION_NFT,
+            TAG_TRANSFER_POSITION_OWNERSHIP,
+            TAG_BURN_POSITION_NFT,
+            TAG_SET_PENDING_SETTLEMENT,
+            TAG_CLEAR_PENDING_SETTLEMENT,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
