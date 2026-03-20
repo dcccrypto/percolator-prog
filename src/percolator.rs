@@ -2393,7 +2393,10 @@ pub mod ix {
         ReclaimSlabRent,
         /// PERC-608: Transfer position ownership. Called by percolator-nft TransferHook.
         /// Changes account[user_idx].owner to new_owner.
-        TransferPositionOwnership { user_idx: u16, new_owner: [u8; 32] },
+        TransferPositionOwnership {
+            user_idx: u16,
+            new_owner: [u8; 32],
+        },
         /// PERC-622: Advance oracle phase (permissionless crank).
         AdvanceOraclePhase,
 
@@ -2984,7 +2987,10 @@ pub mod ix {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     new_owner.copy_from_slice(&rest[..32]);
-                    Ok(Instruction::TransferPositionOwnership { user_idx, new_owner })
+                    Ok(Instruction::TransferPositionOwnership {
+                        user_idx,
+                        new_owner,
+                    })
                 }
                 TAG_ADVANCE_ORACLE_PHASE => Ok(Instruction::AdvanceOraclePhase),
                 TAG_AUDIT_CRANK => Ok(Instruction::AuditCrank),
@@ -14611,10 +14617,13 @@ pub mod processor {
             // PERC-608: Transfer Position Ownership (tag 64)
             // Called by percolator-nft TransferHook via CPI.
             // ═══════════════════════════════════════════════════════════════
-            Instruction::TransferPositionOwnership { user_idx, new_owner } => {
+            Instruction::TransferPositionOwnership {
+                user_idx,
+                new_owner,
+            } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_caller = &accounts[0]; // NFT program mint authority PDA (signer)
-                let a_slab = &accounts[1];   // slab (writable)
+                let a_slab = &accounts[1]; // slab (writable)
 
                 accounts::expect_signer(a_caller)?;
                 accounts::expect_writable(a_slab)?;
@@ -14632,14 +14641,18 @@ pub mod processor {
 
                 // Verify magic.
                 let magic = u64::from_le_bytes(
-                    slab_data[0..8].try_into().map_err(|_| PercolatorError::InvalidMagic)?,
+                    slab_data[0..8]
+                        .try_into()
+                        .map_err(|_| PercolatorError::InvalidMagic)?,
                 );
                 if magic != MAGIC {
                     return Err(PercolatorError::InvalidMagic.into());
                 }
 
                 let max_accounts = u16::from_le_bytes(
-                    slab_data[8..10].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                    slab_data[8..10]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
                 );
 
                 if user_idx >= max_accounts {
@@ -14650,7 +14663,7 @@ pub mod processor {
                 // V0: engine_off=480, bitmap_off=608, acct_size=240
                 // V1D: engine_off=424, bitmap_off=1048, acct_size=240
                 let (bitmap_off, acct_size) = if slab_data.len() > 100_000 {
-                    (608usize, 240usize)  // V0
+                    (608usize, 240usize) // V0
                 } else {
                     (1048usize, 240usize) // V1D
                 };
