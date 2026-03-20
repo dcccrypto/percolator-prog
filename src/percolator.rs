@@ -14621,9 +14621,10 @@ pub mod processor {
                 user_idx,
                 new_owner,
             } => {
-                accounts::expect_len(accounts, 2)?;
+                accounts::expect_len(accounts, 3)?;
                 let a_caller = &accounts[0]; // NFT program mint authority PDA (signer)
                 let a_slab = &accounts[1]; // slab (writable)
+                let a_nft_prog = &accounts[2]; // percolator-nft program (for PDA derivation)
 
                 accounts::expect_signer(a_caller)?;
                 accounts::expect_writable(a_slab)?;
@@ -14631,6 +14632,23 @@ pub mod processor {
                 // Slab must be owned by this program.
                 if a_slab.owner != program_id {
                     return Err(ProgramError::IllegalOwner);
+                }
+
+                // Verify a_caller is the canonical mint_authority PDA derived from the NFT program.
+                // The NFT program derives: find_program_address(&[b"mint_authority"], nft_program_id)
+                let (expected_mint_auth, _) = solana_program::pubkey::Pubkey::find_program_address(
+                    &[b"mint_authority"],
+                    a_nft_prog.key,
+                );
+                if a_caller.key != &expected_mint_auth {
+                    solana_program::msg!(
+                        "TransferPositionOwnership rejected: caller {} is not the expected \
+                         mint_authority PDA {} for NFT program {}",
+                        a_caller.key,
+                        expected_mint_auth,
+                        a_nft_prog.key
+                    );
+                    return Err(ProgramError::InvalidArgument);
                 }
 
                 // Read slab header to get max_accounts.
@@ -14660,17 +14678,35 @@ pub mod processor {
                 }
 
                 // Detect layout and find account offset.
-                // V0: engine_off=480, bitmap_off=608, acct_size=240
-                // V1D: engine_off=424, bitmap_off=1048, acct_size=240
-                let (bitmap_off, acct_size) = if slab_data.len() > 100_000 {
-                    (608usize, 240usize) // V0
-                } else {
-                    (1048usize, 240usize) // V1D
-                };
+                // Account size is always 240 bytes (repr(C) size_of::<Account>()).
+                // Layout variants differ only in bitmap_off:
+                //   V0  (large devnet slab):  bitmap_off=608,  determined by data size
+                //   V1D (small/medium slab):  bitmap_off=1048, determined by data size
+                // We compute the expected slab sizes and pick the matching layout.
+                // Fallback: if neither matches, use V1D (smaller, more common on devnet).
+                const ACCT_SIZE: usize = 240;
+                const V0_BITMAP_OFF: usize = 608;
+                const V1D_BITMAP_OFF: usize = 1048;
 
                 let bitmap_bytes = ((max_accounts as usize) + 7) / 8;
-                let accounts_off = bitmap_off + bitmap_bytes;
-                let acct_off = accounts_off + (user_idx as usize) * acct_size;
+                let v0_accounts_off = V0_BITMAP_OFF + bitmap_bytes;
+                let v1d_accounts_off = V1D_BITMAP_OFF + bitmap_bytes;
+
+                let v0_total = v0_accounts_off + (max_accounts as usize) * ACCT_SIZE;
+                let v1d_total = v1d_accounts_off + (max_accounts as usize) * ACCT_SIZE;
+
+                // Choose layout by matching total slab size (±8 bytes for alignment padding).
+                let (bitmap_off, accounts_off) =
+                    if slab_data.len() >= v0_total && slab_data.len() <= v0_total + 8 {
+                        (V0_BITMAP_OFF, v0_accounts_off)
+                    } else if slab_data.len() >= v1d_total && slab_data.len() <= v1d_total + 16 {
+                        (V1D_BITMAP_OFF, v1d_accounts_off)
+                    } else {
+                        // Unknown layout — use V1D as best-effort fallback.
+                        (V1D_BITMAP_OFF, v1d_accounts_off)
+                    };
+
+                let acct_off = accounts_off + (user_idx as usize) * ACCT_SIZE;
 
                 // Verify slot is allocated (bitmap bit set).
                 let byte_idx = bitmap_off + (user_idx as usize) / 8;
@@ -14679,8 +14715,13 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument.into());
                 }
 
-                // Account owner is at offset 0 within the account slot (32 bytes).
-                let owner_off = acct_off;
+                // Account.owner is at offset 184 within the account slot (repr(C) layout).
+                // Layout: account_id(8) + capital(16) + kind(4) + pnl(16) + reserved_pnl(8)
+                //       + warmup_started_at_slot(8) + warmup_slope_per_step(16)
+                //       + position_size(16) + entry_price(8) + funding_index(16)
+                //       + matcher_program(32) + matcher_context(32) + owner(32) = 184
+                const ACCT_OWNER_OFF: usize = 184;
+                let owner_off = acct_off + ACCT_OWNER_OFF;
                 if owner_off + 32 > slab_data.len() {
                     return Err(ProgramError::AccountDataTooSmall);
                 }
