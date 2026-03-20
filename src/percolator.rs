@@ -2440,6 +2440,58 @@ pub mod ix {
         ClaimEpochWithdrawal,
         /// PERC-628: Advance the shared vault epoch (permissionless crank).
         AdvanceEpoch,
+
+        // ── PERC-608: Position NFTs ──────────────────────────────────────
+        /// PERC-608: Mint a Position NFT for an open position (tag 64).
+        /// Called standalone by keepers to mint for existing positions,
+        /// or invoked internally after a position-opening trade.
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] payer (user or keeper)
+        ///   1. [writable]         slab
+        ///   2. [writable]         position_nft PDA  (["position_nft", slab, user_idx])
+        ///   3. [writable]         nft_mint PDA      (["position_nft_mint", slab, user_idx])
+        ///   4. [writable]         owner_ata          (Token-2022 ATA for owner)
+        ///   5. [signer]           owner              (must match engine account.owner)
+        ///   6. []                 vault_authority PDA
+        ///   7. []                 token_2022_program
+        ///   8. []                 system_program
+        ///   9. []                 rent sysvar
+        MintPositionNft {
+            user_idx: u16,
+        },
+
+        /// PERC-608: Transfer position ownership via the NFT (tag 65).
+        ///
+        /// Preconditions:
+        ///   - Caller (current owner) holds the NFT.
+        ///   - `pending_settlement == 0` (keeper settled funding already).
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] current_owner
+        ///   1. [writable]         slab
+        ///   2. [writable]         position_nft PDA
+        ///   3. [writable]         nft_mint PDA
+        ///   4. [writable]         current_owner_ata  (source Token-2022 ATA)
+        ///   5. [writable]         new_owner_ata      (destination Token-2022 ATA)
+        ///   6. []                 new_owner
+        ///   7. []                 token_2022_program
+        TransferPositionOwnership {
+            user_idx: u16,
+        },
+
+        /// PERC-608: Burn the Position NFT when a position is closed (tag 66).
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] owner
+        ///   1. [writable]         slab
+        ///   2. [writable]         position_nft PDA  (closed, rent returned to owner)
+        ///   3. [writable]         nft_mint PDA      (closed, rent returned to owner)
+        ///   4. [writable]         owner_ata          (Token-2022 ATA; balance burned)
+        ///   5. []                 token_2022_program
+        BurnPositionNft {
+            user_idx: u16,
+        },
     }
 
     impl Instruction {
@@ -2939,6 +2991,21 @@ pub mod ix {
                 }
                 TAG_CLAIM_EPOCH_WITHDRAWAL => Ok(Instruction::ClaimEpochWithdrawal),
                 TAG_ADVANCE_EPOCH => Ok(Instruction::AdvanceEpoch),
+
+                // ── PERC-608: Position NFT instructions ──────────────────
+                TAG_MINT_POSITION_NFT => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::MintPositionNft { user_idx })
+                }
+                TAG_TRANSFER_POSITION_OWNERSHIP => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::TransferPositionOwnership { user_idx })
+                }
+                TAG_BURN_POSITION_NFT => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::BurnPositionNft { user_idx })
+                }
+
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -7995,6 +8062,376 @@ mod shared_vault_kani {
         } else {
             // Fully funded: payout == request
             assert_eq!(payout as u128, lp_user as u128);
+        }
+    }
+}
+
+// 8f. mod position_nft — PERC-608: Transferable Position NFTs (SPL Token-2022)
+pub mod position_nft {
+    //! Position NFT module — PERC-608.
+    //!
+    //! Each open position has a corresponding `PositionNft` PDA that holds:
+    //!   - `mint`: the SPL Token-2022 NFT mint (supply=1, decimals=0)
+    //!   - `position`: the slab pubkey + user_idx that identifies the position
+    //!   - `owner`: current owner's wallet pubkey
+    //!   - `pending_settlement`: flag set by keeper before a transfer
+    //!
+    //! Seeds: `[b"position_nft", slab_key, user_idx_le_bytes]`
+    //!
+    //! Instructions:
+    //!   - `MintPositionNft`  (tag 64): create PDA + mint 1 token → owner ATA
+    //!   - `TransferPositionOwnership` (tag 65): keeper-gated ownership transfer
+    //!   - `BurnPositionNft`  (tag 66): burn NFT + close PDA on position close
+
+    use bytemuck::{Pod, Zeroable};
+
+    /// Magic for PositionNft PDA: "POSNFT\0\0" = 0x504F534E46540000
+    pub const POSITION_NFT_MAGIC: u64 = 0x504F_534E_4654_0000;
+
+    /// Size of the `PositionNftState` account in bytes.
+    pub const POSITION_NFT_STATE_LEN: usize = core::mem::size_of::<PositionNftState>();
+
+    /// PDA seed prefix.
+    pub const POSITION_NFT_SEED: &[u8] = b"position_nft";
+
+    /// On-chain layout for a Position NFT state PDA.
+    ///
+    /// Seeds: `[b"position_nft", slab_pubkey, user_idx.to_le_bytes()]`
+    ///
+    /// Total size: 128 bytes (16-byte aligned).
+    ///
+    /// Layout:
+    ///   0..8    magic (u64)          — `POSITION_NFT_MAGIC` when initialized
+    ///   8..40   mint (Pubkey)        — SPL Token-2022 mint for this NFT
+    ///   40..72  slab (Pubkey)        — slab account the position lives in
+    ///   72..104 owner (Pubkey)       — current owner's wallet pubkey
+    ///   104     user_idx (u16)       — position index within the slab engine
+    ///   106     pending_settlement   — 1 = keeper must settle funding before transfer
+    ///   107     bump (u8)            — PDA bump seed
+    ///   108     mint_bump (u8)       — mint PDA bump seed
+    ///   109..128 _reserved ([u8;19]) — zero-padded
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    pub struct PositionNftState {
+        /// Magic: `POSITION_NFT_MAGIC` when initialized, 0 when uninitialized.
+        pub magic: u64,
+        /// SPL Token-2022 NFT mint public key.
+        pub mint: [u8; 32],
+        /// Slab pubkey where the underlying position lives.
+        pub slab: [u8; 32],
+        /// Current owner wallet pubkey.
+        pub owner: [u8; 32],
+        /// User index within the slab's RiskEngine accounts array.
+        pub user_idx: u16,
+        /// Pending settlement flag: 1 if the keeper must settle funding before
+        /// a transfer is allowed, 0 otherwise.
+        pub pending_settlement: u8,
+        /// PDA bump for this state account.
+        pub bump: u8,
+        /// Bump for the NFT mint PDA.
+        pub mint_bump: u8,
+        /// Reserved for future use.
+        pub _reserved: [u8; 19],
+    }
+
+    impl PositionNftState {
+        #[inline]
+        pub fn is_initialized(&self) -> bool {
+            self.magic == POSITION_NFT_MAGIC
+        }
+    }
+
+    /// Derive the `PositionNft` state PDA.
+    ///
+    /// Seeds: `[b"position_nft", slab_key, user_idx.to_le_bytes()]`
+    pub fn derive_position_nft(
+        program_id: &solana_program::pubkey::Pubkey,
+        slab_key: &solana_program::pubkey::Pubkey,
+        user_idx: u16,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[
+                POSITION_NFT_SEED,
+                slab_key.as_ref(),
+                &user_idx.to_le_bytes(),
+            ],
+            program_id,
+        )
+    }
+
+    /// Derive the NFT mint PDA.
+    ///
+    /// Seeds: `[b"position_nft_mint", slab_key, user_idx.to_le_bytes()]`
+    pub fn derive_position_nft_mint(
+        program_id: &solana_program::pubkey::Pubkey,
+        slab_key: &solana_program::pubkey::Pubkey,
+        user_idx: u16,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[
+                b"position_nft_mint",
+                slab_key.as_ref(),
+                &user_idx.to_le_bytes(),
+            ],
+            program_id,
+        )
+    }
+
+    /// Read a `PositionNftState` from a raw byte slice.
+    pub fn read_position_nft_state(data: &[u8]) -> Option<PositionNftState> {
+        if data.len() < POSITION_NFT_STATE_LEN {
+            return None;
+        }
+        let bytes = &data[..POSITION_NFT_STATE_LEN];
+        Some(*bytemuck::from_bytes::<PositionNftState>(bytes))
+    }
+
+    /// Write a `PositionNftState` into a raw byte slice.
+    pub fn write_position_nft_state(data: &mut [u8], state: &PositionNftState) {
+        let bytes = bytemuck::bytes_of(state);
+        data[..POSITION_NFT_STATE_LEN].copy_from_slice(bytes);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // SPL Token-2022 mint/burn/transfer helpers
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Create a new Token-2022 NFT mint account (PDA-owned) and initialize it.
+    /// Supply = 1, decimals = 0, no freeze authority.
+    /// Mint authority = vault_authority PDA (same authority used for position vault).
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub fn create_nft_mint<'a>(
+        payer: &solana_program::account_info::AccountInfo<'a>,
+        mint_account: &solana_program::account_info::AccountInfo<'a>,
+        mint_authority: &solana_program::account_info::AccountInfo<'a>,
+        system_program: &solana_program::account_info::AccountInfo<'a>,
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        rent_sysvar: &solana_program::account_info::AccountInfo<'a>,
+        mint_seeds: &[&[u8]],
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::{invoke, invoke_signed};
+            use solana_program::rent::Rent;
+            use solana_program::sysvar::Sysvar;
+            use spl_token_2022::state::Mint;
+            use solana_program::program_pack::Pack;
+
+            let space = Mint::LEN;
+            let rent = Rent::get()?;
+            let lamports = rent.minimum_balance(space);
+
+            let create_ix = solana_program::system_instruction::create_account(
+                payer.key,
+                mint_account.key,
+                lamports,
+                space as u64,
+                token2022_program.key,
+            );
+            invoke_signed(
+                &create_ix,
+                &[payer.clone(), mint_account.clone(), system_program.clone()],
+                &[mint_seeds],
+            )?;
+
+            let init_ix = spl_token_2022::instruction::initialize_mint(
+                token2022_program.key,
+                mint_account.key,
+                mint_authority.key,
+                None, // no freeze authority
+                0,    // decimals = 0 → NFT
+            )?;
+            invoke(
+                &init_ix,
+                &[
+                    mint_account.clone(),
+                    rent_sysvar.clone(),
+                ],
+            )?;
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::Mint;
+            let mut data = mint_account.try_borrow_mut_data()?;
+            let mut mint_state = Mint::default();
+            mint_state.is_initialized = true;
+            mint_state.decimals = 0;
+            mint_state.mint_authority =
+                solana_program::program_option::COption::Some(*mint_authority.key);
+            mint_state.freeze_authority = solana_program::program_option::COption::None;
+            mint_state.supply = 0;
+            Mint::pack(mint_state, &mut data)?;
+        }
+        Ok(())
+    }
+
+    /// Mint exactly 1 NFT token to the destination ATA. Signed by mint authority PDA.
+    #[allow(unused_variables)]
+    pub fn mint_nft_to<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        destination: &solana_program::account_info::AccountInfo<'a>,
+        authority: &solana_program::account_info::AccountInfo<'a>,
+        signer_seeds: &[&[&[u8]]],
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke_signed;
+            let ix = spl_token_2022::instruction::mint_to(
+                token2022_program.key,
+                mint.key,
+                destination.key,
+                authority.key,
+                &[],
+                1, // supply = 1 (NFT)
+            )?;
+            invoke_signed(
+                &ix,
+                &[
+                    mint.clone(),
+                    destination.clone(),
+                    authority.clone(),
+                    token2022_program.clone(),
+                ],
+                signer_seeds,
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::{Account as TokenAccount, Mint};
+
+            let mut mint_data = mint.try_borrow_mut_data()?;
+            let mut mint_state = Mint::unpack(&mint_data)?;
+            mint_state.supply = mint_state
+                .supply
+                .checked_add(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            Mint::pack(mint_state, &mut mint_data)?;
+            drop(mint_data);
+
+            let mut dst_data = destination.try_borrow_mut_data()?;
+            let mut dst_state = TokenAccount::unpack(&dst_data)?;
+            dst_state.amount = dst_state
+                .amount
+                .checked_add(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            TokenAccount::pack(dst_state, &mut dst_data)?;
+            Ok(())
+        }
+    }
+
+    /// Burn the NFT from the holder's ATA. Holder (new_owner) is the authority.
+    #[allow(unused_variables)]
+    pub fn burn_nft<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        source: &solana_program::account_info::AccountInfo<'a>,
+        authority: &solana_program::account_info::AccountInfo<'a>,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke;
+            let ix = spl_token_2022::instruction::burn(
+                token2022_program.key,
+                source.key,
+                mint.key,
+                authority.key,
+                &[],
+                1, // burn exactly 1
+            )?;
+            invoke(
+                &ix,
+                &[
+                    source.clone(),
+                    mint.clone(),
+                    authority.clone(),
+                    token2022_program.clone(),
+                ],
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::{Account as TokenAccount, Mint};
+
+            let mut src_data = source.try_borrow_mut_data()?;
+            let mut src_state = TokenAccount::unpack(&src_data)?;
+            src_state.amount = src_state
+                .amount
+                .checked_sub(1)
+                .ok_or(solana_program::program_error::ProgramError::InsufficientFunds)?;
+            TokenAccount::pack(src_state, &mut src_data)?;
+            drop(src_data);
+
+            let mut mint_data = mint.try_borrow_mut_data()?;
+            let mut mint_state = Mint::unpack(&mint_data)?;
+            mint_state.supply = mint_state
+                .supply
+                .checked_sub(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            Mint::pack(mint_state, &mut mint_data)?;
+            Ok(())
+        }
+    }
+
+    /// Transfer the NFT from current holder to new owner's ATA.
+    /// Caller must ensure pending_settlement == 0 before calling.
+    #[allow(unused_variables)]
+    pub fn transfer_nft<'a>(
+        token2022_program: &solana_program::account_info::AccountInfo<'a>,
+        mint: &solana_program::account_info::AccountInfo<'a>,
+        source: &solana_program::account_info::AccountInfo<'a>,
+        destination: &solana_program::account_info::AccountInfo<'a>,
+        authority: &solana_program::account_info::AccountInfo<'a>,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke;
+            let ix = spl_token_2022::instruction::transfer_checked(
+                token2022_program.key,
+                source.key,
+                mint.key,
+                destination.key,
+                authority.key,
+                &[],
+                1,  // amount = 1
+                0,  // decimals = 0
+            )?;
+            invoke(
+                &ix,
+                &[
+                    source.clone(),
+                    mint.clone(),
+                    destination.clone(),
+                    authority.clone(),
+                    token2022_program.clone(),
+                ],
+            )
+        }
+        #[cfg(feature = "test")]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token_2022::state::Account as TokenAccount;
+
+            let mut src_data = source.try_borrow_mut_data()?;
+            let mut src_state = TokenAccount::unpack(&src_data)?;
+            src_state.amount = src_state
+                .amount
+                .checked_sub(1)
+                .ok_or(solana_program::program_error::ProgramError::InsufficientFunds)?;
+            TokenAccount::pack(src_state, &mut src_data)?;
+            drop(src_data);
+
+            let mut dst_data = destination.try_borrow_mut_data()?;
+            let mut dst_state = TokenAccount::unpack(&dst_data)?;
+            dst_state.amount = dst_state
+                .amount
+                .checked_add(1)
+                .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?;
+            TokenAccount::pack(dst_state, &mut dst_data)?;
+            Ok(())
         }
     }
 }
@@ -15569,6 +16006,376 @@ pub mod processor {
                 } else {
                     msg!("PERC-628: Claim: {} LP → 0 payout", req.lp_amount);
                 }
+            }
+
+            // ── PERC-608: Position NFT instructions ──────────────────────
+
+            /// MintPositionNft — create PositionNft PDA + Token-2022 NFT mint,
+            /// then mint 1 NFT to the position owner's ATA.
+            ///
+            /// Accounts:
+            ///   [0] payer (signer, writable)
+            ///   [1] slab  (writable)
+            ///   [2] position_nft PDA (writable, unchecked — created here)
+            ///   [3] nft_mint PDA (writable, unchecked — created here)
+            ///   [4] owner_ata (writable) — Token-2022 ATA for owner
+            ///   [5] owner (signer)       — must match engine account owner
+            ///   [6] vault_authority PDA  — authority for mint signing
+            ///   [7] token_2022_program
+            ///   [8] system_program
+            ///   [9] rent sysvar
+            Instruction::MintPositionNft { user_idx } => {
+                accounts::expect_len(accounts, 10)?;
+                let a_payer = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+                let a_nft_mint = &accounts[3];
+                let a_owner_ata = &accounts[4];
+                let a_owner = &accounts[5];
+                let a_vault_auth = &accounts[6];
+                let a_token22 = &accounts[7];
+                let a_system = &accounts[8];
+                let a_rent = &accounts[9];
+
+                accounts::expect_signer(a_payer)?;
+                accounts::expect_signer(a_owner)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_nft_pda)?;
+                accounts::expect_writable(a_nft_mint)?;
+                accounts::expect_writable(a_owner_ata)?;
+
+                // Verify slab is initialized
+                let data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                // Verify user_idx is valid and caller is authorized
+                let engine = zc::engine_ref(&data)?;
+                check_idx(engine, user_idx)?;
+                let u_owner = engine.accounts[user_idx as usize].owner;
+                if !crate::verify::owner_ok(u_owner, a_owner.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+                // Position must be open (non-zero capital or position size)
+                let acct = &engine.accounts[user_idx as usize];
+                if acct.capital.get() == 0 && acct.position_size.get() == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+                drop(data);
+
+                // Derive + verify PDA keys
+                let (expected_nft_pda, nft_bump) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                let (expected_mint, mint_bump) =
+                    crate::position_nft::derive_position_nft_mint(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_mint, &expected_mint)?;
+
+                // Vault authority (mint authority)
+                let (expected_vault_auth, _) =
+                    accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
+
+                // Guard: PositionNft PDA must not already exist (prevent double-mint)
+                {
+                    let nft_data = a_nft_pda.try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    if nft_data.len() >= crate::position_nft::POSITION_NFT_STATE_LEN {
+                        if let Some(st) = crate::position_nft::read_position_nft_state(&nft_data) {
+                            if st.is_initialized() {
+                                msg!("PERC-608: PositionNft already exists for this position");
+                                return Err(ProgramError::AccountAlreadyInitialized);
+                            }
+                        }
+                    }
+                }
+
+                // Allocate PositionNft state PDA
+                {
+                    let nft_pda_seeds: &[&[u8]] = &[
+                        crate::position_nft::POSITION_NFT_SEED,
+                        a_slab.key.as_ref(),
+                        &user_idx.to_le_bytes(),
+                        &[nft_bump],
+                    ];
+                    let space = crate::position_nft::POSITION_NFT_STATE_LEN;
+                    let rent = solana_program::rent::Rent::get()?;
+                    let lamports = rent.minimum_balance(space);
+                    let create_ix = solana_program::system_instruction::create_account(
+                        a_payer.key,
+                        a_nft_pda.key,
+                        lamports,
+                        space as u64,
+                        program_id,
+                    );
+                    #[cfg(not(feature = "test"))]
+                    {
+                        solana_program::program::invoke_signed(
+                            &create_ix,
+                            &[a_payer.clone(), a_nft_pda.clone(), a_system.clone()],
+                            &[nft_pda_seeds],
+                        )?;
+                    }
+                    let _ = (create_ix, a_system, a_rent);
+                }
+
+                // Create & initialize NFT mint (Token-2022, decimals=0)
+                {
+                    let mint_seeds: &[&[u8]] = &[
+                        b"position_nft_mint",
+                        a_slab.key.as_ref(),
+                        &user_idx.to_le_bytes(),
+                        &[mint_bump],
+                    ];
+                    crate::position_nft::create_nft_mint(
+                        a_payer,
+                        a_nft_mint,
+                        a_vault_auth,
+                        a_system,
+                        a_token22,
+                        a_rent,
+                        mint_seeds,
+                    )?;
+                }
+
+                // Mint 1 token to owner ATA (vault_authority signs)
+                {
+                    let (_, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                    let vault_seeds: &[&[u8]] = &[
+                        b"vault",
+                        a_slab.key.as_ref(),
+                        &[vault_bump],
+                    ];
+                    crate::position_nft::mint_nft_to(
+                        a_token22,
+                        a_nft_mint,
+                        a_owner_ata,
+                        a_vault_auth,
+                        &[vault_seeds],
+                    )?;
+                }
+
+                // Write PositionNft state
+                {
+                    let mut nft_data = a_nft_pda.try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    let state = crate::position_nft::PositionNftState {
+                        magic: crate::position_nft::POSITION_NFT_MAGIC,
+                        mint: a_nft_mint.key.to_bytes(),
+                        slab: a_slab.key.to_bytes(),
+                        owner: a_owner.key.to_bytes(),
+                        user_idx,
+                        pending_settlement: 0,
+                        bump: nft_bump,
+                        mint_bump,
+                        _reserved: [0u8; 19],
+                    };
+                    crate::position_nft::write_position_nft_state(&mut nft_data, &state);
+                }
+
+                msg!(
+                    "PERC-608: MintPositionNft: slab={}, user_idx={}, owner={}",
+                    a_slab.key,
+                    user_idx,
+                    a_owner.key
+                );
+            }
+
+            /// TransferPositionOwnership — transfer position NFT + update owner in PDA.
+            ///
+            /// Precondition: `pending_settlement == 0` (keeper settled funding already).
+            ///
+            /// Accounts:
+            ///   [0] current_owner (signer, writable)
+            ///   [1] slab (writable)
+            ///   [2] position_nft PDA (writable)
+            ///   [3] nft_mint PDA (writable — for transfer_checked mint ref)
+            ///   [4] current_owner_ata (writable)
+            ///   [5] new_owner_ata (writable)
+            ///   [6] new_owner
+            ///   [7] token_2022_program
+            Instruction::TransferPositionOwnership { user_idx } => {
+                accounts::expect_len(accounts, 8)?;
+                let a_current_owner = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+                let a_nft_mint = &accounts[3];
+                let a_src_ata = &accounts[4];
+                let a_dst_ata = &accounts[5];
+                let a_new_owner = &accounts[6];
+                let a_token22 = &accounts[7];
+
+                accounts::expect_signer(a_current_owner)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_nft_pda)?;
+                accounts::expect_writable(a_nft_mint)?;
+                accounts::expect_writable(a_src_ata)?;
+                accounts::expect_writable(a_dst_ata)?;
+
+                // Verify slab
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+
+                // Verify user_idx
+                let engine = zc::engine_ref(&slab_data)?;
+                check_idx(engine, user_idx)?;
+                drop(slab_data);
+
+                // Verify NFT PDA key
+                let (expected_nft_pda, _) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                // Read + validate PositionNft state
+                let mut nft_state = {
+                    let nft_data = a_nft_pda.try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::read_position_nft_state(&nft_data)
+                        .filter(|s| s.is_initialized())
+                        .ok_or(ProgramError::UninitializedAccount)?
+                };
+
+                // Guard: caller must be current NFT owner
+                if nft_state.owner != a_current_owner.key.to_bytes() {
+                    msg!("PERC-608: TransferPositionOwnership: caller is not current NFT owner");
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // Guard: mint matches stored mint
+                if nft_state.mint != a_nft_mint.key.to_bytes() {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Guard: funding must be settled before transfer
+                if nft_state.pending_settlement != 0 {
+                    msg!("PERC-608: PendingFundingNotSettled — keeper must run settlement crank first");
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // Transfer NFT (Token-2022 transfer_checked, 1 token, 0 decimals)
+                crate::position_nft::transfer_nft(
+                    a_token22,
+                    a_nft_mint,
+                    a_src_ata,
+                    a_dst_ata,
+                    a_current_owner,
+                )?;
+
+                // Update owner in slab engine
+                {
+                    let mut slab_data = state::slab_data_mut(a_slab)?;
+                    let engine = zc::engine_mut(&mut slab_data)?;
+                    engine.accounts[user_idx as usize].owner = a_new_owner.key.to_bytes();
+                }
+
+                // Update PositionNft state
+                nft_state.owner = a_new_owner.key.to_bytes();
+                {
+                    let mut nft_data = a_nft_pda.try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+                }
+
+                msg!(
+                    "PERC-608: TransferPositionOwnership: slab={}, user_idx={}, new_owner={}",
+                    a_slab.key,
+                    user_idx,
+                    a_new_owner.key
+                );
+            }
+
+            /// BurnPositionNft — burn NFT + close PositionNft PDA on position close.
+            ///
+            /// Accounts:
+            ///   [0] owner (signer, writable)
+            ///   [1] slab (writable)
+            ///   [2] position_nft PDA (writable — closed, rent returned to owner)
+            ///   [3] nft_mint PDA (writable — closed, rent returned to owner)
+            ///   [4] owner_ata (writable)
+            ///   [5] token_2022_program
+            Instruction::BurnPositionNft { user_idx } => {
+                accounts::expect_len(accounts, 6)?;
+                let a_owner = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_nft_pda = &accounts[2];
+                let a_nft_mint = &accounts[3];
+                let a_owner_ata = &accounts[4];
+                let a_token22 = &accounts[5];
+
+                accounts::expect_signer(a_owner)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_nft_pda)?;
+                accounts::expect_writable(a_nft_mint)?;
+                accounts::expect_writable(a_owner_ata)?;
+
+                // Verify slab is initialized (position may already be closed)
+                let slab_data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
+                drop(slab_data);
+
+                // Verify NFT PDA key
+                let (expected_nft_pda, _) =
+                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+                // Read + validate PositionNft state
+                let nft_state = {
+                    let nft_data = a_nft_pda.try_borrow_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    crate::position_nft::read_position_nft_state(&nft_data)
+                        .filter(|s| s.is_initialized())
+                        .ok_or(ProgramError::UninitializedAccount)?
+                };
+
+                // Guard: caller must be NFT owner
+                if nft_state.owner != a_owner.key.to_bytes() {
+                    msg!("PERC-608: BurnPositionNft: caller is not NFT owner");
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // Guard: mint matches stored mint
+                if nft_state.mint != a_nft_mint.key.to_bytes() {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Burn 1 NFT from owner ATA
+                crate::position_nft::burn_nft(
+                    a_token22,
+                    a_nft_mint,
+                    a_owner_ata,
+                    a_owner,
+                )?;
+
+                // Close PositionNft PDA: zero data + transfer lamports to owner
+                {
+                    let mut nft_data = a_nft_pda.try_borrow_mut_data()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                    // Zero out the state (magic = 0 marks as uninitialized)
+                    for b in nft_data.iter_mut() {
+                        *b = 0;
+                    }
+                }
+                // Reclaim rent from PositionNft PDA → owner
+                {
+                    let lamports = a_nft_pda.lamports();
+                    **a_nft_pda.try_borrow_mut_lamports()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)? = 0;
+                    **a_owner.try_borrow_mut_lamports()
+                        .map_err(|_| ProgramError::AccountBorrowFailed)? = a_owner
+                        .lamports()
+                        .checked_add(lamports)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                }
+
+                msg!(
+                    "PERC-608: BurnPositionNft: slab={}, user_idx={}, owner={}",
+                    a_slab.key,
+                    user_idx,
+                    a_owner.key
+                );
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,

@@ -128,6 +128,20 @@ pub const TAG_CLAIM_EPOCH_WITHDRAWAL: u8 = 62;
 /// PERC-628: Advance the shared vault epoch (permissionless crank).
 pub const TAG_ADVANCE_EPOCH: u8 = 63;
 
+// ═══════════════════════════════════════════════════════════════
+// PERC-608: Position NFTs (SPL Token-2022)
+// ═══════════════════════════════════════════════════════════════
+/// PERC-608: Mint a Position NFT when opening a position.
+/// Called internally at end of TradeNoCpi / TradeCpi for new positions.
+/// Also callable standalone by keepers to mint for pre-existing positions.
+pub const TAG_MINT_POSITION_NFT: u8 = 64;
+/// PERC-608: Transfer position ownership via Position NFT.
+/// Keeper settles pending funding before completing transfer.
+pub const TAG_TRANSFER_POSITION_OWNERSHIP: u8 = 65;
+/// PERC-608: Burn Position NFT when closing a position.
+/// Called internally at end of CloseAccount.
+pub const TAG_BURN_POSITION_NFT: u8 = 66;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +214,9 @@ mod tests {
             TAG_QUEUE_WITHDRAWAL_SV,
             TAG_CLAIM_EPOCH_WITHDRAWAL,
             TAG_ADVANCE_EPOCH,
+            TAG_MINT_POSITION_NFT,
+            TAG_TRANSFER_POSITION_OWNERSHIP,
+            TAG_BURN_POSITION_NFT,
         ];
 
         for i in 0..tags.len() {
@@ -277,6 +294,9 @@ mod tests {
             TAG_QUEUE_WITHDRAWAL_SV,
             TAG_CLAIM_EPOCH_WITHDRAWAL,
             TAG_ADVANCE_EPOCH,
+            TAG_MINT_POSITION_NFT,
+            TAG_TRANSFER_POSITION_OWNERSHIP,
+            TAG_BURN_POSITION_NFT,
         ];
 
         for (i, &tag) in tags.iter().enumerate() {
