@@ -12730,12 +12730,10 @@ pub mod processor {
                 const MAX_HYPERP_DEVIATION_BPS: u64 = 500;
                 if prev_mark > 0 {
                     let deviation = if dex_price > prev_mark {
-                        ((dex_price - prev_mark) as u128)
-                            .saturating_mul(10_000)
+                        ((dex_price - prev_mark) as u128).saturating_mul(10_000)
                             / (prev_mark as u128)
                     } else {
-                        ((prev_mark - dex_price) as u128)
-                            .saturating_mul(10_000)
+                        ((prev_mark - dex_price) as u128).saturating_mul(10_000)
                             / (prev_mark as u128)
                     };
                     if deviation > MAX_HYPERP_DEVIATION_BPS as u128 {
