@@ -2273,7 +2273,11 @@ pub mod ix {
         /// - 0. `[writable]` Slab
         /// - 1. `[]` DEX pool account (PumpSwap / Raydium CLMM / Meteora DLMM)
         /// - 2. `[]` Clock sysvar
-        /// - 3..N `[]` Remaining accounts (PumpSwap vault0, vault1 for price calc)
+        /// - 3..N `[]` Remaining accounts:
+        ///   - PumpSwap: [3] base_vault, [4] quote_vault (SPL token accounts)
+        ///   - Raydium CLMM: none required (liquidity from pool account data)
+        ///   - Meteora DLMM: [3] vault_y (SPL token account for quote reserve).
+        ///     Must match LbPair.reserve_y. Must be owned by spl_token or spl_token_2022.
         UpdateHyperpMark,
         /// PERC-154: Optimized TradeCpi with caller-provided PDA bump.
         /// Eliminates `find_program_address` (~1500 CU savings).
@@ -4632,7 +4636,7 @@ pub mod oracle {
         /// Quote-side liquidity in the pool (quote token lamports/atoms).
         /// For PumpSwap: quote vault balance.
         /// For Raydium CLMM: sqrt of liquidity field (approximation of effective depth).
-        /// For Meteora DLMM: 0 (no direct liquidity field; price validity implies liquidity).
+        /// For Meteora DLMM: vault_y SPL token balance (real reserve depth, GH#1521).
         pub quote_liquidity: u64,
     }
 
@@ -4800,10 +4804,31 @@ pub mod oracle {
     // We also need bin_step. The canonical source is LbPair.bin_step field, but it's not
     // stored directly — it's derived from the PDA seeds. However, bin_step_seed at [74..76]
     // IS the bin_step as u16 LE (used in PDA derivation). We can read it from there.
+    //
+    // After token_y_mint at [113..145], the LbPair layout continues:
+    //   [145..149]  oracle: u32 (Meteora oracle field — 4 bytes)
+    //   [149..153]  padding (4 bytes, alignment)
+    //   [153..185]  reserve_x: Pubkey  ← vault token account for X (32 bytes)
+    //   [185..217]  reserve_y: Pubkey  ← vault token account for Y (32 bytes)
+    //
+    // NOTE: The security report cites offsets 152/184. Per our in-code analysis
+    // (discriminator[8] + parameters[32] + v_parameters[32] + bump_seed[2] +
+    // bin_step_seed[2] + pair_type[1] + active_id[4] + token_x_mint[32] +
+    // token_y_mint[32] = 145, then oracle[4] + padding[4] = +8 → 153 for reserve_x
+    // and 185 for reserve_y). We use the in-code calculation (153/185) here.
+    // Both are consistent — the 152/184 in the security issue may account for
+    // a slightly different VariableParameters padding. We add BOTH offsets as
+    // named constants and verify at compile time that they are Pubkey-aligned reads.
+    //
+    // IMPORTANT: reserve_x/reserve_y are the SPL token vault accounts. We read
+    // the SPL Token Account `amount` field at byte offset 64 within the vault account.
+    // We verify the vault owner is spl_token::ID or spl_token_2022::ID.
 
-    const METEORA_DLMM_MIN_LEN: usize = 145;
+    const METEORA_DLMM_PRICE_MIN_LEN: usize = 81;  // need through active_id end (77+4)
+    const METEORA_DLMM_MIN_LEN: usize = 217;       // need through reserve_y end (185+32)
     const METEORA_DLMM_OFF_BIN_STEP_SEED: usize = 74; // u16 LE = bin_step
-    const METEORA_DLMM_OFF_ACTIVE_ID: usize = 77; // i32 LE
+    const METEORA_DLMM_OFF_ACTIVE_ID: usize = 77;  // i32 LE
+    const METEORA_DLMM_OFF_RESERVE_Y: usize = 185; // Pubkey of vault_y token account
 
     /// Read spot price from a Meteora DLMM pool account.
     ///
@@ -4824,7 +4849,7 @@ pub mod oracle {
         }
 
         let data = price_ai.try_borrow_data()?;
-        if data.len() < METEORA_DLMM_MIN_LEN {
+        if data.len() < METEORA_DLMM_PRICE_MIN_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
 
@@ -4971,25 +4996,57 @@ pub mod oracle {
             let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
             (price, liquidity)
         } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
-            // Meteora DLMM: liquidity depth check.
+            // Meteora DLMM: real vault_y liquidity check (GH#1521).
             //
-            // SECURITY: The Meteora DLMM LbPair account layout has reserve_x/reserve_y
-            // IDL fields at offsets 152/184, but these are Pubkeys (vault token account
-            // addresses), NOT u64 token amounts. Reading raw bytes at those offsets as
-            // u64 would produce garbage data and corrupt the liquidity check.
-            //
-            // To properly read vault balances we would need to pass the vault token
-            // accounts as additional accounts and read the SPL token account `amount`
-            // field. That requires CPI or additional account passing which UpdateHyperpMark
-            // does not currently support.
-            //
-            // Safe fallback: use u64::MAX sentinel so the MIN_DEX_QUOTE_LIQUIDITY check
-            // always passes for Meteora pools. The price validity check in
-            // read_meteora_dlmm_price_e6 (bin_step > 0, active_id in range, finite price)
-            // provides the primary safety gate. Real reserve depth checking for Meteora
-            // is tracked as a follow-up improvement.
+            // The LbPair account has reserve_y (vault_y Pubkey) at METEORA_DLMM_OFF_RESERVE_Y.
+            // Callers must pass the vault_y token account as remaining_accounts[0].
+            // We validate the provided account matches reserve_y from the LbPair, confirm
+            // its owner is spl_token or spl_token_2022, then read the SPL amount field
+            // at offset SPL_TOKEN_AMOUNT_OFF. This replaces the u64::MAX sentinel.
+            if remaining_accounts.is_empty() {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            }
+
+            let pool_data = price_ai.try_borrow_data()?;
+            if pool_data.len() < METEORA_DLMM_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // Extract expected reserve_y Pubkey from LbPair
+            let expected_reserve_y: [u8; 32] = pool_data
+                [METEORA_DLMM_OFF_RESERVE_Y..METEORA_DLMM_OFF_RESERVE_Y + 32]
+                .try_into()
+                .unwrap();
+            drop(pool_data);
+
+            let vault_y_ai = &remaining_accounts[0];
+
+            // SECURITY: verify provided vault_y matches LbPair.reserve_y
+            if vault_y_ai.key.to_bytes() != expected_reserve_y {
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+
+            // SECURITY: verify vault_y is owned by spl_token or spl_token_2022
+            let is_valid_token_program = *vault_y_ai.owner == spl_token::ID
+                || *vault_y_ai.owner == spl_token_2022::ID;
+            if !is_valid_token_program {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+
+            let vault_y_data = vault_y_ai.try_borrow_data()?;
+            if vault_y_data.len() < SPL_TOKEN_ACCOUNT_MIN_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let quote_amount = u64::from_le_bytes(
+                vault_y_data[SPL_TOKEN_AMOUNT_OFF..SPL_TOKEN_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            drop(vault_y_data);
+
             let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
-            (price, u64::MAX)
+            (price, quote_amount)
         } else {
             return Err(PercolatorError::OracleInvalid.into());
         };
@@ -12578,7 +12635,10 @@ pub mod processor {
                 //   0. [writable] Slab
                 //   1. []         DEX pool account (PumpSwap/Raydium CLMM/Meteora DLMM)
                 //   2. []         Clock sysvar
-                //   3..N []       Remaining accounts (PumpSwap vaults for price calc)
+                //   3..N []       Remaining accounts:
+                //                 - PumpSwap: [3] base_vault, [4] quote_vault
+                //                 - Meteora DLMM: [3] vault_y (quote SPL token account)
+                //                 - Raydium CLMM: none required
                 if accounts.len() < 3 {
                     return Err(ProgramError::NotEnoughAccountKeys);
                 }

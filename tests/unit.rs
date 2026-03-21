@@ -3318,13 +3318,34 @@ fn test_close_slab_non_admin_rejected() {
 // === UpdateHyperpMark — Minimum DEX Liquidity Tests (PERC-141 / GH #297 Fix 1) ===
 
 /// Build a PumpSwap pool account mock.
-/// Layout: 195+ bytes, with base_vault at offset 131, quote_vault at offset 163.
-fn make_pumpswap_pool(base_vault_key: &Pubkey, quote_vault_key: &Pubkey) -> Vec<u8> {
+/// Layout: 195+ bytes, with base_mint at offset 35, base_vault at offset 131, quote_vault at offset 163.
+/// The base_mint is required by the UpdateHyperpMark security check: it must match the market's collateral_mint.
+fn make_pumpswap_pool(
+    base_mint_key: &Pubkey,
+    base_vault_key: &Pubkey,
+    quote_vault_key: &Pubkey,
+) -> Vec<u8> {
     let mut data = vec![0u8; 256]; // generous size
-                                   // base_vault at offset 131
+    // base_mint at offset 35 — must match market collateral_mint
+    data[35..67].copy_from_slice(base_mint_key.as_ref());
+    // base_vault at offset 131
     data[131..163].copy_from_slice(base_vault_key.as_ref());
     // quote_vault at offset 163
     data[163..195].copy_from_slice(quote_vault_key.as_ref());
+    data
+}
+
+/// Build a Meteora DLMM LbPair account mock.
+/// Includes bin_step_seed at 74, active_id at 77, and reserve_y at 185.
+/// active_id=0 → price_e6 = 1_000_000 (price == 1.0 for any bin_step).
+fn make_meteora_lbpair(bin_step: u16, active_id: i32, vault_y_key: &Pubkey) -> Vec<u8> {
+    let mut data = vec![0u8; 220]; // must be ≥ METEORA_DLMM_MIN_LEN (217)
+    // bin_step_seed at offset 74
+    data[74..76].copy_from_slice(&bin_step.to_le_bytes());
+    // active_id at offset 77
+    data[77..81].copy_from_slice(&active_id.to_le_bytes());
+    // reserve_y at offset 185
+    data[185..217].copy_from_slice(vault_y_key.as_ref());
     data
 }
 
@@ -3419,7 +3440,8 @@ fn test_update_hyperp_mark_rejects_insufficient_pumpswap_liquidity() {
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let base_vault_key = Pubkey::new_unique();
     let quote_vault_key = Pubkey::new_unique();
-    let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
+    // base_mint must match the market's collateral_mint (security check in UpdateHyperpMark)
+    let pool_data = make_pumpswap_pool(&f.mint.key, &base_vault_key, &quote_vault_key);
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
     let mut base_vault =
@@ -3479,7 +3501,8 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let base_vault_key = Pubkey::new_unique();
     let quote_vault_key = Pubkey::new_unique();
-    let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
+    // base_mint must match the market's collateral_mint (security check in UpdateHyperpMark)
+    let pool_data = make_pumpswap_pool(&f.mint.key, &base_vault_key, &quote_vault_key);
 
     let base_amount = 2_000_000u64; // 2 tokens (base)
     let quote_amount = 20_000_000_000u64; // 20,000 USDC — well above MIN_DEX_QUOTE_LIQUIDITY (10,000 USDC)
@@ -3559,7 +3582,8 @@ fn test_update_hyperp_mark_boundary_liquidity() {
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let base_vault_key = Pubkey::new_unique();
     let quote_vault_key = Pubkey::new_unique();
-    let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
+    // base_mint must match the market's collateral_mint (security check in UpdateHyperpMark)
+    let pool_data = make_pumpswap_pool(&f.mint.key, &base_vault_key, &quote_vault_key);
 
     let threshold = percolator_prog::constants::MIN_DEX_QUOTE_LIQUIDITY;
     let below_threshold = threshold.saturating_sub(1);
@@ -3594,6 +3618,229 @@ fn test_update_hyperp_mark_boundary_liquidity() {
         res,
         Err(PercolatorError::InsufficientDexLiquidity.into()),
         "Boundary case: threshold-1 should be rejected"
+    );
+}
+
+// === UpdateHyperpMark — Meteora DLMM Vault Tests (GH#1521) ===
+
+/// Helper: initialise a Hyperp market and return the fixture.
+fn init_hyperp_market_fixture(f: &mut MarketFixture, initial_mark: u64) {
+    let init_data = encode_init_hyperp_market(&f.admin.key, &f.mint.key, initial_mark);
+    let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+    let accounts = [
+        f.admin.to_info(),
+        f.slab.to_info(),
+        f.mint.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        f.clock.to_info(),
+        f.rent.to_info(),
+        dummy_ata.to_info(),
+        f.system.to_info(),
+    ];
+    process_instruction(&f.program_id, &accounts, &init_data)
+        .expect("InitMarket Hyperp should succeed");
+}
+
+/// Test: UpdateHyperpMark accepts Meteora pool with sufficient vault_y liquidity.
+#[test]
+fn test_update_hyperp_mark_meteora_accepts_sufficient_liquidity() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 1_000_000u64; // $1.00 in e6
+    init_hyperp_market_fixture(&mut f, initial_mark);
+
+    let meteora_id = oracle::METEORA_DLMM_PROGRAM_ID;
+    let vault_y_key = Pubkey::new_unique();
+    // bin_step=100, active_id=0 → price = 1.0 → price_e6 = 1_000_000
+    let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
+    let pool_key = Pubkey::new_unique();
+
+    let mut pool_account = TestAccount::new(pool_key, meteora_id, 0, pool_data);
+    // vault_y with sufficient liquidity (above MIN_DEX_QUOTE_LIQUIDITY = 10B)
+    let mut vault_y = TestAccount::new(
+        vault_y_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(20_000_000_000), // 20B > 10B threshold
+    );
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200), // slot 200 > 100 (> MIN_HYPERP_UPDATE_INTERVAL_SLOTS)
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        vault_y.to_info(), // remaining_accounts[0] = vault_y
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert!(
+        res.is_ok(),
+        "UpdateHyperpMark should accept Meteora with sufficient vault_y liquidity: {:?}",
+        res
+    );
+    let config = state::read_config(&f.slab.data);
+    assert_ne!(config.authority_price_e6, 0, "Mark price should be updated");
+}
+
+/// Test: UpdateHyperpMark rejects Meteora pool with insufficient vault_y liquidity.
+#[test]
+fn test_update_hyperp_mark_meteora_rejects_insufficient_liquidity() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 1_000_000u64;
+    init_hyperp_market_fixture(&mut f, initial_mark);
+
+    let meteora_id = oracle::METEORA_DLMM_PROGRAM_ID;
+    let vault_y_key = Pubkey::new_unique();
+    let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
+
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    let mut vault_y = TestAccount::new(
+        vault_y_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(1), // 1 lamport — far below threshold
+    );
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        vault_y.to_info(),
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert_eq!(
+        res,
+        Err(PercolatorError::InsufficientDexLiquidity.into()),
+        "UpdateHyperpMark should reject Meteora with insufficient vault_y liquidity"
+    );
+}
+
+/// Test: UpdateHyperpMark rejects Meteora when vault_y key does not match LbPair.reserve_y.
+#[test]
+fn test_update_hyperp_mark_meteora_rejects_wrong_vault_y() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 1_000_000u64;
+    init_hyperp_market_fixture(&mut f, initial_mark);
+
+    let meteora_id = oracle::METEORA_DLMM_PROGRAM_ID;
+    let vault_y_key = Pubkey::new_unique();
+    let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
+
+    let wrong_vault_y_key = Pubkey::new_unique(); // different key — should be rejected
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    let mut wrong_vault_y = TestAccount::new(
+        wrong_vault_y_key,
+        spl_token::ID,
+        0,
+        make_spl_vault(20_000_000_000),
+    );
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        wrong_vault_y.to_info(), // wrong vault key
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert_eq!(
+        res,
+        Err(PercolatorError::InvalidOracleKey.into()),
+        "UpdateHyperpMark should reject Meteora when vault_y key does not match reserve_y"
+    );
+}
+
+/// Test: UpdateHyperpMark rejects Meteora when vault_y is owned by an invalid program.
+#[test]
+fn test_update_hyperp_mark_meteora_rejects_invalid_vault_owner() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 1_000_000u64;
+    init_hyperp_market_fixture(&mut f, initial_mark);
+
+    let meteora_id = oracle::METEORA_DLMM_PROGRAM_ID;
+    let vault_y_key = Pubkey::new_unique();
+    let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
+
+    let bad_owner = Pubkey::new_unique(); // not spl_token or spl_token_2022
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    let mut vault_y = TestAccount::new(
+        vault_y_key,
+        bad_owner, // invalid token program owner
+        0,
+        make_spl_vault(20_000_000_000),
+    );
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        vault_y.to_info(),
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert_eq!(
+        res,
+        Err(PercolatorError::OracleInvalid.into()),
+        "UpdateHyperpMark should reject Meteora vault owned by unknown program"
+    );
+}
+
+/// Test: UpdateHyperpMark rejects Meteora when no vault_y account provided.
+#[test]
+fn test_update_hyperp_mark_meteora_rejects_missing_vault_y() {
+    let mut f = setup_hyperp_market();
+    let initial_mark = 1_000_000u64;
+    init_hyperp_market_fixture(&mut f, initial_mark);
+
+    let meteora_id = oracle::METEORA_DLMM_PROGRAM_ID;
+    let vault_y_key = Pubkey::new_unique();
+    let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
+
+    let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    let mut clock = TestAccount::new(
+        solana_program::sysvar::clock::id(),
+        solana_program::sysvar::id(),
+        0,
+        make_clock(200, 200),
+    );
+
+    // Only 3 accounts — no vault_y in remaining_accounts
+    let accounts = [
+        f.slab.to_info(),
+        pool_account.to_info(),
+        clock.to_info(),
+        // no vault_y here
+    ];
+
+    let res = process_instruction(&f.program_id, &accounts, &encode_update_hyperp_mark());
+    assert_eq!(
+        res,
+        Err(ProgramError::NotEnoughAccountKeys),
+        "UpdateHyperpMark should reject Meteora without vault_y account"
     );
 }
 
@@ -5275,7 +5522,7 @@ fn test_update_hyperp_mark_blend_weight_zero_backward_compat() {
         "default mark_oracle_weight_bps should be 0"
     );
 
-    // Build sufficient PumpSwap pool
+    // Build sufficient PumpSwap pool (base_mint = market collateral_mint)
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let bvk = Pubkey::new_unique();
     let qvk = Pubkey::new_unique();
@@ -5283,10 +5530,10 @@ fn test_update_hyperp_mark_blend_weight_zero_backward_compat() {
         Pubkey::new_unique(),
         pumpswap_id,
         0,
-        make_pumpswap_pool(&bvk, &qvk),
+        make_pumpswap_pool(&f.mint.key, &bvk, &qvk),
     );
     let mut bv = TestAccount::new(bvk, spl_token::ID, 0, make_spl_vault(2_000_000));
-    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(200_000_000));
+    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(20_000_000_000)); // 20B > MIN_DEX_QUOTE_LIQUIDITY
     let mut clk = TestAccount::new(
         solana_program::sysvar::clock::id(),
         solana_program::sysvar::id(),
@@ -5347,7 +5594,7 @@ fn test_update_hyperp_mark_blend_weight_5000() {
         state::write_config(&mut f.slab.data, &cfg);
     }
 
-    // Build sufficient PumpSwap pool (DEX price ~$150)
+    // Build sufficient PumpSwap pool (DEX price ~$150, base_mint = market collateral_mint)
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let bvk = Pubkey::new_unique();
     let qvk = Pubkey::new_unique();
@@ -5355,10 +5602,10 @@ fn test_update_hyperp_mark_blend_weight_5000() {
         Pubkey::new_unique(),
         pumpswap_id,
         0,
-        make_pumpswap_pool(&bvk, &qvk),
+        make_pumpswap_pool(&f.mint.key, &bvk, &qvk),
     );
     let mut bv = TestAccount::new(bvk, spl_token::ID, 0, make_spl_vault(1_000_000));
-    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(150_000_000));
+    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(15_000_000_000)); // 15B > MIN_DEX_QUOTE_LIQUIDITY
     let mut clk = TestAccount::new(
         solana_program::sysvar::clock::id(),
         solana_program::sysvar::id(),
