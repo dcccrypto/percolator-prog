@@ -3475,14 +3475,14 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
         assert!(res.is_ok(), "InitMarket Hyperp should succeed: {:?}", res);
     }
 
-    // Build PumpSwap pool with SUFFICIENT liquidity (200M quote = $200 USDC)
+    // Build PumpSwap pool with SUFFICIENT liquidity (20B quote = $20,000 USDC, above 10,000 USDC minimum)
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let base_vault_key = Pubkey::new_unique();
     let quote_vault_key = Pubkey::new_unique();
     let pool_data = make_pumpswap_pool(&base_vault_key, &quote_vault_key);
 
     let base_amount = 2_000_000u64; // 2 tokens (base)
-    let quote_amount = 200_000_000u64; // 200 USDC — well above 100M threshold
+    let quote_amount = 20_000_000_000u64; // 20,000 USDC — well above MIN_DEX_QUOTE_LIQUIDITY (10,000 USDC)
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
     let mut base_vault = TestAccount::new(

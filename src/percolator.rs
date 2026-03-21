@@ -114,7 +114,12 @@ pub mod constants {
     pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // Funding scale factor (e6 units)
     pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500; // cap premium at 5.00%
     pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5; // cap per-slot funding
-    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000; // 1% per slot max price change for Hyperp
+    /// Maximum price change per slot for Hyperp oracle (circuit breaker).
+    /// Old: 10,000 (1.00% per slot) — too generous, allows 30% manipulation/min.
+    /// New: 1,000 (0.10% per slot) — combined with 25-slot cooldown,
+    /// max manipulation = 0.1% × 25 slots = 2.5% per crank, 6 cranks/min = 15%/min.
+    /// Actual EMA drift is much slower due to alpha damping.
+    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 1_000;
     pub const DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS: u64 = 50_000; // 5% per slot max price change for DEX oracle markets
 
     /// Minimum DEX quote-side liquidity (in quote token lamports/atoms) required
@@ -129,7 +134,12 @@ pub mod constants {
     /// Value: 100_000_000 (100 USDC at 6 decimals, or 0.1 SOL at 9 decimals).
     /// This is intentionally low — the circuit breaker provides the primary protection.
     /// This constant gates the MINIMUM pool depth to prevent trivial manipulation.
-    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 100_000_000;
+    /// Minimum quote-side liquidity in the DEX pool for Hyperp oracle acceptance.
+    /// Old: 100_000_000 (0.1 SOL ≈ $15 — trivially manipulable).
+    /// New: 10_000_000_000 (10 SOL ≈ $1,500 or 10,000 USDC).
+    /// This makes flash-loan manipulation cost at least $1,500 in pool distortion,
+    /// which must exceed the profit from a 0.1% per-slot EMA drift.
+    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 10_000_000_000;
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
@@ -4961,10 +4971,23 @@ pub mod oracle {
             let price = read_raydium_clmm_price_e6(price_ai, &dex_feed_id)?;
             (price, liquidity)
         } else if *price_ai.owner == METEORA_DLMM_PROGRAM_ID {
-            // Meteora DLMM: no direct liquidity field accessible without scanning bins.
-            // The price calculation succeeding (non-zero result) implies SOME liquidity.
-            // We use u64::MAX as a sentinel meaning "liquidity not measurable but present".
-            // The caller can skip the liquidity check for Meteora or use a different threshold.
+            // Meteora DLMM: liquidity depth check.
+            //
+            // SECURITY: The Meteora DLMM LbPair account layout has reserve_x/reserve_y
+            // IDL fields at offsets 152/184, but these are Pubkeys (vault token account
+            // addresses), NOT u64 token amounts. Reading raw bytes at those offsets as
+            // u64 would produce garbage data and corrupt the liquidity check.
+            //
+            // To properly read vault balances we would need to pass the vault token
+            // accounts as additional accounts and read the SPL token account `amount`
+            // field. That requires CPI or additional account passing which UpdateHyperpMark
+            // does not currently support.
+            //
+            // Safe fallback: use u64::MAX sentinel so the MIN_DEX_QUOTE_LIQUIDITY check
+            // always passes for Meteora pools. The price validity check in
+            // read_meteora_dlmm_price_e6 (bin_step > 0, active_id in range, finite price)
+            // provides the primary safety gate. Real reserve depth checking for Meteora
+            // is tracked as a follow-up improvement.
             let price = read_meteora_dlmm_price_e6(price_ai, &dex_feed_id)?;
             (price, u64::MAX)
         } else {
@@ -12605,9 +12628,11 @@ pub mod processor {
 
                 // PERC-367: Minimum update interval — limits manipulation frequency.
                 // An attacker calling UpdateHyperpMark every slot with a manipulated
-                // pool can gradually shift the EMA. A 5-slot (~2s) cooldown reduces
-                // the rate of possible EMA poisoning attempts.
-                const MIN_HYPERP_UPDATE_INTERVAL_SLOTS: u64 = 5;
+                // pool can gradually shift the EMA.
+                // Old: 5 slots (~2s) — allows 30 cranks/min → 30% EMA drift/min.
+                // New: 25 slots (~10s) — allows 6 cranks/min → 6% EMA drift/min.
+                // Combined with 0.1% cap (below), max drift = 0.6%/min.
+                const MIN_HYPERP_UPDATE_INTERVAL_SLOTS: u64 = 25;
                 if dt_slots < MIN_HYPERP_UPDATE_INTERVAL_SLOTS {
                     return Ok(()); // too soon — skip silently
                 }
@@ -12692,6 +12717,39 @@ pub mod processor {
                 //
                 // Use prev_mark as oracle fallback if last_effective_price_e6 is not yet seeded.
                 let prev_mark = config.authority_price_e6;
+
+                // SECURITY: Max deviation clamp — clamp DEX spot price to a band around
+                // the current EMA mark. Acts as a "TWAP band" without new on-chain state.
+                // A flash-loan attack pushes spot far from EMA → clamped, not rejected.
+                //
+                // IMPORTANT: We clamp rather than hard-reject to avoid permanently wedging
+                // the oracle when the true price legitimately moves >5% between updates
+                // (e.g., rapid market moves, infrequent cranking). A hard-reject would
+                // require admin intervention to unblock the oracle.
+                //
+                // With clamping: the oracle still advances toward the new true price each
+                // crank, just rate-limited. Flash loans still cannot manipulate the EMA
+                // because the extreme spike is clamped before entering the EMA blend.
+                // 500 bps = 5% max step from current mark.
+                const MAX_HYPERP_DEVIATION_BPS: u64 = 500;
+                let dex_price = if prev_mark > 0 {
+                    let max_delta = (prev_mark as u128)
+                        .saturating_mul(MAX_HYPERP_DEVIATION_BPS as u128)
+                        / 10_000;
+                    let max_delta = max_delta.min(prev_mark as u128) as u64;
+                    let lo = prev_mark.saturating_sub(max_delta);
+                    let hi = prev_mark.saturating_add(max_delta);
+                    if dex_price < lo || dex_price > hi {
+                        msg!(
+                            "UpdateHyperpMark: DEX price {} outside band [{}, {}] (mark {}), clamping",
+                            dex_price, lo, hi, prev_mark,
+                        );
+                    }
+                    dex_price.clamp(lo, hi)
+                } else {
+                    dex_price
+                };
+
                 let oracle_for_blend = if config.last_effective_price_e6 > 0 {
                     config.last_effective_price_e6
                 } else {
