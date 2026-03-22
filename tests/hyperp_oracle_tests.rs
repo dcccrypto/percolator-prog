@@ -4,7 +4,7 @@
 //! and fails safely. Any failing test is a mainnet blocker.
 //!
 //! Test categories:
-//!   1. Security Gate 1 — MIN_DEX_QUOTE_LIQUIDITY >= $50k
+//!   1. Security Gate 1 — MIN_DEX_QUOTE_LIQUIDITY >= $2M
 //!   2. Security Gate 2 — oracle.update() NOT CPI-callable (documented)
 //!   3. Security Gate 3 — Per-epoch OI cap proportional to pool depth
 //!   4. Security Gate 4 — EMA window >= 50 slots
@@ -33,41 +33,43 @@ fn hyperp_config_with_mark(prev_mark: u64) -> state::MarketConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECURITY GATE 1: MIN_DEX_QUOTE_LIQUIDITY >= $50k
+// SECURITY GATE 1: MIN_DEX_QUOTE_LIQUIDITY >= $2M
+// (Raised from $50k: at $50k depth, 1% oracle distortion costs <$20k — unsafe for long-tail tokens.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn gate1_min_dex_liquidity_is_fifty_k_usdc() {
-    // MAINNET GATE: Security requires $50,000 minimum pool depth before mainnet.
-    // 50_000 USDC at 6 decimals = 50_000_000_000 atoms.
+fn gate1_min_dex_liquidity_is_two_million_usdc() {
+    // MAINNET GATE: Security requires $2,000,000 minimum pool depth before any long-tail market
+    // goes live. At this depth, 1% oracle distortion requires $20M capital — economically irrational.
+    // 2_000_000 USDC at 6 decimals = 2_000_000_000_000 atoms.
     assert_eq!(
         constants::MIN_DEX_QUOTE_LIQUIDITY,
-        50_000_000_000,
-        "GATE1 FAIL: MIN_DEX_QUOTE_LIQUIDITY must be $50k (50_000_000_000 atoms)"
+        2_000_000_000_000,
+        "GATE1 FAIL: MIN_DEX_QUOTE_LIQUIDITY must be $2M (2_000_000_000_000 atoms)"
     );
 }
 
 #[test]
 fn gate1_below_threshold_is_rejected() {
-    let below = 49_999_000_000u64; // $49,999
+    let below = 1_999_999_000_000u64; // $1,999,999
     assert!(
         below < constants::MIN_DEX_QUOTE_LIQUIDITY,
-        "$49,999 pool must be below the $50k minimum"
+        "$1,999,999 pool must be below the $2M minimum"
     );
 }
 
 #[test]
 fn gate1_at_threshold_is_accepted() {
-    let at = 50_000_000_000u64; // $50,000
+    let at = 2_000_000_000_000u64; // $2,000,000
     assert!(
         at >= constants::MIN_DEX_QUOTE_LIQUIDITY,
-        "$50,000 pool must meet or exceed the minimum"
+        "$2,000,000 pool must meet or exceed the minimum"
     );
 }
 
 #[test]
 fn gate1_deep_pool_is_accepted() {
-    let deep = 100_000_000_000u64; // $100k
+    let deep = 5_000_000_000_000u64; // $5M
     assert!(deep >= constants::MIN_DEX_QUOTE_LIQUIDITY);
 }
 
@@ -521,14 +523,15 @@ fn manipulation_sustained_4_cranks_bounded() {
 
 #[test]
 fn manipulation_min_pool_requirement_is_economic_barrier() {
-    // At $50k pool depth, flash loan must move $50k to shift price 1%.
+    // At $2M pool depth, flash loan must move $2M to shift price 1%.
     // With 0.1% EMA cap, attacker gains only 0.1% per crank.
-    // For a $100k position: gain = 0.1% × $100k = $100/crank.
-    // Flash loan fee ($50k × 0.09%) = $45 + pool fees + slippage >> $100.
-    // Attack is unprofitable. This verifies the threshold is set correctly.
+    // For a $1M position: gain = 0.1% × $1M = $1,000/crank.
+    // Flash loan fee ($2M × 0.09%) = $1,800 + pool fees + slippage >> $1,000.
+    // Attack is unprofitable. Prior $50k threshold was insufficient for long-tail tokens
+    // where distortion capital was <$20k — now raised to $2M to close that gap.
     assert!(
-        constants::MIN_DEX_QUOTE_LIQUIDITY >= 50_000_000_000,
-        "Pool minimum must be >= $50k for flash-loan resistance"
+        constants::MIN_DEX_QUOTE_LIQUIDITY >= 2_000_000_000_000,
+        "Pool minimum must be >= $2M for flash-loan resistance on long-tail tokens"
     );
 }
 
@@ -551,15 +554,15 @@ fn threat_cpi_manipulation_gate2_boundary_conditions() {
 /// DEFENCE: MIN_DEX_QUOTE_LIQUIDITY check before every EMA update.
 #[test]
 fn threat_liquidity_migration_depth_check() {
-    // Post-migration pool depths that must be rejected:
+    // Post-migration pool depths that must be rejected (all well below the $2M minimum):
     let empty = 0u64;
-    let ten_k = 10_000_000_000u64; // $10k
-    let forty_nine_k = 49_000_000_000u64; // $49k
+    let fifty_k = 50_000_000_000u64; // $50k (old threshold — now insufficient)
+    let one_m = 1_000_000_000_000u64; // $1M
 
-    for &shallow in &[empty, ten_k, forty_nine_k] {
+    for &shallow in &[empty, fifty_k, one_m] {
         assert!(
             shallow < constants::MIN_DEX_QUOTE_LIQUIDITY,
-            "Pool depth ${} must fail $50k minimum",
+            "Pool depth ${} must fail $2M minimum",
             shallow / 1_000_000
         );
     }

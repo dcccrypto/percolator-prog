@@ -3497,7 +3497,7 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
         assert!(res.is_ok(), "InitMarket Hyperp should succeed: {:?}", res);
     }
 
-    // Build PumpSwap pool with SUFFICIENT liquidity (60B quote = $60,000 USDC, above $50,000 minimum)
+    // Build PumpSwap pool with SUFFICIENT liquidity (2.1T quote = $2,100,000 USDC, above $2M minimum)
     let pumpswap_id = oracle::PUMPSWAP_PROGRAM_ID;
     let base_vault_key = Pubkey::new_unique();
     let quote_vault_key = Pubkey::new_unique();
@@ -3505,7 +3505,7 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
     let pool_data = make_pumpswap_pool(&f.mint.key, &base_vault_key, &quote_vault_key);
 
     let base_amount = 2_000_000u64; // 2 tokens (base)
-    let quote_amount = 60_000_000_000u64; // 60,000 USDC — well above MIN_DEX_QUOTE_LIQUIDITY ($50,000)
+    let quote_amount = 2_100_000_000_000u64; // 2,100,000 USDC — well above MIN_DEX_QUOTE_LIQUIDITY ($2M)
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), pumpswap_id, 0, pool_data);
     let mut base_vault = TestAccount::new(
@@ -3656,12 +3656,12 @@ fn test_update_hyperp_mark_meteora_accepts_sufficient_liquidity() {
     let pool_key = Pubkey::new_unique();
 
     let mut pool_account = TestAccount::new(pool_key, meteora_id, 0, pool_data);
-    // vault_y with sufficient liquidity (above MIN_DEX_QUOTE_LIQUIDITY = $50k = 50B)
+    // vault_y with sufficient liquidity (above MIN_DEX_QUOTE_LIQUIDITY = $2M = 2T atoms)
     let mut vault_y = TestAccount::new(
         vault_y_key,
         spl_token::ID,
         0,
-        make_spl_vault(60_000_000_000), // 60B > 50B threshold
+        make_spl_vault(2_100_000_000_000), // 2.1T > 2T threshold ($2.1M > $2M)
     );
     let mut clock = TestAccount::new(
         solana_program::sysvar::clock::id(),
@@ -5533,7 +5533,7 @@ fn test_update_hyperp_mark_blend_weight_zero_backward_compat() {
         make_pumpswap_pool(&f.mint.key, &bvk, &qvk),
     );
     let mut bv = TestAccount::new(bvk, spl_token::ID, 0, make_spl_vault(2_000_000));
-    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(60_000_000_000)); // 60B > MIN_DEX_QUOTE_LIQUIDITY ($50k)
+    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(2_100_000_000_000)); // 2.1T > MIN_DEX_QUOTE_LIQUIDITY ($2M)
     let mut clk = TestAccount::new(
         solana_program::sysvar::clock::id(),
         solana_program::sysvar::id(),
@@ -5605,7 +5605,7 @@ fn test_update_hyperp_mark_blend_weight_5000() {
         make_pumpswap_pool(&f.mint.key, &bvk, &qvk),
     );
     let mut bv = TestAccount::new(bvk, spl_token::ID, 0, make_spl_vault(1_000_000));
-    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(60_000_000_000)); // 60B > MIN_DEX_QUOTE_LIQUIDITY ($50k)
+    let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(2_100_000_000_000)); // 2.1T > MIN_DEX_QUOTE_LIQUIDITY ($2M)
     let mut clk = TestAccount::new(
         solana_program::sysvar::clock::id(),
         solana_program::sysvar::id(),

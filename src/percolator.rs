@@ -137,11 +137,14 @@ pub mod constants {
     /// Minimum quote-side liquidity in the DEX pool for Hyperp oracle acceptance.
     /// Old: 100_000_000 (0.1 SOL ≈ $15 — trivially manipulable).
     /// Old: 10_000_000_000 (10 SOL ≈ $1,500 or 10,000 USDC).
-    /// New: 50_000_000_000 ($50,000 USDC at 6 decimals / ~333 SOL at 9 decimals).
-    /// MAINNET GATE: Security requires $50k minimum depth before mainnet launch.
-    /// At this depth, flash-loan manipulation requires $50k+ capital at risk per attack,
-    /// with only 0.1%/slot EMA drift gain — economically irrational.
-    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 50_000_000_000;
+    /// Old: 50_000_000_000 ($50,000 USDC — insufficient for non-major tokens; 1% oracle
+    ///      distortion costs <$20k at $50k depth, making manipulation cheap on long-tail markets).
+    /// New: 2_000_000_000_000 ($2,000,000 USDC at 6 decimals).
+    /// MAINNET GATE: Security requires $2M minimum depth before any long-tail market goes live.
+    /// At this depth, 1% oracle distortion requires $20M capital at risk per attack — economically
+    /// irrational. SOL/BTC/ETH majors already exceed this threshold; non-majors must reach it
+    /// before market activation.
+    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 2_000_000_000_000;
 
     /// Per-epoch OI cap denominator: max OI per epoch = DEX quote liquidity / this divisor.
     /// E.g., divisor=10 → max epoch OI = 10% of pool depth.
