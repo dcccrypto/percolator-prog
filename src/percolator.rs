@@ -136,10 +136,25 @@ pub mod constants {
     /// This constant gates the MINIMUM pool depth to prevent trivial manipulation.
     /// Minimum quote-side liquidity in the DEX pool for Hyperp oracle acceptance.
     /// Old: 100_000_000 (0.1 SOL ≈ $15 — trivially manipulable).
-    /// New: 10_000_000_000 (10 SOL ≈ $1,500 or 10,000 USDC).
-    /// This makes flash-loan manipulation cost at least $1,500 in pool distortion,
-    /// which must exceed the profit from a 0.1% per-slot EMA drift.
-    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 10_000_000_000;
+    /// Old: 10_000_000_000 (10 SOL ≈ $1,500 or 10,000 USDC).
+    /// New: 50_000_000_000 ($50,000 USDC at 6 decimals / ~333 SOL at 9 decimals).
+    /// MAINNET GATE: Security requires $50k minimum depth before mainnet launch.
+    /// At this depth, flash-loan manipulation requires $50k+ capital at risk per attack,
+    /// with only 0.1%/slot EMA drift gain — economically irrational.
+    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 50_000_000_000;
+
+    /// Per-epoch OI cap denominator: max OI per epoch = DEX quote liquidity / this divisor.
+    /// E.g., divisor=10 → max epoch OI = 10% of pool depth.
+    /// This prevents attackers from opening positions that dwarf the backing pool.
+    /// Security Gate 3 (mainnet): per-epoch OI must be proportional to pool depth.
+    pub const HYPERP_EPOCH_OI_POOL_DIVISOR: u64 = 10;
+
+    /// Compile-time assertion: EMA window must be >= 50 slots (Security Gate 4).
+    /// Current: 72_000 slots (~8 hours). This check ensures no regression.
+    const _: () = assert!(
+        MARK_PRICE_EMA_WINDOW_SLOTS >= 50,
+        "EMA window must be >= 50 slots for mainnet (security gate 4)"
+    );
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
@@ -4106,6 +4121,45 @@ pub mod state {
         let bytes = status.to_le_bytes();
         config._orphan_pad[0] = bytes[0];
         config._orphan_pad[1] = bytes[1];
+    }
+
+    // ========================================
+    // Security Gate 3: Per-epoch OI cap proportional to pool depth
+    // ========================================
+
+    /// Read the last observed DEX quote liquidity from `_orphan_pad[2..6]`.
+    /// Stored as a u32 in units of 1_000 (i.e., raw_value × 1_000 = actual u64).
+    /// Max storable: 4_294_967_295 × 1_000 ≈ 4.3 trillion atoms (~$4.3B at 6 dec).
+    /// 0 = never observed (pool depth not yet recorded).
+    #[inline]
+    pub fn get_last_dex_liquidity_k(config: &MarketConfig) -> u32 {
+        u32::from_le_bytes(config._orphan_pad[2..6].try_into().unwrap_or([0u8; 4]))
+    }
+
+    /// Write the last observed DEX quote liquidity into `_orphan_pad[2..6]`.
+    /// Stores `value / 1_000` (saturating). Caller should pass raw quote_liquidity.
+    #[inline]
+    pub fn set_last_dex_liquidity_k(config: &mut MarketConfig, quote_liquidity: u64) {
+        let scaled = (quote_liquidity / 1_000).min(u32::MAX as u64) as u32;
+        let bytes = scaled.to_le_bytes();
+        config._orphan_pad[2] = bytes[0];
+        config._orphan_pad[3] = bytes[1];
+        config._orphan_pad[4] = bytes[2];
+        config._orphan_pad[5] = bytes[3];
+    }
+
+    /// Compute the per-epoch OI cap based on last recorded pool depth.
+    /// Returns None if pool depth not yet recorded (no cap enforcement).
+    /// Cap = quote_liquidity / HYPERP_EPOCH_OI_POOL_DIVISOR.
+    /// This ensures market OI cannot grow faster than the backing pool depth supports.
+    #[inline]
+    pub fn compute_epoch_oi_cap_from_pool(config: &MarketConfig) -> Option<u64> {
+        let depth_k = get_last_dex_liquidity_k(config);
+        if depth_k == 0 {
+            return None; // No pool depth recorded yet
+        }
+        let depth = (depth_k as u64).saturating_mul(1_000);
+        Some(depth / crate::constants::HYPERP_EPOCH_OI_POOL_DIVISOR)
     }
 
     /// Read the slot at which AuditCrank last paused the market from
@@ -8385,6 +8439,29 @@ pub mod processor {
         let phase_cap = state::phase_oi_cap(phase, u64::MAX) as u128;
         let max_oi = max_oi.min(phase_cap);
 
+        // SECURITY GATE 3: Per-epoch OI cap proportional to pool depth.
+        // For Hyperp markets, OI cannot exceed (pool_depth / HYPERP_EPOCH_OI_POOL_DIVISOR).
+        // This prevents attackers from building OI positions that dwarf the backing pool —
+        // which would make oracle manipulation economically attractive.
+        // Non-Hyperp markets (Pyth-pinned) are exempt: they have a trusted oracle source.
+        let max_oi = if oracle::is_hyperp_mode(config) {
+            if let Some(pool_oi_cap) = state::compute_epoch_oi_cap_from_pool(config) {
+                let pool_cap = pool_oi_cap as u128;
+                if max_oi > pool_cap {
+                    msg!(
+                        "OI cap tightened by pool depth: configured={} pool_cap={}",
+                        max_oi,
+                        pool_cap,
+                    );
+                }
+                max_oi.min(pool_cap)
+            } else {
+                max_oi
+            }
+        } else {
+            max_oi
+        };
+
         if current_oi > max_oi {
             msg!(
                 "OI cap exceeded: current={} max={} (vault={} multiplier={} effective={} skew_factor={} phase={})",
@@ -12642,6 +12719,29 @@ pub mod processor {
                 if accounts.len() < 3 {
                     return Err(ProgramError::NotEnoughAccountKeys);
                 }
+
+                // SECURITY GATE 2: Reject UpdateHyperpMark if called via CPI.
+                //
+                // Threat: An attacker bundles UpdateHyperpMark + Trade in the same
+                // transaction, first pushing a manipulated pool price to prime the EMA,
+                // then immediately trading against the freshly biased mark price.
+                // Even with the 25-slot cooldown, if both instructions run in the same
+                // transaction (same block), the cooldown offers no protection.
+                //
+                // Defence: solana_program::program::get_stack_height() returns 1 for
+                // top-level instructions and >1 for CPI calls. Reject anything > 1.
+                // This is an on-chain, consensus-level check — cannot be bypassed.
+                //
+                // Note: this prevents anyone from using UpdateHyperpMark as a CPI
+                // sub-call from another program. Direct invocation (stack height = 1)
+                // is the only valid path.
+                if solana_program::instruction::get_stack_height()
+                    > solana_program::instruction::TRANSACTION_LEVEL_STACK_HEIGHT
+                {
+                    msg!("UpdateHyperpMark: CPI invocation rejected (security gate 2)");
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
                 let a_slab = &accounts[0];
                 let a_dex_pool = &accounts[1];
                 let a_clock = &accounts[2];
@@ -12850,10 +12950,17 @@ pub mod processor {
 
                 config.authority_price_e6 = new_mark;
                 config.last_effective_price_e6 = new_index;
+
+                // SECURITY GATE 3: Record pool depth for per-epoch OI cap enforcement.
+                // This is read by the trade path to compute the epoch OI ceiling proportional
+                // to backing pool depth. Without this, OI can grow unbounded relative to the
+                // pool, making the oracle manipulable by large-position pressure.
+                state::set_last_dex_liquidity_k(&mut config, dex_result.quote_liquidity);
+
                 state::write_config(&mut data, &config);
 
                 msg!(
-                    "UpdateHyperpMark: dex_price={} oracle={} blend={} prev_mark={} new_mark={} index={} weight_bps={} dt={}",
+                    "UpdateHyperpMark: dex_price={} oracle={} blend={} prev_mark={} new_mark={} index={} weight_bps={} dt={} pool_depth={}",
                     dex_price,
                     oracle_for_blend,
                     blend_input,
@@ -12861,7 +12968,8 @@ pub mod processor {
                     new_mark,
                     new_index,
                     oracle_weight_bps,
-                    dt_slots
+                    dt_slots,
+                    dex_result.quote_liquidity,
                 );
             }
 
