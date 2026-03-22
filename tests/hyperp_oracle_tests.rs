@@ -120,7 +120,10 @@ fn gate3_no_pool_depth_returns_none() {
     let cfg = hyperp_config_with_mark(100_000_000);
     // No depth recorded (zeroed config)
     let cap = state::compute_epoch_oi_cap_from_pool(&cfg);
-    assert!(cap.is_none(), "Without pool depth, epoch OI cap must be None");
+    assert!(
+        cap.is_none(),
+        "Without pool depth, epoch OI cap must be None"
+    );
 }
 
 #[test]
@@ -139,7 +142,9 @@ fn gate3_pool_50k_produces_correct_epoch_cap() {
     assert!(
         diff <= 1000 * constants::HYPERP_EPOCH_OI_POOL_DIVISOR,
         "OI cap should be pool_depth / HYPERP_EPOCH_OI_POOL_DIVISOR. expected={} got={} diff={}",
-        expected, cap, diff
+        expected,
+        cap,
+        diff
     );
 }
 
@@ -169,9 +174,9 @@ fn gate3_pool_depth_storage_roundtrip() {
 
     // Test roundtrip for multiple depths
     for &depth in &[
-        50_000_000_000u64,   // $50k
-        100_000_000_000,     // $100k
-        1_000_000_000_000,   // $1M
+        50_000_000_000u64, // $50k
+        100_000_000_000,   // $100k
+        1_000_000_000_000, // $1M
     ] {
         state::set_last_dex_liquidity_k(&mut cfg, depth);
         let retrieved = state::get_last_dex_liquidity_k(&cfg) as u64 * 1_000;
@@ -179,7 +184,8 @@ fn gate3_pool_depth_storage_roundtrip() {
         assert!(
             depth.abs_diff(retrieved) <= 999,
             "Storage roundtrip error > 999: depth={} retrieved={}",
-            depth, retrieved
+            depth,
+            retrieved
         );
     }
 }
@@ -201,7 +207,8 @@ fn gate4_ema_window_at_least_50_slots() {
 fn gate4_ema_alpha_consistent_with_window() {
     let expected = 2_000_000u64 / (constants::MARK_PRICE_EMA_WINDOW_SLOTS + 1);
     assert_eq!(
-        constants::MARK_PRICE_EMA_ALPHA_E6, expected,
+        constants::MARK_PRICE_EMA_ALPHA_E6,
+        expected,
         "EMA alpha must equal 2/(N+1) in e6 units"
     );
 }
@@ -254,13 +261,18 @@ fn ema_dt_zero_returns_oracle_price_bootstrap_behavior() {
     let spot = 160_000_000u64;
 
     let result = oracle::compute_ema_mark_price(
-        prev, spot, 0,
+        prev,
+        spot,
+        0,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
     );
     // At dt=0 the function returns oracle_e6 (bootstrap semantics).
     // The instruction handler skips this call entirely when dt=0 via the same-slot guard.
-    assert_eq!(result, spot, "EMA at dt=0 returns oracle (bootstrap semantics)");
+    assert_eq!(
+        result, spot,
+        "EMA at dt=0 returns oracle (bootstrap semantics)"
+    );
 }
 
 #[test]
@@ -289,7 +301,9 @@ fn ema_10pct_spike_dampened_to_01pct() {
     let spiked = 110_000_000u64; // +10%
 
     let after = oracle::compute_ema_mark_price(
-        prev, spiked, 1,
+        prev,
+        spiked,
+        1,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
     );
@@ -309,21 +323,29 @@ fn ema_convergence_distance_decreases_over_slots() {
     let oracle_price = 100_000_000u64; // $100
 
     let d_after_1 = verify::mark_distance_after_step(
-        prev_mark, oracle_price,
+        prev_mark,
+        oracle_price,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         1,
     );
     let d_after_25 = verify::mark_distance_after_step(
-        prev_mark, oracle_price,
+        prev_mark,
+        oracle_price,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         25,
     );
     let original_dist = oracle_price - prev_mark; // 10_000_000
 
-    assert!(d_after_1 < original_dist, "After 1 step, distance must decrease");
-    assert!(d_after_25 <= d_after_1, "After 25 steps, distance must be <= after 1 step");
+    assert!(
+        d_after_1 < original_dist,
+        "After 1 step, distance must decrease"
+    );
+    assert!(
+        d_after_25 <= d_after_1,
+        "After 25 steps, distance must be <= after 1 step"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +357,12 @@ fn cb_fires_on_50pct_crash_single_slot() {
     let prev = 100_000_000u64;
     let crashed = 50_000_000u64; // -50%
     assert!(
-        verify::circuit_breaker_triggered(prev, crashed, constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS, 1),
+        verify::circuit_breaker_triggered(
+            prev,
+            crashed,
+            constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+            1
+        ),
         "CB must fire on 50% single-slot crash"
     );
 }
@@ -345,7 +372,12 @@ fn cb_fires_on_50pct_pump_single_slot() {
     let prev = 100_000_000u64;
     let pumped = 150_000_000u64; // +50%
     assert!(
-        verify::circuit_breaker_triggered(prev, pumped, constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS, 1),
+        verify::circuit_breaker_triggered(
+            prev,
+            pumped,
+            constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+            1
+        ),
         "CB must fire on 50% single-slot pump"
     );
 }
@@ -355,7 +387,12 @@ fn cb_does_not_fire_on_normal_01pct_move() {
     let prev = 100_000_000u64;
     let normal = 100_090_000u64; // +0.09% < cap of 0.10%
     assert!(
-        !verify::circuit_breaker_triggered(prev, normal, constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS, 1),
+        !verify::circuit_breaker_triggered(
+            prev,
+            normal,
+            constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+            1
+        ),
         "CB must NOT fire on 0.09% move (cap=0.1%)"
     );
 }
@@ -365,7 +402,12 @@ fn cb_does_not_fire_on_legitimate_5pct_move_over_100_slots() {
     let prev = 100_000_000u64;
     let moved = 105_000_000u64; // +5% over 100 slots → cap allows 10%
     assert!(
-        !verify::circuit_breaker_triggered(prev, moved, constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS, 100),
+        !verify::circuit_breaker_triggered(
+            prev,
+            moved,
+            constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+            100
+        ),
         "CB must not fire on 5% move over 100 slots (cap=0.1% × 100=10%)"
     );
 }
@@ -377,17 +419,16 @@ fn cb_clamped_ema_stays_within_cap_bounds() {
     let dt = 1u64;
     let cap = constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS;
 
-    let new_mark = oracle::compute_ema_mark_price(
-        prev, attack, dt,
-        constants::MARK_PRICE_EMA_ALPHA_E6, cap,
-    );
+    let new_mark =
+        oracle::compute_ema_mark_price(prev, attack, dt, constants::MARK_PRICE_EMA_ALPHA_E6, cap);
 
     // allowed_move = prev × cap / 1_000_000 per slot × dt
     let allowed = (prev as u128 * cap as u128 * dt as u128 / 1_000_000) as u64;
     assert!(
         new_mark.abs_diff(prev) <= allowed + 1,
         "EMA must stay within cap bounds. diff={} allowed={}",
-        new_mark.abs_diff(prev), allowed
+        new_mark.abs_diff(prev),
+        allowed
     );
 }
 
@@ -398,10 +439,12 @@ fn cb_clamped_ema_stays_within_cap_bounds() {
 #[test]
 fn staleness_large_dt_mark_moves_toward_new_price() {
     let last_mark = 200_000_000u64; // $200
-    let new_spot = 180_000_000u64;  // $180 (keeper was offline for 1000 slots)
+    let new_spot = 180_000_000u64; // $180 (keeper was offline for 1000 slots)
 
     let new_mark = oracle::compute_ema_mark_price(
-        last_mark, new_spot, 1000,
+        last_mark,
+        new_spot,
+        1000,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
     );
@@ -418,7 +461,10 @@ fn staleness_cb_fires_on_large_single_slot_jump() {
     let crashed = 50_000_000u64;
 
     let fired = verify::circuit_breaker_triggered(
-        prev, crashed, constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS, 1
+        prev,
+        crashed,
+        constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+        1,
     );
     assert!(fired, "CB must fire on 50% crash");
 }
@@ -433,7 +479,9 @@ fn manipulation_single_block_20pct_swing_clamped() {
     let attack = 120_000_000u64; // +20%
 
     let new_mark = oracle::compute_ema_mark_price(
-        prev, attack, 1,
+        prev,
+        attack,
+        1,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
     );
@@ -454,7 +502,9 @@ fn manipulation_sustained_4_cranks_bounded() {
     let mut mark = start;
     for _ in 0..4 {
         mark = oracle::compute_ema_mark_price(
-            mark, attack, 25,
+            mark,
+            attack,
+            25,
             constants::MARK_PRICE_EMA_ALPHA_E6,
             constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         );
@@ -493,7 +543,7 @@ fn threat_cpi_manipulation_gate2_boundary_conditions() {
     use solana_program::instruction::TRANSACTION_LEVEL_STACK_HEIGHT;
     // At height=1 (normal tx): gate does NOT fire → oracle update allowed
     assert!(1 <= TRANSACTION_LEVEL_STACK_HEIGHT); // allowed
-    // At height=2 (CPI): gate fires → update rejected
+                                                  // At height=2 (CPI): gate fires → update rejected
     assert!(2 > TRANSACTION_LEVEL_STACK_HEIGHT); // blocked
 }
 
@@ -509,7 +559,8 @@ fn threat_liquidity_migration_depth_check() {
     for &shallow in &[empty, ten_k, forty_nine_k] {
         assert!(
             shallow < constants::MIN_DEX_QUOTE_LIQUIDITY,
-            "Pool depth ${} must fail $50k minimum", shallow / 1_000_000
+            "Pool depth ${} must fail $50k minimum",
+            shallow / 1_000_000
         );
     }
 }
@@ -526,7 +577,9 @@ fn threat_validator_mev_walk_profit_bounded() {
     let mut mark = start;
     for _ in 0..3 {
         mark = oracle::compute_ema_mark_price(
-            mark, attack_target, 25,
+            mark,
+            attack_target,
+            25,
             constants::MARK_PRICE_EMA_ALPHA_E6,
             constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         );
@@ -598,7 +651,9 @@ fn decimal_ema_price_in_e6_format() {
     let btc_spike = 55_000_000_000u64; // $55k (+10%)
 
     let result = oracle::compute_ema_mark_price(
-        btc_price, btc_spike, 1,
+        btc_price,
+        btc_spike,
+        1,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
     );
@@ -612,7 +667,8 @@ fn decimal_ema_price_in_e6_format() {
     assert!(
         result.abs_diff(btc_price) <= max_move + 1,
         "BTC EMA must respect 0.1% cap. diff={} max={}",
-        result.abs_diff(btc_price), max_move
+        result.abs_diff(btc_price),
+        max_move
     );
 }
 
@@ -623,7 +679,9 @@ fn decimal_small_price_token_no_overflow() {
     let micro_spike = 2u64; // +100% — immediately CB fires
 
     let result = oracle::compute_ema_mark_price(
-        micro_price, micro_spike, 1,
+        micro_price,
+        micro_spike,
+        1,
         constants::MARK_PRICE_EMA_ALPHA_E6,
         constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
     );
@@ -631,7 +689,10 @@ fn decimal_small_price_token_no_overflow() {
     // At this price level, cap = 0.1% rounds to 0, so result == micro_price
     // This is correct: EMA cannot move below 1 unit precision
     assert!(result >= micro_price, "Micro-price EMA must not underflow");
-    assert!(result <= micro_spike, "Micro-price EMA must not overshoot target");
+    assert!(
+        result <= micro_spike,
+        "Micro-price EMA must not overshoot target"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -647,20 +708,26 @@ fn stress_1000_ema_iterations_no_panic() {
 
     for i in 0u64..1000 {
         let spot = match i % 3 {
-            0 => mark + mark / 333, // +0.3%
+            0 => mark + mark / 333,               // +0.3%
             1 => mark.saturating_sub(mark / 333), // -0.3%
             _ => mark,
         };
 
         mark = oracle::compute_ema_mark_price(
-            mark, spot, 1,
+            mark,
+            spot,
+            1,
             constants::MARK_PRICE_EMA_ALPHA_E6,
             constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         );
 
         // Invariant: mark must never be zero or overflow
         assert!(mark > 0, "Mark must never be zero at iteration {}", i);
-        assert!(mark < u64::MAX / 2, "Mark must not overflow at iteration {}", i);
+        assert!(
+            mark < u64::MAX / 2,
+            "Mark must not overflow at iteration {}",
+            i
+        );
     }
 
     // After 1000 ±0.3% oscillations, mark should remain near start (EMA dampens)
@@ -682,7 +749,9 @@ fn stress_price_accuracy_within_1pct_of_oracle() {
     let mut mark = start;
     for _ in 0..100 {
         mark = oracle::compute_ema_mark_price(
-            mark, oracle_price, 1,
+            mark,
+            oracle_price,
+            1,
             constants::MARK_PRICE_EMA_ALPHA_E6,
             constants::DEFAULT_HYPERP_PRICE_CAP_E2BPS,
         );
