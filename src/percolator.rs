@@ -1090,7 +1090,7 @@ pub mod ix {
         KeeperCrank {
             caller_idx: u16,
             allow_panic: u8,
-            candidates: alloc::vec::Vec<u16>,
+            candidates: alloc::vec::Vec<(u16, Option<percolator::LiquidationPolicy>)>,
         },
         TradeNoCpi {
             lp_idx: u16,
@@ -1255,9 +1255,10 @@ pub mod ix {
                     let caller_idx = read_u16(&mut rest)?;
                     let allow_panic = read_u8(&mut rest)?;
                     // Parse candidate list: remaining bytes are u16 account indices
+                    // Each candidate maps to (u16, None) — None defaults to FullClose
                     let mut candidates = alloc::vec::Vec::new();
                     while rest.len() >= 2 {
-                        candidates.push(read_u16(&mut rest)?);
+                        candidates.push((read_u16(&mut rest)?, None));
                     }
                     Ok(Instruction::KeeperCrank {
                         caller_idx,
@@ -1511,8 +1512,8 @@ pub mod ix {
             liquidation_buffer_bps,
             min_liquidation_abs,
             min_initial_deposit: U128::ZERO,
-            min_nonzero_mm_req: 0u128,
-            min_nonzero_im_req: 0u128,
+            min_nonzero_mm_req: 1u128,
+            min_nonzero_im_req: 2u128,
         };
         Ok((params, insurance_floor))
     }
@@ -2843,7 +2844,7 @@ pub mod processor {
                 // The data is already zeroed above, so init_in_place only sets non-zero fields.
                 let engine = zc::engine_mut(&mut data)?;
                 engine.init_in_place(risk_params);
-                engine.set_insurance_floor(insurance_floor);
+                engine.insurance_floor = insurance_floor;
 
                 // Initialize slot fields to current slot to prevent overflow on first crank
                 let a_clock = &accounts[5];
@@ -3387,8 +3388,8 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
-                // Set funding rate before crank (anti-retroactivity: stored rate used next interval)
-                engine.set_funding_rate_for_next_interval(effective_funding_rate);
+                // Recompute r_last from final state before crank
+                engine.recompute_r_last_from_final_state();
 
                 // Two-phase crank: candidates computed off-chain, passed in instruction data
                 let _outcome = engine
@@ -3412,7 +3413,7 @@ pub mod processor {
                     if dust_before >= scale {
                         let units_to_sweep = dust_before / scale;
                         engine
-                            .top_up_insurance_fund(units_to_sweep as u128)
+                            .top_up_insurance_fund(units_to_sweep as u128, clock.slot)
                             .map_err(map_risk_error)?;
                         Some(dust_before % scale)
                     } else {
@@ -3449,9 +3450,8 @@ pub mod processor {
                     } else {
                         current.saturating_sub(max_step.min(current - smoothed))
                     };
-                    engine.set_insurance_floor(
-                        final_thresh.clamp(config.thresh_min, config.thresh_max),
-                    );
+                    engine.insurance_floor =
+                        final_thresh.clamp(config.thresh_min, config.thresh_max);
                     state::write_last_thr_update_slot(&mut data, clock.slot);
                 }
 
@@ -3817,7 +3817,7 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let _res = engine
-                    .liquidate_at_oracle(target_idx, clock.slot, price)
+                    .liquidate_at_oracle(target_idx, clock.slot, price, percolator::LiquidationPolicy::FullClose)
                     .map_err(map_risk_error)?;
                 sol_log_64(_res as u64, 0, 0, 0, 4); // result
                 #[cfg(feature = "cu-audit")]
@@ -3988,12 +3988,13 @@ pub mod processor {
                 )?;
             }
             Instruction::TopUpInsurance { amount } => {
-                accounts::expect_len(accounts, 5)?;
+                accounts::expect_len(accounts, 6)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
                 let a_token = &accounts[4];
+                let a_clock = &accounts[5];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -4030,9 +4031,10 @@ pub mod processor {
                 let old_dust = state::read_dust_base(&data);
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
+                let clock = Clock::from_account_info(a_clock)?;
                 let engine = zc::engine_mut(&mut data)?;
                 engine
-                    .top_up_insurance_fund(units as u128)
+                    .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
             Instruction::SetRiskThreshold { new_threshold } => {
@@ -4060,7 +4062,7 @@ pub mod processor {
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
-                engine.set_insurance_floor(new_threshold);
+                engine.insurance_floor = new_threshold;
             }
 
             Instruction::UpdateAdmin { new_admin } => {
