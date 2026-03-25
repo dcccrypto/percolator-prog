@@ -12377,6 +12377,15 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
+                // Must have no open positions (all force-closed before withdrawal)
+                {
+                    let engine = zc::engine_ref(&slab_data)?;
+                    if engine.total_open_interest.get() > 0 {
+                        msg!("WithdrawInsuranceLimited: cannot withdraw while positions open");
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                }
+
                 let config = state::read_config(&slab_data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
                 let (vault_auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
