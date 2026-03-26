@@ -104,8 +104,15 @@ fn cross_oracle_btc_stable_market_deviation_under_10bps() {
     // 1 hour of cranks at 25-slot intervals
     for i in 0..(SLOTS_PER_HOUR / 25) {
         // Pool price = Pyth ± 0.05% noise (arb bots keep it tight on majors)
-        let noise_bps: i64 = if i % 3 == 0 { 5 } else if i % 3 == 1 { -5 } else { 0 };
-        let pool_price = (pyth_price as i128 + pyth_price as i128 * noise_bps as i128 / 10_000) as u64;
+        let noise_bps: i64 = if i % 3 == 0 {
+            5
+        } else if i % 3 == 1 {
+            -5
+        } else {
+            0
+        };
+        let pool_price =
+            (pyth_price as i128 + pyth_price as i128 * noise_bps as i128 / 10_000) as u64;
 
         mark = oracle::compute_ema_mark_price(mark, pool_price, 25, EMA_ALPHA, EMA_CAP);
 
@@ -137,7 +144,8 @@ fn cross_oracle_sol_volatile_market_deviation_under_50bps() {
             3 => -30,
             _ => 0,
         };
-        let pool_price = (pyth_price as i128 + pyth_price as i128 * noise_bps as i128 / 10_000) as u64;
+        let pool_price =
+            (pyth_price as i128 + pyth_price as i128 * noise_bps as i128 / 10_000) as u64;
         mark = oracle::compute_ema_mark_price(mark, pool_price, 25, EMA_ALPHA, EMA_CAP);
 
         let dev = deviation_bps(mark, pyth_price);
@@ -170,7 +178,8 @@ fn cross_oracle_memecoin_high_volatility_deviation_under_200bps() {
             5 => -100,
             _ => 0,
         };
-        let pool_price = (pyth_price as i128 + pyth_price as i128 * noise_bps as i128 / 10_000).max(1) as u64;
+        let pool_price =
+            (pyth_price as i128 + pyth_price as i128 * noise_bps as i128 / 10_000).max(1) as u64;
         mark = oracle::compute_ema_mark_price(mark, pool_price, 25, EMA_ALPHA, EMA_CAP);
 
         let dev = deviation_bps(mark, pyth_price);
@@ -200,7 +209,8 @@ fn cross_oracle_eth_trending_market_tracks_within_100bps() {
         let real_price = start_price + (end_price - start_price) * i / steps;
         // Pool tracks with ±0.1% noise
         let noise_bps: i64 = if i % 2 == 0 { 10 } else { -10 };
-        let pool_price = (real_price as i128 + real_price as i128 * noise_bps as i128 / 10_000) as u64;
+        let pool_price =
+            (real_price as i128 + real_price as i128 * noise_bps as i128 / 10_000) as u64;
 
         mark = oracle::compute_ema_mark_price(mark, pool_price, 25, EMA_ALPHA, EMA_CAP);
 
@@ -286,7 +296,8 @@ fn manipulation_sustained_10_cranks_5pct_pump() {
     assert!(
         drift_bps <= 250, // ≤2.5% after 250 slots of sustained +5%
         "Sustained 10-crank +5% attack: drift must be ≤250 bps. Got {} bps. mark={}",
-        drift_bps, mark
+        drift_bps,
+        mark
     );
 
     // Now verify recovery: 10 more cranks at real price
@@ -349,7 +360,8 @@ fn manipulation_asymmetric_pump_more_than_dump() {
     assert!(
         drift_bps <= 250,
         "Asymmetric 3×+3% / 1×-1% over 100 cranks: drift must be ≤250 bps. Got {} bps. mark={}",
-        drift_bps, mark
+        drift_bps,
+        mark
     );
 }
 
@@ -379,11 +391,13 @@ fn convergence_50pct_gap_1_hour_moves_meaningfully() {
     assert!(
         gap_bps < 5000, // Must make SOME progress (gap < original 50%)
         "50% gap must decrease after 1 hour. Remaining: {} bps. mark={}",
-        gap_bps, mark
+        gap_bps,
+        mark
     );
     assert!(
         mark > 50_000_000,
-        "Mark must move toward oracle. mark={}", mark
+        "Mark must move toward oracle. mark={}",
+        mark
     );
 }
 
@@ -400,7 +414,11 @@ fn convergence_10pct_gap_closes_within_14_hours() {
         mark = oracle::compute_ema_mark_price(mark, oracle, 25, EMA_ALPHA, EMA_CAP);
     }
     let gap_10m = deviation_bps(mark, oracle);
-    assert!(gap_10m < 1000, "10% gap must reduce after 10 min. Got {} bps", gap_10m);
+    assert!(
+        gap_10m < 1000,
+        "10% gap must reduce after 10 min. Got {} bps",
+        gap_10m
+    );
 
     // Continue for 14 hours total
     let remaining_slots = SLOTS_PER_HOUR * 14 - slots_10m;
@@ -447,7 +465,8 @@ fn convergence_monotonic_approach_from_below() {
         assert!(
             gap <= prev_gap,
             "Convergence must be monotonic from below. gap={} prev_gap={}",
-            gap, prev_gap
+            gap,
+            prev_gap
         );
         prev_gap = gap;
     }
@@ -465,7 +484,8 @@ fn convergence_monotonic_approach_from_above() {
         assert!(
             gap <= prev_gap,
             "Convergence must be monotonic from above. gap={} prev_gap={}",
-            gap, prev_gap
+            gap,
+            prev_gap
         );
         prev_gap = gap;
     }
@@ -482,7 +502,8 @@ fn convergence_never_overshoots() {
         assert!(
             mark <= oracle,
             "Mark approaching from below must never overshoot. mark={} oracle={}",
-            mark, oracle
+            mark,
+            oracle
         );
     }
 
@@ -493,7 +514,8 @@ fn convergence_never_overshoots() {
         assert!(
             mark >= oracle,
             "Mark approaching from above must never overshoot. mark={} oracle={}",
-            mark, oracle
+            mark,
+            oracle
         );
     }
 }
@@ -545,7 +567,8 @@ fn funding_hyperp_mark_index_gap_bounded() {
     assert!(
         actual_move <= max_move + 1,
         "Index movement must be ≤ cap × dt. actual={} max={}",
-        actual_move, max_move
+        actual_move,
+        max_move
     );
 }
 
@@ -560,8 +583,14 @@ fn funding_rate_sign_flips_correctly() {
     let premium_above = (mark_above as i128 - index as i128) * 10_000 / index as i128;
     let premium_below = (mark_below as i128 - index as i128) * 10_000 / index as i128;
 
-    assert!(premium_above > 0, "Premium must be positive when mark > index");
-    assert!(premium_below < 0, "Premium must be negative when mark < index");
+    assert!(
+        premium_above > 0,
+        "Premium must be positive when mark > index"
+    );
+    assert!(
+        premium_below < 0,
+        "Premium must be negative when mark < index"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -583,7 +612,8 @@ fn transition_oi_cap_increases_with_pool_growth() {
     assert!(
         cap_deep.unwrap() > cap_thin.unwrap(),
         "OI cap must increase with pool depth. thin={:?} deep={:?}",
-        cap_thin, cap_deep
+        cap_thin,
+        cap_deep
     );
 }
 
@@ -614,7 +644,10 @@ fn transition_below_2m_minimum_not_enforced_at_storage_level() {
 
     // Cap computation still works — it's the instruction handler that rejects
     let cap = state::compute_epoch_oi_cap_from_pool(&cfg);
-    assert!(cap.is_some(), "Storage-level cap computation should work below minimum");
+    assert!(
+        cap.is_some(),
+        "Storage-level cap computation should work below minimum"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -628,7 +661,11 @@ fn extreme_btc_at_1m_no_overflow() {
     let mark = price - price / 100; // 1% below
 
     let result = oracle::compute_ema_mark_price(mark, price, 25, EMA_ALPHA, EMA_CAP);
-    assert!(result > 0 && result < u64::MAX / 2, "BTC $1M must not overflow. result={}", result);
+    assert!(
+        result > 0 && result < u64::MAX / 2,
+        "BTC $1M must not overflow. result={}",
+        result
+    );
     assert!(result > mark, "Must move toward price");
     assert!(result <= price, "Must not overshoot");
 }
@@ -640,7 +677,11 @@ fn extreme_micro_token_1_wei_no_underflow() {
     let mark = 1u64;
 
     let result = oracle::compute_ema_mark_price(mark, price, 25, EMA_ALPHA, EMA_CAP);
-    assert!(result >= 1, "Micro token must not underflow to 0. result={}", result);
+    assert!(
+        result >= 1,
+        "Micro token must not underflow to 0. result={}",
+        result
+    );
 }
 
 #[test]
@@ -655,7 +696,10 @@ fn extreme_100x_price_increase_handled() {
         let real_price = 1_000_000 + (target - 1_000_000) * i / steps;
         mark = oracle::compute_ema_mark_price(mark, real_price, 25, EMA_ALPHA, EMA_CAP);
         assert!(mark > 0, "Must never be zero during 100x increase");
-        assert!(mark < u64::MAX / 2, "Must never overflow during 100x increase");
+        assert!(
+            mark < u64::MAX / 2,
+            "Must never overflow during 100x increase"
+        );
     }
 
     // 100x in 8h is extreme. EMA cap (0.1%/slot) compounds:
@@ -673,7 +717,8 @@ fn extreme_100x_price_increase_handled() {
     assert!(
         mark < target, // Must not overshoot
         "Mark must not exceed target. mark={} target={}",
-        mark, target
+        mark,
+        target
     );
     // The slow convergence IS the protection
     let gap_bps = deviation_bps(mark, target);
@@ -730,7 +775,11 @@ fn soak_100k_iterations_random_walk_no_panic() {
 
         // Invariants that must hold on every iteration
         assert!(mark > 0, "Mark must never be zero at iteration {}", i);
-        assert!(mark < u64::MAX / 2, "Mark must not overflow at iteration {}", i);
+        assert!(
+            mark < u64::MAX / 2,
+            "Mark must not overflow at iteration {}",
+            i
+        );
     }
 
     // Mark should stay within reasonable bounds of the base (random walk is mean-reverting)
@@ -986,7 +1035,8 @@ fn oi_cap_pool_depth_decreasing_tightens_cap() {
     assert!(
         cap_3m < cap_10m,
         "Decreasing pool depth must tighten OI cap. 10M={} 3M={}",
-        cap_10m, cap_3m
+        cap_10m,
+        cap_3m
     );
 
     // Cap should be proportional
@@ -995,7 +1045,9 @@ fn oi_cap_pool_depth_decreasing_tightens_cap() {
     assert!(
         ratio > 1.0,
         "Cap must increase with depth. ratio={:.2} cap_10m={} cap_3m={}",
-        ratio, cap_10m, cap_3m
+        ratio,
+        cap_10m,
+        cap_3m
     );
 }
 
@@ -1022,7 +1074,8 @@ fn oi_cap_divisor_prevents_overleveraged_pool() {
     assert!(
         diff <= 1000 * constants::HYPERP_EPOCH_OI_POOL_DIVISOR,
         "OI cap for $2M pool should be ~$200K. Got {} expected ~{}",
-        cap, expected_approx
+        cap,
+        expected_approx
     );
 }
 
@@ -1078,7 +1131,8 @@ fn blend_50_50_gives_midpoint() {
     assert!(
         result.abs_diff(expected) <= 1,
         "50/50 blend should give midpoint. Got {} expected {}",
-        result, expected
+        result,
+        expected
     );
 }
 
@@ -1139,26 +1193,56 @@ fn cb_multi_slot_dt_widens_band() {
     let price_2pct_up = 102_000_000u64; // +2%
 
     // At dt=1: 0.1% cap → +2% triggers CB
-    assert!(verify::circuit_breaker_triggered(prev, price_2pct_up, EMA_CAP, 1));
+    assert!(verify::circuit_breaker_triggered(
+        prev,
+        price_2pct_up,
+        EMA_CAP,
+        1
+    ));
 
     // At dt=25: 2.5% cap → +2% does NOT trigger CB
-    assert!(!verify::circuit_breaker_triggered(prev, price_2pct_up, EMA_CAP, 25));
+    assert!(!verify::circuit_breaker_triggered(
+        prev,
+        price_2pct_up,
+        EMA_CAP,
+        25
+    ));
 
     // At dt=20: 2.0% cap → +2% boundary (exactly at cap)
     let dt_exactly_at = 20u64;
     let max_at_dt20 = (prev as u128 * EMA_CAP as u128 * dt_exactly_at as u128 / 1_000_000) as u64;
     let exactly_at = prev + max_at_dt20;
     // Exactly at boundary should NOT fire
-    assert!(!verify::circuit_breaker_triggered(prev, exactly_at, EMA_CAP, dt_exactly_at));
+    assert!(!verify::circuit_breaker_triggered(
+        prev,
+        exactly_at,
+        EMA_CAP,
+        dt_exactly_at
+    ));
     // One above should fire
-    assert!(verify::circuit_breaker_triggered(prev, exactly_at + 1, EMA_CAP, dt_exactly_at));
+    assert!(verify::circuit_breaker_triggered(
+        prev,
+        exactly_at + 1,
+        EMA_CAP,
+        dt_exactly_at
+    ));
 }
 
 #[test]
 fn cb_prev_mark_zero_never_fires() {
     // First-ever price: no previous mark → CB should not fire
-    assert!(!verify::circuit_breaker_triggered(0, 100_000_000, EMA_CAP, 1));
-    assert!(!verify::circuit_breaker_triggered(0, 999_000_000, EMA_CAP, 1));
+    assert!(!verify::circuit_breaker_triggered(
+        0,
+        100_000_000,
+        EMA_CAP,
+        1
+    ));
+    assert!(!verify::circuit_breaker_triggered(
+        0,
+        999_000_000,
+        EMA_CAP,
+        1
+    ));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1178,7 +1262,13 @@ fn scenario_btc_halving_pump_30pct_over_48_hours() {
     for i in 0..steps {
         let real_price = start + (end - start) * i / steps;
         // Pool tracks with ±0.05% arb noise (tight on BTC)
-        let noise: i64 = if i % 4 == 0 { 5 } else if i % 4 == 2 { -5 } else { 0 };
+        let noise: i64 = if i % 4 == 0 {
+            5
+        } else if i % 4 == 2 {
+            -5
+        } else {
+            0
+        };
         let pool = (real_price as i128 + real_price as i128 * noise as i128 / 10_000) as u64;
 
         mark = oracle::compute_ema_mark_price(mark, pool, 25, EMA_ALPHA, EMA_CAP);
@@ -1220,7 +1310,9 @@ fn scenario_sol_lunch_dump_recover() {
         mark = oracle::compute_ema_mark_price(mark, pool, 25, EMA_ALPHA, EMA_CAP);
 
         let dev = deviation_bps(mark, target);
-        if dev > max_dev { max_dev = dev; }
+        if dev > max_dev {
+            max_dev = dev;
+        }
     }
 
     // Phase 2: US lunch dump -5% over 1 hour
@@ -1231,7 +1323,9 @@ fn scenario_sol_lunch_dump_recover() {
         mark = oracle::compute_ema_mark_price(mark, target, 25, EMA_ALPHA, EMA_CAP);
 
         let dev = deviation_bps(mark, target);
-        if dev > max_dev { max_dev = dev; }
+        if dev > max_dev {
+            max_dev = dev;
+        }
     }
 
     // Phase 3: Slow recovery to base over 3 hours
@@ -1240,7 +1334,9 @@ fn scenario_sol_lunch_dump_recover() {
         mark = oracle::compute_ema_mark_price(mark, target, 25, EMA_ALPHA, EMA_CAP);
 
         let dev = deviation_bps(mark, target);
-        if dev > max_dev { max_dev = dev; }
+        if dev > max_dev {
+            max_dev = dev;
+        }
     }
 
     assert!(
@@ -1274,7 +1370,8 @@ fn scenario_defi_exploit_flash_crash_90pct_ema_absorbs() {
     assert!(
         impact_bps <= 250, // ≤2.5% from 3 cranks of -90%
         "3-crank 90% crash: mark should move ≤250 bps. Got {} bps. mark={}",
-        impact_bps, mark
+        impact_bps,
+        mark
     );
 
     // If the crash is real, mark will eventually converge over hours.
