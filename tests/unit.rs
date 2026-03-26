@@ -5845,3 +5845,255 @@ fn test_tranche_waterfall_total_loss() {
     assert_eq!(state.senior_capital(), 0);
     assert_eq!(state.total_capital, 0);
 }
+
+// =============================================================================
+// GH#1724 — ClearPendingSettlement Admin-Only Guard
+// =============================================================================
+// Security test: confirms ClearPendingSettlement rejects any non-admin signer,
+// including the attacker pattern from the issue: caller_idx=u16::MAX bypass.
+// The on-chain handler uses require_admin(header.admin, a_keeper.key) which
+// must fire before any state mutation.
+
+fn encode_clear_pending_settlement(user_idx: u16) -> Vec<u8> {
+    let mut data = vec![percolator_prog::tags::TAG_CLEAR_PENDING_SETTLEMENT];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data
+}
+
+fn encode_set_pending_settlement(user_idx: u16) -> Vec<u8> {
+    let mut data = vec![percolator_prog::tags::TAG_SET_PENDING_SETTLEMENT];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data
+}
+
+/// Build an initialized PositionNft PDA account data buffer with pending_settlement=1.
+fn make_nft_pda_data(
+    nft_mint_key: &Pubkey,
+    slab_key: &Pubkey,
+    owner_key: &Pubkey,
+    user_idx: u16,
+    bump: u8,
+    pending_settlement: u8,
+) -> Vec<u8> {
+    use percolator_prog::position_nft::{
+        write_position_nft_state, PositionNftState, POSITION_NFT_MAGIC, POSITION_NFT_STATE_LEN,
+    };
+    let state = PositionNftState {
+        magic: POSITION_NFT_MAGIC,
+        mint: nft_mint_key.to_bytes(),
+        slab: slab_key.to_bytes(),
+        owner: owner_key.to_bytes(),
+        user_idx,
+        pending_settlement,
+        bump,
+        mint_bump: 254,
+        _reserved: [0u8; 19],
+    };
+    let mut buf = vec![0u8; POSITION_NFT_STATE_LEN];
+    write_position_nft_state(&mut buf, &state);
+    buf
+}
+
+#[test]
+fn test_gh1724_clear_pending_settlement_requires_admin() {
+    // GH#1724: non-admin signer MUST NOT be able to clear pending_settlement.
+    // The issue described an attack where any signer could call ClearPendingSettlement
+    // with caller_idx=u16::MAX to bypass the keeper settlement guard.
+    // The handler must return EngineUnauthorized for all non-admin callers.
+
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+
+    // 1. Init market
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+    }
+
+    // 2. Build a fake NFT PDA pre-loaded with pending_settlement=1
+    let user_idx: u16 = 0;
+    let (nft_pda_key, bump) =
+        percolator_prog::position_nft::derive_position_nft(&f.program_id, &f.slab.key, user_idx);
+    let nft_mint_key = Pubkey::new_unique();
+    let position_owner_key = Pubkey::new_unique();
+    let nft_data = make_nft_pda_data(&nft_mint_key, &f.slab.key, &position_owner_key, user_idx, bump, 1);
+
+    let mut nft_pda_account =
+        TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
+
+    // 3. Attacker (non-admin) attempts to clear pending_settlement
+    let mut attacker = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+
+    let result = process_instruction(
+        &f.program_id,
+        &[
+            attacker.to_info(),
+            f.slab.to_info(),
+            nft_pda_account.to_info(),
+        ],
+        &encode_clear_pending_settlement(user_idx),
+    );
+
+    assert_eq!(
+        result,
+        Err(PercolatorError::EngineUnauthorized.into()),
+        "GH#1724: non-admin must not clear pending_settlement"
+    );
+
+    // 4. Verify pending_settlement is still set (state not mutated)
+    let loaded = percolator_prog::position_nft::read_position_nft_state(&nft_pda_account.data)
+        .expect("NFT PDA should still be parseable");
+    assert_eq!(
+        loaded.pending_settlement, 1,
+        "GH#1724: pending_settlement must remain set after rejected ClearPendingSettlement"
+    );
+}
+
+#[test]
+fn test_gh1724_clear_pending_settlement_admin_succeeds() {
+    // Positive path: the authorized admin CAN clear pending_settlement.
+    // This confirms the guard doesn't break the happy path.
+
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+
+    // 1. Init market
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+    }
+
+    // 2. Build NFT PDA with pending_settlement=1
+    let user_idx: u16 = 0;
+    let (nft_pda_key, bump) =
+        percolator_prog::position_nft::derive_position_nft(&f.program_id, &f.slab.key, user_idx);
+    let nft_mint_key = Pubkey::new_unique();
+    let position_owner_key = Pubkey::new_unique();
+    let nft_data = make_nft_pda_data(&nft_mint_key, &f.slab.key, &position_owner_key, user_idx, bump, 1);
+
+    let mut nft_pda_account =
+        TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
+
+    // 3. Admin clears pending_settlement — must succeed
+    let result = process_instruction(
+        &f.program_id,
+        &[
+            f.admin.to_info(),
+            f.slab.to_info(),
+            nft_pda_account.to_info(),
+        ],
+        &encode_clear_pending_settlement(user_idx),
+    );
+
+    assert!(
+        result.is_ok(),
+        "GH#1724: authorized admin must be able to clear pending_settlement, got: {:?}",
+        result
+    );
+
+    // 4. Verify the flag was actually cleared
+    let loaded = percolator_prog::position_nft::read_position_nft_state(&nft_pda_account.data)
+        .expect("NFT PDA should be parseable");
+    assert_eq!(
+        loaded.pending_settlement, 0,
+        "GH#1724: pending_settlement must be cleared by admin"
+    );
+}
+
+#[test]
+fn test_gh1724_set_pending_settlement_also_requires_admin() {
+    // Defense-in-depth: SetPendingSettlement also uses require_admin.
+    // Confirm a non-admin cannot set the flag either (DoS prevention, GH#1475).
+
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+
+    // 1. Init market
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+    }
+
+    // 2. Build NFT PDA with pending_settlement=0
+    let user_idx: u16 = 0;
+    let (nft_pda_key, bump) =
+        percolator_prog::position_nft::derive_position_nft(&f.program_id, &f.slab.key, user_idx);
+    let nft_mint_key = Pubkey::new_unique();
+    let position_owner_key = Pubkey::new_unique();
+    let nft_data = make_nft_pda_data(&nft_mint_key, &f.slab.key, &position_owner_key, user_idx, bump, 0);
+
+    let mut nft_pda_account =
+        TestAccount::new(nft_pda_key, f.program_id, 0, nft_data).writable();
+
+    // 3. Griever (non-admin) attempts to set pending_settlement — must be rejected
+    let mut griever = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+
+    let result = process_instruction(
+        &f.program_id,
+        &[
+            griever.to_info(),
+            f.slab.to_info(),
+            nft_pda_account.to_info(),
+        ],
+        &encode_set_pending_settlement(user_idx),
+    );
+
+    assert_eq!(
+        result,
+        Err(PercolatorError::EngineUnauthorized.into()),
+        "GH#1724/GH#1475: non-admin must not set pending_settlement"
+    );
+
+    // 4. Verify flag not set
+    let loaded = percolator_prog::position_nft::read_position_nft_state(&nft_pda_account.data)
+        .expect("NFT PDA should still be parseable");
+    assert_eq!(
+        loaded.pending_settlement, 0,
+        "GH#1724: pending_settlement must remain 0 after rejected SetPendingSettlement"
+    );
+}
