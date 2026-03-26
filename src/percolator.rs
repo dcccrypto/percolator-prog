@@ -4433,6 +4433,649 @@ pub mod processor {
                     &signer_seeds,
                 )?;
             }
+            Instruction::AdminForceClose { target_idx } => {
+                // Admin force-close: unconditionally close any position at oracle price.
+                // Accounts: [admin(signer), slab(writable), clock, oracle]
+                accounts::expect_len(accounts, 4)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_oracle = &accounts[3];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let mut config = state::read_config(&data);
+                let clock = Clock::from_account_info(&accounts[2])?;
+
+                // Read oracle price (same logic as LiquidateAtOracle)
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let idx = config.last_effective_price_e6;
+                    if idx == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    // PERC-365: Reject ADL if Hyperp oracle is stale
+                    {
+                        let eng = zc::engine_ref(&data)?;
+                        oracle::check_hyperp_staleness(
+                            eng.current_slot,
+                            eng.max_crank_staleness_slots,
+                            clock.slot,
+                        )?;
+                    }
+                    idx
+                } else {
+                    oracle::read_price_clamped(
+                        &mut config,
+                        a_oracle,
+                        clock.unix_timestamp,
+                        &accounts[4..],
+                    )?
+                };
+                state::write_config(&mut data, &config);
+
+                let engine = zc::engine_mut(&mut data)?;
+                check_idx(engine, target_idx)?;
+
+                engine
+                    .admin_force_close(target_idx, clock.slot, price)
+                    .map_err(map_risk_error)?;
+            }
+
+            Instruction::UpdateRiskParams {
+                initial_margin_bps,
+                maintenance_margin_bps,
+                trading_fee_bps,
+                oi_cap_multiplier_bps,
+                max_pnl_cap,
+                oi_ramp_slots,
+                skew_factor_bps,
+                adaptive_funding_enabled,
+                adaptive_scale_bps,
+                adaptive_max_funding_bps,
+                mark_oracle_weight_bps,
+                vol_margin_scale_bps,
+                vol_alpha_e6,
+                vol_margin_target_e6,
+            } => {
+                // Update margin + fee parameters. Admin only.
+                // Accounts: [admin(signer), slab(writable)]
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Validate: initial >= maintenance, both > 0, both <= 10000
+                if initial_margin_bps == 0 || maintenance_margin_bps == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if initial_margin_bps > 10_000 || maintenance_margin_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if initial_margin_bps < maintenance_margin_bps {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
+                // Validate trading fee if provided (0-1000 bps = 0-10%)
+                if let Some(fee) = trading_fee_bps {
+                    if fee > 1_000 {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
+
+                let engine = zc::engine_mut(&mut data)?;
+                let _ = engine.set_margin_params(initial_margin_bps, maintenance_margin_bps);
+
+                // Update trading fee if provided (backwards compatible)
+                if let Some(fee) = trading_fee_bps {
+                    engine.params.trading_fee_bps = fee;
+                }
+
+                // GH#1736: Validate updated RiskParams via the canonical validate() method
+                // to close any residual bypass paths (e.g. future field additions).
+                // This is a belt-and-suspenders check after the explicit guards above.
+                engine.params.validate().map_err(map_risk_error)?;
+
+                // PERC-273: Update OI cap multiplier if provided
+                // PERC-272: Update max PnL cap if provided
+                // PERC-298 + PERC-302: Update OI cap, skew factor, ramp slots if provided
+                if oi_cap_multiplier_bps.is_some()
+                    || max_pnl_cap.is_some()
+                    || oi_ramp_slots.is_some()
+                    || skew_factor_bps.is_some()
+                    || adaptive_funding_enabled.is_some()
+                    || adaptive_scale_bps.is_some()
+                    || adaptive_max_funding_bps.is_some()
+                    || mark_oracle_weight_bps.is_some()
+                    || vol_margin_scale_bps.is_some()
+                    || vol_alpha_e6.is_some()
+                    || vol_margin_target_e6.is_some()
+                {
+                    let mut config = state::read_config(&data);
+                    if let Some(oi_cap) = oi_cap_multiplier_bps {
+                        // Preserve existing skew factor when only updating multiplier
+                        let (_, existing_skew) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                        config.oi_cap_multiplier_bps = pack_oi_cap(oi_cap, existing_skew);
+                    }
+                    if let Some(skew) = skew_factor_bps {
+                        // PERC-298: validate skew_factor_bps <= 10_000 (100%)
+                        if skew > 10_000 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
+                        let (existing_mult, _) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                        config.oi_cap_multiplier_bps = pack_oi_cap(existing_mult, skew);
+                    }
+                    if let Some(pnl_cap) = max_pnl_cap {
+                        config.max_pnl_cap = pnl_cap;
+                    }
+                    if let Some(ramp) = oi_ramp_slots {
+                        config.oi_ramp_slots = ramp;
+                    }
+                    // PERC-300: Adaptive funding rate params
+                    if let Some(enabled) = adaptive_funding_enabled {
+                        config.adaptive_funding_enabled = enabled;
+                    }
+                    if let Some(scale) = adaptive_scale_bps {
+                        config.adaptive_scale_bps = scale;
+                    }
+                    if let Some(max_bps) = adaptive_max_funding_bps {
+                        config.adaptive_max_funding_bps = max_bps;
+                    }
+                    // PERC-118: Mark blend weight
+                    if let Some(w) = mark_oracle_weight_bps {
+                        if w > 10_000 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
+                        state::set_mark_oracle_weight_bps(&mut config, w);
+                    }
+                    // VRAM: Volatility-Regime Adaptive Margin params
+                    if let Some(scale) = vol_margin_scale_bps {
+                        state::set_vol_margin_scale_bps(&mut config, scale);
+                    }
+                    if let Some(alpha) = vol_alpha_e6 {
+                        state::set_vol_alpha_e6(&mut config, alpha);
+                    }
+                    if let Some(target) = vol_margin_target_e6 {
+                        state::set_vol_margin_target_e6(&mut config, target);
+                    }
+                    state::write_config(&mut data, &config);
+                    let (mult, skew) = unpack_oi_cap(config.oi_cap_multiplier_bps);
+                    msg!(
+                        "UpdateRiskParams: oi_cap={} max_pnl_cap={:?} skew_factor={} oi_ramp_slots={:?}",
+                        mult,
+                        max_pnl_cap,
+                        skew,
+                        oi_ramp_slots
+                    );
+                }
+
+                msg!("UpdateRiskParams: initial_margin_bps={}, maintenance_margin_bps={}, trading_fee_bps={:?}",
+                    initial_margin_bps, maintenance_margin_bps, trading_fee_bps);
+            }
+
+            Instruction::RenounceAdmin { confirmation } => {
+                // Renounce admin: set admin to all zeros (irreversible).
+                // SECURITY (#312): Requires market RESOLVED + confirmation code.
+                // PERC-136 #312: Only allowed after market is RESOLVED to prevent
+                // admin abandonment while users still have open positions.
+                // Accounts: [admin(signer), slab(writable)]
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                // Guard: market must be RESOLVED before admin can renounce (PERC-136 #312)
+                if !state::is_resolved(&data) {
+                    return Err(PercolatorError::AdminRenounceNotAllowed.into());
+                }
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // SECURITY (#312): Market must be RESOLVED before admin can renounce
+                if !state::is_resolved(&data) {
+                    return Err(PercolatorError::AdminRenounceNotAllowed.into());
+                }
+
+                // SECURITY (#312): Require confirmation code to prevent accidental calls
+                if confirmation != crate::constants::RENOUNCE_ADMIN_CONFIRMATION {
+                    return Err(PercolatorError::InvalidConfirmation.into());
+                }
+
+                // Set admin to all zeros — irreversible
+                let mut new_header = header;
+                new_header.admin = [0u8; 32];
+                state::write_header(&mut data, &new_header);
+            }
+
+            Instruction::CreateInsuranceMint => {
+                // Create insurance LP mint for this market. Admin only, once per market.
+                // Accounts: [admin(signer), slab, ins_lp_mint(writable), vault_authority,
+                //            collateral_mint, system_program, token_program, rent, payer(signer+writable)]
+                accounts::expect_len(accounts, 9)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_ins_lp_mint = &accounts[2];
+                let a_vault_authority = &accounts[3];
+                let a_collateral_mint = &accounts[4];
+                let a_system = &accounts[5];
+                let a_token = &accounts[6];
+                let a_rent = &accounts[7];
+                let a_payer = &accounts[8];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_ins_lp_mint)?;
+                accounts::expect_signer(a_payer)?;
+                accounts::expect_writable(a_payer)?;
+                verify_token_program(a_token)?;
+
+                let data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Verify the ins_lp_mint PDA
+                let (expected_mint, mint_bump) =
+                    accounts::derive_insurance_lp_mint(program_id, a_slab.key);
+                accounts::expect_key(a_ins_lp_mint, &expected_mint)?;
+
+                // Verify vault authority PDA
+                let (expected_auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_authority, &expected_auth)?;
+
+                // Check mint doesn't already exist (data len == 0 means not yet created)
+                if a_ins_lp_mint.data_len() > 0 {
+                    return Err(PercolatorError::InsuranceMintAlreadyExists.into());
+                }
+
+                // Read collateral mint decimals
+                let decimals = crate::insurance_lp::read_mint_decimals(a_collateral_mint)?;
+
+                // Create and initialize the mint PDA
+                let slab_key_bytes = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [mint_bump];
+                let mint_seeds: &[&[u8]] = &[b"ins_lp", slab_key_bytes, &bump_arr];
+
+                crate::insurance_lp::create_mint(
+                    a_payer,
+                    a_ins_lp_mint,
+                    a_vault_authority,
+                    a_system,
+                    a_token,
+                    a_rent,
+                    decimals,
+                    mint_seeds,
+                )?;
+
+                msg!("Insurance LP mint created");
+            }
+
+            Instruction::DepositInsuranceLP { amount } => {
+                // Deposit collateral into insurance fund, receive LP tokens.
+                // Accounts: [depositor(signer), slab(writable), depositor_ata(writable),
+                //            vault(writable), token_program, ins_lp_mint(writable),
+                //            depositor_lp_ata(writable), vault_authority]
+                accounts::expect_len(accounts, 8)?;
+                let a_depositor = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_depositor_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_ins_lp_mint = &accounts[5];
+                let a_depositor_lp_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+
+                accounts::expect_signer(a_depositor)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_depositor_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_ins_lp_mint)?;
+                accounts::expect_writable(a_depositor_lp_ata)?;
+                verify_token_program(a_token)?;
+
+                if amount == 0 {
+                    return Err(PercolatorError::InsuranceZeroAmount.into());
+                }
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                // Block deposits on resolved markets
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                // Verify vault
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_depositor_ata, a_depositor.key, &mint)?;
+
+                // Verify insurance LP mint PDA
+                let (expected_lp_mint, _) =
+                    accounts::derive_insurance_lp_mint(program_id, a_slab.key);
+                accounts::expect_key(a_ins_lp_mint, &expected_lp_mint)?;
+
+                // Verify LP mint exists
+                if a_ins_lp_mint.data_len() == 0 {
+                    return Err(PercolatorError::InsuranceMintNotCreated.into());
+                }
+
+                // Verify vault authority PDA
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                // Read current insurance balance and LP supply BEFORE deposit
+                let engine = zc::engine_mut(&mut data)?;
+                let insurance_balance_before: u128 = engine.insurance_fund.balance.get();
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_ins_lp_mint)?;
+
+                // Transfer collateral from depositor to vault
+                collateral::deposit(a_token, a_depositor_ata, a_vault, a_depositor, amount)?;
+
+                // Convert base tokens to units
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+
+                // Accumulate dust
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+                // Calculate LP tokens to mint
+                let lp_tokens_to_mint: u64 = if lp_supply == 0 {
+                    // First deposit: 1:1 ratio (units of collateral = LP tokens)
+                    // Guard: if insurance already has balance but supply is 0, that means
+                    // admin topped up via TopUpInsurance before creating LP mint.
+                    // Still safe: first LP depositor gets tokens proportional to their deposit only.
+                    units
+                } else {
+                    if insurance_balance_before == 0 {
+                        // Shouldn't happen: supply > 0 but balance == 0 means fund was drained.
+                        // Reject to prevent division by zero and unfair minting.
+                        return Err(PercolatorError::InsuranceSupplyMismatch.into());
+                    }
+                    // Proportional: tokens = deposit_units * supply / balance
+                    // Use u128 for intermediate to prevent overflow
+                    let numerator = (units as u128)
+                        .checked_mul(lp_supply as u128)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    let result = numerator / insurance_balance_before;
+                    // Round DOWN (depositor gets fewer tokens — pool is never underfunded)
+                    if result > u64::MAX as u128 {
+                        return Err(PercolatorError::EngineOverflow.into());
+                    }
+                    result as u64
+                };
+
+                if lp_tokens_to_mint == 0 {
+                    // Deposit too small to mint any LP tokens — reject to prevent loss
+                    return Err(PercolatorError::InsuranceZeroAmount.into());
+                }
+
+                // Top up insurance fund in engine
+                // Re-borrow engine after the collateral transfer
+                let engine = zc::engine_mut(&mut data)?;
+                engine
+                    .top_up_insurance_fund(units as u128)
+                    .map_err(map_risk_error)?;
+
+                // Mint LP tokens to depositor
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                crate::insurance_lp::mint_to(
+                    a_token,
+                    a_ins_lp_mint,
+                    a_depositor_lp_ata,
+                    a_vault_authority,
+                    lp_tokens_to_mint,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "Insurance LP deposit: {} tokens, {} LP minted",
+                    amount,
+                    lp_tokens_to_mint
+                );
+            }
+
+            Instruction::WithdrawInsuranceLP { lp_amount } => {
+                // Burn LP tokens and withdraw proportional share of insurance fund.
+                // Accounts: [withdrawer(signer), slab(writable), withdrawer_ata(writable),
+                //            vault(writable), token_program, ins_lp_mint(writable),
+                //            withdrawer_lp_ata(writable), vault_authority]
+                accounts::expect_len(accounts, 8)?;
+                let a_withdrawer = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_withdrawer_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_ins_lp_mint = &accounts[5];
+                let a_withdrawer_lp_ata = &accounts[6];
+                let a_vault_authority = &accounts[7];
+
+                accounts::expect_signer(a_withdrawer)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_withdrawer_ata)?;
+                accounts::expect_writable(a_vault)?;
+                accounts::expect_writable(a_ins_lp_mint)?;
+                accounts::expect_writable(a_withdrawer_lp_ata)?;
+                verify_token_program(a_token)?;
+
+                if lp_amount == 0 {
+                    return Err(PercolatorError::InsuranceZeroAmount.into());
+                }
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                // Verify vault
+                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_withdrawer_ata, a_withdrawer.key, &mint)?;
+
+                // Verify insurance LP mint PDA
+                let (expected_lp_mint, _) =
+                    accounts::derive_insurance_lp_mint(program_id, a_slab.key);
+                accounts::expect_key(a_ins_lp_mint, &expected_lp_mint)?;
+
+                if a_ins_lp_mint.data_len() == 0 {
+                    return Err(PercolatorError::InsuranceMintNotCreated.into());
+                }
+
+                // Verify vault authority
+                accounts::expect_key(a_vault_authority, &auth)?;
+
+                // Read current insurance balance and LP supply
+                let engine = zc::engine_mut(&mut data)?;
+                let insurance_balance: u128 = engine.insurance_fund.balance.get();
+                let lp_supply = crate::insurance_lp::read_mint_supply(a_ins_lp_mint)?;
+
+                if lp_supply == 0 || insurance_balance == 0 {
+                    return Err(PercolatorError::InsuranceSupplyMismatch.into());
+                }
+
+                // Calculate units to return: lp_amount * insurance_balance / lp_supply
+                // Round DOWN (user gets less — pool is never underfunded)
+                let numerator = (lp_amount as u128)
+                    .checked_mul(insurance_balance)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+                let units_to_return = numerator / (lp_supply as u128);
+
+                if units_to_return == 0 {
+                    return Err(PercolatorError::InsuranceZeroAmount.into());
+                }
+
+                // Safety: cannot withdraw below risk_reduction_threshold
+                let remaining = insurance_balance.saturating_sub(units_to_return);
+                let threshold = engine.params.risk_reduction_threshold;
+                if remaining < threshold.get() {
+                    return Err(PercolatorError::InsuranceBelowThreshold.into());
+                }
+
+                // Convert units to base tokens
+                let units_u64 = if units_to_return > u64::MAX as u128 {
+                    return Err(PercolatorError::EngineOverflow.into());
+                } else {
+                    units_to_return as u64
+                };
+                let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                // Reduce insurance fund balance (checked to prevent silent underflow)
+                let new_balance = insurance_balance
+                    .checked_sub(units_to_return)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+                engine.insurance_fund.balance = percolator::U128::new(new_balance);
+
+                // Burn LP tokens from withdrawer (user signs as authority over their tokens)
+                crate::insurance_lp::burn(
+                    a_token,
+                    a_ins_lp_mint,
+                    a_withdrawer_lp_ata,
+                    a_withdrawer,
+                    lp_amount,
+                )?;
+
+                // Transfer collateral from vault to withdrawer
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_withdrawer_ata,
+                    a_vault_authority,
+                    base_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "Insurance LP withdraw: {} LP burned, {} tokens returned",
+                    lp_amount,
+                    base_amount
+                );
+            }
+
+            Instruction::PauseMarket => {
+                // Pause the market. Admin only.
+                // When paused: Trade, Deposit, Withdraw, InitUser are blocked.
+                // Still allowed: Crank, Liquidate, AdminForceClose, Unpause, SetRiskThreshold, etc.
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                state::set_paused(&mut data, true);
+                msg!("Market paused by admin");
+            }
+
+            Instruction::UnpauseMarket => {
+                // Unpause the market. Admin only.
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                state::set_paused(&mut data, false);
+                msg!("Market unpaused by admin");
+            }
+
+            Instruction::AcceptAdmin => {
+                // Two-step admin transfer: Step 2 — pending admin accepts.
+                accounts::expect_len(accounts, 2)?;
+                let a_new_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_new_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut header = state::read_header(&data);
+
+                // Must have a pending admin proposal
+                if header.pending_admin == [0u8; 32] {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // Signer must be the pending admin
+                if header.pending_admin != a_new_admin.key.to_bytes() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                header.admin = header.pending_admin;
+                header.pending_admin = [0u8; 32];
+                state::write_header(&mut data, &header);
+                msg!("Admin transfer accepted");
+            }
 
             Instruction::SetInsuranceWithdrawPolicy {
                 authority,
