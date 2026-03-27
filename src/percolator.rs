@@ -3514,17 +3514,11 @@ pub mod processor {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
                 }
-                // Funding rate: engine uses zero-rate core profile
-                // (recompute_r_last_from_final_state always sets rate to 0).
-                // Funding accrual is handled internally by the engine via
-                // K-coefficient mechanism, not via external rate injection.
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
-                // Two-phase crank: candidates computed off-chain, passed in instruction data
-                // (keeper_crank internally calls recompute_r_last_from_final_state)
                 let _outcome = engine
                     .keeper_crank(
                         clock.slot,
@@ -3537,6 +3531,25 @@ pub mod processor {
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_end");
                     sol_log_compute_units();
+                }
+
+                // Set the NEW funding rate on the engine for the NEXT crank.
+                // Anti-retroactivity: this crank used the old rate; next crank
+                // will use this new rate via accrue_market_to.
+                {
+                    let mark_e6 = config.authority_price_e6;
+                    let index_e6 = config.last_effective_price_e6;
+                    if mark_e6 > 0 && index_e6 > 0 {
+                        let new_rate = oracle::compute_premium_funding_bps_per_slot(
+                            mark_e6,
+                            index_e6,
+                            config.funding_horizon_slots,
+                            config.funding_k_bps,
+                            config.funding_max_premium_bps,
+                            config.funding_max_bps_per_slot,
+                        );
+                        engine.funding_rate_bps_per_slot_last = new_rate;
+                    }
                 }
 
                 // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund
