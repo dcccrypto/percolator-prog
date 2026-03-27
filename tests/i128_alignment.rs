@@ -9,7 +9,7 @@
 //! Run:       cargo test --release --test i128_alignment -- --nocapture
 
 use litesvm::LiteSVM;
-use percolator::{Account, AccountKind, RiskEngine, RiskParams, I128, U128};
+use percolator::{Account, RiskEngine, RiskParams, I128, U128};
 use solana_sdk::{
     account::Account as SolanaAccount,
     clock::Clock,
@@ -243,7 +243,7 @@ fn test_account_struct_alignment() {
     let account = Account {
         account_id: 12345,
         capital: U128::new(0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210),
-        kind: AccountKind::User,
+        kind: Account::KIND_USER,
         pnl: -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10i128,
         reserved_pnl: 0xDEAD_BEEF_CAFE_BABEu128,
         warmup_started_at_slot: 999999,

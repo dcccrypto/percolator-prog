@@ -746,18 +746,11 @@ pub mod zc {
 
     /// Validate enum discriminants from raw bytes BEFORE casting to &RiskEngine.
     ///
-    /// RiskEngine contains two enum types:
+    /// RiskEngine contains one remaining enum type:
     ///   - SideMode (2 instances): validated here (O(1))
-    ///   - AccountKind (MAX_ACCOUNTS instances in accounts[]): NOT validated
     ///
-    /// AccountKind soundness argument:
-    ///   1. InitMarket zeroes the entire slab → kind=0=AccountKind::User (valid)
-    ///   2. Only add_user (kind=0) and add_lp (kind=1) write the field
-    ///   3. Slab is program-owned → no external writes possible
-    ///   4. Therefore invalid AccountKind requires a program bug, not data corruption
-    ///
-    /// Validating all MAX_ACCOUNTS kind bytes would cost ~40-60k CU per call,
-    /// making KeeperCrank and TradeCpi exceed the 200k CU budget.
+    /// Account.kind was changed from AccountKind enum to plain u8, eliminating
+    /// the UB class at the type level — u8 has no invalid representations.
     #[inline]
     fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
@@ -2379,12 +2372,15 @@ pub mod oracle {
         // Apply k multiplier (100 => 1.00x)
         let scaled = premium_bps.saturating_mul(funding_k_bps as i128) / 100i128;
 
-        // Convert to per-slot by dividing by horizon
-        let mut per_slot = (scaled / (funding_horizon_slots as i128)) as i64;
-
-        // Policy clamp
-        per_slot = per_slot.clamp(-max_bps_per_slot, max_bps_per_slot);
-        per_slot
+        // Convert to per-slot by dividing by horizon, clamp in i128 before
+        // casting to i64 to avoid truncation on huge admin-configured inputs.
+        let per_slot_128 = scaled / (funding_horizon_slots as i128);
+        let clamped_128 = per_slot_128.clamp(
+            -(max_bps_per_slot as i128),
+            max_bps_per_slot as i128,
+        );
+        // Safe: clamped value is within i64 range (max_bps_per_slot is i64)
+        clamped_128 as i64
     }
 }
 
@@ -3400,14 +3396,9 @@ pub mod processor {
                 // Read last threshold update slot BEFORE mutable engine borrow
                 let last_thr_slot = state::read_last_thr_update_slot(&data);
 
-                // SECURITY (C4): allow_panic triggers global settlement - admin only
-                // This prevents griefing attacks where anyone triggers panic at worst moment
-                if allow_panic != 0 {
-                    accounts::expect_signer(a_caller)?;
-                    if !crate::verify::admin_ok(header.admin, a_caller.key.to_bytes()) {
-                        return Err(PercolatorError::EngineUnauthorized.into());
-                    }
-                }
+                // allow_panic: read and discarded for wire compatibility.
+                // No runtime behavior — global settlement is not implemented.
+                let _ = allow_panic;
 
                 // Read dust before borrowing engine (for dust sweep later)
                 let dust_before = state::read_dust_base(&data);
@@ -3436,18 +3427,11 @@ pub mod processor {
                     oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
                 };
 
-                // Hyperp mode: compute and store funding rate BEFORE engine borrow
-                // This avoids borrow conflicts with config read/write
-                let hyperp_funding_rate = if is_hyperp {
-                    // Read previous funding rate (piecewise-constant: use stored rate, then update)
-                    // authority_timestamp is reinterpreted as i64 funding rate in Hyperp mode
-                    // Legacy states may still contain unix timestamps in this slot; clamp to policy.
-                    let prev_rate = config.authority_timestamp.clamp(
-                        -config.funding_max_bps_per_slot,
-                        config.funding_max_bps_per_slot,
-                    );
-
-                    // Compute new rate from premium
+                // Hyperp mode: compute and store funding rate for next crank.
+                // The rate is not consumed by keeper_crank (engine uses zero-rate
+                // core profile). When funding is wired into the engine, restore
+                // prev_rate and pass to keeper_crank.
+                if is_hyperp {
                     let mark_e6 = config.authority_price_e6;
                     let index_e6 = config.last_effective_price_e6;
                     let new_rate = oracle::compute_premium_funding_bps_per_slot(
@@ -3458,14 +3442,8 @@ pub mod processor {
                         config.funding_max_premium_bps,
                         config.funding_max_bps_per_slot,
                     );
-
-                    // Store new rate in config for next crank
                     config.authority_timestamp = new_rate;
-
-                    Some(prev_rate) // Use PREVIOUS rate for this crank (piecewise-constant model)
-                } else {
-                    None
-                };
+                }
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
