@@ -2121,6 +2121,10 @@ pub mod oracle {
         // Staleness check (skip on devnet)
         #[cfg(not(feature = "devnet"))]
         {
+            // Validate timestamp fits in i64 before cast (year 2262+ overflow)
+            if timestamp > i64::MAX as u64 {
+                return Err(PercolatorError::OracleStale.into());
+            }
             let age = now_unix_ts.saturating_sub(timestamp as i64);
             if age < 0 || age as u64 > max_staleness_secs {
                 return Err(PercolatorError::OracleStale.into());
