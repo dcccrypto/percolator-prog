@@ -103,6 +103,10 @@ pub const TAG_RECLAIM_SLAB_RENT: u8 = 52;
 /// Data: tag(1) + user_idx(2) + new_owner(32)
 /// Accounts: [nft_mint_authority(signer), slab(writable), nft_program]
 pub const TAG_TRANSFER_OWNERSHIP_CPI: u8 = 69;
+/// PERC-8111: Set per-wallet position cap (admin only).
+/// Data: tag(1) + cap_e6(8) — 0 = disabled, non-zero = max abs(position_size) in e6.
+/// Accounts: [admin(signer), slab(writable)]
+pub const TAG_SET_WALLET_CAP: u8 = 70;
 
 /// PERC-622: Advance oracle phase (permissionless crank).
 /// Transitions market through Phase 1→2→3 based on time + volume milestones.
@@ -227,6 +231,7 @@ mod tests {
             TAG_SET_PENDING_SETTLEMENT,
             TAG_CLEAR_PENDING_SETTLEMENT,
             TAG_TRANSFER_OWNERSHIP_CPI,
+            TAG_SET_WALLET_CAP,
         ];
 
         for i in 0..tags.len() {

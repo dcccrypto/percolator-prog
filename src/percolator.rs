@@ -2013,6 +2013,9 @@ pub mod error {
         CrossMarginPairNotFound,
         /// Cross-margin attestation stale (too many slots since attested).
         CrossMarginAttestationStale,
+        /// PERC-8111: Per-wallet position cap exceeded.
+        /// Trade rejected because the resulting position would exceed max_wallet_pos_e6.
+        WalletPositionCapExceeded,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2554,6 +2557,22 @@ pub mod ix {
         ClearPendingSettlement {
             user_idx: u16,
         },
+
+        /// PERC-8111: Set per-wallet position cap (admin only).
+        ///
+        /// Sets the maximum absolute position size any single wallet may hold on this market.
+        /// Enforced on every trade (TradeNoCpi + TradeCpi) after execute_trade.
+        ///
+        /// - `cap_e6 = 0`: disable per-wallet cap (no limit).
+        /// - `cap_e6 > 0`: max |position_size| in e6 units ($1 = 1_000_000).
+        ///   Phase 1 launch: 1_000_000_000 ($1K).
+        ///
+        /// Accounts:
+        ///   0. [signer]   admin
+        ///   1. [writable] slab
+        SetWalletCap {
+            cap_e6: u64,
+        },
     }
 
     impl Instruction {
@@ -3086,6 +3105,12 @@ pub mod ix {
                 TAG_CLEAR_PENDING_SETTLEMENT => {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ClearPendingSettlement { user_idx })
+                }
+
+                // PERC-8111: Per-wallet position cap
+                TAG_SET_WALLET_CAP => {
+                    let cap_e6 = read_u64(&mut rest)?;
+                    Ok(Instruction::SetWalletCap { cap_e6 })
                 }
 
                 _ => Err(ProgramError::InvalidInstructionData),
@@ -4189,6 +4214,46 @@ pub mod state {
     pub fn write_last_audit_pause_slot(config: &mut MarketConfig, slot: u64) {
         let bytes = slot.to_le_bytes();
         config._rebalancing_pad[..6].copy_from_slice(&bytes[..6]);
+    }
+
+    // =========================================================================
+    // PERC-8111: Per-Wallet Position Cap
+    // =========================================================================
+    //
+    // Stored in `_safety_valve_pad[0..4]` as a little-endian u32.
+    // Unit: the value is in **kilo-e6** units, i.e.:
+    //   stored_value * 1_000 == max_wallet_pos_e6
+    //
+    // This gives a range of $0 (disabled) to ~$4.295B with 1 kilo-e6 = $0.001 step.
+    // For Phase 1 launch: max $1K → stored as 1_000_000.
+    //
+    // 0 = disabled (no per-wallet cap enforced).
+
+    /// Read per-wallet position cap from `_safety_valve_pad[0..4]`.
+    /// Returns the cap in e6 units ($1 = 1_000_000). 0 = disabled.
+    #[inline]
+    pub fn get_max_wallet_pos_e6(config: &MarketConfig) -> u64 {
+        let raw = u32::from_le_bytes([
+            config._safety_valve_pad[0],
+            config._safety_valve_pad[1],
+            config._safety_valve_pad[2],
+            config._safety_valve_pad[3],
+        ]);
+        (raw as u64).saturating_mul(1_000)
+    }
+
+    /// Write per-wallet position cap into `_safety_valve_pad[0..4]`.
+    /// Pass `cap_e6 = 0` to disable. Values are truncated to the nearest kilo-e6.
+    /// `cap_e6` is in e6 units ($1 = 1_000_000). Max storable: ~$4.295B.
+    #[inline]
+    pub fn set_max_wallet_pos_e6(config: &mut MarketConfig, cap_e6: u64) {
+        // Store as kilo-e6 units (divide by 1_000, round down, clamp to u32::MAX)
+        let raw = (cap_e6 / 1_000).min(u32::MAX as u64) as u32;
+        let bytes = raw.to_le_bytes();
+        config._safety_valve_pad[0] = bytes[0];
+        config._safety_valve_pad[1] = bytes[1];
+        config._safety_valve_pad[2] = bytes[2];
+        config._safety_valve_pad[3] = bytes[3];
     }
 
     #[cfg(test)]
@@ -8569,6 +8634,40 @@ pub mod processor {
         Ok(())
     }
 
+    /// PERC-8111: Per-wallet position cap check.
+    ///
+    /// If `max_wallet_pos_e6 > 0`, reject the trade when the resulting
+    /// `|position_size|` for `user_idx` would exceed `max_wallet_pos_e6`.
+    ///
+    /// The check is applied **after** `execute_trade`, so `position_size` already
+    /// reflects the new position. This mirrors the OI cap pattern and catches both
+    /// initial opens and size-increasing adds.
+    ///
+    /// Risk-reducing trades (closing or reducing position) are always allowed.
+    fn check_wallet_position_cap(
+        engine: &RiskEngine,
+        config: &state::MarketConfig,
+        user_idx: u16,
+    ) -> Result<(), ProgramError> {
+        let cap = state::get_max_wallet_pos_e6(config);
+        if cap == 0 {
+            return Ok(()); // Cap disabled
+        }
+
+        let pos = engine.accounts[user_idx as usize].position_size.get();
+        let abs_pos = pos.unsigned_abs() as u64;
+
+        if abs_pos > cap {
+            msg!(
+                "PERC-8111: Wallet position cap exceeded: |pos|={} cap={} (e6 units)",
+                abs_pos,
+                cap,
+            );
+            return Err(PercolatorError::WalletPositionCapExceeded.into());
+        }
+        Ok(())
+    }
+
     /// PERC-312: Safety valve — check and auto-exit rebalancing mode.
     /// If rebalancing is active and trade would increase position on the dominant side, reject.
     /// Dominant side = direction of net LP position (longs dominant if net_lp_pos < 0,
@@ -10459,6 +10558,8 @@ pub mod processor {
                 check_oi_cap(engine, &config, clock.slot)?;
                 check_pnl_cap(engine, &config)?;
                 check_phase_leverage(engine, &config, user_idx)?;
+                // PERC-8111: Per-wallet position cap
+                check_wallet_position_cap(engine, &config, user_idx)?;
 
                 // PERC-622: Accumulate trade volume for oracle phase transitions.
                 // trade_notional_e6 = |size| * price / 1e6 (approximate notional)
@@ -10827,6 +10928,8 @@ pub mod processor {
                     check_oi_cap(engine, &config, clock.slot)?;
                     check_pnl_cap(engine, &config)?;
                     check_phase_leverage(engine, &config, user_idx)?;
+                    // PERC-8111: Per-wallet position cap
+                    check_wallet_position_cap(engine, &config, user_idx)?;
 
                     // PERC-622: Accumulate trade volume for oracle phase transitions.
                     {
@@ -16559,6 +16662,35 @@ pub mod processor {
                     "PERC-608: ClearPendingSettlement slab={} user_idx={}",
                     a_slab.key,
                     user_idx,
+                );
+            }
+
+            // PERC-8111: SetWalletCap — admin sets per-wallet position cap.
+            Instruction::SetWalletCap { cap_e6 } => {
+                // Accounts: [admin(signer), slab(writable)]
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let mut config = state::read_config(&data);
+                state::set_max_wallet_pos_e6(&mut config, cap_e6);
+                state::write_config(&mut data, &config);
+
+                let stored = state::get_max_wallet_pos_e6(&config);
+                msg!(
+                    "PERC-8111: SetWalletCap: cap_e6={} stored={}",
+                    cap_e6,
+                    stored,
                 );
             }
 

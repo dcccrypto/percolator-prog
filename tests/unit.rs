@@ -6191,3 +6191,359 @@ fn test_update_risk_params_accepts_valid_params() {
         result
     );
 }
+
+// =============================================================================
+// PERC-8111: Per-Wallet Position Cap Tests
+// =============================================================================
+
+/// Encode SetWalletCap instruction (tag=70).
+fn encode_set_wallet_cap(cap_e6: u64) -> Vec<u8> {
+    let mut data = vec![70u8]; // TAG_SET_WALLET_CAP
+    encode_u64(cap_e6, &mut data);
+    data
+}
+
+/// PERC-8111: SetWalletCap stores and round-trips correctly via state helpers.
+#[test]
+fn test_set_wallet_cap_roundtrip_state() {
+    use percolator_prog::state;
+    let mut cfg: percolator_prog::state::MarketConfig = bytemuck::Zeroable::zeroed();
+
+    // Default: 0 (disabled)
+    assert_eq!(state::get_max_wallet_pos_e6(&cfg), 0);
+
+    // Set $1K cap = 1_000_000_000 e6
+    state::set_max_wallet_pos_e6(&mut cfg, 1_000_000_000);
+    let stored = state::get_max_wallet_pos_e6(&cfg);
+    // Stored as kilo-e6 → stored = 1_000_000_000 / 1_000 * 1_000 = 1_000_000_000 (exact)
+    assert_eq!(
+        stored, 1_000_000_000,
+        "Round-trip $1K cap failed: got {}",
+        stored
+    );
+
+    // Disable: set to 0
+    state::set_max_wallet_pos_e6(&mut cfg, 0);
+    assert_eq!(
+        state::get_max_wallet_pos_e6(&cfg),
+        0,
+        "Disabling cap failed"
+    );
+
+    // $10K cap
+    state::set_max_wallet_pos_e6(&mut cfg, 10_000_000_000);
+    let stored10k = state::get_max_wallet_pos_e6(&cfg);
+    assert_eq!(stored10k, 10_000_000_000);
+}
+
+/// PERC-8111: SetWalletCap instruction accepted by initialized market (admin only).
+#[test]
+fn test_set_wallet_cap_instruction_accepted() {
+    let mut f = setup_initialized_market();
+    let data = encode_set_wallet_cap(1_000_000_000); // $1K
+    let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+    let result = process_instruction(&f.program_id, &accounts, &data);
+    assert!(
+        result.is_ok(),
+        "SetWalletCap must succeed for admin: {:?}",
+        result
+    );
+}
+
+/// PERC-8111: SetWalletCap rejected by non-admin.
+#[test]
+fn test_set_wallet_cap_rejected_by_non_admin() {
+    let mut f = setup_initialized_market();
+    let data = encode_set_wallet_cap(1_000_000_000);
+
+    let mut non_admin = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+
+    let accounts = vec![non_admin.to_info(), f.slab.to_info()];
+    let result = process_instruction(&f.program_id, &accounts, &data);
+    assert!(result.is_err(), "SetWalletCap must reject non-admin");
+}
+
+/// PERC-8111: SetWalletCap disable (cap=0) accepted.
+#[test]
+fn test_set_wallet_cap_disable() {
+    let mut f = setup_initialized_market();
+    // Set a cap first
+    {
+        let data = encode_set_wallet_cap(1_000_000_000);
+        let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+        process_instruction(&f.program_id, &accounts, &data).unwrap();
+    }
+    // Now disable it
+    {
+        let data = encode_set_wallet_cap(0);
+        let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+        let result = process_instruction(&f.program_id, &accounts, &data);
+        assert!(
+            result.is_ok(),
+            "SetWalletCap(0) disable must succeed: {:?}",
+            result
+        );
+    }
+}
+
+/// PERC-8111: TradeNoCpi rejected when position would exceed cap.
+/// Setup: set $1K cap, then attempt a trade of 2K units → expect WalletPositionCapExceeded.
+#[test]
+#[cfg(feature = "test")]
+#[ignore = "PERC-199: TradeNoCpi uses Clock::get() syscall, unavailable in unit tests — migrate to LiteSVM"]
+fn test_wallet_cap_blocks_trade_exceeding_limit() {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let init_accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+    }
+
+    // Set wallet cap: 500 (500 base units = $0.0005 in e6 at price=100 — small but enforceable)
+    {
+        let data = encode_set_wallet_cap(500);
+        let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+        process_instruction(&f.program_id, &accounts, &data).unwrap();
+    }
+
+    // Create user + lp
+    let mut user = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut user_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, user.key, 10_000),
+    )
+    .writable();
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+    }
+    let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 5000)).unwrap();
+    }
+
+    let mut lp = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, lp.key, 10_000),
+    )
+    .writable();
+    let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+    let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+    {
+        let accs = vec![
+            lp.to_info(),
+            f.slab.to_info(),
+            lp_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+        ];
+        process_instruction(&f.program_id, &accs, &encode_init_lp(d1.key, d2.key, 0)).unwrap();
+    }
+    let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+    {
+        let accounts = vec![
+            lp.to_info(),
+            f.slab.to_info(),
+            lp_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_deposit(lp_idx, 5000)).unwrap();
+    }
+
+    // Trade size=1000 > cap=500 → must be rejected
+    let result = {
+        let accounts = vec![
+            user.to_info(),
+            lp.to_info(),
+            f.slab.to_info(),
+            f.pyth_index.to_info(),
+        ];
+        process_instruction(
+            &f.program_id,
+            &accounts,
+            &encode_trade(lp_idx, user_idx, 1000),
+        )
+    };
+    assert_eq!(
+        result,
+        Err(percolator_prog::error::PercolatorError::WalletPositionCapExceeded.into()),
+        "PERC-8111: Trade exceeding wallet cap must be rejected"
+    );
+}
+
+/// PERC-8111: TradeNoCpi allowed when position is within cap.
+#[test]
+#[cfg(feature = "test")]
+#[ignore = "PERC-199: TradeNoCpi uses Clock::get() syscall, unavailable in unit tests — migrate to LiteSVM"]
+fn test_wallet_cap_allows_trade_within_limit() {
+    let mut f = setup_market();
+    let init_data = encode_init_market(&f, 100);
+    {
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let init_accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            dummy_ata.to_info(),
+            f.system.to_info(),
+        ];
+        process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+    }
+
+    // Set wallet cap: 2000 units → trade of 100 should be fine
+    {
+        let data = encode_set_wallet_cap(2000);
+        let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+        process_instruction(&f.program_id, &accounts, &data).unwrap();
+    }
+
+    let mut user = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut user_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, user.key, 10_000),
+    )
+    .writable();
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+    }
+    let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+    {
+        let accounts = vec![
+            user.to_info(),
+            f.slab.to_info(),
+            user_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 5000)).unwrap();
+    }
+
+    let mut lp = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut lp_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, lp.key, 10_000),
+    )
+    .writable();
+    let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+    let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+    {
+        let accs = vec![
+            lp.to_info(),
+            f.slab.to_info(),
+            lp_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+        ];
+        process_instruction(&f.program_id, &accs, &encode_init_lp(d1.key, d2.key, 0)).unwrap();
+    }
+    let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+    {
+        let accounts = vec![
+            lp.to_info(),
+            f.slab.to_info(),
+            lp_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &encode_deposit(lp_idx, 5000)).unwrap();
+    }
+
+    // Trade size=100 < cap=2000 → must succeed
+    let result = {
+        let accounts = vec![
+            user.to_info(),
+            lp.to_info(),
+            f.slab.to_info(),
+            f.pyth_index.to_info(),
+        ];
+        process_instruction(
+            &f.program_id,
+            &accounts,
+            &encode_trade(lp_idx, user_idx, 100),
+        )
+    };
+    assert!(
+        result.is_ok(),
+        "PERC-8111: Trade within wallet cap must succeed: {:?}",
+        result
+    );
+}
