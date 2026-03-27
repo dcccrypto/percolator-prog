@@ -2118,7 +2118,7 @@ fn test_hyperp_init_market_with_valid_price() {
             &[0u8; 32],       // Hyperp mode: feed_id = 0
             0,                // invert
             initial_price_e6, // Valid initial mark price
-            0,                // warmup
+            100,              // warmup (must be > 0 since PERC-8093)
         ),
     };
 
@@ -2251,7 +2251,7 @@ fn test_hyperp_init_market_with_inverted_price() {
             &[0u8; 32],   // Hyperp mode: feed_id = 0
             1,            // invert = 1 (inverted market)
             raw_price_e6, // Raw price, will be inverted internally
-            0,            // warmup
+            100,          // warmup (must be > 0 since PERC-8093)
         ),
     };
 
@@ -8575,13 +8575,59 @@ fn test_attack_close_account_with_position() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
+    {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let num_used_off = SBF_ENGINE_OFF + 1256;
+        let num_used = u16::from_le_bytes([slab.data[num_used_off], slab.data[num_used_off+1]]);
+        println!("DEBUG after init_market: num_used_accounts={} slab_len={}", num_used, slab.data.len());
+        // Check header magic
+        let magic = u64::from_le_bytes(slab.data[0..8].try_into().unwrap());
+        println!("DEBUG: slab header magic=0x{:x}", magic);
+    }
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
+    {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let num_used_off = SBF_ENGINE_OFF + 1256;
+        let num_used = u16::from_le_bytes([slab.data[num_used_off], slab.data[num_used_off+1]]);
+        println!("DEBUG after init_lp(idx={}): num_used_accounts={}", lp_idx, num_used);
+        // Check a wider range around expected offset for any non-zero value
+        let start = SBF_ENGINE_OFF + 1200;
+        let end = SBF_ENGINE_OFF + 1300;
+        let nonzero: Vec<(usize, u8)> = slab.data[start..end].iter().enumerate()
+            .filter(|(_, &v)| v != 0)
+            .map(|(i, &v)| (start + i, v))
+            .collect();
+        println!("DEBUG: Non-zero bytes in slab[{}..{}]: {:?}", start, end, nonzero);
+        // Check accounts via expected x86_64 offsets vs shifted BPF offsets
+        // x86_64: accounts at engine+9472, BPF empirically: engine+9488
+        let acc_x86 = SBF_ENGINE_OFF + 9472;
+        let acc_bpf = SBF_ENGINE_OFF + 9488;
+        // LP account[0].account_id (u64) at offset 0 of account
+        let id_x86 = u64::from_le_bytes(slab.data[acc_x86..acc_x86+8].try_into().unwrap());
+        let id_bpf = u64::from_le_bytes(slab.data[acc_bpf..acc_bpf+8].try_into().unwrap());
+        println!("DEBUG: lp account_id at x86 accounts+0={} bpf accounts+0={}", id_x86, id_bpf);
+        // Scan for account_id (should be 0 for first LP)
+        let account_size = 248usize;
+        for trial_accounts_off in [9472usize, 9488] {
+            let abs = SBF_ENGINE_OFF + trial_accounts_off;
+            let id = u64::from_le_bytes(slab.data[abs..abs+8].try_into().unwrap());
+            let cap_lo = u64::from_le_bytes(slab.data[abs+8..abs+16].try_into().unwrap());
+            let cap_hi = u64::from_le_bytes(slab.data[abs+16..abs+24].try_into().unwrap());
+            println!("DEBUG: accounts[trial=engine+{}]: id={} cap_lo={} cap_hi={}", trial_accounts_off, id, cap_lo, cap_hi);
+        }
+    }
     env.deposit(&lp, lp_idx, 100_000_000_000);
 
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
+    {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let num_used_off = SBF_ENGINE_OFF + 1256;
+        let num_used = u16::from_le_bytes([slab.data[num_used_off], slab.data[num_used_off+1]]);
+        println!("DEBUG after init_user(idx={}): num_used_accounts={}", user_idx, num_used);
+    }
     env.deposit(&user, user_idx, 10_000_000_000);
 
     // Open position
@@ -8589,6 +8635,25 @@ fn test_attack_close_account_with_position() {
 
     // Verify position exists
     let pos = env.read_account_position(user_idx);
+    let cap = env.read_account_capital(user_idx);
+    println!("DEBUG: user_idx={} lp_idx={} pos={} cap={}", user_idx, lp_idx, pos, cap);
+    // Also dump raw bytes at position offset
+    {
+        const ACCOUNTS_OFFSET: usize = SBF_ENGINE_OFF + 9472;
+        const ACCOUNT_SIZE: usize = 248;
+        const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let off = ACCOUNTS_OFFSET + (user_idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
+        println!("DEBUG: slab.data.len()={} off={}", slab.data.len(), off);
+        if slab.data.len() > off + 16 {
+            let raw = &slab.data[off..off+16];
+            println!("DEBUG: raw position bytes: {:?}", raw);
+        }
+        // Also check num_used_accounts
+        let num_used_off = SBF_ENGINE_OFF + 1256;
+        let num_used = u16::from_le_bytes([slab.data[num_used_off], slab.data[num_used_off+1]]);
+        println!("DEBUG: num_used_accounts={}", num_used);
+    }
     assert!(pos != 0, "User should have open position");
 
     // Try to close account with position

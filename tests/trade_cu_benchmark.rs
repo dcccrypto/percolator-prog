@@ -39,7 +39,7 @@ use std::path::PathBuf;
 // Note: struct layouts differ between BPF and native; these are BPF values.
 // Use `cargo build-sbf` (NOT --features test) — the test feature bypasses CPI
 // for token transfers, which fails in LiteSVM's BPF runtime.
-const SLAB_LEN: usize = 1025832; // MAX_ACCOUNTS=4096 (BPF, PERC-328: matches SBF .so output)
+const SLAB_LEN: usize = 1025880; // MAX_ACCOUNTS=4096 (BPF, updated for PERC-8093: +48 bytes in RiskParams)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -108,7 +108,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 = not Hyperp mode)
                                                  // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // warmup_period_slots (must be > 0 since PERC-8093)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps

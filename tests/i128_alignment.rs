@@ -371,7 +371,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for Pyth-mode markets)
                                                  // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // warmup_period_slots (must be > 0 since PERC-8093)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
