@@ -26,7 +26,7 @@ use std::path::PathBuf;
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
 // Updated for PERC-328: matches SBF .so output after MarketConfig grew
 // (PERC-312 safety valve, PERC-314 dispute, PERC-315 LP collateral fields)
-const SLAB_LEN: usize = 1025832;
+const SLAB_LEN: usize = 1025880; // percolator@cf35789: +48 bytes from RiskParams new fields
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

@@ -2020,6 +2020,8 @@ pub mod error {
         /// Trade rejected because it would increase |long_oi - short_oi| / total_oi
         /// beyond the oi_imbalance_hard_block_bps threshold.
         OiImbalanceHardBlock,
+        /// Entry price must be positive when opening a position (RiskError::InvalidEntryPrice).
+        EngineInvalidEntryPrice,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2040,6 +2042,7 @@ pub mod error {
             RiskError::NotAnLPAccount => PercolatorError::EngineNotAnLPAccount,
             RiskError::PositionSizeMismatch => PercolatorError::EnginePositionSizeMismatch,
             RiskError::AccountKindMismatch => PercolatorError::EngineAccountKindMismatch,
+            RiskError::InvalidEntryPrice => PercolatorError::EngineInvalidEntryPrice,
         };
         ProgramError::Custom(err as u32)
     }
@@ -3257,6 +3260,10 @@ pub mod ix {
             fee_split_protocol_bps: 0,
             fee_split_creator_bps: 0,
             fee_utilization_surge_bps: 0,
+            // PERC-8093: new RiskParams fields (percolator@cf35789)
+            min_nonzero_mm_req: 0,
+            min_nonzero_im_req: 0,
+            insurance_floor: U128::ZERO,
         })
     }
 
