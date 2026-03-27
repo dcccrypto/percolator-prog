@@ -1827,8 +1827,11 @@ fn benchmark_all_instructions() {
             ],
             data: encode_set_risk_threshold(1_000_000),
         };
-        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("SetRiskThreshold:      {:>8} CU", cu);
+        // SetRiskThreshold always rejects (I_floor immutable per spec §2.2.1)
+        match measure(&mut env.svm, ix, &[&admin]) {
+            Ok(cu) => println!("SetRiskThreshold:      {:>8} CU (rejected)", cu),
+            Err(_) => println!("SetRiskThreshold:      (rejected — I_floor immutable)"),
+        }
     }
 
     // --- UpdateConfig (Tag 14) ---
