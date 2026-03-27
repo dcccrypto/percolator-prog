@@ -2315,19 +2315,25 @@ pub mod oracle {
     ///
     /// Security: When dt_slots == 0 (same slot) or cap_e2bps == 0 (cap disabled),
     /// returns index unchanged to prevent bypassing rate limits.
+    /// Maximum effective dt for rate-limiting. Caps accumulated movement to
+    /// prevent a crank pause from allowing a full-magnitude index jump.
+    /// ~1 hour at 2.5 slots/sec = 9000 slots.
+    const MAX_CLAMP_DT_SLOTS: u64 = 9_000;
+
     pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
         if index == 0 {
             return mark;
         }
-        // Bug #9 fix: return index (no movement) when dt=0 or cap=0,
-        // rather than mark (bypass rate limiting)
         if cap_e2bps == 0 || dt_slots == 0 {
             return index;
         }
 
+        // Cap dt to bound accumulated movement after crank pauses
+        let capped_dt = dt_slots.min(MAX_CLAMP_DT_SLOTS);
+
         let max_delta_u128 = (index as u128)
             .saturating_mul(cap_e2bps as u128)
-            .saturating_mul(dt_slots as u128)
+            .saturating_mul(capped_dt as u128)
             / 1_000_000u128;
 
         let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
@@ -3420,7 +3426,7 @@ pub mod processor {
                     // engine borrow ends here (last use above).
                     // Write dust_base AFTER dropping the engine borrow to avoid
                     // aliasing conflict with state::write_dust_base.
-                    if forgive_dust {
+                    if forgive_dust && dust_before != 0 {
                         // Forgive any sub-scale remainder — on resolved markets
                         // no new dust can accumulate, so this is terminal cleanup.
                         state::write_dust_base(&mut data, 0);
@@ -3814,12 +3820,8 @@ pub mod processor {
                 let exec_price = ret.exec_price_e6;
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
-                    state::write_config(&mut data, &config);
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Side-mode gating is handled inside engine.execute_trade()
-
-                    // Trade size selection via verify helper (Kani-provable: uses exec_size, not requested_size)
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
                     #[cfg(feature = "cu-audit")]
                     {
@@ -3831,21 +3833,18 @@ pub mod processor {
                         exec_size: trade_size,
                     };
                     execute_trade_with_matcher(
-                        engine, &matcher, lp_idx, user_idx, clock.slot, price, size,
+                        engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
                     ).map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
                         sol_log_compute_units();
                     }
-                    // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
 
-                    // Hyperp mode: update mark price with execution price.
-                    // Normalize to engine-space then clamp against index.
-                    // Skip mark update if normalization fails (price too small for scale).
+                    // Hyperp: update mark price with normalized exec price.
+                    // Reuse config from pre-CPI phase (single round-trip).
                     if is_hyperp {
-                        let mut config = state::read_config(&data);
                         if let Some(normalized_exec) = crate::verify::to_engine_price(
                             ret.exec_price_e6, config.invert, config.unit_scale,
                         ) {
@@ -3855,9 +3854,11 @@ pub mod processor {
                                 config.oracle_price_cap_e2bps,
                             );
                             config.authority_price_e6 = clamped_mark;
-                            state::write_config(&mut data, &config);
                         }
                     }
+                    // Single config write (covers oracle price update from pre-CPI
+                    // phase + Hyperp mark update)
+                    state::write_config(&mut data, &config);
                 }
             }
             Instruction::LiquidateAtOracle { target_idx } => {
@@ -4673,6 +4674,12 @@ pub mod processor {
                 // Previously inferred from authority_timestamp bit patterns, which an
                 // oracle authority could forge via crafted PushOraclePrice timestamps.
                 let configured = state::is_policy_configured(&data);
+                // Defensive: configured flag should only be set on resolved markets
+                // (SetInsuranceWithdrawPolicy is gated on is_resolved). If this
+                // invariant is ever broken, reject rather than use repurposed fields.
+                if configured && !resolved {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 let (stored_bps, stored_last_slot) = if configured {
                     unpack_ins_withdraw_meta(config.authority_timestamp)
                 } else {
