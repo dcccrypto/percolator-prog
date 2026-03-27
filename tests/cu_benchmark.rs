@@ -32,7 +32,7 @@ use std::path::PathBuf;
 // ExternalAccountDataModified errors in LiteSVM's BPF runtime).
 // Build with: cargo build-sbf   (no --features test)
 // Note: BPF struct layout differs from native; these are BPF values.
-const SLAB_LEN: usize = 1025832; // MAX_ACCOUNTS=4096 (BPF, updated for struct growth)
+const SLAB_LEN: usize = 1025880; // MAX_ACCOUNTS=4096 (BPF, updated for PERC-8093: +48 bytes in RiskParams)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -138,7 +138,8 @@ fn encode_init_market_with_params(
 }
 
 fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<u8> {
-    encode_init_market_with_params(admin, mint, feed_id, 0, 0)
+    // warmup_period_slots must be > 0 (validated in RiskParams::validate since PERC-8093)
+    encode_init_market_with_params(admin, mint, feed_id, 0, 100)
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
@@ -299,7 +300,8 @@ impl TestEnv {
     }
 
     fn init_market(&mut self) {
-        self.init_market_with_params(0, 0);
+        // warmup_period_slots must be > 0 (validated since PERC-8093)
+        self.init_market_with_params(0, 100);
     }
 
     fn init_market_with_params(
@@ -1340,8 +1342,8 @@ fn benchmark_worst_case_scenarios() {
         let num_users = 4095;
 
         let mut env = TestEnv::new();
-        // threshold=0, warmup=0
-        env.init_market_with_params(0, 0);
+        // threshold=0, warmup=100 (warmup_period_slots must be > 0 since PERC-8093)
+        env.init_market_with_params(0, 100);
 
         // Top up insurance so force_realize is OFF and liquidation path runs
         let insurance_funder = Keypair::new();
