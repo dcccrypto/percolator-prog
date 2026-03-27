@@ -37,7 +37,7 @@ use percolator_prog::verify::{
     decide_admin_op,
     decide_crank,
     // New: allow_panic crank decision
-    decide_keeper_crank_with_panic,
+    decide_keeper_crank,
     decide_single_owner_op,
     decide_trade_cpi,
     decide_trade_cpi_from_ret,
@@ -1477,30 +1477,24 @@ fn kani_matcher_accepts_partial_fill_with_flag() {
     );
 }
 
-/// Universal characterization: decide_keeper_crank_with_panic ==
-///   if allow_panic != 0 && !admin_ok(admin, signer) => Reject
-///   else => decide_crank(permissionless, idx_exists, stored_owner, signer)
+/// Universal characterization: decide_keeper_crank ==
+///   decide_crank(permissionless, idx_exists, stored_owner, signer)
+/// allow_panic removed from model — runtime ignores it for wire compat.
 #[kani::proof]
-fn kani_decide_keeper_crank_with_panic_universal() {
-    let allow_panic: u8 = kani::any();
-    let admin: [u8; 32] = kani::any();
+fn kani_decide_keeper_crank_universal() {
     let signer: [u8; 32] = kani::any();
     let permissionless: bool = kani::any();
     let idx_exists: bool = kani::any();
     let stored_owner: [u8; 32] = kani::any();
 
-    let decision = decide_keeper_crank_with_panic(
-        allow_panic, admin, signer, permissionless, idx_exists, stored_owner,
+    let decision = decide_keeper_crank(
+        permissionless, idx_exists, stored_owner, signer,
     );
 
-    let expected = if allow_panic != 0 && !admin_ok(admin, signer) {
-        SimpleDecision::Reject
-    } else {
-        decide_crank(permissionless, idx_exists, stored_owner, signer)
-    };
+    let expected = decide_crank(permissionless, idx_exists, stored_owner, signer);
 
     assert_eq!(decision, expected,
-        "decide_keeper_crank_with_panic must match specification");
+        "decide_keeper_crank must equal decide_crank");
 }
 
 // =============================================================================
@@ -2529,38 +2523,8 @@ fn kani_units_roundtrip_exact_when_no_dust() {
     assert_eq!(recovered, base, "roundtrip must be exact when dust==0");
 }
 
-/// Universal: allow_panic != 0 && !admin_ok => Reject (for all other inputs)
-#[kani::proof]
-fn kani_universal_panic_requires_admin() {
-    let allow_panic: u8 = kani::any();
-    kani::assume(allow_panic != 0); // Panic requested
-
-    let admin: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-
-    // Admin check fails (either burned or mismatch)
-    kani::assume(!admin_ok(admin, signer));
-
-    // Other inputs can be anything
-    let permissionless: bool = kani::any();
-    let idx_exists: bool = kani::any();
-    let stored_owner: [u8; 32] = kani::any();
-
-    let decision = decide_keeper_crank_with_panic(
-        allow_panic,
-        admin,
-        signer,
-        permissionless,
-        idx_exists,
-        stored_owner,
-    );
-
-    assert_eq!(
-        decision,
-        SimpleDecision::Reject,
-        "allow_panic without admin auth must ALWAYS reject"
-    );
-}
+// kani_universal_panic_requires_admin removed — allow_panic is dead
+// (runtime ignores it, model no longer includes it).
 
 // =============================================================================
 // AI. UNIVERSAL GATE KILL-SWITCH FOR FROM_RET PATH

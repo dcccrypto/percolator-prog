@@ -575,28 +575,20 @@ pub mod verify {
     }
 
     // =========================================================================
-    // KeeperCrank with allow_panic decision logic
+    // KeeperCrank decision logic
     // =========================================================================
 
-    /// Decision for KeeperCrank with allow_panic support.
-    /// - If allow_panic != 0: requires admin authorization
-    /// - If allow_panic == 0 and permissionless: always accept
-    /// - If allow_panic == 0 and self-crank: requires idx exists and owner match
+    /// Decision for KeeperCrank authorization.
+    /// allow_panic is read-and-discarded at runtime for wire compatibility,
+    /// so the model ignores it too. Permissionless: always accept.
+    /// Self-crank: requires idx exists and owner match.
     #[inline]
-    pub fn decide_keeper_crank_with_panic(
-        allow_panic: u8,
-        admin: [u8; 32],
-        signer: [u8; 32],
+    pub fn decide_keeper_crank(
         permissionless: bool,
         idx_exists: bool,
         stored_owner: [u8; 32],
+        signer: [u8; 32],
     ) -> SimpleDecision {
-        // If allow_panic is requested, must have admin authorization
-        if allow_panic != 0 {
-            if !admin_ok(admin, signer) {
-                return SimpleDecision::Reject;
-            }
-        }
         // Normal crank logic
         decide_crank(permissionless, idx_exists, stored_owner, signer)
     }
@@ -626,6 +618,16 @@ pub mod verify {
             return None;
         }
         Some(inverted as u64)
+    }
+
+    /// Convert a raw oracle price to engine-space: invert then scale.
+    /// All Hyperp internal prices (authority_price_e6, last_effective_price_e6)
+    /// must be in engine-space. Apply this at every ingress point:
+    /// InitMarket, PushOraclePrice, TradeCpi mark-update.
+    #[inline]
+    pub fn to_engine_price(raw: u64, invert: u8, unit_scale: u32) -> Option<u64> {
+        let after_invert = invert_price_e6(raw, invert)?;
+        scale_price_e6(after_invert, unit_scale)
     }
 
     /// Scale oracle price by unit_scale: scaled_e6 = price_e6 / unit_scale
@@ -2881,10 +2883,10 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // For Hyperp mode with inverted markets, apply inversion to initial price
-                // This ensures the stored mark/index are in "market price" form
-                let initial_mark_price_e6 = if is_hyperp && invert != 0 {
-                    crate::verify::invert_price_e6(initial_mark_price_e6, invert)
+                // Normalize initial mark price to engine-space (invert + scale).
+                // All Hyperp internal prices must be in engine-space.
+                let initial_mark_price_e6 = if is_hyperp {
+                    crate::verify::to_engine_price(initial_mark_price_e6, invert, unit_scale)
                         .ok_or(PercolatorError::OracleInvalid)?
                 } else {
                     initial_mark_price_e6
@@ -3839,15 +3841,16 @@ pub mod processor {
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
 
-                    // Hyperp mode: update mark price with execution price
-                    // Apply circuit breaker to prevent extreme mark price manipulation
+                    // Hyperp mode: update mark price with execution price.
+                    // Normalize to engine-space then clamp against index.
                     if is_hyperp {
                         let mut config = state::read_config(&data);
-                        // Clamp exec_price against current index to prevent manipulation
-                        // Uses same circuit breaker as PushOraclePrice for consistency
+                        let normalized_exec = crate::verify::to_engine_price(
+                            ret.exec_price_e6, config.invert, config.unit_scale,
+                        ).unwrap_or(ret.exec_price_e6);
                         let clamped_mark = oracle::clamp_oracle_price(
                             config.last_effective_price_e6,
-                            ret.exec_price_e6,
+                            normalized_exec,
                             config.oracle_price_cap_e2bps,
                         );
                         config.authority_price_e6 = clamped_mark;
@@ -4380,8 +4383,17 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
+                // Normalize to engine-space for Hyperp markets (invert + scale).
+                // Non-Hyperp authority prices are raw (normalization happens in
+                // read_engine_price_e6 at consumption time).
+                let normalized_price = if is_hyperp {
+                    crate::verify::to_engine_price(price_e6, config.invert, config.unit_scale)
+                        .ok_or(PercolatorError::OracleInvalid)?
+                } else {
+                    price_e6
+                };
+
                 // For non-Hyperp markets, require monotonic authority timestamps.
-                // This prevents stale rollback pushes from replacing fresher authority data.
                 if !is_hyperp
                     && config.authority_timestamp != 0
                     && timestamp < config.authority_timestamp
@@ -4389,10 +4401,10 @@ pub mod processor {
                     return Err(PercolatorError::OracleStale.into());
                 }
 
-                // Clamp the incoming price against circuit breaker
+                // Clamp against circuit breaker (both sides in same price space)
                 let clamped = oracle::clamp_oracle_price(
                     config.last_effective_price_e6,
-                    price_e6,
+                    normalized_price,
                     config.oracle_price_cap_e2bps,
                 );
                 config.authority_price_e6 = clamped;
