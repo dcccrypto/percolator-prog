@@ -3518,34 +3518,9 @@ pub mod processor {
                 let liqs = engine.lifetime_liquidations;
                 let ins_low = engine.insurance_fund.balance.get() as u64;
 
-                // --- Insurance floor auto-update (rate-limited + EWMA smoothed + step-clamped)
-                if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
-                    // raw target: floor (static config value)
-                    let raw_target = config.thresh_floor;
-                    let clamped_target = raw_target.clamp(config.thresh_min, config.thresh_max);
-                    let current = engine.params.insurance_floor.get();
-                    // EWMA: new = alpha * target + (1 - alpha) * current
-                    let alpha = config.thresh_alpha_bps as u128;
-                    let smoothed = (alpha * clamped_target + (10_000 - alpha) * current) / 10_000;
-                    // Step clamp: max step = thresh_step_bps / 10000 of current (but at least thresh_min_step)
-                    // Bug #6 fix: When current == 0, allow stepping to clamped_target directly
-                    // Otherwise threshold would only increase by thresh_min_step (=1) per update
-                    let max_step = if current == 0 {
-                        clamped_target // Allow full jump when starting from zero
-                    } else {
-                        (current * config.thresh_step_bps as u128 / 10_000)
-                            .max(config.thresh_min_step)
-                    };
-                    let final_thresh = if smoothed > current {
-                        current.saturating_add(max_step.min(smoothed - current))
-                    } else {
-                        current.saturating_sub(max_step.min(current - smoothed))
-                    };
-                    engine.params.insurance_floor = percolator::U128::new(
-                        final_thresh.clamp(config.thresh_min, config.thresh_max),
-                    );
-                    state::write_last_thr_update_slot(&mut data, clock.slot);
-                }
+                // Spec §2.2.1: I_floor is immutable — no auto-update.
+                // Insurance floor is set at InitMarket and never changes.
+                // (EWMA auto-update removed per spec compliance.)
 
                 // Write remaining dust if sweep occurred
                 if let Some(dust) = remaining_dust {
@@ -3687,7 +3662,7 @@ pub mod processor {
                 // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
                 // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
                 // Nonce write is deferred until after execute_trade
-                let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx) = {
+                let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx, engine_current_slot) = {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &*data)?;
                     require_initialized(&*data)?;
@@ -3726,6 +3701,7 @@ pub mod processor {
                         req_id,
                         lp_acc.matcher_program,
                         lp_acc.matcher_context,
+                        engine.current_slot,
                     )
                 };
 
@@ -3740,15 +3716,15 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Read oracle price: Hyperp mode uses index directly, otherwise circuit-breaker clamping
+                // Oracle price: Hyperp mode applies rate-limited index update
+                // via clamp_toward_with_dt (prevents stale-index manipulation).
+                // Non-Hyperp: standard circuit-breaker clamping.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
-                    // Hyperp mode: use current index price for trade execution
-                    let idx = config.last_effective_price_e6;
-                    if idx == 0 {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                    idx
+                    oracle::get_engine_oracle_price_e6(
+                        engine_current_slot, clock.slot, clock.unix_timestamp,
+                        &mut config, a_oracle,
+                    )?
                 } else {
                     oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
                 };
@@ -3876,17 +3852,17 @@ pub mod processor {
                 let mut config = state::read_config(&data);
 
                 let clock = Clock::from_account_info(&accounts[2])?;
-                let price = {
-                    let is_hyperp = oracle::is_hyperp_mode(&config);
-                    if is_hyperp {
-                        let idx = config.last_effective_price_e6;
-                        if idx == 0 {
-                            return Err(PercolatorError::OracleInvalid.into());
-                        }
-                        idx
-                    } else {
-                        oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
-                    }
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    // Read engine.current_slot before mutable borrow
+                    let eng = zc::engine_ref(&data)?;
+                    let last_slot = eng.current_slot;
+                    oracle::get_engine_oracle_price_e6(
+                        last_slot, clock.slot, clock.unix_timestamp,
+                        &mut config, a_oracle,
+                    )?
+                } else {
+                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
                 };
                 state::write_config(&mut data, &config);
 
@@ -4090,81 +4066,10 @@ pub mod processor {
                     .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
-            Instruction::SetRiskThreshold { new_threshold } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_clock = &accounts[2];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                let mut config = state::read_config(&data);
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Enforce per-market admin limit
-                if new_threshold > config.max_insurance_floor {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                // Read actual current insurance_floor from engine (not stale config
-                // baseline) to prevent bypass via auto-update drift.
-                let current_floor = {
-                    let engine = zc::engine_ref(&data)?;
-                    engine.params.insurance_floor.get()
-                };
-
-                // Rate-limit: max change per day (immutable cap).
-                // 0 = locked (no changes allowed after init).
-                if config.max_insurance_floor_change_per_day == 0 {
-                    if new_threshold != current_floor {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-                } else {
-                    let current_floor = current_floor; // shadow for clarity
-                    let delta = if new_threshold > current_floor {
-                        new_threshold - current_floor
-                    } else {
-                        current_floor - new_threshold
-                    };
-
-                    // Compute allowed delta based on elapsed time
-                    const SLOTS_PER_DAY: u64 = 216_000; // ~2.5 slots/sec * 86400
-                    let elapsed = clock.slot.saturating_sub(config.last_insurance_floor_change_slot);
-                    let max_delta = if elapsed >= SLOTS_PER_DAY {
-                        config.max_insurance_floor_change_per_day
-                    } else if elapsed == 0 {
-                        // Same slot: only allow idempotent re-set (delta == 0)
-                        0u128
-                    } else {
-                        // Pro-rate: max_change * elapsed / SLOTS_PER_DAY
-                        (config.max_insurance_floor_change_per_day as u128)
-                            .saturating_mul(elapsed as u128)
-                            / (SLOTS_PER_DAY as u128)
-                    };
-
-                    if delta > max_delta {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-
-                    // Update tracking
-                    config.last_insurance_floor_change_slot = clock.slot;
-                    config.last_insurance_floor_value = new_threshold;
-                    state::write_config(&mut data, &config);
-                }
-
-                let engine = zc::engine_mut(&mut data)?;
-                engine.params.insurance_floor = percolator::U128::new(new_threshold);
+            Instruction::SetRiskThreshold { new_threshold: _ } => {
+                // Spec §2.2.1: I_floor is immutable after InitMarket.
+                // Instruction rejected; retained for wire compatibility.
+                return Err(PercolatorError::InvalidConfigParam.into());
             }
 
             Instruction::UpdateAdmin { new_admin } => {
@@ -4365,6 +4270,12 @@ pub mod processor {
             }
 
             Instruction::SetMaintenanceFee { new_fee } => {
+                // Spec §8.2: "Implementations MUST NOT realize any recurring
+                // account-local maintenance fee." Reject non-zero values.
+                // Instruction retained for wire compatibility; only fee=0 accepted.
+                if new_fee != 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
@@ -4382,14 +4293,8 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
-                // Enforce per-market admin limit
-                let config = state::read_config(&data);
-                if new_fee > config.max_maintenance_fee_per_slot {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
                 let engine = zc::engine_mut(&mut data)?;
-                engine.params.maintenance_fee_per_slot = percolator::U128::new(new_fee);
+                engine.params.maintenance_fee_per_slot = percolator::U128::new(0);
             }
 
             Instruction::SetOracleAuthority { new_authority } => {

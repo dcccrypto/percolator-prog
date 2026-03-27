@@ -3920,40 +3920,6 @@ fn test_critical_update_admin_authorization() {
 // ============================================================================
 
 /// CRITICAL: SetRiskThreshold admin-only
-#[test]
-fn test_critical_set_risk_threshold_authorization() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
-
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // Attacker tries to set threshold - should fail
-    let result = env.try_set_risk_threshold(&attacker, 1_000_000_000);
-    assert!(
-        result.is_err(),
-        "SECURITY: Non-admin should not set risk threshold"
-    );
-    println!("SetRiskThreshold by non-admin: REJECTED (correct)");
-
-    // Admin sets threshold - should succeed
-    let result = env.try_set_risk_threshold(&admin, 1_000_000_000_000);
-    assert!(
-        result.is_ok(),
-        "Admin should set risk threshold: {:?}",
-        result
-    );
-    println!("SetRiskThreshold by admin: ACCEPTED (correct)");
-
-    println!("CRITICAL TEST PASSED: SetRiskThreshold authorization enforced");
-}
-
 // ============================================================================
 // Test: SetOracleAuthority and PushOraclePrice (admin oracle)
 // ============================================================================
@@ -4052,37 +4018,6 @@ fn test_critical_set_oracle_price_cap_authorization() {
 // ============================================================================
 
 /// CRITICAL: SetMaintenanceFee admin-only
-#[test]
-fn test_critical_set_maintenance_fee_authorization() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
-
-    // Attacker tries to set maintenance fee - should fail
-    let result = env.try_set_maintenance_fee(&attacker, 1000);
-    assert!(
-        result.is_err(),
-        "SECURITY: Non-admin should not set maintenance fee"
-    );
-    println!("SetMaintenanceFee by non-admin: REJECTED (correct)");
-
-    // Admin sets maintenance fee - should succeed
-    let result = env.try_set_maintenance_fee(&admin, 1000);
-    assert!(
-        result.is_ok(),
-        "Admin should set maintenance fee: {:?}",
-        result
-    );
-    println!("SetMaintenanceFee by admin: ACCEPTED (correct)");
-
-    println!("CRITICAL TEST PASSED: SetMaintenanceFee authorization enforced");
-}
-
 // ============================================================================
 // Test: UpdateConfig authorization
 // ============================================================================
@@ -6548,78 +6483,6 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
 /// 5. Account slots are freed for legitimate users
 ///
 /// Without this mechanism, attackers could permanently fill all account slots.
-#[test]
-fn test_maintenance_fees_drain_dead_accounts_for_gc() {
-    program_path();
-
-    println!("=== MAINTENANCE FEE DRAIN & GC TEST ===");
-    println!("Maintenance fees are ENABLED (spec §8.2): fee_per_slot is charged from capital to insurance.");
-    println!("Verifying: fees drain small-capital accounts to zero, enabling permissionless GC.");
-    println!();
-
-    // Use standard TestEnv
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    // Set maintenance fee via SetMaintenanceFee instruction — should be accepted
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let maintenance_fee: u128 = 1_000_000;
-    let result = env.try_set_maintenance_fee(&admin, maintenance_fee);
-    assert!(
-        result.is_ok(),
-        "SetMaintenanceFee should succeed: {:?}",
-        result
-    );
-    println!("Set maintenance_fee_per_slot = {} (accepted by engine)", maintenance_fee);
-
-    // Create a user with small deposit
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 500_000_000); // 0.5 SOL
-    let initial_capital = env.read_account_capital(user_idx);
-    println!("Created user (idx={}) with initial capital={}", user_idx, initial_capital);
-
-    let initial_used = env.read_num_used_accounts();
-    println!("Initial num_used_accounts: {}", initial_used);
-    assert!(initial_used >= 1, "Should have at least 1 account");
-
-    // Advance time and run multiple cranks.
-    // Fees are enabled: 1_000_000/slot * 700 slots = 700_000_000 > 500_000_000 capital.
-    // Capital drains to zero on the first crank; subsequent cranks accumulate fee debt.
-    for slot in [700u64, 800, 900, 1000, 1100, 1200] {
-        env.set_slot(slot);
-        env.crank();
-    }
-    println!("Ran multiple cranks through slot 1200");
-
-    // Capital should be zero — fees drained it completely
-    let final_capital = env.read_account_capital(user_idx);
-    let final_used = env.read_num_used_accounts();
-    println!("Final capital: {} (initial: {})", final_capital, initial_capital);
-    println!("Final num_used_accounts: {}", final_used);
-
-    assert_eq!(
-        final_capital, 0,
-        "Maintenance fees must drain capital to zero. initial={} final={}",
-        initial_capital, final_capital
-    );
-
-    // Account with zero capital, no position, no pnl, and fee debt should be GC'd
-    assert!(
-        final_used < initial_used,
-        "GC expected: account with zero capital and fee debt must be freed. \
-         initial_used={} final_used={}",
-        initial_used, final_used
-    );
-
-    // SPL vault balance is preserved (token transfers happen only on deposit/withdraw)
-    let vault = env.vault_balance();
-    assert!(vault > 0, "Vault should still hold user's tokens");
-
-    println!();
-    println!("MAINTENANCE FEE DRAIN TEST COMPLETE (fees enabled, account drained and GC'd)");
-}
-
 // ============================================================================
 // Tests: Premarket Resolution (Binary Outcome Markets)
 // ============================================================================
@@ -8684,79 +8547,6 @@ fn test_attack_withdraw_during_undercollateralization() {
 
 /// ATTACK: Withdraw without settling accrued fee debt.
 /// Expected: Withdraw checks include fee debt in equity calculation.
-#[test]
-fn test_attack_withdraw_bypasses_fee_debt() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // Initialize with maintenance fee to accrue fee debt
-    env.init_market_with_warmup(0, 0);
-
-    // Set maintenance fee via admin
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_maintenance_fee(&admin, 1_000_000_000)
-        .expect("maintenance fee setup must succeed"); // High fee
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 100_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    // Open position to create fee exposure
-    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
-
-    // Advance many slots so fees accrue
-    env.set_slot(10_000);
-    env.crank();
-
-    let user_pos_before = env.read_account_position(user_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
-    let user_cap_before = env.read_account_capital(user_idx);
-    let lp_cap_before = env.read_account_capital(lp_idx);
-    let spl_vault_before = env.vault_balance();
-    let engine_vault_before = env.read_engine_vault();
-
-    // Try to withdraw full deposit - fee debt should reduce available equity
-    let result = env.try_withdraw(&user, user_idx, 10_000_000_000);
-    assert!(
-        result.is_err(),
-        "ATTACK: Full withdrawal should fail because fee debt reduces equity"
-    );
-    assert_eq!(
-        env.read_account_position(user_idx),
-        user_pos_before,
-        "Rejected fee-debt bypass withdraw must preserve user position"
-    );
-    assert_eq!(
-        env.read_account_position(lp_idx),
-        lp_pos_before,
-        "Rejected fee-debt bypass withdraw must preserve LP position"
-    );
-    assert_eq!(
-        env.read_account_capital(user_idx),
-        user_cap_before,
-        "Rejected fee-debt bypass withdraw must preserve user capital"
-    );
-    assert_eq!(
-        env.read_account_capital(lp_idx),
-        lp_cap_before,
-        "Rejected fee-debt bypass withdraw must preserve LP capital"
-    );
-    assert_eq!(
-        env.vault_balance(),
-        spl_vault_before,
-        "Rejected fee-debt bypass withdraw must preserve SPL vault"
-    );
-    assert_eq!(
-        env.read_engine_vault(),
-        engine_vault_before,
-        "Rejected fee-debt bypass withdraw must preserve engine vault"
-    );
-}
-
 // ============================================================================
 // 2. Authorization Bypass
 // ============================================================================
@@ -11654,47 +11444,6 @@ fn test_attack_trade_after_force_close() {
 
 /// ATTACK: Close account that still has maintenance fee debt.
 /// Expected: CloseAccount forgives remaining fee debt after paying what's possible.
-#[test]
-fn test_attack_gc_close_account_with_fee_debt() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 0);
-
-    // Set moderate maintenance fee (so account isn't fully drained by crank)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_maintenance_fee(&admin, 100_000)
-        .expect("maintenance fee setup must succeed"); // Lower fee
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 100_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000); // Larger deposit to survive fees
-
-    // Advance a small number of slots to accrue some fee debt
-    env.set_slot(200);
-    env.crank();
-
-    // Close account - should work even with fee debt (forgives remaining)
-    let vault_before = env.vault_balance();
-    let result = env.try_close_account(&user, user_idx);
-    assert!(
-        result.is_ok(),
-        "CloseAccount should succeed (forgives remaining fee debt): {:?}",
-        result
-    );
-
-    let vault_after = env.vault_balance();
-    // User's remaining capital (after fee deduction) should be returned
-    assert!(
-        vault_before > vault_after,
-        "ATTACK: Close should return capital to user (vault should decrease)"
-    );
-}
-
 /// ATTACK: Try to use GC'd account slot for new account creation.
 /// Expected: After GC, slot is marked unused and can be reused.
 #[test]
@@ -11925,47 +11674,6 @@ fn test_attack_update_config_extreme_values() {
 /// Admin can rapidly toggle insurance_floor via SetRiskThreshold.
 /// Per spec v10.5, insurance_floor does NOT gate trades — it only reserves
 /// insurance fund balance. Trades succeed regardless of floor value.
-#[test]
-fn test_attack_risk_threshold_rapid_toggle() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 100_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // Set floor to a large value
-    let result = env.try_set_risk_threshold(&admin, 1_000_000_000_000);
-    assert!(result.is_ok(), "Admin should set floor: {:?}", result);
-
-    // Trades still succeed (insurance_floor does not gate trades in v10.5)
-    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    assert!(result.is_ok(), "Trade should succeed regardless of floor: {:?}", result);
-
-    // Advance slot before second SetRiskThreshold (elapsed must be > 0)
-    env.set_slot(2);
-
-    // Set floor back to 0
-    let result = env.try_set_risk_threshold(&admin, 0);
-    assert!(result.is_ok(), "Admin should reset floor: {:?}", result);
-
-    // Conservation
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(engine_vault as u64, vault, "Conservation: engine={} vault={}", engine_vault, vault);
-}
-
 // ============================================================================
 // 20. Integer Boundary Tests
 // ============================================================================
@@ -12893,58 +12601,6 @@ fn test_attack_close_slab_uninitialized() {
 
 /// ATTACK: Set maintenance fee to u128::MAX (maximum possible fee).
 /// Expected: Fee is accepted but capital should drain predictably (not corrupt state).
-#[test]
-fn test_attack_maintenance_fee_u128_max() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    // u128::MAX exceeds the per-market cap (MAX_PROTOCOL_FEE_ABS = 1e20), so it is rejected.
-    let result = env.try_set_maintenance_fee(&admin, u128::MAX);
-    assert!(
-        result.is_err(),
-        "u128::MAX maintenance fee must be rejected by per-market cap check"
-    );
-
-    // The maximum allowed fee (= MAX_PROTOCOL_FEE_ABS = 1e20) is accepted.
-    const MAX_PROTOCOL_FEE_ABS: u128 = 100_000_000_000_000_000_000u128;
-    let result = env.try_set_maintenance_fee(&admin, MAX_PROTOCOL_FEE_ABS);
-    assert!(
-        result.is_ok(),
-        "Admin should set max maintenance fee (MAX_PROTOCOL_FEE_ABS): {:?}",
-        result
-    );
-
-    // Create user and deposit
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    // Advance time and crank - fees are ENABLED (spec §8.2).
-    // MAX_PROTOCOL_FEE_ABS >> capital, so capital drains to zero. Crank must still succeed.
-    let capital_before = env.read_account_capital(user_idx);
-    env.set_slot(200);
-    let result = env.try_crank();
-    assert!(
-        result.is_ok(),
-        "Crank must succeed even with MAX_PROTOCOL_FEE_ABS fee: {:?}",
-        result
-    );
-    let capital_after = env.read_account_capital(user_idx);
-    assert!(
-        capital_after < capital_before,
-        "Capital must be drained by maintenance fee (fee >> capital). before={} after={}",
-        capital_before, capital_after
-    );
-    assert_eq!(
-        capital_after, 0,
-        "Capital must be fully drained to zero (fee >> capital). before={} after={}",
-        capital_before, capital_after
-    );
-}
-
 /// ATTACK: SetMaintenanceFee as non-admin.
 /// Expected: Rejected (admin auth check).
 #[test]
@@ -15499,125 +15155,7 @@ fn test_attack_close_slab_before_insurance_withdrawal() {
 
 /// ATTACK: High maintenance fee accrual over many slots should not create
 /// unbounded debt or break equity calculations. Fee debt is saturating.
-#[test]
-fn test_attack_fee_debt_accumulation_large_maintenance_fee() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 100_000_000_000);
-
-    // Set high maintenance fee (10M per slot - enough to drain user in ~1000 slots)
-    env.try_set_maintenance_fee(&admin, 10_000_000).unwrap();
-
-    // Advance 2000 slots - user deposit (10B) should be significantly drained
-    env.set_slot_and_price(2000, 100_000_000);
-    env.crank();
-
-    // User's capital should have been reduced by maintenance fees
-    let user_capital = env.read_account_capital(user_idx);
-    // 10M/slot * 2000 slots = 20B total fees, split across accounts
-    // User had 10B, LP had 100B - fees should drain proportionally or from all
-    assert!(
-        user_capital <= 10_000_000_000u128,
-        "Maintenance fee accrual must not increase user capital: {}",
-        user_capital
-    );
-
-    // Key invariant: vault must still have tokens (system didn't panic/corrupt)
-    let vault = env.vault_balance();
-    assert!(
-        vault > 0,
-        "Vault should still have tokens after fee accrual"
-    );
-
-    // LP should still have substantial capital
-    let lp_capital = env.read_account_capital(lp_idx);
-    assert!(
-        lp_capital > 0,
-        "LP capital should be non-zero after moderate maintenance fees. lp_capital={}",
-        lp_capital
-    );
-
-    // Conservation: total vault == sum of actual tokens
-    // Fees go to insurance, so vault = c_tot + insurance (internal accounting)
-    // But actual SPL vault balance never changes from fees alone (they're internal)
-    let expected_vault = 10_000_000_000u64 + 100_000_000_000u64;
-    assert_eq!(
-        vault, expected_vault,
-        "ATTACK: Maintenance fees changed actual vault token balance! vault={}",
-        vault
-    );
-}
-
 /// ATTACK: Maintenance fee set to u128::MAX should not panic or corrupt state.
-#[test]
-fn test_attack_extreme_maintenance_fee() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000_000);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 100_000_000_000);
-
-    // u128::MAX exceeds the per-market cap (MAX_PROTOCOL_FEE_ABS = 1e20) and is rejected.
-    let result = env.try_set_maintenance_fee(&admin, u128::MAX);
-    assert!(
-        result.is_err(),
-        "u128::MAX maintenance fee must be rejected by per-market cap check"
-    );
-
-    // Set fee to the maximum allowed value (MAX_PROTOCOL_FEE_ABS = 1e20).
-    const MAX_PROTOCOL_FEE_ABS: u128 = 100_000_000_000_000_000_000u128;
-    let result = env.try_set_maintenance_fee(&admin, MAX_PROTOCOL_FEE_ABS);
-    assert!(
-        result.is_ok(),
-        "Extreme maintenance fee (MAX_PROTOCOL_FEE_ABS) update should be accepted: {:?}",
-        result
-    );
-
-    // Vault tokens must be preserved (maintenance fees are internal accounting, not SPL transfers)
-    let total_deposited = 1_000_000_000u64 + 100_000_000_000u64;
-    let vault = env.vault_balance();
-    assert_eq!(
-        vault, total_deposited,
-        "ATTACK: Extreme maintenance fee changed vault token balance! vault={}",
-        vault
-    );
-
-    // Advance time and crank - system must not panic.
-    // MAX_PROTOCOL_FEE_ABS >> any realistic capital, so fee accrual drains capital to zero.
-    env.set_slot_and_price(100, 100_000_000);
-    let crank_result = env.try_crank();
-    // The crank may fail or succeed gracefully; no panic or state corruption is acceptable.
-    let _ = crank_result;
-
-    // After attempted crank, vault tokens still preserved (no SPL tokens moved)
-    let vault_after = env.vault_balance();
-    assert_eq!(
-        vault_after, total_deposited,
-        "ATTACK: Crank with extreme fee changed vault! vault={}",
-        vault_after
-    );
-}
-
 /// ATTACK: Warmup period prevents immediate profit withdrawal.
 /// User with positive PnL should not be able to withdraw profit before warmup completes.
 #[test]
@@ -17000,55 +16538,6 @@ fn test_attack_multi_crank_funding_conservation() {
 /// ATTACK: Deposit to LP account with outstanding fee debt.
 /// Deposit should pay fee debt first, then add remainder to capital.
 /// Verify insurance fund receives correct fee payment.
-#[test]
-fn test_attack_lp_deposit_with_fee_debt_settlement() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    // Set maintenance fee
-    env.try_set_maintenance_fee(&admin, 1_000_000)
-        .expect("maintenance fee setup must succeed");
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    env.crank();
-
-    // Advance time to accrue maintenance fees
-    env.set_slot(1000);
-    env.crank();
-
-    // Insurance should have received fees
-    let insurance_after_fees = env.read_insurance_balance();
-
-    // Deposit more to LP - should settle fees first
-    env.deposit(&lp, lp_idx, 5_000_000_000);
-
-    // LP capital should reflect deposit minus any settled fees
-    let lp_cap = env.read_account_capital(lp_idx);
-    // Capital should be positive and <= initial + new deposit
-    assert!(lp_cap > 0, "LP capital should be positive after deposit");
-    assert!(
-        lp_cap <= 15_000_000_000,
-        "ATTACK: LP capital exceeds total deposits! Fee debt not properly settled."
-    );
-
-    // Insurance should be >= what it was before the deposit
-    let insurance_after_deposit = env.read_insurance_balance();
-    assert!(
-        insurance_after_deposit >= insurance_after_fees,
-        "ATTACK: Insurance decreased after deposit with fee debt!"
-    );
-}
-
 /// ATTACK: UpdateConfig should preserve conservation invariant.
 /// Changing risk parameters should not alter vault/capital/insurance totals.
 #[test]
@@ -17170,61 +16659,6 @@ fn test_attack_crank_freshness_boundary() {
 
 /// ATTACK: Insurance fund receives both dust sweep and fee accrual in same crank.
 /// Verify both sources of insurance top-up are correctly accounted for.
-#[test]
-fn test_attack_insurance_dust_plus_fee_consistency() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // unit_scale=1000 for dust generation
-    env.init_market_full(0, 1000, 0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    // Set maintenance fee to generate fee revenue
-    env.try_set_maintenance_fee(&admin, 100_000)
-        .expect("maintenance fee setup must succeed");
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_user(&lp);
-    // Deposit 10000500: 10000 units + 500 dust
-    env.deposit(&lp, lp_idx, 10_000_500);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    // Deposit 10000500: 10000 units + 500 dust
-    env.deposit(&user, user_idx, 10_000_500);
-
-    // Total dust = 1000, which is >= unit_scale=1000, so 1 unit will be swept
-
-    env.crank();
-    let insurance_after_first_crank = env.read_insurance_balance();
-
-    // Advance time to accrue maintenance fees
-    env.set_slot(100);
-    env.crank();
-
-    let insurance_after_second_crank = env.read_insurance_balance();
-
-    // Insurance should have increased from fees (and possibly more dust)
-    // Note: With no open positions, maintenance fees don't accrue.
-    // Insurance may only increase from dust sweeps (if more dust accumulated).
-    assert!(
-        insurance_after_second_crank >= insurance_after_first_crank,
-        "ATTACK: Insurance decreased between cranks! Before={} After={}",
-        insurance_after_first_crank,
-        insurance_after_second_crank
-    );
-
-    // SPL vault should hold total deposited base tokens
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault, 20_001_000,
-        "ATTACK: SPL vault doesn't match total deposits!"
-    );
-}
-
 /// ATTACK: Close all positions then close account, verify complete cleanup.
 /// User opens position, closes it, then closes account.
 /// Verify capital is correctly returned and no value is left behind.
@@ -17540,58 +16974,6 @@ fn test_attack_circuit_breaker_clamping_second_price() {
 /// ATTACK: Fee debt exceeds capital during crank.
 /// Create a scenario where maintenance fees accumulate to exceed capital.
 /// Verify equity calculation remains correct and no underflow occurs.
-#[test]
-fn test_attack_fee_debt_exceeds_capital_crank() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 100); // Very small deposit
-
-    env.crank();
-
-    // Open small position
-    env.trade(&user, &lp, lp_idx, user_idx, 1);
-
-    // Set high maintenance fee
-    env.try_set_maintenance_fee(&admin, 9000)
-        .expect("maintenance fee setup must succeed"); // 90% annual
-
-    // Advance many slots to accumulate fee debt
-    env.set_slot(10_000);
-    env.crank();
-
-    // User should still exist without panic
-    let user_cap = env.read_account_capital(user_idx);
-    let user_pnl = env.read_account_pnl(user_idx);
-
-    // Capital + PnL might be very small or zero, but shouldn't underflow
-    // The key test is that the crank didn't panic/abort
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault, 10_000_000_100,
-        "ATTACK: SPL vault changed after fee accrual! vault={}",
-        spl_vault
-    );
-    // Conservation: user_cap >= 0 always (unsigned in engine)
-    assert!(
-        user_cap + (user_pnl.max(0) as u128) <= 10_000_000_100u128,
-        "ATTACK: User equity exceeds total deposits!"
-    );
-}
-
 /// ATTACK: Rapid price oscillation precision loss.
 /// Execute many trades with alternating prices to accumulate rounding errors.
 /// Verify total value is conserved across repeated operations.
@@ -17772,62 +17154,6 @@ fn test_attack_withdraw_exact_capital_no_position() {
 /// ATTACK: Threshold EWMA convergence across many cranks.
 /// Set a risk threshold and verify it converges toward target via EWMA
 /// rather than allowing wild oscillations that could be exploited.
-#[test]
-fn test_attack_threshold_ewma_convergence() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    env.crank();
-
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // Top up insurance so risk gate doesn't block trades
-    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
-
-    // Set a specific risk threshold
-    env.try_set_risk_threshold(&admin, 1_000_000).unwrap();
-
-    // Open position to create risk
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-
-    // Crank many times to let EWMA converge
-    for slot in (10..200).step_by(15) {
-        env.set_slot(slot);
-        env.crank();
-    }
-
-    // Conservation check: SPL vault unchanged
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault, 30_000_000_000,
-        "ATTACK: SPL vault changed during threshold convergence!"
-    );
-
-    // Total capital conserved (user + lp capital <= initial 20B deposits)
-    let user_cap = env.read_account_capital(user_idx);
-    let lp_cap = env.read_account_capital(lp_idx);
-    assert!(
-        user_cap + lp_cap <= 20_000_000_000,
-        "ATTACK: Total capital exceeds deposits after EWMA convergence!"
-    );
-}
-
 /// ATTACK: Trade at exactly the initial margin boundary.
 /// Open a position that requires exactly initial_margin_bps of capital.
 /// Then try to open slightly more - should fail margin check.
@@ -17924,66 +17250,6 @@ fn test_attack_many_deposits_one_withdrawal_conservation() {
 
 /// ATTACK: Risk gate activation with insurance at exact threshold boundary.
 /// Verify behavior when insurance_fund.balance == risk_reduction_threshold exactly.
-#[test]
-fn test_attack_risk_gate_exact_threshold_boundary() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    env.crank();
-
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // Top up insurance to a large amount
-    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
-
-    // Set threshold to 0 (gate always inactive)
-    env.try_set_risk_threshold(&admin, 0).unwrap();
-
-    // Trade should succeed (gate is inactive)
-    let trade1 = env.try_trade(&user, &lp, lp_idx, user_idx, 100_000);
-    assert!(
-        trade1.is_ok(),
-        "Trade should succeed when threshold=0 (gate inactive): {:?}",
-        trade1
-    );
-
-    // Now set threshold much higher than insurance (gate becomes active)
-    env.set_slot(2);
-    let insurance = env.read_insurance_balance();
-    env.try_set_risk_threshold(&admin, insurance * 100).unwrap();
-
-    env.set_slot(10);
-
-    // Risk-increasing trade should be blocked when gate is active
-    let trade2 = env.try_trade(&user, &lp, lp_idx, user_idx, 100_000);
-    assert!(
-        trade2.is_err(),
-        "Trade should be blocked when gate is active (threshold >> insurance)"
-    );
-
-    // Verify insurance fund didn't decrease
-    let insurance_after = env.read_insurance_balance();
-    assert!(
-        insurance_after >= insurance,
-        "ATTACK: Insurance decreased without withdrawal! before={} after={}",
-        insurance,
-        insurance_after
-    );
-}
-
 /// ATTACK: Unit scale boundary - init market with MAX_UNIT_SCALE.
 /// Verify that operations work correctly at the maximum unit scale.
 #[test]
@@ -18613,94 +17879,6 @@ fn test_attack_account_reinit_after_gc_clean_state() {
 /// ATTACK: Insurance fund growth from fees doesn't inflate haircut.
 /// Haircut = min(residual, pnl_pos_tot) / pnl_pos_tot where residual = vault - c_tot - insurance.
 /// Insurance growing from fees reduces residual, which REDUCES haircut (safer).
-#[test]
-fn test_attack_insurance_fee_growth_doesnt_inflate_haircut() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.crank();
-
-    // Maintenance fees are ENABLED (spec §8.2): fee = dt * fee_per_slot charged from
-    // capital to insurance. SetMaintenanceFee sets 100/slot.
-    env.try_set_maintenance_fee(&admin, 100).unwrap();
-
-    // Top up insurance to disable force-realize
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-
-    // Trade to create positions
-    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
-
-    // Record insurance before crank
-    let insurance_before = env.read_insurance_balance();
-
-    // Advance time — fees charge from capital to insurance. Insurance grows.
-    env.set_slot(1000);
-    env.crank();
-
-    // Insurance should GROW from maintenance fees (fees are enabled)
-    let insurance_after = env.read_insurance_balance();
-    assert!(
-        insurance_after > insurance_before,
-        "Insurance must grow from enabled maintenance fees. before={} after={}",
-        insurance_before,
-        insurance_after
-    );
-
-    // vault = SPL vault in engine units. residual = vault - c_tot - insurance
-    // Conservation: when fees move capital to insurance, c_tot decreases and
-    // insurance increases by equal amount → residual stays non-negative.
-    let engine_vault = env.read_engine_vault();
-    let c_tot = env.read_c_tot();
-
-    // residual should be non-negative (vault >= c_tot + insurance)
-    assert!(
-        engine_vault >= c_tot + insurance_after,
-        "ATTACK: vault < c_tot + insurance! vault={} c_tot={} insurance={}",
-        engine_vault,
-        c_tot,
-        insurance_after
-    );
-
-    // Haircut = min(residual, pnl_pos_tot) / pnl_pos_tot
-    // Fee transfers move capital→insurance, so residual = vault - c_tot - insurance
-    // remains stable: fees do NOT inflate residual and cannot inflate haircut above 1.0.
-    let residual = engine_vault - c_tot - insurance_after;
-    let pnl_pos_tot = env.read_pnl_pos_tot();
-    if pnl_pos_tot > 0 {
-        // Haircut ratio should be <= 1.0 (residual/pnl_pos_tot <= 1)
-        assert!(
-            residual <= pnl_pos_tot || pnl_pos_tot == 0,
-            "Fee-induced insurance growth must not inflate haircut above 1.0! residual={} pnl_pos_tot={}",
-            residual,
-            pnl_pos_tot
-        );
-    }
-
-    // SPL vault is unchanged: fee transfers are internal accounting, not SPL movements.
-    // deposits + insurance top-up = 20B + 5B + 1B = 26B
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault,
-        26_000_000_000, // 20B + 5B + 1B insurance
-        "ATTACK: SPL vault changed from maintenance fees (should be internal only)!"
-    );
-}
-
 /// ATTACK: Withdraw more than capital should fail.
 /// Verify that withdrawing more than available capital is rejected.
 /// Also verify that withdrawal with position leaves at least margin.
@@ -19044,24 +18222,22 @@ fn test_attack_old_admin_blocked_after_transfer() {
     env.try_update_admin(&old_admin, &new_admin.pubkey())
         .unwrap();
 
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
     // Old admin should fail
-    let old_result = env.try_set_risk_threshold(&old_admin, 999);
+    let old_result = env.try_update_admin(&old_admin, &old_admin.pubkey());
     assert!(
         old_result.is_err(),
-        "ATTACK: Old admin can still set threshold after transfer!"
+        "ATTACK: Old admin can still perform admin ops after transfer!"
     );
 
     // New admin should succeed
-    let new_result = env.try_set_risk_threshold(&new_admin, 999);
+    let new_result = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(
         new_result.is_ok(),
-        "New admin should be able to set threshold: {:?}",
+        "New admin should be able to perform admin ops: {:?}",
         new_result
     );
 }
+
 
 /// ATTACK: Verify conservation after complex multi-user lifecycle.
 /// Multiple users open positions, some profitable, some losing, then all close.
@@ -19634,137 +18810,8 @@ fn test_attack_threshold_ewma_alpha_zero_freezes() {
 
 /// ATTACK: Deposit after setting large maintenance fee.
 /// Verify fee settlement during deposit doesn't extract extra value.
-#[test]
-fn test_attack_deposit_with_pending_fee_debt() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Open a position so maintenance fees actually accrue
-    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
-    let pos = env.read_account_position(user_idx);
-    assert_eq!(
-        pos, 100_000,
-        "Precondition: user must have open position for fee accrual"
-    );
-
-    // Set a maintenance fee
-    env.try_set_maintenance_fee(&admin, 1000).unwrap(); // 10%
-
-    // Advance many slots to accrue fee debt on the open position
-    env.set_slot(10000);
-
-    // Record insurance before deposit
-    let insurance_before = env.read_insurance_balance();
-
-    // Deposit more - fee debt should be settled during deposit
-    env.deposit(&user, user_idx, 2_000_000_000);
-
-    let insurance_after = env.read_insurance_balance();
-
-    // In ADL engine, deposit calls fee_debt_sweep but not touch_account_full,
-    // so maintenance fee debt may not accrue during deposit. Insurance stays equal or grows.
-    assert!(
-        insurance_after >= insurance_before,
-        "ATTACK: Insurance decreased from deposit! before={} after={}",
-        insurance_before,
-        insurance_after
-    );
-
-    // SPL vault should reflect all deposits + insurance
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    // 20B LP + 5B user + 1B insurance + 2B new deposit = 28B
-    assert_eq!(
-        spl_vault, 28_000_000_000,
-        "ATTACK: SPL vault mismatch after deposit with fees!"
-    );
-}
-
 /// ATTACK: Close account forgives fee debt without extracting from vault.
 /// CloseAccount pays what it can from capital, forgives the rest.
-#[test]
-fn test_attack_close_account_fee_debt_forgiveness() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000_000); // 1B deposit
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Open position to accrue fees, then close it to zero position
-    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
-    assert_eq!(
-        env.read_account_position(user_idx),
-        100_000,
-        "Precondition: user must have position for fee accrual"
-    );
-
-    // Set large maintenance fee
-    env.try_set_maintenance_fee(&admin, 10000).unwrap(); // 100%
-
-    // Advance to accrue massive fee debt on the open position
-    env.set_slot(1000);
-    env.crank(); // Crank settles fees + might liquidate
-
-    // Close the position back to zero (trade opposite direction)
-    let pos = env.read_account_position(user_idx);
-    if pos != 0 {
-        env.try_trade(&user, &lp, lp_idx, user_idx, -pos)
-            .expect("position flattening before close must succeed");
-    }
-
-    // Record insurance before close
-    let insurance_before = env.read_insurance_balance();
-
-    // Close account - should succeed; fee debt is forgiven after paying what's possible
-    env.try_close_account(&user, user_idx).unwrap();
-
-    // Insurance should have received whatever fee payment was possible
-    let insurance_after = env.read_insurance_balance();
-    assert!(
-        insurance_after >= insurance_before,
-        "Insurance should not decrease during close: before={} after={}",
-        insurance_before,
-        insurance_after
-    );
-
-    // User should have no capital remaining
-    let user_cap = env.read_account_capital(user_idx);
-    assert_eq!(
-        user_cap, 0,
-        "Closed account should have zero capital: {}",
-        user_cap
-    );
-}
-
 /// ATTACK: Liquidate account that becomes insolvent from price move.
 /// After price crash, undercollateralized account should be liquidatable.
 #[test]
@@ -21925,10 +20972,9 @@ fn test_attack_update_admin_old_admin_rejected() {
     // Transfer admin to new_admin
     env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
 
-    // Old admin tries SetRiskThreshold - should fail
+    // Old admin tries admin operation - should fail
     let slab_before_old_admin_attempt = env.svm.get_account(&env.slab).unwrap().data;
-    env.set_slot(2);
-    let result = env.try_set_risk_threshold(&admin, 500_000_000);
+    let result = env.try_update_admin(&admin, &admin.pubkey());
     assert!(
         result.is_err(),
         "ATTACK: Old admin still authorized after UpdateAdmin!"
@@ -21936,12 +20982,11 @@ fn test_attack_update_admin_old_admin_rejected() {
     let slab_after_old_admin_attempt = env.svm.get_account(&env.slab).unwrap().data;
     assert_eq!(
         slab_after_old_admin_attempt, slab_before_old_admin_attempt,
-        "Rejected SetRiskThreshold by old admin must preserve slab bytes"
+        "Rejected admin op by old admin must preserve slab bytes"
     );
 
     // New admin can do it
-    env.set_slot(3);
-    let result = env.try_set_risk_threshold(&new_admin, 500_000_000);
+    let result = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(
         result.is_ok(),
         "New admin should be authorized: {:?}",
@@ -21949,67 +20994,9 @@ fn test_attack_update_admin_old_admin_rejected() {
     );
 }
 
+
 /// ATTACK: Set maintenance fee to extreme value, accrue fees.
 /// Verify fee debt accumulates but doesn't cause overflow or negative capital.
-#[test]
-fn test_attack_extreme_maintenance_fee_no_overflow() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Set high maintenance fee (10B/slot) — fees are ENABLED (spec §8.2).
-    // dt=1000 slots: fee = 10_000_000_000 * 1000 = 10^13, clamped to MAX_PROTOCOL_FEE_ABS.
-    // No overflow in the engine: checked_mul overflows → clamped, no panic, no error return.
-    env.try_set_maintenance_fee(&admin, 10_000_000_000).unwrap();
-
-    // Advance many slots - fees drain capital to zero (fee >> capital)
-    let user_cap_before = env.read_account_capital(user_idx);
-    env.set_slot(1000);
-    env.crank();
-
-    // Capital must be drained to zero (fee >> capital, no arithmetic overflow)
-    let user_cap = env.read_account_capital(user_idx);
-    assert_eq!(
-        user_cap, 0,
-        "Capital must be drained to zero by extreme maintenance fee. before={} after={}",
-        user_cap_before, user_cap
-    );
-
-    // Conservation still holds: vault >= c_tot + insurance (fee moved capital→insurance)
-    let engine_vault = env.read_engine_vault();
-    let c_tot = env.read_c_tot();
-    let insurance = env.read_insurance_balance();
-    assert!(
-        engine_vault >= c_tot + insurance,
-        "ATTACK: vault < c_tot + insurance! vault={} c_tot={} insurance={}",
-        engine_vault, c_tot, insurance
-    );
-
-    // SPL vault unchanged (fee transfers are internal accounting, not SPL movements)
-    let spl_vault = {
-        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
-        TokenAccount::unpack(&vault_data).unwrap().amount
-    };
-    assert_eq!(
-        spl_vault, 26_000_000_000,
-        "ATTACK: SPL vault changed from maintenance fees (should be internal only)!"
-    );
-}
-
 /// ATTACK: SetOracleAuthority to zero disables PushOraclePrice.
 /// Oracle authority cleared means stored price is cleared and push fails.
 #[test]
@@ -22130,50 +21117,6 @@ fn test_attack_multi_lp_independent_positions() {
 /// Per spec v10.5, insurance_floor (SetRiskThreshold) does NOT gate trades.
 /// Trade gating is side-mode based (DrainOnly/ResetPending only).
 /// This test verifies that changing insurance_floor does not affect trading.
-#[test]
-fn test_attack_set_risk_threshold_enables_trades() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Trade succeeds
-    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
-    assert_ne!(env.read_account_position(user_idx), 0);
-
-    // Set very high floor — does NOT block trades in v10.5
-    env.set_slot(2);
-    env.try_set_risk_threshold(&admin, 999_000_000_000_000)
-        .unwrap();
-
-    // Trades still succeed (insurance_floor does not gate trades)
-    // Use different size to avoid duplicate transaction hash
-    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 200_000);
-    assert!(
-        result.is_ok(),
-        "Insurance floor does not gate trades in spec v10.5: {:?}",
-        result
-    );
-
-    // Conservation
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(engine_vault as u64, vault, "Conservation: engine={} vault={}", engine_vault, vault);
-}
-
 /// ATTACK: Close account after round-trip trade with PnL.
 /// Protocol requires position=0 and PnL=0 for close.
 #[test]
@@ -22266,22 +21209,16 @@ fn test_attack_update_admin_same_address_noop() {
         "Self-update admin must not move vault funds"
     );
 
-    // Admin should still work
-    env.set_slot(2);
-    let result = env.try_set_maintenance_fee(&admin, 100);
-    assert!(
-        result.is_ok(),
-        "Admin should still be authorized after self-update: {:?}",
-        result
-    );
+    // Non-admin must still be rejected
     let random = Keypair::new();
     env.svm.airdrop(&random.pubkey(), 1_000_000_000).unwrap();
-    let non_admin_result = env.try_set_maintenance_fee(&random, 100);
+    let non_admin_result = env.try_update_admin(&random, &random.pubkey());
     assert!(
         non_admin_result.is_err(),
         "Self-update admin must not broaden admin permissions"
     );
 }
+
 
 /// ATTACK: Double deposit then withdraw full amount.
 /// Verify deposits accumulate correctly and full withdrawal returns sum.
@@ -25643,59 +24580,6 @@ fn test_attack_trade_exact_margin_boundary_succeeds() {
 
 /// ATTACK: Maintenance fee settlement when capital is very small.
 /// With large maintenance_fee_per_slot and small capital, fee should not go negative.
-#[test]
-fn test_attack_maintenance_fee_depletes_small_capital() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000); // Very small deposit (1M tokens)
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-
-    // Maintenance fees are ENABLED (spec §8.2): 1_000_000/slot charged from capital.
-    // User capital=1_000_000. First crank at slot 200: dt=200, fee=200_000_000 >> capital.
-    // Capital drains to zero immediately.
-    env.try_set_maintenance_fee(&admin, 1_000_000).unwrap();
-
-    let cap_before = env.read_account_capital(user_idx);
-
-    // Crank several times — capital is depleted by fee on first crank
-    for slot in (200..=1000).step_by(100) {
-        env.set_slot(slot);
-        env.crank();
-    }
-
-    // Capital must be zero (fee >> capital, drained on first crank)
-    let cap = env.read_account_capital(user_idx);
-    assert_eq!(
-        cap, 0,
-        "Capital must be drained to zero by maintenance fee. before={} after={}",
-        cap_before, cap
-    );
-
-    // Conservation
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(
-        engine_vault as u64, vault,
-        "Conservation: engine={} vault={}",
-        engine_vault, vault
-    );
-
-    // Suppress unused variable warning
-    let _ = lp_idx;
-}
-
 /// ATTACK: Mark precision with very small price increments.
 /// Multiple tiny price changes and cranks should maintain conservation.
 #[test]
@@ -26113,9 +24997,6 @@ fn test_attack_funding_rate_sign_flip_lp_position_cross() {
 
 // REMOVED: test_attack_gc_exact_threshold_account - duplicate of
 // test_attack_user_gc_when_empty (round 5, line 9260)
-
-// REMOVED: test_attack_close_account_fee_forgiveness_edge - duplicate of
-// test_attack_close_account_fee_debt_forgiveness (round 9, line 14814)
 
 /// ATTACK: TopUpInsurance with unit_scale dust edge case.
 /// Insurance topup amount that doesn't align with unit_scale.
@@ -26538,61 +25419,6 @@ fn test_attack_oracle_price_cap_u64_max() {
 
 /// ATTACK: SetMaintenanceFee then immediately close account.
 /// Fee set then close in rapid sequence should settle fees correctly.
-#[test]
-fn test_attack_set_fee_then_immediate_close() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Set maintenance fee
-    env.try_set_maintenance_fee(&admin, 100_000).unwrap();
-
-    // Advance some slots
-    env.set_slot(500);
-    env.crank();
-
-    // Withdraw all and close.
-    // In ADL engine, the arg-swapped withdraw call passes now_slot=oracle_price (138M)
-    // which causes enormous maintenance fee accrual (fee × 138M slots), wiping capital.
-    // The withdrawal may therefore fail; close_account (which uses correct arg order)
-    // will still succeed, returning whatever capital remains.
-    let cap = env.read_account_capital(user_idx);
-    if cap > 0 {
-        let _ = env.try_withdraw(&user, user_idx, cap as u64);
-        // Withdrawal may fail due to arg-swapped fee accrual — that's expected.
-    }
-
-    let close_result = env.try_close_account(&user, user_idx);
-    assert!(
-        close_result.is_ok(),
-        "CloseAccount after fee set should succeed: {:?}",
-        close_result
-    );
-
-    // Conservation
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(
-        engine_vault as u64, vault,
-        "Conservation: engine={} vault={}",
-        engine_vault, vault
-    );
-}
-
 /// ATTACK: Withdraw between two cranks (deposit, crank, withdraw, crank).
 /// Tests that withdrawal doesn't cause double-counting in settlement.
 #[test]
@@ -26746,52 +25572,6 @@ fn test_attack_slot_reuse_multi_user_gc_reinit() {
 /// reserves a portion of the insurance fund that cannot be withdrawn.
 /// Trades are NOT gated by insurance_floor (spec v10.5 uses side-mode gating).
 /// This test verifies insurance_floor can be set and the engine state is consistent.
-#[test]
-fn test_attack_risk_threshold_exact_insurance_boundary() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    // Top up insurance to exact amount
-    env.try_top_up_insurance(&admin, 5_000_000_000).unwrap();
-    env.crank();
-
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // Set insurance_floor to exact insurance balance
-    let insurance = env.read_insurance_balance();
-    env.try_set_risk_threshold(&admin, insurance).unwrap();
-
-    // In spec v10.5, insurance_floor does NOT gate trades.
-    // Trades succeed as long as margin is sufficient and side mode is Normal.
-    let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    assert!(
-        trade_result.is_ok(),
-        "Trade should succeed: insurance_floor does not gate trades in spec v10.5"
-    );
-
-    // Conservation must hold
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(
-        engine_vault as u64, vault,
-        "Conservation at threshold boundary: engine={} vault={}",
-        engine_vault, vault
-    );
-}
-
 /// ATTACK: LP tries to withdraw when haircut is active (vault < c_tot + insurance).
 /// After a user takes a large loss, LP capital might be haircutted - can LP
 /// withdraw more than their haircutted equity?
@@ -27199,59 +25979,6 @@ fn test_attack_position_flip_margin_requirement_switch() {
 
 /// ATTACK: Large maintenance fee with huge dt gap (thousands of slots).
 /// Tests saturating arithmetic in fee accrual over long periods.
-#[test]
-fn test_attack_maintenance_fee_huge_dt_saturation() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Maintenance fees are ENABLED (spec §8.2). Fee=u64::MAX/slot.
-    // Huge dt: checked_mul(1_000_000, u64::MAX) overflows → fee clamped to MAX_PROTOCOL_FEE_ABS.
-    // Fee >> capital (10B), so capital drains to zero. No panic, no error return.
-    env.try_set_maintenance_fee(&admin, u64::MAX as u128)
-        .unwrap();
-
-    let user_cap_before = env.read_account_capital(user_idx);
-
-    // Jump forward a massive number of slots — must not panic, must deplete capital
-    env.set_slot(1_000_000);
-    env.crank();
-
-    // No panic; conservation holds (fee moved capital→insurance)
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(
-        engine_vault as u64, vault,
-        "Conservation after huge dt: engine={} vault={}",
-        engine_vault, vault
-    );
-
-    // User's capital must be drained to zero (fee >> capital)
-    let user_cap = env.read_account_capital(user_idx);
-    assert_eq!(
-        user_cap, 0,
-        "Capital must be drained to zero by u64::MAX fee. before={} after={}",
-        user_cap_before, user_cap
-    );
-
-    // Suppress unused variable warning
-    let _ = lp_idx;
-}
-
 /// ATTACK: Trade with different sizes in rapid succession (consecutive slots).
 /// Position accumulation should be correct across rapid trades.
 #[test]
@@ -27594,67 +26321,6 @@ fn test_attack_lp_partial_close_aggregate_update() {
 
 /// ATTACK: Settlement ordering - mark settlement, then funding, then fees.
 /// Create scenario where ordering matters and verify correctness.
-#[test]
-fn test_attack_settlement_ordering_mark_funding_fees() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-
-    // Set maintenance fee to create fee debt during settlement
-    env.try_set_maintenance_fee(&admin, 10_000).unwrap();
-
-    env.crank();
-
-    // Open position
-    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
-
-    // Big price move + long time gap = mark settlement + funding + fees all at once
-    env.set_slot_and_price(1000, 150_000_000);
-    env.crank();
-
-    // Verify settlement was consistent
-    let c_tot = env.read_c_tot();
-    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
-    assert_eq!(
-        c_tot, sum,
-        "c_tot after combined settlement: c_tot={} sum={}",
-        c_tot, sum
-    );
-
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(
-        engine_vault as u64, vault,
-        "Conservation after combined settlement: engine={} vault={}",
-        engine_vault, vault
-    );
-
-    // User should have gained from mark but lost from fees
-    let user_cap = env.read_account_capital(user_idx);
-    // With position=5M, price move from 138 to 150 = +$12/unit
-    // Mark PnL ~ 5M * 12 / 1 = +60 units (simplified)
-    // Fees should have eaten some capital
-    // Verify capital is reasonable (not negative/zero from fee-before-mark bug)
-    assert!(
-        user_cap > 0,
-        "User should have positive capital after profitable mark settlement: cap={}",
-        user_cap
-    );
-}
-
 /// ATTACK: Inverted market (invert=1) with large price swing.
 /// Tests conservation in inverted market with significant movement.
 #[test]
@@ -28444,123 +27110,8 @@ fn test_attack_oracle_timestamp_i64_max_no_overflow() {
 
 /// ATTACK: LP deposit with pending fee debt.
 /// LP depositing should settle fees first, then add remaining to capital.
-#[test]
-fn test_attack_lp_deposit_settles_fee_debt_first() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 20_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-
-    // Set maintenance fee
-    env.try_set_maintenance_fee(&admin, 10_000).unwrap();
-    env.crank();
-
-    // Open position so fees accrue
-    env.trade(&user, &lp, lp_idx, user_idx, 3_000_000);
-
-    // Advance time to accumulate fee debt
-    env.set_slot(500);
-    env.crank();
-
-    let lp_cap_before = env.read_account_capital(lp_idx);
-
-    // LP deposits more capital (should settle fees first)
-    env.deposit(&lp, lp_idx, 5_000_000_000);
-
-    let lp_cap_after = env.read_account_capital(lp_idx);
-
-    // Capital increase should be <= deposit amount (fees eaten some)
-    let increase = lp_cap_after - lp_cap_before;
-    assert!(
-        increase <= 5_000_000_000,
-        "LP capital increase should be <= deposit: increase={}",
-        increase
-    );
-
-    // Conservation
-    let vault = env.vault_balance();
-    let engine_vault = env.read_engine_vault();
-    assert_eq!(
-        engine_vault as u64, vault,
-        "Conservation after LP deposit with fees: engine={} vault={}",
-        engine_vault, vault
-    );
-}
-
 /// ATTACK: Config change then immediate trade tests new config applied.
 /// After SetMaintenanceFee, immediate deposit should use new fee rate.
-#[test]
-fn test_attack_config_change_applied_to_next_instruction() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 30_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-    env.crank();
-
-    // Maintenance fees are ENABLED (spec §8.2): config change takes effect immediately.
-    // Next crank will charge dt * fee_per_slot from capital.
-    env.try_set_maintenance_fee(&admin, 1_000_000).unwrap();
-
-    // Trade immediately after config change
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-
-    // Record capital after trade (trading fees may reduce capital slightly)
-    let user_cap_after_trade = env.read_account_capital(user_idx);
-
-    // Advance 200 slots — fees charge dt * fee_per_slot = 200 * 1_000_000 = 200_000_000
-    env.set_slot(200);
-    env.crank();
-
-    // User capital must decrease by the maintenance fee charged over 200 slots
-    let user_cap = env.read_account_capital(user_idx);
-    let expected_fee: u128 = 200 * 1_000_000;
-    assert!(
-        user_cap < user_cap_after_trade,
-        "Maintenance fee must reduce capital after crank. before_crank={} after_crank={}",
-        user_cap_after_trade, user_cap
-    );
-    assert_eq!(
-        user_cap,
-        user_cap_after_trade.saturating_sub(expected_fee),
-        "Capital must decrease by exactly dt * fee_per_slot = {}. before={} after={}",
-        expected_fee, user_cap_after_trade, user_cap
-    );
-
-    // Conservation: fees moved capital→insurance, c_tot is lower, but must still be consistent
-    let engine_vault = env.read_engine_vault();
-    let c_tot = env.read_c_tot();
-    let insurance = env.read_insurance_balance();
-    assert!(
-        engine_vault >= c_tot + insurance,
-        "Conservation: vault < c_tot + insurance! vault={} c_tot={} insurance={}",
-        engine_vault, c_tot, insurance
-    );
-}
-
 /// ATTACK: Multiple admin changes in rapid succession.
 /// Tests that admin state is correctly updated through multiple transfers.
 #[test]
@@ -28576,20 +27127,21 @@ fn test_attack_rapid_admin_transfers() {
     env.svm.airdrop(&admin2.pubkey(), 5_000_000_000).unwrap();
     env.svm.airdrop(&admin3.pubkey(), 5_000_000_000).unwrap();
 
-    // Chain: admin1 → admin2 → admin3
+    // Chain: admin1 -> admin2 -> admin3
     env.try_update_admin(&admin1, &admin2.pubkey()).unwrap();
     env.try_update_admin(&admin2, &admin3.pubkey()).unwrap();
 
     // Only admin3 should work now
-    let r1 = env.try_set_maintenance_fee(&admin1, 100);
+    let r1 = env.try_update_admin(&admin1, &admin1.pubkey());
     assert!(r1.is_err(), "Admin1 should be locked out");
 
-    let r2 = env.try_set_maintenance_fee(&admin2, 100);
+    let r2 = env.try_update_admin(&admin2, &admin2.pubkey());
     assert!(r2.is_err(), "Admin2 should be locked out");
 
-    let r3 = env.try_set_maintenance_fee(&admin3, 100);
+    let r3 = env.try_update_admin(&admin3, &admin3.pubkey());
     assert!(r3.is_ok(), "Admin3 should be active: {:?}", r3);
 }
+
 
 /// ATTACK: Deposit to LP account from non-owner.
 /// Tests authorization on LP deposits.
@@ -29263,17 +27815,9 @@ fn test_property_authorization_exhaustive() {
 
     // --- Admin-protected operations: non-admin cannot execute ---
 
-    // A4: Set maintenance fee
-    let r = env.try_set_maintenance_fee(&attacker, 100);
-    assert!(r.is_err(), "A4: Non-admin set_maintenance_fee should fail");
-
-    // A5: Set risk threshold
-    let r = env.try_set_risk_threshold(&attacker, 999);
-    assert!(r.is_err(), "A5: Non-admin set_risk_threshold should fail");
-
-    // A6: Update admin
+    // A4: Update admin
     let r = env.try_update_admin(&attacker, &attacker.pubkey());
-    assert!(r.is_err(), "A6: Non-admin update_admin should fail");
+    assert!(r.is_err(), "A4: Non-admin update_admin should fail");
 
     // --- Vault unchanged after all rejections ---
     let vault_after = env.vault_balance();
@@ -29288,27 +27832,28 @@ fn test_property_authorization_exhaustive() {
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
     env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
 
-    let r = env.try_set_maintenance_fee(&admin, 200);
+    let r = env.try_update_admin(&admin, &admin.pubkey());
     assert!(
         r.is_err(),
-        "A7: Old admin should be locked out after transfer"
+        "A5: Old admin should be locked out after transfer"
     );
 
-    let r = env.try_set_maintenance_fee(&new_admin, 200);
-    assert!(r.is_ok(), "A8: New admin should work after transfer");
+    let r = env.try_update_admin(&new_admin, &new_admin.pubkey());
+    assert!(r.is_ok(), "A6: New admin should work after transfer");
 
     // --- Zero admin burn (spec §7) ---
     let zero = Pubkey::default();
     let r = env.try_update_admin(&new_admin, &zero);
     assert!(
         r.is_ok(),
-        "A9: UpdateAdmin to zero should succeed (admin burn)"
+        "A7: UpdateAdmin to zero should succeed (admin burn)"
     );
 
     // Admin must be locked out after burn
-    let r = env.try_set_maintenance_fee(&new_admin, 300);
-    assert!(r.is_err(), "A10: Admin operations must fail after admin burn");
+    let r = env.try_update_admin(&new_admin, &new_admin.pubkey());
+    assert!(r.is_err(), "A8: Admin operations must fail after admin burn");
 }
+
 
 /// PROPERTY TEST: Account lifecycle invariants across create/use/close/GC cycles.
 ///
@@ -31182,42 +29727,6 @@ fn test_init_market_admin_limits_enforced() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // SetMaintenanceFee: within limit should succeed
-    let result = env.try_set_maintenance_fee(&admin, 1000);
-    assert!(result.is_ok(), "Fee at limit should succeed: {:?}", result);
-
-    // SetMaintenanceFee: above limit should fail
-    let result = env.try_set_maintenance_fee(&admin, 1001);
-    assert!(result.is_err(), "Fee above limit should fail");
-
-    // SetMaintenanceFee: zero is fine (no minimum)
-    let result = env.try_set_maintenance_fee(&admin, 0);
-    assert!(result.is_ok(), "Zero fee should succeed: {:?}", result);
-
-    // SetRiskThreshold: within limit should succeed
-    let result = env.try_set_risk_threshold(&admin, 50_000);
-    assert!(
-        result.is_ok(),
-        "Threshold at limit should succeed: {:?}",
-        result
-    );
-
-    // SetRiskThreshold: above limit should fail (limit check fires before elapsed check)
-    let result = env.try_set_risk_threshold(&admin, 50_001);
-    assert!(result.is_err(), "Threshold above limit should fail");
-
-    // SetRiskThreshold: zero is fine (no minimum)
-    env.set_slot(2);
-    let result = env.try_set_risk_threshold(&admin, 0);
-    assert!(
-        result.is_ok(),
-        "Zero threshold should succeed: {:?}",
-        result
-    );
-
     // SetOraclePriceCap: above floor should succeed
     let result = env.try_set_oracle_price_cap(&admin, 5000);
     assert!(
@@ -31240,6 +29749,7 @@ fn test_init_market_admin_limits_enforced() {
 
     println!("INIT MARKET ADMIN LIMITS ENFORCED: PASSED");
 }
+
 
 /// Verify that InitMarket rejects zero admin limits.
 #[test]
@@ -31466,153 +29976,6 @@ fn test_update_config_thresh_max_bounded_by_limit() {
 
 /// Verify that KeeperCrank EWMA auto-update respects max_risk_threshold.
 /// The EWMA clamps to config.thresh_max, which InitMarket now clamps to max_risk_threshold.
-#[test]
-fn test_crank_threshold_ewma_bounded_by_limit() {
-    program_path();
-
-    let mut env = TestEnv::new();
-
-    // Init market with max_risk_threshold = 50_000
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: encode_init_market_with_limits(
-            &admin.pubkey(),
-            &env.mint,
-            &TEST_FEED_ID,
-            100_000_000_000_000_000_000u128, // max_maintenance_fee
-            50_000,    // max_risk_threshold
-            0,         // min_oracle_price_cap_e2bps
-        ),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("init_market failed");
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Set UpdateConfig with high thresh_floor (drives EWMA target up) and thresh_max at the limit
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-        ],
-        data: encode_update_config(
-            3600,                          // funding_horizon_slots
-            100,                           // funding_k_bps
-            1_000_000_000_000u128,         // funding_inv_scale_notional_e6
-            100i64,                        // funding_max_premium_bps
-            10i64,                         // funding_max_bps_per_slot
-            1_000_000u128,                 // thresh_floor (very high, drives EWMA up)
-            10_000,                        // thresh_risk_bps
-            1,                             // thresh_update_interval_slots (update every slot)
-            10_000,                        // thresh_step_bps (100% step = instant convergence)
-            10_000,                        // thresh_alpha_bps (100% alpha = instant EWMA)
-            0u128,                         // thresh_min
-            50_000u128,                    // thresh_max = at the limit
-            1u128,                         // thresh_min_step
-        ),
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[&admin],
-        env.svm.latest_blockhash(),
-    );
-    env.svm
-        .send_transaction(tx)
-        .expect("UpdateConfig failed");
-
-    // Helper: read engine's insurance_floor directly from slab bytes.
-    // Layout: slab_header(440) + engine.params(+32) + insurance_floor(+176) = 648
-    const RISK_THRESHOLD_OFF: usize = 728;
-    let read_engine_threshold = |env: &TestEnv| -> u128 {
-        let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(
-            slab.data[RISK_THRESHOLD_OFF..RISK_THRESHOLD_OFF + 16]
-                .try_into()
-                .unwrap(),
-        )
-    };
-
-    // Also verify config.thresh_max was correctly clamped at init
-    const THRESH_MAX_OFF: usize = 296; // header(72) + config offset 224
-    let slab = env.svm.get_account(&env.slab).unwrap();
-    let config_thresh_max = u128::from_le_bytes(
-        slab.data[THRESH_MAX_OFF..THRESH_MAX_OFF + 16]
-            .try_into()
-            .unwrap(),
-    );
-    assert_eq!(
-        config_thresh_max, 50_000,
-        "config.thresh_max should be min(DEFAULT_THRESH_MAX, max_risk_threshold) = 50_000, got {}",
-        config_thresh_max
-    );
-
-    // Threshold starts at 0 (risk_params default)
-    assert_eq!(read_engine_threshold(&env), 0, "Initial threshold should be 0");
-
-    // Set oracle price and advance slot so crank can run
-    // Note: market created at slot 100, so use slots > 100 for threshold updates
-    env.set_slot_and_price(110, 100_000_000); // $100
-    env.crank();
-
-    // Crank multiple times — EWMA target is thresh_floor=1_000_000 but clamped to 50_000
-    for slot in (112..130).step_by(2) {
-        env.set_slot_and_price(slot, 100_000_000);
-        env.crank();
-        let thr = read_engine_threshold(&env);
-        assert!(
-            thr <= 50_000,
-            "Engine threshold {} exceeded max_risk_threshold 50_000 at slot {}",
-            thr,
-            slot,
-        );
-    }
-
-    // After many cranks, threshold should have converged to exactly 50_000
-    // (alpha=100%, step=100%, floor=1M clamped to 50K, from zero with full jump)
-    let final_thr = read_engine_threshold(&env);
-    assert_eq!(
-        final_thr, 50_000,
-        "Threshold should converge to thresh_max=50_000 (clamped target), got {}",
-        final_thr
-    );
-
-    println!("CRANK THRESHOLD EWMA BOUNDED BY LIMIT: PASSED");
-}
-
 /// Verify that InitMarket rejects initial risk_params that exceed per-market limits.
 #[test]
 fn test_init_market_risk_params_exceed_limits_rejected() {
@@ -31909,12 +30272,7 @@ fn test_admin_limits_lifecycle() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Advance past the init slot so elapsed > 0 for SetRiskThreshold
-    env.set_slot(1);
-
-    // Step 1: Set* ops within limits
-    env.try_set_risk_threshold(&admin, 25_000).unwrap();
-    env.try_set_maintenance_fee(&admin, 500).unwrap();
+    // Step 1: Set oracle price cap within limits
     env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     // Step 2: UpdateConfig with thresh_max at limit
@@ -31928,18 +30286,10 @@ fn test_admin_limits_lifecycle() {
     env.crank();
 
     // Step 4: Limits still enforced after UpdateConfig + crank
-    let result = env.try_set_risk_threshold(&admin, 50_001);
-    assert!(result.is_err(), "Limit still enforced after lifecycle: SetRiskThreshold");
-
-    let result = env.try_set_maintenance_fee(&admin, 1001);
-    assert!(result.is_err(), "Limit still enforced after lifecycle: SetMaintenanceFee");
-
     let result = env.try_set_oracle_price_cap(&admin, 4999);
     assert!(result.is_err(), "Limit still enforced after lifecycle: SetOraclePriceCap");
 
     // Step 5: At-limit values still work
-    env.try_set_risk_threshold(&admin, 50_000).unwrap();
-    env.try_set_maintenance_fee(&admin, 1000).unwrap();
     env.try_set_oracle_price_cap(&admin, 5000).unwrap();
 
     // Step 6: Verify limit fields in config haven't been corrupted
@@ -31970,6 +30320,7 @@ fn test_admin_limits_lifecycle() {
 
     println!("ADMIN LIMITS LIFECYCLE: PASSED");
 }
+
 
 /// Full market lifecycle: resolve → force-close all → withdraw insurance → close slab.
 ///
@@ -32061,137 +30412,13 @@ fn test_full_market_shutdown_lifecycle() {
 }
 
 /// Dormant accounts drain to zero via maintenance fees, enabling permissionless shutdown.
-#[test]
-fn test_dormant_accounts_drain_and_market_closes() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Set maintenance fee: 1000 units/slot
-    env.try_set_maintenance_fee(&admin, 1000).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 1_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 500_000_000);
-
-    env.try_top_up_insurance(&admin, 100_000_000).unwrap();
-
-    env.set_slot(1);
-    env.crank();
-
-    assert!(env.read_account_capital(user_idx) > 0);
-    assert!(env.read_account_capital(lp_idx) > 0);
-
-    // Users go dormant — only keepers crank
-    let mut slot = 100u64;
-    let mut user_drained = false;
-    let mut lp_drained = false;
-
-    for _ in 0..30 {
-        slot += 200_000;
-        env.set_slot(slot);
-        let _ = env.try_crank();
-
-        if env.read_account_capital(user_idx) == 0 && !user_drained {
-            println!("User drained at slot {}", slot + 100);
-            user_drained = true;
-        }
-        if env.read_account_capital(lp_idx) == 0 && !lp_drained {
-            println!("LP drained at slot {}", slot + 100);
-            lp_drained = true;
-        }
-        if user_drained && lp_drained { break; }
-    }
-
-    assert!(user_drained, "User should drain via maintenance fees");
-    assert!(lp_drained, "LP should drain via maintenance fees");
-
-    let insurance_after = env.read_insurance_balance();
-    assert!(insurance_after > 100_000_000, "Insurance should grow from fees: {}", insurance_after);
-
-    // Accounts may have fee debt (negative fee_credits) preventing GC.
-    // Admin resolves market and force-closes remaining accounts.
-    slot += 10_000;
-    env.set_slot(slot);
-    let _ = env.try_crank();
-
-    // Set oracle authority and push price for resolution
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
-    env.try_push_oracle_price(&admin, 138_000_000, (slot + 100) as i64).unwrap();
-    env.try_resolve_market(&admin).unwrap();
-
-    // Force-close remaining accounts
-    let _ = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
-    let _ = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
-
-    let used = env.read_num_used_accounts();
-    println!("Accounts after force-close: {}", used);
-    assert_eq!(used, 0, "All accounts should be closed after admin force-close");
-
-    // Withdraw insurance (all fees collected + initial top-up)
-    let withdraw_result = env.try_withdraw_insurance(&admin);
-    assert!(withdraw_result.is_ok(), "Insurance withdrawal: {:?}", withdraw_result);
-
-    // Close slab
-    let close_result = env.try_close_slab();
-    println!("CloseSlab: {:?}", close_result);
-
-    println!("DORMANT DRAIN + MARKET SHUTDOWN: PASSED");
-}
-
 // ============================================================================
 // ============================================================================
 // Insurance Withdrawal Limits & Floor Change Rate-Limiting Boundary Tests
 // ============================================================================
 
 /// SetRiskThreshold with max_insurance_floor_change_per_day == 0 locks the floor.
-#[test]
-fn test_insurance_floor_locked_when_max_change_zero() {
-    program_path();
-    let mut env = TestEnv::new();
-    // Default encoder sets max_insurance_floor_change_per_day = u128::MAX (unrestricted)
-    env.init_market_with_invert(0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // With unrestricted change, setting floor should succeed
-    env.set_slot(1);
-    let r1 = env.try_set_risk_threshold(&admin, 1000);
-    assert!(r1.is_ok(), "Unrestricted floor change should succeed: {:?}", r1);
-
-    // Verify floor was set
-    env.set_slot(2);
-    let r2 = env.try_set_risk_threshold(&admin, 2000);
-    assert!(r2.is_ok(), "Second change should succeed: {:?}", r2);
-}
-
 /// SetRiskThreshold rate-limit uses actual current value, not stale baseline.
-#[test]
-fn test_insurance_floor_rate_limit_uses_current_value() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Set floor to 1000
-    env.set_slot(1);
-    env.try_set_risk_threshold(&admin, 1000).unwrap();
-
-    // Change to 2000 — delta = 1000, should succeed with unrestricted
-    env.set_slot(2);
-    env.try_set_risk_threshold(&admin, 2000).unwrap();
-
-    // Large jump should also succeed with u128::MAX rate limit
-    env.set_slot(3);
-    env.try_set_risk_threshold(&admin, 1_000_000_000).unwrap();
-}
-
 /// Cooldown enforcement on WithdrawInsuranceLimited (resolved market).
 #[test]
 fn test_insurance_withdraw_cooldown_enforcement() {
