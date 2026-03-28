@@ -12,17 +12,33 @@
 
 /// C2: unsafe_close skips ALL CloseSlab validation — test environments only!
 /// PERC-136 #309: Guard against accidental enabling outside test builds.
-#[cfg(all(feature = "unsafe_close", feature = "mainnet"))]
-compile_error!("unsafe_close MUST NOT be enabled on mainnet builds!");
+#// =============================================================================
+// 🛡️ SOLANA PROGRAM DEPLOYMENT SECURITY GUARDS
+// =============================================================================
 
-#[cfg(all(feature = "unsafe_close", not(feature = "test"), not(test)))]
+// ✅ FIX #1: INVERTED LOGIC - Require 'mainnet' flag when deploying.
+// If ANY dangerous feature is enabled WITHOUT the 'mainnet' guard, FAIL COMPILE.
+// This prevents accidental builds that include test-only logic.
+#[cfg(all(
+    not(feature = "mainnet"), 
+    any(feature = "unsafe_close", feature = "devnet", feature = "test")
+))]
 compile_error!(
-    "unsafe_close MUST ONLY be enabled with the 'test' feature — it is a drain-all backdoor!"
+    "SECURITY VIOLATION: Dangerous features (unsafe_close, devnet, or test) detected WITHOUT 'mainnet' guard!\n\
+     This binary CANNOT be deployed to mainnet.\n\
+     To fix, use: cargo build-sbf --features mainnet"
 );
 
-/// H2: devnet disables oracle staleness/confidence checks — not safe for mainnet!
-#[cfg(all(feature = "devnet", feature = "mainnet"))]
-compile_error!("devnet feature MUST NOT be enabled on mainnet builds!");
+// ✅ FIX #2: CONFLICT GUARD - Reject double-enabling dangerous flags on Mainnet.
+// Even if 'mainnet' is passed, we must ensure NO test-only features are leaked into the binary.
+#[cfg(all(
+    feature = "mainnet", 
+    any(feature = "unsafe_close", feature = "devnet", feature = "test")
+))]
+compile_error!(
+    "SECURITY VIOLATION: Test-only features (unsafe_close, devnet, or test) CANNOT be enabled with 'mainnet'!\n\
+     Remove these flags to create a production-ready build: cargo build-sbf --features mainnet"
+);
 
 extern crate alloc;
 
