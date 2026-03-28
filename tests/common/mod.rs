@@ -458,7 +458,7 @@ impl TestEnv {
     pub fn init_lp(&mut self, owner: &Keypair) -> u16 {
         let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
         let matcher = spl_token::ID;
         let ctx = Pubkey::new_unique();
         self.svm
@@ -486,7 +486,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(matcher, false),
                 AccountMeta::new_readonly(ctx, false),
             ],
-            data: encode_init_lp(&matcher, &ctx, 0),
+            data: encode_init_lp(&matcher, &ctx, 100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -503,7 +503,7 @@ impl TestEnv {
     pub fn init_user(&mut self, owner: &Keypair) -> u16 {
         let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -516,7 +516,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_col, false),
             ],
-            data: encode_init_user(0),
+            data: encode_init_user(100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -2492,7 +2492,7 @@ impl TradeCpiTestEnv {
     pub fn init_lp_with_matcher(&mut self, owner: &Keypair, matcher_prog: &Pubkey) -> (u16, Pubkey) {
         let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
 
         // Derive the LP PDA that will be used later (must match percolator derivation)
         let lp_bytes = idx.to_le_bytes();
@@ -2556,7 +2556,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(*matcher_prog, false),
                 AccountMeta::new_readonly(ctx, false),
             ],
-            data: encode_init_lp(matcher_prog, &ctx, 0),
+            data: encode_init_lp(matcher_prog, &ctx, 100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -2580,7 +2580,7 @@ impl TradeCpiTestEnv {
     ) -> u16 {
         let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -2594,7 +2594,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(*matcher_prog, false),
                 AccountMeta::new_readonly(*matcher_ctx, false),
             ],
-            data: encode_init_lp(matcher_prog, matcher_ctx, 0),
+            data: encode_init_lp(matcher_prog, matcher_ctx, 100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -2613,7 +2613,7 @@ impl TradeCpiTestEnv {
     pub fn init_user(&mut self, owner: &Keypair) -> u16 {
         let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 0);
+        let ata = self.create_ata(&owner.pubkey(), 100);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -2626,7 +2626,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_col, false),
             ],
-            data: encode_init_user(0),
+            data: encode_init_user(100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -3609,7 +3609,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_col, false),
             ],
-            data: encode_init_user(0),
+            data: encode_init_user(100),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -4394,7 +4394,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(self.pyth_col, false),
             ],
-            data: encode_init_lp(&Pubkey::new_unique(), &Pubkey::new_unique(), 0),
+            data: encode_init_lp(&Pubkey::new_unique(), &Pubkey::new_unique(), 100),
         };
 
         let tx = Transaction::new_signed_with_payer(

@@ -3187,11 +3187,13 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-                // Update current_slot so add_user stamps warmup_started_at_slot correctly
-                engine.current_slot = clock.slot;
-                let idx = engine.add_user(units as u128).map_err(map_risk_error)?;
-                engine
-                    .set_owner(idx, a_user.key.to_bytes())
+                // Canonical deposit-based materialization (spec §10.3).
+                // deposit() materializes at free_head when slot is unused,
+                // enforcing min_initial_deposit.
+                let idx = engine.free_head;
+                engine.deposit(idx, units as u128, 0, clock.slot)
+                    .map_err(map_risk_error)?;
+                engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
             }
             Instruction::InitLP {
@@ -3247,17 +3249,15 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-                // Update current_slot so add_lp stamps warmup_started_at_slot correctly
-                engine.current_slot = clock.slot;
-                let idx = engine
-                    .add_lp(
-                        matcher_program.to_bytes(),
-                        matcher_context.to_bytes(),
-                        units as u128,
-                    )
+                // Canonical deposit-based materialization (spec §10.3).
+                let idx = engine.free_head;
+                engine.deposit(idx, units as u128, 0, clock.slot)
                     .map_err(map_risk_error)?;
-                engine
-                    .set_owner(idx, a_user.key.to_bytes())
+                // Set LP fields on the materialized account
+                engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
+                engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
+                engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
+                engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
             }
             Instruction::DepositCollateral { user_idx, amount } => {
@@ -3458,7 +3458,9 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                // Check if market is resolved - if so, settle accounts and sweep dust
+                // Check if market is resolved - frozen time mode.
+                // All resolved operations use engine.current_slot (frozen at
+                // last pre-resolution crank) instead of clock.slot.
                 if state::is_resolved(&data) {
                     let config = state::read_config(&data);
                     let settlement_price = config.authority_price_e6;
@@ -3466,7 +3468,11 @@ pub mod processor {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
-                    let clock = Clock::from_account_info(a_clock)?;
+                    // Read frozen slot from engine (NOT clock.slot)
+                    let frozen_slot = {
+                        let eng = zc::engine_ref(&data)?;
+                        eng.current_slot
+                    };
 
                     // Dust sweep: resolved crank must also sweep dust so
                     // CloseSlab's dust_base == 0 check can eventually pass.
@@ -3505,22 +3511,17 @@ pub mod processor {
                             // close_account_resolved using stored local state.
                             // on stored local state without accrue/settle.
                             let _ = engine.touch_account_full(
-                                idx as usize, settlement_price, clock.slot,
-                            );
-                            // Zero position for resolved-market settlement
-                            let _ = engine.settle_position_at_price(
-                                idx, settlement_price,
+                                idx as usize, settlement_price, frozen_slot,
                             );
                         }
                     }
 
-                    // Update crank cursor for next call
+                    // Update crank cursor (do NOT advance current_slot — frozen)
                     engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 {
                         0
                     } else {
                         end
                     };
-                    engine.current_slot = clock.slot;
 
                     // Sweep dust to insurance fund.
                     // On resolved markets, also forgive sub-scale remainder
@@ -3530,7 +3531,7 @@ pub mod processor {
                         if dust_before >= scale {
                             let units_to_sweep = dust_before / scale;
                             engine.top_up_insurance_fund(
-                                units_to_sweep as u128, clock.slot,
+                                units_to_sweep as u128, frozen_slot,
                             ).map_err(map_risk_error)?;
                         }
                         true
@@ -4102,14 +4103,10 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Best-effort settlement: touch settles K-pair PnL,
-                    // settle_position_at_price zeros the position and updates OI.
-                    let _ = engine.touch_account_full(
-                        user_idx as usize, price, clock.slot,
-                    );
-                    engine.settle_position_at_price(user_idx, price)
-                        .map_err(map_risk_error)?;
-                    engine.close_account_resolved(user_idx)
+                    // Use frozen time (engine.current_slot from last crank).
+                    let frozen_slot = engine.current_slot;
+                    let funding_rate = compute_current_funding_rate(&config);
+                    engine.close_account(user_idx, frozen_slot, price, funding_rate)
                         .map_err(map_risk_error)?
                 } else {
                     engine
@@ -5003,12 +5000,14 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Best-effort settlement + position zeroing for resolved markets.
-                let _ = engine.touch_account_full(
-                    user_idx as usize, price, clock.slot,
-                );
-                let _ = engine.settle_position_at_price(user_idx, price);
-                let amt_units = engine.close_account_resolved(user_idx)
+                // Try canonical close first (handles stale-epoch accounts).
+                // If that fails (same-epoch position), fall back to
+                // close_account_resolved (best-effort, may lose some PnL).
+                let frozen_slot = engine.current_slot;
+                let funding_rate = compute_current_funding_rate(&config);
+                let amt_units = engine.close_account(
+                    user_idx, frozen_slot, price, funding_rate,
+                ).or_else(|_| engine.close_account_resolved(user_idx))
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
                     .try_into()
@@ -5081,7 +5080,6 @@ pub mod processor {
 
             Instruction::SettleAccount { user_idx } => {
                 // Standalone account settlement (§10.2). Permissionless.
-                // Settles lazy A/K/mark/funding effects for a single account.
                 accounts::expect_len(accounts, 3)?;
                 let a_slab = &accounts[0];
                 let a_clock = &accounts[1];
@@ -5091,6 +5089,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let mut config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
@@ -5175,6 +5176,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let mut config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
