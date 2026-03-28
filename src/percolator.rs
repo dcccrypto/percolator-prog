@@ -11618,6 +11618,13 @@ pub mod processor {
                 config.authority_price_e6 = 0;
                 config.authority_timestamp = 0;
                 state::write_config(&mut data, &config);
+
+                // Emit event so keepers/indexers can track authority migrations
+                msg!(
+                    "SET_ORACLE_AUTHORITY slab={} new_authority={}",
+                    a_slab.key,
+                    new_authority
+                );
             }
 
             Instruction::PushOraclePrice {
