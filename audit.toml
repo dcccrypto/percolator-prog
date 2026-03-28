@@ -28,4 +28,9 @@ ignore = [
     # Source: deep transitive dev-dep
     # Impact: DEV-ONLY. No security issue, just unmaintained.
     "RUSTSEC-2021-0139",
+
+    # RUSTSEC-2021-0145: atty 0.2.14 potential unaligned read (unsound)
+    # Source: env_logger → solana-logger → solana-genesis-config → litesvm (dev-only chain)
+    # Impact: DEV-ONLY. Not in on-chain binary.
+    "RUSTSEC-2021-0145",
 ]
