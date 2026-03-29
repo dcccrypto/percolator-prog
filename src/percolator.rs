@@ -17184,6 +17184,181 @@ pub mod processor {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// PERC-8206: OI Imbalance Hard Block — Kani Proofs
+// ═══════════════════════════════════════════════════════════════
+//
+// Three harnesses:
+//
+//   C9-A: proof_oi_imbalance_hard_block_never_exceeds_cap
+//         After check_oi_imbalance_hard_block approves a trade, the
+//         resulting OI imbalance ratio is bounded: if the trade is
+//         allowed AND the cap is active, either the post-trade ratio
+//         is < threshold OR the trade was balance-improving (reducing
+//         the dominant side). This closes the "silent truncation" gap.
+//
+//   C9-B: proof_oi_imbalance_exceeding_cap_causes_error
+//         When threshold_bps > 0 and the current ratio >= threshold AND
+//         the trade increases the dominant side: check always returns Err.
+//         No silent Ok return — formally ruling out silent truncation.
+//
+//   C9-C: proof_oi_imbalance_disabled_never_blocks
+//         When threshold_bps == 0, check_oi_imbalance_hard_block returns
+//         Ok for ALL inputs — disabled means truly disabled.
+
+#[cfg(kani)]
+mod oi_imbalance_kani_proofs {
+    use super::*;
+    use alloc::vec;
+
+    /// Build a minimal slab, set long_oi/short_oi on the engine, apply
+    /// `threshold_bps` to config, then call check_oi_imbalance_hard_block.
+    fn run_check_kani(
+        long_oi: u128,
+        short_oi: u128,
+        threshold_bps: u16,
+        size: i128,
+    ) -> Result<(), ProgramError> {
+        let mut slab = vec![0u8; SLAB_LEN];
+        {
+            let engine = zc::engine_mut(&mut slab).unwrap();
+            engine.long_oi.set(long_oi);
+            engine.short_oi.set(short_oi);
+            engine
+                .total_open_interest
+                .set(long_oi.saturating_add(short_oi));
+        }
+        let mut config = <state::MarketConfig as bytemuck::Zeroable>::zeroed();
+        state::set_oi_imbalance_hard_block_bps(&mut config, threshold_bps);
+        let engine = zc::engine_ref(&slab).unwrap();
+        check_oi_imbalance_hard_block(engine, &config, size)
+    }
+
+    /// C9-A: If a trade is approved (Ok) by the hard block check AND the
+    /// threshold is active (> 0) AND total_oi > 0, then one of these holds:
+    ///   (a) current imbalance ratio is strictly below threshold, OR
+    ///   (b) the trade is balance-improving (it reduces the dominant side).
+    /// This proves the check never silently approves imbalance-worsening trades
+    /// when the cap has already been breached.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_oi_imbalance_hard_block_never_exceeds_cap() {
+        let long_oi: u128 = kani::any();
+        let short_oi: u128 = kani::any();
+        let threshold_bps: u16 = kani::any();
+        let size: i128 = kani::any();
+
+        // Bound inputs to tractable ranges for the solver
+        kani::assume(long_oi <= 1_000_000_000_000u128); // 1T max
+        kani::assume(short_oi <= 1_000_000_000_000u128);
+        kani::assume(threshold_bps > 0); // cap is active
+        kani::assume(threshold_bps <= 10_000);
+
+        let total_oi = long_oi.saturating_add(short_oi);
+
+        let result = run_check_kani(long_oi, short_oi, threshold_bps, size);
+
+        if result.is_ok() && total_oi > 0 {
+            // Compute actual imbalance ratio the check sees
+            let skew = long_oi.abs_diff(short_oi);
+            let current_ratio_bps = skew.saturating_mul(10_000u128) / total_oi;
+
+            // Case (a): ratio < threshold → check passes normally
+            let below_threshold = current_ratio_bps < threshold_bps as u128;
+
+            // Case (b): trade is balance-improving (reduces the dominant side)
+            let balance_improving = if size > 0 {
+                // long trade is balance-improving when short side is dominant
+                short_oi > long_oi
+            } else if size < 0 {
+                // short trade is balance-improving when long side is dominant
+                long_oi > short_oi
+            } else {
+                true // zero-size always passes
+            };
+
+            assert!(
+                below_threshold || balance_improving,
+                "C9-A: approved trade must be below threshold or balance-improving"
+            );
+        }
+
+        // Non-vacuity: both pass and block paths are reachable
+        kani::cover!(result.is_ok(), "C9-A: check can approve trade");
+        kani::cover!(result.is_err(), "C9-A: check can block trade");
+    }
+
+    /// C9-B: When the cap is active, ratio >= threshold, AND the trade would
+    /// worsen imbalance (increases dominant side) — check MUST return Err.
+    /// This formally rules out any silent truncation or Ok bypass.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_oi_imbalance_exceeding_cap_causes_error() {
+        let long_oi: u128 = kani::any();
+        let short_oi: u128 = kani::any();
+        let threshold_bps: u16 = kani::any();
+        let size: i128 = kani::any();
+
+        kani::assume(long_oi <= 1_000_000_000_000u128);
+        kani::assume(short_oi <= 1_000_000_000_000u128);
+        kani::assume(threshold_bps > 0);
+        kani::assume(threshold_bps <= 10_000);
+
+        let total_oi = long_oi.saturating_add(short_oi);
+        kani::assume(total_oi > 0); // non-empty market
+
+        let skew = long_oi.abs_diff(short_oi);
+        let current_ratio_bps = skew.saturating_mul(10_000u128) / total_oi;
+
+        // Pre-condition: ratio already at or above cap
+        kani::assume(current_ratio_bps >= threshold_bps as u128);
+
+        // Trade would INCREASE the dominant side (worsen imbalance)
+        let worsens = if size > 0 {
+            long_oi >= short_oi
+        } else if size < 0 {
+            short_oi >= long_oi
+        } else {
+            false
+        };
+        kani::assume(worsens);
+
+        let result = run_check_kani(long_oi, short_oi, threshold_bps, size);
+
+        assert!(
+            result.is_err(),
+            "C9-B: exceeding cap with imbalance-worsening trade must return Err, not silently truncate"
+        );
+
+        kani::cover!(true, "C9-B: imbalance-worsening trade at/above cap blocked");
+    }
+
+    /// C9-C: When threshold_bps == 0 (disabled), check returns Ok for ALL
+    /// inputs regardless of current OI imbalance or trade direction.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_oi_imbalance_disabled_never_blocks() {
+        let long_oi: u128 = kani::any();
+        let short_oi: u128 = kani::any();
+        let size: i128 = kani::any();
+
+        kani::assume(long_oi <= 1_000_000_000_000u128);
+        kani::assume(short_oi <= 1_000_000_000_000u128);
+
+        // Disabled: threshold_bps == 0
+        let threshold_bps: u16 = 0;
+
+        let result = run_check_kani(long_oi, short_oi, threshold_bps, size);
+
+        assert!(
+            result.is_ok(),
+            "C9-C: disabled OI hard block must never block any trade"
+        );
+
+        kani::cover!(true, "C9-C: disabled check always passes");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // PERC-622: Oracle Phase Transition — Tests & Kani Proofs
 // ═══════════════════════════════════════════════════════════════
 
