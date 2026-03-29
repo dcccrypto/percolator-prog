@@ -4072,6 +4072,313 @@ impl TestEnv {
             .send_transaction(tx)
             .expect("init_market_with_trading_fee failed");
     }
+
+    // ------------------------------------------------------------------
+    // Init market with trading fee AND warmup period
+    // ------------------------------------------------------------------
+    pub fn init_market_with_trading_fee_and_warmup(
+        &mut self,
+        trading_fee_bps: u64,
+        warmup_period_slots: u64,
+    ) {
+        let admin = &self.payer;
+        let dummy_ata = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        let mut data = vec![0u8];
+        data.extend_from_slice(admin.pubkey().as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&TEST_FEED_ID);
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_secs
+        data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+        data.push(0u8); // invert
+        data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+        data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+        data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot
+        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
+        data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+        data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // warmup_period_slots
+        data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+        data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
+        data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
+        data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+        data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
+        data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+        data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+        data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+        data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
+        data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+        data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
+        data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
+        data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+        data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+        data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+        data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
+                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("init_market_with_trading_fee_and_warmup failed");
+    }
+
+    // ------------------------------------------------------------------
+    // Instruction helpers for tags 24, 26, 27, 28
+    // ------------------------------------------------------------------
+
+    /// SettleAccount (tag 26) -- permissionless
+    pub fn try_settle_account(&mut self, user_idx: u16) -> Result<(), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let mut data = vec![26u8];
+        data.extend_from_slice(&user_idx.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.slab, false),        // 0: slab (writable)
+                AccountMeta::new_readonly(sysvar::clock::ID, false), // 1: clock
+                AccountMeta::new_readonly(self.pyth_index, false),   // 2: oracle
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// SettleAccount (tag 26) with a specific signer -- used for permissionless test
+    pub fn try_settle_account_with_signer(
+        &mut self,
+        signer: &Keypair,
+        user_idx: u16,
+    ) -> Result<(), String> {
+        let mut data = vec![26u8];
+        data.extend_from_slice(&user_idx.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// DepositFeeCredits (tag 27) -- owner only
+    pub fn try_deposit_fee_credits(
+        &mut self,
+        owner: &Keypair,
+        user_idx: u16,
+        amount: u64,
+    ) -> Result<(), String> {
+        let ata = self.create_ata(&owner.pubkey(), amount);
+
+        let mut data = vec![27u8];
+        data.extend_from_slice(&user_idx.to_le_bytes());
+        data.extend_from_slice(&amount.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),   // 0: user (signer)
+                AccountMeta::new(self.slab, false),       // 1: slab
+                AccountMeta::new(ata, false),             // 2: user_ata
+                AccountMeta::new(self.vault, false),      // 3: vault
+                AccountMeta::new_readonly(spl_token::ID, false), // 4: token_program
+                AccountMeta::new_readonly(sysvar::clock::ID, false), // 5: clock
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// ConvertReleasedPnl (tag 28) -- owner only
+    pub fn try_convert_released_pnl(
+        &mut self,
+        owner: &Keypair,
+        user_idx: u16,
+        amount: u64,
+    ) -> Result<(), String> {
+        let mut data = vec![28u8];
+        data.extend_from_slice(&user_idx.to_le_bytes());
+        data.extend_from_slice(&amount.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),  // 0: user (signer)
+                AccountMeta::new(self.slab, false),      // 1: slab
+                AccountMeta::new_readonly(sysvar::clock::ID, false), // 2: clock
+                AccountMeta::new_readonly(self.pyth_index, false),   // 3: oracle
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// QueryLpFees (tag 24) -- read-only, no signer required
+    pub fn try_query_lp_fees(&mut self, lp_idx: u16) -> Result<(), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let mut data = vec![24u8];
+        data.extend_from_slice(&lp_idx.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(self.slab, false), // 0: slab (read-only)
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    // ------------------------------------------------------------------
+    // Account field readers for fee_credits and fees_earned_total
+    // ------------------------------------------------------------------
+
+    /// Read fee_credits (i128) for an account slot.
+    /// Fee credits is at offset 240 within Account.
+    pub fn read_account_fee_credits(&self, idx: u16) -> i128 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const FEE_CREDITS_OFFSET: usize = 240;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
+        if slab_data.len() < off + 16 {
+            return 0;
+        }
+        i128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
+    }
+
+    /// Read fees_earned_total (u128) for an account slot.
+    /// fees_earned_total is at offset 264 within Account.
+    pub fn read_account_fees_earned_total(&self, idx: u16) -> u128 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const FEES_EARNED_OFFSET: usize = 264;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEES_EARNED_OFFSET;
+        if slab_data.len() < off + 16 {
+            return 0;
+        }
+        u128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
+    }
+
+    /// Read warmup_started_at_slot (u64) for an account slot.
+    /// warmup_started_at_slot is at offset 64 within Account.
+    pub fn read_account_warmup_started_at_slot(&self, idx: u16) -> u64 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const WARMUP_SLOT_OFFSET: usize = 64;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + WARMUP_SLOT_OFFSET;
+        if slab_data.len() < off + 8 {
+            return 0;
+        }
+        u64::from_le_bytes(slab_data[off..off + 8].try_into().unwrap())
+    }
+
+    /// Read reserved_pnl (u128) for an account slot.
+    /// reserved_pnl is at offset 48 within Account.
+    pub fn read_account_reserved_pnl(&self, idx: u16) -> u128 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 520 + 9336;
+        const ACCOUNT_SIZE: usize = 280;
+        const RESERVED_PNL_OFFSET: usize = 48;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + RESERVED_PNL_OFFSET;
+        if slab_data.len() < off + 16 {
+            return 0;
+        }
+        u128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
+    }
 }
 
 // ============================================================================
