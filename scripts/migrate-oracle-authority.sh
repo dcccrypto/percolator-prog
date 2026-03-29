@@ -39,10 +39,32 @@ LARGE_PROG="FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD"
 # Add/remove as markets are created. Source: indexer /api/markets or GH#1748.
 # Format: "SLAB_PUBKEY PROGRAM_ID MARKET_NAME"
 SLABS=(
-    # BTC/USD (GH#1754 — completely non-tradeable)
-    # SEEKER/SKR (GH#1748)
-    # Other markets (add addresses from indexer)
-    # TODO: populate from `percolator-indexer markets list --rpc $RPC`
+    "CixbiFBpC79Xwuq4yd7bqhyPGBHrvSi2GdqHhUPVdrKL FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn WENDYS"
+    "5qPupXTuiKnwkVBHnhMRVJSj2EZ2Fii3Di5Fp4CPsvUA FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn RIGGED"
+    "EeyNDVKYJV2FNbsrpau3oEfTXJXSxDFCDhst383JfeGq FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn SIEVE"
+    "7eubYRwJiQdJgXsw1VdaNQ7YHvHbgChe7wbPNQw74S23 FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn BTC"
+    "AB3ZN1vxbBEh8FZRfrL55QQUUaLCwawqvCYzTDpgbuLF FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn BTC2"
+    "GGU89iQLmceyXRDK8vgAxVvdi9RJb9JsPhXZ2NoFSENV FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn BTC3"
+    "8Cg2Jc117eS67TftFdHARwp3c6mXv9rJiNgQr3G6mkXr FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn DARK"
+    "ykoRHvTmJRsCmN1guhBCWpdDhRhZb1oTutCZy5EgPEd FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn SMT"
+    "DBonukT6AavEuGaTS6yccVNrUkoQMekcazSNwybcaBpR FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn USELESS"
+    "D1dHxYSMUfWkkjyFQe5YWGyUMmUrgLNVcGzi7nxysKB5 FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn GROKIUS"
+    "G6pwRShh2SfcJQpL7GHQGr9ww8xn4J8XrUqaUJSfNGSb FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator"
+    "AWbcen87WbyqfvD3onLYxtRyJi7adtpxC4heZqZbSdLP FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator2"
+    "FnkgNG1J3yo31QjCUBeHfeUYKzRQymkrpFyHwEsa9qJy FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn shitcoin"
+    "9chA42j7BFRovLQyZZYFAUvHjF6F4urHqvABt5vPK4hx FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn 6yEiTM4X"
+    "3wiGU2vYXiz8GftjQqLeMiEt5H1ouprHFCryHydFmrZE FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn FTCW"
+    "FrzyATwi84ecScxXseSCmiEBP1pVmQ6zsrm7kqyJTo5C FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn HEY"
+    "484DG6KQi5eVXuaXzWxaWMWeXDp9LFXyshNi33UnWfxV FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator3"
+    "6F86pCA6DcJxx3eY8ZaUteLL6bTw1uAyVGQ71ahGqjtC FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn pump"
+    "GDyHCzpiuEsWDkLuji3NEFYJfqbDTzMCKn9ugUzTZqAW FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator4"
+    "F4pA14HBzNyy42W448RV6VK4yFmgqa29Z8RsAfSrdH15 FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator5"
+    "5MEEy1iQXwda4zeEw2qV1k3vmbTJQMM8jnBx7fosqLGZ FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator6"
+    "7emdGeEHsjwoayV8ACM6EJSihz8MNd9CKKShDLKBo6Dr FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator7"
+    "4U1ajBLar6yRdQWydG4M6VV2j1DcAWQjQAJRA1hMsB6J FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator8"
+    "3CteDuQbeHoPRGHr8z9zapane36bq9RAB6hreTJ3jUkA FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn 5SX2"
+    "Fo2CRdqPaEbLcF4B4wu5KENgpHMAfwe4evuP6TviTvje FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn 5SX2b"
+    "7JjoV9CUcJJA2GMsjmpU2tDSUJvn2uwH3YBsxP3c5eDj FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn Percolator9"
 )
 
 log() { echo "[$(date -u '+%H:%M:%S')] $*"; }
@@ -104,13 +126,13 @@ DISCOVERED=$(discover_slabs) || true
 if [[ -n "$DISCOVERED" ]]; then
     log "Auto-discovered markets:"
     echo "$DISCOVERED"
-    readarray -t SLABS_DYNAMIC <<< "$DISCOVERED"
+    SLABS_DYNAMIC=()
 else
     SLABS_DYNAMIC=()
 fi
 
 # Merge hardcoded + discovered (deduplicate by first field)
-ALL_SLABS=("${SLABS[@]}" "${SLABS_DYNAMIC[@]}")
+ALL_SLABS=("${SLABS[@]}")
 
 if [[ ${#ALL_SLABS[@]} -eq 0 ]]; then
     log "ERROR: No slabs found. Either:"
