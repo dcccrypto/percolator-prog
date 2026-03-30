@@ -15920,6 +15920,7 @@ pub mod processor {
             // keeper fund PDA. Permissionless (no admin check).
             Instruction::TopUpKeeperFund { amount } => {
                 // accounts: [0] funder (signer), [1] slab (writable), [2] keeper_fund PDA (writable)
+                // optional: [3] system_program (required when funder is not program-owned)
                 accounts::expect_len(accounts, 3)?;
                 let a_funder = &accounts[0];
                 let a_slab = &accounts[1];
@@ -15948,9 +15949,36 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // Transfer lamports from funder to keeper fund PDA
-                **a_funder.try_borrow_mut_lamports()? -= amount;
-                **a_keeper_fund.try_borrow_mut_lamports()? += amount;
+                // Transfer lamports from funder to keeper fund PDA.
+                // For externally-owned funders, use System Program transfer.
+                // Direct lamport mutation is only valid for program-owned sources.
+                if a_funder.owner != program_id {
+                    if accounts.len() < 4 {
+                        return Err(ProgramError::NotEnoughAccountKeys);
+                    }
+                    let a_system = &accounts[3];
+                    if *a_system.key != solana_program::system_program::id() {
+                        return Err(ProgramError::IncorrectProgramId);
+                    }
+                    solana_program::program::invoke(
+                        &solana_program::system_instruction::transfer(
+                            a_funder.key,
+                            a_keeper_fund.key,
+                            amount,
+                        ),
+                        &[a_funder.clone(), a_keeper_fund.clone(), a_system.clone()],
+                    )?;
+                } else {
+                    let funder_lamports = **a_funder.try_borrow_lamports()?;
+                    if funder_lamports < amount {
+                        return Err(ProgramError::InsufficientFunds);
+                    }
+                    **a_funder.try_borrow_mut_lamports()? = funder_lamports - amount;
+                    **a_keeper_fund.try_borrow_mut_lamports()? = a_keeper_fund
+                        .lamports()
+                        .checked_add(amount)
+                        .ok_or(ProgramError::InsufficientFunds)?;
+                }
 
                 // Update keeper fund state
                 let mut fund_data = a_keeper_fund
