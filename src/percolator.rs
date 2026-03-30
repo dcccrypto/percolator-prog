@@ -2038,6 +2038,13 @@ pub mod error {
         /// PERC-8297: Engine detected a corrupt state invariant violation.
         /// Distinct from EngineOverflow for better diagnostics (pre-audit).
         EngineCorruptState,
+        /// PERC-8273 T8: ADL rejected — insurance fund balance is above the depletion threshold.
+        /// ADL is only permitted when insurance is fully depleted (balance == 0).
+        InsuranceFundNotDepleted,
+        /// PERC-8273 T8: ADL rejected — no ADL candidate positions provided.
+        NoAdlCandidates,
+        /// PERC-8273 T8: ADL rejected — target (bankrupt) position is already closed (size == 0).
+        BankruptPositionAlreadyClosed,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -15099,34 +15106,41 @@ pub mod processor {
             }
 
             Instruction::ExecuteAdl { target_idx } => {
-                // PERC-305: Auto-deleverage — permissionless instruction to surgically
-                // close/reduce the most profitable position when pnl_pos_tot > max_pnl_cap.
+                // PERC-8273 T8: Auto-deleverage — keeper-gated instruction to surgically
+                // close/reduce the most profitable opposing position when the insurance
+                // fund is fully depleted and bankrupt positions must be covered.
+                //
+                // Spec §PERC-8273:
+                //   - Signer must be the market admin/keeper authority (header.admin)
+                //   - Precondition: insurance_fund.balance == 0 (fully depleted)
+                //   - Precondition: target position size > 0 (not already closed)
+                //   - Emits AdlEvent log (sol_log_64 tag 0xAD1E)
+                //   - Settles realised PnL to capital after deleverage
                 //
                 // Accounts:
-                //   0. [signer]   Caller (permissionless — incentive is unblocking
-                //                 the market for normal trading)
+                //   0. [signer]   Keeper / crank authority (must match header.admin)
                 //   1. [writable] Slab account
                 //   2. []         Clock sysvar
                 //   3. []         Oracle account (Pyth/Chainlink/authority — same as liquidation)
-                //   4.. []       (optional) Backup oracle accounts for non-hyperp markets
+                //   4.. []        (optional) Backup oracle accounts for non-hyperp markets
                 accounts::expect_len(accounts, 4)?;
-                let a_caller = &accounts[0];
+                let a_keeper = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_oracle = &accounts[3];
-                accounts::expect_signer(a_caller)?;
+                accounts::expect_signer(a_keeper)?;
                 accounts::expect_writable(a_slab)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                let mut config = state::read_config(&data);
-
-                // ADL requires max_pnl_cap to be set
-                if config.max_pnl_cap == 0 {
-                    msg!("ADL: max_pnl_cap not configured");
-                    return Err(ProgramError::InvalidInstructionData);
+                // Keeper authority check: signer must be the market admin key.
+                {
+                    let header = state::read_header(&data);
+                    require_admin(header.admin, a_keeper.key)?;
                 }
+
+                let mut config = state::read_config(&data);
 
                 let clock = Clock::from_account_info(&accounts[2])?;
 
@@ -15161,31 +15175,66 @@ pub mod processor {
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
-                check_idx(engine, target_idx)?;
 
-                let pnl_pos_tot = engine.pnl_pos_tot.get();
-                let cap = config.max_pnl_cap as u128;
-
-                // Precondition: PnL cap must be exceeded
-                if pnl_pos_tot <= cap {
+                // PERC-8273: Gate — insurance fund must be fully depleted (balance == 0).
+                // ADL is the last resort: insurance covers losses first; only when
+                // insurance is exhausted are profitable positions deleveraged.
+                let insurance_balance = engine.insurance_fund.balance.get();
+                if insurance_balance != 0 {
                     msg!(
-                        "ADL: pnl_pos_tot {} <= cap {}, not needed",
-                        pnl_pos_tot,
-                        cap
+                        "ADL: insurance_fund.balance={} — not depleted, ADL rejected",
+                        insurance_balance
                     );
-                    return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                    return Err(PercolatorError::InsuranceFundNotDepleted.into());
                 }
 
-                let excess = pnl_pos_tot.saturating_sub(cap);
+                // PERC-8273: Gate — target index must be valid and position must be open.
+                check_idx(engine, target_idx)?;
+                let pos_size = engine.accounts[target_idx as usize].position_size.get();
+                if pos_size == 0 {
+                    msg!("ADL: target_idx={} position already closed", target_idx);
+                    return Err(PercolatorError::BankruptPositionAlreadyClosed.into());
+                }
 
-                // Delegate to core engine's execute_adl — handles settlement,
-                // PnL checks, full/partial close, and OI updates.
+                // Compute excess PnL to remove (pnl_pos_tot above cap).
+                // If max_pnl_cap is 0 (unconfigured), treat cap as 0 (full excess).
+                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let cap = config.max_pnl_cap as u128;
+                let excess = if pnl_pos_tot > cap {
+                    pnl_pos_tot.saturating_sub(cap)
+                } else {
+                    // Even with insurance depleted, proceed with minimal deleverage (1 unit)
+                    // to allow partial position closure — excess == 0 will close the full position.
+                    pnl_pos_tot
+                };
+
+                // Delegate to core engine's execute_adl — handles funding settlement,
+                // PnL checks, full/partial close, and OI/pnl_pos_tot updates.
                 let closed_abs = engine
                     .execute_adl(target_idx, clock.slot, price, excess)
                     .map_err(map_risk_error)?;
 
+                // Settle any realised PnL to capital after ADL close.
+                // Positive PnL must be moved to capital so the account is self-consistent.
+                let final_pnl = engine.accounts[target_idx as usize].pnl.get();
+                if final_pnl > 0 {
+                    let settle = final_pnl as u128;
+                    let old_cap = engine.accounts[target_idx as usize].capital.get();
+                    engine.accounts[target_idx as usize].capital =
+                        percolator::U128::new(old_cap.saturating_add(settle));
+                    engine.set_pnl(target_idx as usize, 0);
+                    engine.c_tot = engine.c_tot.saturating_add(settle);
+                }
+
+                // Emit AdlEvent — tag 0xAD1E_0001 for indexers.
+                // Fields: (tag, target_idx, price, closed_abs_lo, closed_abs_hi)
+                // closed_abs split into lo/hi u64 since sol_log_64 takes u64 args.
+                let closed_lo = closed_abs as u64;
+                let closed_hi = (closed_abs >> 64) as u64;
+                sol_log_64(0xAD1E_0001, target_idx as u64, price, closed_lo, closed_hi);
+
                 msg!(
-                    "ADL: idx={} closed={} excess={} pnl_pos_tot_after={}",
+                    "ADL: idx={} closed={} excess={} insurance=0 pnl_pos_tot_after={}",
                     target_idx,
                     closed_abs,
                     excess,
