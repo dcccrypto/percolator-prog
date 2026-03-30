@@ -8582,7 +8582,7 @@ mod shared_vault_kani {
 // 9. mod processor
 pub mod processor {
     use crate::{
-        accounts, collateral, trade_notional_e6_from_size,
+        accounts, collateral,
         constants::{
             DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS, DEFAULT_FUNDING_HORIZON_SLOTS,
             DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6, DEFAULT_FUNDING_K_BPS,
