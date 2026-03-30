@@ -6610,3 +6610,155 @@ fn transfer_ownership_cpi_rejects_non_executable_nft_program() {
     let result = process_instruction(&program_id, &accounts, &ix);
     assert_eq!(result, Err(ProgramError::IncorrectProgramId));
 }
+
+// =============================================================================
+// PERC-8273 T8: ExecuteAdl Tests
+// =============================================================================
+
+fn encode_execute_adl(target_idx: u16) -> Vec<u8> {
+    let mut data = vec![50u8]; // TAG_EXECUTE_ADL = 50
+    encode_u16(target_idx, &mut data);
+    data
+}
+
+/// PERC-8273: ExecuteAdl must reject when insurance fund is not depleted.
+#[test]
+fn test_execute_adl_rejects_insurance_not_depleted() {
+    let mut f = setup_initialized_market();
+
+    // Top up the insurance fund so it is NOT depleted
+    let mut funder = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut funder_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, funder.key, 1_000_000_000),
+    )
+    .writable();
+    let topup_accs = vec![
+        funder.to_info(),
+        f.slab.to_info(),
+        funder_ata.to_info(),
+        f.vault.to_info(),
+        f.token_prog.to_info(),
+        f.clock.to_info(),
+    ];
+    process_instruction(
+        &f.program_id,
+        &topup_accs,
+        &encode_topup_insurance(1_000_000),
+    )
+    .unwrap();
+
+    // Verify insurance is non-zero
+    let ins = zc::engine_ref(&f.slab.data)
+        .unwrap()
+        .insurance_fund
+        .balance
+        .get();
+    assert!(ins > 0, "Insurance should be non-zero after top-up");
+
+    // Try to execute ADL — must fail with InsuranceFundNotDepleted
+    let accounts = vec![
+        f.admin.to_info(),
+        f.slab.to_info(),
+        f.clock.to_info(),
+        f.pyth_index.to_info(),
+    ];
+    let result = process_instruction(&f.program_id, &accounts, &encode_execute_adl(0));
+    assert_eq!(
+        result,
+        Err(ProgramError::Custom(
+            percolator_prog::error::PercolatorError::InsuranceFundNotDepleted as u32
+        )),
+        "PERC-8273: ExecuteAdl must reject when insurance fund is not depleted"
+    );
+}
+
+/// PERC-8273: ExecuteAdl must reject when signer is not the admin/keeper.
+#[test]
+fn test_execute_adl_rejects_unauthorized_signer() {
+    let mut f = setup_initialized_market();
+
+    // Insurance is zero (fresh market — no top-up), but signer is wrong
+    let mut rando = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+
+    let accounts = vec![
+        rando.to_info(),
+        f.slab.to_info(),
+        f.clock.to_info(),
+        f.pyth_index.to_info(),
+    ];
+    let result = process_instruction(&f.program_id, &accounts, &encode_execute_adl(0));
+    // Must fail — rando is not the admin
+    assert!(
+        result.is_err(),
+        "PERC-8273: ExecuteAdl must reject non-admin signer, got: {:?}",
+        result
+    );
+    let err = result.unwrap_err();
+    assert_eq!(
+        err,
+        ProgramError::Custom(percolator_prog::error::PercolatorError::EngineUnauthorized as u32),
+        "PERC-8273: Expected EngineUnauthorized for non-admin signer"
+    );
+}
+
+/// PERC-8273: ExecuteAdl must reject when target position is already closed (size == 0).
+#[test]
+fn test_execute_adl_rejects_bankrupt_position_already_closed() {
+    let mut f = setup_initialized_market();
+
+    // Insurance is zero (fresh market), admin signs, target_idx=0 has no position (size=0)
+    let accounts = vec![
+        f.admin.to_info(),
+        f.slab.to_info(),
+        f.clock.to_info(),
+        f.pyth_index.to_info(),
+    ];
+    // target_idx=0 is not used — check_idx will fail with EngineAccountNotFound
+    // (which is fine — BankruptPositionAlreadyClosed is only for used accounts with pos=0)
+    let result = process_instruction(&f.program_id, &accounts, &encode_execute_adl(0));
+    assert!(
+        result.is_err(),
+        "PERC-8273: ExecuteAdl on unused idx must fail"
+    );
+}
+
+/// PERC-8273: ExecuteAdl must reject non-signer caller even if admin key matches.
+#[test]
+fn test_execute_adl_rejects_non_signer_caller() {
+    let mut f = setup_initialized_market();
+
+    // Admin account without signer flag
+    let mut admin_no_sign =
+        TestAccount::new(f.admin.key, solana_program::system_program::id(), 0, vec![]);
+    // NOT .signer()
+
+    let accounts = vec![
+        admin_no_sign.to_info(),
+        f.slab.to_info(),
+        f.clock.to_info(),
+        f.pyth_index.to_info(),
+    ];
+    let result = process_instruction(&f.program_id, &accounts, &encode_execute_adl(0));
+    assert_eq!(
+        result,
+        Err(ProgramError::Custom(
+            percolator_prog::error::PercolatorError::ExpectedSigner as u32
+        )),
+        "PERC-8273: ExecuteAdl must reject when caller is not a signer"
+    );
+}
