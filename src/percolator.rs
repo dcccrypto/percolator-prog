@@ -438,6 +438,16 @@ pub fn restore_margins(engine: &mut percolator::RiskEngine, orig: (u64, u64)) {
     engine.params.maintenance_margin_bps = orig.1;
 }
 
+#[inline]
+fn trade_notional_e6_from_size(size: i128, price_e6: u64) -> u64 {
+    let notional = size
+        .unsigned_abs()
+        .saturating_mul(price_e6 as u128)
+        .checked_div(1_000_000)
+        .unwrap_or(0);
+    core::cmp::min(notional, u64::MAX as u128) as u64
+}
+
 /// Maximum age (in slots) for a CMOR attestation to be considered fresh.
 /// ~2 minutes at 400ms slots = 300 slots.
 pub const CMOR_MAX_AGE_SLOTS: u64 = 300;
@@ -10847,10 +10857,7 @@ pub mod processor {
                 // PERC-622: Accumulate trade volume for oracle phase transitions.
                 // trade_notional_e6 = |size| * price / 1e6 (approximate notional)
                 {
-                    let trade_notional_e6 = (size.unsigned_abs() as u64)
-                        .saturating_mul(price)
-                        .checked_div(1_000_000)
-                        .unwrap_or(0);
+                    let trade_notional_e6 = trade_notional_e6_from_size(size, price);
                     let mut vol_config = state::read_config(&data);
                     state::accumulate_volume(&mut vol_config, trade_notional_e6);
                     state::write_config(&mut data, &vol_config);
@@ -11218,10 +11225,7 @@ pub mod processor {
 
                     // PERC-622: Accumulate trade volume for oracle phase transitions.
                     {
-                        let trade_notional_e6 = (trade_size.unsigned_abs() as u64)
-                            .saturating_mul(price)
-                            .checked_div(1_000_000)
-                            .unwrap_or(0);
+                        let trade_notional_e6 = trade_notional_e6_from_size(trade_size, price);
                         let mut vol_config = state::read_config(&data);
                         state::accumulate_volume(&mut vol_config, trade_notional_e6);
                         state::write_config(&mut data, &vol_config);
