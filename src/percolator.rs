@@ -16530,8 +16530,8 @@ pub mod processor {
                 accounts::expect_writable(a_src_ata)?;
                 accounts::expect_writable(a_dst_ata)?;
 
-                // Verify slab
-                let mut slab_data = state::slab_data_mut(a_slab)?;
+                // Verify slab (read-only — we drop this borrow before the CPI below)
+                let slab_data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &slab_data)?;
                 require_initialized(&slab_data)?;
 
@@ -16572,7 +16572,18 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                // Transfer NFT
+                // GH#1870 (PERC-8223): Drop slab borrow BEFORE the Token-2022 CPI.
+                // Token-2022 will invoke our TransferHook (tag 69 / TransferOwnershipCpi)
+                // which also borrows the slab mutably to update the owner field.
+                // Holding a live mutable borrow across that CPI causes AccountBorrowFailed.
+                //
+                // The owner update is handled exclusively by the TransferOwnershipCpi CPI
+                // handler (tag 69) called from the TransferHook. We must NOT write owner
+                // here again after the CPI — that would be a silent double-write that also
+                // re-borrows after the hook already committed the change.
+                drop(slab_data);
+
+                // Transfer NFT — triggers TransferHook → tag 69 → writes new owner to slab.
                 crate::position_nft::transfer_nft(
                     a_token22,
                     a_nft_mint,
@@ -16581,13 +16592,8 @@ pub mod processor {
                     a_current_owner,
                 )?;
 
-                // Update owner in slab engine
-                {
-                    let engine = zc::engine_mut(&mut slab_data)?;
-                    engine.accounts[user_idx as usize].owner = a_new_owner.key.to_bytes();
-                }
-
-                // Update PositionNft state
+                // Update PositionNft PDA state (owner field only).
+                // slab owner was already updated by the TransferHook CPI above.
                 nft_state.owner = a_new_owner.key.to_bytes();
                 {
                     let mut nft_data = a_nft_pda
@@ -16838,6 +16844,23 @@ pub mod processor {
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
+
+                // GH#1871 (PERC-8224): Reject cap_e6 values that would silently store as 0.
+                // set_max_wallet_pos_e6 divides by 1_000 before storing — any cap_e6 in the
+                // range [1..999] truncates to 0, indistinguishable from "disabled" (cap_e6==0).
+                // Callers who intend to disable must pass exactly 0; any non-zero cap must be
+                // at least 1_000 (≥ $0.000001) so the stored value is ≥ 1.
+                const MIN_WALLET_CAP_E6: u64 = 1_000;
+                if cap_e6 != 0 && cap_e6 < MIN_WALLET_CAP_E6 {
+                    msg!(
+                        "PERC-8224: SetWalletCap rejected: cap_e6={} is below minimum floor {} \
+                         (use 0 to disable, or >= {} to set a real cap)",
+                        cap_e6,
+                        MIN_WALLET_CAP_E6,
+                        MIN_WALLET_CAP_E6,
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
