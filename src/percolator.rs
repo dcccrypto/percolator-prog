@@ -16010,13 +16010,16 @@ pub mod processor {
             }
 
             // PERC-628: AdvanceEpoch — permissionless crank to advance the epoch.
+            //
+            // PERC-8249: No signer required — this is a permissionless crank.
+            // Any caller can advance the epoch once is_epoch_elapsed() returns true.
+            // The epoch-elapsed check is the sole guard against premature execution.
             Instruction::AdvanceEpoch => {
-                // accounts: [0] caller (signer), [1] shared_vault PDA (writable)
+                // accounts: [0] caller (fee payer, NOT required to be a signer),
+                //           [1] shared_vault PDA (writable)
                 accounts::expect_len(accounts, 2)?;
-                let a_caller = &accounts[0];
                 let a_shared_vault = &accounts[1];
 
-                accounts::expect_signer(a_caller)?;
                 accounts::expect_writable(a_shared_vault)?;
 
                 let (expected_sv, _) = Pubkey::find_program_address(
