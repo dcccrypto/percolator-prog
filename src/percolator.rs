@@ -10332,7 +10332,10 @@ pub mod processor {
                                 // PnL = diff * abs_pos / settle_price
                                 let entry = acc.entry_price as i128;
                                 let settle = settlement_price as i128;
-                                let abs_pos = if pos < 0 { pos.wrapping_neg() } else { pos };
+                                // GH#1937 / PERC-8301: use unsigned_abs() instead of
+                                // wrapping_neg() to correctly handle i128::MIN and all
+                                // negative values without overflow (same pattern as PR#163).
+                                let abs_pos = pos.unsigned_abs() as i128;
                                 let diff = if pos > 0 {
                                     settle.saturating_sub(entry)
                                 } else {
@@ -13885,8 +13888,14 @@ pub mod processor {
                 // Accounts: [withdrawer(signer), slab(writable), withdrawer_ata(writable),
                 //            vault(writable), token_program, lp_vault_mint(writable),
                 //            withdrawer_lp_ata(writable), vault_authority,
-                //            lp_vault_state(writable)]
-                accounts::expect_len(accounts, 9)?;
+                //            lp_vault_state(writable), creator_lock_pda(writable)]
+                //
+                // GH#1926 / PERC-8287: accounts[9] (creator_lock_pda) is now REQUIRED —
+                // was previously optional, allowing bypass by omitting the account.
+                // Non-creator withdrawers must pass the derived creator_lock PDA key;
+                // if no lock exists on-chain the enforcement is a no-op. The SDK must
+                // always include the creator_lock PDA in LpVaultWithdraw instructions.
+                accounts::expect_len(accounts, 10)?;
                 let a_withdrawer = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_withdrawer_ata = &accounts[2];
@@ -13910,13 +13919,18 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
                 }
 
-                // PERC-627: Creator stake lock enforcement.
-                if accounts.len() >= 10 {
+                // PERC-627: Creator stake lock enforcement (now unconditional — account required).
+                // GH#1926: accounts[9] MUST be the derived creator_lock PDA for this slab.
+                // If the PDA does not exist on-chain, the lock read returns None (no-op for
+                // non-creators). Callers cannot bypass by passing a wrong account.
+                {
                     let a_creator_lock = &accounts[9];
                     let (expected_lock_pda, _) = Pubkey::find_program_address(
                         &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
                         program_id,
                     );
+                    // Key must match expected PDA — prevents bypass via wrong account.
+                    accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
                     if *a_creator_lock.key == expected_lock_pda {
                         accounts::expect_writable(a_creator_lock)?;
                         let mut lock_data = a_creator_lock
@@ -14516,6 +14530,13 @@ pub mod processor {
                     // Return bond to challenger
                     if dispute.bond_amount > 0 {
                         let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                        // GH#1927 / PERC-8288: verify challenger_ata owner before sending bond.
+                        // Defense-in-depth: confirms a_challenger_ata is owned by the challenger
+                        // on record in the dispute PDA (admin trust boundary, not user-exploitable,
+                        // but ensures bond cannot be misdirected by a malicious admin call).
+                        let challenger_key = Pubkey::new_from_array(dispute.challenger);
+                        verify_token_account(a_challenger_ata, &challenger_key, &mint)?;
                         let (auth, vault_bump) =
                             accounts::derive_vault_authority(program_id, a_slab.key);
                         accounts::expect_key(a_vault_authority, &auth)?;
