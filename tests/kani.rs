@@ -7123,15 +7123,13 @@ fn kani_c10c_transfer_tag_separation_prevents_double_borrow() {
 
     // CPI target tag must be 69.
     assert_eq!(
-        TAG_TRANSFER_OWNERSHIP_CPI,
-        69u8,
+        TAG_TRANSFER_OWNERSHIP_CPI, 69u8,
         "C10-C: CPI hook tag must be 69 (TransferOwnershipCpi)"
     );
 
     // User-facing tag must be 65.
     assert_eq!(
-        TAG_TRANSFER_POSITION_OWNERSHIP,
-        65u8,
+        TAG_TRANSFER_POSITION_OWNERSHIP, 65u8,
         "C10-C: user instruction tag must be 65 (TransferPositionOwnership)"
     );
 
@@ -7139,8 +7137,7 @@ fn kani_c10c_transfer_tag_separation_prevents_double_borrow() {
     // would invoke the 8-account user instruction instead of the 3-account
     // CPI path, causing MissingRequiredSignature / AccountBorrowFailed.
     assert_ne!(
-        TAG_TRANSFER_OWNERSHIP_CPI,
-        TAG_TRANSFER_POSITION_OWNERSHIP,
+        TAG_TRANSFER_OWNERSHIP_CPI, TAG_TRANSFER_POSITION_OWNERSHIP,
         "C10-C: hook tag (69) must differ from user instruction tag (65) to prevent double-borrow"
     );
 }
@@ -7164,6 +7161,9 @@ fn kani_c10c2_only_tag_69_is_valid_cpi_hook() {
 
     if tag == 65u8 {
         // Tag 65 must NOT route to the CPI handler — it's the user instruction.
-        assert!(!routes_to_cpi_handler, "C10-C2: tag 65 must not route to CPI handler");
+        assert!(
+            !routes_to_cpi_handler,
+            "C10-C2: tag 65 must not route to CPI handler"
+        );
     }
 }
