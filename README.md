@@ -254,9 +254,45 @@ At minimum, monitor:
   - rotate admin again
 - burning admin (setting to all zeros) is irreversible and disables admin ops forever
 
+### Shared Vault initialisation (one-time, first-caller-wins)
+
+> **⚠️ Do this immediately after program deployment** — see [Deployment flow](#deployment-flow) for the full warning.
+
+`InitSharedVault` has no admin key check. The first signer to call it sets the vault's
+`epoch_duration_slots` and `max_market_exposure_bps`. After deployment:
+
+1. Call `InitSharedVault` atomically with program deploy (same transaction or same block).
+2. Verify the PDA was written with the expected parameters before enabling LP deposits.
+3. Never leave the shared vault PDA uninitialised on a live network.
+
 ---
 
 ## Deployment flow
+
+> ### ⚠️ SECURITY: InitSharedVault is first-caller-wins
+>
+> `InitSharedVault` has **no admin key validation**. The instruction only checks that the
+> shared vault PDA is uninitialised. Any signer who submits `InitSharedVault` first will
+> become the de-facto initialiser and set `epoch_duration_slots` and
+> `max_market_exposure_bps`.
+>
+> **Operational requirement:** `InitSharedVault` MUST be called by the authorised deployer
+> **in the same transaction** as (or immediately after) program deployment. Do NOT leave
+> the shared vault uninitialised after deploying.
+>
+> **Threat:** If deployment and initialisation are in separate transactions, a front-runner
+> can slip in a `InitSharedVault` with adversarial parameters before the deployer's
+> transaction lands. On devnet or mainnet this is a realistic race condition.
+>
+> **Mitigation checklist:**
+> - Include `InitSharedVault` in the deploy script so it fires atomically with program
+>   deployment (or as the very next instruction in the same bundle).
+> - Immediately after deployment, verify: `solana account <SHARED_VAULT_PDA>` shows the
+>   expected magic (`0x53565354`) and correct `epoch_duration_slots`.
+> - If the vault is already initialised with unexpected parameters, upgrade the program
+>   and redeploy — the PDA is owned by the program so only a program upgrade can reset it.
+>
+> See GH#1915 for the original audit finding.
 
 ### Step 0: Create accounts off-chain
 Create:
