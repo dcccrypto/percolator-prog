@@ -11301,9 +11301,7 @@ pub mod processor {
                     let equity = (acc.capital.get() as i128)
                         .saturating_add(acc.pnl.get())
                         .saturating_add(mark);
-                    let notional = (if pos < 0 { -pos } else { pos } as u128)
-                        .saturating_mul(price as u128)
-                        / 1_000_000;
+                    let notional = pos.unsigned_abs().saturating_mul(price as u128) / 1_000_000;
                     let maint_req = notional
                         .saturating_mul(engine.params.maintenance_margin_bps as u128)
                         / 10_000;
