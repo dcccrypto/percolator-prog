@@ -702,7 +702,8 @@ fn test_withdraw_rejects_wrong_vault_authority_pda() {
     }
 
     let wrong_auth = Pubkey::new_unique();
-    let mut fake_vault_pda = TestAccount::new(wrong_auth, solana_program::system_program::id(), 0, vec![]);
+    let mut fake_vault_pda =
+        TestAccount::new(wrong_auth, solana_program::system_program::id(), 0, vec![]);
 
     let res = process_instruction(
         &f.program_id,
