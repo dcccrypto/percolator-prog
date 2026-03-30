@@ -2043,6 +2043,9 @@ pub mod error {
             RiskError::PositionSizeMismatch => PercolatorError::EnginePositionSizeMismatch,
             RiskError::AccountKindMismatch => PercolatorError::EngineAccountKindMismatch,
             RiskError::InvalidEntryPrice => PercolatorError::EngineInvalidEntryPrice,
+            // Added in PERC-8270: new variants from two-phase crank
+            RiskError::SideBlocked => PercolatorError::EngineOverflow,
+            RiskError::CorruptState => PercolatorError::EngineOverflow,
         };
         ProgramError::Custom(err as u32)
     }
@@ -2079,7 +2082,10 @@ pub mod ix {
         },
         KeeperCrank {
             caller_idx: u16,
-            allow_panic: u8,
+            /// Ordered candidate accounts for two-phase keeper (PERC-8270)
+            /// Each entry: (account_idx, optional liquidation policy)
+            /// Empty = backward-compatible fallback to cursor-based scan
+            candidates: alloc::vec::Vec<(u16, Option<percolator::LiquidationPolicy>)>,
         },
         TradeNoCpi {
             lp_idx: u16,
@@ -2639,12 +2645,47 @@ pub mod ix {
                     Ok(Instruction::WithdrawCollateral { user_idx, amount })
                 }
                 TAG_KEEPER_CRANK => {
-                    // KeeperCrank
+                    // KeeperCrank — two-phase: candidates computed off-chain (PERC-8270)
                     let caller_idx = read_u16(&mut rest)?;
-                    let allow_panic = read_u8(&mut rest)?;
+                    // format_version byte:
+                    //   0 = legacy (bare u16 indices, all FullClose, backward-compat)
+                    //   1 = extended (u16 idx + u8 policy_tag per candidate)
+                    //     policy tag 0 = FullClose, 1 = ExactPartial(u128), 0xFF = touch-only
+                    //   Missing = empty candidates (new callers omit)
+                    let mut candidates = alloc::vec::Vec::new();
+                    if rest.len() >= 1 {
+                        let format_version = read_u8(&mut rest)?;
+                        if format_version == 0 {
+                            while rest.len() >= 2 {
+                                candidates.push((
+                                    read_u16(&mut rest)?,
+                                    Some(percolator::LiquidationPolicy::FullClose),
+                                ));
+                            }
+                        } else if format_version == 1 {
+                            while rest.len() >= 3 {
+                                let idx = read_u16(&mut rest)?;
+                                let tag = read_u8(&mut rest)?;
+                                let policy = match tag {
+                                    0 => Some(percolator::LiquidationPolicy::FullClose),
+                                    1 => {
+                                        if rest.len() < 16 {
+                                            return Err(ProgramError::InvalidInstructionData);
+                                        }
+                                        let q = read_u128(&mut rest)?;
+                                        Some(percolator::LiquidationPolicy::ExactPartial(q))
+                                    }
+                                    0xFF => None,
+                                    _ => return Err(ProgramError::InvalidInstructionData),
+                                };
+                                candidates.push((idx, policy));
+                            }
+                        }
+                        // else: unknown format_version, treat as empty candidates
+                    }
                     Ok(Instruction::KeeperCrank {
                         caller_idx,
-                        allow_panic,
+                        candidates,
                     })
                 }
                 TAG_TRADE_NO_CPI => {
@@ -5925,9 +5966,9 @@ pub mod collateral {
 pub mod insurance_lp {
     #[allow(unused_imports)]
     use alloc::format;
-    use solana_program::{
-        account_info::AccountInfo, program_error::ProgramError, system_instruction,
-    };
+    #[cfg(not(feature = "test"))]
+    use solana_program::system_instruction;
+    use solana_program::{account_info::AccountInfo, program_error::ProgramError};
 
     #[cfg(not(feature = "test"))]
     use solana_program::program::{invoke, invoke_signed};
@@ -10220,7 +10261,7 @@ pub mod processor {
             }
             Instruction::KeeperCrank {
                 caller_idx,
-                allow_panic,
+                candidates,
             } => {
                 use crate::constants::CRANK_NO_CALLER;
 
@@ -10315,18 +10356,12 @@ pub mod processor {
                 }
 
                 let mut config = state::read_config(&data);
-                let header = state::read_header(&data);
+                let _header = state::read_header(&data);
                 // Read last threshold update slot BEFORE mutable engine borrow
                 let last_thr_slot = state::read_last_thr_update_slot(&data);
 
-                // SECURITY (C4): allow_panic triggers global settlement - admin only
-                // This prevents griefing attacks where anyone triggers panic at worst moment
-                if allow_panic != 0 {
-                    accounts::expect_signer(a_caller)?;
-                    if !crate::verify::admin_ok(header.admin, a_caller.key.to_bytes()) {
-                        return Err(PercolatorError::EngineUnauthorized.into());
-                    }
-                }
+                // Note: allow_panic removed in PERC-8270 two-phase keeper refactor.
+                // Admin-only panic settle is handled via a dedicated AdminForceClose instruction.
 
                 // Read dust before borrowing engine (for dust sweep later)
                 let dust_before = state::read_dust_base(&data);
@@ -10467,7 +10502,7 @@ pub mod processor {
                 }
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
-                let effective_caller_idx = if permissionless {
+                let _effective_caller_idx = if permissionless {
                     CRANK_NO_CALLER
                 } else {
                     caller_idx
@@ -10568,11 +10603,11 @@ pub mod processor {
                 }
                 let _outcome = engine
                     .keeper_crank(
-                        effective_caller_idx,
                         clock.slot,
                         price,
+                        &candidates,
+                        percolator::LIQ_BUDGET_PER_CRANK,
                         effective_funding_rate,
-                        allow_panic != 0,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]

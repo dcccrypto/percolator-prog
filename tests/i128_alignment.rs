@@ -259,6 +259,10 @@ fn test_account_struct_alignment() {
         fee_credits: I128::new(-999),
         last_fee_slot: 888888,
         last_partial_liquidation_slot: 0,
+        position_basis_q: 0i128,
+        adl_a_basis: 1_000_000u128,
+        adl_k_snap: 0i128,
+        adl_epoch_snap: 0,
     };
 
     // Verify all fields round-trip correctly
