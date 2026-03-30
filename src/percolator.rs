@@ -15295,6 +15295,19 @@ pub mod processor {
                     return Err(ProgramError::IllegalOwner);
                 }
 
+                // Hardening: nft program account must be an executable loader-owned program.
+                // Rejecting non-program accounts prevents spoofing the PDA namespace with
+                // arbitrary keys that cannot represent a real on-chain program.
+                if !a_nft_prog.executable {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+                if *a_nft_prog.owner != solana_program::bpf_loader_upgradeable::id()
+                    && *a_nft_prog.owner != solana_program::bpf_loader::id()
+                    && *a_nft_prog.owner != solana_program::bpf_loader_deprecated::id()
+                {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
                 // Verify a_caller is the canonical mint_authority PDA derived from the NFT program.
                 // The NFT program derives: find_program_address(&[b"mint_authority"], nft_program_id)
                 let (expected_mint_auth, _) = solana_program::pubkey::Pubkey::find_program_address(
