@@ -1,5 +1,18 @@
 # Percolator-prog Formal Verification Audit
 
+## Internal Audit Addendum (2026-03-30)
+
+Scope: full repository pass focused on authz/CPI identity, decode strictness, arithmetic safety, and permissionless DoS bounds.
+
+Key outcomes:
+- Hardened `TransferOwnershipCpi` to require the NFT program account to be an executable loader-owned program before PDA validation.
+- Fixed trade-volume accumulation to avoid `i128 -> u64` truncation before notional multiplication by introducing saturating `u128` math with `u64` clamp.
+- Added regression coverage for the ownership-CPI hardening (`tests/unit.rs`: `transfer_ownership_cpi_rejects_non_executable_nft_program`).
+
+Notes from the wider pass:
+- Permissionless loops are bounded (`KeeperCrank` resolved path batch cap, `AuditCrank` over `MAX_ACCOUNTS`, oracle source cap in median path).
+- No additional high-confidence, merge-safe runtime bugs were identified in this pass beyond the changes above.
+
 ## Kani Proofs Summary
 
 **Date:** 2026-02-06

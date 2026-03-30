@@ -6203,6 +6203,14 @@ fn encode_set_wallet_cap(cap_e6: u64) -> Vec<u8> {
     data
 }
 
+/// Encode TransferOwnershipCpi instruction (tag=69).
+fn encode_transfer_ownership_cpi(user_idx: u16, new_owner: Pubkey) -> Vec<u8> {
+    let mut data = vec![69u8]; // TAG_TRANSFER_OWNERSHIP_CPI
+    encode_u16(user_idx, &mut data);
+    encode_pubkey(&new_owner, &mut data);
+    data
+}
+
 /// PERC-8111: SetWalletCap stores and round-trips correctly via state helpers.
 #[test]
 fn test_set_wallet_cap_roundtrip_state() {
@@ -6546,4 +6554,23 @@ fn test_wallet_cap_allows_trade_within_limit() {
         "PERC-8111: Trade within wallet cap must succeed: {:?}",
         result
     );
+}
+
+#[test]
+fn transfer_ownership_cpi_rejects_non_executable_nft_program() {
+    let program_id = Pubkey::new_unique();
+    let mut caller = TestAccount::new(
+        Pubkey::new_unique(),
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut slab = TestAccount::new(program_id, program_id, 0, vec![]).writable();
+    let mut not_program = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, vec![]);
+
+    let accounts = vec![caller.to_info(), slab.to_info(), not_program.to_info()];
+    let ix = encode_transfer_ownership_cpi(0, Pubkey::new_unique());
+    let result = process_instruction(&program_id, &accounts, &ix);
+    assert_eq!(result, Err(ProgramError::IncorrectProgramId));
 }
