@@ -1986,38 +1986,71 @@ pub mod error {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum PercolatorError {
+        /// Slab header magic bytes do not match expected "PERCOLAT" constant.
         InvalidMagic,
+        /// Slab header version field is not a supported program version.
         InvalidVersion,
+        /// InitMarket called on a slab that is already fully initialised.
         AlreadyInitialized,
+        /// Instruction requires an initialised slab but magic check failed.
         NotInitialized,
+        /// Slab data length does not match any accepted tier (use CloseStaleSlabs for wrong-size slabs).
         InvalidSlabLen,
+        /// Provided oracle key does not match the oracle stored in MarketConfig.
         InvalidOracleKey,
+        /// Oracle price is older than max_staleness_secs — price is stale.
         OracleStale,
+        /// Oracle confidence interval exceeds conf_filter_bps — price is too uncertain.
         OracleConfTooWide,
+        /// Provided vault ATA does not match the vault recorded in MarketConfig.
         InvalidVaultAta,
+        /// Token mint does not match the collateral_mint stored in MarketConfig.
         InvalidMint,
+        /// Instruction requires a transaction signer but the provided account is not signed.
         ExpectedSigner,
+        /// Instruction requires a writable account but the provided account is read-only.
         ExpectedWritable,
+        /// Oracle account failed program-ownership or feed-ID verification.
         OracleInvalid,
+        /// Engine: user's capital balance is insufficient for the requested operation.
         EngineInsufficientBalance,
+        /// Engine: position would be undercollateralised after this trade — rejected.
         EngineUndercollateralized,
+        /// Engine: caller is not the authorised owner of this account slot.
         EngineUnauthorized,
+        /// Engine: the provided matching engine program/context does not match the LP binding.
         EngineInvalidMatchingEngine,
+        /// Engine: PnL warmup period not yet elapsed — position cannot be closed profitably yet.
         EnginePnlNotWarmedUp,
+        /// Engine: arithmetic overflow in risk calculation.
         EngineOverflow,
+        /// Engine: the requested account index is out of range or not allocated.
         EngineAccountNotFound,
+        /// Engine: operation requires an LP account but a user account was provided.
         EngineNotAnLPAccount,
+        /// Engine: position size in instruction does not match the account's stored size.
         EnginePositionSizeMismatch,
+        /// Engine: market is in risk-reduction-only mode — new positions not permitted.
         EngineRiskReductionOnlyMode,
+        /// Engine: account kind mismatch (e.g. LP account passed where user account expected).
         EngineAccountKindMismatch,
+        /// Provided token account is not owned by the expected wallet or has wrong mint.
         InvalidTokenAccount,
+        /// Provided program account is not the SPL token program or token-2022 program.
         InvalidTokenProgram,
+        /// One or more UpdateConfig / UpdateRiskParams fields are out of the allowed range.
         InvalidConfigParam,
+        /// TradeNoCpi called on a Hyperp-mode market that requires CPI routing.
         HyperpTradeNoCpiDisabled,
+        /// CreateInsuranceMint called but the insurance LP mint already exists for this market.
         InsuranceMintAlreadyExists,
+        /// Insurance LP operation requires mint to exist — call CreateInsuranceMint first.
         InsuranceMintNotCreated,
+        /// WithdrawInsuranceLP would reduce the insurance balance below risk_reduction_threshold.
         InsuranceBelowThreshold,
+        /// Insurance deposit or withdrawal amount is zero.
         InsuranceZeroAmount,
+        /// Insurance LP supply vs capital invariant is violated (supply > 0 but capital == 0).
         InsuranceSupplyMismatch,
         /// Market is paused — trading, deposits, and withdrawals are disabled
         MarketPaused,
@@ -2134,22 +2167,56 @@ pub mod ix {
         /// Fields removed to shrink the enum (RiskParams ~300 B was the largest variant,
         /// bloating every other variant's stack allocation and causing SBF stack overflow).
         InitMarket,
-        InitUser {
-            fee_payment: u64,
-        },
+        /// Tag 1: Initialise a new user position slot. Transfers `fee_payment` base tokens to vault.
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] user wallet
+        ///   1. [writable]         slab
+        ///   2. [writable]         user token ATA (source)
+        ///   3. [writable]         vault token ATA (destination)
+        ///   4. []                 token program
+        InitUser { fee_payment: u64 },
+        /// Tag 2: Initialise a new LP (market-maker) position slot with matcher program binding.
+        /// Transfers `fee_payment` base tokens to vault.
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] LP wallet
+        ///   1. [writable]         slab
+        ///   2. [writable]         LP token ATA (source)
+        ///   3. [writable]         vault token ATA (destination)
+        ///   4. []                 token program
         InitLP {
             matcher_program: Pubkey,
             matcher_context: Pubkey,
             fee_payment: u64,
         },
-        DepositCollateral {
-            user_idx: u16,
-            amount: u64,
-        },
-        WithdrawCollateral {
-            user_idx: u16,
-            amount: u64,
-        },
+        /// Tag 3: Deposit additional collateral into an existing position.
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] user wallet
+        ///   1. [writable]         slab
+        ///   2. [writable]         user token ATA (source)
+        ///   3. [writable]         vault token ATA (destination)
+        ///   4. []                 token program
+        DepositCollateral { user_idx: u16, amount: u64 },
+        /// Tag 4: Withdraw free collateral from a position (subject to margin constraints).
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] user wallet
+        ///   1. [writable]         slab
+        ///   2. [writable]         user token ATA (destination)
+        ///   3. [writable]         vault token ATA (source)
+        ///   4. []                 vault authority PDA
+        ///   5. []                 token program
+        WithdrawCollateral { user_idx: u16, amount: u64 },
+        /// Tag 5: Keeper crank — settle funding, run liquidations, and advance epoch state.
+        ///
+        /// Permissioned: caller_idx must map to a registered keeper account on this slab.
+        /// Two-phase keeper (PERC-8270): pass `candidates` for targeted processing; empty list
+        /// falls back to legacy cursor-based scan.
+        ///
+        /// Accounts: `[0]` caller(signer) · `[1]` slab(writable) · `[2]` oracle ·
+        /// `[3]` clock · `[4+]` optional backup oracle / candidate accounts
         KeeperCrank {
             caller_idx: u16,
             /// Ordered candidate accounts for two-phase keeper (PERC-8270)
@@ -2157,31 +2224,75 @@ pub mod ix {
             /// Empty = backward-compatible fallback to cursor-based scan
             candidates: alloc::vec::Vec<(u16, Option<percolator::LiquidationPolicy>)>,
         },
+        /// Tag 6: Execute a trade directly against the LP without CPI (no matcher required).
+        /// Only valid when the market has no CPI-based matching engine (Hyperp / admin-oracle mode).
+        ///
+        /// Accounts:
+        ///   0. [signer]   user wallet
+        ///   1. [writable] slab
+        ///   2. []         oracle account
+        ///   3. []         clock sysvar
         TradeNoCpi {
             lp_idx: u16,
             user_idx: u16,
             size: i128,
         },
-        LiquidateAtOracle {
-            target_idx: u16,
-        },
-        CloseAccount {
-            user_idx: u16,
-        },
-        TopUpInsurance {
-            amount: u64,
-        },
+        /// Tag 7: Liquidate an undercollateralised position at the current oracle price.
+        /// Permissionless — anyone can call. Liquidation proceeds go to the insurance fund.
+        ///
+        /// Accounts:
+        ///   0. [signer]   liquidator wallet (receives liquidation reward)
+        ///   1. [writable] slab
+        ///   2. []         oracle account
+        ///   3. []         clock sysvar
+        LiquidateAtOracle { target_idx: u16 },
+        /// Tag 8: Close a user position and return collateral to the user's token account.
+        /// Requires position size == 0 and no pending settlement.
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] user wallet
+        ///   1. [writable]         slab
+        ///   2. [writable]         user token ATA (destination)
+        ///   3. [writable]         vault token ATA (source)
+        ///   4. []                 vault authority PDA
+        ///   5. []                 token program
+        CloseAccount { user_idx: u16 },
+        /// Tag 9: Top up the global insurance fund by transferring base tokens from admin wallet.
+        /// Admin only.
+        ///
+        /// Accounts:
+        ///   0. [signer, writable] admin wallet
+        ///   1. [writable]         slab
+        ///   2. [writable]         admin token ATA (source)
+        ///   3. [writable]         vault token ATA (destination)
+        ///   4. []                 token program
+        TopUpInsurance { amount: u64 },
+        /// Tag 10: Execute a trade via CPI from a registered matching engine.
+        /// The calling matcher program is verified via PDA derivation.
+        ///
+        /// Accounts:
+        ///   0. [signer]   matcher program PDA (caller authority)
+        ///   1. [writable] slab
+        ///   2. []         oracle account
+        ///   3. []         clock sysvar
         TradeCpi {
             lp_idx: u16,
             user_idx: u16,
             size: i128,
         },
-        SetRiskThreshold {
-            new_threshold: u128,
-        },
-        UpdateAdmin {
-            new_admin: Pubkey,
-        },
+        /// Tag 11: Update the insurance fund withdrawal threshold. Admin only.
+        ///
+        /// Accounts:
+        ///   0. [signer]   admin
+        ///   1. [writable] slab
+        SetRiskThreshold { new_threshold: u128 },
+        /// Tag 12: Propose a new admin key (two-step transfer — new admin must call AcceptAdmin).
+        /// Admin only.
+        ///
+        /// Accounts:
+        ///   0. [signer]   current admin
+        ///   1. [writable] slab
+        UpdateAdmin { new_admin: Pubkey },
         /// Close the market slab and recover SOL to admin.
         /// Requires: no active accounts, no vault funds, no insurance funds.
         CloseSlab,
@@ -2209,26 +2320,17 @@ pub mod ix {
             funding_k2_bps: u16,
         },
         /// Set maintenance fee per slot (admin only)
-        SetMaintenanceFee {
-            new_fee: u128,
-        },
+        SetMaintenanceFee { new_fee: u128 },
         /// Set the oracle price authority (admin only).
         /// Authority can push prices instead of requiring Pyth/Chainlink.
         /// Pass zero pubkey to disable and require Pyth/Chainlink.
-        SetOracleAuthority {
-            new_authority: Pubkey,
-        },
+        SetOracleAuthority { new_authority: Pubkey },
         /// Push oracle price (oracle authority only).
         /// Stores the price for use by crank/trade operations.
-        PushOraclePrice {
-            price_e6: u64,
-            timestamp: i64,
-        },
+        PushOraclePrice { price_e6: u64, timestamp: i64 },
         /// Set oracle price circuit breaker cap (admin only).
         /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
-        SetOraclePriceCap {
-            max_change_e2bps: u64,
-        },
+        SetOraclePriceCap { max_change_e2bps: u64 },
         /// Resolve market: force-close all positions at admin oracle price, enter withdraw-only mode.
         /// Admin only. Uses authority_price_e6 as settlement price.
         ResolveMarket,
@@ -2236,9 +2338,7 @@ pub mod ix {
         WithdrawInsurance,
         /// Admin force-close: unconditionally close any position at oracle price.
         /// Skips margin checks. Admin only.
-        AdminForceClose {
-            target_idx: u16,
-        },
+        AdminForceClose { target_idx: u16 },
         /// Update initial and maintenance margin BPS. Admin only.
         UpdateRiskParams {
             initial_margin_bps: u64,
@@ -2274,22 +2374,16 @@ pub mod ix {
         },
         /// Renounce admin: set admin to all zeros (irreversible). Admin only.
         /// Renounce admin permanently. Requires market RESOLVED and confirmation code.
-        RenounceAdmin {
-            confirmation: u64,
-        },
+        RenounceAdmin { confirmation: u64 },
         /// Create the insurance LP SPL mint for this market. Admin only, once per market.
         /// Mint PDA: ["ins_lp", slab_pubkey]. Authority: vault PDA.
         CreateInsuranceMint,
         /// Deposit collateral into insurance fund, receive LP tokens proportional to share.
         /// Permissionless. LP tokens are freely transferable.
-        DepositInsuranceLP {
-            amount: u64,
-        },
+        DepositInsuranceLP { amount: u64 },
         /// Burn LP tokens and withdraw proportional share of insurance fund.
         /// Cannot withdraw below risk_reduction_threshold.
-        WithdrawInsuranceLP {
-            lp_amount: u64,
-        },
+        WithdrawInsuranceLP { lp_amount: u64 },
         /// Pause the market. Admin only. Blocks trade/deposit/withdraw/init_user.
         /// Crank, liquidation, admin actions, and unpause still allowed.
         PauseMarket,
@@ -2423,18 +2517,14 @@ pub mod ix {
         ///            vault(writable), token_program, lp_vault_mint(writable),
         ///            depositor_lp_ata(writable), vault_authority,
         ///            lp_vault_state(writable)]
-        LpVaultDeposit {
-            amount: u64,
-        },
+        LpVaultDeposit { amount: u64 },
         /// PERC-272: Burn LP shares and withdraw proportional SOL from LP vault.
         /// Cannot withdraw if it would bring vault capital below OI reservation.
         /// Accounts: [withdrawer(signer), slab(writable), withdrawer_ata(writable),
         ///            vault(writable), token_program, lp_vault_mint(writable),
         ///            withdrawer_lp_ata(writable), vault_authority,
         ///            lp_vault_state(writable)]
-        LpVaultWithdraw {
-            lp_amount: u64,
-        },
+        LpVaultWithdraw { lp_amount: u64 },
         /// PERC-272: Permissionless crank — distribute accrued fee revenue to LP vault.
         /// Reads fee_revenue delta since last snapshot, credits LP portion to vault capital.
         /// Accounts: [slab(writable), lp_vault_state(writable)]
@@ -2442,46 +2532,28 @@ pub mod ix {
 
         /// PERC-306: Fund per-market isolated insurance balance.
         /// Accounts: [admin(signer, writable), slab(writable), user_ata(writable), vault(writable), token_program]
-        FundMarketInsurance {
-            amount: u64,
-        },
+        FundMarketInsurance { amount: u64 },
 
         /// PERC-306: Set insurance isolation BPS for a market.
         /// Accounts: [admin(signer), slab(writable)]
-        SetInsuranceIsolation {
-            bps: u16,
-        },
+        SetInsuranceIsolation { bps: u16 },
         /// PERC-314: Challenge settlement price.
-        ChallengeSettlement {
-            proposed_price_e6: u64,
-        },
+        ChallengeSettlement { proposed_price_e6: u64 },
         /// PERC-314: Resolve dispute (admin).
-        ResolveDispute {
-            accept: u8,
-        },
+        ResolveDispute { accept: u8 },
         /// PERC-315: Deposit LP vault tokens as perp collateral.
-        DepositLpCollateral {
-            user_idx: u16,
-            lp_amount: u64,
-        },
+        DepositLpCollateral { user_idx: u16, lp_amount: u64 },
         /// PERC-315: Withdraw LP collateral (position must be closed).
-        WithdrawLpCollateral {
-            user_idx: u16,
-            lp_amount: u64,
-        },
+        WithdrawLpCollateral { user_idx: u16, lp_amount: u64 },
         /// PERC-309: Queue large LP withdrawal.
-        QueueWithdrawal {
-            lp_amount: u64,
-        },
+        QueueWithdrawal { lp_amount: u64 },
         /// PERC-309: Claim one epoch tranche.
         ClaimQueuedWithdrawal,
         /// PERC-309: Cancel queued withdrawal.
         CancelQueuedWithdrawal,
         /// PERC-305: Auto-deleverage — surgically close/reduce the most profitable
         /// position when pnl_pos_tot exceeds max_pnl_cap. Permissionless.
-        ExecuteAdl {
-            target_idx: u16,
-        },
+        ExecuteAdl { target_idx: u16 },
         /// Close a stale slab (wrong size from an old program layout) and recover rent SOL.
         ///
         /// Unlike CloseSlab (tag 13), this path skips `slab_guard` so that slabs with
@@ -2516,10 +2588,7 @@ pub mod ix {
         /// PERC-608: Transfer position ownership via CPI from percolator-nft TransferHook.
         /// Changes account[user_idx].owner to new_owner. Reads new_owner from instruction data.
         /// Caller must be the NFT program's mint authority PDA.
-        TransferOwnershipCpi {
-            user_idx: u16,
-            new_owner: [u8; 32],
-        },
+        TransferOwnershipCpi { user_idx: u16, new_owner: [u8; 32] },
         /// PERC-622: Advance oracle phase (permissionless crank).
         AdvanceOraclePhase,
 
@@ -2534,37 +2603,26 @@ pub mod ix {
         /// Creates/updates an OffsetPairConfig PDA at ["cmor_pair", slab_a, slab_b].
         ///
         /// Accounts: [admin(signer,payer), slab_a, slab_b, pair_pda(writable), system_program]
-        SetOffsetPair {
-            offset_bps: u16,
-        },
+        SetOffsetPair { offset_bps: u16 },
 
         /// Permissionless: attest user positions across two slabs for portfolio margin credit.
         /// Creates/updates a CrossMarginAttestation PDA at ["cmor", user, slab_a, slab_b].
         ///
         /// Accounts: [payer(signer), slab_a, slab_b, attestation_pda(writable),
         ///            pair_pda, system_program]
-        AttestCrossMargin {
-            user_idx_a: u16,
-            user_idx_b: u16,
-        },
+        AttestCrossMargin { user_idx_a: u16, user_idx_b: u16 },
         /// PERC-623: Anyone can top up a market's keeper fund by transferring
         /// lamports. The amount is read from instruction data (u64).
-        TopUpKeeperFund {
-            amount: u64,
-        },
+        TopUpKeeperFund { amount: u64 },
         /// PERC-628: Initialize the global shared vault.
         InitSharedVault {
             epoch_duration_slots: u64,
             max_market_exposure_bps: u16,
         },
         /// PERC-628: Allocate virtual liquidity to a market.
-        AllocateMarket {
-            amount: u128,
-        },
+        AllocateMarket { amount: u128 },
         /// PERC-628: Queue a withdrawal for the current epoch.
-        QueueWithdrawalSV {
-            lp_amount: u64,
-        },
+        QueueWithdrawalSV { lp_amount: u64 },
         /// PERC-628: Claim a queued withdrawal after epoch elapses.
         ClaimEpochWithdrawal,
         /// PERC-628: Advance the shared vault epoch (permissionless crank).
@@ -2584,9 +2642,7 @@ pub mod ix {
         ///   7. []                 token_2022_program
         ///   8. []                 system_program
         ///   9. []                 rent sysvar
-        MintPositionNft {
-            user_idx: u16,
-        },
+        MintPositionNft { user_idx: u16 },
 
         /// PERC-608: Transfer position ownership via the NFT (keeper-gated).
         ///
@@ -2603,9 +2659,7 @@ pub mod ix {
         ///   5. [writable]         new_owner_ata      (destination Token-2022 ATA)
         ///   6. []                 new_owner
         ///   7. []                 token_2022_program
-        TransferPositionOwnership {
-            user_idx: u16,
-        },
+        TransferPositionOwnership { user_idx: u16 },
 
         /// PERC-608: Burn the Position NFT when a position is closed.
         ///
@@ -2617,9 +2671,7 @@ pub mod ix {
         ///   4. [writable]         owner_ata          (Token-2022 ATA; balance burned)
         ///   5. []                 vault_authority PDA (mint close authority)
         ///   6. []                 token_2022_program
-        BurnPositionNft {
-            user_idx: u16,
-        },
+        BurnPositionNft { user_idx: u16 },
 
         /// PERC-608: Keeper sets pending_settlement=1 before a funding settlement transfer.
         ///
@@ -2627,9 +2679,7 @@ pub mod ix {
         ///   0. [signer] keeper (permissioned: must be a keeper)
         ///   1. [writable] slab
         ///   2. [writable] position_nft PDA
-        SetPendingSettlement {
-            user_idx: u16,
-        },
+        SetPendingSettlement { user_idx: u16 },
 
         /// PERC-608: Keeper clears pending_settlement=0 after running KeeperCrank.
         ///
@@ -2637,9 +2687,7 @@ pub mod ix {
         ///   0. [signer] keeper
         ///   1. [writable] slab
         ///   2. [writable] position_nft PDA
-        ClearPendingSettlement {
-            user_idx: u16,
-        },
+        ClearPendingSettlement { user_idx: u16 },
 
         /// PERC-8111: Set per-wallet position cap (admin only).
         ///
@@ -2653,9 +2701,7 @@ pub mod ix {
         /// Accounts:
         ///   0. [signer]   admin
         ///   1. [writable] slab
-        SetWalletCap {
-            cap_e6: u64,
-        },
+        SetWalletCap { cap_e6: u64 },
         /// PERC-8110: Set OI imbalance hard block threshold (admin only).
         /// When `|long_oi - short_oi| / total_oi * 10_000 >= threshold_bps`, any new
         /// trade that would *increase* imbalance is rejected with OiImbalanceHardBlock.
@@ -2667,9 +2713,7 @@ pub mod ix {
         /// Accounts:
         ///   0. [signer]   admin
         ///   1. [writable] slab
-        SetOiImbalanceHardBlock {
-            threshold_bps: u16,
-        },
+        SetOiImbalanceHardBlock { threshold_bps: u16 },
     }
 
     impl Instruction {

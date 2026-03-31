@@ -131,6 +131,13 @@ pub const TAG_ATTEST_CROSS_MARGIN: u8 = 55;
 /// Tag 56 reserved for PERC-622 AdvanceOraclePhase.
 pub const TAG_TOPUP_KEEPER_FUND: u8 = 57;
 /// PERC-629: Slash creation deposit.
+///
+/// ⚠️  UNIMPLEMENTED — reserved for post-launch.
+/// This tag is defined and tested (uniqueness + sequential) but has NO corresponding
+/// `Instruction` variant, decode arm, or dispatch handler. CPI calls with tag 58 will
+/// return `InvalidInstructionData`. The `creator_history` module implements `compute_slash`
+/// and its Kani proofs, but they are not yet wired to an on-chain instruction.
+/// See GH#1975 for resolution options before external audit.
 pub const TAG_SLASH_CREATION_DEPOSIT: u8 = 58;
 /// PERC-628: Initialize the global shared vault.
 pub const TAG_INIT_SHARED_VAULT: u8 = 59;
