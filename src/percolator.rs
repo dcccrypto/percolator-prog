@@ -16197,6 +16197,14 @@ pub mod processor {
             }
 
             // PERC-628: InitSharedVault — admin creates the global shared vault PDA.
+            //
+            // PERC-8292 / GH#1915: First-caller-wins singleton init (intentional by design).
+            // The signer is required but is NOT checked against a stored admin key because
+            // SharedVaultState has no admin field (adding one would be a breaking layout change).
+            // Security: the `AccountAlreadyInitialized` guard on `a_shared_vault.data_is_empty()`
+            // prevents double-init, so the race window only exists during deployment.
+            // Mitigation: submit InitSharedVault in the same transaction as program deployment,
+            // or use a multisig signer. See docs/PERC-628-shared-vault.md §Deployment Procedure.
             Instruction::InitSharedVault {
                 epoch_duration_slots,
                 max_market_exposure_bps,
