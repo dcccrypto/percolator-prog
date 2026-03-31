@@ -1575,7 +1575,7 @@ fn test_attack_tradecpi_wrong_lp_pda() {
 /// ATTACK: Provide a PDA that has lamports (non-system shape).
 /// Expected: PDA shape validation rejects accounts with lamports/data.
 #[test]
-fn test_attack_tradecpi_pda_with_lamports() {
+fn test_tradecpi_pda_with_lamports_and_data_still_works() {
     let mut env = TradeCpiTestEnv::new();
     env.init_market();
 
@@ -1588,27 +1588,20 @@ fn test_attack_tradecpi_pda_with_lamports() {
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
-    let user_pos_before = env.read_account_position(user_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
-    let user_cap_before = env.read_account_capital(user_idx);
-    let lp_cap_before = env.read_account_capital(lp_idx);
-    let spl_vault_before = env.vault_balance();
-    let engine_vault_before = env.read_vault();
 
-    // Derive the correct PDA but fund it with lamports to break shape check
+    // Derive the correct PDA and give it lamports + data.
+    // No shape checks are needed — PDA key match is sufficient.
+    // Only this program can sign for it via invoke_signed.
     let lp_bytes = lp_idx.to_le_bytes();
     let (lp_pda, _) =
         Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
 
-    // Give the PDA lamports AND non-zero data length.
-    // Lamports alone are harmless (dusting DoS prevention), but non-zero
-    // data_len still fails the shape check.
     env.svm
         .set_account(
             lp_pda,
             Account {
                 lamports: 1_000_000,
-                data: vec![0u8; 32], // data_len=32 fails data_len_zero check
+                data: vec![0u8; 32],
                 owner: solana_sdk::system_program::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -1626,39 +1619,11 @@ fn test_attack_tradecpi_pda_with_lamports() {
         &matcher_ctx,
     );
     assert!(
-        result.is_err(),
-        "ATTACK: PDA with lamports/data should be rejected"
+        result.is_ok(),
+        "PDA with lamports/data must not block TradeCpi (key match is sufficient): {:?}",
+        result,
     );
-    assert_eq!(
-        env.read_account_position(user_idx),
-        user_pos_before,
-        "Rejected malformed-PDA TradeCpi must preserve user position"
-    );
-    assert_eq!(
-        env.read_account_position(lp_idx),
-        lp_pos_before,
-        "Rejected malformed-PDA TradeCpi must preserve LP position"
-    );
-    assert_eq!(
-        env.read_account_capital(user_idx),
-        user_cap_before,
-        "Rejected malformed-PDA TradeCpi must preserve user capital"
-    );
-    assert_eq!(
-        env.read_account_capital(lp_idx),
-        lp_cap_before,
-        "Rejected malformed-PDA TradeCpi must preserve LP capital"
-    );
-    assert_eq!(
-        env.vault_balance(),
-        spl_vault_before,
-        "Rejected malformed-PDA TradeCpi must preserve SPL vault"
-    );
-    assert_eq!(
-        env.read_vault(),
-        engine_vault_before,
-        "Rejected malformed-PDA TradeCpi must preserve engine vault"
-    );
+    assert_ne!(env.read_account_position(user_idx), 0, "Trade should create position");
 }
 
 /// ATTACK: LP A's matcher tries to trade for LP B.

@@ -48,7 +48,6 @@ use percolator_prog::verify::{
     // New: Oracle inversion math
     invert_price_e6,
     len_ok,
-    lp_pda_shape_ok,
     matcher_identity_ok,
     matcher_shape_ok,
     nonce_on_failure,
@@ -71,7 +70,6 @@ use percolator_prog::verify::{
     // New: WithdrawInsurance vault accounting
     withdraw_insurance_vault,
     writable_ok,
-    LpPdaShape,
     MatcherAccountsShape,
     // ABI validation from real inputs
     MatcherReturnFields,
@@ -898,30 +896,10 @@ fn kani_len_ok_universal() {
 
 // =============================================================================
 // R. LP PDA SHAPE VALIDATION (4 proofs)
-// NOTE: LpPdaShape has 2 bools (4 combinations). Lamports not checked —
-// external dusting of the PDA is harmless but checking would create a DoS
-// vector (anyone could brick an LP's TradeCpi by funding its PDA).
+// LP PDA shape check removed — PDA key match is sufficient.
+// Only this program can sign for the PDA, so it's always system-owned
+// with zero data. The shape proof is no longer needed.
 // =============================================================================
-
-/// Universal: lp_pda_shape_ok is fully characterized as 2-way AND
-///
-/// CODE-EQUALS-SPEC: The body of `lp_pda_shape_ok` IS
-/// `is_system_owned && data_len_zero`. This proof asserts
-/// the function equals its own body for all symbolic inputs.
-#[kani::proof]
-fn kani_lp_pda_shape_universal() {
-    let shape = LpPdaShape {
-        is_system_owned: kani::any(),
-        data_len_zero: kani::any(),
-    };
-
-    let expected = shape.is_system_owned && shape.data_len_zero;
-    assert_eq!(
-        lp_pda_shape_ok(shape),
-        expected,
-        "lp_pda_shape_ok must equal (system_owned && data_zero)"
-    );
-}
 
 // =============================================================================
 // S. ORACLE FEED_ID AND SLAB SHAPE (4 proofs)

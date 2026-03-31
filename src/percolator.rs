@@ -222,21 +222,9 @@ pub mod verify {
         actual >= need
     }
 
-    /// LP PDA shape validation for TradeCpi.
-    /// PDA must be system-owned, have zero data, and zero lamports.
-    #[derive(Clone, Copy)]
-    pub struct LpPdaShape {
-        pub is_system_owned: bool,
-        pub data_len_zero: bool,
-    }
-
-    #[inline]
-    pub fn lp_pda_shape_ok(s: LpPdaShape) -> bool {
-        // Lamports not checked: external dusting of the PDA is harmless
-        // (only this program can sign for it) but checking would create
-        // a DoS vector — anyone could brick an LP's TradeCpi by funding its PDA.
-        s.is_system_owned && s.data_len_zero
-    }
+    // LP PDA shape check removed — PDA key match is sufficient.
+    // Only this program can sign for the PDA (invoke_signed), so it's
+    // always system-owned with zero data. Extra checks wasted CUs.
 
     /// Oracle feed ID check: provided feed_id must match expected config feed_id.
     #[inline]
@@ -3979,15 +3967,8 @@ pub mod processor {
                 ) {
                     return Err(ProgramError::InvalidSeeds);
                 }
-                // LP PDA shape validation via verify helper (Kani-provable)
-                let lp_pda_shape = crate::verify::LpPdaShape {
-                    is_system_owned: a_lp_pda.owner == &solana_program::system_program::ID,
-                    data_len_zero: a_lp_pda.data_len() == 0,
-                    // lamports not checked — external dusting is harmless but would DoS
-                };
-                if !crate::verify::lp_pda_shape_ok(lp_pda_shape) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
+                // PDA key match is sufficient — only this program can sign
+                // for it, so it's always system-owned with zero data.
 
                 // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
                 // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
