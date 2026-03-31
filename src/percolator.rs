@@ -228,12 +228,14 @@ pub mod verify {
     pub struct LpPdaShape {
         pub is_system_owned: bool,
         pub data_len_zero: bool,
-        pub lamports_zero: bool,
     }
 
     #[inline]
     pub fn lp_pda_shape_ok(s: LpPdaShape) -> bool {
-        s.is_system_owned && s.data_len_zero && s.lamports_zero
+        // Lamports not checked: external dusting of the PDA is harmless
+        // (only this program can sign for it) but checking would create
+        // a DoS vector — anyone could brick an LP's TradeCpi by funding its PDA.
+        s.is_system_owned && s.data_len_zero
     }
 
     /// Oracle feed ID check: provided feed_id must match expected config feed_id.
@@ -3981,7 +3983,7 @@ pub mod processor {
                 let lp_pda_shape = crate::verify::LpPdaShape {
                     is_system_owned: a_lp_pda.owner == &solana_program::system_program::ID,
                     data_len_zero: a_lp_pda.data_len() == 0,
-                    lamports_zero: **a_lp_pda.lamports.borrow() == 0,
+                    // lamports not checked — external dusting is harmless but would DoS
                 };
                 if !crate::verify::lp_pda_shape_ok(lp_pda_shape) {
                     return Err(ProgramError::InvalidAccountData);

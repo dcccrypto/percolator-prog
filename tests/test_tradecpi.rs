@@ -126,42 +126,36 @@ fn test_tradecpi_permissionless_lp_no_signature_required() {
 ///
 /// This prevents an attacker from creating an account at the PDA address.
 #[test]
-fn test_tradecpi_rejects_pda_with_wrong_shape() {
+fn test_tradecpi_pda_with_dusted_lamports_still_works() {
     let mut env = TradeCpiTestEnv::new();
 
     env.init_market();
 
     let matcher_prog = env.matcher_program_id;
 
-    // Create LP
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
     env.deposit(&lp, lp_idx, 100_000_000_000);
 
-    // Create user
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
-    let user_pos_before = env.read_account_position(user_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
-    let user_cap_before = env.read_account_capital(user_idx);
-    let lp_cap_before = env.read_account_capital(lp_idx);
-    let vault_before = env.vault_balance();
-    let engine_vault_before = env.read_vault();
 
     // Derive the CORRECT LP PDA
     let lp_bytes = lp_idx.to_le_bytes();
     let (correct_lp_pda, _) =
         Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
 
-    // Create an account at the PDA address with wrong shape
-    // (has lamports - not zero)
+    // Externally dust the PDA with lamports (DoS attempt).
+    // Lamports are NOT checked — dusting is harmless because only
+    // this program can sign for the PDA. Checking lamports would let
+    // anyone brick an LP's TradeCpi by sending SOL to the PDA.
     env.svm
         .set_account(
             correct_lp_pda,
             Account {
-                lamports: 1_000_000, // Non-zero lamports - INVALID
-                data: vec![],
+                lamports: 1_000_000, // Dusted with SOL
+                data: vec![],        // Still zero data + system-owned
                 owner: solana_sdk::system_program::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -169,7 +163,7 @@ fn test_tradecpi_rejects_pda_with_wrong_shape() {
         )
         .unwrap();
 
-    // Try TradeCpi - should fail because PDA shape is wrong
+    // TradeCpi should still work — lamports on PDA are irrelevant
     let result = env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -179,46 +173,15 @@ fn test_tradecpi_rejects_pda_with_wrong_shape() {
         &matcher_prog,
         &matcher_ctx,
     );
-
     assert!(
-        result.is_err(),
-        "SECURITY: TradeCpi should reject PDA with non-zero lamports"
-    );
-    assert_eq!(
-        env.read_account_position(user_idx),
-        user_pos_before,
-        "Rejected malformed-PDA TradeCpi must preserve user position"
-    );
-    assert_eq!(
-        env.read_account_position(lp_idx),
-        lp_pos_before,
-        "Rejected malformed-PDA TradeCpi must preserve LP position"
-    );
-    assert_eq!(
-        env.read_account_capital(user_idx),
-        user_cap_before,
-        "Rejected malformed-PDA TradeCpi must preserve user capital"
-    );
-    assert_eq!(
-        env.read_account_capital(lp_idx),
-        lp_cap_before,
-        "Rejected malformed-PDA TradeCpi must preserve LP capital"
-    );
-    assert_eq!(
-        env.vault_balance(),
-        vault_before,
-        "Rejected malformed-PDA TradeCpi must preserve SPL vault"
-    );
-    assert_eq!(
-        env.read_vault(),
-        engine_vault_before,
-        "Rejected malformed-PDA TradeCpi must preserve engine vault aggregate"
+        result.is_ok(),
+        "Dusted PDA must not block TradeCpi (anti-DoS): {:?}",
+        result,
     );
 
-    println!("TRADECPI PDA SHAPE VALIDATION VERIFIED: PDA with wrong shape REJECTED");
-    println!("  - PDA address is correct but has non-zero lamports");
-    println!("  - lp_pda_shape_ok check requires: system-owned, zero data, zero lamports");
-    println!("  - This prevents attackers from polluting the PDA address");
+    // Trade should have created positions
+    assert_ne!(env.read_account_position(user_idx), 0, "User should have position");
+    assert_ne!(env.read_account_position(lp_idx), 0, "LP should have position");
 }
 
 /// ATTACK: Configure LP with matcher_program = percolator program (self-CPI recursion vector).
@@ -1637,13 +1600,15 @@ fn test_attack_tradecpi_pda_with_lamports() {
     let (lp_pda, _) =
         Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
 
-    // Give the PDA lamports (makes it non-system shape)
+    // Give the PDA lamports AND non-zero data length.
+    // Lamports alone are harmless (dusting DoS prevention), but non-zero
+    // data_len still fails the shape check.
     env.svm
         .set_account(
             lp_pda,
             Account {
                 lamports: 1_000_000,
-                data: vec![0u8; 32],
+                data: vec![0u8; 32], // data_len=32 fails data_len_zero check
                 owner: solana_sdk::system_program::ID,
                 executable: false,
                 rent_epoch: 0,

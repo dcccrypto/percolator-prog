@@ -898,30 +898,28 @@ fn kani_len_ok_universal() {
 
 // =============================================================================
 // R. LP PDA SHAPE VALIDATION (4 proofs)
-// NOTE: LpPdaShape has 3 bools (8 combinations). These 4 concrete proofs cover
-// all-valid + each individual failure. Retained as documentation of each
-// validation requirement. The function is a simple conjunction (&&).
+// NOTE: LpPdaShape has 2 bools (4 combinations). Lamports not checked —
+// external dusting of the PDA is harmless but checking would create a DoS
+// vector (anyone could brick an LP's TradeCpi by funding its PDA).
 // =============================================================================
 
-/// Universal: lp_pda_shape_ok is fully characterized as 3-way AND
+/// Universal: lp_pda_shape_ok is fully characterized as 2-way AND
 ///
 /// CODE-EQUALS-SPEC: The body of `lp_pda_shape_ok` IS
-/// `is_system_owned && data_len_zero && lamports_zero`. This proof asserts
-/// the function equals its own body for all symbolic inputs. Fully symbolic;
-/// provides regression protection if the function body is modified.
+/// `is_system_owned && data_len_zero`. This proof asserts
+/// the function equals its own body for all symbolic inputs.
 #[kani::proof]
 fn kani_lp_pda_shape_universal() {
     let shape = LpPdaShape {
         is_system_owned: kani::any(),
         data_len_zero: kani::any(),
-        lamports_zero: kani::any(),
     };
 
-    let expected = shape.is_system_owned && shape.data_len_zero && shape.lamports_zero;
+    let expected = shape.is_system_owned && shape.data_len_zero;
     assert_eq!(
         lp_pda_shape_ok(shape),
         expected,
-        "lp_pda_shape_ok must equal (system_owned && data_zero && lamports_zero)"
+        "lp_pda_shape_ok must equal (system_owned && data_zero)"
     );
 }
 
