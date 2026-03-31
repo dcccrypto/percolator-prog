@@ -10696,7 +10696,7 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
-                let _outcome = engine
+                let crank_outcome = engine
                     .keeper_crank(
                         clock.slot,
                         price,
@@ -10705,6 +10705,14 @@ pub mod processor {
                         effective_funding_rate,
                     )
                     .map_err(map_risk_error)?;
+                // GH#1931 / PERC-8296: Surface silent accrue_market_to failures for observability.
+                // Non-zero means ADL coefficients went stale for this crank cycle (no fund risk).
+                if crank_outcome.adl_accrue_failures > 0 {
+                    msg!(
+                        "ADL_ACCRUE_FAILURE: {} failures this crank — ADL coefficients stale",
+                        crank_outcome.adl_accrue_failures
+                    );
+                }
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_end");
