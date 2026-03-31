@@ -336,4 +336,26 @@ mod tests {
             );
         }
     }
+
+    /// Guard: TAG_SLASH_CREATION_DEPOSIT (58) must remain unimplemented until PERC-629 is
+    /// scheduled for mainnet. This test documents the intentional stub status and ensures
+    /// the tag never silently gains a dispatch handler without deliberate review.
+    ///
+    /// If PERC-629 is being implemented: (1) remove this test, (2) add an Instruction variant
+    /// and decode arm in percolator.rs, (3) add a dispatch arm, (4) add a security review.
+    /// See GH#1975.
+    #[test]
+    fn tag_slash_creation_deposit_is_unimplemented_stub() {
+        // The tag value is reserved in the sequential range but intentionally has no
+        // Instruction variant, decode arm, or dispatch handler. Any CPI call with tag 58
+        // currently returns InvalidInstructionData.
+        //
+        // This assertion is a compile-time-value guard: if the constant changes (indicating
+        // someone rewired it), this test will draw attention to the change.
+        assert_eq!(
+            super::TAG_SLASH_CREATION_DEPOSIT,
+            58u8,
+            "TAG_SLASH_CREATION_DEPOSIT must stay at 58 — change only when PERC-629 is scheduled"
+        );
+    }
 }
