@@ -110,6 +110,22 @@ pub const DEFAULT_MAX_MARKET_EXPOSURE_BPS: u16 = 2_000; // 20%
 5. Pending withdrawals never exceed total capital
 6. Available for allocation = total - allocated (no underflow)
 
+## Instruction Authorization Table
+
+> **Authoritative reference for auditors and integrators.**
+> The sole guard on AdvanceEpoch is `is_epoch_elapsed()` returning true — there is
+> **no signer requirement**. This was an audit finding (GH#1913 / PERC-8314) and is
+> intentional: epoch advancement is a permissionless keeper crank, consistent with
+> `TAG_ADVANCE_EPOCH` in `tags.rs` and the CRANK_NO_CALLER pattern used elsewhere.
+
+| Instruction          | Signer Required? | Auth Check                        | Notes                                                |
+|----------------------|------------------|-----------------------------------|------------------------------------------------------|
+| InitSharedVault      | ✅ admin          | `admin_ok()`                      | One-time initialisation; deploy-time first-caller guard (see GH#1915) |
+| AllocateMarket       | ✅ admin          | `admin_ok()`                      | Admin-gated market registration                      |
+| QueueWithdrawalSV    | ✅ user           | `owner_ok()`                      | User requests epoch withdrawal                       |
+| ClaimEpochWithdrawal | ✅ user           | `owner_ok()` + `claimed == 0`    | Kani-proven: no double-claim (C11-A), conservation (C11-B) |
+| AdvanceEpoch         | ❌ none           | `is_epoch_elapsed()` only         | **Permissionless crank** — any fee-payer may call once epoch has elapsed |
+
 ## Implementation Plan
 1. Pure logic module + design doc + tests + Kani proofs
 2. SharedVaultState + MarketAllocation + WithdrawalRequest PDAs
