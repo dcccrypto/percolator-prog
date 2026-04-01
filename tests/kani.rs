@@ -7894,3 +7894,111 @@ fn proof_inductive_claim_epoch_stable_after_claimed() {
         "I3-B: any claim on an already-claimed request must yield zero payout"
     );
 }
+
+// ─── PERC-8373: funding_horizon_slots u64→i64 cast safety ───────────────────
+
+/// Proof: compute_inventory_funding_bps_per_slot never triggers UB when
+/// funding_horizon_slots is in the valid range (1 ..= i64::MAX as u64).
+/// The guard in UpdateConfig enforces this bound at the only write-path.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_funding_horizon_slots_cast_no_wrap() {
+    use percolator_prog::state::compute_inventory_funding_bps_per_slot;
+
+    let funding_horizon_slots: u64 = kani::any();
+    // Simulate UpdateConfig guard: 0 < slots <= i64::MAX
+    kani::assume(funding_horizon_slots > 0);
+    kani::assume(funding_horizon_slots <= i64::MAX as u64);
+
+    let net_lp_pos: i128 = kani::any();
+    let price_e6: u64 = kani::any();
+    let funding_k_bps: u64 = kani::any();
+    let funding_inv_scale_notional_e6: u128 = kani::any();
+    let funding_max_premium_bps: i64 = kani::any();
+    let funding_max_bps_per_slot: i64 = kani::any();
+    let funding_k2_bps: u16 = kani::any();
+
+    // Bound inputs to representative sub-ranges to keep model tractable
+    kani::assume(net_lp_pos >= -(1_000_000_000i128) && net_lp_pos <= 1_000_000_000i128);
+    kani::assume(price_e6 <= 1_000_000_000_000u64);
+    kani::assume(funding_k_bps <= 10_000u64);
+    kani::assume(funding_inv_scale_notional_e6 >= 1);
+    kani::assume(funding_inv_scale_notional_e6 <= 1_000_000_000_000_000_000u128);
+    kani::assume(funding_max_premium_bps >= 0 && funding_max_premium_bps <= 10_000);
+    kani::assume(funding_max_bps_per_slot >= 0 && funding_max_bps_per_slot <= 10_000);
+
+    // Non-vacuity
+    kani::cover!(funding_horizon_slots == 1, "COVER: horizon == 1 (minimum)");
+    kani::cover!(
+        funding_horizon_slots == i64::MAX as u64,
+        "COVER: horizon at i64::MAX"
+    );
+    kani::cover!(
+        funding_horizon_slots == 100_000,
+        "COVER: typical horizon ~7-day"
+    );
+
+    // Cast must not wrap: because horizon is in 1..=i64::MAX the as-i64 cast
+    // yields a positive integer (no sign-bit flip) and division is safe.
+    let result = compute_inventory_funding_bps_per_slot(
+        net_lp_pos,
+        price_e6,
+        funding_horizon_slots,
+        funding_k_bps,
+        funding_inv_scale_notional_e6,
+        funding_max_premium_bps,
+        funding_max_bps_per_slot,
+        funding_k2_bps,
+    );
+
+    // Output is bounded by the sanity clamp in the function
+    assert!(
+        result >= -10_000 && result <= 10_000,
+        "output within sanity clamp"
+    );
+}
+
+/// Proof: compute_premium_funding_bps_per_slot is safe because it casts to
+/// i128 (not i64), so there is no wrap risk regardless of horizon size.
+/// Included here for completeness of the GH#1986 audit trail.
+#[cfg(kani)]
+#[kani::proof]
+fn proof_premium_funding_horizon_cast_safe() {
+    use percolator_prog::state::compute_premium_funding_bps_per_slot;
+
+    let funding_horizon_slots: u64 = kani::any();
+    kani::assume(funding_horizon_slots > 0);
+    kani::assume(funding_horizon_slots <= i64::MAX as u64);
+
+    let mark_e6: u64 = kani::any();
+    let index_e6: u64 = kani::any();
+    let funding_k_bps: u64 = kani::any();
+    let max_premium_bps: i64 = kani::any();
+    let max_bps_per_slot: i64 = kani::any();
+
+    kani::assume(mark_e6 <= 1_000_000_000_000u64);
+    kani::assume(index_e6 >= 1 && index_e6 <= 1_000_000_000_000u64);
+    kani::assume(funding_k_bps <= 10_000u64);
+    kani::assume(max_premium_bps >= 0 && max_premium_bps <= 10_000);
+    kani::assume(max_bps_per_slot >= 0 && max_bps_per_slot <= 10_000);
+
+    kani::cover!(funding_horizon_slots == 1, "COVER: horizon == 1 (minimum)");
+    kani::cover!(
+        funding_horizon_slots == i64::MAX as u64,
+        "COVER: horizon at i64::MAX"
+    );
+
+    let result = compute_premium_funding_bps_per_slot(
+        mark_e6,
+        index_e6,
+        funding_horizon_slots,
+        funding_k_bps,
+        max_premium_bps,
+        max_bps_per_slot,
+    );
+
+    assert!(
+        result >= -max_bps_per_slot && result <= max_bps_per_slot,
+        "output within policy clamp"
+    );
+}

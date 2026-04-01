@@ -11849,6 +11849,11 @@ pub mod processor {
                 if funding_horizon_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                // GH#1986: funding_horizon_slots is cast to i64 in funding math;
+                // guard against values that would wrap negative.
+                if funding_horizon_slots > i64::MAX as u64 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
                 if funding_inv_scale_notional_e6 == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
