@@ -4071,6 +4071,156 @@ fn test_critical_update_config_authorization() {
 }
 
 // ============================================================================
+// Test: GH#1986 — funding_horizon_slots upper-bound guard (u64→i64 cast risk)
+// ============================================================================
+
+/// PERC-8373 / GH#1986: UpdateConfig must reject funding_horizon_slots > i64::MAX.
+/// A value above i64::MAX as-cast to i64 wraps negative, causing incorrect
+/// funding rate division.  The guard added in percolator.rs ensures
+/// InvalidConfigParam is returned for any such value.
+#[test]
+fn test_update_config_funding_horizon_slots_upper_bound() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // i64::MAX + 1: must be rejected
+    let overflow_slots: u64 = (i64::MAX as u64) + 1;
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(admin.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(env.slab, false),
+        ],
+        data: encode_update_config(
+            overflow_slots,
+            100,
+            1_000_000_000_000u128,
+            100i64,
+            10i64,
+            0u128,
+            100,
+            100,
+            100,
+            1000,
+            0u128,
+            1_000_000_000_000_000u128,
+            1u128,
+        ),
+    };
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    let result = env
+        .svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e));
+    assert!(
+        result.is_err(),
+        "SECURITY: funding_horizon_slots > i64::MAX must be rejected (got Ok)"
+    );
+    println!(
+        "UpdateConfig with overflow horizon ({}) REJECTED (correct)",
+        overflow_slots
+    );
+
+    // u64::MAX: must also be rejected
+    let max_slots: u64 = u64::MAX;
+    let ix2 = solana_sdk::instruction::Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(admin.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(env.slab, false),
+        ],
+        data: encode_update_config(
+            max_slots,
+            100,
+            1_000_000_000_000u128,
+            100i64,
+            10i64,
+            0u128,
+            100,
+            100,
+            100,
+            1000,
+            0u128,
+            1_000_000_000_000_000u128,
+            1u128,
+        ),
+    };
+    let tx2 = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[ix2],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    let result2 = env
+        .svm
+        .send_transaction(tx2)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e));
+    assert!(
+        result2.is_err(),
+        "SECURITY: funding_horizon_slots = u64::MAX must be rejected (got Ok)"
+    );
+    println!("UpdateConfig with u64::MAX horizon REJECTED (correct)");
+
+    // i64::MAX exactly: must be accepted (boundary value)
+    let boundary_slots: u64 = i64::MAX as u64;
+    let ix3 = solana_sdk::instruction::Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(admin.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(env.slab, false),
+        ],
+        data: encode_update_config(
+            boundary_slots,
+            100,
+            1_000_000_000_000u128,
+            100i64,
+            10i64,
+            0u128,
+            100,
+            100,
+            100,
+            1000,
+            0u128,
+            1_000_000_000_000_000u128,
+            1u128,
+        ),
+    };
+    let tx3 = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[ix3],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    let result3 = env
+        .svm
+        .send_transaction(tx3)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e));
+    assert!(
+        result3.is_ok(),
+        "BOUNDARY: funding_horizon_slots = i64::MAX should be accepted: {:?}",
+        result3
+    );
+    println!("UpdateConfig with i64::MAX horizon ACCEPTED (correct boundary)");
+
+    println!("TEST PASSED: GH#1986 funding_horizon_slots upper-bound guard verified");
+}
+
+// ============================================================================
 // Test: LiquidateAtOracle acceptance/rejection logic
 // ============================================================================
 
