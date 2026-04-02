@@ -17483,8 +17483,8 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                // Bump at offset 9 (version=8, bump=9 — stable across layouts)
-                let bump = slab_data[9];
+                // Bump at offset 12: magic(8 bytes) + version(4 bytes) = 12
+                let bump = slab_data[12];
                 drop(slab_data);
 
                 // 3. Derive vault PDA and verify
