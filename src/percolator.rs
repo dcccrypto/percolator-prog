@@ -15097,6 +15097,11 @@ pub mod processor {
                     return Err(PercolatorError::LpVaultZeroAmount.into());
                 }
 
+                // Guard against u128 → u64 truncation (matches LpVaultWithdraw).
+                if capital_units > u64::MAX as u128 {
+                    return Err(PercolatorError::EngineOverflow.into());
+                }
+
                 let slab_data = a_slab.try_borrow_data()?;
                 let config = state::read_config(&slab_data);
                 let base_amount =
