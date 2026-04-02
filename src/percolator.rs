@@ -4379,6 +4379,9 @@ pub mod processor {
                             clock.slot,
                         );
                         config.mark_ewma_last_slot = clock.slot;
+                        // Stamp funding rate from updated mark
+                        engine.funding_rate_bps_per_slot_last =
+                            compute_current_funding_rate(&config);
                     }
 
                     // Hyperp: also update authority_price (legacy mark field)
@@ -4390,10 +4393,6 @@ pub mod processor {
                         );
                         config.last_mark_push_slot = clock.slot as u128;
                     }
-
-                    // Stamp funding rate from new mark (universal)
-                    engine.funding_rate_bps_per_slot_last =
-                        compute_current_funding_rate(&config);
                 }
                 // Engine borrow dropped. Write nonce + config.
                 {
