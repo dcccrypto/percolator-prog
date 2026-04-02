@@ -3355,3 +3355,126 @@ fn test_instruction_decoder_removed_tags_rejected() {
     );
 }
 
+// ── Mark EWMA clamp-base tests ─────────────────────────────────────────
+
+use percolator_prog::verify::{ewma_update, mark_ewma_clamp_base};
+use percolator_prog::oracle::clamp_oracle_price;
+
+/// Test 1.1: Single-slot max movement with index-clamped EWMA.
+/// Mark starts at index=100. Attacker fills at max-clamped price.
+/// After one EWMA update, mark is within cap * alpha(1) of index.
+#[test]
+fn test_ewma_single_slot_max_movement() {
+    let index: u64 = 100_000_000;
+    let cap: u64 = 10_000; // 1%
+    let halflife: u64 = 100;
+
+    // Attacker exec price: as far from index as circuit breaker allows
+    let clamped = clamp_oracle_price(
+        mark_ewma_clamp_base(index), 200_000_000, cap,
+    );
+    // Should be index + 1% = 101_000_000
+    assert_eq!(clamped, 101_000_000);
+
+    // EWMA update: mark starts at index
+    let new_mark = ewma_update(index, clamped, halflife, 0, 1);
+    // alpha(1) = 1 / (1 + 100) ≈ 0.0099
+    // delta = 101M - 100M = 1M. Movement = 1M * 0.0099 ≈ 9_900
+    let movement = new_mark - index;
+    assert!(movement < 100_000, "Single slot movement {} should be < 0.1%", movement);
+    assert!(movement > 0, "Should move up at all");
+}
+
+/// Test 1.2: Walk-up attack with OLD code (clamp against MARK).
+/// Proves the vulnerability: mark walks away from index without bound.
+#[test]
+fn test_ewma_walkup_clamp_against_mark_vulnerable() {
+    let index: u64 = 100_000_000;
+    let cap: u64 = 10_000; // 1%
+    let halflife: u64 = 100;
+    let mut mark = index;
+
+    // 500 slots of wash trading, clamping against MARK (old behavior)
+    for slot in 1..=500u64 {
+        let clamped = clamp_oracle_price(mark.max(1), 200_000_000, cap);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+    }
+    // Mark should have walked well above 1 cap-width from index
+    // (mark-clamp compounds because the clamp base itself moves up)
+    assert!(
+        mark > index + index / 50, // > 2% above index (beyond 1 cap-width)
+        "Mark-clamped walk should diverge beyond cap: mark={} index={} gap={}bps",
+        mark, index, (mark - index) * 10_000 / index
+    );
+}
+
+/// Test 1.3: Walk-up attack with NEW code (clamp against INDEX).
+/// After 100 slots, mark must be within one cap-width of index.
+#[test]
+fn test_ewma_walkup_clamp_against_index_bounded() {
+    let index: u64 = 100_000_000;
+    let cap: u64 = 10_000; // 1%
+    let halflife: u64 = 100;
+    let mut mark = index;
+
+    // 100 slots of wash trading, clamping against INDEX (new behavior)
+    for slot in 1..=100u64 {
+        let clamp_base = mark_ewma_clamp_base(index); // always index
+        let clamped = clamp_oracle_price(clamp_base, 200_000_000, cap);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+    }
+    // Mark must be within cap of index (1% = 1_000_000)
+    let max_gap = index as u128 * cap as u128 / 1_000_000;
+    assert!(
+        (mark as u128) <= index as u128 + max_gap,
+        "Index-clamped walk must be bounded: mark={} index={} max_gap={}",
+        mark, index, max_gap
+    );
+}
+
+/// Test 1.4: Legitimate price discovery — mark tracks moving index.
+#[test]
+fn test_ewma_tracks_moving_index() {
+    let cap: u64 = 10_000; // 1%
+    let halflife: u64 = 100;
+    let mut index: u64 = 100_000_000;
+    let mut mark = index;
+
+    // Index jumps 5% over 50 slots (0.1% per slot, within cap)
+    for slot in 1..=50u64 {
+        index += 100_000; // +0.1%/slot
+        let clamp_base = mark_ewma_clamp_base(index);
+        let exec = index; // fair trades at index
+        let clamped = clamp_oracle_price(clamp_base, exec, cap);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+    }
+    // Mark should be within 5% of final index (EWMA lags by design)
+    let gap_pct = ((index as i128 - mark as i128).unsigned_abs() * 100) / index as u128;
+    assert!(
+        gap_pct <= 5,
+        "Mark should track index: mark={} index={} gap={}%",
+        mark, index, gap_pct
+    );
+}
+
+/// Test 1.5: Walk-down attack (shorts dominate) — same bound.
+#[test]
+fn test_ewma_walkdown_clamp_against_index_bounded() {
+    let index: u64 = 100_000_000;
+    let cap: u64 = 10_000;
+    let halflife: u64 = 100;
+    let mut mark = index;
+
+    for slot in 1..=100u64 {
+        let clamp_base = mark_ewma_clamp_base(index);
+        let clamped = clamp_oracle_price(clamp_base, 1, cap); // attack downward
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+    }
+    let max_gap = index as u128 * cap as u128 / 1_000_000;
+    assert!(
+        mark as u128 >= index as u128 - max_gap,
+        "Downward walk must be bounded: mark={} index={} max_gap={}",
+        mark, index, max_gap
+    );
+}
+

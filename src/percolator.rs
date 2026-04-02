@@ -701,6 +701,15 @@ pub mod verify {
     // Mark EWMA (trade-derived mark price)
     // =========================================================================
 
+    /// Choose the clamp base for mark EWMA updates.
+    /// Always clamps against the index (last_effective_price_e6),
+    /// never against the mark itself. This bounds mark-index
+    /// divergence to one cap-width regardless of wash-trade duration.
+    #[inline]
+    pub fn mark_ewma_clamp_base(last_effective_price_e6: u64) -> u64 {
+        last_effective_price_e6.max(1)
+    }
+
     /// EWMA update for mark price tracking.
     ///
     /// Computes: new = old * (1 - alpha) + price * alpha
@@ -4024,9 +4033,14 @@ pub mod processor {
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
-                // Same pattern as TradeCpi — all fills contribute to EWMA.
+                // Clamp against index (same as TradeCpi) to bound mark-index gap.
+                let clamped_price = oracle::clamp_oracle_price(
+                    crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
+                    price,
+                    config.oracle_price_cap_e2bps,
+                );
                 config.mark_ewma_e6 = crate::verify::ewma_update(
-                    config.mark_ewma_e6, price,
+                    config.mark_ewma_e6, clamped_price,
                     config.mark_ewma_halflife_slots,
                     config.mark_ewma_last_slot, clock.slot,
                 );
@@ -4298,7 +4312,7 @@ pub mod processor {
                     // Update trade-derived mark EWMA (all market types).
                     // Clamp exec price against current mark to prevent single-trade manipulation.
                     let clamped_exec = oracle::clamp_oracle_price(
-                        config.mark_ewma_e6.max(1),
+                        crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
                         ret.exec_price_e6,
                         config.oracle_price_cap_e2bps,
                     );
