@@ -2613,15 +2613,25 @@ pub mod processor {
             return Err(RiskError::AccountNotFound);
         }
 
-        // Step 1: Zero position with stored_pos_count maintenance
+        // Step 1: Zero position with stored_pos_count + stale_count maintenance
         let basis = engine.accounts[i].position_basis_q;
         if basis != 0 {
             if basis > 0 {
                 engine.stored_pos_count_long = engine.stored_pos_count_long
                     .checked_sub(1).ok_or(RiskError::Overflow)?;
+                // Epoch-mismatched accounts must also decrement stale count
+                // (spec §5.3 step 5: stale accounts pending side reset)
+                if engine.accounts[i].adl_epoch_snap != engine.adl_epoch_long {
+                    engine.stale_account_count_long = engine.stale_account_count_long
+                        .saturating_sub(1);
+                }
             } else {
                 engine.stored_pos_count_short = engine.stored_pos_count_short
                     .checked_sub(1).ok_or(RiskError::Overflow)?;
+                if engine.accounts[i].adl_epoch_snap != engine.adl_epoch_short {
+                    engine.stale_account_count_short = engine.stale_account_count_short
+                        .saturating_sub(1);
+                }
             }
             engine.accounts[i].position_basis_q = 0;
             engine.accounts[i].adl_a_basis = ADL_ONE;
@@ -3387,7 +3397,8 @@ pub mod processor {
                     }
                     engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
                     engine.c_tot = percolator::U128::new(
-                        engine.c_tot.get().saturating_sub(fee),
+                        engine.c_tot.get().checked_sub(fee)
+                            .ok_or(ProgramError::ArithmeticOverflow)?,
                     );
                     let new_ins = engine.insurance_fund.balance.get()
                         .checked_add(fee)
@@ -3464,7 +3475,8 @@ pub mod processor {
                     }
                     engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
                     engine.c_tot = percolator::U128::new(
-                        engine.c_tot.get().saturating_sub(fee),
+                        engine.c_tot.get().checked_sub(fee)
+                            .ok_or(ProgramError::ArithmeticOverflow)?,
                     );
                     let new_ins = engine.insurance_fund.balance.get()
                         .checked_add(fee)
