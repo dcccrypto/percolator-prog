@@ -53,6 +53,7 @@ pub mod constants {
     pub const DEFAULT_INSURANCE_WITHDRAW_MIN_BASE: u64 = 1;
     pub const DEFAULT_INSURANCE_WITHDRAW_MAX_BPS: u16 = 100; // 1%
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
+    pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
@@ -694,6 +695,42 @@ pub mod verify {
     #[inline]
     pub fn withdraw_insurance_vault(vault_before: u128, insurance_amount: u128) -> Option<u128> {
         vault_before.checked_sub(insurance_amount)
+    }
+
+    // =========================================================================
+    // Mark EWMA (trade-derived mark price)
+    // =========================================================================
+
+    /// EWMA update for mark price tracking.
+    ///
+    /// Computes: new = old * (1 - alpha) + price * alpha
+    /// where alpha ≈ dt / (dt + halflife)  (Padé approximant of 1 - 2^(-dt/hl))
+    ///
+    /// Returns old unchanged if dt == 0 (same-slot protection).
+    /// Returns price directly if old == 0 (first update) or halflife == 0 (instant).
+    #[inline]
+    pub fn ewma_update(
+        old: u64,
+        price: u64,
+        halflife_slots: u64,
+        last_slot: u64,
+        now_slot: u64,
+    ) -> u64 {
+        if old == 0 { return price; }
+        let dt = now_slot.saturating_sub(last_slot);
+        if dt == 0 { return old; }
+        if halflife_slots == 0 { return price; }
+        let alpha_bps = (10_000u128 * dt as u128) / (dt as u128 + halflife_slots as u128);
+        let old128 = old as u128;
+        let price128 = price as u128;
+        let result = if price >= old {
+            let delta = price128 - old128;
+            old128 + (delta * alpha_bps / 10_000)
+        } else {
+            let delta = old128 - price128;
+            old128 - (delta * alpha_bps / 10_000)
+        };
+        core::cmp::min(result, u64::MAX as u128) as u64
     }
 }
 
@@ -1725,6 +1762,18 @@ pub mod state {
         pub last_insurance_withdraw_slot: u64,
         /// Padding for alignment.
         pub _liw_padding: u64,
+
+        // ========================================
+        // Mark EWMA (trade-derived mark price for funding)
+        // ========================================
+        /// EWMA of execution prices (e6). Updated on every TradeCpi fill.
+        pub mark_ewma_e6: u64,
+        /// Slot when mark_ewma_e6 was last updated.
+        pub mark_ewma_last_slot: u64,
+        /// EWMA decay half-life in slots. 0 = last trade price directly.
+        pub mark_ewma_halflife_slots: u64,
+        /// Padding for u128 alignment.
+        pub _ewma_padding: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -2381,13 +2430,21 @@ pub mod oracle {
     ) -> Result<u64, ProgramError> {
         // Hyperp mode: index_feed_id == 0
         if is_hyperp_mode(config) {
-            let mark = config.authority_price_e6;
+            // Mark source: prefer trade-derived EWMA, fall back to authority push
+            let mark = if config.mark_ewma_e6 > 0 {
+                config.mark_ewma_e6
+            } else {
+                config.authority_price_e6
+            };
             if mark == 0 {
                 return Err(super::error::PercolatorError::OracleInvalid.into());
             }
-            // Hyperp stale mark check: use last_mark_push_slot (dedicated field).
-            // Rejects if the authority hasn't pushed a mark price recently.
-            let last_push = config.last_mark_push_slot as u64;
+            // Staleness: keyed off last trade OR last authority push (whichever is newer)
+            let last_update = core::cmp::max(
+                config.mark_ewma_last_slot,
+                config.last_mark_push_slot as u64,
+            );
+            let last_push = last_update;
             if last_push > 0 {
                 let max_stale_slots = if config.max_staleness_secs > u64::MAX / 3 {
                     u64::MAX
@@ -2580,7 +2637,7 @@ pub mod processor {
             DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
             DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_HYPERP_PRICE_CAP_E2BPS, MAX_ORACLE_PRICE_CAP_E2BPS,
             DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS, DEFAULT_INSURANCE_WITHDRAW_MAX_BPS,
-            DEFAULT_INSURANCE_WITHDRAW_MIN_BASE,
+            DEFAULT_INSURANCE_WITHDRAW_MIN_BASE, DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
             DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN,
             DEFAULT_THRESH_MIN_STEP, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS,
             DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG,
@@ -2817,11 +2874,11 @@ pub mod processor {
     /// Returns 0 if prices are invalid or funding params are unset.
     /// Compute funding rate from mark-index premium.
     /// Returns 0 for non-Hyperp markets (no internal mark/index pair).
+    /// Compute funding rate from mark-index premium.
+    /// Uses trade-derived EWMA mark (all market types).
+    /// Returns 0 if no trades yet (mark_ewma == 0) or params unset.
     fn compute_current_funding_rate(config: &MarketConfig) -> i64 {
-        if !oracle::is_hyperp_mode(config) {
-            return 0;
-        }
-        let mark = config.authority_price_e6;
+        let mark = config.mark_ewma_e6;
         let index = config.last_effective_price_e6;
         if mark == 0 || index == 0 || config.funding_horizon_slots == 0 {
             return 0;
@@ -3310,6 +3367,11 @@ pub mod processor {
                     last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
                     last_insurance_withdraw_slot: 0,
                     _liw_padding: 0,
+                    // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
+                    mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+                    mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
+                    mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
+                    _ewma_padding: 0,
                 };
                 // Hyperp markets must have non-zero cap for index smoothing
                 if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -4216,18 +4278,35 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
                         sol_log_compute_units();
                     }
-                    // Hyperp: update mark + stamp funding rate while engine is borrowed
+                    // Update trade-derived mark EWMA (all market types).
+                    // Clamp exec price against current mark to prevent single-trade manipulation.
+                    let clamped_exec = oracle::clamp_oracle_price(
+                        config.mark_ewma_e6.max(1),
+                        ret.exec_price_e6,
+                        config.oracle_price_cap_e2bps,
+                    );
+                    config.mark_ewma_e6 = crate::verify::ewma_update(
+                        config.mark_ewma_e6,
+                        clamped_exec,
+                        config.mark_ewma_halflife_slots,
+                        config.mark_ewma_last_slot,
+                        clock.slot,
+                    );
+                    config.mark_ewma_last_slot = clock.slot;
+
+                    // Hyperp: also update authority_price (legacy mark field)
                     if is_hyperp {
-                        let clamped_mark = oracle::clamp_oracle_price(
+                        config.authority_price_e6 = oracle::clamp_oracle_price(
                             config.last_effective_price_e6,
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
-                        config.authority_price_e6 = clamped_mark;
                         config.last_mark_push_slot = clock.slot as u128;
-                        engine.funding_rate_bps_per_slot_last =
-                            compute_current_funding_rate(&config);
                     }
+
+                    // Stamp funding rate from new mark (universal)
+                    engine.funding_rate_bps_per_slot_last =
+                        compute_current_funding_rate(&config);
                 }
                 // Engine borrow dropped. Write nonce + config.
                 {
@@ -4660,7 +4739,7 @@ pub mod processor {
                 let clock = Clock::from_account_info(a_clock)?;
                 if oracle::is_hyperp_mode(&config) {
                     let prev_index = config.last_effective_price_e6;
-                    let mark = config.authority_price_e6;
+                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
                     if mark > 0 && prev_index > 0 {
                         let last_idx_slot = config.last_hyperp_index_slot;
                         let dt = clock.slot.saturating_sub(last_idx_slot);
@@ -4758,7 +4837,7 @@ pub mod processor {
                     let push_clock = Clock::get()
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     let prev_index = config.last_effective_price_e6;
-                    let mark = config.authority_price_e6;
+                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
                     if mark > 0 && prev_index > 0 {
                         let last_idx_slot = config.last_hyperp_index_slot;
                         let dt = push_clock.slot.saturating_sub(last_idx_slot);
@@ -4844,6 +4923,10 @@ pub mod processor {
                     let push_clock = Clock::get()
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     config.last_mark_push_slot = push_clock.slot as u128;
+                    // Admin push directly sets mark_ewma (no EWMA blending).
+                    // Trades use EWMA blending; admin pushes are authoritative.
+                    config.mark_ewma_e6 = clamped;
+                    config.mark_ewma_last_slot = push_clock.slot;
                 } else {
                     config.authority_timestamp = timestamp;
                     // Do NOT write last_effective_price_e6 here.
@@ -4886,7 +4969,7 @@ pub mod processor {
                 if is_hyperp {
                     let clock = Clock::from_account_info(a_clock)?;
                     let prev_index = config.last_effective_price_e6;
-                    let mark = config.authority_price_e6;
+                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
                     if mark > 0 && prev_index > 0 {
                         let last_idx_slot = config.last_hyperp_index_slot;
                         let dt = clock.slot.saturating_sub(last_idx_slot);
@@ -5016,7 +5099,7 @@ pub mod processor {
                 // Admin must be able to resolve even if mark is stale.
                 if oracle::is_hyperp_mode(&config) {
                     let prev_index = config.last_effective_price_e6;
-                    let mark = config.authority_price_e6;
+                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
                     if mark > 0 && prev_index > 0 {
                         let last_idx_slot = config.last_hyperp_index_slot;
                         let dt = clock.slot.saturating_sub(last_idx_slot);
