@@ -17427,7 +17427,22 @@ pub mod processor {
             //   - After rescue, CloseSlab can reclaim rent normally
             // ─────────────────────────────────────────────────────────────
             Instruction::RescueOrphanVault => {
-                // Accounts: [admin(signer), slab(writable), admin_ata(writable),
+                // Layout-agnostic rescue: reads raw bytes from the slab header
+                // instead of using slab_guard/read_config/engine_mut which assume
+                // a specific compiled struct layout (V_ADL). V1M slabs have different
+                // ENGINE_OFF/CONFIG_LEN, so we bypass all struct-dependent code.
+                //
+                // Security:
+                //   - Slab must be owned by this program
+                //   - Slab must be initialized (TALOCREP magic at offset 0)
+                //   - Admin at raw offset 16..48 must match signer
+                //   - Vault PDA derived from ["vault", slab_pubkey]
+                //   - Vault ATA verified as SPL token account owned by PDA
+                //   - Admin ATA verified as SPL token account owned by admin
+                //   - Reads actual SPL balance, transfers via PDA-signed CPI
+                //   - No engine access = no layout dependency
+                //
+                // Accounts: [admin(signer), slab(readonly), admin_ata(writable),
                 //            vault(writable), token_program, vault_pda]
                 accounts::expect_len(accounts, 6)?;
                 let a_admin = &accounts[0];
@@ -17438,58 +17453,80 @@ pub mod processor {
                 let a_vault_pda = &accounts[5];
 
                 accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
+                // 1. Slab must be owned by this program
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
 
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
-                accounts::expect_key(a_vault_pda, &auth)?;
-
-                // Require no open positions — same check as WithdrawInsurance
-                let engine = zc::engine_mut(&mut data)?;
-                if engine.num_used_accounts != 0 {
+                // 2. Read raw slab bytes for magic + admin (layout-stable fields)
+                let slab_data = a_slab.try_borrow_data()?;
+                if slab_data.len() < 48 {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                // Read actual vault SPL token balance (byte offset 64 in token account)
+                // Magic at offset 0..8 must be TALOCREP
+                let magic = u64::from_le_bytes(
+                    slab_data[0..8].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                );
+                if magic != MAGIC {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Admin pubkey at raw offset 16..48 (stable across all layout versions)
+                let admin_bytes: [u8; 32] = slab_data[16..48]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?;
+                let slab_admin = Pubkey::new_from_array(admin_bytes);
+                if slab_admin != *a_admin.key {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Bump at offset 9 (version=8, bump=9 — stable across layouts)
+                let bump = slab_data[9];
+                drop(slab_data);
+
+                // 3. Derive vault PDA and verify
+                let (auth, expected_bump) =
+                    accounts::derive_vault_authority(program_id, a_slab.key);
+                if bump != expected_bump {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                accounts::expect_key(a_vault_pda, &auth)?;
+
+                // 4. Verify vault ATA is owned by vault PDA (read SPL token account)
                 let vault_data = a_vault.try_borrow_data()?;
                 let vault_token =
                     crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
+                if vault_token.owner != auth {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 let actual_amount = vault_token.amount;
+                let vault_mint = vault_token.mint;
                 drop(vault_data);
+
+                // 5. Verify admin ATA is owned by admin and same mint
+                let admin_ata_data = a_admin_ata.try_borrow_data()?;
+                let admin_token =
+                    crate::spl_token::state::TokenAccountView::unpack(&admin_ata_data)?;
+                if admin_token.owner != *a_admin.key {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                if admin_token.mint != vault_mint {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                drop(admin_ata_data);
 
                 if actual_amount == 0 {
                     msg!("PERC-8400: vault is empty, nothing to rescue");
                     return Ok(());
                 }
 
-                // Zero engine state BEFORE CPI (defense-in-depth against re-entrancy)
-                engine.vault = percolator::U128::ZERO;
-                engine.insurance_fund.balance = percolator::U128::ZERO;
-                engine.insurance_fund.fee_revenue = percolator::U128::ZERO;
-                // Also zero dust_base so CloseSlab won't block
-                state::write_dust_base(&mut data, 0);
-
-                // Transfer all tokens from vault → admin ATA
+                // 6. Transfer all tokens from vault → admin ATA via PDA-signed CPI
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                let bump_arr: [u8; 1] = [bump];
                 let seed3: &[u8] = &bump_arr;
                 let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
                 let signer_seeds: [&[&[u8]]; 1] = [&seeds];
