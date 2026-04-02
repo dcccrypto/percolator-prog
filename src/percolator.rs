@@ -2877,14 +2877,8 @@ pub mod processor {
         }
     }
 
-    /// Execute a trade via a matching engine.
-    /// `size` is the user's requested position change (positive = user goes long).
-    /// Compute the current funding rate from config (mark-index premium).
-    /// Returns 0 if prices are invalid or funding params are unset.
-    /// Compute funding rate from mark-index premium.
-    /// Returns 0 for non-Hyperp markets (no internal mark/index pair).
-    /// Compute funding rate from mark-index premium.
-    /// Uses trade-derived EWMA mark (all market types).
+    /// Compute funding rate from mark-index premium (all market types).
+    /// Uses trade-derived EWMA mark vs oracle index.
     /// Returns 0 if no trades yet (mark_ewma == 0) or params unset.
     fn compute_current_funding_rate(config: &MarketConfig) -> i64 {
         let mark = config.mark_ewma_e6;
@@ -4033,20 +4027,23 @@ pub mod processor {
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
-                // Clamp against index (same as TradeCpi) to bound mark-index gap.
-                let clamped_price = oracle::clamp_oracle_price(
-                    crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
-                    price,
-                    config.oracle_price_cap_e2bps,
-                );
-                config.mark_ewma_e6 = crate::verify::ewma_update(
-                    config.mark_ewma_e6, clamped_price,
-                    config.mark_ewma_halflife_slots,
-                    config.mark_ewma_last_slot, clock.slot,
-                );
-                config.mark_ewma_last_slot = clock.slot;
-                engine.funding_rate_bps_per_slot_last =
-                    compute_current_funding_rate(&config);
+                // Only when circuit breaker is active (cap > 0) — without cap,
+                // exec prices are unbounded and EWMA would be manipulable.
+                if config.oracle_price_cap_e2bps > 0 {
+                    let clamped_price = oracle::clamp_oracle_price(
+                        crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
+                        price,
+                        config.oracle_price_cap_e2bps,
+                    );
+                    config.mark_ewma_e6 = crate::verify::ewma_update(
+                        config.mark_ewma_e6, clamped_price,
+                        config.mark_ewma_halflife_slots,
+                        config.mark_ewma_last_slot, clock.slot,
+                    );
+                    config.mark_ewma_last_slot = clock.slot;
+                    engine.funding_rate_bps_per_slot_last =
+                        compute_current_funding_rate(&config);
+                }
 
                 // Write updated config (mark_ewma changed)
                 state::write_config(&mut data, &config);
@@ -4310,20 +4307,23 @@ pub mod processor {
                         sol_log_compute_units();
                     }
                     // Update trade-derived mark EWMA (all market types).
-                    // Clamp exec price against current mark to prevent single-trade manipulation.
-                    let clamped_exec = oracle::clamp_oracle_price(
-                        crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
-                        ret.exec_price_e6,
-                        config.oracle_price_cap_e2bps,
-                    );
-                    config.mark_ewma_e6 = crate::verify::ewma_update(
-                        config.mark_ewma_e6,
-                        clamped_exec,
-                        config.mark_ewma_halflife_slots,
-                        config.mark_ewma_last_slot,
-                        clock.slot,
-                    );
-                    config.mark_ewma_last_slot = clock.slot;
+                    // Only when circuit breaker is active — without cap, exec prices
+                    // are unbounded and EWMA would be manipulable.
+                    if config.oracle_price_cap_e2bps > 0 {
+                        let clamped_exec = oracle::clamp_oracle_price(
+                            crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
+                            ret.exec_price_e6,
+                            config.oracle_price_cap_e2bps,
+                        );
+                        config.mark_ewma_e6 = crate::verify::ewma_update(
+                            config.mark_ewma_e6,
+                            clamped_exec,
+                            config.mark_ewma_halflife_slots,
+                            config.mark_ewma_last_slot,
+                            clock.slot,
+                        );
+                        config.mark_ewma_last_slot = clock.slot;
+                    }
 
                     // Hyperp: also update authority_price (legacy mark field)
                     if is_hyperp {
