@@ -111,6 +111,12 @@ pub const TAG_SET_WALLET_CAP: u8 = 70;
 /// Data: tag(1) + threshold_bps(2) — 0 = disabled, 1-10000 = max imbalance ratio in bps.
 /// Accounts: [admin(signer), slab(writable)]
 pub const TAG_SET_OI_IMBALANCE_HARD_BLOCK: u8 = 71;
+/// PERC-8400: Rescue orphan vault — recover tokens from vault when engine balance
+/// is zero due to raw SPL transfer bypassing engine accounting.
+/// Admin-only. Requires no open positions (num_used_accounts == 0).
+/// Reads actual vault token balance and transfers to admin ATA.
+/// Accounts: [admin(signer), slab(writable), admin_ata(writable), vault(writable), token_program, vault_pda]
+pub const TAG_RESCUE_ORPHAN_VAULT: u8 = 72;
 
 /// PERC-622: Advance oracle phase (permissionless crank).
 /// Transitions market through Phase 1→2→3 based on time + volume milestones.
@@ -244,6 +250,7 @@ mod tests {
             TAG_TRANSFER_OWNERSHIP_CPI,
             TAG_SET_WALLET_CAP,
             TAG_SET_OI_IMBALANCE_HARD_BLOCK,
+            TAG_RESCUE_ORPHAN_VAULT,
         ];
 
         for i in 0..tags.len() {

@@ -2714,6 +2714,10 @@ pub mod ix {
         ///   0. [signer]   admin
         ///   1. [writable] slab
         SetOiImbalanceHardBlock { threshold_bps: u16 },
+        /// PERC-8400: Rescue orphan vault — recover tokens stranded in vault ATA
+        /// when engine balance is zero (e.g. raw SPL transfer bypassed engine).
+        /// Admin-only. Requires no open positions.
+        RescueOrphanVault,
     }
 
     impl Instruction {
@@ -3294,6 +3298,8 @@ pub mod ix {
                     let threshold_bps = read_u16(&mut rest)?;
                     Ok(Instruction::SetOiImbalanceHardBlock { threshold_bps })
                 }
+
+                TAG_RESCUE_ORPHAN_VAULT => Ok(Instruction::RescueOrphanVault),
 
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -17387,6 +17393,104 @@ pub mod processor {
                     "PERC-8110: SetOiImbalanceHardBlock: threshold_bps={} stored={}",
                     threshold_bps,
                     stored,
+                );
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            // PERC-8400: RescueOrphanVault
+            // Recover tokens stranded in vault ATA when engine balance is
+            // zero (caused by raw SPL transfer that bypassed engine
+            // accounting during market creation).
+            //
+            // Security:
+            //   - Admin-only (require_admin)
+            //   - Slab must be initialized (slab_guard + require_initialized)
+            //   - No open positions (num_used_accounts == 0)
+            //   - Vault verified via PDA derivation (same as WithdrawInsurance)
+            //   - Engine vault+insurance zeroed after transfer (idempotent)
+            //   - Reads actual SPL token balance, not engine-tracked balance
+            //   - After rescue, CloseSlab can reclaim rent normally
+            // ─────────────────────────────────────────────────────────────
+            Instruction::RescueOrphanVault => {
+                // Accounts: [admin(signer), slab(writable), admin_ata(writable),
+                //            vault(writable), token_program, vault_pda]
+                accounts::expect_len(accounts, 6)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_admin_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_vault_pda = &accounts[5];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
+                accounts::expect_key(a_vault_pda, &auth)?;
+
+                // Require no open positions — same check as WithdrawInsurance
+                let engine = zc::engine_mut(&mut data)?;
+                if engine.num_used_accounts != 0 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Read actual vault SPL token balance (byte offset 64 in token account)
+                let vault_data = a_vault.try_borrow_data()?;
+                let vault_token =
+                    crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
+                let actual_amount = vault_token.amount;
+                drop(vault_data);
+
+                if actual_amount == 0 {
+                    msg!("PERC-8400: vault is empty, nothing to rescue");
+                    return Ok(());
+                }
+
+                // Zero engine state BEFORE CPI (defense-in-depth against re-entrancy)
+                engine.vault = percolator::U128::ZERO;
+                engine.insurance_fund.balance = percolator::U128::ZERO;
+                engine.insurance_fund.fee_revenue = percolator::U128::ZERO;
+                // Also zero dust_base so CloseSlab won't block
+                state::write_dust_base(&mut data, 0);
+
+                // Transfer all tokens from vault → admin ATA
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_admin_ata,
+                    a_vault_pda,
+                    actual_amount,
+                    &signer_seeds,
+                )?;
+
+                msg!(
+                    "PERC-8400: rescued {} tokens from orphan vault",
+                    actual_amount,
                 );
             }
 
