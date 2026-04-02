@@ -1064,6 +1064,36 @@ fn test_resolve_permissionless_disabled_by_default() {
     env.set_slot(1_000_000);
     let result = env.try_resolve_permissionless();
     assert!(result.is_err(), "Should fail when feature disabled");
+    assert!(!env.is_market_resolved(), "Market must NOT be resolved after rejected call");
+}
+
+/// Can't double-resolve — admin resolves first, permissionless rejected.
+#[test]
+fn test_resolve_permissionless_already_admin_resolved() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Enable permissionless resolve
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
+        let offset = config_end - 16;
+        slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Admin resolves first
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    assert!(env.is_market_resolved());
+
+    // Permissionless attempt on already-resolved market
+    env.set_slot(1_000);
+    let result = env.try_resolve_permissionless();
+    assert!(result.is_err(), "Can't double-resolve");
 }
 
 /// Settlement price = last_oracle_price from engine.
