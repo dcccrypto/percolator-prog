@@ -9912,6 +9912,29 @@ pub mod processor {
         };
         init_market_write_slab(&mut data, &fields, *risk_params, &write_ctx)?;
 
+        // PERC-8400: Account for seed deposit in engine.
+        // InitMarket requires MIN_INIT_MARKET_SEED tokens in the vault, but
+        // init_in_place sets engine.insurance_fund = 0. Read the actual vault
+        // balance and record it so the engine tracks the seed capital.
+        {
+            let vault_data = a_vault.try_borrow_data()?;
+            let seed_amount =
+                crate::spl_token::state::get_token_account_amount(&vault_data)?;
+            drop(vault_data);
+            if seed_amount > 0 {
+                let config = state::read_config(&data);
+                let (units, dust) =
+                    crate::units::base_to_units(seed_amount, config.unit_scale);
+                let engine = zc::engine_mut(&mut data)?;
+                engine
+                    .top_up_insurance_fund(units as u128)
+                    .map_err(crate::error::map_risk_error)?;
+                if dust > 0 {
+                    state::write_dust_base(&mut data, dust);
+                }
+            }
+        }
+
         // PERC-623: Optional keeper fund PDA initialization.
         // accounts[9] = keeper_fund PDA (writable), accounts[10] = system_program
         // The admin funds the keeper with SOL lamports (separate from the SPL token
