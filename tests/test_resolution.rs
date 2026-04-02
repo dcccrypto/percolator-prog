@@ -1020,37 +1020,45 @@ fn test_resolved_crank_cursor_wraps_to_zero() {
 
 // ── Permissionless Resolution Tests ────────────────────────────────────
 
-/// Permissionless resolution succeeds after oracle is stale long enough.
+/// Permissionless resolution succeeds when oracle is actually dead.
 #[test]
 fn test_resolve_permissionless_after_staleness() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    // Enable permissionless resolve by writing config field directly
+    // Enable permissionless resolve + set bounded staleness
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        // permissionless_resolve_stale_slots: last 16 bytes before end of config,
-        // first u64 of the pair.
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
-        let offset = config_end - 16; // 2 u64 fields from end
+        // permissionless_resolve_stale_slots
+        let offset = config_end - 16;
         slab.data[offset..offset + 8].copy_from_slice(&100u64.to_le_bytes());
+        // max_staleness_secs: at offset 72+96 = 168 in config
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes()); // 30 seconds
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
-    // Crank to establish last_crank_slot + last_oracle_price
+    // Crank to establish baseline (oracle is fresh at slot 100, ts=100)
     env.crank();
     assert!(!env.is_market_resolved());
 
-    // Not stale enough — should fail
+    // Oracle still fresh (ts=100, clock=150, age=50 > 30 but set_slot updates oracle)
+    // set_slot updates pyth_data publish_time → oracle stays fresh
     env.set_slot(50);
     let result = env.try_resolve_permissionless();
-    assert!(result.is_err(), "Should fail when oracle not stale enough");
+    assert!(result.is_err(), "Should fail when oracle is live");
 
-    // Advance past staleness (100 slots threshold, add padding for slot offset)
-    env.set_slot(200);
+    // Make oracle actually stale: advance clock WITHOUT updating oracle data
+    env.svm.set_sysvar(&Clock {
+        slot: 500,
+        unix_timestamp: 500,
+        ..Clock::default()
+    });
+    // Oracle publish_time is still 150 (from set_slot(50)), age = 500-150 = 350 > 30
+
     let result = env.try_resolve_permissionless();
-    assert!(result.is_ok(), "Should succeed after staleness: {:?}", result);
+    assert!(result.is_ok(), "Should succeed when oracle is dead: {:?}", result);
     assert!(env.is_market_resolved());
 }
 
@@ -1108,11 +1116,14 @@ fn test_resolve_permissionless_settlement_price() {
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
         let offset = config_end - 16;
         slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
+        // Bounded staleness so oracle can go stale
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
-    env.crank(); // oracle = $138
-    env.set_slot(200);
+    env.crank(); // oracle = $138 at ts=100
+    // Make oracle stale without updating publish_time
+    env.svm.set_sysvar(&Clock { slot: 500, unix_timestamp: 500, ..Clock::default() });
     env.try_resolve_permissionless().unwrap();
 
     let settlement = env.read_authority_price();

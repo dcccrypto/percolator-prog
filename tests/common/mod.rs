@@ -2211,7 +2211,7 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Permissionless resolution (anyone can call when oracle is stale enough)
+    /// Permissionless resolution (anyone can call when oracle is dead)
     pub fn try_resolve_permissionless(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
@@ -2220,6 +2220,7 @@ impl TestEnv {
             accounts: vec![
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_resolve_permissionless(),
         };

@@ -1049,6 +1049,8 @@ pub mod ix {
             max_insurance_floor_change_per_day: u128,
             risk_params: RiskParams,
             insurance_floor: u128,
+            /// Slots of oracle staleness for permissionless resolution. 0 = disabled.
+            permissionless_resolve_stale_slots: u64,
         },
         InitUser {
             fee_payment: u64,
@@ -1210,7 +1212,12 @@ pub mod ix {
                     let max_insurance_floor_change_per_day = if rest.len() >= 16 {
                         read_u128(&mut rest)?
                     } else {
-                        0u128 // default: locked after init
+                        0u128
+                    };
+                    let permissionless_resolve_stale_slots = if rest.len() >= 8 {
+                        read_u64(&mut rest)?
+                    } else {
+                        0u64 // disabled by default
                     };
                     Ok(Instruction::InitMarket {
                         admin,
@@ -1229,6 +1236,7 @@ pub mod ix {
                         max_insurance_floor_change_per_day,
                         risk_params,
                         insurance_floor,
+                        permissionless_resolve_stale_slots,
                     })
                 }
                 1 => {
@@ -3159,6 +3167,7 @@ pub mod processor {
                 max_insurance_floor_change_per_day,
                 risk_params,
                 insurance_floor,
+                permissionless_resolve_stale_slots,
             } => {
                 // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
                 // (feed_id is now passed in instruction data, not as account)
@@ -3390,7 +3399,7 @@ pub mod processor {
                     mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
                     mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
                     _ewma_padding: 0,
-                    permissionless_resolve_stale_slots: 0, // disabled by default
+                    permissionless_resolve_stale_slots,
                     _perm_resolve_padding: 0,
                 };
                 // Hyperp markets must have non-zero cap for index smoothing
@@ -5864,11 +5873,12 @@ pub mod processor {
             }
 
             Instruction::ResolvePermissionless => {
-                // Permissionless resolution after prolonged oracle staleness.
-                // Anyone can call — no signer required.
-                accounts::expect_len(accounts, 2)?;
+                // Permissionless resolution when oracle is actually dead.
+                // Anyone can call. Requires oracle account to prove staleness.
+                accounts::expect_len(accounts, 3)?;
                 let a_slab = &accounts[0];
                 let a_clock = &accounts[1];
+                let a_oracle = &accounts[2];
 
                 accounts::expect_writable(a_slab)?;
 
@@ -5880,31 +5890,90 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
 
-                // Feature must be enabled at init
                 if config.permissionless_resolve_stale_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
 
-                let engine = zc::engine_ref(&data)?;
-                let last_price = engine.last_oracle_price;
-                if last_price == 0 {
-                    return Err(PercolatorError::OracleInvalid.into());
+                // Verify oracle is actually stale RIGHT NOW by trying to read it.
+                // If the oracle read succeeds, the oracle is live → reject.
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                if !is_hyperp {
+                    let oracle_result = oracle::read_engine_price_e6(
+                        a_oracle, &config.index_feed_id,
+                        clock.unix_timestamp, config.max_staleness_secs,
+                        config.conf_filter_bps, config.invert, config.unit_scale,
+                    );
+                    if oracle_result.is_ok() {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                } else {
+                    // Hyperp: check mark staleness (last trade or push)
+                    let last_update = core::cmp::max(
+                        config.mark_ewma_last_slot,
+                        config.last_mark_push_slot as u64,
+                    );
+                    let staleness = clock.slot.saturating_sub(last_update);
+                    if staleness < config.permissionless_resolve_stale_slots {
+                        return Err(PercolatorError::OracleStale.into());
+                    }
                 }
 
-                // Oracle must be stale for at least the configured duration
-                let staleness = clock.slot.saturating_sub(engine.last_crank_slot);
-                if staleness < config.permissionless_resolve_stale_slots {
-                    return Err(PercolatorError::OracleStale.into());
+                // Also require minimum time since last crank (defense in depth)
+                {
+                    let engine = zc::engine_ref(&data)?;
+                    let crank_staleness = clock.slot.saturating_sub(engine.last_crank_slot);
+                    if crank_staleness < config.permissionless_resolve_stale_slots {
+                        return Err(PercolatorError::OracleStale.into());
+                    }
                 }
 
-                // Settle at last known good oracle price
-                let mut config = config;
+                // Flush Hyperp index + accrue to boundary (Bug 1+3 fix)
+                if is_hyperp {
+                    let mark = if config.mark_ewma_e6 > 0 {
+                        config.mark_ewma_e6
+                    } else {
+                        config.authority_price_e6
+                    };
+                    let prev_index = config.last_effective_price_e6;
+                    if mark > 0 && prev_index > 0 {
+                        let last_idx_slot = config.last_hyperp_index_slot;
+                        let engine_slot = {
+                            let e = zc::engine_ref(&data)?;
+                            e.last_crank_slot
+                        };
+                        let dt = engine_slot.saturating_sub(last_idx_slot);
+                        let new_index = oracle::clamp_toward_with_dt(
+                            prev_index.max(1), mark,
+                            config.oracle_price_cap_e2bps, dt,
+                        );
+                        config.last_effective_price_e6 = new_index;
+                        config.last_hyperp_index_slot = engine_slot;
+                    }
+                    state::write_config(&mut data, &config);
+                    let engine = zc::engine_mut(&mut data)?;
+                    let _ = engine.accrue_market_to(
+                        engine.last_crank_slot,
+                        config.last_effective_price_e6,
+                    );
+                    config = state::read_config(&data);
+                }
+
+                // Settlement price = last oracle price from engine
+                let last_price = {
+                    let engine = zc::engine_ref(&data)?;
+                    let p = engine.last_oracle_price;
+                    if p == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    config.resolution_slot = engine.last_crank_slot;
+                    p
+                };
+
                 config.authority_price_e6 = last_price;
-                config.resolution_slot = engine.last_crank_slot;
                 state::write_config(&mut data, &config);
                 state::set_resolved(&mut data);
             }
