@@ -9104,3 +9104,181 @@ fn test_attack_conservation_invariant() {
         vault_after_reversal
     );
 }
+
+
+// ============================================================================
+// PERC-8400: RescueOrphanVault tests
+// ============================================================================
+
+/// Test happy path: vault has tokens that engine doesn't track (orphan scenario).
+/// InitMarket seeds vault with 500M (VAULT_SEED_AMOUNT) which the engine tracks.
+/// We inject additional orphan tokens, then rescue should recover ALL vault tokens
+/// (both seed and orphan) because the instruction reads actual SPL balance.
+#[test]
+fn test_rescue_orphan_vault_happy_path() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Vault starts with VAULT_SEED_AMOUNT (500M) from init_market
+    let initial_vault = env.vault_balance();
+    assert_eq!(initial_vault, VAULT_SEED_AMOUNT);
+
+    // Inject additional orphan tokens (simulating raw SPL transfer bug)
+    let orphan_amount: u64 = 200_000_000;
+    {
+        let mut vault_account = env.svm.get_account(&env.vault).unwrap();
+        let mut token = TokenAccount::unpack(&vault_account.data).unwrap();
+        token.amount += orphan_amount;
+        TokenAccount::pack(token, &mut vault_account.data).unwrap();
+        env.svm.set_account(env.vault, vault_account).unwrap();
+    }
+
+    assert_eq!(env.vault_balance(), VAULT_SEED_AMOUNT + orphan_amount);
+
+    // Build RescueOrphanVault instruction
+    let admin_ata = env.create_ata(&admin.pubkey(), 0);
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(admin_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(vault_pda, false),
+        ],
+        data: vec![72u8], // TAG_RESCUE_ORPHAN_VAULT
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("RescueOrphanVault should succeed");
+
+    // Verify: vault empty, admin got everything
+    assert_eq!(env.vault_balance(), 0, "Vault should be empty after rescue");
+    let admin_account = env.svm.get_account(&admin_ata).unwrap();
+    let admin_token = TokenAccount::unpack(&admin_account.data).unwrap();
+    assert_eq!(
+        admin_token.amount,
+        VAULT_SEED_AMOUNT + orphan_amount,
+        "Admin should have all rescued tokens"
+    );
+
+    // CloseSlab should now succeed
+    let result = env.try_close_slab();
+    assert!(result.is_ok(), "CloseSlab should succeed after rescue: {:?}", result);
+
+    println!("PERC-8400: RescueOrphanVault happy path PASSED");
+}
+
+/// ATTACK: Non-admin tries to rescue vault tokens.
+#[test]
+fn test_rescue_orphan_vault_non_admin_rejected() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let attacker_ata = env.create_ata(&attacker.pubkey(), 0);
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+
+    let vault_before = env.vault_balance();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(vault_pda, false),
+        ],
+        data: vec![72u8],
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "ATTACK: Non-admin rescue should be rejected");
+    assert_eq!(env.vault_balance(), vault_before, "Vault should be unchanged");
+
+    println!("PERC-8400: Non-admin rescue rejected PASSED");
+}
+
+/// Rescue on empty vault should be a no-op.
+#[test]
+fn test_rescue_orphan_vault_empty_is_noop() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Drain vault to 0 by setting directly (simulating already-rescued state)
+    {
+        let mut vault_account = env.svm.get_account(&env.vault).unwrap();
+        let mut token = TokenAccount::unpack(&vault_account.data).unwrap();
+        token.amount = 0;
+        TokenAccount::pack(token, &mut vault_account.data).unwrap();
+        env.svm.set_account(env.vault, vault_account).unwrap();
+    }
+
+    let admin_ata = env.create_ata(&admin.pubkey(), 0);
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(admin_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(vault_pda, false),
+        ],
+        data: vec![72u8],
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("Empty vault rescue should succeed (no-op)");
+
+    println!("PERC-8400: Empty vault no-op PASSED");
+}
