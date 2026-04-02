@@ -8787,12 +8787,20 @@ pub mod processor {
         // Pre-PERC-8270 devnet slabs (BPF): Account had no ADL fields, RiskEngine had no last_market_slot.
         // BPF compiled value from percolator@cf35789 (pre-PERC-8270 struct layout).
         const PRE_ADL_SLAB_LEN: usize = 1025880;
+        // PERC-8400: V1M mainnet slab tiers (small=65416, medium=257512, large=1025896).
+        // The mainnet SOL/USDC market uses medium tier (1024 slots, 257512 bytes).
+        const V1M_SMALL_LEN: usize = 65416;
+        const V1M_MEDIUM_LEN: usize = 257512;
+        const V1M_LARGE_LEN: usize = 1025896;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
             correct_len: data.len() == SLAB_LEN
                 || data.len() == PRE_118_SLAB_LEN
                 || data.len() == OLDEST_SLAB_LEN
-                || data.len() == PRE_ADL_SLAB_LEN,
+                || data.len() == PRE_ADL_SLAB_LEN
+                || data.len() == V1M_SMALL_LEN
+                || data.len() == V1M_MEDIUM_LEN
+                || data.len() == V1M_LARGE_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -15398,15 +15406,22 @@ pub mod processor {
                 //   PRE_118_SLAB_LEN   — pre-PERC-118 (SLAB_LEN - 16)
                 //   OLDEST_SLAB_LEN    — oldest devnet (SLAB_LEN - 24)
                 //   PRE_ADL_SLAB_LEN   — pre-PERC-8270 BPF (1025880)
+                //   V1M tiers          — PERC-8400 mainnet V1M layout
                 const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
                 const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
                 const PRE_ADL_SLAB_LEN: usize = 1025880;
+                const V1M_SMALL_LEN: usize = 65416;
+                const V1M_MEDIUM_LEN: usize = 257512;
+                const V1M_LARGE_LEN: usize = 1025896;
                 let slab_data = a_slab.try_borrow_data()?;
                 let slab_len = slab_data.len();
                 if slab_len == SLAB_LEN
                     || slab_len == PRE_118_SLAB_LEN
                     || slab_len == OLDEST_SLAB_LEN
                     || slab_len == PRE_ADL_SLAB_LEN
+                    || slab_len == V1M_SMALL_LEN
+                    || slab_len == V1M_MEDIUM_LEN
+                    || slab_len == V1M_LARGE_LEN
                 {
                     return Err(PercolatorError::InvalidSlabLen.into());
                 }

@@ -2573,6 +2573,7 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
+source = "git+https://github.com/dcccrypto/percolator.git?rev=4861c56ba3f313fe0631f1b63b298d4c693cd415#4861c56ba3f313fe0631f1b63b298d4c693cd415"
 
 [[package]]
 name = "percolator-prog"
