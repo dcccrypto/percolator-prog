@@ -2718,6 +2718,8 @@ pub mod ix {
         /// when engine balance is zero (e.g. raw SPL transfer bypassed engine).
         /// Admin-only. Requires no open positions.
         RescueOrphanVault,
+        /// PERC-8400: Close orphan slab and reclaim rent.
+        CloseOrphanSlab,
     }
 
     impl Instruction {
@@ -3300,6 +3302,8 @@ pub mod ix {
                 }
 
                 TAG_RESCUE_ORPHAN_VAULT => Ok(Instruction::RescueOrphanVault),
+
+                TAG_CLOSE_ORPHAN_SLAB => Ok(Instruction::CloseOrphanSlab),
 
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -17544,6 +17548,95 @@ pub mod processor {
                     "PERC-8400: rescued {} tokens from orphan vault",
                     actual_amount,
                 );
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            // PERC-8400: CloseOrphanSlab
+            // Layout-agnostic slab close: verifies admin via raw bytes,
+            // confirms vault ATA is empty, zeros slab data, drains lamports.
+            // ─────────────────────────────────────────────────────────────
+            Instruction::CloseOrphanSlab => {
+                // Accounts: [admin(signer,writable), slab(writable), vault(readonly)]
+                accounts::expect_len(accounts, 3)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_vault = &accounts[2];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                // 1. Slab must be owned by this program
+                if a_slab.owner != program_id {
+                    return Err(ProgramError::IllegalOwner);
+                }
+
+                // 2. Read raw slab bytes
+                {
+                    let mut slab_data = a_slab.try_borrow_mut_data()?;
+                    if slab_data.len() < 48 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+
+                    // Magic at offset 0..8 must be TALOCREP
+                    let magic = u64::from_le_bytes(
+                        slab_data[0..8]
+                            .try_into()
+                            .map_err(|_| ProgramError::InvalidAccountData)?,
+                    );
+                    if magic != MAGIC {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+
+                    // Admin pubkey at raw offset 16..48
+                    let admin_bytes: [u8; 32] = slab_data[16..48]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?;
+                    let slab_admin = Pubkey::new_from_array(admin_bytes);
+                    if slab_admin != *a_admin.key {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+
+                    // 3. Verify vault ATA is empty (prevent stranding tokens)
+                    let vault_data = a_vault.try_borrow_data()
+                        .map_err(|_| ProgramError::InvalidAccountData)?;
+                    if vault_data.len() >= 72 {
+                        let vault_amount = u64::from_le_bytes(
+                            vault_data[64..72]
+                                .try_into()
+                                .map_err(|_| ProgramError::InvalidAccountData)?,
+                        );
+                        if vault_amount > 0 {
+                            msg!("PERC-8400: vault still has {} tokens, rescue first", vault_amount);
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                        // Verify vault is owned by the vault PDA for this slab
+                        let vault_owner_bytes: [u8; 32] = vault_data[32..64]
+                            .try_into()
+                            .map_err(|_| ProgramError::InvalidAccountData)?;
+                        let vault_owner = Pubkey::new_from_array(vault_owner_bytes);
+                        let (expected_auth, _) =
+                            accounts::derive_vault_authority(program_id, a_slab.key);
+                        if vault_owner != expected_auth {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                    }
+                    drop(vault_data);
+
+                    // 4. Zero out the slab data
+                    for b in slab_data.iter_mut() {
+                        *b = 0;
+                    }
+                }
+
+                // 4. Drain all lamports from slab → admin
+                let slab_lamports = a_slab.lamports();
+                **a_slab.lamports.borrow_mut() = 0;
+                **a_admin.lamports.borrow_mut() = a_admin
+                    .lamports()
+                    .checked_add(slab_lamports)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                msg!("PERC-8400: closed orphan slab, reclaimed {} lamports", slab_lamports);
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,

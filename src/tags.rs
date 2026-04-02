@@ -118,6 +118,11 @@ pub const TAG_SET_OI_IMBALANCE_HARD_BLOCK: u8 = 71;
 /// Accounts: [admin(signer), slab(writable), admin_ata(writable), vault(writable), token_program, vault_pda]
 pub const TAG_RESCUE_ORPHAN_VAULT: u8 = 72;
 
+/// PERC-8400: Close orphan slab — drain lamports when vault is already empty.
+/// Layout-agnostic: reads raw bytes for magic + admin, verifies vault ATA is zero.
+/// Accounts: [admin(signer,writable), slab(writable), vault(readonly), vault_pda(readonly)]
+pub const TAG_CLOSE_ORPHAN_SLAB: u8 = 73;
+
 /// PERC-622: Advance oracle phase (permissionless crank).
 /// Transitions market through Phase 1→2→3 based on time + volume milestones.
 pub const TAG_ADVANCE_ORACLE_PHASE: u8 = 56;
@@ -251,6 +256,7 @@ mod tests {
             TAG_SET_WALLET_CAP,
             TAG_SET_OI_IMBALANCE_HARD_BLOCK,
             TAG_RESCUE_ORPHAN_VAULT,
+            TAG_CLOSE_ORPHAN_SLAB,
         ];
 
         for i in 0..tags.len() {
