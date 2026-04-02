@@ -2619,18 +2619,19 @@ pub mod processor {
             if basis > 0 {
                 engine.stored_pos_count_long = engine.stored_pos_count_long
                     .checked_sub(1).ok_or(RiskError::Overflow)?;
-                // Epoch-mismatched accounts must also decrement stale count
-                // (spec §5.3 step 5: stale accounts pending side reset)
+                // Epoch-mismatched accounts: decrement stale count (spec §5.3 step 5).
+                // On resolved markets, epoch mismatch is expected for accounts that
+                // were created before the last side reset. Use checked arithmetic.
                 if engine.accounts[i].adl_epoch_snap != engine.adl_epoch_long {
                     engine.stale_account_count_long = engine.stale_account_count_long
-                        .saturating_sub(1);
+                        .checked_sub(1).ok_or(RiskError::Overflow)?;
                 }
             } else {
                 engine.stored_pos_count_short = engine.stored_pos_count_short
                     .checked_sub(1).ok_or(RiskError::Overflow)?;
                 if engine.accounts[i].adl_epoch_snap != engine.adl_epoch_short {
                     engine.stale_account_count_short = engine.stale_account_count_short
-                        .saturating_sub(1);
+                        .checked_sub(1).ok_or(RiskError::Overflow)?;
                 }
             }
             engine.accounts[i].position_basis_q = 0;
@@ -5620,17 +5621,22 @@ pub mod processor {
                 verify_token_program(a_token)?;
 
                 // Phase 1: Read fee debt and validate (immutable borrow)
+                // Also verify vault BEFORE the SPL transfer.
                 let (unit_scale, debt_units) = {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
-                    // Block on resolved markets — deposit_fee_credits advances
-                    // engine.current_slot, which bricks WithdrawCollateral's
-                    // touch_account_full(frozen_slot) time monotonicity check.
                     if state::is_resolved(&data) {
                         return Err(ProgramError::InvalidAccountData);
                     }
                     let cfg = state::read_config(&data);
+                    let mint = Pubkey::new_from_array(cfg.collateral_mint);
+                    let auth = accounts::derive_vault_authority_with_bump(
+                        program_id, a_slab.key, cfg.vault_authority_bump,
+                    )?;
+                    verify_vault(a_vault, &auth, &mint,
+                        &Pubkey::new_from_array(cfg.vault_pubkey))?;
+                    verify_token_account(a_user_ata, a_user.key, &mint)?;
                     let engine = zc::engine_ref(&data)?;
                     check_idx(engine, user_idx)?;
                     let owner = engine.accounts[user_idx as usize].owner;
@@ -5656,15 +5662,9 @@ pub mod processor {
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
                 // Phase 4: Engine deposit_fee_credits (mutable borrow)
+                // Vault already verified in Phase 1.
                 let mut data = state::slab_data_mut(a_slab)?;
                 let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
                 let clock = Clock::from_account_info(a_clock)?;
                 let (units2, dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let old_dust = state::read_dust_base(&data);
