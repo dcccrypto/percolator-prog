@@ -1493,3 +1493,115 @@ fn test_resolve_permissionless_inverted_with_positions() {
     assert!(env.is_market_resolved());
 }
 
+// ============================================================================
+// Finding 1: ResolvePermissionless sentinel collision fix
+// ============================================================================
+
+/// Before any crank, permissionless resolution must be rejected (no real oracle established).
+#[test]
+fn test_resolve_permissionless_rejects_before_first_crank() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 100);
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Do NOT crank — last_effective_price_e6 is still 0
+
+    // Make oracle stale
+    env.svm.set_sysvar(&Clock {
+        slot: 600,
+        unix_timestamp: 600,
+        ..Clock::default()
+    });
+
+    let result = env.try_resolve_permissionless();
+    assert!(result.is_err(), "Must reject when no real oracle price established");
+}
+
+// ============================================================================
+// Finding 3: ResolveMarket settlement guard — live cap
+// ============================================================================
+
+/// A market with min_oracle_price_cap_e2bps=0 but live oracle_price_cap > 0
+/// should still enforce the settlement guard using the live cap.
+/// Scenario: authority pushes at $138 (matching oracle), then the external oracle
+/// jumps to $150 before resolution. The settlement guard should catch this.
+#[test]
+fn test_resolve_market_uses_live_cap_when_floor_is_zero() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Init with min_oracle_price_cap = 0 (no immutable floor)
+    env.init_market_with_invert(0);
+
+    // Set a live oracle_price_cap via admin
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap(); // 1% cap
+
+    // Crank to establish baseline
+    env.crank();
+
+    // Set up authority and push at current oracle price ($138)
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.set_slot(200);
+    env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
+
+    // Now external oracle jumps to $150 (9% move from $138)
+    // This simulates the oracle updating while the authority price is stale
+    env.set_slot_and_price(300, 150_000_000);
+
+    // ResolveMarket: authority_price=$138M, fresh oracle=$150M, cap=1%
+    // 138M is NOT within 1% of 150M → should be rejected.
+    // But with min_oracle_price_cap_e2bps=0, the old code skips the guard entirely.
+    let result = env.try_resolve_market(&admin);
+    assert!(
+        result.is_err(),
+        "Settlement guard must use live cap when floor=0 but cap>0"
+    );
+}
+
+// ============================================================================
+// Finding 8: ResolvePermissionless — authority pricing freshness
+// ============================================================================
+
+/// A market with a live oracle authority should NOT be permissionlessly resolvable
+/// just because the external feed is stale — the authority can still push prices.
+#[test]
+fn test_resolve_permissionless_blocked_by_live_authority() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 100);
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Crank + set authority
+    env.crank();
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+
+    // Authority pushes a fresh price
+    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+
+    // Make external oracle stale
+    env.svm.set_sysvar(&Clock {
+        slot: 600,
+        unix_timestamp: 600,
+        ..Clock::default()
+    });
+
+    // Should be rejected — authority is alive and pushing prices
+    let result = env.try_resolve_permissionless();
+    assert!(
+        result.is_err(),
+        "Must not resolve permissionlessly when authority is active"
+    );
+}
+

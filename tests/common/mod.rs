@@ -115,6 +115,8 @@ pub fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    // verification_level = 1 (Full) at offset 40 (u16 LE)
+    data[40..42].copy_from_slice(&1u16.to_le_bytes());
     data[42..74].copy_from_slice(feed_id);
     data[74..82].copy_from_slice(&price.to_le_bytes());
     data[82..90].copy_from_slice(&conf.to_le_bytes());

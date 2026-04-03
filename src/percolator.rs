@@ -2052,12 +2052,16 @@ pub mod oracle {
 
     // PriceUpdateV2 account layout offsets (134 bytes minimum)
     // See: https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
+    // Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) + ...
     const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
+    const OFF_VERIFICATION_LEVEL: usize = 40; // u16 enum: 0=Partial, 1=Full
     const OFF_FEED_ID: usize = 42; // 32 bytes
     const OFF_PRICE: usize = 74; // i64
     const OFF_CONF: usize = 82; // u64
     const OFF_EXPO: usize = 90; // i32
     const OFF_PUBLISH_TIME: usize = 94; // i64
+    /// Pyth VerificationLevel::Full (the only safe level for production)
+    const PYTH_VERIFICATION_FULL: u16 = 1;
 
     // Chainlink OCR2 State/Aggregator account layout offsets
     // Note: Different from the Transmissions ring buffer format in older docs
@@ -2100,6 +2104,19 @@ pub mod oracle {
         let data = price_ai.try_borrow_data()?;
         if data.len() < PRICE_UPDATE_V2_MIN_LEN {
             return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Reject partially verified Pyth updates (only Full is safe)
+        #[cfg(not(feature = "test"))]
+        {
+            let vl = u16::from_le_bytes(
+                data[OFF_VERIFICATION_LEVEL..OFF_VERIFICATION_LEVEL + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            if vl != PYTH_VERIFICATION_FULL {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
         }
 
         // Validate feed_id matches expected
@@ -5288,12 +5305,12 @@ pub mod processor {
                     }
                 }
                 // Non-Hyperp: settlement price must be within circuit-breaker
-                // bounds of a FRESH external oracle read — not stored baseline
-                // which can be authority-influenced. Uses the immutable
-                // min_oracle_price_cap_e2bps for the comparison.
+                // bounds of a FRESH external oracle read. Uses the live
+                // oracle_price_cap_e2bps (not just the immutable floor) so markets
+                // with min_cap=0 but live cap>0 still get the settlement guard.
                 // Hyperp: admin IS the price source, no external baseline.
                 if !oracle::is_hyperp_mode(&config)
-                    && config.min_oracle_price_cap_e2bps != 0
+                    && config.oracle_price_cap_e2bps != 0
                 {
                     let clock_tmp = Clock::from_account_info(a_clock)?;
                     // Read fresh external oracle price (bypasses authority override)
@@ -5309,7 +5326,7 @@ pub mod processor {
                     let clamped = oracle::clamp_oracle_price(
                         fresh_oracle,
                         config.authority_price_e6,
-                        config.min_oracle_price_cap_e2bps,
+                        config.oracle_price_cap_e2bps,
                     );
                     if clamped != config.authority_price_e6 {
                         return Err(PercolatorError::OracleInvalid.into());
@@ -6087,6 +6104,14 @@ pub mod processor {
                     }
                 }
 
+                // Block if an oracle authority is configured.
+                // A market with authority pricing has a human-in-the-loop who
+                // can push prices and resolve manually. Permissionless resolution
+                // is for fully admin-free markets only.
+                if config.oracle_authority != [0u8; 32] {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 // Also require minimum time since last crank (defense in depth)
                 {
                     let engine = zc::engine_ref(&data)?;
@@ -6128,12 +6153,19 @@ pub mod processor {
                 }
 
                 // Settlement price = last oracle price from engine.
-                // Reject if no real oracle read ever happened (sentinel price=1
-                // from non-Hyperp init, or price=0 from uninitialized state).
+                // Reject if no real oracle read ever happened. We check
+                // last_effective_price_e6 > 0 instead of last_oracle_price > 1
+                // because the engine init sentinel (init_price=1 for non-Hyperp)
+                // collides with legitimate unit_scale-derived prices of 1.
+                // last_effective_price_e6 starts at 0 for non-Hyperp and is only
+                // set by the first crank's read_price_clamped.
+                if !is_hyperp && config.last_effective_price_e6 == 0 {
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
                 let last_price = {
                     let engine = zc::engine_ref(&data)?;
                     let p = engine.last_oracle_price;
-                    if p <= 1 {
+                    if p == 0 {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     config.resolution_slot = engine.last_crank_slot;
