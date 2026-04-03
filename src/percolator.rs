@@ -10264,6 +10264,11 @@ pub mod processor {
             }
             Instruction::DepositCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 6)?;
+
+                if amount == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
@@ -10325,6 +10330,11 @@ pub mod processor {
             }
             Instruction::WithdrawCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 8)?;
+
+                if amount == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_vault = &accounts[2];
