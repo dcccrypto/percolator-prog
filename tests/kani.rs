@@ -3401,8 +3401,11 @@ fn proof_ewma_weighted_monotone_in_fee() {
     kani::assume(halflife > 0 && halflife <= 10_000);
     kani::assume(now_slot >= last_slot);
     kani::assume(now_slot - last_slot <= 10_000);
-    kani::assume(min_fee > 0 && min_fee <= KANI_MAX_PRICE);
+    kani::assume(min_fee > 1 && min_fee <= KANI_MAX_PRICE);
     kani::assume(fee_a < fee_b);
+    // Force at least one fee below threshold to exercise the scaling logic.
+    // Without this, both fees could exceed min_fee → both get full alpha → trivially monotone.
+    kani::assume(fee_a < min_fee);
 
     let result_a = ewma_update(old, price, halflife, last_slot, now_slot, fee_a, min_fee);
     let result_b = ewma_update(old, price, halflife, last_slot, now_slot, fee_b, min_fee);
@@ -3437,7 +3440,9 @@ fn proof_ewma_zero_fee_identity() {
     assert_eq!(result, old, "Zero fee must never move mark");
 }
 
-/// At-or-above threshold, fee-weighted result equals unweighted (min_fee=0).
+/// At-or-above threshold, fee-weighted result equals disabled-weighting result.
+/// When fee_paid >= min_fee, effective_alpha = alpha (full weight), which is
+/// identical to the min_fee=0 (disabled) path.
 #[kani::proof]
 #[kani::unwind(2)]
 fn proof_ewma_weight_at_threshold_equals_unweighted() {
@@ -3457,9 +3462,12 @@ fn proof_ewma_weight_at_threshold_equals_unweighted() {
     kani::assume(min_fee > 0 && min_fee <= KANI_MAX_PRICE);
     kani::assume(fee_paid >= min_fee);
 
+    // At-threshold: effective_alpha = alpha (unscaled)
     let weighted = ewma_update(old, price, halflife, last_slot, now_slot, fee_paid, min_fee);
-    let unweighted = ewma_update(old, price, halflife, last_slot, now_slot, 0, 0);
-    assert_eq!(weighted, unweighted,
-        "At-or-above threshold must equal unweighted");
+    // Disabled weighting: also uses full alpha (min_fee=0 skips scaling)
+    // Pass fee_paid to satisfy the old==0 bootstrap check too
+    let disabled = ewma_update(old, price, halflife, last_slot, now_slot, fee_paid, 0);
+    assert_eq!(weighted, disabled,
+        "At-or-above threshold must equal disabled-weighting result");
 }
 

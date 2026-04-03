@@ -3910,11 +3910,11 @@ fn test_funding_bootstrap_multiple_trades_and_crank() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.top_up_insurance(&admin, 1_000_000_000);
 
-    // Advance and trade again — EWMA should be stable (same price)
-    env.set_slot(200);
+    // Advance, change price, trade again — EWMA should update toward new price
+    env.set_slot_and_price(200, 140_000_000); // price moves from 138 to 140
     env.trade(&user, &lp, lp_idx, user_idx, 500_000);
     let ewma2 = env.read_mark_ewma();
-    assert!(ewma2 > 0, "EWMA still set after second trade");
+    assert!(ewma2 > ewma1, "EWMA must move toward higher price: ewma1={} ewma2={}", ewma1, ewma2);
 
     // Crank to accrue funding
     env.set_slot(300);
@@ -4254,23 +4254,21 @@ fn test_trade_nocpi_full_size_moves_mark() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    // Seed EWMA
+    // Seed EWMA at default price
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     let ewma_after_seed = env.read_mark_ewma();
 
-    // Large trade should move mark (fee well above threshold)
-    env.set_slot(200);
+    // Change price, then large trade should move mark toward new price
+    env.set_slot_and_price(200, 140_000_000); // 138 → 140
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
     let ewma_after_big = env.read_mark_ewma();
 
-    // With mark_min_fee=0 (disabled), the mark should move on any trade.
-    // With mark_min_fee=100 and a large trade generating fee >> 100, it should also move.
-    // Since oracle price ≈ exec price, the mark stays close, but there should be
-    // at least EWMA time-decay convergence from the dt=100 gap.
-    // The key test: this should NOT be blocked by fee weighting.
+    // The large trade's fee (>> mark_min_fee=100) should NOT be blocked.
+    // EWMA must move toward the new higher price.
     assert!(
-        ewma_after_big > 0,
-        "Mark should still be set after large trade"
+        ewma_after_big > ewma_after_seed,
+        "Large trade must move mark toward new price: seed={} after={}",
+        ewma_after_seed, ewma_after_big
     );
 }
 
@@ -4293,16 +4291,17 @@ fn test_trade_nocpi_zero_min_fee_allows_all() {
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     let ewma_seed = env.read_mark_ewma();
 
-    // Even dust trade should move mark when min_fee=0
-    env.set_slot(200);
+    // Change price, then even dust trade should move mark when min_fee=0
+    env.set_slot_and_price(200, 140_000_000); // 138 → 140
     env.trade(&user, &lp, lp_idx, user_idx, 1);
     let ewma_after = env.read_mark_ewma();
 
-    // With min_fee=0 and dt=100, EWMA should update (converge from time decay)
-    // Both trades execute at oracle price so mark ≈ oracle, but the EWMA
-    // time-decay factor means each update applies alpha*delta.
-    // The key assertion: the update was NOT blocked.
-    assert!(ewma_after > 0, "Mark should be set");
+    // With min_fee=0, dust trade gets full weight. EWMA must move toward new price.
+    assert!(
+        ewma_after > ewma_seed,
+        "Dust trade must move mark when min_fee=0: seed={} after={}",
+        ewma_seed, ewma_after,
+    );
 }
 
 // ============================================================================
