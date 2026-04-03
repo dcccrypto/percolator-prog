@@ -5612,9 +5612,8 @@ pub mod oracle {
         if max_change_e2bps == 0 || last_price == 0 {
             return raw_price;
         }
-        let max_delta =
-            ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000).min(u64::MAX as u128)
-                as u64;
+        let max_delta = ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000)
+            .min(u64::MAX as u128) as u64;
         let lower = last_price.saturating_sub(max_delta);
         let upper = last_price.saturating_add(max_delta);
         raw_price.clamp(lower, upper)
@@ -5983,10 +5982,7 @@ pub mod oracle {
         // Clamp to i64 range before the cast to prevent silent truncation
         // when large funding_k_bps produces a value exceeding i64::MAX.
         let per_slot_i128 = scaled / (funding_horizon_slots as i128);
-        let clamped = per_slot_i128.clamp(
-            -(max_bps_per_slot as i128),
-            max_bps_per_slot as i128,
-        );
+        let clamped = per_slot_i128.clamp(-(max_bps_per_slot as i128), max_bps_per_slot as i128);
         clamped as i64
     }
 }
