@@ -125,6 +125,10 @@ pub mod constants {
     /// Actual EMA drift is much slower due to alpha damping.
     pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 1_000;
     pub const DEFAULT_DEX_ORACLE_PRICE_CAP_E2BPS: u64 = 50_000; // 5% per slot max price change for DEX oracle markets
+    /// Maximum allowed value for oracle_price_cap_e2bps. 1_000_000 e2bps = 100%
+    /// per slot. Values above this are non-sensical and would effectively disable
+    /// the circuit breaker. GH#2017.
+    pub const MAX_ORACLE_PRICE_CAP_E2BPS: u64 = 1_000_000;
 
     /// Minimum DEX quote-side liquidity (in quote token lamports/atoms) required
     /// for UpdateHyperpMark to accept the price. This prevents bootstrapping a
@@ -12064,6 +12068,20 @@ pub mod processor {
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
+
+                // SECURITY (PERC-8386 / GH#2017): enforce upper bound on price cap.
+                // Values above 1_000_000 e2bps (= 100% per slot) are non-sensical
+                // and would effectively disable the circuit breaker. The field is
+                // u64 so negative values are impossible at the type level, but we
+                // enforce bounds at the instruction boundary for defense-in-depth.
+                if max_change_e2bps > crate::constants::MAX_ORACLE_PRICE_CAP_E2BPS {
+                    msg!(
+                        "SetOracleCap: cap_e2bps {} exceeds maximum {} (100%/slot)",
+                        max_change_e2bps,
+                        crate::constants::MAX_ORACLE_PRICE_CAP_E2BPS
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;

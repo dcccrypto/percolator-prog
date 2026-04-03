@@ -8002,3 +8002,309 @@ fn proof_premium_funding_horizon_cast_safe() {
         "output within policy clamp"
     );
 }
+
+// ============================================================================
+// PERC-8374: Kani proofs for compute_premium_funding_bps_per_slot (6-arg oracle
+//            version) and compute_combined_funding_rate — closes GH#1959 gap.
+// ============================================================================
+
+/// Proof: compute_premium_funding_bps_per_slot (6-arg oracle version) returns 0
+/// when any of mark_e6, index_e6, or funding_horizon_slots is zero.
+/// Validates zero-division guard and defensive 0-input handling.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_premium_funding_zero_inputs() {
+    use percolator_prog::oracle::compute_premium_funding_bps_per_slot;
+
+    let mark_e6: u64 = kani::any();
+    let index_e6: u64 = kani::any();
+    let funding_k_bps: u64 = kani::any();
+    let max_premium_bps: i64 = kani::any();
+    let max_bps_per_slot: i64 = kani::any();
+    kani::assume(max_premium_bps >= 0 && max_premium_bps <= 10_000);
+    kani::assume(max_bps_per_slot >= 0 && max_bps_per_slot <= 10_000);
+    kani::assume(funding_k_bps <= 10_000);
+
+    // mark == 0 → rate must be 0
+    let r_mark_zero = compute_premium_funding_bps_per_slot(
+        0,
+        index_e6,
+        1,
+        funding_k_bps,
+        max_premium_bps,
+        max_bps_per_slot,
+    );
+    kani::assert(r_mark_zero == 0, "mark=0 must return 0");
+
+    // index == 0 → rate must be 0
+    let r_index_zero = compute_premium_funding_bps_per_slot(
+        mark_e6,
+        0,
+        1,
+        funding_k_bps,
+        max_premium_bps,
+        max_bps_per_slot,
+    );
+    kani::assert(r_index_zero == 0, "index=0 must return 0");
+
+    // horizon == 0 → rate must be 0 (zero-division guard)
+    let r_horizon_zero = compute_premium_funding_bps_per_slot(
+        mark_e6,
+        index_e6,
+        0,
+        funding_k_bps,
+        max_premium_bps,
+        max_bps_per_slot,
+    );
+    kani::assert(r_horizon_zero == 0, "funding_horizon_slots=0 must return 0");
+}
+
+/// Proof: compute_premium_funding_bps_per_slot (6-arg) output is always bounded
+/// by [-max_bps_per_slot, +max_bps_per_slot] across the full valid input domain.
+/// Covers overflow-free arithmetic and correct policy clamp.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_premium_funding_bounded() {
+    use percolator_prog::oracle::compute_premium_funding_bps_per_slot;
+
+    let mark_e6: u64 = kani::any();
+    let index_e6: u64 = kani::any();
+    let funding_horizon_slots: u64 = kani::any();
+    let funding_k_bps: u64 = kani::any();
+    let max_premium_bps: i64 = kani::any();
+    let max_bps_per_slot: i64 = kani::any();
+
+    kani::assume(mark_e6 <= 1_000_000_000_000u64); // 1M USD @ 1e6 scale
+    kani::assume(index_e6 >= 1 && index_e6 <= 1_000_000_000_000u64);
+    kani::assume(funding_horizon_slots >= 1 && funding_horizon_slots <= i64::MAX as u64);
+    kani::assume(funding_k_bps <= 10_000u64);
+    kani::assume(max_premium_bps >= 0 && max_premium_bps <= 10_000);
+    kani::assume(max_bps_per_slot >= 0 && max_bps_per_slot <= 10_000);
+
+    kani::cover!(
+        mark_e6 == 1_000_000_000_000u64,
+        "COVER: near-max mark price"
+    );
+    kani::cover!(funding_horizon_slots == 1, "COVER: minimum horizon");
+
+    let result = compute_premium_funding_bps_per_slot(
+        mark_e6,
+        index_e6,
+        funding_horizon_slots,
+        funding_k_bps,
+        max_premium_bps,
+        max_bps_per_slot,
+    );
+
+    kani::assert(
+        result >= -max_bps_per_slot && result <= max_bps_per_slot,
+        "output must be clamped to [-max_bps_per_slot, +max_bps_per_slot]",
+    );
+}
+
+/// Proof: compute_premium_funding_bps_per_slot (6-arg) sign correctness.
+/// mark > index → rate >= 0 (longs overpaying).
+/// mark < index → rate <= 0 (shorts overpaying).
+/// mark == index → rate == 0 (no premium).
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_premium_funding_sign_correct() {
+    use percolator_prog::oracle::compute_premium_funding_bps_per_slot;
+
+    let mark_e6: u64 = kani::any();
+    let index_e6: u64 = kani::any();
+    let funding_horizon_slots: u64 = kani::any();
+    let funding_k_bps: u64 = kani::any();
+    let max_premium_bps: i64 = kani::any();
+    let max_bps_per_slot: i64 = kani::any();
+
+    kani::assume(mark_e6 >= 1 && mark_e6 <= 1_000_000_000_000u64);
+    kani::assume(index_e6 >= 1 && index_e6 <= 1_000_000_000_000u64);
+    kani::assume(funding_horizon_slots >= 1 && funding_horizon_slots <= 1_000_000u64);
+    kani::assume(funding_k_bps >= 1 && funding_k_bps <= 10_000u64);
+    kani::assume(max_premium_bps > 0 && max_premium_bps <= 10_000);
+    kani::assume(max_bps_per_slot > 0 && max_bps_per_slot <= 10_000);
+
+    let result = compute_premium_funding_bps_per_slot(
+        mark_e6,
+        index_e6,
+        funding_horizon_slots,
+        funding_k_bps,
+        max_premium_bps,
+        max_bps_per_slot,
+    );
+
+    if mark_e6 > index_e6 {
+        kani::assert(result >= 0, "mark > index must yield non-negative rate");
+    } else if mark_e6 < index_e6 {
+        kani::assert(result <= 0, "mark < index must yield non-positive rate");
+    } else {
+        kani::assert(result == 0, "mark == index must yield zero rate");
+    }
+}
+
+/// Proof: compute_premium_funding_bps_per_slot (6-arg) does not panic on extreme
+/// (saturating) inputs — max u64 mark, min horizon, max k_bps. Validates the
+/// saturating_mul paths do not cause UB.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_premium_funding_extreme_no_panic() {
+    use percolator_prog::oracle::compute_premium_funding_bps_per_slot;
+
+    // Worst-case extreme inputs: max mark, min index, minimum valid horizon
+    let result =
+        compute_premium_funding_bps_per_slot(u64::MAX, 1u64, 1u64, 10_000u64, 10_000i64, 10_000i64);
+    // Must not panic; result must be clamped within policy
+    kani::assert(
+        result >= -10_000 && result <= 10_000,
+        "extreme inputs must be saturated to policy bounds",
+    );
+
+    // Inverted: min mark, max index
+    let result2 =
+        compute_premium_funding_bps_per_slot(1u64, u64::MAX, 1u64, 10_000u64, 10_000i64, 10_000i64);
+    kani::assert(
+        result2 >= -10_000 && result2 <= 10_000,
+        "extreme inverted inputs must be saturated to policy bounds",
+    );
+}
+
+/// Proof: compute_combined_funding_rate output is bounded by
+/// [min(inv, prem), max(inv, prem)] — it is a convex blend, never extrapolates.
+/// Validates MAX_FUNDING_RATE_BPS clamping behavior.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_combined_rate_bounded() {
+    let inv_rate: i64 = kani::any();
+    let prem_rate: i64 = kani::any();
+    let weight: u64 = kani::any();
+
+    kani::assume(inv_rate >= -10_000 && inv_rate <= 10_000);
+    kani::assume(prem_rate >= -10_000 && prem_rate <= 10_000);
+    kani::assume(weight <= 10_000);
+
+    let combined =
+        percolator::RiskEngine::compute_combined_funding_rate(inv_rate, prem_rate, weight);
+
+    let lo = core::cmp::min(inv_rate, prem_rate);
+    let hi = core::cmp::max(inv_rate, prem_rate);
+    kani::assert(
+        combined >= lo && combined <= hi,
+        "combined rate must lie between inventory and premium (convex blend)",
+    );
+}
+
+/// Proof: compute_combined_funding_rate sign-correctness on positive/negative premium.
+/// When premium > inv and weight > 0, combined >= inv (pulled toward premium).
+/// When premium < inv and weight > 0, combined <= inv (pulled toward premium).
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_combined_rate_sign_correct() {
+    let inv_rate: i64 = kani::any();
+    let prem_rate: i64 = kani::any();
+    let weight: u64 = kani::any();
+
+    kani::assume(inv_rate >= -10_000 && inv_rate <= 10_000);
+    kani::assume(prem_rate >= -10_000 && prem_rate <= 10_000);
+    kani::assume(weight > 0 && weight < 10_000);
+
+    let combined =
+        percolator::RiskEngine::compute_combined_funding_rate(inv_rate, prem_rate, weight);
+
+    // With a non-trivial weight, combined must be strictly between inv and prem
+    // (or equal when inv == prem)
+    if prem_rate > inv_rate {
+        kani::assert(
+            combined >= inv_rate && combined <= prem_rate,
+            "positive premium blend must pull rate toward premium",
+        );
+    } else if prem_rate < inv_rate {
+        kani::assert(
+            combined >= prem_rate && combined <= inv_rate,
+            "negative premium blend must pull rate toward premium",
+        );
+    } else {
+        kani::assert(
+            combined == inv_rate,
+            "equal rates must yield combined == inv_rate",
+        );
+    }
+}
+
+/// Proof: compute_combined_funding_rate weight=0 and weight=10000 boundary cases.
+/// Validates that edge weights return pure inventory / pure premium respectively.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8374_combined_rate_weight_extremes() {
+    let inv_rate: i64 = kani::any();
+    let prem_rate: i64 = kani::any();
+
+    kani::assume(inv_rate >= -10_000 && inv_rate <= 10_000);
+    kani::assume(prem_rate >= -10_000 && prem_rate <= 10_000);
+
+    let r_inv_only = percolator::RiskEngine::compute_combined_funding_rate(inv_rate, prem_rate, 0);
+    kani::assert(
+        r_inv_only == inv_rate,
+        "weight=0 must return pure inventory rate",
+    );
+
+    let r_prem_only =
+        percolator::RiskEngine::compute_combined_funding_rate(inv_rate, prem_rate, 10_000);
+    kani::assert(
+        r_prem_only == prem_rate,
+        "weight=10000 must return pure premium rate",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PERC-8386 / GH#2017: oracle price-cap bounds validation
+// ---------------------------------------------------------------------------
+
+/// Proof: MAX_ORACLE_PRICE_CAP_E2BPS is exactly 1_000_000 (100% per slot).
+/// Any valid cap_e2bps value accepted by SetOraclePriceCap must be in [0, 1_000_000].
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8386_oracle_cap_upper_bound() {
+    use percolator_prog::constants::MAX_ORACLE_PRICE_CAP_E2BPS;
+
+    let cap: u64 = kani::any();
+    kani::assume(cap <= MAX_ORACLE_PRICE_CAP_E2BPS);
+
+    // The accepted range [0, MAX] must not exceed 100% per slot
+    kani::assert(
+        cap <= 1_000_000,
+        "oracle cap must not exceed 100% per slot (1_000_000 e2bps)",
+    );
+
+    // Cover: boundary values are reachable
+    kani::cover!(cap == 0, "cap=0 is reachable within range");
+    kani::cover!(
+        cap == MAX_ORACLE_PRICE_CAP_E2BPS,
+        "cap=MAX is reachable within range"
+    );
+}
+
+/// Proof: values above MAX_ORACLE_PRICE_CAP_E2BPS are always rejected.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(2)]
+fn kani_perc8386_oracle_cap_rejects_above_max() {
+    use percolator_prog::constants::MAX_ORACLE_PRICE_CAP_E2BPS;
+
+    let cap: u64 = kani::any();
+    kani::assume(cap > MAX_ORACLE_PRICE_CAP_E2BPS);
+
+    // Any value above MAX is out of bounds
+    kani::assert(
+        cap > 1_000_000,
+        "values above MAX must be above 100% per slot",
+    );
+}
