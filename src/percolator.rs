@@ -17457,8 +17457,7 @@ pub mod processor {
 
                 // Read actual vault SPL token balance (byte offset 64 in token account)
                 let vault_data = a_vault.try_borrow_data()?;
-                let vault_token =
-                    crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
+                let vault_token = crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
                 let actual_amount = vault_token.amount;
                 drop(vault_data);
 
