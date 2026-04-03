@@ -8796,6 +8796,9 @@ pub mod processor {
         const V1M_SMALL_LEN: usize = 65416;
         const V1M_MEDIUM_LEN: usize = 257512;
         const V1M_LARGE_LEN: usize = 1025896;
+        // V1M2 layout: ENGINE_OFF=616, CONFIG_LEN=512, ACCOUNT_SIZE=312
+        // Created by program build with SBF target (cfg target_arch="sbf", u128 align=16)
+        const V1M2_MEDIUM_LEN: usize = 323312;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
             correct_len: data.len() == SLAB_LEN
@@ -8804,7 +8807,8 @@ pub mod processor {
                 || data.len() == PRE_ADL_SLAB_LEN
                 || data.len() == V1M_SMALL_LEN
                 || data.len() == V1M_MEDIUM_LEN
-                || data.len() == V1M_LARGE_LEN,
+                || data.len() == V1M_LARGE_LEN
+                || data.len() == V1M2_MEDIUM_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
