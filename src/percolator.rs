@@ -9065,12 +9065,13 @@ pub mod processor {
         }
 
         let pos = engine.accounts[user_idx as usize].position_size.get();
-        let abs_pos = pos.unsigned_abs() as u64;
+        // Compare in u128 to prevent silent truncation when |pos| >= 2^64.
+        let abs_pos = pos.unsigned_abs();
 
-        if abs_pos > cap {
+        if abs_pos > cap as u128 {
             msg!(
                 "PERC-8111: Wallet position cap exceeded: |pos|={} cap={} (e6 units)",
-                abs_pos,
+                abs_pos.min(u64::MAX as u128) as u64,
                 cap,
             );
             return Err(PercolatorError::WalletPositionCapExceeded.into());
