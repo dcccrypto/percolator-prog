@@ -3389,6 +3389,33 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
+                // Validate custom funding parameters (same checks as UpdateConfig).
+                // These are immutable after init for governance-free deployments.
+                if let Some(h) = custom_funding_horizon {
+                    if h == 0 {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
+                if let Some(k) = custom_funding_k {
+                    if k > 100_000 {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
+                if let Some(mp) = custom_max_premium {
+                    if mp < 0 {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
+                if let Some(ms) = custom_max_per_slot {
+                    if ms < 0 || ms > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
+                // mark_min_fee upper bound: prevent setting so high that EWMA never updates
+                if mark_min_fee > percolator::MAX_PROTOCOL_FEE_ABS as u64 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
                 #[cfg(debug_assertions)]
                 {
                     if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
@@ -4137,9 +4164,10 @@ pub mod processor {
 
                 // Side-mode gating is handled inside engine.execute_trade()
 
-                // Snapshot capitals for fee-weighted EWMA (before execute_trade modifies them)
-                let cap_user_before = engine.accounts[user_idx as usize].capital.get();
-                let cap_lp_before = engine.accounts[lp_idx as usize].capital.get();
+                // Snapshot insurance fund balance for fee-weighted EWMA.
+                // The delta after execute_trade = exact fee collected into I
+                // (avoids the pre-trade capital snapshot overestimate issue).
+                let ins_before = engine.insurance_fund.balance.get();
 
                 #[cfg(feature = "cu-audit")]
                 {
@@ -4165,19 +4193,12 @@ pub mod processor {
                         price,
                         config.oracle_price_cap_e2bps,
                     );
-                    // Compute fee_paid for EWMA weighting (mirrors engine fee logic)
+                    // fee_paid = actual fee collected into insurance (post - pre).
+                    // This is exact: no overestimate from pre-trade capital snapshot.
                     let fee_paid_nocpi = if config.mark_min_fee > 0 {
-                        let notional = (size.unsigned_abs())
-                            .saturating_mul(price as u128)
-                            / (percolator::POS_SCALE as u128);
-                        let fee_bps = engine.params.trading_fee_bps;
-                        let fee = if notional > 0 && fee_bps > 0 {
-                            // ceil(notional * fee_bps / 10_000)
-                            (notional.saturating_mul(fee_bps as u128) + 9_999) / 10_000
-                        } else { 0u128 };
-                        let paid_user = core::cmp::min(fee, cap_user_before) as u64;
-                        let paid_lp = core::cmp::min(fee, cap_lp_before) as u64;
-                        paid_user.saturating_add(paid_lp)
+                        let ins_after = engine.insurance_fund.balance.get();
+                        let delta = ins_after.saturating_sub(ins_before);
+                        core::cmp::min(delta, u64::MAX as u128) as u64
                     } else { 0u64 };
                     config.mark_ewma_e6 = crate::verify::ewma_update(
                         config.mark_ewma_e6, clamped_price,
@@ -4436,9 +4457,8 @@ pub mod processor {
 
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
 
-                    // Snapshot capitals for fee-weighted EWMA
-                    let cap_user_cpi = engine.accounts[user_idx as usize].capital.get();
-                    let cap_lp_cpi = engine.accounts[lp_idx as usize].capital.get();
+                    // Snapshot insurance for fee-weighted EWMA (exact delta approach)
+                    let ins_before_cpi = engine.insurance_fund.balance.get();
 
                     #[cfg(feature = "cu-audit")]
                     {
@@ -4469,18 +4489,11 @@ pub mod processor {
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
-                        // Compute fee_paid for EWMA weighting (TradeCpi path)
+                        // fee_paid = actual fee collected into insurance (post - pre).
                         let fee_paid_cpi = if config.mark_min_fee > 0 {
-                            let notional = (trade_size.unsigned_abs())
-                                .saturating_mul(exec_price as u128)
-                                / (percolator::POS_SCALE as u128);
-                            let fee_bps = engine.params.trading_fee_bps;
-                            let fee = if notional > 0 && fee_bps > 0 {
-                                (notional.saturating_mul(fee_bps as u128) + 9_999) / 10_000
-                            } else { 0u128 };
-                            let paid_user = core::cmp::min(fee, cap_user_cpi) as u64;
-                            let paid_lp = core::cmp::min(fee, cap_lp_cpi) as u64;
-                            paid_user.saturating_add(paid_lp)
+                            let ins_after_cpi = engine.insurance_fund.balance.get();
+                            let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                            core::cmp::min(delta, u64::MAX as u128) as u64
                         } else { 0u64 };
                         config.mark_ewma_e6 = crate::verify::ewma_update(
                             config.mark_ewma_e6,

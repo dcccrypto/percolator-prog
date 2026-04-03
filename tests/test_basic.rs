@@ -3984,6 +3984,87 @@ fn test_init_market_no_funding_params_uses_defaults() {
 }
 
 // ============================================================================
+// Init-time funding param validation
+// ============================================================================
+
+/// InitMarket with funding_horizon_slots=0 must be rejected.
+#[test]
+fn test_init_market_rejects_zero_funding_horizon() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_funding(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        0, 10_000, 0,
+        0, // funding_horizon_slots = 0 (invalid)
+        100, 500, 5,
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "funding_horizon_slots=0 must be rejected");
+}
+
+/// InitMarket with funding_k_bps > 100_000 must be rejected.
+#[test]
+fn test_init_market_rejects_excessive_funding_k() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_funding(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        0, 10_000, 0,
+        500,
+        100_001, // k > 100_000 (invalid)
+        500, 5,
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "funding_k_bps > 100_000 must be rejected");
+}
+
+/// InitMarket with negative funding_max_premium_bps must be rejected.
+#[test]
+fn test_init_market_rejects_negative_max_premium() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_funding(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        0, 10_000, 0,
+        500, 100,
+        -1, // negative (invalid)
+        5,
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "negative funding_max_premium_bps must be rejected");
+}
+
+/// InitMarket with negative funding_max_bps_per_slot must be rejected.
+#[test]
+fn test_init_market_rejects_negative_max_per_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_funding(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        0, 10_000, 0,
+        500, 100, 500,
+        -1, // negative (invalid)
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "negative funding_max_bps_per_slot must be rejected");
+}
+
+/// InitMarket with mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected.
+#[test]
+fn test_init_market_rejects_excessive_mark_min_fee() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_min_fee(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        0, 10_000, 0,
+        500, 100, 500, 5,
+        u64::MAX, // way too large
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected");
+}
+
+// ============================================================================
 // Phase 3: mark_min_fee config field + wire format
 // ============================================================================
 
