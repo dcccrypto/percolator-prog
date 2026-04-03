@@ -15921,6 +15921,8 @@ pub mod processor {
                     return Err(ProgramError::IncorrectProgramId);
                 }
 
+                // Verify slab_a is program-owned before trusting its data.
+                accounts::expect_owner(a_slab_a, program_id)?;
                 // Verify admin on slab_a (#958: slab_a admin check)
                 {
                     let data_a = a_slab_a.try_borrow_data()?;
@@ -15934,6 +15936,8 @@ pub mod processor {
                     require_admin(header.admin, a_admin.key)?;
                 }
 
+                // Verify slab_b is program-owned before trusting its data.
+                accounts::expect_owner(a_slab_b, program_id)?;
                 // #958: Verify admin on slab_b — prevents cross-admin pair manipulation
                 // where slab_a admin could register a pair with an unrelated slab_b.
                 {
