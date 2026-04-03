@@ -9105,7 +9105,6 @@ fn test_attack_conservation_invariant() {
     );
 }
 
-
 // ============================================================================
 // PERC-8400: RescueOrphanVault tests
 // ============================================================================
@@ -9167,7 +9166,9 @@ fn test_rescue_orphan_vault_happy_path() {
         &[&admin],
         env.svm.latest_blockhash(),
     );
-    env.svm.send_transaction(tx).expect("RescueOrphanVault should succeed");
+    env.svm
+        .send_transaction(tx)
+        .expect("RescueOrphanVault should succeed");
 
     // Verify: vault empty, admin got everything
     assert_eq!(env.vault_balance(), 0, "Vault should be empty after rescue");
@@ -9181,7 +9182,11 @@ fn test_rescue_orphan_vault_happy_path() {
 
     // CloseSlab should now succeed
     let result = env.try_close_slab();
-    assert!(result.is_ok(), "CloseSlab should succeed after rescue: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "CloseSlab should succeed after rescue: {:?}",
+        result
+    );
 
     println!("PERC-8400: RescueOrphanVault happy path PASSED");
 }
@@ -9226,8 +9231,15 @@ fn test_rescue_orphan_vault_non_admin_rejected() {
         env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "ATTACK: Non-admin rescue should be rejected");
-    assert_eq!(env.vault_balance(), vault_before, "Vault should be unchanged");
+    assert!(
+        result.is_err(),
+        "ATTACK: Non-admin rescue should be rejected"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        vault_before,
+        "Vault should be unchanged"
+    );
 
     println!("PERC-8400: Non-admin rescue rejected PASSED");
 }
@@ -9278,7 +9290,9 @@ fn test_rescue_orphan_vault_empty_is_noop() {
         &[&admin],
         env.svm.latest_blockhash(),
     );
-    env.svm.send_transaction(tx).expect("Empty vault rescue should succeed (no-op)");
+    env.svm
+        .send_transaction(tx)
+        .expect("Empty vault rescue should succeed (no-op)");
 
     println!("PERC-8400: Empty vault no-op PASSED");
 }

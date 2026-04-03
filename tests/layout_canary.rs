@@ -19,7 +19,10 @@ use std::mem::{align_of, size_of};
 #[test]
 fn header_len_pinned() {
     // SlabHeader: magic(8) + version(4) + ... = 104 bytes
-    assert_eq!(HEADER_LEN, 104, "HEADER_LEN changed — this breaks ALL existing slabs");
+    assert_eq!(
+        HEADER_LEN, 104,
+        "HEADER_LEN changed — this breaks ALL existing slabs"
+    );
 }
 
 #[test]
@@ -107,7 +110,9 @@ fn slab_guard_accepts_all_known_sizes() {
             "slab_guard would REJECT on-chain slab size {} ({}) — \
              add it to slab_guard's accepted sizes before deploying!\n\
              Accepted sizes: {:?}",
-            size, label, accepted
+            size,
+            label,
+            accepted
         );
     }
 }
@@ -132,7 +137,8 @@ fn account_struct_size_pinned() {
         known_sizes.contains(&account_size),
         "Account struct size {} is not a known size {:?} — \
          this will break existing markets! Update slab_guard, SDK, and this test.",
-        account_size, known_sizes
+        account_size,
+        known_sizes
     );
 }
 
@@ -180,7 +186,11 @@ fn sbf_config_len_would_be_496() {
     //   4. slab_guard accepted sizes
     println!("Expected SBF CONFIG_LEN: 496 (u128 align=8)");
     println!("Expected SBF ENGINE_OFF: align_up(104 + 496, 8) = 600");
-    println!("Actual native CONFIG_LEN: {} (u128 align={})", CONFIG_LEN, align_of::<u128>());
+    println!(
+        "Actual native CONFIG_LEN: {} (u128 align={})",
+        CONFIG_LEN,
+        align_of::<u128>()
+    );
     println!("Actual native ENGINE_OFF: {}", ENGINE_OFF);
     // The SBF values (496, 600) are for the OLD bpf target.
     // Modern SBF (target_arch=sbf, not bpf) uses 512, 616.
@@ -203,8 +213,14 @@ fn print_all_layout_constants() {
     println!("║  ENGINE_OFF    = {:>8}            ║", ENGINE_OFF);
     println!("║  ENGINE_LEN    = {:>8}            ║", ENGINE_LEN);
     println!("║  SLAB_LEN      = {:>8}            ║", SLAB_LEN);
-    println!("║  MAX_ACCOUNTS  = {:>8}            ║", percolator::MAX_ACCOUNTS);
-    println!("║  Account size  = {:>8}            ║", size_of::<percolator::Account>());
+    println!(
+        "║  MAX_ACCOUNTS  = {:>8}            ║",
+        percolator::MAX_ACCOUNTS
+    );
+    println!(
+        "║  Account size  = {:>8}            ║",
+        size_of::<percolator::Account>()
+    );
     println!("║  u128 align    = {:>8}            ║", align_of::<u128>());
     println!("╚══════════════════════════════════════╝");
 
@@ -213,5 +229,8 @@ fn print_all_layout_constants() {
     println!("\nSDK cross-check (V1M2 layout for 323312-byte slabs):");
     println!("  SDK V1M2_ENGINE_OFF should be: 616 (SBF target)");
     println!("  SDK V1M2_CONFIG_LEN should be: 512 (SBF target)");
-    println!("  SDK V1M2_ACCOUNT_SIZE should be: {}", size_of::<percolator::Account>());
+    println!(
+        "  SDK V1M2_ACCOUNT_SIZE should be: {}",
+        size_of::<percolator::Account>()
+    );
 }
