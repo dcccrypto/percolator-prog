@@ -9923,13 +9923,11 @@ pub mod processor {
         // balance and split 50/50 between insurance fund and LP vault capital.
         {
             let vault_data = a_vault.try_borrow_data()?;
-            let seed_amount =
-                crate::spl_token::state::get_token_account_amount(&vault_data)?;
+            let seed_amount = crate::spl_token::state::get_token_account_amount(&vault_data)?;
             drop(vault_data);
             if seed_amount > 0 {
                 let config = state::read_config(&data);
-                let (units, dust) =
-                    crate::units::base_to_units(seed_amount, config.unit_scale);
+                let (units, dust) = crate::units::base_to_units(seed_amount, config.unit_scale);
                 let insurance_half = (units as u128) / 2;
                 let vault_half = (units as u128) - insurance_half; // rounds up
                 let engine = zc::engine_mut(&mut data)?;
@@ -9938,9 +9936,7 @@ pub mod processor {
                     .top_up_insurance_fund(insurance_half)
                     .map_err(crate::error::map_risk_error)?;
                 // LP vault half: tracked in vault only (available as LP capital)
-                engine.vault = percolator::U128::new(
-                    engine.vault.get().saturating_add(vault_half),
-                );
+                engine.vault = percolator::U128::new(engine.vault.get().saturating_add(vault_half));
                 if dust > 0 {
                     state::write_dust_base(&mut data, dust);
                 }
@@ -17507,7 +17503,9 @@ pub mod processor {
 
                 // Magic at offset 0..8 must be TALOCREP
                 let magic = u64::from_le_bytes(
-                    slab_data[0..8].try_into().map_err(|_| ProgramError::InvalidAccountData)?,
+                    slab_data[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
                 );
                 if magic != MAGIC {
                     return Err(ProgramError::InvalidAccountData);
@@ -17536,8 +17534,7 @@ pub mod processor {
 
                 // 4. Verify vault ATA is owned by vault PDA (read SPL token account)
                 let vault_data = a_vault.try_borrow_data()?;
-                let vault_token =
-                    crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
+                let vault_token = crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
                 if vault_token.owner != auth {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -17632,7 +17629,8 @@ pub mod processor {
                     }
 
                     // 3. Verify vault ATA is empty (prevent stranding tokens)
-                    let vault_data = a_vault.try_borrow_data()
+                    let vault_data = a_vault
+                        .try_borrow_data()
                         .map_err(|_| ProgramError::InvalidAccountData)?;
                     if vault_data.len() >= 72 {
                         let vault_amount = u64::from_le_bytes(
@@ -17641,7 +17639,10 @@ pub mod processor {
                                 .map_err(|_| ProgramError::InvalidAccountData)?,
                         );
                         if vault_amount > 0 {
-                            msg!("PERC-8400: vault still has {} tokens, rescue first", vault_amount);
+                            msg!(
+                                "PERC-8400: vault still has {} tokens, rescue first",
+                                vault_amount
+                            );
                             return Err(ProgramError::InvalidAccountData);
                         }
                         // Verify vault is owned by the vault PDA for this slab
@@ -17671,7 +17672,10 @@ pub mod processor {
                     .checked_add(slab_lamports)
                     .ok_or(PercolatorError::EngineOverflow)?;
 
-                msg!("PERC-8400: closed orphan slab, reclaimed {} lamports", slab_lamports);
+                msg!(
+                    "PERC-8400: closed orphan slab, reclaimed {} lamports",
+                    slab_lamports
+                );
             }
 
             // Defense-in-depth: if a future tag routes here by mistake,
