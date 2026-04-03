@@ -5977,12 +5977,15 @@ pub mod oracle {
         // Apply k multiplier (100 => 1.00x)
         let scaled = premium_bps.saturating_mul(funding_k_bps as i128) / 100i128;
 
-        // Convert to per-slot by dividing by horizon
-        let mut per_slot = (scaled / (funding_horizon_slots as i128)) as i64;
-
-        // Policy clamp
-        per_slot = per_slot.clamp(-max_bps_per_slot, max_bps_per_slot);
-        per_slot
+        // Convert to per-slot by dividing by horizon.
+        // Clamp to i64 range before the cast to prevent silent truncation
+        // when large funding_k_bps produces a value exceeding i64::MAX.
+        let per_slot_i128 = scaled / (funding_horizon_slots as i128);
+        let clamped = per_slot_i128.clamp(
+            -(max_bps_per_slot as i128),
+            max_bps_per_slot as i128,
+        );
+        clamped as i64
     }
 }
 
