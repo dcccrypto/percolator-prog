@@ -16015,10 +16015,12 @@ pub mod processor {
                     return Err(ProgramError::IncorrectProgramId);
                 }
 
-                // #983: Validate system program
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
+                // PERC-8391: Verify slab_a and slab_b are program-owned before
+                // trusting their data — defense-in-depth matching SetOffsetPair
+                // (PR#195/209). Without this, a crafted account with valid-looking
+                // layout could be substituted.
+                accounts::expect_owner(a_slab_a, program_id)?;
+                accounts::expect_owner(a_slab_b, program_id)?;
 
                 // Read pair config to get offset_bps
                 let pair_data = a_pair_pda.try_borrow_data()?;
