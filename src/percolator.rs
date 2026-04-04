@@ -15921,11 +15921,6 @@ pub mod processor {
                     return Err(ProgramError::IncorrectProgramId);
                 }
 
-                // #983: Validate system program
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
                 // Verify admin on slab_a (#958: slab_a admin check)
                 {
                     let data_a = a_slab_a.try_borrow_data()?;
