@@ -3935,14 +3935,11 @@ pub mod processor {
                             // are force-closed via AdminForceCloseAccount, which
                             // does best-effort touch then falls through to
                             // close_account_resolved using stored local state.
-                            // on stored local state without accrue/settle.
-                            // Best-effort touch for resolved settlement.
-                            // _not_atomic callers must abort on Err (partial state).
-                            // If touch fails, abort the crank — the account will be
-                            // settled by ForceCloseResolved in a separate transaction.
-                            engine.touch_account_full_not_atomic(
-                                idx as usize, settlement_price, frozen_slot,
-                            ).map_err(map_risk_error)?;
+                            // Resolved crank does NOT call touch_account_full.
+                            // touch_account_full_not_atomic can leave partial state on
+                            // error, and aborting on one bad account would stall the
+                            // entire batch. Accounts are settled by ForceCloseResolved
+                            // which handles K-pair fallback atomically.
                         }
                     }
 
@@ -4290,6 +4287,14 @@ pub mod processor {
 
                     check_idx(engine, lp_idx)?;
                     check_idx(engine, user_idx)?;
+
+                    // TradeCpi: enforce LP account kind on lp_idx.
+                    // The LP's matcher program/context are used for CPI — a non-LP
+                    // account would have zero matcher fields, causing CPI to fail
+                    // or route to the wrong program.
+                    if !engine.accounts[lp_idx as usize].is_lp() {
+                        return Err(PercolatorError::EngineAccountKindMismatch.into());
+                    }
 
                     // Owner authorization via verify helper (Kani-provable)
                     let u_owner = engine.accounts[user_idx as usize].owner;
@@ -4663,9 +4668,10 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    engine.touch_account_full_not_atomic(
-                        user_idx as usize, price, config.resolution_slot,
-                    ).map_err(map_risk_error)?;
+                    // force_close_resolved handles K-pair PnL, maintenance fees,
+                    // loss settlement, and account close internally.
+                    // Do NOT pre-touch: touch can fail on epoch-mismatch accounts
+                    // that force_close_resolved was specifically designed to handle.
                     engine.force_close_resolved_not_atomic(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -5799,12 +5805,6 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Best-effort touch to settle K-pair PnL and maintenance fees.
-                // If touch fails (epoch mismatch, overflow), force_close_resolved
-                // handles it via its manual K-pair fallback.
-                engine.touch_account_full_not_atomic(
-                        user_idx as usize, price, config.resolution_slot,
-                    ).map_err(map_risk_error)?;
                 let amt_units = engine.force_close_resolved_not_atomic(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
@@ -6259,9 +6259,6 @@ pub mod processor {
                 );
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                engine.touch_account_full_not_atomic(
-                        user_idx as usize, price, config.resolution_slot,
-                    ).map_err(map_risk_error)?;
                 let amt_units = engine.force_close_resolved_not_atomic(user_idx)
                     .map_err(map_risk_error)?;
 

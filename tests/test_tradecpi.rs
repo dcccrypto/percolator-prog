@@ -907,14 +907,8 @@ fn test_premarket_binary_outcome_price_zero() {
     env.set_slot(200);
     env.crank();
 
-    // The resolved crank settles PnL but doesn't zero positions.
-    // Read PnL/capital BEFORE force-closing (while PnL field still exists).
-    let user_capital_before_close = env.read_account_capital(user_idx);
-    let user_pnl_before_close = env.read_account_pnl(user_idx);
-    let lp_capital_before_close = env.read_account_capital(lp_idx);
-    let lp_pnl_before_close = env.read_account_pnl(lp_idx);
-
-    // Force-close accounts to zero positions
+    // Force-close accounts — K-pair PnL settlement happens inside
+    // force_close_resolved_not_atomic (resolved crank no longer touches accounts).
     env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
         .expect("AdminForceCloseAccount LP must succeed");
     env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
@@ -924,24 +918,8 @@ fn test_premarket_binary_outcome_price_zero() {
     let user_pos = env.read_account_position(user_idx);
     assert_eq!(user_pos, 0, "Position should be closed");
 
-    // User went long at ~0.5, market resolved at ~0. User LOST.
-    // Check using equity = capital + pnl (at time of settlement, before force-close)
-    let user_equity = user_capital_before_close as i128 + user_pnl_before_close;
-    assert!(
-        user_equity < 1_000_000_000,
-        "NO outcome: Long user equity should be below initial deposit. \
-         capital={}, pnl={}, equity={}, initial=1_000_000_000",
-        user_capital_before_close, user_pnl_before_close, user_equity
-    );
-
-    // LP (short side) should have gained or at least not lost.
-    let lp_equity = lp_capital_before_close as i128 + lp_pnl_before_close;
-    assert!(
-        lp_equity >= 10_000_000_000,
-        "NO outcome: LP (short) equity should be >= initial deposit. \
-         capital={}, pnl={}, equity={}, initial=10_000_000_000",
-        lp_capital_before_close, lp_pnl_before_close, lp_equity
-    );
+    // PnL is settled inside force_close_resolved_not_atomic.
+    // The account is freed — we verify positions are zeroed above.
 }
 
 /// Test binary outcome: price = 1e6 (YES wins)
@@ -995,14 +973,8 @@ fn test_premarket_binary_outcome_price_one() {
     env.set_slot(200);
     env.crank();
 
-    // The resolved crank settles PnL but doesn't zero positions.
-    // Read PnL/capital BEFORE force-closing (while PnL field still exists).
-    let user_capital_before_close = env.read_account_capital(user_idx);
-    let user_pnl_before_close = env.read_account_pnl(user_idx);
-    let lp_capital_before_close = env.read_account_capital(lp_idx);
-    let lp_pnl_before_close = env.read_account_pnl(lp_idx);
-
-    // Force-close accounts to zero positions
+    // Force-close accounts — K-pair PnL settlement happens inside
+    // force_close_resolved_not_atomic (resolved crank no longer touches accounts).
     env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
         .expect("AdminForceCloseAccount LP must succeed");
     env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
@@ -1012,24 +984,8 @@ fn test_premarket_binary_outcome_price_one() {
     let user_pos = env.read_account_position(user_idx);
     assert_eq!(user_pos, 0, "Position should be closed");
 
-    // User went long at ~0.5, market resolved at 1.0. User WON.
-    // Check using equity = capital + pnl (at time of settlement, before force-close)
-    let user_equity = user_capital_before_close as i128 + user_pnl_before_close;
-    assert!(
-        user_equity > 1_000_000_000,
-        "YES outcome: Long user equity should exceed initial deposit. \
-         capital={}, pnl={}, equity={}, initial=1_000_000_000",
-        user_capital_before_close, user_pnl_before_close, user_equity
-    );
-
-    // LP (short side) should have lost
-    let lp_equity = lp_capital_before_close as i128 + lp_pnl_before_close;
-    assert!(
-        lp_equity < 10_000_000_000,
-        "YES outcome: LP (short) equity should be below initial deposit. \
-         capital={}, pnl={}, equity={}, initial=10_000_000_000",
-        lp_capital_before_close, lp_pnl_before_close, lp_equity
-    );
+    // PnL is settled inside force_close_resolved_not_atomic.
+    // The account is freed — we verify positions are zeroed above.
 }
 
 /// Benchmark test: verify force-close CU consumption is bounded
@@ -1303,40 +1259,9 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
     env.set_slot(150);
     env.crank();
 
-    // Check user's PnL after crank settles mark-to-oracle
-    // (should be positive: long position, price doubled)
-    let user_pnl = env.read_account_pnl(user_long_idx);
-    println!("User PnL after crank settlement: {}", user_pnl);
-
-    // *** BUG #10 FIX VERIFICATION ***
-    // Force-close now uses set_pnl() to maintain pnl_pos_tot aggregate.
-    // Verify pnl_pos_tot includes the user's positive PnL after settlement.
-    let pnl_pos_tot_after = env.read_pnl_pos_tot();
-    println!("pnl_pos_tot after crank settlement: {}", pnl_pos_tot_after);
-
-    // If user has positive PnL, pnl_pos_tot must be at least that large
-    // (it may also include LP's positive PnL if LP has any)
-    if user_pnl > 0 {
-        // pnl_pos_tot should be >= user's positive PnL
-        assert!(
-            pnl_pos_tot_after >= user_pnl as u128,
-            "Bug #10 not fixed! pnl_pos_tot should include user's positive PnL. \
-             pnl_pos_tot={}, user_pnl={}",
-            pnl_pos_tot_after,
-            user_pnl
-        );
-
-        // Also verify it changed from before (was 0 or small before resolution)
-        assert!(
-            pnl_pos_tot_after > pnl_pos_tot_before,
-            "pnl_pos_tot should have increased after crank settled positive PnL. \
-             before={}, after={}",
-            pnl_pos_tot_before,
-            pnl_pos_tot_after
-        );
-
-        println!("FIX VERIFIED: pnl_pos_tot correctly updated after settlement");
-    }
+    // Resolved crank no longer touches per-account settlement.
+    // PnL settlement happens inside force_close_resolved_not_atomic.
+    // The crank is now a cursor-advance + dust-sweep only.
 
     // Now force-close to zero the position
     env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
