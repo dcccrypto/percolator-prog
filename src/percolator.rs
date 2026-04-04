@@ -12291,6 +12291,23 @@ pub mod processor {
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
 
+                // Validate that bounds themselves are within the global oracle sanity range.
+                // A non-zero bound above MAX_ORACLE_PRICE would allow extreme liquidations via admin misconfiguration.
+                if min_oracle_price_e6 > 0 && !crate::verify::oracle_price_valid(min_oracle_price_e6) {
+                    msg!(
+                        "SetOraclePriceBounds: min_price {} out of valid oracle range [1, 1e15]",
+                        min_oracle_price_e6
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+                if max_oracle_price_e6 > 0 && !crate::verify::oracle_price_valid(max_oracle_price_e6) {
+                    msg!(
+                        "SetOraclePriceBounds: max_price {} out of valid oracle range [1, 1e15]",
+                        max_oracle_price_e6
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 // Validate that min <= max when both are non-zero
                 if min_oracle_price_e6 > 0
                     && max_oracle_price_e6 > 0
