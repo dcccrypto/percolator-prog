@@ -1402,11 +1402,13 @@ pub mod ix {
                     let lp_idx = read_u16(&mut rest)?;
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
-                    // Backward compat: limit_price_e6 is optional
-                    let limit_price_e6 = if rest.len() >= 8 {
+                    // limit_price_e6: exactly 8 bytes or absent (0 = no limit)
+                    let limit_price_e6 = if rest.len() == 8 {
                         read_u64(&mut rest)?
+                    } else if rest.is_empty() {
+                        0u64
                     } else {
-                        0u64 // no limit
+                        return Err(ProgramError::InvalidInstructionData);
                     };
                     Ok(Instruction::TradeCpi {
                         lp_idx,
@@ -3989,7 +3991,12 @@ pub mod processor {
                         a_oracle,
                     )?
                 } else {
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                    let p = oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
+                    // Stamp last good oracle slot for permissionless resolution delay.
+                    // ResolvePermissionless checks against this (not last_crank_slot)
+                    // so the delay counts from oracle death, not crank inactivity.
+                    config.last_hyperp_index_slot = clock.slot;
+                    p
                 };
 
                 state::write_config(&mut data, &config);
@@ -4098,6 +4105,10 @@ pub mod processor {
                 // Read oracle price with circuit-breaker clamping
                 let price =
                     oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
+                // Stamp last good oracle slot for permissionless resolution delay
+                if !oracle::is_hyperp_mode(&config) {
+                    config.last_hyperp_index_slot = clock.slot;
+                }
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -6079,11 +6090,19 @@ pub mod processor {
                     }
                 }
 
-                // Also require minimum time since last crank (defense in depth)
+                // Require oracle has been dead for the configured delay.
+                // Non-Hyperp: use last_hyperp_index_slot (repurposed as last_good_oracle_slot)
+                // which is stamped on every successful external oracle read.
+                // Hyperp: use last_crank_slot (mark staleness already checked above).
                 {
-                    let engine = zc::engine_ref(&data)?;
-                    let crank_staleness = clock.slot.saturating_sub(engine.last_crank_slot);
-                    if crank_staleness < config.permissionless_resolve_stale_slots {
+                    let reference_slot = if !is_hyperp {
+                        config.last_hyperp_index_slot // = last_good_oracle_slot
+                    } else {
+                        let engine = zc::engine_ref(&data)?;
+                        engine.last_crank_slot
+                    };
+                    let oracle_dead_duration = clock.slot.saturating_sub(reference_slot);
+                    if oracle_dead_duration < config.permissionless_resolve_stale_slots {
                         return Err(PercolatorError::OracleStale.into());
                     }
                 }
