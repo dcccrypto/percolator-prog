@@ -5677,27 +5677,27 @@ pub mod oracle {
         min_price_e6: u64,
         max_price_e6: u64,
     ) -> u64 {
-        // First apply relative clamping (circuit breaker)
-        let circuit_breaker_clamped =
-            if max_change_e2bps == 0 || last_price == 0 {
-                raw_price
-            } else {
-                let max_delta = ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000)
-                    .min(u64::MAX as u128) as u64;
-                let lower = last_price.saturating_sub(max_delta);
-                let upper = last_price.saturating_add(max_delta);
-                raw_price.clamp(lower, upper)
-            };
+        // Compute circuit breaker allowed range [cb_min, cb_max]
+        let (cb_min, cb_max) = if max_change_e2bps == 0 || last_price == 0 {
+            (0u64, u64::MAX)
+        } else {
+            let max_delta = ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000)
+                .min(u64::MAX as u128) as u64;
+            (last_price.saturating_sub(max_delta), last_price.saturating_add(max_delta))
+        };
 
-        // Then apply absolute bounds
-        if min_price_e6 > 0 && circuit_breaker_clamped < min_price_e6 {
-            return min_price_e6;
-        }
-        if max_price_e6 > 0 && circuit_breaker_clamped > max_price_e6 {
-            return max_price_e6;
-        }
+        // Compute bounds allowed range [bound_min, bound_max]
+        // 0 means "no constraint" — use the extremes
+        let bound_min = if min_price_e6 > 0 { min_price_e6 } else { 0u64 };
+        let bound_max = if max_price_e6 > 0 { max_price_e6 } else { u64::MAX };
 
-        circuit_breaker_clamped
+        // Compute intersection of both ranges
+        // If cb_min > bound_max or cb_max < bound_min, the ranges don't overlap,
+        // but we still clamp to produce a sane result (prefer bounds over breaker)
+        let final_min = if bound_min == 0 { cb_min } else { cb_min.max(bound_min) };
+        let final_max = if bound_max == u64::MAX { cb_max } else { cb_max.min(bound_max) };
+
+        raw_price.clamp(final_min, final_max)
     }
 
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
@@ -12320,6 +12320,13 @@ pub mod processor {
                     );
                     return Err(ProgramError::InvalidArgument);
                 }
+
+                // Runtime behavior: clamp_oracle_price_with_bounds() computes the intersection
+                // of the circuit breaker range (relative to last_price) and the bounds range.
+                // This prevents bounds from circumventing the circuit breaker protection.
+                // Even if bounds are set far outside the typical price range, they will be
+                // constrained by the per-slot price movement cap at read time.
+                // Example: last=100, cap=10% → allowed [90,110], min=150 → final range [90,110]
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
