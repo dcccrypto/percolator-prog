@@ -28,11 +28,11 @@ fn header_len_pinned() {
 #[test]
 fn config_len_pinned() {
     // CONFIG_LEN depends on target alignment:
-    //   Native (u128 align=16): 512
-    //   SBF/BPF (u128 align=8): 496
-    // Tests run on native, so we expect 512.
+    //   Native (u128 align=16): 528 (HIGH-003: +16 bytes for oracle bounds)
+    //   SBF/BPF (u128 align=8): 512 (HIGH-003: +16 bytes for oracle bounds)
+    // Tests run on native, so we expect 528.
     assert_eq!(
-        CONFIG_LEN, 512,
+        CONFIG_LEN, 528,
         "CONFIG_LEN changed on native target — check MarketConfig struct for added/removed fields"
     );
 }
@@ -40,8 +40,8 @@ fn config_len_pinned() {
 #[test]
 fn engine_off_pinned() {
     // ENGINE_OFF = align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN)
-    // Native: align_up(104 + 512, 16) = align_up(616, 16) = 624 (if align=16)
-    //   or align_up(616, 8) = 616 (if align=8)
+    // Native: align_up(104 + 528, 16) = align_up(632, 16) = 640
+    //   (CONFIG_LEN grew by 16 bytes for HIGH-003 oracle bounds)
     let expected = (HEADER_LEN + CONFIG_LEN + (ENGINE_ALIGN - 1)) & !(ENGINE_ALIGN - 1);
     assert_eq!(ENGINE_OFF, expected, "ENGINE_OFF formula changed");
     println!("ENGINE_OFF = {} (native)", ENGINE_OFF);
