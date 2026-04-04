@@ -9532,6 +9532,25 @@ pub mod processor {
         Ok(())
     }
 
+    /// GH#2073: Verify the Token-2022 program account is the canonical
+    /// `spl_token_2022::id()`.  Without this check a crafted program with
+    /// a valid-looking interface could be substituted for the real
+    /// Token-2022 program in MintPositionNft / TransferPositionOwnership /
+    /// BurnPositionNft CPI calls.
+    #[allow(unused_variables)]
+    fn verify_token22_program(a_token22: &AccountInfo) -> Result<(), ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            if *a_token22.key != spl_token_2022::id() {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+            if !a_token22.executable {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+        }
+        Ok(())
+    }
+
     /// PERC-328: Validate SPL mint account in its own stack frame.
     /// `Mint::unpack` creates an 82-byte struct on the stack; keeping it in
     /// the caller's frame (process_init_market) contributed to SBF 4 KiB
@@ -12543,6 +12562,10 @@ pub mod processor {
                 accounts::expect_signer(a_payer)?;
                 accounts::expect_writable(a_payer)?;
                 verify_token_program(a_token)?;
+                // GH#2074: verify system_program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 let data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -13791,6 +13814,10 @@ pub mod processor {
                 accounts::expect_writable(a_lp_vault_state)?;
                 accounts::expect_writable(a_lp_vault_mint)?;
                 verify_token_program(a_token)?;
+                // GH#2074: verify system_program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 if fee_share_bps > 10_000 {
                     return Err(PercolatorError::LpVaultInvalidFeeShare.into());
@@ -14596,6 +14623,10 @@ pub mod processor {
                 accounts::expect_writable(a_challenger_ata)?;
                 accounts::expect_writable(a_vault)?;
                 verify_token_program(a_token)?;
+                // GH#2074: verify system_program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 let data = a_slab.try_borrow_data()?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -15018,6 +15049,10 @@ pub mod processor {
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_queue)?;
+                // GH#2074: verify system_program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 let data = a_slab.try_borrow_data()?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -16949,6 +16984,12 @@ pub mod processor {
                 accounts::expect_writable(a_nft_pda)?;
                 accounts::expect_writable(a_nft_mint)?;
                 accounts::expect_writable(a_owner_ata)?;
+                // GH#2073: verify token_2022_program
+                verify_token22_program(a_token22)?;
+                // GH#2074: verify system_program
+                if *a_system.key != solana_program::system_program::id() {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
 
                 // Verify slab
                 let data = state::slab_data_mut(a_slab)?;
@@ -17124,6 +17165,8 @@ pub mod processor {
                 accounts::expect_writable(a_nft_mint)?;
                 accounts::expect_writable(a_src_ata)?;
                 accounts::expect_writable(a_dst_ata)?;
+                // GH#2073: verify token_2022_program
+                verify_token22_program(a_token22)?;
 
                 // Verify slab (read-only — we drop this borrow before the CPI below)
                 let slab_data = state::slab_data_mut(a_slab)?;
@@ -17230,6 +17273,8 @@ pub mod processor {
                 accounts::expect_writable(a_nft_pda)?;
                 accounts::expect_writable(a_nft_mint)?;
                 accounts::expect_writable(a_owner_ata)?;
+                // GH#2073: verify token_2022_program
+                verify_token22_program(a_token22)?;
 
                 // Verify slab
                 let slab_data = state::slab_data_mut(a_slab)?;
