@@ -11617,6 +11617,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                // Block closes during pause — prevents fund extraction during
+                // emergency pause, matching Deposit/Withdraw/Trade behaviour.
+                require_not_paused(&data)?;
                 let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
