@@ -16324,26 +16324,33 @@ pub mod processor {
 
             // PERC-628: InitSharedVault — admin creates the global shared vault PDA.
             //
-            // PERC-8292 / GH#1915: First-caller-wins singleton init (intentional by design).
-            // The signer is required but is NOT checked against a stored admin key because
-            // SharedVaultState has no admin field (adding one would be a breaking layout change).
-            // Security: the `AccountAlreadyInitialized` guard on `a_shared_vault.data_is_empty()`
-            // prevents double-init, so the race window only exists during deployment.
-            // Mitigation: submit InitSharedVault in the same transaction as program deployment,
-            // or use a multisig signer. See docs/PERC-628-shared-vault.md §Deployment Procedure.
+            // Security: require the caller to prove admin authority by passing
+            // an existing slab whose admin matches the signer. This closes the
+            // front-running window described in PERC-8292 — without a valid
+            // slab admin key the instruction is rejected.
             Instruction::InitSharedVault {
                 epoch_duration_slots,
                 max_market_exposure_bps,
             } => {
                 // accounts: [0] admin (signer), [1] shared_vault PDA (writable),
-                //           [2] system_program
-                accounts::expect_len(accounts, 3)?;
+                //           [2] system_program, [3] slab (admin proof)
+                accounts::expect_len(accounts, 4)?;
                 let a_admin = &accounts[0];
                 let a_shared_vault = &accounts[1];
                 let a_system_program = &accounts[2];
+                let a_slab = &accounts[3];
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_shared_vault)?;
+
+                // Verify signer is a slab admin (prevents unauthorised init).
+                {
+                    let slab_data = state::slab_data_mut(a_slab)?;
+                    slab_guard(program_id, a_slab, &slab_data)?;
+                    require_initialized(&slab_data)?;
+                    let header = state::read_header(&slab_data);
+                    require_admin(header.admin, a_admin.key)?;
+                }
 
                 if *a_system_program.key != solana_program::system_program::id() {
                     return Err(ProgramError::IncorrectProgramId);
