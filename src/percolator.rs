@@ -15791,8 +15791,9 @@ pub mod processor {
                     } else if slab_data.len() >= v1d_total && slab_data.len() <= v1d_total + 16 {
                         (V1D_BITMAP_OFF, v1d_accounts_off)
                     } else {
-                        // Unknown layout — use V1D as best-effort fallback.
-                        (V1D_BITMAP_OFF, v1d_accounts_off)
+                        // SECURITY(M-3): reject unknown slab layouts instead of
+                        // silently falling back — a wrong offset could corrupt data.
+                        return Err(ProgramError::InvalidAccountData);
                     };
 
                 let acct_off = accounts_off + (user_idx as usize) * ACCT_SIZE;
@@ -17750,33 +17751,43 @@ pub mod processor {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
+                    // SECURITY(M-1): Verify vault is owned by SPL Token program.
+                    if a_vault.owner != &crate::spl_token::id() {
+                        return Err(ProgramError::IllegalOwner);
+                    }
+
                     // 3. Verify vault ATA is empty (prevent stranding tokens)
                     let vault_data = a_vault
                         .try_borrow_data()
                         .map_err(|_| ProgramError::InvalidAccountData)?;
-                    if vault_data.len() >= 72 {
-                        let vault_amount = u64::from_le_bytes(
-                            vault_data[64..72]
-                                .try_into()
-                                .map_err(|_| ProgramError::InvalidAccountData)?,
-                        );
-                        if vault_amount > 0 {
-                            msg!(
-                                "PERC-8400: vault still has {} tokens, rescue first",
-                                vault_amount
-                            );
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                        // Verify vault is owned by the vault PDA for this slab
-                        let vault_owner_bytes: [u8; 32] = vault_data[32..64]
+                    // SECURITY(M-1): Require valid SPL token account data length.
+                    // The old soft check (>= 72) skipped vault verification entirely
+                    // for short accounts, allowing a non-token account to bypass the
+                    // emptiness guard.
+                    if vault_data.len() < 72 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let vault_amount = u64::from_le_bytes(
+                        vault_data[64..72]
                             .try_into()
-                            .map_err(|_| ProgramError::InvalidAccountData)?;
-                        let vault_owner = Pubkey::new_from_array(vault_owner_bytes);
-                        let (expected_auth, _) =
-                            accounts::derive_vault_authority(program_id, a_slab.key);
-                        if vault_owner != expected_auth {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
+                            .map_err(|_| ProgramError::InvalidAccountData)?,
+                    );
+                    if vault_amount > 0 {
+                        msg!(
+                            "PERC-8400: vault still has {} tokens, rescue first",
+                            vault_amount
+                        );
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    // Verify vault is owned by the vault PDA for this slab
+                    let vault_owner_bytes: [u8; 32] = vault_data[32..64]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidAccountData)?;
+                    let vault_owner = Pubkey::new_from_array(vault_owner_bytes);
+                    let (expected_auth, _) =
+                        accounts::derive_vault_authority(program_id, a_slab.key);
+                    if vault_owner != expected_auth {
+                        return Err(ProgramError::InvalidAccountData);
                     }
                     drop(vault_data);
 
