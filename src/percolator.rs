@@ -12747,6 +12747,13 @@ pub mod processor {
                     // Guard: if insurance already has balance but supply is 0, that means
                     // admin topped up via TopUpInsurance before creating LP mint.
                     // Still safe: first LP depositor gets tokens proportional to their deposit only.
+                    //
+                    // SECURITY(M-6): Enforce minimum first deposit to prevent vault
+                    // share inflation attacks via TopUpInsurance donation.
+                    const MIN_FIRST_DEPOSIT_UNITS: u64 = 1_000;
+                    if units < MIN_FIRST_DEPOSIT_UNITS {
+                        return Err(PercolatorError::InsuranceZeroAmount.into());
+                    }
                     units
                 } else {
                     if insurance_balance_before == 0 {
