@@ -10262,6 +10262,8 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                // SECURITY(M-10): Block InitLP during pause (consistent with InitUser).
+                require_not_paused(&data)?;
 
                 // Block new LPs when market is resolved
                 if state::is_resolved(&data) {
