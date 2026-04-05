@@ -15579,6 +15579,9 @@ pub mod processor {
                 const V1M_SMALL_LEN: usize = 65416;
                 const V1M_MEDIUM_LEN: usize = 257512;
                 const V1M_LARGE_LEN: usize = 1025896;
+                // SECURITY(C-2): V1M2 tier was missing — an active V1M2 slab
+                // could bypass CloseSlab safety checks (vault/insurance/position guards).
+                const V1M2_MEDIUM_LEN: usize = 323312;
                 let slab_data = a_slab.try_borrow_data()?;
                 let slab_len = slab_data.len();
                 if slab_len == SLAB_LEN
@@ -15588,6 +15591,7 @@ pub mod processor {
                     || slab_len == V1M_SMALL_LEN
                     || slab_len == V1M_MEDIUM_LEN
                     || slab_len == V1M_LARGE_LEN
+                    || slab_len == V1M2_MEDIUM_LEN
                 {
                     return Err(PercolatorError::InvalidSlabLen.into());
                 }

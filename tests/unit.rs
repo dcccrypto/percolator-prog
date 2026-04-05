@@ -6706,6 +6706,39 @@ fn transfer_ownership_cpi_rejects_non_executable_nft_program() {
     assert_eq!(result, Err(ProgramError::IncorrectProgramId));
 }
 
+/// SECURITY(C-2): CloseStaleSlabs must reject V1M2_MEDIUM_LEN (323312) slabs.
+/// Without this rejection, an active V1M2 slab could be zeroed + drained
+/// bypassing all CloseSlab safety checks (vault, insurance, positions).
+#[test]
+fn close_stale_slabs_rejects_v1m2_slab() {
+    let program_id = Pubkey::new_unique();
+    let admin = Pubkey::new_unique();
+
+    // Create a V1M2-sized slab (323312 bytes) with valid magic + admin
+    let mut slab_data = vec![0u8; 323312];
+    // Write MAGIC (TALOCREP) at offset 0..8
+    let magic_bytes = 0x5045524F434C4154u64.to_le_bytes();
+    slab_data[0..8].copy_from_slice(&magic_bytes);
+    // Write admin at offset 16..48
+    slab_data[16..48].copy_from_slice(&admin.to_bytes());
+
+    let mut slab = TestAccount::new(Pubkey::new_unique(), program_id, 0, slab_data).writable();
+    let mut dest = TestAccount::new(admin, solana_program::system_program::id(), 0, vec![])
+        .signer()
+        .writable();
+
+    let accounts = vec![dest.to_info(), slab.to_info()];
+    let ix = vec![51u8]; // TAG_CLOSE_STALE_SLAB = 51
+    let result = process_instruction(&program_id, &accounts, &ix);
+    assert_eq!(
+        result,
+        Err(ProgramError::Custom(
+            percolator_prog::error::PercolatorError::InvalidSlabLen as u32
+        )),
+        "SECURITY(C-2): CloseStaleSlabs must reject V1M2_MEDIUM_LEN (323312) slabs"
+    );
+}
+
 // =============================================================================
 // PERC-8273 T8: ExecuteAdl Tests
 // =============================================================================
