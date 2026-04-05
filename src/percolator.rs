@@ -12215,10 +12215,18 @@ pub mod processor {
                 }
 
                 // Require admin oracle price to be set (authority_price_e6 > 0)
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 if config.authority_price_e6 == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
+
+                // SECURITY(M-15): Record resolved_slot and settlement_price_e6.
+                // Without resolved_slot, ChallengeSettlement dispute window is
+                // computed from slot 0, making disputes always appear expired.
+                let clock = Clock::get()?;
+                config.resolved_slot = clock.slot;
+                config.settlement_price_e6 = config.authority_price_e6;
+                state::write_config(&mut data, &config);
 
                 // Set the resolved flag
                 state::set_resolved(&mut data);
