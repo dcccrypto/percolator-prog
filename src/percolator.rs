@@ -13632,6 +13632,40 @@ pub mod processor {
 
                 // Read spot price AND liquidity from the DEX pool (#297 Fix 1).
                 // Rejects thin pools where an attacker can cheaply manipulate spot price.
+                // SECURITY(M-4): Raydium CLMM and Meteora DLMM pools must also bind
+                // one token to the market's collateral_mint, just like PumpSwap.
+                if *a_dex_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID {
+                    let pool_data = a_dex_pool.try_borrow_data()?;
+                    const RAYDIUM_CLMM_OFF_MINT0: usize = 73;
+                    const RAYDIUM_CLMM_OFF_MINT1: usize = 105;
+                    if pool_data.len() < RAYDIUM_CLMM_OFF_MINT1 + 32 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let mint0: [u8; 32] = pool_data[RAYDIUM_CLMM_OFF_MINT0..RAYDIUM_CLMM_OFF_MINT0 + 32]
+                        .try_into().unwrap();
+                    let mint1: [u8; 32] = pool_data[RAYDIUM_CLMM_OFF_MINT1..RAYDIUM_CLMM_OFF_MINT1 + 32]
+                        .try_into().unwrap();
+                    if mint0 != config.collateral_mint && mint1 != config.collateral_mint {
+                        msg!("UpdateHyperpMark: Raydium CLMM pool mints do not match collateral_mint");
+                        return Err(PercolatorError::InvalidOracleKey.into());
+                    }
+                } else if *a_dex_pool.owner == crate::oracle::METEORA_DLMM_PROGRAM_ID {
+                    let pool_data = a_dex_pool.try_borrow_data()?;
+                    const METEORA_OFF_TOKEN_X_MINT: usize = 81;
+                    const METEORA_OFF_TOKEN_Y_MINT: usize = 113;
+                    if pool_data.len() < METEORA_OFF_TOKEN_Y_MINT + 32 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    let mint_x: [u8; 32] = pool_data[METEORA_OFF_TOKEN_X_MINT..METEORA_OFF_TOKEN_X_MINT + 32]
+                        .try_into().unwrap();
+                    let mint_y: [u8; 32] = pool_data[METEORA_OFF_TOKEN_Y_MINT..METEORA_OFF_TOKEN_Y_MINT + 32]
+                        .try_into().unwrap();
+                    if mint_x != config.collateral_mint && mint_y != config.collateral_mint {
+                        msg!("UpdateHyperpMark: Meteora DLMM pool mints do not match collateral_mint");
+                        return Err(PercolatorError::InvalidOracleKey.into());
+                    }
+                }
+
                 let remaining = &accounts[3..];
                 let dex_result = oracle::read_dex_price_with_liquidity(
                     a_dex_pool,
