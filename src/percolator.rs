@@ -10865,8 +10865,12 @@ pub mod processor {
                 let effective_funding_rate = {
                     let oi = engine.total_open_interest.get();
                     let vault = engine.vault.get();
-                    if vault == 0 || oi == 0 {
+                    if oi == 0 {
                         blended_funding_rate
+                    } else if vault == 0 {
+                        // SECURITY(M-7): freeze funding when vault is empty but
+                        // positions exist — no liquidity to back payments.
+                        0
                     } else {
                         let oi_x10000 = (oi as u128).saturating_mul(10_000);
                         let vault_x2 = (vault as u128).saturating_mul(2);
