@@ -4969,25 +4969,24 @@ pub mod oracle {
 
         // Compute price_e6 = sqrt_price_x64^2 * 10^decimal_diff / 2^128
         //
-        // PRECISION FIX: The naive approach `(sqrt >> 64) * sqrt` drops all low bits,
-        // causing sqrtHi = 0 for micro-priced tokens (most memecoins where sqrt < 2^64).
-        // Instead, we scale up by 1e6 BEFORE dividing, preserving precision:
-        //   scaled_sqrt = sqrt * 1_000_000
-        //   term = scaled_sqrt >> 64
-        //   price_e6_raw = term * sqrt >> 64
-        // This gives us 6 extra decimal digits of precision.
-        // We then adjust decimal_diff by -6 since we already multiplied by 1e6.
-        let scaled_sqrt = sqrt_price_x64
+        // SECURITY(M-14): Use hi/lo 64-bit decomposition for pseudo-256-bit
+        // squaring to avoid divide-before-multiply precision loss. The old
+        // approach lost up to 64 bits for micro-priced tokens (memecoins
+        // where sqrt_price_x64 < 2^64), causing zero or imprecise price reads.
+        //
+        // sqrt^2 = (hi*2^64 + lo)^2  =>  divided by 2^128:
+        //   result = hi^2 + (2*hi*lo) >> 64
+        let hi = sqrt_price_x64 >> 64;
+        let lo = sqrt_price_x64 & ((1u128 << 64) - 1);
+        let hh = hi * hi;
+        let hl2 = hi.checked_mul(lo).unwrap_or(u128::MAX >> 1) << 1;
+        let price_ratio = hh.saturating_add(hl2 >> 64);
+
+        let price_e6_raw = price_ratio
             .checked_mul(1_000_000)
             .ok_or(PercolatorError::EngineOverflow)?;
-        let term = scaled_sqrt >> 64;
-        let price_e6_raw = term
-            .checked_mul(sqrt_price_x64)
-            .ok_or(PercolatorError::EngineOverflow)?
-            >> 64;
 
-        // We already embedded 1e6, so adjust decimal_diff accordingly
-        let adjusted_diff = decimal_diff - 6;
+        let adjusted_diff = decimal_diff;
 
         let price_e6 = if adjusted_diff >= 0 {
             let scale = 10u128.pow(adjusted_diff as u32);
