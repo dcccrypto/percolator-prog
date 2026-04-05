@@ -6706,6 +6706,41 @@ fn transfer_ownership_cpi_rejects_non_executable_nft_program() {
     assert_eq!(result, Err(ProgramError::IncorrectProgramId));
 }
 
+/// SECURITY(C-1): TransferOwnershipCpi must reject an arbitrary deployed program
+/// that is not the canonical percolator-nft program, even if it is executable
+/// and loader-owned. This prevents position theft via fake NFT programs.
+#[test]
+fn transfer_ownership_cpi_rejects_wrong_nft_program_id() {
+    let program_id = Pubkey::new_unique();
+    let fake_nft_prog_id = Pubkey::new_unique();
+    let (mint_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &fake_nft_prog_id);
+
+    let mut caller = TestAccount::new(
+        mint_auth,
+        solana_program::system_program::id(),
+        0,
+        vec![],
+    )
+    .signer();
+    let mut slab = TestAccount::new(program_id, program_id, 0, vec![]).writable();
+    let mut fake_prog = TestAccount::new(
+        fake_nft_prog_id,
+        solana_program::bpf_loader_upgradeable::id(),
+        0,
+        vec![],
+    )
+    .executable();
+
+    let accounts = vec![caller.to_info(), slab.to_info(), fake_prog.to_info()];
+    let ix = encode_transfer_ownership_cpi(0, Pubkey::new_unique());
+    let result = process_instruction(&program_id, &accounts, &ix);
+    assert_eq!(
+        result,
+        Err(ProgramError::IncorrectProgramId),
+        "SECURITY(C-1): must reject NFT program that is not the canonical percolator-nft"
+    );
+}
+
 // =============================================================================
 // PERC-8273 T8: ExecuteAdl Tests
 // =============================================================================
