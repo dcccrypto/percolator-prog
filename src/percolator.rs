@@ -3308,6 +3308,12 @@ pub mod processor {
                 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // Liveness: if permissionless resolution is enabled, force_close must
+                // also be enabled. Otherwise abandoned accounts on resolved markets
+                // with burned admin have no cleanup path.
+                if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 // Validate custom funding parameters (same checks as UpdateConfig).
                 // These are immutable after init for governance-free deployments.
@@ -3568,6 +3574,9 @@ pub mod processor {
                 // Tokens are already in the vault from deposit() above, so we
                 // only move the internal accounting (capital → insurance) without
                 // touching engine.vault (which was already incremented by deposit).
+                // Charge new_account_fee: capital → insurance.
+                // engine.set_capital() is test_visible! (private in prod), so manual
+                // adjustment is required. Mirrors set_capital's signed-delta logic.
                 let fee = engine.params.new_account_fee.get();
                 if fee > 0 {
                     let cap = engine.accounts[idx as usize].capital.get();
@@ -3646,6 +3655,9 @@ pub mod processor {
                 engine.deposit(idx, units as u128, 0, clock.slot)
                     .map_err(map_risk_error)?;
                 // Charge new_account_fee: capital → insurance (no vault change)
+                // Charge new_account_fee: capital → insurance.
+                // engine.set_capital() is test_visible! (private in prod), so manual
+                // adjustment is required. Mirrors set_capital's signed-delta logic.
                 let fee = engine.params.new_account_fee.get();
                 if fee > 0 {
                     let cap = engine.accounts[idx as usize].capital.get();
@@ -3801,14 +3813,9 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                // On resolved markets, settle before withdraw. Unlike close
-                // (which has a manual fallback), withdrawals must use settled
-                // state — reject if touch fails.
-                if resolved {
-                    engine.touch_account_full_not_atomic(
-                        user_idx as usize, price, config.resolution_slot,
-                    ).map_err(map_risk_error)?;
-                }
+                // withdraw_not_atomic internally calls touch_account_full.
+                // No separate pre-touch needed — it would run without lifecycle
+                // handling and leave stale side state.
 
                 // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
                 if config.unit_scale != 0 && amount % config.unit_scale as u64 != 0 {
@@ -4191,7 +4198,8 @@ pub mod processor {
                     if config.mark_ewma_e6 != old_ewma {
                         config.mark_ewma_last_slot = clock.slot;
                     }
-                    stamp_funding_rate(engine, &config);
+                    // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
+                    // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
                 }
 
                 // Write updated config (mark_ewma changed)
@@ -4430,6 +4438,9 @@ pub mod processor {
                     let pristine = state::read_config(&data);
                     config.last_effective_price_e6 = pristine.last_effective_price_e6;
                     config.last_hyperp_index_slot = pristine.last_hyperp_index_slot;
+                    // Revert last_good_oracle_slot too — zero-fills must not refresh
+                    // the oracle-death timer (prevents resolution-delay manipulation).
+                    config.last_good_oracle_slot = pristine.last_good_oracle_slot;
                     state::write_config(&mut data, &config);
                     state::write_req_nonce(&mut data, req_id);
                     return Ok(());
@@ -4501,8 +4512,8 @@ pub mod processor {
                         if config.mark_ewma_e6 != old_ewma_cpi {
                             config.mark_ewma_last_slot = clock.slot;
                         }
-                        // Stamp funding rate from updated mark
-                        stamp_funding_rate(engine, &config);
+                        // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
+                        // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
                     }
 
                     // Hyperp: also update authority_price (legacy mark field)
