@@ -4650,6 +4650,19 @@ pub mod oracle {
         0xb0, 0xbc,
     ]);
 
+    /// Percolator-NFT program ID (TransferHook CPI origin).
+    /// SECURITY(C-1): TransferOwnershipCpi must reject any NFT program that does
+    /// not match this constant. Without this check an attacker can deploy a
+    /// malicious program, derive its mint_authority PDA, and overwrite any
+    /// position owner on any slab.
+    /// NOTE: Replace with the real deployed percolator-nft program ID before mainnet.
+    /// PercNFT1111111111111111111111111111111111111
+    pub const PERCOLATOR_NFT_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+        0x0b, 0x78, 0x01, 0x61, 0x09, 0x72, 0x65, 0x03, 0x63, 0x6f, 0x6c, 0x61, 0x74, 0x6f, 0x72,
+        0x2d, 0x6e, 0x66, 0x74, 0x2d, 0x70, 0x72, 0x6f, 0x67, 0x72, 0x61, 0x6d, 0x2d, 0x69, 0x64,
+        0x00, 0x00,
+    ]);
+
     // PriceUpdateV2 account layout (Borsh-serialized via Anchor's #[account])
     // See: https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
     //
@@ -15735,6 +15748,19 @@ pub mod processor {
                 // Slab must be owned by this program.
                 if a_slab.owner != program_id {
                     return Err(ProgramError::IllegalOwner);
+                }
+
+                // SECURITY(C-1): Verify the NFT program is the canonical percolator-nft
+                // program. Without this check any deployed program's mint_authority
+                // PDA can overwrite position owners, enabling full position theft.
+                if *a_nft_prog.key != oracle::PERCOLATOR_NFT_PROGRAM_ID {
+                    solana_program::msg!(
+                        "TransferOwnershipCpi rejected: NFT program {} is not the \
+                         canonical percolator-nft program {}",
+                        a_nft_prog.key,
+                        oracle::PERCOLATOR_NFT_PROGRAM_ID,
+                    );
+                    return Err(ProgramError::IncorrectProgramId);
                 }
 
                 // Hardening: nft program account must be an executable loader-owned program.
