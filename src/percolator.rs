@@ -423,11 +423,14 @@ pub fn apply_vram_scaling(
     let ewmv = state::get_ewmv_e12(config);
     let target = state::get_vol_margin_target_e6(config);
     let mult = compute_vram_margin_bps(ewmv, scale_bps, target);
-    // Scale margins, capping at 10_000 bps (100%)
+    // Scale margins, capping at 10_000 bps (100%).
+    // SECURITY(M-8): Cap maintenance at 5_000 bps (50%) to ensure a buffer
+    // between initial and maintenance. Without this, extreme volatility
+    // collapses both to 100%, creating a liquidation cascade cliff.
     engine.params.initial_margin_bps =
         ((orig_init as u128).saturating_mul(mult as u128) / 10_000).min(10_000) as u64;
     engine.params.maintenance_margin_bps =
-        ((orig_maint as u128).saturating_mul(mult as u128) / 10_000).min(10_000) as u64;
+        ((orig_maint as u128).saturating_mul(mult as u128) / 10_000).min(5_000) as u64;
     // Maintain invariant: initial >= maintenance
     if engine.params.initial_margin_bps < engine.params.maintenance_margin_bps {
         engine.params.initial_margin_bps = engine.params.maintenance_margin_bps;
