@@ -17673,9 +17673,25 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
+                // SECURITY(H-2): Market must be resolved before vault rescue.
+                // Without this, admin could drain vault while users have open positions.
+                // The flags byte at offset 13 is stable across all layout versions.
+                let flags = slab_data[state::FLAGS_OFF];
+                if flags & state::FLAG_RESOLVED == 0 {
+                    solana_program::msg!(
+                        "RescueOrphanVault rejected: market is not resolved"
+                    );
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 // Bump at offset 12: magic(8 bytes) + version(4 bytes) = 12
                 let bump = slab_data[12];
                 drop(slab_data);
+
+                // SECURITY(M-2): Verify vault is owned by SPL Token program.
+                if a_vault.owner != &crate::spl_token::id() {
+                    return Err(ProgramError::IllegalOwner);
+                }
 
                 // 3. Derive vault PDA and verify
                 let (auth, expected_bump) =
