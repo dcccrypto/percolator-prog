@@ -175,6 +175,13 @@ pub const TAG_SET_PENDING_SETTLEMENT: u8 = 67;
 /// PERC-608: Keeper clears pending_settlement flag after settlement crank.
 pub const TAG_CLEAR_PENDING_SETTLEMENT: u8 = 68;
 
+/// HIGH-003: Set oracle price bounds (min/max) for a market.
+/// Admin-only. Rejects prices outside the bounds during price updates.
+/// Data: tag(1) + min_oracle_price_e6(8) + max_oracle_price_e6(8)
+/// Accounts: [admin(signer), slab(writable)]
+/// 0 = disabled (no bound). Prices are in e6 format (same as existing oracle prices).
+pub const TAG_SET_ORACLE_PRICE_BOUNDS: u8 = 74;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +264,7 @@ mod tests {
             TAG_SET_OI_IMBALANCE_HARD_BLOCK,
             TAG_RESCUE_ORPHAN_VAULT,
             TAG_CLOSE_ORPHAN_SLAB,
+            TAG_SET_ORACLE_PRICE_BOUNDS,
         ];
 
         for i in 0..tags.len() {

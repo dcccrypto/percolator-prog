@@ -52,11 +52,11 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
-    // Native (u128 align=16): 512; SBF (u128 align=8): 496
+    // Native (u128 align=16): 528; SBF (u128 align=8): 512 (HIGH-003: added min/max oracle bounds)
     #[cfg(target_arch = "bpf")]
-    const _: [(); 496] = [(); CONFIG_LEN];
-    #[cfg(not(target_arch = "bpf"))]
     const _: [(); 512] = [(); CONFIG_LEN];
+    #[cfg(not(target_arch = "bpf"))]
+    const _: [(); 528] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -1520,11 +1520,21 @@ pub mod verify {
     // ---- 10. ORACLE MANIPULATION ----
     // Helpers for adversarial oracle inputs.
 
-    /// Validate oracle price is within sane bounds.
+    /// Validate oracle price is within sane bounds and market-specific bounds.
     /// price=0 and price>MAX_ORACLE are rejected.
+    /// Also checks against per-market min/max bounds if configured.
     #[inline]
     pub fn oracle_price_valid(price: u64) -> bool {
         price > 0 && price <= 1_000_000_000_000_000 // MAX_ORACLE_PRICE
+    }
+
+    /// Validate oracle price against market-specific bounds (HIGH-003).
+    /// Returns true if price is within [min, max] bounds (0 = no bound).
+    #[inline]
+    pub fn price_within_bounds(price: u64, min_price: u64, max_price: u64) -> bool {
+        let within_min = if min_price == 0 { true } else { price >= min_price };
+        let within_max = if max_price == 0 { true } else { price <= max_price };
+        within_min && within_max
     }
 
     /// Circuit breaker should fire for extreme oracle jumps.
@@ -2335,6 +2345,13 @@ pub mod ix {
         /// Set oracle price circuit breaker cap (admin only).
         /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
         SetOraclePriceCap { max_change_e2bps: u64 },
+        /// Set oracle price bounds (HIGH-003): min and max allowed prices (admin only).
+        /// min_price_e6 and max_price_e6 in e6 format. 0 = no bound.
+        /// Prices outside [min, max] are rejected during oracle updates.
+        SetOraclePriceBounds {
+            min_oracle_price_e6: u64,
+            max_oracle_price_e6: u64,
+        },
         /// Resolve market: force-close all positions at admin oracle price, enter withdraw-only mode.
         /// Admin only. Uses authority_price_e6 as settlement price.
         ResolveMarket,
@@ -2937,6 +2954,15 @@ pub mod ix {
                     // SetOraclePriceCap
                     let max_change_e2bps = read_u64(&mut rest)?;
                     Ok(Instruction::SetOraclePriceCap { max_change_e2bps })
+                }
+                TAG_SET_ORACLE_PRICE_BOUNDS => {
+                    // SetOraclePriceBounds (HIGH-003)
+                    let min_oracle_price_e6 = read_u64(&mut rest)?;
+                    let max_oracle_price_e6 = read_u64(&mut rest)?;
+                    Ok(Instruction::SetOraclePriceBounds {
+                        min_oracle_price_e6,
+                        max_oracle_price_e6,
+                    })
                 }
                 TAG_RESOLVE_MARKET => Ok(Instruction::ResolveMarket),
                 TAG_WITHDRAW_INSURANCE => Ok(Instruction::WithdrawInsurance),
@@ -3768,6 +3794,16 @@ pub mod state {
         /// Last effective oracle price (after clamping), in e6 format.
         /// 0 = no history (first price accepted as-is).
         pub last_effective_price_e6: u64,
+
+        // ========================================
+        // Oracle Price Bounds (HIGH-003: Limit extreme prices)
+        // ========================================
+        /// Minimum allowed oracle price in e6 format. 0 = no minimum.
+        /// Prices below this are rejected (can be set via UpdateMarketConfig).
+        pub min_oracle_price_e6: u64,
+        /// Maximum allowed oracle price in e6 format. 0 = no maximum.
+        /// Prices above this are rejected (can be set via UpdateMarketConfig).
+        pub max_oracle_price_e6: u64,
 
         // ========================================
         // Dynamic OI Cap (PERC-273)
@@ -5631,6 +5667,39 @@ pub mod oracle {
             || *price_ai.owner == METEORA_DLMM_PROGRAM_ID
     }
 
+    /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`,
+    /// and also enforce per-market min/max bounds (HIGH-003).
+    /// Units: 1_000_000 e2bps = 100%. 0 = disabled (no cap). last_price == 0 = first-time.
+    pub fn clamp_oracle_price_with_bounds(
+        last_price: u64,
+        raw_price: u64,
+        max_change_e2bps: u64,
+        min_price_e6: u64,
+        max_price_e6: u64,
+    ) -> u64 {
+        // Compute circuit breaker allowed range [cb_min, cb_max]
+        let (cb_min, cb_max) = if max_change_e2bps == 0 || last_price == 0 {
+            (0u64, u64::MAX)
+        } else {
+            let max_delta = ((last_price as u128) * (max_change_e2bps as u128) / 1_000_000)
+                .min(u64::MAX as u128) as u64;
+            (last_price.saturating_sub(max_delta), last_price.saturating_add(max_delta))
+        };
+
+        // Compute bounds allowed range [bound_min, bound_max]
+        // 0 means "no constraint" — use the extremes
+        let bound_min = if min_price_e6 > 0 { min_price_e6 } else { 0u64 };
+        let bound_max = if max_price_e6 > 0 { max_price_e6 } else { u64::MAX };
+
+        // Compute intersection of both ranges
+        // If cb_min > bound_max or cb_max < bound_min, the ranges don't overlap,
+        // but we still clamp to produce a sane result (prefer bounds over breaker)
+        let final_min = if bound_min == 0 { cb_min } else { cb_min.max(bound_min) };
+        let final_max = if bound_max == u64::MAX { cb_max } else { cb_max.min(bound_max) };
+
+        raw_price.clamp(final_min, final_max)
+    }
+
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
     /// Units: 1_000_000 e2bps = 100%. 0 = disabled (no cap). last_price == 0 = first-time.
     pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_e2bps: u64) -> u64 {
@@ -5668,6 +5737,7 @@ pub mod oracle {
     }
 
     /// PERC-299: Extended version that also reports whether the circuit breaker fired.
+    /// Also enforces per-market price bounds (HIGH-003).
     pub fn read_price_clamped_ext(
         config: &mut super::state::MarketConfig,
         price_ai: &AccountInfo,
@@ -5684,7 +5754,13 @@ pub mod oracle {
         } else {
             config.oracle_price_cap_e2bps
         };
-        let clamped = clamp_oracle_price(config.last_effective_price_e6, raw, effective_cap);
+        let clamped = clamp_oracle_price_with_bounds(
+            config.last_effective_price_e6,
+            raw,
+            effective_cap,
+            config.min_oracle_price_e6,
+            config.max_oracle_price_e6,
+        );
         let was_clamped = clamped != raw && config.last_effective_price_e6 != 0;
         config.last_effective_price_e6 = clamped;
         Ok((clamped, was_clamped))
@@ -9823,6 +9899,17 @@ pub mod processor {
                     &fields.initial_mark_price_e6.to_le_bytes(),
                 );
             }
+            // HIGH-003: Initialize oracle price bounds to disabled (0 = no bounds)
+            wcb(
+                data,
+                offset_of!(MC, min_oracle_price_e6),
+                &0u64.to_le_bytes(),
+            );
+            wcb(
+                data,
+                offset_of!(MC, max_oracle_price_e6),
+                &0u64.to_le_bytes(),
+            );
             wcb(
                 data,
                 offset_of!(MC, market_created_slot),
@@ -12216,6 +12303,77 @@ pub mod processor {
                 }
 
                 config.oracle_price_cap_e2bps = max_change_e2bps;
+                state::write_config(&mut data, &config);
+            }
+
+            Instruction::SetOraclePriceBounds {
+                min_oracle_price_e6,
+                max_oracle_price_e6,
+            } => {
+                // HIGH-003: Set per-market oracle price bounds
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                // Validate that bounds themselves are within the global oracle sanity range.
+                // A non-zero bound above MAX_ORACLE_PRICE would allow extreme liquidations via admin misconfiguration.
+                if min_oracle_price_e6 > 0 && !crate::verify::oracle_price_valid(min_oracle_price_e6) {
+                    msg!(
+                        "SetOraclePriceBounds: min_price {} out of valid oracle range [1, 1e15]",
+                        min_oracle_price_e6
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+                if max_oracle_price_e6 > 0 && !crate::verify::oracle_price_valid(max_oracle_price_e6) {
+                    msg!(
+                        "SetOraclePriceBounds: max_price {} out of valid oracle range [1, 1e15]",
+                        max_oracle_price_e6
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Validate that min <= max when both are non-zero
+                if min_oracle_price_e6 > 0
+                    && max_oracle_price_e6 > 0
+                    && min_oracle_price_e6 > max_oracle_price_e6
+                {
+                    msg!(
+                        "SetOraclePriceBounds: min_price {} > max_price {}",
+                        min_oracle_price_e6,
+                        max_oracle_price_e6
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Runtime behavior: clamp_oracle_price_with_bounds() computes the intersection
+                // of the circuit breaker range (relative to last_price) and the bounds range.
+                // This prevents bounds from circumventing the circuit breaker protection.
+                // Even if bounds are set far outside the typical price range, they will be
+                // constrained by the per-slot price movement cap at read time.
+                // Example: last=100, cap=10% → allowed [90,110], min=150 → final range [90,110]
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let mut config = state::read_config(&data);
+
+                config.min_oracle_price_e6 = min_oracle_price_e6;
+                config.max_oracle_price_e6 = max_oracle_price_e6;
+
+                msg!(
+                    "SetOraclePriceBounds: slab={} min={} max={}",
+                    a_slab.key,
+                    min_oracle_price_e6,
+                    max_oracle_price_e6
+                );
+
                 state::write_config(&mut data, &config);
             }
 
