@@ -6770,7 +6770,8 @@ pub mod lp_vault {
     #[inline]
     pub fn apply_loyalty_mult(fee: u64, delta_epochs: u64) -> u64 {
         let mult = loyalty_multiplier_bps(delta_epochs);
-        ((fee as u128) * (mult as u128) / 10_000) as u64
+        // SECURITY(M-12): cap to prevent u128→u64 truncation for large fees.
+        ((fee as u128) * (mult as u128) / 10_000).min(u64::MAX as u128) as u64
     }
 
     // Per-user loyalty PDA
@@ -6862,8 +6863,9 @@ pub mod lp_collateral {
         if total_supply == 0 || vault_tvl == 0 || lp_amount == 0 {
             return 0;
         }
-        let raw_value = (lp_amount as u128) * vault_tvl / (total_supply as u128);
-        raw_value * (ltv_bps as u128) / 10_000
+        // SECURITY(M-11): use saturating_mul to prevent silent u128 wrapping.
+        let raw_value = (lp_amount as u128).saturating_mul(vault_tvl) / (total_supply as u128);
+        raw_value.saturating_mul(ltv_bps as u128) / 10_000
     }
 
     /// Check if vault TVL has dropped more than threshold since position open.
@@ -7816,7 +7818,8 @@ pub mod creator_history {
         let numerator = (base_e6 as u128)
             .saturating_mul(mult_bps as u128)
             .saturating_mul((10_000u64.saturating_sub(disc_bps)) as u128);
-        let result = (numerator / (10_000u128 * 10_000u128)) as u64;
+        // SECURITY(M-13): cap to prevent u128→u64 truncation.
+        let result = (numerator / (10_000u128 * 10_000u128)).min(u64::MAX as u128) as u64;
         // Floor: 50% of base
         let floor = base_e6 / 2;
         result.max(floor)
