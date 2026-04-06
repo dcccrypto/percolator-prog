@@ -41,8 +41,9 @@ use std::path::PathBuf;
 // for token transfers, which fails in LiteSVM's BPF runtime.
 // Updated PERC-8271: PERC-8270 (ADL T5) added 4 Account fields (+56 bytes/account) and
 // 3 RiskEngine fields. Previous BPF value: 1025880 (now a legacy tier in slab_guard).
-// BPF SLAB_LEN = 1288304 (8-byte i128 alignment). Native = 1321088 (16-byte).
-const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields, MAX_ACCOUNTS=4096
+// PERC-SetDexPool: CONFIG_LEN +32 (dex_pool). BPF ENGINE_OFF = 632 (was 600).
+// BPF SLAB_LEN = 1288336 (1288304 + 32). Native = 1321120 (16-byte).
+const SLAB_LEN: usize = 1288336; // PERC-SetDexPool: +32 bytes dex_pool field, MAX_ACCOUNTS=4096
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -567,6 +568,13 @@ fn benchmark_trade_cu() {
         println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
     }
+    {
+        let binary_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if binary_len < 900_000 {
+            println!("SKIP: Binary is {binary_len} bytes (medium/small build). Run: cargo build-sbf (no features)");
+            return;
+        }
+    }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // Scenario 1: Open new long position (fresh user, no existing position)
@@ -869,6 +877,13 @@ fn benchmark_trade_cu_summary_table() {
     if !path.exists() {
         println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
+    }
+    {
+        let binary_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if binary_len < 900_000 {
+            println!("SKIP: Binary is {} bytes (medium/small build). Run: cargo build-sbf (no --features flag) then cargo test", binary_len);
+            return;
+        }
     }
 
     let mut env = TradeTestEnv::new();

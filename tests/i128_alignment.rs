@@ -9,7 +9,7 @@
 //! Run:       cargo test --release --test i128_alignment -- --nocapture
 
 use litesvm::LiteSVM;
-use percolator::{Account, AccountKind, RiskEngine, RiskParams, I128, U128};
+use percolator::{Account, RiskEngine, RiskParams, I128, U128};
 use solana_sdk::{
     account::Account as SolanaAccount,
     clock::Clock,
@@ -26,10 +26,11 @@ use std::path::PathBuf;
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
 // Updated for PERC-8271: PERC-8270 (ADL T5) added 4 Account fields (+56 bytes/account) and
 // 3 RiskEngine fields — total layout growth.
+// PERC-SetDexPool: CONFIG_LEN grew by 32 bytes (dex_pool field). ENGINE_OFF (BPF) = 632 (was 600).
 // NOTE: BPF layout differs from native (BPF uses 8-byte i128 alignment vs 16-byte native).
-// BPF SLAB_LEN = 1288304. Native = 1321088.
-// Previous BPF value: 1025880 (pre-PERC-8270, now a legacy tier in slab_guard).
-const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields (cargo build-sbf)
+// BPF SLAB_LEN = 1288336 (1288304 + 32). Native = 1321120.
+// Previous BPF value: 1288304 (pre-SetDexPool, now a legacy tier in slab_guard).
+const SLAB_LEN: usize = 1288336; // PERC-SetDexPool: +32 bytes dex_pool field (cargo build-sbf)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -245,17 +246,19 @@ fn test_account_struct_alignment() {
     );
 
     // Create an account with known values
+    let pnl_val: i128 = -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10i128;
+    let capital_val: u128 = 0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210;
     let account = Account {
         account_id: 12345,
-        capital: U128::new(0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210),
-        kind: AccountKind::User,
-        pnl: I128::new(-0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
-        reserved_pnl: 0xDEAD_BEEF_CAFE_BABE, // u64, not U128
+        capital: U128::new(capital_val),
+        kind: Account::KIND_USER,
+        pnl: pnl_val,
+        reserved_pnl: 0xDEAD_BEEF_CAFE_BABEu128,
         warmup_started_at_slot: 999999,
-        warmup_slope_per_step: U128::new(42),
-        position_size: I128::new(-1_000_000_000_000i128),
+        warmup_slope_per_step: 42u128,
+        position_size: -1_000_000_000_000i128,
         entry_price: 100_000_000,
-        funding_index: I128::new(12345678901234i128),
+        funding_index: 12345678901234i64,
         matcher_program: [0xAA; 32],
         matcher_context: [0xBB; 32],
         owner: [0xCC; 32],
@@ -266,28 +269,23 @@ fn test_account_struct_alignment() {
         adl_a_basis: 1_000_000u128,
         adl_k_snap: 0i128,
         adl_epoch_snap: 0,
+        fees_earned_total: U128::ZERO,
     };
 
     // Verify all fields round-trip correctly
-    assert_eq!(
-        account.capital.get(),
-        0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210
-    );
-    assert_eq!(
-        account.pnl.get(),
-        -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10
-    );
-    assert_eq!(account.reserved_pnl, 0xDEAD_BEEF_CAFE_BABE); // u64 comparison
-    assert_eq!(account.position_size.get(), -1_000_000_000_000i128);
-    assert_eq!(account.funding_index.get(), 12345678901234i128);
+    assert_eq!(account.capital.get(), capital_val);
+    assert_eq!(account.pnl, pnl_val);
+    assert_eq!(account.reserved_pnl, 0xDEAD_BEEF_CAFE_BABEu128);
+    assert_eq!(account.position_size, -1_000_000_000_000i128);
+    assert_eq!(account.funding_index, 12345678901234i64);
     assert_eq!(account.fee_credits.get(), -999);
 
     println!("Account fields verified:");
     println!("  capital: 0x{:032X}", account.capital.get());
-    println!("  pnl: {}", account.pnl.get());
-    println!("  reserved_pnl: 0x{:016X}", account.reserved_pnl); // u64 format
-    println!("  position_size: {}", account.position_size.get());
-    println!("  funding_index: {}", account.funding_index.get());
+    println!("  pnl: {}", account.pnl);
+    println!("  reserved_pnl: 0x{:032X}", account.reserved_pnl);
+    println!("  position_size: {}", account.position_size);
+    println!("  funding_index: {}", account.funding_index);
     println!("  fee_credits: {}", account.fee_credits.get());
 
     println!("\nAccount alignment test passed!");
@@ -449,6 +447,16 @@ fn test_bpf_i128_alignment() {
     if !path.exists() {
         println!("SKIP: BPF not found at {:?}. Run: cargo build-sbf", path);
         return;
+    }
+
+    // Skip if binary is not production (4096 accounts). Medium/small binaries reject
+    // the 1288336-byte slab with InvalidSlabLen since their SLAB_LEN is much smaller.
+    {
+        let binary = std::fs::read(&path).unwrap_or_default();
+        if binary.len() < 900_000 {
+            println!("SKIP: Binary appears to be medium/small build ({} bytes). Run: cargo build-sbf (no features)", binary.len());
+            return;
+        }
     }
 
     // Set up LiteSVM environment

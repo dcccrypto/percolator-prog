@@ -34,8 +34,9 @@ use std::path::PathBuf;
 // Note: BPF struct layout differs from native; these are BPF values.
 // Updated PERC-8271: PERC-8270 (ADL T5) grew Account by 56 bytes (4 fields) and RiskEngine by 24 bytes.
 // Previous BPF value: 1025880 — now a legacy acceptance tier in slab_guard for devnet migration.
-// BPF SLAB_LEN = 1288304 (8-byte i128 alignment). Native = 1321088 (16-byte).
-const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields, MAX_ACCOUNTS=4096
+// PERC-SetDexPool: CONFIG_LEN grew by 32 bytes (dex_pool field). ENGINE_OFF (BPF) = 632 (was 600).
+// BPF SLAB_LEN = 1288336 (1288304 + 32). Native = 1321120 (16-byte alignment).
+const SLAB_LEN: usize = 1288336; // PERC-SetDexPool: +32 bytes dex_pool field, MAX_ACCOUNTS=4096
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -681,6 +682,18 @@ fn benchmark_worst_case_scenarios() {
     if !path.exists() {
         println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
+    }
+
+    // Skip if binary is not production (4096 accounts). Medium/small binaries reject
+    // the 1288336-byte slab with InvalidSlabLen since their SLAB_LEN is much smaller.
+    // Run without --features medium/small to test production layout.
+    {
+        let binary = std::fs::read(&path).unwrap_or_default();
+        // Production binary is ~1.2MB+; medium is ~740KB. Use size as proxy.
+        if binary.len() < 900_000 {
+            println!("SKIP: Binary appears to be medium/small build ({} bytes). Run: cargo build-sbf", binary.len());
+            return;
+        }
     }
 
     // Scenario 1: All empty slots (just LP, no users)

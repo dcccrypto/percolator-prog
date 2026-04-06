@@ -52,11 +52,12 @@ pub mod constants {
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
-    // Native (u128 align=16): 512; SBF (u128 align=8): 496
+    // PERC-SetDexPool: +32 bytes for dex_pool field.
+    // Native (u128 align=16): 544; SBF (u128 align=8): 528
     #[cfg(target_arch = "bpf")]
-    const _: [(); 496] = [(); CONFIG_LEN];
+    const _: [(); 528] = [(); CONFIG_LEN];
     #[cfg(not(target_arch = "bpf"))]
-    const _: [(); 512] = [(); CONFIG_LEN];
+    const _: [(); 544] = [(); CONFIG_LEN];
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     pub const fn align_up(x: usize, a: usize) -> usize {
@@ -2727,6 +2728,49 @@ pub mod ix {
         RescueOrphanVault,
         /// PERC-8400: Close orphan slab and reclaim rent.
         CloseOrphanSlab,
+
+        /// PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool address for a HYPERP market.
+        ///
+        /// Admin-only. Only valid for HYPERP markets (index_feed_id == [0;32]).
+        ///
+        /// Validates the pool account before storing:
+        ///   - Owned by approved DEX program (Raydium CLMM / PumpSwap / Meteora DLMM)
+        ///   - Pool contains a mint matching the market's collateral_mint
+        ///
+        /// Writes pool pubkey to config.dex_pool. After this call, UpdateHyperpMark
+        /// will reject any pool key that does not match.
+        ///
+        /// Accounts:
+        ///   0. [signer]   admin
+        ///   1. [writable] slab
+        ///   2. []         pool_account (DEX pool to validate and store)
+        SetDexPool { pool: Pubkey },
+
+        /// CPI to the matcher program to initialize a matcher context account.
+        ///
+        /// The LP PDA (derived from ["lp", slab, lp_idx]) signs via invoke_signed so the
+        /// matcher program can verify the caller. Only the percolator program can produce
+        /// this PDA signature. Admin-only.
+        ///
+        /// Accounts:
+        ///   0. [signer]    admin
+        ///   1. []          slab (owned by this program — used to verify admin + LP slot)
+        ///   2. [writable]  matcher_ctx (must match LP's stored matcher_context)
+        ///   3. []          matcher_prog (executable; must match LP's stored matcher_program)
+        ///   4. []          lp_pda (PDA ["lp", slab, lp_idx]; required by CPI as signer)
+        InitMatcherCtx {
+            lp_idx: u16,
+            kind: u8,
+            trading_fee_bps: u32,
+            base_spread_bps: u32,
+            max_total_bps: u32,
+            impact_k_bps: u32,
+            liquidity_notional_e6: u128,
+            max_fill_abs: u128,
+            max_inventory_abs: u128,
+            fee_to_insurance_bps: u16,
+            skew_spread_mult_bps: u16,
+        },
     }
 
     impl Instruction {
@@ -2780,7 +2824,7 @@ pub mod ix {
                     //     policy tag 0 = FullClose, 1 = ExactPartial(u128), 0xFF = touch-only
                     //   Missing = empty candidates (new callers omit)
                     let mut candidates = alloc::vec::Vec::new();
-                    if rest.len() >= 1 {
+                    if !rest.is_empty() {
                         let format_version = read_u8(&mut rest)?;
                         if format_version == 0 {
                             while rest.len() >= 2 {
@@ -3312,6 +3356,40 @@ pub mod ix {
 
                 TAG_CLOSE_ORPHAN_SLAB => Ok(Instruction::CloseOrphanSlab),
 
+                // PERC-SetDexPool: Pin DEX pool pubkey on-chain for HYPERP markets (admin only)
+                TAG_SET_DEX_POOL => {
+                    let pool = read_pubkey(&mut rest)?;
+                    Ok(Instruction::SetDexPool { pool })
+                }
+
+                // InitMatcherCtx: CPI to matcher program to initialize a matcher context account
+                TAG_INIT_MATCHER_CTX => {
+                    let lp_idx = read_u16(&mut rest)?;
+                    let kind = read_u8(&mut rest)?;
+                    let trading_fee_bps = read_u32(&mut rest)?;
+                    let base_spread_bps = read_u32(&mut rest)?;
+                    let max_total_bps = read_u32(&mut rest)?;
+                    let impact_k_bps = read_u32(&mut rest)?;
+                    let liquidity_notional_e6 = read_u128(&mut rest)?;
+                    let max_fill_abs = read_u128(&mut rest)?;
+                    let max_inventory_abs = read_u128(&mut rest)?;
+                    let fee_to_insurance_bps = read_u16(&mut rest)?;
+                    let skew_spread_mult_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::InitMatcherCtx {
+                        lp_idx,
+                        kind,
+                        trading_fee_bps,
+                        base_spread_bps,
+                        max_total_bps,
+                        impact_k_bps,
+                        liquidity_notional_e6,
+                        max_fill_abs,
+                        max_inventory_abs,
+                        fee_to_insurance_bps,
+                        skew_spread_mult_bps,
+                    })
+                }
+
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -3435,6 +3513,7 @@ pub mod ix {
             // PERC-8093: new RiskParams fields (percolator@cf35789)
             min_nonzero_mm_req: 0,
             min_nonzero_im_req: 0,
+            min_initial_deposit: U128::ZERO,
             insurance_floor: U128::ZERO,
         })
     }
@@ -3875,6 +3954,14 @@ pub mod state {
         pub _lp_col_pad: [u8; 7],
         /// Loan-to-value ratio in basis points for LP tokens (e.g., 8000 = 80%).
         pub lp_collateral_ltv_bps: u64,
+
+        // ========================================
+        // DEX Pool Pinning (PERC-SetDexPool)
+        // ========================================
+        /// Admin-approved DEX pool pubkey for HYPERP markets.
+        /// All zeros = no pool set (UpdateHyperpMark is rejected until set).
+        /// Set via SetDexPool (tag 74) — admin-only. Cannot be overridden by keeper.
+        pub dex_pool: [u8; 32],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -8797,9 +8884,24 @@ pub mod processor {
     #[allow(unused_imports)]
     use alloc::format;
     use percolator::{
-        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, RiskParams, TradeExecution,
+        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution,
         MAX_ACCOUNTS,
     };
+    /// Local no-op matching engine: passes oracle price directly as execution price.
+    /// Used for markets without an external CPI matcher (i.e. internal oracle matching).
+    struct NoopMatchingEngine;
+    impl MatchingEngine for NoopMatchingEngine {
+        fn execute_match(
+            &self,
+            _lp_program: &[u8; 32],
+            _lp_context: &[u8; 32],
+            _lp_account_id: u64,
+            oracle_price: u64,
+            size: i128,
+        ) -> percolator::Result<TradeExecution> {
+            Ok(TradeExecution { price: oracle_price, size })
+        }
+    }
     use solana_program::instruction::{AccountMeta, Instruction as SolInstruction};
     use solana_program::{
         account_info::AccountInfo,
@@ -8842,13 +8944,20 @@ pub mod processor {
     ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable).
         // Accepted sizes (backward compatibility across devnet upgrades):
-        //   SLAB_LEN           — current (PERC-8270 ADL fields: +56 bytes/account +24 bytes engine)
-        //   SLAB_LEN - 16      — pre-PERC-118 (before trade_twap_e6 + twap_last_slot, +16 bytes)
-        //   SLAB_LEN - 24      — pre-PERC-118 + pre-Account-reorder (oldest devnet slabs, -8 bytes)
-        //   PRE_ADL_SLAB_LEN   — pre-PERC-8270 slabs (295208 bytes smaller, 4096*56+24 growth)
-        // New ADL fields default to zero when read from pre-PERC-8270 slabs → safe conservative values.
-        const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
-        const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
+        //   SLAB_LEN               — current (PERC-SetDexPool: +32 bytes for dex_pool field)
+        //   PRE_DEX_POOL_SLAB_LEN  — pre-PERC-SetDexPool slabs (before dex_pool field)
+        //   PRE_118_SLAB_LEN       — pre-PERC-118 (before trade_twap_e6 + twap_last_slot, +16 bytes)
+        //   OLDEST_SLAB_LEN        — pre-PERC-118 + pre-Account-reorder (oldest devnet slabs, -8 bytes)
+        //   PRE_ADL_SLAB_LEN       — pre-PERC-8270 slabs (295208 bytes smaller, 4096*56+24 growth)
+        // New fields default to zero when read from older slabs → safe conservative values.
+        // dex_pool == [0;32] on old slabs: UpdateHyperpMark rejects until admin calls SetDexPool.
+        //
+        // PERC-SetDexPool: CONFIG_LEN grew by 32 bytes → SLAB_LEN grew by 32 bytes.
+        // Old slabs (pre-SetDexPool) have SLAB_LEN-32 bytes and read dex_pool as all-zeros.
+        // This is the correct default: UpdateHyperpMark correctly rejects until admin pins the pool.
+        const PRE_DEX_POOL_SLAB_LEN: usize = SLAB_LEN - 32;
+        const PRE_118_SLAB_LEN: usize = SLAB_LEN - 48; // pre-SetDexPool(-32) + pre-118(-16)
+        const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56;  // pre-SetDexPool(-32) + pre-118(-16) + pre-reorder(-8)
         // Pre-PERC-8270 devnet slabs (BPF): Account had no ADL fields, RiskEngine had no last_market_slot.
         // BPF compiled value from percolator@cf35789 (pre-PERC-8270 struct layout).
         const PRE_ADL_SLAB_LEN: usize = 1025880;
@@ -8860,16 +8969,22 @@ pub mod processor {
         // V1M2 layout: ENGINE_OFF=616, CONFIG_LEN=512, ACCOUNT_SIZE=312
         // Created by program build with SBF target (cfg target_arch="sbf", u128 align=16)
         const V1M2_MEDIUM_LEN: usize = 323312;
+        // Transitional: 323328-byte slabs created before SLAB_LEN was corrected to 323344.
+        // These slabs have CONFIG_LEN=528 (SBF) but were allocated at the wrong size.
+        // Accept them so RescueOrphanVault + CloseOrphanSlab can recover funds.
+        const V1M2_MEDIUM_TRANSITIONAL: usize = 323328;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
             correct_len: data.len() == SLAB_LEN
+                || data.len() == PRE_DEX_POOL_SLAB_LEN
                 || data.len() == PRE_118_SLAB_LEN
                 || data.len() == OLDEST_SLAB_LEN
                 || data.len() == PRE_ADL_SLAB_LEN
                 || data.len() == V1M_SMALL_LEN
                 || data.len() == V1M_MEDIUM_LEN
                 || data.len() == V1M_LARGE_LEN
-                || data.len() == V1M2_MEDIUM_LEN,
+                || data.len() == V1M2_MEDIUM_LEN
+                || data.len() == V1M2_MEDIUM_TRANSITIONAL,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -9055,7 +9170,7 @@ pub mod processor {
         // Margin requirement is looser than phase allows.
         // Check if the user's position actually exceeds phase leverage.
         let acct = &engine.accounts[user_idx as usize];
-        let pos_size = acct.position_size.get().unsigned_abs();
+        let pos_size = acct.position_size.unsigned_abs();
         if pos_size == 0 {
             return Ok(());
         }
@@ -9090,7 +9205,7 @@ pub mod processor {
         if cap == 0 {
             return Ok(()); // PnL cap disabled
         }
-        let current_pnl = engine.pnl_pos_tot.get();
+        let current_pnl = engine.pnl_pos_tot;
         if current_pnl > cap as u128 {
             msg!(
                 "PnL cap exceeded: current_pnl_pos_tot={} max={}",
@@ -9122,7 +9237,7 @@ pub mod processor {
             return Ok(()); // Cap disabled
         }
 
-        let pos = engine.accounts[user_idx as usize].position_size.get();
+        let pos = engine.accounts[user_idx as usize].position_size;
         // Compare in u128 to prevent silent truncation when |pos| >= 2^64.
         let abs_pos = pos.unsigned_abs();
 
@@ -10587,7 +10702,7 @@ pub mod processor {
                             let _ = engine.touch_account(idx);
 
                             let acc = &engine.accounts[idx as usize];
-                            let pos = acc.position_size.get();
+                            let pos = acc.position_size;
                             if pos != 0 {
                                 // Settle position using COIN-MARGINED PnL formula
                                 // (matches mark_pnl_for_position in the risk engine)
@@ -10613,13 +10728,13 @@ pub mod processor {
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
                                 // SECURITY: Must use set_pnl() for correct haircut calculations
-                                let old_pnl = acc.pnl.get();
+                                let old_pnl = acc.pnl;
                                 let new_pnl = old_pnl.saturating_add(pnl_delta);
                                 engine.set_pnl(idx as usize, new_pnl);
 
                                 // Clear position
                                 engine.accounts[idx as usize].position_size =
-                                    percolator::I128::ZERO;
+                                    0i128;
                                 engine.accounts[idx as usize].entry_price = 0;
                             }
                         }
@@ -11104,7 +11219,7 @@ pub mod processor {
                     if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
-                    let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                    let old_user_pos = engine.accounts[user_idx as usize].position_size;
                     let net_lp = engine.net_lp_pos.get();
                     check_safety_valve(&config, net_lp, size, old_user_pos, clock.slot)?;
                     // PERC-8110: OI imbalance hard block (pre-trade)
@@ -11136,7 +11251,7 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_nocpi_compute_end");
                         sol_log_compute_units();
                     }
-                    let old_lp_pos = engine.accounts[lp_idx as usize].position_size.get();
+                    let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                     if risk_state.would_increase_risk(old_lp_pos, -size) {
                         return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                     }
@@ -11160,7 +11275,7 @@ pub mod processor {
                 }
 
                 let trade_result = engine
-                    .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
+                    .execute_trade(&NoopMatchingEngine, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error);
                 crate::restore_margins(engine, margin_orig);
                 trade_result?;
@@ -11493,7 +11608,7 @@ pub mod processor {
                             msg!("CU_CHECKPOINT: trade_cpi_compute_end");
                             sol_log_compute_units();
                         }
-                        let old_lp_pos = engine.accounts[lp_idx as usize].position_size.get();
+                        let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                         if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
                             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                         }
@@ -11505,7 +11620,7 @@ pub mod processor {
                     // PERC-312: Safety valve check
                     // PERC-8110: OI imbalance hard block (pre-trade)
                     {
-                        let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                        let old_user_pos = engine.accounts[user_idx as usize].position_size;
                         let net_lp = engine.net_lp_pos.get();
                         check_safety_valve(&config, net_lp, trade_size, old_user_pos, clock.slot)?;
                         check_oi_imbalance_hard_block(engine, &config, trade_size)?;
@@ -11614,14 +11729,14 @@ pub mod processor {
                 sol_log_64(target_idx as u64, price, 0, 0, 0); // idx, price
                 {
                     let acc = &engine.accounts[target_idx as usize];
-                    sol_log_64(acc.capital.get() as u64, acc.pnl.get() as u64, 0, 0, 1); // cap, pnl
-                    sol_log_64(acc.position_size.get() as u64, acc.entry_price, 0, 0, 2); // pos, entry
+                    sol_log_64(acc.capital.get() as u64, acc.pnl as u64, 0, 0, 1); // cap, pnl
+                    sol_log_64(acc.position_size as u64, acc.entry_price, 0, 0, 2); // pos, entry
                                                                                           // Calculate mark PnL
-                    let pos = acc.position_size.get();
+                    let pos = acc.position_size;
                     let entry = acc.entry_price as i128;
                     let mark = pos.saturating_mul(price as i128 - entry) / 1_000_000;
                     let equity = (acc.capital.get() as i128)
-                        .saturating_add(acc.pnl.get())
+                        .saturating_add(acc.pnl)
                         .saturating_add(mark);
                     let notional = pos.unsigned_abs().saturating_mul(price as u128) / 1_000_000;
                     let maint_req = notional
@@ -11638,7 +11753,7 @@ pub mod processor {
                 }
                 // Snapshot pre-liquidation state for event logging
                 let pre_cap = engine.accounts[target_idx as usize].capital.get() as u64;
-                let pre_pos = engine.accounts[target_idx as usize].position_size.get();
+                let pre_pos = engine.accounts[target_idx as usize].position_size;
                 // VRAM: scale margins before liquidation check
                 let vram_orig = crate::apply_vram_scaling(engine, &config);
 
@@ -11664,7 +11779,7 @@ pub mod processor {
                 crate::restore_margins(engine, vram_orig);
                 let _res = liq_result?;
                 let post_cap = engine.accounts[target_idx as usize].capital.get() as u64;
-                let post_pos = engine.accounts[target_idx as usize].position_size.get();
+                let post_pos = engine.accounts[target_idx as usize].position_size;
                 // Enhanced liquidation event: tag=4, result, pre_cap, post_cap, price
                 sol_log_64(_res as u64, pre_cap, post_cap, price, 4);
                 // Liquidation detail: tag=5, pre_pos(low), pre_pos(high), post_pos(low), partial_flag
@@ -12324,7 +12439,7 @@ pub mod processor {
                 let mut has_open_positions = false;
                 for i in 0..percolator::MAX_ACCOUNTS {
                     if engine.is_used(i) {
-                        let pos = engine.accounts[i].position_size.get();
+                        let pos = engine.accounts[i].position_size;
                         if pos != 0 {
                             has_open_positions = true;
                             break;
@@ -13624,6 +13739,24 @@ pub mod processor {
                 const MIN_HYPERP_UPDATE_INTERVAL_SLOTS: u64 = 25;
                 if dt_slots < MIN_HYPERP_UPDATE_INTERVAL_SLOTS {
                     return Ok(()); // too soon — skip silently
+                }
+
+                // SECURITY (PERC-SetDexPool): Verify pool matches admin-pinned address.
+                // config.dex_pool is set by SetDexPool (admin-only). An attacker who
+                // compromises the Supabase service_role key can change the keeper's
+                // dex_pool_address in the DB — but the on-chain check here rejects any
+                // pool key that does not match what the admin explicitly approved.
+                // All-zeros dex_pool means SetDexPool was never called → reject.
+                if config.dex_pool == [0u8; 32] {
+                    msg!("UpdateHyperpMark: dex_pool not set — admin must call SetDexPool first");
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
+                if a_dex_pool.key.to_bytes() != config.dex_pool {
+                    msg!(
+                        "UpdateHyperpMark: pool key {} does not match stored dex_pool",
+                        a_dex_pool.key,
+                    );
+                    return Err(PercolatorError::InvalidOracleKey.into());
                 }
 
                 // SECURITY: verify the DEX pool account is owned by an approved DEX program
@@ -15085,7 +15218,7 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                let pos = engine.accounts[user_idx as usize].position_size.get();
+                let pos = engine.accounts[user_idx as usize].position_size;
                 if pos != 0 {
                     return Err(PercolatorError::LpCollateralPositionOpen.into());
                 }
@@ -15572,7 +15705,7 @@ pub mod processor {
 
                 // PERC-8273: Gate — target index must be valid and position must be open.
                 check_idx(engine, target_idx)?;
-                let pos_size = engine.accounts[target_idx as usize].position_size.get();
+                let pos_size = engine.accounts[target_idx as usize].position_size;
                 if pos_size == 0 {
                     msg!("ADL: target_idx={} position already closed", target_idx);
                     return Err(PercolatorError::BankruptPositionAlreadyClosed.into());
@@ -15580,7 +15713,7 @@ pub mod processor {
 
                 // Compute excess PnL to remove (pnl_pos_tot above cap).
                 // If max_pnl_cap is 0 (unconfigured), treat cap as 0 (full excess).
-                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let pnl_pos_tot = engine.pnl_pos_tot;
                 let cap = config.max_pnl_cap as u128;
                 let excess = if pnl_pos_tot > cap {
                     pnl_pos_tot.saturating_sub(cap)
@@ -15598,7 +15731,7 @@ pub mod processor {
 
                 // Settle any realised PnL to capital after ADL close.
                 // Positive PnL must be moved to capital so the account is self-consistent.
-                let final_pnl = engine.accounts[target_idx as usize].pnl.get();
+                let final_pnl = engine.accounts[target_idx as usize].pnl;
                 if final_pnl > 0 {
                     let settle = final_pnl as u128;
                     let old_cap = engine.accounts[target_idx as usize].capital.get();
@@ -15620,7 +15753,7 @@ pub mod processor {
                     target_idx,
                     closed_abs,
                     excess,
-                    engine.pnl_pos_tot.get()
+                    engine.pnl_pos_tot
                 );
             }
 
@@ -15968,11 +16101,11 @@ pub mod processor {
                     }
                     let acc = &engine.accounts[idx];
                     sum_capital = sum_capital.saturating_add(acc.capital.get() as i128);
-                    let pnl = acc.pnl.get();
+                    let pnl = acc.pnl;
                     if pnl > 0 {
                         sum_pnl_pos = sum_pnl_pos.saturating_add(pnl as u128);
                     }
-                    let pos = acc.position_size.get();
+                    let pos = acc.position_size;
                     sum_oi = sum_oi.saturating_add(pos.unsigned_abs());
                 }
 
@@ -15988,7 +16121,7 @@ pub mod processor {
                 }
 
                 // Invariant 2: sum(max(0, pnl)) == engine.pnl_pos_tot
-                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let pnl_pos_tot = engine.pnl_pos_tot;
                 if sum_pnl_pos != pnl_pos_tot {
                     msg!("AUDIT_VIOLATION: pnl_pos_mismatch");
                     sol_log_64(sum_pnl_pos as u64, pnl_pos_tot as u64, 0, 0, 0xAD02);
@@ -16237,7 +16370,7 @@ pub mod processor {
                 }
                 let engine_a = zc::engine_ref(&data_a)?;
                 check_idx(engine_a, user_idx_a)?;
-                let pos_a = engine_a.accounts[user_idx_a as usize].position_size.get();
+                let pos_a = engine_a.accounts[user_idx_a as usize].position_size;
                 let owner_a = engine_a.accounts[user_idx_a as usize].owner;
                 let slot = engine_a.current_slot;
                 drop(data_a);
@@ -16249,7 +16382,7 @@ pub mod processor {
                 }
                 let engine_b = zc::engine_ref(&data_b)?;
                 check_idx(engine_b, user_idx_b)?;
-                let pos_b = engine_b.accounts[user_idx_b as usize].position_size.get();
+                let pos_b = engine_b.accounts[user_idx_b as usize].position_size;
                 let owner_b = engine_b.accounts[user_idx_b as usize].owner;
                 drop(data_b);
 
@@ -17141,12 +17274,12 @@ pub mod processor {
                 // Read position data for metadata (AC5)
                 let acct = &engine.accounts[user_idx as usize];
                 let cap = acct.capital.get();
-                let pos = acct.position_size.get();
+                let pos = acct.position_size;
                 if cap == 0 && pos == 0 {
                     return Err(ProgramError::InvalidArgument);
                 }
                 let entry_price_raw = acct.entry_price;
-                let pos_size = acct.position_size.get();
+                let pos_size = acct.position_size;
                 let direction = if pos_size >= 0 { "LONG" } else { "SHORT" };
                 drop(data);
 
@@ -17944,6 +18077,253 @@ pub mod processor {
                 msg!(
                     "PERC-8400: closed orphan slab, reclaimed {} lamports",
                     slab_lamports
+                );
+            }
+
+            // ──────────────────────────────────────────────────────────────────
+            // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
+            //
+            // Security model:
+            //   - Admin-only: signer must be the slab admin.
+            //   - HYPERP markets only: index_feed_id must be all-zeros.
+            //   - Pool validation: owned by approved DEX program (Raydium/PumpSwap/Meteora).
+            //   - Mint validation: pool must contain the market's collateral_mint.
+            //   - After setting, UpdateHyperpMark will reject any non-matching pool key.
+            //
+            // This eliminates the Supabase service_role attack vector: even if an attacker
+            // modifies dex_pool_address in the DB, the on-chain check will reject the
+            // keeper-supplied pool unless it matches what the admin pinned here.
+            // ──────────────────────────────────────────────────────────────────
+            Instruction::SetDexPool { pool } => {
+                // Accounts: [admin(signer), slab(writable), pool_account(readonly)]
+                accounts::expect_len(accounts, 3)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_pool = &accounts[2];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let mut config = state::read_config(&data);
+
+                // Only valid for HYPERP markets (index_feed_id == all zeros)
+                if !oracle::is_hyperp_mode(&config) {
+                    msg!("SetDexPool: not a HYPERP market (index_feed_id is non-zero)");
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Validate pool account ownership — must be an approved DEX program
+                let is_approved_dex = *a_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID
+                    || *a_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID
+                    || *a_pool.owner == crate::oracle::METEORA_DLMM_PROGRAM_ID;
+                if !is_approved_dex {
+                    msg!("SetDexPool: pool account not owned by an approved DEX program");
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
+
+                // Validate that the pool contains the market's collateral_mint.
+                // Layout constants (all pool formats use no Anchor discriminator except Raydium/Meteora):
+                //   PumpSwap:     base_mint at offset 35..67
+                //   Raydium CLMM: mint0 at offset 73..105, mint1 at offset 105..137
+                //   Meteora DLMM: token_x_mint at offset 81..113, token_y_mint at offset 113..145
+                {
+                    let pool_data = a_pool.try_borrow_data()?;
+
+                    let mint_matches = if *a_pool.owner == crate::oracle::PUMPSWAP_PROGRAM_ID {
+                        // PumpSwap: base_mint at offset 35
+                        const PS_OFF_BASE_MINT: usize = 35;
+                        if pool_data.len() < PS_OFF_BASE_MINT + 32 {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                        let base_mint: [u8; 32] =
+                            pool_data[PS_OFF_BASE_MINT..PS_OFF_BASE_MINT + 32]
+                                .try_into()
+                                .unwrap();
+                        base_mint == config.collateral_mint
+                    } else if *a_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID {
+                        // Raydium CLMM: mint0 at 73..105, mint1 at 105..137
+                        const RAYDIUM_OFF_MINT0: usize = 73;
+                        const RAYDIUM_OFF_MINT1: usize = 105;
+                        if pool_data.len() < RAYDIUM_OFF_MINT1 + 32 {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                        let mint0: [u8; 32] = pool_data[RAYDIUM_OFF_MINT0..RAYDIUM_OFF_MINT0 + 32]
+                            .try_into()
+                            .unwrap();
+                        let mint1: [u8; 32] = pool_data[RAYDIUM_OFF_MINT1..RAYDIUM_OFF_MINT1 + 32]
+                            .try_into()
+                            .unwrap();
+                        mint0 == config.collateral_mint || mint1 == config.collateral_mint
+                    } else {
+                        // Meteora DLMM: token_x_mint at 81..113, token_y_mint at 113..145
+                        const METEORA_OFF_X: usize = 81;
+                        const METEORA_OFF_Y: usize = 113;
+                        if pool_data.len() < METEORA_OFF_Y + 32 {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                        let x_mint: [u8; 32] = pool_data[METEORA_OFF_X..METEORA_OFF_X + 32]
+                            .try_into()
+                            .unwrap();
+                        let y_mint: [u8; 32] = pool_data[METEORA_OFF_Y..METEORA_OFF_Y + 32]
+                            .try_into()
+                            .unwrap();
+                        x_mint == config.collateral_mint || y_mint == config.collateral_mint
+                    };
+
+                    if !mint_matches {
+                        msg!("SetDexPool: pool mints do not include market collateral_mint");
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                }
+
+                // Store the pool pubkey
+                config.dex_pool = pool.to_bytes();
+                state::write_config(&mut data, &config);
+
+                msg!(
+                    "SetDexPool: pinned pool {} for HYPERP market {}",
+                    pool,
+                    a_slab.key,
+                );
+            }
+
+            // InitMatcherCtx (Tag 75): CPI to matcher program to initialize a matcher context.
+            //
+            // Security model:
+            //   - Admin-only: verifies signer matches slab header admin.
+            //   - Slab must be owned by this program and properly initialized.
+            //   - LP slot must be in use; matcher_prog/matcher_ctx must match LP's stored values.
+            //   - matcher_ctx must be owned by matcher_prog (prevents substitution attacks).
+            //   - LP PDA is derived and signed via invoke_signed — only percolator can produce this.
+            //   - Standard invoke_signed (not unchecked) — safe for init path (no open borrow).
+            Instruction::InitMatcherCtx {
+                lp_idx,
+                kind,
+                trading_fee_bps,
+                base_spread_bps,
+                max_total_bps,
+                impact_k_bps,
+                liquidity_notional_e6,
+                max_fill_abs,
+                max_inventory_abs,
+                fee_to_insurance_bps,
+                skew_spread_mult_bps,
+            } => {
+                // Accounts: [admin(signer), slab(readonly), matcher_ctx(writable),
+                //            matcher_prog(executable), lp_pda]
+                accounts::expect_len(accounts, 5)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_matcher_ctx = &accounts[2];
+                let a_matcher_prog = &accounts[3];
+                let a_lp_pda = &accounts[4];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_matcher_ctx)?;
+
+                // Slab must be owned by this program and properly initialized.
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Validate LP slot and extract stored matcher identifiers.
+                let engine = zc::engine_ref(&data)?;
+                check_idx(engine, lp_idx)?;
+                let lp_acc = &engine.accounts[lp_idx as usize];
+
+                // LP must have a matcher program configured (all-zeros means unset).
+                if lp_acc.matcher_program == [0u8; 32] {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Passed matcher_prog must match LP's stored matcher_program.
+                if lp_acc.matcher_program != a_matcher_prog.key.to_bytes() {
+                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+                }
+
+                // Passed matcher_ctx must match LP's stored matcher_context.
+                if lp_acc.matcher_context != a_matcher_ctx.key.to_bytes() {
+                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+                }
+
+                // matcher_ctx must currently be owned by matcher_prog (prevents substitution).
+                if a_matcher_ctx.owner != a_matcher_prog.key {
+                    return Err(ProgramError::IncorrectProgramId);
+                }
+
+                // matcher_prog must be a deployed executable program.
+                if !a_matcher_prog.executable {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Derive LP PDA and verify the caller-supplied account matches.
+                let lp_bytes = lp_idx.to_le_bytes();
+                let (expected_lp_pda, bump) = Pubkey::find_program_address(
+                    &[b"lp", a_slab.key.as_ref(), &lp_bytes],
+                    program_id,
+                );
+                if *a_lp_pda.key != expected_lp_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+
+                // Drop borrow before CPI — cannot hold RefCell borrow across invoke.
+                drop(data);
+
+                // Build matcher init CPI data (matcher tag 2 + InitParams).
+                // Layout from percolator-match/src/vamm.rs InitParams::parse:
+                // tag(1) + kind(1) + trading_fee_bps(4) + base_spread_bps(4) + max_total_bps(4) +
+                // impact_k_bps(4) + liquidity_notional_e6(16) + max_fill_abs(16) +
+                // max_inventory_abs(16) + fee_to_insurance_bps(2) + skew_spread_mult_bps(2) = 70 bytes
+                let mut cpi_data = [0u8; 70];
+                cpi_data[0] = 2; // MATCHER_INIT_TAG
+                cpi_data[1] = kind;
+                cpi_data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
+                cpi_data[6..10].copy_from_slice(&base_spread_bps.to_le_bytes());
+                cpi_data[10..14].copy_from_slice(&max_total_bps.to_le_bytes());
+                cpi_data[14..18].copy_from_slice(&impact_k_bps.to_le_bytes());
+                cpi_data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
+                cpi_data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
+                cpi_data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
+                cpi_data[66..68].copy_from_slice(&fee_to_insurance_bps.to_le_bytes());
+                cpi_data[68..70].copy_from_slice(&skew_spread_mult_bps.to_le_bytes());
+
+                // CPI accounts: LP PDA (signer via invoke_signed) + matcher_ctx (writable).
+                let metas = [
+                    solana_program::instruction::AccountMeta::new_readonly(
+                        *a_lp_pda.key,
+                        true, // signer — supplied via invoke_signed seeds
+                    ),
+                    solana_program::instruction::AccountMeta::new(*a_matcher_ctx.key, false),
+                ];
+
+                let ix = solana_program::instruction::Instruction {
+                    program_id: *a_matcher_prog.key,
+                    accounts: metas.to_vec(),
+                    data: cpi_data.to_vec(),
+                };
+
+                let bump_arr = [bump];
+                let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
+
+                solana_program::program::invoke_signed(
+                    &ix,
+                    &[a_lp_pda.clone(), a_matcher_ctx.clone()],
+                    &[seeds],
+                )?;
+
+                msg!(
+                    "InitMatcherCtx: initialized matcher context for LP idx {}",
+                    lp_idx
                 );
             }
 
@@ -19630,6 +20010,6 @@ pub mod entrypoint {
 // 11. mod risk (glue)
 pub mod risk {
     pub use percolator::{
-        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, RiskParams, TradeExecution,
+        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution,
     };
 }

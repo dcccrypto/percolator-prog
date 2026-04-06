@@ -123,6 +123,24 @@ pub const TAG_RESCUE_ORPHAN_VAULT: u8 = 72;
 /// Accounts: [admin(signer,writable), slab(writable), vault(readonly), vault_pda(readonly)]
 pub const TAG_CLOSE_ORPHAN_SLAB: u8 = 73;
 
+/// PERC-SetDexPool: Pin the admin-approved DEX pool address on-chain for a HYPERP market.
+/// Admin-only. Only valid for HYPERP markets (index_feed_id == [0;32]).
+/// Validates pool account ownership (Raydium/Meteora/PumpSwap) and mint match before storing.
+/// UpdateHyperpMark will reject any pool that doesn't match the stored address.
+/// Data: tag(1) + pool_pubkey(32)
+/// Accounts: [admin(signer), slab(writable), pool_account(readonly)]
+pub const TAG_SET_DEX_POOL: u8 = 74;
+
+/// CPI to the matcher program (DHP6DtwXP1yJsz8YzfoeigRFPB979gzmumkmCxDLSkUX) to initialize
+/// the matcher context account for a given LP slot. The LP PDA must sign via invoke_signed.
+/// Admin-only. Must be called before TradeCpi can succeed for this LP.
+/// Data: tag(1) + lp_idx(2) + kind(1) + trading_fee_bps(4) + base_spread_bps(4) +
+///       max_total_bps(4) + impact_k_bps(4) + liquidity_notional_e6(16) +
+///       max_fill_abs(16) + max_inventory_abs(16) + fee_to_insurance_bps(2) +
+///       skew_spread_mult_bps(2) = 72 bytes total
+/// Accounts: [admin(signer), slab(readonly), matcher_ctx(writable), matcher_prog(executable), lp_pda]
+pub const TAG_INIT_MATCHER_CTX: u8 = 75;
+
 /// PERC-622: Advance oracle phase (permissionless crank).
 /// Transitions market through Phase 1→2→3 based on time + volume milestones.
 pub const TAG_ADVANCE_ORACLE_PHASE: u8 = 56;
@@ -257,6 +275,8 @@ mod tests {
             TAG_SET_OI_IMBALANCE_HARD_BLOCK,
             TAG_RESCUE_ORPHAN_VAULT,
             TAG_CLOSE_ORPHAN_SLAB,
+            TAG_SET_DEX_POOL,
+            TAG_INIT_MATCHER_CTX,
         ];
 
         for i in 0..tags.len() {
