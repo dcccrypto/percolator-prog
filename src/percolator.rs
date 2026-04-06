@@ -13001,6 +13001,11 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                // SECURITY(M-1): Block insurance LP withdrawal during pause.
+                // The insurance fund backstops losses during emergencies — allowing
+                // withdrawal during pause creates a bank-run dynamic that depletes
+                // the fund when it is most needed.
+                require_not_paused(&data)?;
 
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
