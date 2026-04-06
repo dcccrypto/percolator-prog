@@ -12248,8 +12248,17 @@ pub mod processor {
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
-                // Update oracle authority in config
+                // SECURITY(M-4): Block SetOracleAuthority on Pyth-pinned markets.
+                // Pyth-pinned markets guarantee decentralized oracle pricing.
+                // Setting a non-zero authority would silently switch to admin-oracle
+                // mode, breaking the trust model users signed up for.
                 let mut config = state::read_config(&data);
+                if crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id)
+                    && new_authority != Pubkey::default()
+                {
+                    msg!("SetOracleAuthority: blocked on Pyth-pinned market");
+                    return Err(ProgramError::InvalidArgument);
+                }
                 config.oracle_authority = new_authority.to_bytes();
                 // Clear stored price when authority changes
                 config.authority_price_e6 = 0;
