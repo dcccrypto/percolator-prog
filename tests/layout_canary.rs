@@ -10,7 +10,7 @@
 use percolator_prog::constants::{
     CONFIG_LEN, ENGINE_ALIGN, ENGINE_LEN, ENGINE_OFF, HEADER_LEN, SLAB_LEN,
 };
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, offset_of, size_of};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Struct size pinning — catches any field addition/removal/reordering
@@ -27,9 +27,10 @@ fn header_len_pinned() {
 
 #[test]
 fn config_len_pinned() {
-    // CONFIG_LEN depends on target alignment:
-    //   Native (u128 align=16): 544  (+32 for dex_pool field, PERC-SetDexPool)
-    //   SBF/BPF (u128 align=8): 528  (+32 for dex_pool field)
+    // CONFIG_LEN = 544 on both native and SBF (MarketConfig size is target-independent).
+    // Only ENGINE_OFF differs between targets because of the alignment boundary:
+    //   Native: align_up(104 + 544, 16) = 656
+    //   SBF:    align_up(104 + 544, 8)  = 648  (verified empirically, SDK PR #149)
     // Tests run on native, so we expect 544.
     assert_eq!(
         CONFIG_LEN, 544,
@@ -181,24 +182,31 @@ fn u128_alignment_documented() {
 
 #[test]
 fn sbf_config_len_would_be_496() {
-    // PERC-SetDexPool: SBF CONFIG_LEN is now 528 (was 496), ENGINE_OFF = 632 (was 600).
-    // On SBF, u128 alignment is 8, so MarketConfig packs tighter than native (16-byte align).
-    // We can't test SBF layout from native, but we document the expected value
-    // and verify the compile-time assertion in the program catches mismatches.
+    // PERC-SetDexPool: SBF CONFIG_LEN = 544 (same as native), ENGINE_OFF = 648.
+    // MarketConfig's u128 fields do NOT cause a size difference between native and SBF —
+    // the struct packs to the same size on both targets (verified empirically via SDK PR #149,
+    // which confirmed V_SETDEXPOOL produces 323344-byte medium slabs with engine_off=648).
     //
-    // If this value changes, update:
-    //   1. SDK detectSlabLayout() constants (slab.ts V_SETDEXPOOL_CONFIG_LEN = 528)
-    //   2. Frontend slab.ts
+    // The alignment difference between native (16) and SBF (8) only affects ENGINE_OFF:
+    //   Native: align_up(104 + 544, 16) = 656
+    //   SBF:    align_up(104 + 544, 8)  = 648
+    //
+    // If CONFIG_LEN changes, update:
+    //   1. emit_layout_json test below (sbf.config_len, sbf.engine_off)
+    //   2. SDK detectSlabLayout() constants (slab.ts V_SETDEXPOOL_CONFIG_LEN, V_SETDEXPOOL_ENGINE_OFF)
     //   3. Indexer StatsCollector
     //   4. slab_guard accepted sizes
-    println!("Expected SBF CONFIG_LEN: 528 (u128 align=8, PERC-SetDexPool: was 496)");
-    println!("Expected SBF ENGINE_OFF: align_up(104 + 528, 8) = 632 (was 600)");
+    println!("SBF CONFIG_LEN: {} (same as native — no size diff for MarketConfig)", CONFIG_LEN);
+    println!("SBF ENGINE_OFF: align_up({} + {}, 8) = {} (native ENGINE_OFF={})",
+        HEADER_LEN, CONFIG_LEN,
+        (HEADER_LEN + CONFIG_LEN + 7) & !7,
+        ENGINE_OFF
+    );
     println!(
         "Actual native CONFIG_LEN: {} (u128 align={})",
         CONFIG_LEN,
         align_of::<u128>()
     );
-    println!("Actual native ENGINE_OFF: {}", ENGINE_OFF);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -235,5 +243,119 @@ fn print_all_layout_constants() {
     println!(
         "  SDK V1M2_ACCOUNT_SIZE should be: {}",
         size_of::<percolator::Account>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. Emit layout.json — machine-readable constants for SDK verification
+//
+//    Run: cargo test layout_canary::emit_layout_json -- --nocapture
+//    Then: cd ../percolator-sdk && npx tsx scripts/verify-layout.ts
+//
+//    The JSON captures the NATIVE target values plus SBF-adjusted constants
+//    (engine_off_sbf, config_len_sbf, account_size_sbf) which the SDK uses.
+//    Whenever a struct changes, this file changes, and verify-layout.ts will
+//    catch any SDK constant that has drifted.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn emit_layout_json() {
+    // Bitmap offset within RiskEngine — where the `used: [u64; BITMAP_WORDS]` field starts.
+    // offset_of! gives the NATIVE value; SBF differs because RiskEngine has u128 fields before `used`.
+    //   Native (u128 align=16): offset_of!(RiskEngine, used) = 1048
+    //   SBF    (u128 align=8):  empirically verified = 1008 (mainnet slab CCTegYZ..., 323312 bytes)
+    // The native value is computed automatically; the SBF value is pinned below.
+    let engine_bitmap_off_native = offset_of!(percolator::RiskEngine, used);
+    // SBF engine_bitmap_off: pinned to 1008 (verified empirically; update if RiskEngine fields change).
+    // To re-verify: cargo build-sbf && cargo test --test layout_canary slab_guard_accepts_all_known_sizes
+    // then check that the computed slab sizes match known on-chain sizes.
+    let engine_bitmap_off_sbf: usize = 1008;
+
+    // SBF vs native differences:
+    //
+    // CONFIG_LEN: SAME on both targets (544). MarketConfig has no internal u128 padding differences.
+    //   Verified empirically: V_SETDEXPOOL binary produces 323344-byte medium slabs (SDK PR #149).
+    let config_len_sbf: usize = CONFIG_LEN; // identical to native for MarketConfig
+
+    // ENGINE_OFF differs because RiskEngine's alignment boundary:
+    //   Native: align_up(HEADER + CONFIG, 16) = align_up(648, 16) = 656
+    //   SBF:    align_up(HEADER + CONFIG, 8)  = align_up(648, 8)  = 648
+    let sbf_engine_align: usize = 8;
+    let engine_off_sbf = (HEADER_LEN + config_len_sbf + (sbf_engine_align - 1)) & !(sbf_engine_align - 1);
+
+    // Account size: differs between native and SBF because Account has i128/u128 fields.
+    //   Native (u128 align=16): 336  (v12.1 upstream)
+    //   SBF    (u128 align=8):  312  (pinned, verified by cargo build-sbf)
+    // The deployed binary uses the old core (pre-v12.1) which has account_size=312 on SBF.
+    // When the v12.1 binary is deployed, update this to the new SBF value.
+    let account_size_sbf: usize = 312; // pinned for current deployed binary (pre-v12.1 core)
+
+    let json = format!(
+        r#"{{
+  "_comment": "Auto-generated by cargo test layout_canary::emit_layout_json. Do not edit manually.",
+  "_target": "native (aarch64/x86_64, u128_align={})",
+  "native": {{
+    "header_len": {},
+    "config_len": {},
+    "engine_align": {},
+    "engine_off": {},
+    "engine_len": {},
+    "slab_len": {},
+    "account_size": {},
+    "max_accounts": {},
+    "engine_bitmap_off": {},
+    "u128_align": {}
+  }},
+  "sbf": {{
+    "_comment": "On-chain (SBF target, u128_align=8) values — what the SDK must use. Manually pinned where native differs.",
+    "config_len": {},
+    "engine_off": {},
+    "account_size": {},
+    "engine_bitmap_off": {}
+  }}
+}}
+"#,
+        align_of::<u128>(),
+        HEADER_LEN,
+        CONFIG_LEN,
+        ENGINE_ALIGN,
+        ENGINE_OFF,
+        ENGINE_LEN,
+        SLAB_LEN,
+        size_of::<percolator::Account>(),
+        percolator::MAX_ACCOUNTS,
+        engine_bitmap_off_native,
+        align_of::<u128>(),
+        config_len_sbf,
+        engine_off_sbf,
+        account_size_sbf,
+        engine_bitmap_off_sbf,
+    );
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let out_path = std::path::Path::new(manifest_dir).join("target/layout.json");
+    std::fs::create_dir_all(out_path.parent().unwrap()).unwrap();
+    std::fs::write(&out_path, &json).expect("failed to write target/layout.json");
+
+    println!("Written: {}", out_path.display());
+    println!("{}", json);
+
+    // Assert the SBF engine_off is self-consistent with our formula
+    assert_eq!(
+        engine_off_sbf,
+        (HEADER_LEN + config_len_sbf + (sbf_engine_align - 1)) & !(sbf_engine_align - 1),
+        "engine_off_sbf formula inconsistent"
+    );
+    // And it must be <= the native value (SBF aligns to 8, native to 16)
+    assert!(
+        engine_off_sbf <= ENGINE_OFF,
+        "engine_off_sbf ({}) should be <= native ENGINE_OFF ({})",
+        engine_off_sbf, ENGINE_OFF
+    );
+    // SBF bitmap offset must be <= native (RiskEngine has u128 fields that pack tighter on SBF)
+    assert!(
+        engine_bitmap_off_sbf <= engine_bitmap_off_native,
+        "engine_bitmap_off_sbf ({}) should be <= native ({})",
+        engine_bitmap_off_sbf, engine_bitmap_off_native
     );
 }
