@@ -3533,7 +3533,10 @@ pub mod ix {
             // PERC-8093: new RiskParams fields (percolator@cf35789)
             min_nonzero_mm_req: 0,
             min_nonzero_im_req: 0,
-            min_initial_deposit: U128::ZERO,
+            // min_initial_deposit must be > 0 (enforced by validate()).
+            // Default to 1 USDC (1e6) for backward-compatible InitMarket payloads.
+            // Can be updated later via UpdateRiskParams.
+            min_initial_deposit: U128::new(1_000_000),
             insurance_floor: U128::ZERO,
         })
     }
