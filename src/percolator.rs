@@ -3510,6 +3510,7 @@ pub mod ix {
             // PERC-8093: new RiskParams fields (percolator@cf35789)
             min_nonzero_mm_req: 0,
             min_nonzero_im_req: 0,
+            min_initial_deposit: U128::ZERO,
             insurance_floor: U128::ZERO,
         })
     }
@@ -8874,9 +8875,24 @@ pub mod processor {
     #[allow(unused_imports)]
     use alloc::format;
     use percolator::{
-        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, RiskParams, TradeExecution,
+        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution,
         MAX_ACCOUNTS,
     };
+    /// Local no-op matching engine: passes oracle price directly as execution price.
+    /// Used for markets without an external CPI matcher (i.e. internal oracle matching).
+    struct NoopMatchingEngine;
+    impl MatchingEngine for NoopMatchingEngine {
+        fn execute_match(
+            &self,
+            _lp_program: &[u8; 32],
+            _lp_context: &[u8; 32],
+            _lp_account_id: u64,
+            oracle_price: u64,
+            size: i128,
+        ) -> percolator::Result<TradeExecution> {
+            Ok(TradeExecution { price: oracle_price, size })
+        }
+    }
     use solana_program::instruction::{AccountMeta, Instruction as SolInstruction};
     use solana_program::{
         account_info::AccountInfo,
@@ -9145,7 +9161,7 @@ pub mod processor {
         // Margin requirement is looser than phase allows.
         // Check if the user's position actually exceeds phase leverage.
         let acct = &engine.accounts[user_idx as usize];
-        let pos_size = acct.position_size.get().unsigned_abs();
+        let pos_size = acct.position_size.unsigned_abs();
         if pos_size == 0 {
             return Ok(());
         }
@@ -9180,7 +9196,7 @@ pub mod processor {
         if cap == 0 {
             return Ok(()); // PnL cap disabled
         }
-        let current_pnl = engine.pnl_pos_tot.get();
+        let current_pnl = engine.pnl_pos_tot;
         if current_pnl > cap as u128 {
             msg!(
                 "PnL cap exceeded: current_pnl_pos_tot={} max={}",
@@ -9212,7 +9228,7 @@ pub mod processor {
             return Ok(()); // Cap disabled
         }
 
-        let pos = engine.accounts[user_idx as usize].position_size.get();
+        let pos = engine.accounts[user_idx as usize].position_size;
         // Compare in u128 to prevent silent truncation when |pos| >= 2^64.
         let abs_pos = pos.unsigned_abs();
 
@@ -10675,7 +10691,7 @@ pub mod processor {
                             let _ = engine.touch_account(idx);
 
                             let acc = &engine.accounts[idx as usize];
-                            let pos = acc.position_size.get();
+                            let pos = acc.position_size;
                             if pos != 0 {
                                 // Settle position using COIN-MARGINED PnL formula
                                 // (matches mark_pnl_for_position in the risk engine)
@@ -10701,13 +10717,13 @@ pub mod processor {
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
                                 // SECURITY: Must use set_pnl() for correct haircut calculations
-                                let old_pnl = acc.pnl.get();
+                                let old_pnl = acc.pnl;
                                 let new_pnl = old_pnl.saturating_add(pnl_delta);
                                 engine.set_pnl(idx as usize, new_pnl);
 
                                 // Clear position
                                 engine.accounts[idx as usize].position_size =
-                                    percolator::I128::ZERO;
+                                    0i128;
                                 engine.accounts[idx as usize].entry_price = 0;
                             }
                         }
@@ -11188,7 +11204,7 @@ pub mod processor {
                     if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
-                    let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                    let old_user_pos = engine.accounts[user_idx as usize].position_size;
                     let net_lp = engine.net_lp_pos.get();
                     check_safety_valve(&config, net_lp, size, old_user_pos, clock.slot)?;
                     // PERC-8110: OI imbalance hard block (pre-trade)
@@ -11220,7 +11236,7 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_nocpi_compute_end");
                         sol_log_compute_units();
                     }
-                    let old_lp_pos = engine.accounts[lp_idx as usize].position_size.get();
+                    let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                     if risk_state.would_increase_risk(old_lp_pos, -size) {
                         return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                     }
@@ -11244,7 +11260,7 @@ pub mod processor {
                 }
 
                 let trade_result = engine
-                    .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
+                    .execute_trade(&NoopMatchingEngine, lp_idx, user_idx, clock.slot, price, size)
                     .map_err(map_risk_error);
                 crate::restore_margins(engine, margin_orig);
                 trade_result?;
@@ -11577,7 +11593,7 @@ pub mod processor {
                             msg!("CU_CHECKPOINT: trade_cpi_compute_end");
                             sol_log_compute_units();
                         }
-                        let old_lp_pos = engine.accounts[lp_idx as usize].position_size.get();
+                        let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                         if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
                             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                         }
@@ -11589,7 +11605,7 @@ pub mod processor {
                     // PERC-312: Safety valve check
                     // PERC-8110: OI imbalance hard block (pre-trade)
                     {
-                        let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                        let old_user_pos = engine.accounts[user_idx as usize].position_size;
                         let net_lp = engine.net_lp_pos.get();
                         check_safety_valve(&config, net_lp, trade_size, old_user_pos, clock.slot)?;
                         check_oi_imbalance_hard_block(engine, &config, trade_size)?;
@@ -11698,14 +11714,14 @@ pub mod processor {
                 sol_log_64(target_idx as u64, price, 0, 0, 0); // idx, price
                 {
                     let acc = &engine.accounts[target_idx as usize];
-                    sol_log_64(acc.capital.get() as u64, acc.pnl.get() as u64, 0, 0, 1); // cap, pnl
-                    sol_log_64(acc.position_size.get() as u64, acc.entry_price, 0, 0, 2); // pos, entry
+                    sol_log_64(acc.capital.get() as u64, acc.pnl as u64, 0, 0, 1); // cap, pnl
+                    sol_log_64(acc.position_size as u64, acc.entry_price, 0, 0, 2); // pos, entry
                                                                                           // Calculate mark PnL
-                    let pos = acc.position_size.get();
+                    let pos = acc.position_size;
                     let entry = acc.entry_price as i128;
                     let mark = pos.saturating_mul(price as i128 - entry) / 1_000_000;
                     let equity = (acc.capital.get() as i128)
-                        .saturating_add(acc.pnl.get())
+                        .saturating_add(acc.pnl)
                         .saturating_add(mark);
                     let notional = pos.unsigned_abs().saturating_mul(price as u128) / 1_000_000;
                     let maint_req = notional
@@ -11722,7 +11738,7 @@ pub mod processor {
                 }
                 // Snapshot pre-liquidation state for event logging
                 let pre_cap = engine.accounts[target_idx as usize].capital.get() as u64;
-                let pre_pos = engine.accounts[target_idx as usize].position_size.get();
+                let pre_pos = engine.accounts[target_idx as usize].position_size;
                 // VRAM: scale margins before liquidation check
                 let vram_orig = crate::apply_vram_scaling(engine, &config);
 
@@ -11748,7 +11764,7 @@ pub mod processor {
                 crate::restore_margins(engine, vram_orig);
                 let _res = liq_result?;
                 let post_cap = engine.accounts[target_idx as usize].capital.get() as u64;
-                let post_pos = engine.accounts[target_idx as usize].position_size.get();
+                let post_pos = engine.accounts[target_idx as usize].position_size;
                 // Enhanced liquidation event: tag=4, result, pre_cap, post_cap, price
                 sol_log_64(_res as u64, pre_cap, post_cap, price, 4);
                 // Liquidation detail: tag=5, pre_pos(low), pre_pos(high), post_pos(low), partial_flag
@@ -12396,7 +12412,7 @@ pub mod processor {
                 let mut has_open_positions = false;
                 for i in 0..percolator::MAX_ACCOUNTS {
                     if engine.is_used(i) {
-                        let pos = engine.accounts[i].position_size.get();
+                        let pos = engine.accounts[i].position_size;
                         if pos != 0 {
                             has_open_positions = true;
                             break;
@@ -15124,7 +15140,7 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                let pos = engine.accounts[user_idx as usize].position_size.get();
+                let pos = engine.accounts[user_idx as usize].position_size;
                 if pos != 0 {
                     return Err(PercolatorError::LpCollateralPositionOpen.into());
                 }
@@ -15607,7 +15623,7 @@ pub mod processor {
 
                 // PERC-8273: Gate — target index must be valid and position must be open.
                 check_idx(engine, target_idx)?;
-                let pos_size = engine.accounts[target_idx as usize].position_size.get();
+                let pos_size = engine.accounts[target_idx as usize].position_size;
                 if pos_size == 0 {
                     msg!("ADL: target_idx={} position already closed", target_idx);
                     return Err(PercolatorError::BankruptPositionAlreadyClosed.into());
@@ -15615,7 +15631,7 @@ pub mod processor {
 
                 // Compute excess PnL to remove (pnl_pos_tot above cap).
                 // If max_pnl_cap is 0 (unconfigured), treat cap as 0 (full excess).
-                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let pnl_pos_tot = engine.pnl_pos_tot;
                 let cap = config.max_pnl_cap as u128;
                 let excess = if pnl_pos_tot > cap {
                     pnl_pos_tot.saturating_sub(cap)
@@ -15633,7 +15649,7 @@ pub mod processor {
 
                 // Settle any realised PnL to capital after ADL close.
                 // Positive PnL must be moved to capital so the account is self-consistent.
-                let final_pnl = engine.accounts[target_idx as usize].pnl.get();
+                let final_pnl = engine.accounts[target_idx as usize].pnl;
                 if final_pnl > 0 {
                     let settle = final_pnl as u128;
                     let old_cap = engine.accounts[target_idx as usize].capital.get();
@@ -15655,7 +15671,7 @@ pub mod processor {
                     target_idx,
                     closed_abs,
                     excess,
-                    engine.pnl_pos_tot.get()
+                    engine.pnl_pos_tot
                 );
             }
 
@@ -15998,11 +16014,11 @@ pub mod processor {
                     }
                     let acc = &engine.accounts[idx];
                     sum_capital = sum_capital.saturating_add(acc.capital.get() as i128);
-                    let pnl = acc.pnl.get();
+                    let pnl = acc.pnl;
                     if pnl > 0 {
                         sum_pnl_pos = sum_pnl_pos.saturating_add(pnl as u128);
                     }
-                    let pos = acc.position_size.get();
+                    let pos = acc.position_size;
                     sum_oi = sum_oi.saturating_add(pos.unsigned_abs());
                 }
 
@@ -16018,7 +16034,7 @@ pub mod processor {
                 }
 
                 // Invariant 2: sum(max(0, pnl)) == engine.pnl_pos_tot
-                let pnl_pos_tot = engine.pnl_pos_tot.get();
+                let pnl_pos_tot = engine.pnl_pos_tot;
                 if sum_pnl_pos != pnl_pos_tot {
                     msg!("AUDIT_VIOLATION: pnl_pos_mismatch");
                     sol_log_64(sum_pnl_pos as u64, pnl_pos_tot as u64, 0, 0, 0xAD02);
@@ -16267,7 +16283,7 @@ pub mod processor {
                 }
                 let engine_a = zc::engine_ref(&data_a)?;
                 check_idx(engine_a, user_idx_a)?;
-                let pos_a = engine_a.accounts[user_idx_a as usize].position_size.get();
+                let pos_a = engine_a.accounts[user_idx_a as usize].position_size;
                 let owner_a = engine_a.accounts[user_idx_a as usize].owner;
                 let slot = engine_a.current_slot;
                 drop(data_a);
@@ -16279,7 +16295,7 @@ pub mod processor {
                 }
                 let engine_b = zc::engine_ref(&data_b)?;
                 check_idx(engine_b, user_idx_b)?;
-                let pos_b = engine_b.accounts[user_idx_b as usize].position_size.get();
+                let pos_b = engine_b.accounts[user_idx_b as usize].position_size;
                 let owner_b = engine_b.accounts[user_idx_b as usize].owner;
                 drop(data_b);
 
@@ -17164,12 +17180,12 @@ pub mod processor {
                 // Read position data for metadata (AC5)
                 let acct = &engine.accounts[user_idx as usize];
                 let cap = acct.capital.get();
-                let pos = acct.position_size.get();
+                let pos = acct.position_size;
                 if cap == 0 && pos == 0 {
                     return Err(ProgramError::InvalidArgument);
                 }
                 let entry_price_raw = acct.entry_price;
-                let pos_size = acct.position_size.get();
+                let pos_size = acct.position_size;
                 let direction = if pos_size >= 0 { "LONG" } else { "SHORT" };
                 drop(data);
 
@@ -19874,6 +19890,6 @@ pub mod entrypoint {
 // 11. mod risk (glue)
 pub mod risk {
     pub use percolator::{
-        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, RiskParams, TradeExecution,
+        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution,
     };
 }

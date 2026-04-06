@@ -26,10 +26,11 @@ use std::path::PathBuf;
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
 // Updated for PERC-8271: PERC-8270 (ADL T5) added 4 Account fields (+56 bytes/account) and
 // 3 RiskEngine fields — total layout growth.
+// PERC-SetDexPool: CONFIG_LEN grew by 32 bytes (dex_pool field). ENGINE_OFF (BPF) = 632 (was 600).
 // NOTE: BPF layout differs from native (BPF uses 8-byte i128 alignment vs 16-byte native).
-// BPF SLAB_LEN = 1288304. Native = 1321088.
-// Previous BPF value: 1025880 (pre-PERC-8270, now a legacy tier in slab_guard).
-const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields (cargo build-sbf)
+// BPF SLAB_LEN = 1288336 (1288304 + 32). Native = 1321120.
+// Previous BPF value: 1288304 (pre-SetDexPool, now a legacy tier in slab_guard).
+const SLAB_LEN: usize = 1288336; // PERC-SetDexPool: +32 bytes dex_pool field (cargo build-sbf)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

@@ -3525,6 +3525,17 @@ fn encode_update_hyperp_mark() -> Vec<u8> {
     vec![percolator_prog::tags::TAG_UPDATE_HYPERP_MARK]
 }
 
+/// PERC-SetDexPool: Directly write dex_pool into the slab config data.
+///
+/// This is the test equivalent of calling SetDexPool on-chain.
+/// Tests that use UpdateHyperpMark must call this after InitMarket to set the
+/// admin-approved pool address, or UpdateHyperpMark will reject with OracleInvalid.
+fn set_dex_pool_in_slab(slab_data: &mut Vec<u8>, pool_key: &solana_program::pubkey::Pubkey) {
+    let mut config = state::read_config(slab_data);
+    config.dex_pool = pool_key.to_bytes();
+    state::write_config(slab_data, &config);
+}
+
 /// Setup a Hyperp market fixture: same as setup_market() but will be
 /// initialized with index_feed_id = [0;32] for Hyperp mode.
 fn setup_hyperp_market() -> MarketFixture {
@@ -3578,6 +3589,9 @@ fn test_update_hyperp_mark_rejects_insufficient_pumpswap_liquidity() {
     let mut base_vault =
         TestAccount::new(base_vault_key, spl_token::ID, 0, make_spl_vault(1_000_000)); // 1 token
     let mut quote_vault = TestAccount::new(quote_vault_key, spl_token::ID, 0, make_spl_vault(1)); // 1 lamport — insufficient
+
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
 
     // Advance clock so dt_slots > 0
     let mut clock = TestAccount::new(
@@ -3651,6 +3665,9 @@ fn test_update_hyperp_mark_accepts_sufficient_pumpswap_liquidity() {
         0,
         make_spl_vault(quote_amount),
     );
+
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
 
     // Advance clock
     let mut clock = TestAccount::new(
@@ -3729,6 +3746,9 @@ fn test_update_hyperp_mark_boundary_liquidity() {
         make_spl_vault(below_threshold),
     );
 
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
+
     let mut clock = TestAccount::new(
         solana_program::sysvar::clock::id(),
         solana_program::sysvar::id(),
@@ -3787,6 +3807,8 @@ fn test_update_hyperp_mark_meteora_accepts_sufficient_liquidity() {
     let pool_key = Pubkey::new_unique();
 
     let mut pool_account = TestAccount::new(pool_key, meteora_id, 0, pool_data);
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
     // vault_y with sufficient liquidity (above MIN_DEX_QUOTE_LIQUIDITY = $2M = 2T atoms)
     let mut vault_y = TestAccount::new(
         vault_y_key,
@@ -3830,6 +3852,8 @@ fn test_update_hyperp_mark_meteora_rejects_insufficient_liquidity() {
     let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
     let mut vault_y = TestAccount::new(
         vault_y_key,
         spl_token::ID,
@@ -3871,6 +3895,8 @@ fn test_update_hyperp_mark_meteora_rejects_wrong_vault_y() {
 
     let wrong_vault_y_key = Pubkey::new_unique(); // different key — should be rejected
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
     let mut wrong_vault_y = TestAccount::new(
         wrong_vault_y_key,
         spl_token::ID,
@@ -3912,6 +3938,8 @@ fn test_update_hyperp_mark_meteora_rejects_invalid_vault_owner() {
 
     let bad_owner = Pubkey::new_unique(); // not spl_token or spl_token_2022
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
     let mut vault_y = TestAccount::new(
         vault_y_key,
         bad_owner, // invalid token program owner
@@ -3952,6 +3980,8 @@ fn test_update_hyperp_mark_meteora_rejects_missing_vault_y() {
     let pool_data = make_meteora_lbpair(100, 0, &vault_y_key);
 
     let mut pool_account = TestAccount::new(Pubkey::new_unique(), meteora_id, 0, pool_data);
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool_account.key);
     let mut clock = TestAccount::new(
         solana_program::sysvar::clock::id(),
         solana_program::sysvar::id(),
@@ -5663,6 +5693,8 @@ fn test_update_hyperp_mark_blend_weight_zero_backward_compat() {
         0,
         make_pumpswap_pool(&f.mint.key, &bvk, &qvk),
     );
+    // PERC-SetDexPool: pin the pool address on-chain before UpdateHyperpMark
+    set_dex_pool_in_slab(&mut f.slab.data, &pool.key);
     let mut bv = TestAccount::new(bvk, spl_token::ID, 0, make_spl_vault(2_000_000));
     let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(2_100_000_000_000)); // 2.1T > MIN_DEX_QUOTE_LIQUIDITY ($2M)
     let mut clk = TestAccount::new(
@@ -5735,6 +5767,7 @@ fn test_update_hyperp_mark_blend_weight_5000() {
         0,
         make_pumpswap_pool(&f.mint.key, &bvk, &qvk),
     );
+    set_dex_pool_in_slab(&mut f.slab.data, &pool.key);
     let mut bv = TestAccount::new(bvk, spl_token::ID, 0, make_spl_vault(1_000_000));
     let mut qv = TestAccount::new(qvk, spl_token::ID, 0, make_spl_vault(2_100_000_000_000)); // 2.1T > MIN_DEX_QUOTE_LIQUIDITY ($2M)
     let mut clk = TestAccount::new(

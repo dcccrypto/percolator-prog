@@ -30,8 +30,9 @@ use std::path::PathBuf;
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
 // Updated PERC-8271: PERC-8270 (ADL T5) grew Account by 56 bytes (4 fields) and RiskEngine by 24 bytes.
 // Previous BPF value: 1025880 (pre-PERC-8270, now a legacy tier in slab_guard).
-// BPF SLAB_LEN = 1288304 (8-byte i128 alignment). Native = 1321088 (16-byte).
-const SLAB_LEN: usize = 1288304; // PERC-8270 BPF: ADL per-account + RiskEngine fields, MAX_ACCOUNTS=4096
+// PERC-SetDexPool: CONFIG_LEN +32 (dex_pool). BPF ENGINE_OFF = 632 (was 600).
+// BPF SLAB_LEN = 1288336 (1288304 + 32). Native = 1321120 (16-byte).
+const SLAB_LEN: usize = 1288336; // PERC-SetDexPool: +32 bytes dex_pool field, MAX_ACCOUNTS=4096
 const MAX_ACCOUNTS: usize = 4096;
 
 // PERC-328: Minimum seed deposit required by production binary (non-test feature).

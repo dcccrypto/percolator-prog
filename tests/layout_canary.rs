@@ -28,11 +28,11 @@ fn header_len_pinned() {
 #[test]
 fn config_len_pinned() {
     // CONFIG_LEN depends on target alignment:
-    //   Native (u128 align=16): 512
-    //   SBF/BPF (u128 align=8): 496
-    // Tests run on native, so we expect 512.
+    //   Native (u128 align=16): 544  (+32 for dex_pool field, PERC-SetDexPool)
+    //   SBF/BPF (u128 align=8): 528  (+32 for dex_pool field)
+    // Tests run on native, so we expect 544.
     assert_eq!(
-        CONFIG_LEN, 512,
+        CONFIG_LEN, 544,
         "CONFIG_LEN changed on native target — check MarketConfig struct for added/removed fields"
     );
 }
@@ -84,9 +84,12 @@ const KNOWN_ON_CHAIN_SLAB_SIZES: &[(usize, &str)] = &[
 
 #[test]
 fn slab_guard_accepts_all_known_sizes() {
-    // Reproduce the slab_guard logic from the program
-    let pre_118_slab_len = SLAB_LEN - 16;
-    let oldest_slab_len = SLAB_LEN - 24;
+    // Reproduce the slab_guard logic from the program.
+    // PERC-SetDexPool: CONFIG_LEN grew by 32 bytes, so SLAB_LEN grew by 32 bytes.
+    // All pre-SetDexPool slabs are now SLAB_LEN-32 bytes.
+    let pre_dex_pool_slab_len = SLAB_LEN - 32; // pre-PERC-SetDexPool (before dex_pool field)
+    let pre_118_slab_len = SLAB_LEN - 48;       // pre-PERC-SetDexPool(-32) + pre-PERC-118(-16)
+    let oldest_slab_len = SLAB_LEN - 56;         // pre-SetDexPool + pre-118 + pre-reorder
     let pre_adl_slab_len: usize = 1025880;
     let v1m_small: usize = 65416;
     let v1m_medium: usize = 257512;
@@ -95,6 +98,7 @@ fn slab_guard_accepts_all_known_sizes() {
 
     let accepted: Vec<usize> = vec![
         SLAB_LEN,
+        pre_dex_pool_slab_len,
         pre_118_slab_len,
         oldest_slab_len,
         pre_adl_slab_len,
@@ -175,27 +179,24 @@ fn u128_alignment_documented() {
 
 #[test]
 fn sbf_config_len_would_be_496() {
-    // On SBF, u128 alignment is 8, so MarketConfig packs tighter.
+    // PERC-SetDexPool: SBF CONFIG_LEN is now 528 (was 496), ENGINE_OFF = 632 (was 600).
+    // On SBF, u128 alignment is 8, so MarketConfig packs tighter than native (16-byte align).
     // We can't test SBF layout from native, but we document the expected value
     // and verify the compile-time assertion in the program catches mismatches.
     //
     // If this value changes, update:
-    //   1. SDK detectSlabLayout() constants
+    //   1. SDK detectSlabLayout() constants (slab.ts V_SETDEXPOOL_CONFIG_LEN = 528)
     //   2. Frontend slab.ts
     //   3. Indexer StatsCollector
     //   4. slab_guard accepted sizes
-    println!("Expected SBF CONFIG_LEN: 496 (u128 align=8)");
-    println!("Expected SBF ENGINE_OFF: align_up(104 + 496, 8) = 600");
+    println!("Expected SBF CONFIG_LEN: 528 (u128 align=8, PERC-SetDexPool: was 496)");
+    println!("Expected SBF ENGINE_OFF: align_up(104 + 528, 8) = 632 (was 600)");
     println!(
         "Actual native CONFIG_LEN: {} (u128 align={})",
         CONFIG_LEN,
         align_of::<u128>()
     );
     println!("Actual native ENGINE_OFF: {}", ENGINE_OFF);
-    // The SBF values (496, 600) are for the OLD bpf target.
-    // Modern SBF (target_arch=sbf, not bpf) uses 512, 616.
-    // The cfg(target_arch = "bpf") assertion in constants is WRONG for sbf!
-    // TODO: Fix to cfg(any(target_arch = "bpf", target_arch = "sbf"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
