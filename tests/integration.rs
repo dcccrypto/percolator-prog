@@ -213,6 +213,15 @@ impl TestEnv {
                 path
             );
         }
+        // Skip if binary is not production (4096 accounts). Medium/small binaries reject
+        // the 1288336-byte slab. These tests require: cargo build-sbf (no features).
+        let binary_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if binary_len < 900_000 {
+            panic!(
+                "SKIP_MEDIUM_BINARY: Binary is {binary_len} bytes (medium/small build). \
+                 Run: cargo build-sbf (no --features flag) then cargo test"
+            );
+        }
 
         let mut svm = LiteSVM::new();
         let program_id = Pubkey::new_unique();

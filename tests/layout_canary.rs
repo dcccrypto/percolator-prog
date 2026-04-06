@@ -131,12 +131,14 @@ fn account_struct_size_pinned() {
     println!("Account size (native): {} bytes", account_size);
     // Pin this. If it changes, EVERY existing market breaks.
     // V1M: 248 bytes, V1M2 (with ADL fields): 312 bytes
+    // v12.1 upstream: 336 bytes (native) — added position_basis_q, adl_a_basis,
+    //   adl_k_snap, adl_epoch_snap, fees_earned_total, fee_credits, last_fee_slot
     // Update this assertion when Account struct changes (and update slab_guard + SDK).
     // Known sizes per target:
-    //   SBF (u128 align=8):  248 (V1M), 312 (V1M2/ADL)
-    //   Native (u128 align=16): 256 (V1M), 320 (V1M2/ADL)
+    //   SBF (u128 align=8):  248 (V1M), 312 (V1M2/ADL), ~320 (v12.1 estimate)
+    //   Native (u128 align=16): 256 (V1M), 320 (V1M2/ADL), 336 (v12.1)
     // Native has +8 padding per u128 field.
-    let known_sizes = [248usize, 256, 312, 320];
+    let known_sizes = [248usize, 256, 312, 320, 336];
     assert!(
         known_sizes.contains(&account_size),
         "Account struct size {} is not a known size {:?} — \

@@ -568,6 +568,13 @@ fn benchmark_trade_cu() {
         println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
     }
+    {
+        let binary_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if binary_len < 900_000 {
+            println!("SKIP: Binary is {binary_len} bytes (medium/small build). Run: cargo build-sbf (no features)");
+            return;
+        }
+    }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // Scenario 1: Open new long position (fresh user, no existing position)
@@ -870,6 +877,13 @@ fn benchmark_trade_cu_summary_table() {
     if !path.exists() {
         println!("SKIP: BPF not found. Run: cargo build-sbf");
         return;
+    }
+    {
+        let binary_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if binary_len < 900_000 {
+            println!("SKIP: Binary is {} bytes (medium/small build). Run: cargo build-sbf (no --features flag) then cargo test", binary_len);
+            return;
+        }
     }
 
     let mut env = TradeTestEnv::new();

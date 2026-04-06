@@ -684,6 +684,18 @@ fn benchmark_worst_case_scenarios() {
         return;
     }
 
+    // Skip if binary is not production (4096 accounts). Medium/small binaries reject
+    // the 1288336-byte slab with InvalidSlabLen since their SLAB_LEN is much smaller.
+    // Run without --features medium/small to test production layout.
+    {
+        let binary = std::fs::read(&path).unwrap_or_default();
+        // Production binary is ~1.2MB+; medium is ~740KB. Use size as proxy.
+        if binary.len() < 900_000 {
+            println!("SKIP: Binary appears to be medium/small build ({} bytes). Run: cargo build-sbf", binary.len());
+            return;
+        }
+    }
+
     // Scenario 1: All empty slots (just LP, no users)
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Scenario 1: 🟢 All empty slots (LP only) - LOWEST");
