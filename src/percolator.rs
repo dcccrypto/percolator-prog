@@ -6722,7 +6722,10 @@ pub mod lp_vault {
         pub total_epochs: u8,
         pub _pad: [u8; 6],
         pub claimed_so_far: u64,
-        pub _reserved: [u8; 24],
+        /// SECURITY(CR-2): Slot of last successful claim. Used to enforce
+        /// one claim per epoch_duration window. 0 = no claim yet.
+        pub last_claim_slot: u64,
+        pub _reserved: [u8; 16],
     }
 
     impl WithdrawQueue {
@@ -6776,7 +6779,8 @@ pub mod lp_vault {
                 total_epochs,
                 _pad: [0; 6],
                 claimed_so_far: 0,
-                _reserved: [0; 24],
+                last_claim_slot: 0,
+                _reserved: [0; 16],
             };
             let mut total_claimed: u64 = 0;
             for _ in 0..total_epochs {
@@ -6802,7 +6806,8 @@ pub mod lp_vault {
                 total_epochs: epochs,
                 _pad: [0; 6],
                 claimed_so_far: 0,
-                _reserved: [0; 24],
+                last_claim_slot: 0,
+                _reserved: [0; 16],
             }
         }
         #[test]
@@ -15401,7 +15406,8 @@ pub mod processor {
                     total_epochs: queue_epochs,
                     _pad: [0; 6],
                     claimed_so_far: 0,
-                    _reserved: [0; 24],
+                    last_claim_slot: 0,
+                    _reserved: [0; 16],
                 };
 
                 let mut q_data = a_queue.try_borrow_mut_data()?;
@@ -15448,6 +15454,26 @@ pub mod processor {
                     return Err(PercolatorError::WithdrawQueueNotFound.into());
                 }
 
+                // SECURITY(CR-2): Enforce one claim per epoch duration window.
+                // Without this, all epochs are claimable in a single slot because
+                // claimable_this_epoch() uses only the epochs_remaining counter
+                // with no clock check.
+                let clock = Clock::get()?;
+                if queue.last_claim_slot > 0
+                    && clock.slot
+                        < queue
+                            .last_claim_slot
+                            .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS)
+                {
+                    msg!(
+                        "ClaimQueuedWithdrawal: epoch not elapsed (slot={}, next={})",
+                        clock.slot,
+                        queue.last_claim_slot
+                            .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS),
+                    );
+                    return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
+                }
+
                 let claimable = queue.claimable_this_epoch();
                 if claimable == 0 {
                     return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
@@ -15455,6 +15481,7 @@ pub mod processor {
 
                 queue.claimed_so_far = queue.claimed_so_far.saturating_add(claimable);
                 queue.epochs_remaining = queue.epochs_remaining.saturating_sub(1);
+                queue.last_claim_slot = clock.slot;
                 crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
                 drop(q_data);
 
