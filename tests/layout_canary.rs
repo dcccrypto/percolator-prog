@@ -89,8 +89,8 @@ fn slab_guard_accepts_all_known_sizes() {
     // PERC-SetDexPool: CONFIG_LEN grew by 32 bytes, so SLAB_LEN grew by 32 bytes.
     // All pre-SetDexPool slabs are now SLAB_LEN-32 bytes.
     let pre_dex_pool_slab_len = SLAB_LEN - 32; // pre-PERC-SetDexPool (before dex_pool field)
-    let pre_118_slab_len = SLAB_LEN - 48;       // pre-PERC-SetDexPool(-32) + pre-PERC-118(-16)
-    let oldest_slab_len = SLAB_LEN - 56;         // pre-SetDexPool + pre-118 + pre-reorder
+    let pre_118_slab_len = SLAB_LEN - 48; // pre-PERC-SetDexPool(-32) + pre-PERC-118(-16)
+    let oldest_slab_len = SLAB_LEN - 56; // pre-SetDexPool + pre-118 + pre-reorder
     let pre_adl_slab_len: usize = 1025880;
     let v1m_small: usize = 65416;
     let v1m_medium: usize = 257512;
@@ -196,9 +196,14 @@ fn sbf_config_len_would_be_496() {
     //   2. SDK detectSlabLayout() constants (slab.ts V_SETDEXPOOL_CONFIG_LEN, V_SETDEXPOOL_ENGINE_OFF)
     //   3. Indexer StatsCollector
     //   4. slab_guard accepted sizes
-    println!("SBF CONFIG_LEN: {} (same as native — no size diff for MarketConfig)", CONFIG_LEN);
-    println!("SBF ENGINE_OFF: align_up({} + {}, 8) = {} (native ENGINE_OFF={})",
-        HEADER_LEN, CONFIG_LEN,
+    println!(
+        "SBF CONFIG_LEN: {} (same as native — no size diff for MarketConfig)",
+        CONFIG_LEN
+    );
+    println!(
+        "SBF ENGINE_OFF: align_up({} + {}, 8) = {} (native ENGINE_OFF={})",
+        HEADER_LEN,
+        CONFIG_LEN,
         (HEADER_LEN + CONFIG_LEN + 7) & !7,
         ENGINE_OFF
     );
@@ -280,7 +285,8 @@ fn emit_layout_json() {
     //   Native: align_up(HEADER + CONFIG, 16) = align_up(648, 16) = 656
     //   SBF:    align_up(HEADER + CONFIG, 8)  = align_up(648, 8)  = 648
     let sbf_engine_align: usize = 8;
-    let engine_off_sbf = (HEADER_LEN + config_len_sbf + (sbf_engine_align - 1)) & !(sbf_engine_align - 1);
+    let engine_off_sbf =
+        (HEADER_LEN + config_len_sbf + (sbf_engine_align - 1)) & !(sbf_engine_align - 1);
 
     // Account size: differs between native and SBF because Account has i128/u128 fields.
     //   Native (u128 align=16): 336  (v12.1 upstream)
@@ -353,12 +359,14 @@ fn emit_layout_json() {
     assert!(
         engine_off_sbf <= ENGINE_OFF,
         "engine_off_sbf ({}) should be <= native ENGINE_OFF ({})",
-        engine_off_sbf, ENGINE_OFF
+        engine_off_sbf,
+        ENGINE_OFF
     );
     // SBF bitmap offset must be <= native (RiskEngine has u128 fields that pack tighter on SBF)
     assert!(
         engine_bitmap_off_sbf <= engine_bitmap_off_native,
         "engine_bitmap_off_sbf ({}) should be <= native ({})",
-        engine_bitmap_off_sbf, engine_bitmap_off_native
+        engine_bitmap_off_sbf,
+        engine_bitmap_off_native
     );
 }

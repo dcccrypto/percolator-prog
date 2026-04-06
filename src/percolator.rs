@@ -54,11 +54,11 @@ pub mod constants {
     // PERC-312: Compile-time assertion for CONFIG_LEN (catches silent misalignment)
     // PERC-SetDexPool: +32 bytes for dex_pool field.
     #[cfg(target_arch = "bpf")]
-    const _: [(); 528] = [(); CONFIG_LEN];      // BPF (legacy, u128 align=8)
+    const _: [(); 528] = [(); CONFIG_LEN]; // BPF (legacy, u128 align=8)
     #[cfg(target_arch = "sbf")]
     const _SBF_CONFIG: [(); 544] = [(); CONFIG_LEN]; // SBF (Solana 2.x)
     #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
-    const _: [(); 544] = [(); CONFIG_LEN];       // native (x86_64/aarch64)
+    const _: [(); 544] = [(); CONFIG_LEN]; // native (x86_64/aarch64)
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
     // SBF layout pinning — verified by cargo build-sbf.
@@ -8907,8 +8907,7 @@ pub mod processor {
     #[allow(unused_imports)]
     use alloc::format;
     use percolator::{
-        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution,
-        MAX_ACCOUNTS,
+        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution, MAX_ACCOUNTS,
     };
     /// Local no-op matching engine: passes oracle price directly as execution price.
     /// Used for markets without an external CPI matcher (i.e. internal oracle matching).
@@ -8922,7 +8921,10 @@ pub mod processor {
             oracle_price: u64,
             size: i128,
         ) -> percolator::Result<TradeExecution> {
-            Ok(TradeExecution { price: oracle_price, size })
+            Ok(TradeExecution {
+                price: oracle_price,
+                size,
+            })
         }
     }
     use solana_program::instruction::{AccountMeta, Instruction as SolInstruction};
@@ -8980,9 +8982,9 @@ pub mod processor {
         // This is the correct default: UpdateHyperpMark correctly rejects until admin pins the pool.
         const PRE_DEX_POOL_SLAB_LEN: usize = SLAB_LEN - 32;
         const PRE_118_SLAB_LEN: usize = SLAB_LEN - 48; // pre-SetDexPool(-32) + pre-118(-16)
-        const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56;  // pre-SetDexPool(-32) + pre-118(-16) + pre-reorder(-8)
-        // Pre-PERC-8270 devnet slabs (BPF): Account had no ADL fields, RiskEngine had no last_market_slot.
-        // BPF compiled value from percolator@cf35789 (pre-PERC-8270 struct layout).
+        const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56; // pre-SetDexPool(-32) + pre-118(-16) + pre-reorder(-8)
+                                                      // Pre-PERC-8270 devnet slabs (BPF): Account had no ADL fields, RiskEngine had no last_market_slot.
+                                                      // BPF compiled value from percolator@cf35789 (pre-PERC-8270 struct layout).
         const PRE_ADL_SLAB_LEN: usize = 1025880;
         // PERC-8400: V1M mainnet slab tiers (small=65416, medium=257512, large=1025896).
         // The mainnet SOL/USDC market uses medium tier (1024 slots, 257512 bytes).
@@ -10756,8 +10758,7 @@ pub mod processor {
                                 engine.set_pnl(idx as usize, new_pnl);
 
                                 // Clear position
-                                engine.accounts[idx as usize].position_size =
-                                    0i128;
+                                engine.accounts[idx as usize].position_size = 0i128;
                                 engine.accounts[idx as usize].entry_price = 0;
                             }
                         }
@@ -11298,7 +11299,14 @@ pub mod processor {
                 }
 
                 let trade_result = engine
-                    .execute_trade(&NoopMatchingEngine, lp_idx, user_idx, clock.slot, price, size)
+                    .execute_trade(
+                        &NoopMatchingEngine,
+                        lp_idx,
+                        user_idx,
+                        clock.slot,
+                        price,
+                        size,
+                    )
                     .map_err(map_risk_error);
                 crate::restore_margins(engine, margin_orig);
                 trade_result?;
@@ -11754,7 +11762,7 @@ pub mod processor {
                     let acc = &engine.accounts[target_idx as usize];
                     sol_log_64(acc.capital.get() as u64, acc.pnl as u64, 0, 0, 1); // cap, pnl
                     sol_log_64(acc.position_size as u64, acc.entry_price, 0, 0, 2); // pos, entry
-                                                                                          // Calculate mark PnL
+                                                                                    // Calculate mark PnL
                     let pos = acc.position_size;
                     let entry = acc.entry_price as i128;
                     let mark = pos.saturating_mul(price as i128 - entry) / 1_000_000;
@@ -12476,7 +12484,10 @@ pub mod processor {
                 // SECURITY(M-9): Account for both balance and isolated_balance.
                 // Without this, isolated_balance tokens remain tracked in engine
                 // but become permanently stranded after slab close.
-                let insurance_units = engine.insurance_fund.balance.get()
+                let insurance_units = engine
+                    .insurance_fund
+                    .balance
+                    .get()
                     .saturating_add(engine.insurance_fund.isolated_balance.get());
                 if insurance_units == 0 {
                     return Ok(()); // Nothing to withdraw
@@ -13832,10 +13843,14 @@ pub mod processor {
                     if pool_data.len() < RAYDIUM_CLMM_OFF_MINT1 + 32 {
                         return Err(ProgramError::InvalidAccountData);
                     }
-                    let mint0: [u8; 32] = pool_data[RAYDIUM_CLMM_OFF_MINT0..RAYDIUM_CLMM_OFF_MINT0 + 32]
-                        .try_into().unwrap();
-                    let mint1: [u8; 32] = pool_data[RAYDIUM_CLMM_OFF_MINT1..RAYDIUM_CLMM_OFF_MINT1 + 32]
-                        .try_into().unwrap();
+                    let mint0: [u8; 32] = pool_data
+                        [RAYDIUM_CLMM_OFF_MINT0..RAYDIUM_CLMM_OFF_MINT0 + 32]
+                        .try_into()
+                        .unwrap();
+                    let mint1: [u8; 32] = pool_data
+                        [RAYDIUM_CLMM_OFF_MINT1..RAYDIUM_CLMM_OFF_MINT1 + 32]
+                        .try_into()
+                        .unwrap();
                     if mint0 != config.collateral_mint && mint1 != config.collateral_mint {
                         msg!("UpdateHyperpMark: Raydium CLMM pool mints do not match collateral_mint");
                         return Err(PercolatorError::InvalidOracleKey.into());
@@ -13847,10 +13862,14 @@ pub mod processor {
                     if pool_data.len() < METEORA_OFF_TOKEN_Y_MINT + 32 {
                         return Err(ProgramError::InvalidAccountData);
                     }
-                    let mint_x: [u8; 32] = pool_data[METEORA_OFF_TOKEN_X_MINT..METEORA_OFF_TOKEN_X_MINT + 32]
-                        .try_into().unwrap();
-                    let mint_y: [u8; 32] = pool_data[METEORA_OFF_TOKEN_Y_MINT..METEORA_OFF_TOKEN_Y_MINT + 32]
-                        .try_into().unwrap();
+                    let mint_x: [u8; 32] = pool_data
+                        [METEORA_OFF_TOKEN_X_MINT..METEORA_OFF_TOKEN_X_MINT + 32]
+                        .try_into()
+                        .unwrap();
+                    let mint_y: [u8; 32] = pool_data
+                        [METEORA_OFF_TOKEN_Y_MINT..METEORA_OFF_TOKEN_Y_MINT + 32]
+                        .try_into()
+                        .unwrap();
                     if mint_x != config.collateral_mint && mint_y != config.collateral_mint {
                         msg!("UpdateHyperpMark: Meteora DLMM pool mints do not match collateral_mint");
                         return Err(PercolatorError::InvalidOracleKey.into());
@@ -17924,9 +17943,7 @@ pub mod processor {
                 // The flags byte at offset 13 is stable across all layout versions.
                 let flags = slab_data[state::FLAGS_OFF];
                 if flags & state::FLAG_RESOLVED == 0 {
-                    solana_program::msg!(
-                        "RescueOrphanVault rejected: market is not resolved"
-                    );
+                    solana_program::msg!("RescueOrphanVault rejected: market is not resolved");
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -18165,10 +18182,10 @@ pub mod processor {
                         if pool_data.len() < PS_OFF_BASE_MINT + 32 {
                             return Err(ProgramError::InvalidAccountData);
                         }
-                        let base_mint: [u8; 32] =
-                            pool_data[PS_OFF_BASE_MINT..PS_OFF_BASE_MINT + 32]
-                                .try_into()
-                                .unwrap();
+                        let base_mint: [u8; 32] = pool_data
+                            [PS_OFF_BASE_MINT..PS_OFF_BASE_MINT + 32]
+                            .try_into()
+                            .unwrap();
                         base_mint == config.collateral_mint
                     } else if *a_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID {
                         // Raydium CLMM: mint0 at 73..105, mint1 at 105..137
@@ -20032,7 +20049,5 @@ pub mod entrypoint {
 
 // 11. mod risk (glue)
 pub mod risk {
-    pub use percolator::{
-        MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution,
-    };
+    pub use percolator::{MatchingEngine, RiskEngine, RiskError, RiskParams, TradeExecution};
 }

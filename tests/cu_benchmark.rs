@@ -691,7 +691,10 @@ fn benchmark_worst_case_scenarios() {
         let binary = std::fs::read(&path).unwrap_or_default();
         // Production binary is ~1.2MB+; medium is ~740KB. Use size as proxy.
         if binary.len() < 900_000 {
-            println!("SKIP: Binary appears to be medium/small build ({} bytes). Run: cargo build-sbf", binary.len());
+            println!(
+                "SKIP: Binary appears to be medium/small build ({} bytes). Run: cargo build-sbf",
+                binary.len()
+            );
             return;
         }
     }
