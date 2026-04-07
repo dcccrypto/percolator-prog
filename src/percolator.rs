@@ -15782,13 +15782,21 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
 
-                // PERC-8273: Gate — insurance fund must be fully depleted (balance == 0).
-                // ADL is the last resort: insurance covers losses first; only when
-                // insurance is exhausted are profitable positions deleveraged.
-                let insurance_balance = engine.insurance_fund.balance.get();
+                // PERC-8273: Gate — insurance fund must be fully depleted
+                // (balance + isolated_balance == 0). ADL is the last resort:
+                // insurance covers losses first; only when insurance is exhausted
+                // are profitable positions deleveraged.
+                // SECURITY(H-3): Sum both global and isolated insurance balances.
+                // Without this, ADL triggers prematurely while isolated insurance
+                // funds still exist to cover losses.
+                let insurance_balance = engine
+                    .insurance_fund
+                    .balance
+                    .get()
+                    .saturating_add(engine.insurance_fund.isolated_balance.get());
                 if insurance_balance != 0 {
                     msg!(
-                        "ADL: insurance_fund.balance={} — not depleted, ADL rejected",
+                        "ADL: insurance total (balance+isolated)={} — not depleted, ADL rejected",
                         insurance_balance
                     );
                     return Err(PercolatorError::InsuranceFundNotDepleted.into());
