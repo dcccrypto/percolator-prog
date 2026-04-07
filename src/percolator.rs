@@ -14481,7 +14481,7 @@ pub mod processor {
                 // Non-creator withdrawers must pass the derived creator_lock PDA key;
                 // if no lock exists on-chain the enforcement is a no-op. The SDK must
                 // always include the creator_lock PDA in LpVaultWithdraw instructions.
-                accounts::expect_len(accounts, 10)?;
+                accounts::expect_len(accounts, 11)?;
                 let a_withdrawer = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_withdrawer_ata = &accounts[2];
@@ -14491,6 +14491,8 @@ pub mod processor {
                 let a_withdrawer_lp_ata = &accounts[6];
                 let a_vault_authority = &accounts[7];
                 let a_lp_vault_state = &accounts[8];
+                // accounts[9] = creator_lock_pda (existing)
+                // accounts[10] = withdraw_queue_pda (SECURITY H-6)
 
                 accounts::expect_signer(a_withdrawer)?;
                 accounts::expect_writable(a_slab)?;
@@ -14557,6 +14559,37 @@ pub mod processor {
                                     msg!("CREATOR_LOCK: fee redirect activated");
                                 }
                                 crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                            }
+                        }
+                    }
+                }
+
+                // SECURITY(H-6): Block instant withdraw when user has an active
+                // withdrawal queue. Without this, the user can queue LP tokens
+                // and then immediately withdraw the same tokens via LpVaultWithdraw,
+                // creating a double-spend on the queued claim.
+                {
+                    let a_withdraw_queue = &accounts[10];
+                    let (expected_queue, _) =
+                        accounts::derive_withdraw_queue(program_id, a_slab.key, a_withdrawer.key);
+                    accounts::expect_key(a_withdraw_queue, &expected_queue)?;
+                    if a_withdraw_queue.data_len() >= crate::lp_vault::WITHDRAW_QUEUE_LEN {
+                        let q_data = a_withdraw_queue
+                            .try_borrow_data()
+                            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                        if let Some(queue) = crate::lp_vault::read_withdraw_queue(&q_data) {
+                            if queue.is_initialized() {
+                                let unclaimed =
+                                    queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
+                                if unclaimed > 0 {
+                                    msg!(
+                                        "LpVaultWithdraw blocked: active queue has {} unclaimed LP",
+                                        unclaimed
+                                    );
+                                    return Err(
+                                        PercolatorError::WithdrawQueueAlreadyExists.into()
+                                    );
+                                }
                             }
                         }
                     }
