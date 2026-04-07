@@ -15938,24 +15938,24 @@ pub mod processor {
                 }
 
                 // 2. Reject slabs with valid sizes — use CloseSlab for those.
-                // Valid tiers (kept in sync with slab_guard):
-                //   SLAB_LEN           — current (PERC-8270 ADL fields, BPF value)
-                //   PRE_118_SLAB_LEN   — pre-PERC-118 (SLAB_LEN - 16)
-                //   OLDEST_SLAB_LEN    — oldest devnet (SLAB_LEN - 24)
-                //   PRE_ADL_SLAB_LEN   — pre-PERC-8270 BPF (1025880)
-                //   V1M tiers          — PERC-8400 mainnet V1M layout
-                const PRE_118_SLAB_LEN: usize = SLAB_LEN - 16;
-                const OLDEST_SLAB_LEN: usize = SLAB_LEN - 24;
+                // SECURITY(H-7): Reject slabs with valid sizes — use CloseSlab for those.
+                // Synchronized with slab_guard's accepted sizes. Previous version had:
+                //   - PRE_118/OLDEST using stale offsets (-16/-24 instead of -48/-56)
+                //   - PRE_DEX_POOL_SLAB_LEN missing entirely
+                //   - V1M2_MEDIUM_TRANSITIONAL missing entirely
+                const PRE_DEX_POOL_SLAB_LEN: usize = SLAB_LEN - 32;
+                const PRE_118_SLAB_LEN: usize = SLAB_LEN - 48;
+                const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56;
                 const PRE_ADL_SLAB_LEN: usize = 1025880;
                 const V1M_SMALL_LEN: usize = 65416;
                 const V1M_MEDIUM_LEN: usize = 257512;
                 const V1M_LARGE_LEN: usize = 1025896;
-                // SECURITY(C-2): V1M2 tier was missing — an active V1M2 slab
-                // could bypass CloseSlab safety checks (vault/insurance/position guards).
                 const V1M2_MEDIUM_LEN: usize = 323312;
+                const V1M2_MEDIUM_TRANSITIONAL: usize = 323328;
                 let slab_data = a_slab.try_borrow_data()?;
                 let slab_len = slab_data.len();
                 if slab_len == SLAB_LEN
+                    || slab_len == PRE_DEX_POOL_SLAB_LEN
                     || slab_len == PRE_118_SLAB_LEN
                     || slab_len == OLDEST_SLAB_LEN
                     || slab_len == PRE_ADL_SLAB_LEN
@@ -15963,6 +15963,7 @@ pub mod processor {
                     || slab_len == V1M_MEDIUM_LEN
                     || slab_len == V1M_LARGE_LEN
                     || slab_len == V1M2_MEDIUM_LEN
+                    || slab_len == V1M2_MEDIUM_TRANSITIONAL
                 {
                     return Err(PercolatorError::InvalidSlabLen.into());
                 }
