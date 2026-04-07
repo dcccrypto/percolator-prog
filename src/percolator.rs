@@ -15195,6 +15195,14 @@ pub mod processor {
 
                 let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+                // SECURITY(H-2): Validate LP escrow is owned by vault authority PDA
+                // and holds the correct LP vault mint. Without this, an attacker can
+                // pass their own token account as escrow, getting engine collateral
+                // credit while retaining control of the LP tokens.
+                let (vault_auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_token_account(a_lp_escrow, &vault_auth, &expected_mint)?;
+
                 let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
 
                 let collateral_units = crate::lp_collateral::lp_token_value(
@@ -15292,6 +15300,11 @@ pub mod processor {
 
                 let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
                 accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+                // SECURITY(H-2): Validate LP escrow on withdrawal too (defense-in-depth).
+                let (vault_auth_check, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_token_account(a_lp_escrow, &vault_auth_check, &expected_mint)?;
+
                 let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
 
                 let collateral_units = crate::lp_collateral::lp_token_value(
