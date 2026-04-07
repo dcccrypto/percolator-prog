@@ -4875,7 +4875,8 @@ pub mod oracle {
         }
 
         // SECURITY (C3): Bound exponent to prevent overflow in pow()
-        if expo.abs() > MAX_EXPO_ABS {
+        // SECURITY(H-1/M-5): use unsigned_abs() — i32::MIN.abs() wraps.
+        if expo.unsigned_abs() > MAX_EXPO_ABS as u32 {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
@@ -9448,7 +9449,8 @@ pub mod processor {
         }
 
         let max_bps = config.funding_max_bps_per_slot;
-        let at_max = funding_rate_bps.abs() >= max_bps.abs() && max_bps != 0;
+        // SECURITY(H-1): use unsigned_abs() to prevent i64::MIN wrapping.
+        let at_max = funding_rate_bps.unsigned_abs() >= max_bps.unsigned_abs() && max_bps != 0;
 
         if at_max {
             config.consecutive_max_funding_epochs =
@@ -12186,11 +12188,18 @@ pub mod processor {
                 if thresh_step_bps > 10_000 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                // Bound per-slot funding caps to a sane maximum (100 bps/slot).
-                if funding_max_bps_per_slot.abs() > 10_000 {
+                // SECURITY(H-1): Use unsigned_abs() instead of abs() to prevent
+                // i64::MIN from wrapping to itself (negative) in SBF release builds,
+                // which would bypass this bounds check and poison the config.
+                if funding_max_bps_per_slot.unsigned_abs() > 10_000 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                if funding_max_premium_bps.abs() > 10_000 {
+                if funding_max_premium_bps.unsigned_abs() > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // SECURITY(M-3): Also validate funding_premium_max_bps_per_slot
+                // which was previously unchecked (sibling fields have bounds).
+                if funding_premium_max_bps_per_slot.unsigned_abs() > 10_000 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
