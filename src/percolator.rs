@@ -12548,6 +12548,13 @@ pub mod processor {
                 engine.insurance_fund.balance = percolator::U128::ZERO;
                 engine.insurance_fund.isolated_balance = percolator::U128::ZERO;
 
+                // SECURITY(M-7): Decrement engine.vault to match token outflow.
+                // Without this, engine.vault overstates actual vault balance,
+                // causing incorrect OI cap calculations and solvency checks.
+                engine.vault = percolator::U128::new(
+                    engine.vault.get().saturating_sub(insurance_units),
+                );
+
                 // Transfer from vault to admin
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -13126,6 +13133,11 @@ pub mod processor {
                     .checked_sub(units_to_return)
                     .ok_or(PercolatorError::EngineOverflow)?;
                 engine.insurance_fund.balance = percolator::U128::new(new_balance);
+
+                // SECURITY(M-7): Decrement engine.vault to match token outflow.
+                engine.vault = percolator::U128::new(
+                    engine.vault.get().saturating_sub(units_to_return),
+                );
 
                 // Burn LP tokens from withdrawer (user signs as authority over their tokens)
                 crate::insurance_lp::burn(
