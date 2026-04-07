@@ -10764,6 +10764,25 @@ pub mod processor {
                                 let new_pnl = old_pnl.saturating_add(pnl_delta);
                                 engine.set_pnl(idx as usize, new_pnl);
 
+                                // SECURITY(H-5): Decrement OI aggregates before
+                                // clearing position. Without this, total_open_interest,
+                                // long_oi, and short_oi remain stale after settlement,
+                                // blocking WithdrawInsuranceLimited and causing
+                                // AuditCrank false positives.
+                                let abs_pos_u128 = pos.unsigned_abs();
+                                engine.total_open_interest = percolator::U128::new(
+                                    engine.total_open_interest.get().saturating_sub(abs_pos_u128),
+                                );
+                                if pos > 0 {
+                                    engine.long_oi = percolator::U128::new(
+                                        engine.long_oi.get().saturating_sub(abs_pos_u128),
+                                    );
+                                } else {
+                                    engine.short_oi = percolator::U128::new(
+                                        engine.short_oi.get().saturating_sub(abs_pos_u128),
+                                    );
+                                }
+
                                 // Clear position
                                 engine.accounts[idx as usize].position_size = 0i128;
                                 engine.accounts[idx as usize].entry_price = 0;
