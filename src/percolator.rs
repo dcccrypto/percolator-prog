@@ -15655,8 +15655,13 @@ pub mod processor {
 
                 let slab_data = a_slab.try_borrow_data()?;
                 let config = state::read_config(&slab_data);
-                let base_amount =
-                    crate::units::units_to_base(capital_units as u64, config.unit_scale);
+                // SECURITY(M-8): use units_to_base_checked (matches LpVaultWithdraw).
+                // The saturating variant silently clamps to u64::MAX on overflow.
+                let base_amount = crate::units::units_to_base_checked(
+                    capital_units as u64,
+                    config.unit_scale,
+                )
+                .ok_or(PercolatorError::EngineOverflow)?;
 
                 // PERC-313: HWM floor enforcement (same as LpVaultWithdraw)
                 if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
