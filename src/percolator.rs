@@ -15810,17 +15810,22 @@ pub mod processor {
                     return Err(PercolatorError::BankruptPositionAlreadyClosed.into());
                 }
 
-                // Compute excess PnL to remove (pnl_pos_tot above cap).
-                // If max_pnl_cap is 0 (unconfigured), treat cap as 0 (full excess).
+                // SECURITY(H-4): Compute excess PnL to remove (pnl_pos_tot above cap).
+                // When cap > 0 and PnL is within cap, ADL is not warranted — reject.
+                // When cap == 0 (unconfigured), all positive PnL is excess (emergency mode).
+                // The old code set excess = pnl_pos_tot when within cap, enabling
+                // unjustified full closure of profitable positions.
                 let pnl_pos_tot = engine.pnl_pos_tot;
                 let cap = config.max_pnl_cap as u128;
-                let excess = if pnl_pos_tot > cap {
-                    pnl_pos_tot.saturating_sub(cap)
-                } else {
-                    // Even with insurance depleted, proceed with minimal deleverage (1 unit)
-                    // to allow partial position closure — excess == 0 will close the full position.
-                    pnl_pos_tot
-                };
+                if cap > 0 && pnl_pos_tot <= cap {
+                    msg!(
+                        "ADL: pnl_pos_tot={} within cap={} — no deleverage needed",
+                        pnl_pos_tot,
+                        cap
+                    );
+                    return Err(ProgramError::InvalidArgument);
+                }
+                let excess = pnl_pos_tot.saturating_sub(cap);
 
                 // Delegate to core engine's execute_adl — handles funding settlement,
                 // PnL checks, full/partial close, and OI/pnl_pos_tot updates.
