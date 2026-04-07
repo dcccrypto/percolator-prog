@@ -16028,84 +16028,29 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
-                // Read slab header to get max_accounts.
+                // SECURITY(CR-1): Use typed engine accessor instead of hardcoded
+                // byte offsets. The old code had three critical bugs:
+                //   1. Read slab_data[8..10] as max_accounts — actually the version field
+                //   2. Hardcoded ACCT_SIZE=240 — actual Account is 320 bytes on SBF
+                //   3. Hardcoded ACCT_OWNER_OFF=184 — stale after Account struct changes
+                // Fix: use zc::engine_mut() + direct struct field access, matching
+                // every other instruction handler in the codebase.
                 let mut slab_data = a_slab.try_borrow_mut_data()?;
-                if slab_data.len() < 16 {
-                    return Err(ProgramError::AccountDataTooSmall);
-                }
+                slab_guard(program_id, a_slab, &slab_data)?;
+                require_initialized(&slab_data)?;
 
-                // Verify magic.
-                let magic = u64::from_le_bytes(
-                    slab_data[0..8]
-                        .try_into()
-                        .map_err(|_| PercolatorError::InvalidMagic)?,
-                );
-                if magic != MAGIC {
-                    return Err(PercolatorError::InvalidMagic.into());
-                }
+                let engine = zc::engine_mut(&mut slab_data)?;
 
-                let max_accounts = u16::from_le_bytes(
-                    slab_data[8..10]
-                        .try_into()
-                        .map_err(|_| ProgramError::InvalidAccountData)?,
-                );
-
-                if user_idx >= max_accounts {
+                // Validate user_idx is in range and slot is allocated (bitmap).
+                if (user_idx as usize) >= percolator::MAX_ACCOUNTS
+                    || !engine.is_used(user_idx as usize)
+                {
                     return Err(ProgramError::InvalidArgument.into());
                 }
 
-                // Detect layout and find account offset.
-                // Account size is always 240 bytes (repr(C) size_of::<Account>()).
-                // Layout variants differ only in bitmap_off:
-                //   V0  (large devnet slab):  bitmap_off=608,  determined by data size
-                //   V1D (small/medium slab):  bitmap_off=1048, determined by data size
-                // We compute the expected slab sizes and pick the matching layout.
-                // Fallback: if neither matches, use V1D (smaller, more common on devnet).
-                const ACCT_SIZE: usize = 240;
-                const V0_BITMAP_OFF: usize = 608;
-                const V1D_BITMAP_OFF: usize = 1048;
-
-                let bitmap_bytes = ((max_accounts as usize) + 7) / 8;
-                let v0_accounts_off = V0_BITMAP_OFF + bitmap_bytes;
-                let v1d_accounts_off = V1D_BITMAP_OFF + bitmap_bytes;
-
-                let v0_total = v0_accounts_off + (max_accounts as usize) * ACCT_SIZE;
-                let v1d_total = v1d_accounts_off + (max_accounts as usize) * ACCT_SIZE;
-
-                // Choose layout by matching total slab size (±8 bytes for alignment padding).
-                let (bitmap_off, accounts_off) =
-                    if slab_data.len() >= v0_total && slab_data.len() <= v0_total + 8 {
-                        (V0_BITMAP_OFF, v0_accounts_off)
-                    } else if slab_data.len() >= v1d_total && slab_data.len() <= v1d_total + 16 {
-                        (V1D_BITMAP_OFF, v1d_accounts_off)
-                    } else {
-                        // SECURITY(M-3): reject unknown slab layouts instead of
-                        // silently falling back — a wrong offset could corrupt data.
-                        return Err(ProgramError::InvalidAccountData);
-                    };
-
-                let acct_off = accounts_off + (user_idx as usize) * ACCT_SIZE;
-
-                // Verify slot is allocated (bitmap bit set).
-                let byte_idx = bitmap_off + (user_idx as usize) / 8;
-                let bit_idx = (user_idx as usize) % 8;
-                if byte_idx >= slab_data.len() || (slab_data[byte_idx] & (1 << bit_idx)) == 0 {
-                    return Err(ProgramError::InvalidArgument.into());
-                }
-
-                // Account.owner is at offset 184 within the account slot (repr(C) layout).
-                // Layout: account_id(8) + capital(16) + kind(4) + pnl(16) + reserved_pnl(8)
-                //       + warmup_started_at_slot(8) + warmup_slope_per_step(16)
-                //       + position_size(16) + entry_price(8) + funding_index(16)
-                //       + matcher_program(32) + matcher_context(32) + owner(32) = 184
-                const ACCT_OWNER_OFF: usize = 184;
-                let owner_off = acct_off + ACCT_OWNER_OFF;
-                if owner_off + 32 > slab_data.len() {
-                    return Err(ProgramError::AccountDataTooSmall);
-                }
-
-                // Write new owner.
-                slab_data[owner_off..owner_off + 32].copy_from_slice(&new_owner);
+                // Write new owner via typed struct — compiler resolves correct
+                // field offset for the target architecture (SBF vs native).
+                engine.accounts[user_idx as usize].owner = new_owner;
 
                 msg!(
                     "TransferPositionOwnership: idx={}, new_owner={}",
