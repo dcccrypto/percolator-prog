@@ -13480,9 +13480,19 @@ pub mod processor {
                     )
                     .ok_or(PercolatorError::EngineOverflow)?;
 
-                    // Per-epoch bps cap
-                    let is_new_epoch = last_withdraw_slot == 0
-                        || clock.slot >= last_withdraw_slot.saturating_add(cooldown_slots);
+                    // SECURITY(M-2): Per-epoch bps cap. The epoch duration must
+                    // be LONGER than the cooldown to allow cumulative tracking.
+                    // Previously, epoch used the same condition as cooldown,
+                    // so is_new_epoch was always true — defeating the cap.
+                    // Fix: epoch = 10x cooldown (e.g., 100-slot cooldown → 1000-slot epoch).
+                    let epoch_duration = cooldown_slots.saturating_mul(10);
+                    let is_new_epoch = if epoch_duration == 0 || last_withdraw_slot == 0 {
+                        last_withdraw_slot == 0
+                    } else {
+                        let epoch_start =
+                            last_withdraw_slot - (last_withdraw_slot % epoch_duration);
+                        clock.slot >= epoch_start.saturating_add(epoch_duration)
+                    };
                     let current_epoch_drawn = if is_new_epoch { 0u64 } else { epoch_drawn };
                     let epoch_cap = if max_withdraw_bps == 0 {
                         u64::MAX
