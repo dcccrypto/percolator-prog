@@ -628,6 +628,125 @@ fn test_buffer_correct_after_many_cranks() {
 }
 
 // ============================================================================
+// B6. New position between cranks enters buffer
+// ============================================================================
+
+/// A new position opened between cranks is immediately reflected in the buffer
+/// (via the trade handler), and survives subsequent cranks with correct notional.
+#[test]
+fn test_new_position_between_cranks_enters_buffer() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 10_000_000_000);
+
+    // Phase 1: user1 trades, enters buffer
+    let user1 = Keypair::new();
+    let user1_idx = env.init_user(&user1);
+    env.deposit(&user1, user1_idx, 10_000_000_000);
+    env.trade(&user1, &lp, lp_idx, user1_idx, 1_000_000);
+
+    let buf = env.read_risk_buffer();
+    assert!(buf.find(user1_idx).is_some(), "user1 must be in buffer after trade");
+
+    // Crank a few times — user1 and LP persist
+    env.set_slot(200);
+    env.crank();
+    env.set_slot(300);
+    env.crank();
+
+    // Phase 2: user2 opens a LARGER position between cranks
+    let user2 = Keypair::new();
+    let user2_idx = env.init_user(&user2);
+    env.deposit(&user2, user2_idx, 10_000_000_000);
+    env.trade(&user2, &lp, lp_idx, user2_idx, 5_000_000);
+
+    // Trade handler should immediately insert user2
+    let buf = env.read_risk_buffer();
+    assert!(buf.find(user2_idx).is_some(),
+        "user2 must be in buffer immediately after trade (no crank needed)");
+
+    // user2's notional should be larger than user1's (5x position)
+    let s1 = buf.find(user1_idx).unwrap();
+    let s2 = buf.find(user2_idx).unwrap();
+    assert!(buf.entries[s2].notional > buf.entries[s1].notional,
+        "user2 (5M) must have higher notional than user1 (1M)");
+
+    // Phase 3: crank refreshes — both still present with correct relative order
+    env.set_slot(400);
+    env.crank();
+
+    let buf = env.read_risk_buffer();
+    assert!(buf.find(user1_idx).is_some(), "user1 must persist after crank");
+    assert!(buf.find(user2_idx).is_some(), "user2 must persist after crank");
+    assert!(buf.find(lp_idx).is_some(), "LP must persist after crank");
+
+    // After crank refresh, notionals are recalculated at current oracle price
+    let s1 = buf.find(user1_idx).unwrap();
+    let s2 = buf.find(user2_idx).unwrap();
+    assert!(buf.entries[s2].notional > buf.entries[s1].notional,
+        "Relative order must be preserved after crank refresh");
+}
+
+/// An evicted account re-enters the buffer when its position grows via new trade.
+#[test]
+fn test_evicted_account_reenters_on_larger_trade() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 10_000_000_000);
+
+    // Create 5 users — user1 (smallest) gets evicted
+    let sizes: [i128; 5] = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
+    let mut users = Vec::new();
+    for &size in &sizes {
+        let u = Keypair::new();
+        let idx = env.init_user(&u);
+        env.deposit(&u, idx, 10_000_000_000);
+        env.trade(&u, &lp, lp_idx, idx, size);
+        users.push((u, idx));
+    }
+
+    assert!(env.read_risk_buffer().find(users[0].1).is_none(),
+        "user1 (1M) must be evicted from full buffer");
+
+    // Crank to advance state
+    env.set_slot(200);
+    env.crank();
+
+    // user1 increases position to 10M — larger than user3's 3M
+    env.trade(&users[0].0, &lp, lp_idx, users[0].1, 9_000_000);
+
+    let buf = env.read_risk_buffer();
+    assert!(buf.find(users[0].1).is_some(),
+        "user1 (now 10M) must re-enter buffer after growing position");
+
+    // user2 (2M) should now be evicted (smallest in buffer)
+    assert!(buf.find(users[1].1).is_none(),
+        "user2 (2M) must be evicted when user1 re-enters at 10M");
+
+    // Verify after crank — re-entry persists
+    env.set_slot(300);
+    env.crank();
+
+    let buf = env.read_risk_buffer();
+    assert!(buf.find(users[0].1).is_some(),
+        "user1 must persist in buffer after crank");
+}
+
+// ============================================================================
 // E (integration). Five accounts → buffer keeps top 4
 // ============================================================================
 
