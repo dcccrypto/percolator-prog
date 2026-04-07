@@ -5791,6 +5791,20 @@ pub mod oracle {
         now_unix_ts: i64,
         remaining_accounts: &[AccountInfo],
     ) -> Result<(u64, bool), ProgramError> {
+        // SECURITY(M-6): Reject CPI callers when oracle is a DEX pool.
+        // DEX spot prices can be manipulated in the same transaction via CPI.
+        // UpdateHyperpMark has its own gate (get_stack_height check), but
+        // non-Hyperp markets reading DEX prices through this path had no
+        // such protection. The 5% circuit breaker cap limits damage but
+        // doesn't prevent same-tx manipulation.
+        if is_dex_oracle(price_ai)
+            && solana_program::instruction::get_stack_height()
+                > solana_program::instruction::TRANSACTION_LEVEL_STACK_HEIGHT
+        {
+            solana_program::msg!("read_price_clamped_ext: CPI with DEX oracle rejected");
+            return Err(super::error::PercolatorError::EngineUnauthorized.into());
+        }
+
         let raw = read_price_with_authority(config, price_ai, now_unix_ts, remaining_accounts)?;
         // For DEX oracles, enforce minimum circuit breaker cap to mitigate flash-loan attacks.
         // This protects existing markets that were initialized with cap=0 (pre-fix default).
