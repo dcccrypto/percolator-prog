@@ -35,6 +35,12 @@ num-derive = "0.4"
 num-traits = "0.2"
 percolator = { path = "../percolator" }
 
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+
 [dev-dependencies]
 bincode = "1"
 solana-sdk = "1.18"

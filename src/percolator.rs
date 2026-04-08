@@ -4779,7 +4779,7 @@ pub mod processor {
     };
     #[allow(unused_imports)]
     use percolator::{
-        RiskEngine, RiskError, I128, U128, ADL_ONE, MAX_ACCOUNTS,
+        RiskEngine, RiskError, RiskParams, I128, U128, ADL_ONE, MAX_ACCOUNTS,
     };
     #[allow(unused_imports)]
     use crate::constants::{ENGINE_OFF, ENGINE_LEN, HEADER_LEN};
@@ -5167,7 +5167,10 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'b [AccountInfo<'a>],
         instruction_data: &[u8],
-    ) -> ProgramResult {
+    ) -> ProgramResult
+    where
+        'b: 'a,
+    {
         // Durable nonce rejection removed — the check was opt-in (only ran if
         // caller voluntarily passed the Instructions sysvar) and therefore not
         // actually enforceable. Timing-sensitive operations should rely on
@@ -5201,1119 +5204,36 @@ pub mod processor {
                 mark_min_fee,
                 force_close_delay_slots,
             } => {
-                // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
-                // (feed_id is now passed in instruction data, not as account)
-                accounts::expect_len(accounts, 9)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_mint = &accounts[2];
-                let a_vault = &accounts[3];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                // Ensure instruction data matches the signer
-                if admin != *a_admin.key {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // SECURITY (H1): Enforce collateral_mint matches the account
-                // This prevents signers from being confused by mismatched instruction data
-                if collateral_mint != *a_mint.key {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // SECURITY (H2): Validate mint is a real SPL Token mint
-                // Check owner == spl_token::ID and data length == Mint::LEN (82 bytes)
-                #[cfg(not(feature = "test"))]
-                {
-                    use solana_program::program_pack::Pack;
-                    use spl_token::state::Mint;
-                    if *a_mint.owner != spl_token::ID {
-                        return Err(ProgramError::IllegalOwner);
-                    }
-                    if a_mint.data_len() != Mint::LEN {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    // Verify mint is initialized by unpacking
-                    let mint_data = a_mint.try_borrow_data()?;
-                    let _ = Mint::unpack(&mint_data)?;
-                }
-
-                // invert must be 0 or 1 (boolean stored as u8)
-                if invert > 1 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
-                if conf_filter_bps > 10_000 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // Validate unit_scale: reject huge values that make most deposits credit 0 units
-                if !crate::verify::init_market_scale_ok(unit_scale) {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // Margin params: initial >= maintenance, both non-zero, initial <= 100%
-                if risk_params.initial_margin_bps == 0
-                    || risk_params.maintenance_margin_bps == 0
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                if risk_params.initial_margin_bps > 10_000 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // insurance_withdraw_max_bps is a percentage (0..=10_000)
-                if insurance_withdraw_max_bps > 10_000 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // If live withdrawals are enabled, require an explicit cooldown
-                // (0 would fall through to DEFAULT which may surprise the admin).
-                if insurance_withdraw_max_bps > 0 && insurance_withdraw_cooldown_slots == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // max_staleness_secs: reject 0 (would brick oracle reads —
-                // any non-zero age > 0 fails the staleness check).
-                if max_staleness_secs == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // Hyperp mode validation: if index_feed_id is all zeros, require initial_mark_price_e6
-                let is_hyperp = index_feed_id == [0u8; 32];
-                if is_hyperp && initial_mark_price_e6 == 0 {
-                    // Hyperp mode requires a non-zero initial mark price
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // Normalize initial mark price to engine-space (invert + scale).
-                // All Hyperp internal prices must be in engine-space.
-                let initial_mark_price_e6 = if is_hyperp {
-                    let p = crate::verify::to_engine_price(initial_mark_price_e6, invert, unit_scale)
-                        .ok_or(PercolatorError::OracleInvalid)?;
-                    // Enforce MAX_ORACLE_PRICE at genesis — same invariant as runtime ingress
-                    if p > percolator::MAX_ORACLE_PRICE {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                    p
-                } else {
-                    initial_mark_price_e6
-                };
-
-                // Validate per-market admin limits (must be set at init time).
-                // Bounds-check against engine-level constants to prevent admin
-                // from setting values that violate engine invariants.
-                if max_maintenance_fee_per_slot == 0
-                    || max_maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                if max_insurance_floor == 0
-                    || max_insurance_floor > percolator::MAX_VAULT_TVL
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // Validate initial insurance_floor against per-market limit
-                if insurance_floor > max_insurance_floor {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // Oracle cap floor: hard-bounded to MAX (100%)
-                if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // Maintenance fee must not exceed the immutable per-market ceiling.
-                if risk_params.maintenance_fee_per_slot.get() > max_maintenance_fee_per_slot {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // Permissionless resolve: if enabled, must exceed max_crank_staleness
-                // to prevent accidental instant-resolution from one missed crank.
-                if permissionless_resolve_stale_slots > 0
-                    && permissionless_resolve_stale_slots <= risk_params.max_crank_staleness_slots
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // Liveness: if permissionless resolution is enabled, force_close must
-                // also be enabled. Otherwise abandoned accounts on resolved markets
-                // with burned admin have no cleanup path.
-                if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // Validate custom funding parameters (same checks as UpdateConfig).
-                // These are immutable after init for governance-free deployments.
-                if let Some(h) = custom_funding_horizon {
-                    if h == 0 {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-                }
-                if let Some(k) = custom_funding_k {
-                    if k > 100_000 {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-                }
-                if let Some(mp) = custom_max_premium {
-                    if mp < 0 {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-                }
-                if let Some(ms) = custom_max_per_slot {
-                    if ms < 0 || ms > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-                }
-                // mark_min_fee upper bound: prevent setting so high that EWMA never updates
-                if mark_min_fee > percolator::MAX_PROTOCOL_FEE_ABS as u64 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                #[cfg(debug_assertions)]
-                {
-                    if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                }
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-
-                // Check magic BEFORE any unsafe cast — raw bytes may contain
-                // invalid enum discriminants that would be UB if cast to RiskEngine.
-                let header = state::read_header(&data);
-                if header.magic == MAGIC {
-                    return Err(PercolatorError::AlreadyInitialized.into());
-                }
-
-                let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault_empty(a_vault, &auth, a_mint.key, a_vault.key)?;
-
-                for b in data.iter_mut() {
-                    *b = 0;
-                }
-
-                // Initialize engine in-place (zero-copy) to avoid stack overflow.
-                let a_clock = &accounts[5];
-                let a_oracle = &accounts[7];
-                let clock = Clock::from_account_info(a_clock)?;
-                // Engine v12 requires init_oracle_price > 0.
-                // Hyperp: use the normalized initial mark price.
-                // Non-Hyperp: use 1 as sentinel — the real oracle price is
-                // established on the first KeeperCrank via accrue_market_to.
-                // This is safe because no trades can happen before a crank
-                // (require_fresh_crank gate in engine), and the first
-                // accrue_market_to overwrites last_oracle_price.
-                let init_price = if is_hyperp { initial_mark_price_e6 } else { 1 };
-
-                // Prevalidate all engine RiskParams invariants to return
-                // ProgramError instead of panicking inside engine.init_in_place().
-                {
-                    let p = &risk_params;
-                    if (p.max_accounts as usize) > percolator::MAX_ACCOUNTS || p.max_accounts == 0 {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.maintenance_margin_bps > p.initial_margin_bps
-                        || p.initial_margin_bps > 10_000
-                    {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.min_nonzero_mm_req == 0
-                        || p.min_nonzero_mm_req >= p.min_nonzero_im_req
-                        || p.min_nonzero_im_req > p.min_initial_deposit.get()
-                    {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.min_initial_deposit.get() == 0
-                        || p.min_initial_deposit.get() > percolator::MAX_VAULT_TVL
-                    {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.min_liquidation_abs.get() > p.liquidation_fee_cap.get()
-                        || p.liquidation_fee_cap.get() > percolator::MAX_PROTOCOL_FEE_ABS
-                    {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.maintenance_fee_per_slot.get() > percolator::MAX_MAINTENANCE_FEE_PER_SLOT {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.insurance_floor.get() > percolator::MAX_VAULT_TVL {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    // new_account_fee must be payable: 0 <= fee <= MAX_VAULT_TVL
-                    if p.new_account_fee.get() > percolator::MAX_VAULT_TVL {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                }
-
-                let engine = zc::engine_mut(&mut data)?;
-                engine.init_in_place(risk_params, clock.slot, init_price);
-                // init_in_place sets last_crank_slot = 0; override to init slot
-                // so first crank doesn't see a huge staleness gap.
-                engine.last_crank_slot = clock.slot;
-
-                let config = MarketConfig {
-                    collateral_mint: a_mint.key.to_bytes(),
-                    vault_pubkey: a_vault.key.to_bytes(),
-                    index_feed_id,
-                    max_staleness_secs,
-                    conf_filter_bps,
-                    vault_authority_bump: bump,
-                    invert,
-                    unit_scale,
-                    // Funding parameters (custom overrides or defaults)
-                    funding_horizon_slots: custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS),
-                    funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
-                    funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-                    funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
-                    funding_max_bps_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_BPS_PER_SLOT),
-                    // Threshold parameters (defaults)
-                    thresh_floor: DEFAULT_THRESH_FLOOR,
-                    thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
-                    thresh_update_interval_slots: DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-                    thresh_step_bps: DEFAULT_THRESH_STEP_BPS,
-                    thresh_alpha_bps: DEFAULT_THRESH_ALPHA_BPS,
-                    thresh_min: DEFAULT_THRESH_MIN,
-                    thresh_max: DEFAULT_THRESH_MAX.min(max_insurance_floor),
-                    thresh_min_step: DEFAULT_THRESH_MIN_STEP,
-                    // Oracle authority (disabled by default - use Pyth/Chainlink)
-                    // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
-                    oracle_authority: [0u8; 32],
-                    authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
-                    // Oracle price circuit breaker
-                    // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
-                    // Default: disabled for non-Hyperp, 1% per slot for Hyperp
-                    oracle_price_cap_e2bps: if is_hyperp {
-                        DEFAULT_HYPERP_PRICE_CAP_E2BPS.max(min_oracle_price_cap_e2bps)
-                    } else {
-                        // Non-Hyperp: start at the immutable floor so the circuit
-                        // breaker is active from genesis. 0 floor = no breaker.
-                        min_oracle_price_cap_e2bps
-                    },
-                    last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    // Per-market admin limits (immutable after init)
-                    max_maintenance_fee_per_slot,
-                    max_insurance_floor,
-                    min_oracle_price_cap_e2bps,
-                    // Insurance withdrawal limits (immutable after init)
-                    insurance_withdraw_max_bps,
-                    _iw_padding: [0u8; 6],
-                    insurance_withdraw_cooldown_slots,
-                    _iw_padding2: 0,
-                    max_insurance_floor_change_per_day,
-                    resolution_slot: clock.slot,
-                    last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
-                    // Hyperp: stamp init slot so stale check works from genesis.
-                    // Non-Hyperp: 0 (no mark push concept).
-                    last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
-                    last_insurance_withdraw_slot: 0,
-                    _liw_padding: 0,
-                    // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
-                    mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
-                    mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
-                    _ewma_padding: 0,
-                    permissionless_resolve_stale_slots,
-                    // Init to clock.slot so permissionless resolution timer starts
-                    // from market creation, not slot 0 (prevents immediate resolution
-                    // if the oracle happens to be down during market creation).
-                    last_good_oracle_slot: clock.slot,
-                    mark_min_fee,
-                    force_close_delay_slots,
-                    // DEX pool pinning: initialized to all-zeros (not set).
-                    // Admin must call SetDexPool (tag 74) for HYPERP markets.
-                    dex_pool: [0u8; 32],
-                };
-                // Hyperp markets must have non-zero cap for index smoothing
-                if is_hyperp && config.oracle_price_cap_e2bps == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                state::write_config(&mut data, &config);
-
-                let new_header = SlabHeader {
-                    magic: MAGIC,
-                    version: 0, // unused, no versioning
-                    bump,
-                    _padding: [0; 3],
-                    admin: a_admin.key.to_bytes(),
-                    _reserved: [0; 24],
-                };
-                state::write_header(&mut data, &new_header);
-                // Step 4: Explicitly initialize nonce to 0 for determinism
-                state::write_req_nonce(&mut data, 0);
-                // Write market_start_slot (§2.1): captures creation slot for rewards program.
-                // Shares _reserved[8..16] with last_thr_update_slot (initialized to same value).
-                state::write_market_start_slot(&mut data, clock.slot);
-
-                // PERC-623: Optional keeper fund PDA initialization.
-                // accounts[9] = keeper_fund PDA (writable), accounts[10] = system_program
-                // Backward compatible: callers passing only 9 accounts skip this.
-                if accounts.len() >= 11 {
-                    let a_keeper_fund = &accounts[9];
-                    let a_system_program = &accounts[10];
-                    accounts::expect_writable(a_keeper_fund)?;
-
-                    if *a_system_program.key != solana_program::system_program::id() {
-                        return Err(ProgramError::IncorrectProgramId);
-                    }
-
-                    let (expected_pda, pda_bump) = Pubkey::find_program_address(
-                        &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
-                        program_id,
-                    );
-                    if *a_keeper_fund.key != expected_pda {
-                        return Err(ProgramError::InvalidSeeds);
-                    }
-
-                    let rent = solana_program::rent::Rent::get()?;
-                    let rent_lamports =
-                        rent.minimum_balance(crate::keeper_fund::KEEPER_FUND_STATE_LEN);
-                    let min_fund = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK
-                        .saturating_mul(100)
-                        .saturating_add(rent_lamports);
-
-                    let bump_bytes = [pda_bump];
-                    let signer_seeds: &[&[u8]] = &[
-                        crate::keeper_fund::KEEPER_FUND_SEED,
-                        a_slab.key.as_ref(),
-                        &bump_bytes,
-                    ];
-                    solana_program::program::invoke_signed(
-                        &solana_program::system_instruction::create_account(
-                            a_admin.key,
-                            &expected_pda,
-                            min_fund,
-                            crate::keeper_fund::KEEPER_FUND_STATE_LEN as u64,
-                            program_id,
-                        ),
-                        &[
-                            a_admin.clone(),
-                            a_keeper_fund.clone(),
-                            a_system_program.clone(),
-                        ],
-                        &[signer_seeds],
-                    )?;
-
-                    let fund_balance = min_fund.saturating_sub(rent_lamports);
-                    let default_reward = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK;
-                    let fund_state = crate::keeper_fund::KeeperFundState {
-                        magic: crate::keeper_fund::KEEPER_FUND_MAGIC,
-                        bump: pda_bump,
-                        depleted_pause: 0,
-                        _pad: [0u8; 6],
-                        balance: fund_balance,
-                        reward_per_crank: default_reward,
-                        total_rewarded: 0,
-                        total_topped_up: 0,
-                    };
-                    let mut fund_data = a_keeper_fund
-                        .try_borrow_mut_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::keeper_fund::write_state(&mut fund_data, &fund_state);
-
-                    msg!(
-                        "PERC-623: KeeperFund initialized — balance={} reward_per_crank={}",
-                        fund_balance,
-                        default_reward
-                    );
-                }
+                handle_init_market(program_id, accounts, admin, collateral_mint, index_feed_id, max_staleness_secs, conf_filter_bps, invert, unit_scale, initial_mark_price_e6, max_maintenance_fee_per_slot, max_insurance_floor, min_oracle_price_cap_e2bps, insurance_withdraw_max_bps, insurance_withdraw_cooldown_slots, max_insurance_floor_change_per_day, risk_params, insurance_floor, permissionless_resolve_stale_slots, custom_funding_horizon, custom_funding_k, custom_max_premium, custom_max_per_slot, mark_min_fee, force_close_delay_slots)?;
             }
             Instruction::InitUser { fee_payment } => {
-                accounts::expect_len(accounts, 6)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block new users when market is resolved
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Reject misaligned deposits — dust would be silently donated
-                let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
-                if dust_check != 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Transfer base tokens to vault
-                collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
-
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
-
-                let engine = zc::engine_mut(&mut data)?;
-                // Canonical deposit-based materialization (spec §10.3).
-                let idx = engine.free_head;
-                engine.deposit(idx, units as u128, 0, clock.slot)
-                    .map_err(map_risk_error)?;
-                // Charge new_account_fee: deduct from capital → insurance
-                // Tokens are already in the vault from deposit() above, so we
-                // only move the internal accounting (capital → insurance) without
-                // touching engine.vault (which was already incremented by deposit).
-                // Charge new_account_fee: capital → insurance.
-                // engine.set_capital() is test_visible! (private in prod), so manual
-                // adjustment is required. Mirrors set_capital's signed-delta logic.
-                let fee = engine.params.new_account_fee.get();
-                if fee > 0 {
-                    let cap = engine.accounts[idx as usize].capital.get();
-                    if cap < fee {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-                    engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
-                    engine.c_tot = percolator::U128::new(
-                        engine.c_tot.get().checked_sub(fee)
-                            .ok_or(ProgramError::ArithmeticOverflow)?,
-                    );
-                    let new_ins = engine.insurance_fund.balance.get()
-                        .checked_add(fee)
-                        .ok_or(ProgramError::ArithmeticOverflow)?;
-                    engine.insurance_fund.balance = percolator::U128::new(new_ins);
-                }
-                engine.set_owner(idx, a_user.key.to_bytes())
-                    .map_err(map_risk_error)?;
+                handle_init_user(program_id, accounts, fee_payment)?;
             }
             Instruction::InitLP {
                 matcher_program,
                 matcher_context,
                 fee_payment,
             } => {
-                accounts::expect_len(accounts, 6)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block new LPs when market is resolved
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Reject misaligned deposits — dust would be silently donated
-                let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
-                if dust_check != 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Transfer base tokens to vault
-                collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
-
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
-
-                let engine = zc::engine_mut(&mut data)?;
-                let idx = engine.free_head;
-                engine.deposit(idx, units as u128, 0, clock.slot)
-                    .map_err(map_risk_error)?;
-                // Charge new_account_fee: capital → insurance (no vault change)
-                // Charge new_account_fee: capital → insurance.
-                // engine.set_capital() is test_visible! (private in prod), so manual
-                // adjustment is required. Mirrors set_capital's signed-delta logic.
-                let fee = engine.params.new_account_fee.get();
-                if fee > 0 {
-                    let cap = engine.accounts[idx as usize].capital.get();
-                    if cap < fee {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-                    engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
-                    engine.c_tot = percolator::U128::new(
-                        engine.c_tot.get().checked_sub(fee)
-                            .ok_or(ProgramError::ArithmeticOverflow)?,
-                    );
-                    let new_ins = engine.insurance_fund.balance.get()
-                        .checked_add(fee)
-                        .ok_or(ProgramError::ArithmeticOverflow)?;
-                    engine.insurance_fund.balance = percolator::U128::new(new_ins);
-                }
-                // Set LP fields
-                engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
-                engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
-                engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
-                engine.set_owner(idx, a_user.key.to_bytes())
-                    .map_err(map_risk_error)?;
+                handle_init_lp(program_id, accounts, matcher_program, matcher_context, fee_payment)?;
             }
             Instruction::DepositCollateral { user_idx, amount } => {
-                accounts::expect_len(accounts, 6)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block deposits when market is resolved
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Reject misaligned deposits — dust would be silently donated
-                let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
-                if dust_check != 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Transfer base tokens to vault
-                collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
-
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, user_idx)?;
-
-                // Owner authorization via verify helper (Kani-provable)
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                engine
-                    .deposit(user_idx, units as u128, 0, clock.slot)
-                    .map_err(map_risk_error)?;
+                handle_deposit_collateral(program_id, accounts, user_idx, amount)?;
             }
             Instruction::WithdrawCollateral { user_idx, amount } => {
-                accounts::expect_len(accounts, 8)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_vault = &accounts[2];
-                let a_user_ata = &accounts[3];
-                let a_vault_pda = &accounts[4];
-                let a_token = &accounts[5];
-                let a_clock = &accounts[6];
-                let a_oracle_idx = &accounts[7];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                let mut config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let derived_pda = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                accounts::expect_key(a_vault_pda, &derived_pda)?;
-
-                verify_vault(
-                    a_vault,
-                    &derived_pda,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                let resolved = state::is_resolved(&data);
-                let clock = Clock::from_account_info(a_clock)?;
-                let price = if resolved {
-                    let settlement = config.authority_price_e6;
-                    if settlement == 0 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    settlement
-                } else {
-                    let is_hyperp = oracle::is_hyperp_mode(&config);
-                    let px = if is_hyperp {
-                        let eng = zc::engine_ref(&data)?;
-                        let last_slot = eng.current_slot;
-                        oracle::get_engine_oracle_price_e6(
-                            last_slot, clock.slot, clock.unix_timestamp,
-                            &mut config, a_oracle_idx,
-                        )?
-                    } else {
-                        read_price_and_stamp(&mut config, a_oracle_idx, clock.unix_timestamp, clock.slot)?
-                    };
-                    state::write_config(&mut data, &config);
-                    px
-                };
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, user_idx)?;
-
-                // Owner authorization via verify helper (Kani-provable)
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                // withdraw_not_atomic internally calls touch_account_full.
-                // No separate pre-touch needed — it would run without lifecycle
-                // handling and leave stale side state.
-
-                // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
-                if config.unit_scale != 0 && amount % config.unit_scale as u64 != 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // Convert requested base tokens to units
-                let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
-
-                // Use frozen time on resolved markets
-                let withdraw_slot = if resolved { config.resolution_slot } else { clock.slot };
-                engine
-                    .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
-                        compute_current_funding_rate(&config))
-                    .map_err(map_risk_error)?;
-
-                // Convert units back to base tokens for payout (checked to prevent silent overflow)
-                let base_to_pay =
-                    crate::units::units_to_base_checked(units_requested, config.unit_scale)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_user_ata,
-                    a_vault_pda,
-                    base_to_pay,
-                    &signer_seeds,
-                )?;
+                handle_withdraw_collateral(program_id, accounts, user_idx, amount)?;
             }
             Instruction::KeeperCrank {
                 caller_idx,
                 candidates,
             } => {
-                use crate::constants::CRANK_NO_CALLER;
-
-                accounts::expect_len(accounts, 4)?;
-                let a_caller = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_clock = &accounts[2];
-                let a_oracle = &accounts[3];
-
-                // Permissionless mode: caller_idx == u16::MAX means anyone can crank.
-                // Resolved markets are always permissionless (settlement is idempotent).
-                let permissionless = caller_idx == CRANK_NO_CALLER;
-
-                if !permissionless {
-                    accounts::expect_signer(a_caller)?;
-                }
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Check if market is resolved - frozen time mode.
-                // NOTE: resolved crank is effectively permissionless regardless of
-                // caller_idx — the resolved path returns before owner-match checks.
-                // This is intentional: settlement is idempotent and no funds move.
-                // All resolved operations use engine.current_slot (frozen at
-                // last pre-resolution crank) instead of clock.slot.
-                if state::is_resolved(&data) {
-                    let config = state::read_config(&data);
-                    let settlement_price = config.authority_price_e6;
-                    if settlement_price == 0 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-
-                    // Use resolution_slot (snapshotted in ResolveMarket)
-                    let frozen_slot = config.resolution_slot;
-
-                    // Dust sweep: resolved crank must also sweep dust so
-                    // CloseSlab's dust_base == 0 check can eventually pass.
-                    let dust_before = state::read_dust_base(&data);
-                    let unit_scale = config.unit_scale;
-
-                    let engine = zc::engine_mut(&mut data)?;
-
-                    // Settle PnL for accounts in a paginated manner.
-                    // touch_account_full settles A/K mark-to-market PnL at
-                    // settlement price. Position zeroing and account close
-                    // happen when users call CloseAccount (close_account_resolved).
-                    const BATCH_SIZE: u16 = 8;
-                    let start = engine.crank_cursor;
-                    let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
-
-                    for idx in start..end {
-                        if engine.is_used(idx as usize) {
-                            // Best-effort settlement at fixed settlement price.
-                            //
-                            // Convergence argument (verified in engine source):
-                            //   accrue_market_to writes last_oracle_price LAST,
-                            //   after all K coefficient updates. If K updates fail
-                            //   (checked arithmetic), stored price is NOT updated,
-                            //   so the next call recomputes the same delta_p. After
-                            //   a successful completion, subsequent calls with the
-                            //   same fixed price hit the early return (delta_p=0).
-                            //
-                            //   Therefore: partial failure → retry → identical
-                            //   final state as single success. Idempotent after
-                            //   first successful application.
-                            //
-                            // Accounts where touch never succeeds (ADL overflow)
-                            // are force-closed via AdminForceCloseAccount, which
-                            // does best-effort touch then falls through to
-                            // close_account_resolved using stored local state.
-                            // Resolved crank does NOT call touch_account_full.
-                            // touch_account_full_not_atomic can leave partial state on
-                            // error, and aborting on one bad account would stall the
-                            // entire batch. Accounts are settled by ForceCloseResolved
-                            // which handles K-pair fallback atomically.
-                        }
-                    }
-
-                    // Update crank cursor (do NOT advance current_slot — frozen)
-                    engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 {
-                        0
-                    } else {
-                        end
-                    };
-
-                    // Sweep dust to insurance fund.
-                    // On resolved markets, also forgive sub-scale remainder
-                    // (worth < 1 engine unit, no engine accounting entry).
-                    let forgive_dust = if unit_scale > 0 {
-                        let scale = unit_scale as u64;
-                        if dust_before >= scale {
-                            let units_to_sweep = dust_before / scale;
-                            engine.top_up_insurance_fund(
-                                units_to_sweep as u128, frozen_slot,
-                            ).map_err(map_risk_error)?;
-                        }
-                        true
-                    } else {
-                        false
-                    };
-
-                    // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
-                    // Propagate CorruptState (real invariant violation), ignore other
-                    // errors (side-reset may fail on frozen ADL state post-resolution).
-                    let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(
-                        &mut ctx,
-                        compute_current_funding_rate(&config),
-                    ) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal on resolved markets
-                    }
-
-                    // engine borrow ends here (last use above).
-                    // Write dust_base AFTER dropping the engine borrow to avoid
-                    // aliasing conflict with state::write_dust_base.
-                    if forgive_dust && dust_before != 0 {
-                        // Forgive any sub-scale remainder — on resolved markets
-                        // no new dust can accumulate, so this is terminal cleanup.
-                        state::write_dust_base(&mut data, 0);
-                    }
-
-                    return Ok(());
-                }
-
-                let mut config = state::read_config(&data);
-
-                // Read dust before borrowing engine (for dust sweep later)
-                let dust_before = state::read_dust_base(&data);
-                let unit_scale = config.unit_scale;
-
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Hyperp mode: use get_engine_oracle_price_e6 for rate-limited index smoothing
-                // Otherwise: use read_price_clamped as before
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let engine_last_slot = {
-                    let engine = zc::engine_ref(&data)?;
-                    engine.current_slot
-                };
-
-                let price = if is_hyperp {
-                    // Hyperp mode: update index toward mark with rate limiting
-                    oracle::get_engine_oracle_price_e6(
-                        engine_last_slot,
-                        clock.slot,
-                        clock.unix_timestamp,
-                        &mut config,
-                        a_oracle,
-                    )?
-                } else {
-                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
-                };
-
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                // Crank authorization:
-                // - Permissionless mode (caller_idx == u16::MAX): anyone can crank
-                // - Self-crank mode: caller_idx must be a valid, existing account owned by signer
-                if !permissionless {
-                    check_idx(engine, caller_idx)?;
-                    let stored_owner = engine.accounts[caller_idx as usize].owner;
-                    if !crate::verify::owner_ok(stored_owner, a_caller.key.to_bytes()) {
-                        return Err(PercolatorError::EngineUnauthorized.into());
-                    }
-                }
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: keeper_crank_start");
-                    sol_log_compute_units();
-                }
-                let funding_rate = compute_current_funding_rate(&config);
-                let _outcome = engine
-                    .keeper_crank_not_atomic(
-                        clock.slot,
-                        price,
-                        &candidates,
-                        percolator::LIQ_BUDGET_PER_CRANK,
-                        funding_rate,
-                    )
-                    .map_err(map_risk_error)?;
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: keeper_crank_end");
-                    sol_log_compute_units();
-                }
-
-                // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund
-                // Done before copying stats so insurance balance reflects the sweep
-                let remaining_dust = if unit_scale > 0 {
-                    let scale = unit_scale as u64;
-                    if dust_before >= scale {
-                        let units_to_sweep = dust_before / scale;
-                        engine
-                            .top_up_insurance_fund(units_to_sweep as u128, clock.slot)
-                            .map_err(map_risk_error)?;
-                        Some(dust_before % scale)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Copy stats before threshold update (avoid borrow conflict)
-                let liqs = engine.lifetime_liquidations;
-                let ins_low = engine.insurance_fund.balance.get() as u64;
-
-                // Spec §2.2.1: I_floor is immutable — no auto-update.
-                // Insurance floor is set at InitMarket and never changes.
-                // (EWMA auto-update removed per spec compliance.)
-
-                // Write remaining dust if sweep occurred
-                if let Some(dust) = remaining_dust {
-                    state::write_dust_base(&mut data, dust);
-                }
-
-                // Debug: log lifetime counters (sol_log_64: tag, liqs, max_accounts, insurance, 0)
-                msg!("CRANK_STATS");
-                sol_log_64(0xC8A4C, liqs, MAX_ACCOUNTS as u64, ins_low, 0);
+                handle_keeper_crank(program_id, accounts, caller_idx, candidates)?;
             }
             Instruction::TradeNoCpi {
                 lp_idx,
                 user_idx,
                 size,
             } => {
-                accounts::expect_len(accounts, 5)?;
-                let a_user = &accounts[0];
-                let a_lp = &accounts[1];
-                let a_slab = &accounts[2];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_signer(a_lp)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block trading when market is resolved
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-
-                let clock = Clock::from_account_info(&accounts[3])?;
-                let a_oracle = &accounts[4];
-
-                // Hyperp mode: reject TradeNoCpi to prevent mark price manipulation
-                // All trades must go through TradeCpi with a pinned matcher
-                if oracle::is_hyperp_mode(&config) {
-                    return Err(PercolatorError::HyperpTradeNoCpiDisabled.into());
-                }
-
-                // Read oracle price with circuit-breaker clamping
-                let price =
-                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?;
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, lp_idx)?;
-                check_idx(engine, user_idx)?;
-
-                // TradeNoCpi: no matcher check. Both sides are bilateral signers,
-                // no CPI is invoked. Matcher config only matters for TradeCpi.
-
-                let u_owner = engine.accounts[user_idx as usize].owner;
-
-                // Owner authorization via verify helper (Kani-provable)
-                if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-                let l_owner = engine.accounts[lp_idx as usize].owner;
-                if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                // Side-mode gating is handled inside engine.execute_trade_not_atomic()
-
-                // Snapshot insurance fund balance for fee-weighted EWMA.
-                // The delta after execute_trade = fees_collected - losses_absorbed.
-                // NOTE: If loss absorption occurs during the same trade (spec §5.4),
-                // delta undercounts the actual fee. This is the conservative direction:
-                // mark is stickier during volatile loss-absorption events, never
-                // more manipulable. A future engine API could expose fee_paid directly.
-                let ins_before = engine.insurance_fund.balance.get();
-
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
-                    sol_log_compute_units();
-                }
-                let funding_rate = compute_current_funding_rate(&config);
-                execute_trade_with_matcher(
-                    engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
-                    funding_rate,
-                ).map_err(map_risk_error)?;
-
-                // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
-                // NOTE: NoOpMatcher fills at oracle price, so mark_ewma converges to oracle
-                // for TradeNoCpi trades. This means TradeNoCpi-only markets have zero premium
-                // and zero funding. Markets that need funding must use TradeCpi with a matcher
-                // that can set exec_price != oracle (creating mark/index divergence).
-                // Only when circuit breaker is active (cap > 0) — without cap,
-                // exec prices are unbounded and EWMA would be manipulable.
-                if config.oracle_price_cap_e2bps > 0 {
-                    let clamped_price = oracle::clamp_oracle_price(
-                        crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
-                        price,
-                        config.oracle_price_cap_e2bps,
-                    );
-                    // fee_paid = actual fee collected into insurance (post - pre).
-                    // This is exact: no overestimate from pre-trade capital snapshot.
-                    let fee_paid_nocpi = if config.mark_min_fee > 0 {
-                        let ins_after = engine.insurance_fund.balance.get();
-                        let delta = ins_after.saturating_sub(ins_before);
-                        core::cmp::min(delta, u64::MAX as u128) as u64
-                    } else { 0u64 };
-                    let old_ewma = config.mark_ewma_e6;
-                    config.mark_ewma_e6 = crate::verify::ewma_update(
-                        old_ewma, clamped_price,
-                        config.mark_ewma_halflife_slots,
-                        config.mark_ewma_last_slot, clock.slot,
-                        fee_paid_nocpi,
-                        config.mark_min_fee,
-                    );
-                    // Only update the EWMA clock when the mark actually moved.
-                    // Zero-weight trades must not refresh the clock — that would
-                    // shrink future dt and damp legitimate updates.
-                    if config.mark_ewma_e6 != old_ewma {
-                        config.mark_ewma_last_slot = clock.slot;
-                    }
-                    // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
-                    // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
-                }
-
-                // Write updated config (mark_ewma changed)
-                state::write_config(&mut data, &config);
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
-                    sol_log_compute_units();
-                }
+                handle_trade_no_cpi(program_id, accounts, lp_idx, user_idx, size)?;
             }
             Instruction::TradeCpi {
                 lp_idx,
@@ -6321,683 +5241,23 @@ pub mod processor {
                 size,
                 limit_price_e6,
             } => {
-                // Phase 1: Updated account layout - lp_pda must be in accounts
-                accounts::expect_len(accounts, 8)?;
-                let a_user = &accounts[0];
-                let a_lp_owner = &accounts[1];
-                let a_slab = &accounts[2];
-                let a_clock = &accounts[3];
-                let a_oracle = &accounts[4];
-                let a_matcher_prog = &accounts[5];
-                let a_matcher_ctx = &accounts[6];
-                let a_lp_pda = &accounts[7];
-
-                accounts::expect_signer(a_user)?;
-                // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
-                // LP owner delegated trade authorization to the matcher program.
-                // The matcher CPI (via LP PDA invoke_signed) validates the trade.
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_matcher_ctx)?;
-
-                // Matcher shape validation via verify helper (Kani-provable)
-                let matcher_shape = crate::verify::MatcherAccountsShape {
-                    prog_executable: a_matcher_prog.executable,
-                    ctx_executable: a_matcher_ctx.executable,
-                    ctx_owner_is_prog: a_matcher_ctx.owner == a_matcher_prog.key,
-                    ctx_len_ok: crate::verify::ctx_len_sufficient(a_matcher_ctx.data_len()),
-                };
-                if !crate::verify::matcher_shape_ok(matcher_shape) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                // Phase 1: Validate lp_pda is the correct PDA, system-owned, empty data, 0 lamports
-                let lp_bytes = lp_idx.to_le_bytes();
-                let (expected_lp_pda, bump) = Pubkey::find_program_address(
-                    &[b"lp", a_slab.key.as_ref(), &lp_bytes],
-                    program_id,
-                );
-                // PDA key validation via verify helper (Kani-provable)
-                if !crate::verify::pda_key_matches(
-                    expected_lp_pda.to_bytes(),
-                    a_lp_pda.key.to_bytes(),
-                ) {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-                // PDA key match is sufficient — only this program can sign
-                // for it, so it's always system-owned with zero data.
-
-                // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
-                // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
-                // Nonce write is deferred until after execute_trade
-                let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx, engine_current_slot) = {
-                    let data = a_slab.try_borrow_data()?;
-                    slab_guard(program_id, a_slab, &*data)?;
-                    require_initialized(&*data)?;
-
-                    // Block trading when market is resolved
-                    if state::is_resolved(&*data) {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-
-                    let config = state::read_config(&*data);
-
-                    // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
-                    // Nonce advancement via verify helper (Kani-provable)
-                    let nonce = state::read_req_nonce(&*data);
-                    let req_id = crate::verify::nonce_on_success(nonce);
-
-                    let engine = zc::engine_ref(&*data)?;
-
-                    check_idx(engine, lp_idx)?;
-                    check_idx(engine, user_idx)?;
-
-                    // TradeCpi: require lp_idx has matcher config (non-zero matcher_program).
-                    // The matcher program/context are used for CPI — zero fields would
-                    // cause CPI to fail or route to the wrong program.
-                    // This uses matcher config, not account kind, as the LP capability check.
-                    if engine.accounts[lp_idx as usize].matcher_program == [0u8; 32] {
-                        return Err(PercolatorError::EngineAccountKindMismatch.into());
-                    }
-
-                    // Owner authorization via verify helper (Kani-provable)
-                    let u_owner = engine.accounts[user_idx as usize].owner;
-                    if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
-                        return Err(PercolatorError::EngineUnauthorized.into());
-                    }
-                    let l_owner = engine.accounts[lp_idx as usize].owner;
-                    if !crate::verify::owner_ok(l_owner, a_lp_owner.key.to_bytes()) {
-                        return Err(PercolatorError::EngineUnauthorized.into());
-                    }
-
-                    let lp_acc = &engine.accounts[lp_idx as usize];
-                    (
-                        lp_acc.account_id,
-                        config,
-                        req_id,
-                        lp_acc.matcher_program,
-                        lp_acc.matcher_context,
-                        engine.current_slot,
-                    )
-                };
-
-                // Matcher identity binding via verify helper (Kani-provable)
-                if !crate::verify::matcher_identity_ok(
-                    lp_matcher_prog,
-                    lp_matcher_ctx,
-                    a_matcher_prog.key.to_bytes(),
-                    a_matcher_ctx.key.to_bytes(),
-                ) {
-                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
-                }
-
-                let clock = Clock::from_account_info(a_clock)?;
-                // Oracle price: Hyperp mode applies rate-limited index update
-                // via clamp_toward_with_dt (prevents stale-index manipulation).
-                // Non-Hyperp: standard circuit-breaker clamping.
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    oracle::get_engine_oracle_price_e6(
-                        engine_current_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_oracle,
-                    )?
-                } else {
-                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
-                };
-
-                // Note: We don't zero the matcher_ctx before CPI because we don't own it.
-                // Security is maintained by ABI validation which checks req_id (nonce),
-                // lp_account_id, and oracle_price_e6 all match the request parameters.
-
-                // Stack-allocated CPI data (67 bytes) — avoids heap allocation
-                let mut cpi_data = [0u8; MATCHER_CALL_LEN];
-                cpi_data[0] = MATCHER_CALL_TAG;
-                cpi_data[1..9].copy_from_slice(&req_id.to_le_bytes());
-                cpi_data[9..11].copy_from_slice(&lp_idx.to_le_bytes());
-                cpi_data[11..19].copy_from_slice(&lp_account_id.to_le_bytes());
-                cpi_data[19..27].copy_from_slice(&price.to_le_bytes());
-                cpi_data[27..43].copy_from_slice(&size.to_le_bytes());
-                // bytes 43..67 already zero (padding)
-
-                let metas = [
-                    AccountMeta::new_readonly(*a_lp_pda.key, true),
-                    AccountMeta::new(*a_matcher_ctx.key, false),
-                ];
-
-                let ix = SolInstruction {
-                    program_id: *a_matcher_prog.key,
-                    accounts: metas.to_vec(),
-                    data: cpi_data.to_vec(),
-                };
-
-                let bump_arr = [bump];
-                let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
-
-                // Phase 2: Use zc helper for CPI - slab not passed to avoid ExternalAccountDataModified
-                zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, a_matcher_prog, seeds)?;
-
-                let ctx_data = a_matcher_ctx.try_borrow_data()?;
-                let ret = crate::matcher_abi::read_matcher_return(&ctx_data)?;
-                // ABI validation via verify helper (Kani-provable)
-                let ret_fields = crate::verify::MatcherReturnFields {
-                    abi_version: ret.abi_version,
-                    flags: ret.flags,
-                    exec_price_e6: ret.exec_price_e6,
-                    exec_size: ret.exec_size,
-                    req_id: ret.req_id,
-                    lp_account_id: ret.lp_account_id,
-                    oracle_price_e6: ret.oracle_price_e6,
-                    reserved: ret.reserved,
-                };
-                if !crate::verify::abi_ok(ret_fields, lp_account_id, price, size, req_id) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                drop(ctx_data);
-
-                // User-side slippage protection.
-                // Normalize limit to engine-space (same invert+scale as exec_price).
-                // For inverted markets, inversion is order-reversing: a "better"
-                // raw buy price maps to a larger engine price, so inequalities flip.
-                if limit_price_e6 != 0 && ret.exec_size != 0 {
-                    let limit_eng = crate::verify::to_engine_price(
-                        limit_price_e6, config.invert, config.unit_scale,
-                    ).ok_or(PercolatorError::OracleInvalid)?;
-                    let inverted = config.invert != 0;
-                    if size > 0 {
-                        // Buying: raw user wants exec <= limit (pay no more)
-                        // Normal:   exec_eng > limit_eng → reject
-                        // Inverted: exec_eng < limit_eng → reject (order flipped)
-                        let bad = if inverted {
-                            ret.exec_price_e6 < limit_eng
-                        } else {
-                            ret.exec_price_e6 > limit_eng
-                        };
-                        if bad {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                    } else {
-                        // Selling: raw user wants exec >= limit (receive no less)
-                        // Normal:   exec_eng < limit_eng → reject
-                        // Inverted: exec_eng > limit_eng → reject (order flipped)
-                        let bad = if inverted {
-                            ret.exec_price_e6 > limit_eng
-                        } else {
-                            ret.exec_price_e6 < limit_eng
-                        };
-                        if bad {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                    }
-                }
-
-                // Zero-fill: ABI-valid no-op when matcher returns exec_size == 0
-                // with FLAG_PARTIAL_OK. Skip engine call which rejects size_q == 0.
-                // Zero-fill: no trade occurred, so do not persist oracle side effects.
-                // Revert last_effective_price_e6 for ALL markets — prevents repeated
-                // zero-fills from walking the circuit-breaker baseline toward the raw
-                // oracle price (Hyperp: index ratchet, non-Hyperp: baseline walk).
-                // SAFETY: mark_ewma_e6 is NOT reverted here because the EWMA update
-                // happens AFTER this early return (inside the exec_size != 0 branch below).
-                // Zero-fills never touch the EWMA, so no revert is needed.
-                if ret.exec_size == 0 {
-                    let mut data = state::slab_data_mut(a_slab)?;
-                    let pristine = state::read_config(&data);
-                    config.last_effective_price_e6 = pristine.last_effective_price_e6;
-                    config.last_hyperp_index_slot = pristine.last_hyperp_index_slot;
-                    // Revert last_good_oracle_slot too — zero-fills must not refresh
-                    // the oracle-death timer (prevents resolution-delay manipulation).
-                    config.last_good_oracle_slot = pristine.last_good_oracle_slot;
-                    state::write_config(&mut data, &config);
-                    state::write_req_nonce(&mut data, req_id);
-                    return Ok(());
-                }
-
-                let exec_price = ret.exec_price_e6;
-                // Reject extreme exec prices that would corrupt engine state
-                // or produce absurd PnL. Must check BEFORE engine call.
-                if exec_price > percolator::MAX_ORACLE_PRICE {
-                    return Err(PercolatorError::OracleInvalid.into());
-                }
-                {
-                    let mut data = state::slab_data_mut(a_slab)?;
-                    let engine = zc::engine_mut(&mut data)?;
-
-                    let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
-
-                    // Snapshot insurance for fee-weighted EWMA (delta approach).
-                    // NOTE: delta = fees - losses_absorbed. Conservative undercount
-                    // during volatile loss-absorption events (see TradeNoCpi comment).
-                    let ins_before_cpi = engine.insurance_fund.balance.get();
-
-                    #[cfg(feature = "cu-audit")]
-                    {
-                        msg!("CU_CHECKPOINT: trade_cpi_execute_start");
-                        sol_log_compute_units();
-                    }
-                    let matcher = CpiMatcher {
-                        exec_price,
-                        exec_size: trade_size,
-                    };
-                    // Compute funding BEFORE trade (uses pre-fill state per anti-retroactivity)
-                    let funding_rate = compute_current_funding_rate(&config);
-                    execute_trade_with_matcher(
-                        engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
-                        funding_rate,
-                    ).map_err(map_risk_error)?;
-                    #[cfg(feature = "cu-audit")]
-                    {
-                        msg!("CU_CHECKPOINT: trade_cpi_execute_end");
-                        sol_log_compute_units();
-                    }
-                    // Update trade-derived mark EWMA (all market types).
-                    // Only when circuit breaker is active — without cap, exec prices
-                    // are unbounded and EWMA would be manipulable.
-                    if config.oracle_price_cap_e2bps > 0 {
-                        let clamped_exec = oracle::clamp_oracle_price(
-                            crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
-                            ret.exec_price_e6,
-                            config.oracle_price_cap_e2bps,
-                        );
-                        // fee_paid = actual fee collected into insurance (post - pre).
-                        let fee_paid_cpi = if config.mark_min_fee > 0 {
-                            let ins_after_cpi = engine.insurance_fund.balance.get();
-                            let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
-                            core::cmp::min(delta, u64::MAX as u128) as u64
-                        } else { 0u64 };
-                        let old_ewma_cpi = config.mark_ewma_e6;
-                        config.mark_ewma_e6 = crate::verify::ewma_update(
-                            old_ewma_cpi,
-                            clamped_exec,
-                            config.mark_ewma_halflife_slots,
-                            config.mark_ewma_last_slot,
-                            clock.slot,
-                            fee_paid_cpi,
-                            config.mark_min_fee,
-                        );
-                        // Only update EWMA clock when mark actually moved
-                        if config.mark_ewma_e6 != old_ewma_cpi {
-                            config.mark_ewma_last_slot = clock.slot;
-                        }
-                        // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
-                        // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
-                    }
-
-                    // Hyperp: also update authority_price (legacy mark field)
-                    if is_hyperp {
-                        config.authority_price_e6 = oracle::clamp_oracle_price(
-                            config.last_effective_price_e6,
-                            ret.exec_price_e6,
-                            config.oracle_price_cap_e2bps,
-                        );
-                        config.last_mark_push_slot = clock.slot as u128;
-                    }
-                }
-                // Engine borrow dropped. Write nonce + config.
-                {
-                    let mut data = state::slab_data_mut(a_slab)?;
-                    state::write_req_nonce(&mut data, req_id);
-                    state::write_config(&mut data, &config);
-                }
+                handle_trade_cpi(program_id, accounts, lp_idx, user_idx, size, limit_price_e6)?;
             }
             Instruction::LiquidateAtOracle { target_idx } => {
-                accounts::expect_len(accounts, 4)?;
-                // AUDIT CRIT-2 FIX: require caller to be a signer
-                accounts::expect_signer(&accounts[0])?;
-                let a_slab = &accounts[1];
-                let a_oracle = &accounts[3];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block liquidations after market resolution — resolved markets
-                // are in withdraw-only settlement phase.
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-
-                let clock = Clock::from_account_info(&accounts[2])?;
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    // Read engine.current_slot before mutable borrow
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_oracle,
-                    )?
-                } else {
-                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
-                };
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, target_idx)?;
-
-                // Debug logging for liquidation (using sol_log_64 for no_std)
-                sol_log_64(target_idx as u64, price, 0, 0, 0); // idx, price
-                {
-                    let acc = &engine.accounts[target_idx as usize];
-                    sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1); // cap
-                    let eff = engine.effective_pos_q(target_idx as usize);
-                    let notional = engine.notional(target_idx as usize, price);
-                    sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2); // notional, has_pos
-                }
-
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: liquidate_start");
-                    sol_log_compute_units();
-                }
-                let _res = engine
-                    .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
-                        percolator::LiquidationPolicy::FullClose,
-                        compute_current_funding_rate(&config))
-                    .map_err(map_risk_error)?;
-                sol_log_64(_res as u64, 0, 0, 0, 4); // result
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: liquidate_end");
-                    sol_log_compute_units();
-                }
+                handle_liquidate_at_oracle(program_id, accounts, target_idx)?;
             }
             Instruction::CloseAccount { user_idx } => {
-                accounts::expect_len(accounts, 8)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_vault = &accounts[2];
-                let a_user_ata = &accounts[3];
-                let a_pda = &accounts[4];
-                let a_token = &accounts[5];
-                let a_oracle = &accounts[7];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                let mut config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-                accounts::expect_key(a_pda, &auth)?;
-
-                let resolved = state::is_resolved(&data);
-                let clock = Clock::from_account_info(&accounts[6])?;
-                let price = if resolved {
-                    let settlement = config.authority_price_e6;
-                    if settlement == 0 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    settlement
-                } else {
-                    let is_hyperp = oracle::is_hyperp_mode(&config);
-                    let px = if is_hyperp {
-                        let eng = zc::engine_ref(&data)?;
-                        let last_slot = eng.current_slot;
-                        oracle::get_engine_oracle_price_e6(
-                            last_slot, clock.slot, clock.unix_timestamp,
-                            &mut config, a_oracle,
-                        )?
-                    } else {
-                        read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
-                    };
-                    state::write_config(&mut data, &config);
-                    px
-                };
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, user_idx)?;
-
-                // Owner authorization via verify helper (Kani-provable)
-                let u_owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: close_account_start");
-                    sol_log_compute_units();
-                }
-                let amt_units = if resolved {
-                    // force_close_resolved handles K-pair PnL, maintenance fees,
-                    // loss settlement, and account close internally.
-                    // Do NOT pre-touch: touch can fail on epoch-mismatch accounts
-                    // that force_close_resolved was specifically designed to handle.
-                    engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
-                        .map_err(map_risk_error)?
-                } else {
-                    engine
-                        .close_account_not_atomic(user_idx, clock.slot, price,
-                            compute_current_funding_rate(&config))
-                        .map_err(map_risk_error)?
-                };
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: close_account_end");
-                    sol_log_compute_units();
-                }
-                let amt_units_u64: u64 = amt_units
-                    .try_into()
-                    .map_err(|_| PercolatorError::EngineOverflow)?;
-
-                // Convert units to base tokens for payout (checked to prevent silent overflow)
-                let base_to_pay =
-                    crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_user_ata,
-                    a_pda,
-                    base_to_pay,
-                    &signer_seeds,
-                )?;
+                handle_close_account(program_id, accounts, user_idx)?;
             }
             Instruction::TopUpInsurance { amount } => {
-                accounts::expect_len(accounts, 6)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block insurance top-up when market is resolved
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                // Reject misaligned deposits — dust would be silently donated
-                let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
-                if dust_check != 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Transfer base tokens to vault
-                collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
-
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
-
-                let clock = Clock::from_account_info(a_clock)?;
-                let engine = zc::engine_mut(&mut data)?;
-                engine
-                    .top_up_insurance_fund(units as u128, clock.slot)
-                    .map_err(map_risk_error)?;
+                handle_top_up_insurance(program_id, accounts, amount)?;
             }
             Instruction::UpdateAdmin { new_admin } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                // Zero-address admin permanently burns admin authority (§7 step [3]).
-                // require_admin rejects [0u8;32] so all admin instructions become
-                // permanently inaccessible once set.
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let mut header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                header.admin = new_admin.to_bytes();
-                state::write_header(&mut data, &header);
+                handle_update_admin(program_id, accounts, new_admin)?;
             }
 
             Instruction::CloseSlab => {
-                accounts::expect_len(accounts, 6)?;
-                let a_dest = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_vault = &accounts[2];
-                let a_vault_auth = &accounts[3];
-                let a_dest_ata = &accounts[4];
-                let a_token = &accounts[5];
-
-                accounts::expect_signer(a_dest)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                {
-                    let mut data = state::slab_data_mut(a_slab)?;
-                    slab_guard(program_id, a_slab, &data)?;
-                    require_initialized(&data)?;
-
-                    // Require resolved — enforce lifecycle ordering
-                    if !state::is_resolved(&data) {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-
-                    let header = state::read_header(&data);
-                    require_admin(header.admin, a_dest.key)?;
-
-                    let config = state::read_config(&data);
-                    let mint = Pubkey::new_from_array(config.collateral_mint);
-                    let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                    verify_vault(
-                        a_vault,
-                        &auth,
-                        &mint,
-                        &Pubkey::new_from_array(config.vault_pubkey),
-                    )?;
-
-                    let engine = zc::engine_ref(&data)?;
-                    if !engine.vault.is_zero() {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-                    if !engine.insurance_fund.balance.is_zero() {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-                    if engine.num_used_accounts != 0 {
-                        return Err(PercolatorError::EngineAccountNotFound.into());
-                    }
-
-                    // Drain any stranded vault tokens (unsolicited transfers or
-                    // sub-scale dust) to admin's ATA. This is the terminal cleanup
-                    // path — engine accounting is already zero.
-                    let vault_data = a_vault.try_borrow_data()?;
-                    let vault_token = spl_token::state::Account::unpack(&vault_data)?;
-                    let stranded = vault_token.amount;
-                    drop(vault_data);
-
-                    if stranded > 0 {
-                        // Validate admin's token account before drain
-                        verify_token_account(a_dest_ata, a_dest.key, &mint)?;
-                        // Verify vault authority PDA
-                        let expected_auth = Pubkey::create_program_address(
-                            &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]],
-                            program_id,
-                        ).map_err(|_| ProgramError::InvalidSeeds)?;
-                        if a_vault_auth.key != &expected_auth {
-                            return Err(ProgramError::InvalidSeeds);
-                        }
-
-                        let seed1: &[u8] = b"vault";
-                        let seed2: &[u8] = a_slab.key.as_ref();
-                        let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                        let seed3: &[u8] = &bump_arr;
-                        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-                        // Drain stranded vault tokens → admin ATA
-                        collateral::withdraw(
-                            a_token,
-                            a_vault,
-                            a_dest_ata,
-                            a_vault_auth,
-                            stranded,
-                            &signer_seeds,
-                        )?;
-                    }
-
-                    // Forgive any remaining dust_base — engine accounting is zero,
-                    // and any sub-scale remainder has been drained from the vault.
-                    // (dust_base tracks base-unit fractions with no engine entry)
-
-                    // Zero out the slab data to prevent reuse
-                    for b in data.iter_mut() {
-                        *b = 0;
-                    }
-                }
-
-                // Transfer all lamports from slab to destination
-                let slab_lamports = a_slab.lamports();
-                **a_slab.lamports.borrow_mut() = 0;
-                **a_dest.lamports.borrow_mut() = a_dest
-                    .lamports()
-                    .checked_add(slab_lamports)
-                    .ok_or(PercolatorError::EngineOverflow)?;
+                handle_close_slab(program_id, accounts)?;
             }
 
             Instruction::UpdateConfig {
@@ -7007,612 +5267,30 @@ pub mod processor {
                 funding_max_premium_bps,
                 funding_max_bps_per_slot,
             } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_clock = &accounts[2];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // Validate parameters
-                if funding_horizon_slots == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                // funding_inv_scale_notional_e6: reserved for future use.
-                // Not currently read by funding computation.
-                let _ = funding_inv_scale_notional_e6;
-                // Reject negative funding bounds — reversed clamp bounds panic
-                if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
-                    || funding_max_bps_per_slot > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                // Read existing config
-                let mut config = state::read_config(&data);
-
-                if funding_k_bps > 100_000 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                // Flush Hyperp index WITHOUT staleness check (admin recovery path).
-                let clock = Clock::from_account_info(a_clock)?;
-                if oracle::is_hyperp_mode(&config) {
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
-                        );
-                        config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
-                    }
-                    state::write_config(&mut data, &config);
-                }
-                // Accrue to boundary using engine's already-stored rate.
-                // Do NOT overwrite funding_rate_bps_per_slot_last before accrual —
-                // that would retroactively reprice the elapsed interval.
-                // Both Hyperp and non-Hyperp must accrue before changing funding params.
-                {
-                    let accrual_price = if oracle::is_hyperp_mode(&config) {
-                        config.last_effective_price_e6
-                    } else {
-                        // Non-Hyperp: use last oracle price from engine
-                        let engine = zc::engine_ref(&data)?;
-                        engine.last_oracle_price
-                    };
-                    if accrual_price > 0 {
-                        let engine = zc::engine_mut(&mut data)?;
-                        engine.accrue_market_to(clock.slot, accrual_price)
-                            .map_err(map_risk_error)?;
-                    }
-                }
-
-                config.funding_horizon_slots = funding_horizon_slots;
-                config.funding_k_bps = funding_k_bps;
-                config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
-                config.funding_max_premium_bps = funding_max_premium_bps;
-                config.funding_max_bps_per_slot = funding_max_bps_per_slot;
-                // Run end-of-instruction lifecycle after accrue + config change.
-                // Finalizes pending resets triggered by the accrual.
-                {
-                    let engine = zc::engine_mut(&mut data)?;
-                    let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(
-                        &mut ctx,
-                        compute_current_funding_rate(&config),
-                    ) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-                    }
-                }
-                state::write_config(&mut data, &config);
+                handle_update_config(program_id, accounts, funding_horizon_slots, funding_k_bps, funding_inv_scale_notional_e6, funding_max_premium_bps, funding_max_bps_per_slot)?;
             }
 
             Instruction::SetOracleAuthority { new_authority } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // SECURITY(M-4): Block SetOracleAuthority on Pyth-pinned markets.
-                // Pyth-pinned markets guarantee decentralized oracle pricing.
-                // Setting a non-zero authority would silently switch to admin-oracle
-                // mode, breaking the trust model users signed up for.
-                let mut config = state::read_config(&data);
-                if crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id)
-                    && new_authority != Pubkey::default()
-                {
-                    msg!("SetOracleAuthority: blocked on Pyth-pinned market");
-                    return Err(ProgramError::InvalidArgument);
-                }
-                // Hyperp: reject zero-address unless trade flow has bootstrapped
-                // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
-                // there's no mark price source. With EWMA bootstrapped, the market
-                // can run admin-free on trade-derived mark.
-                if oracle::is_hyperp_mode(&config)
-                    && new_authority == Pubkey::default()
-                    && config.mark_ewma_e6 == 0
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                config.oracle_authority = new_authority.to_bytes();
-                // Clear stored price when authority changes — except on Hyperp
-                // where authority_price_e6 is the mark price.
-                if !oracle::is_hyperp_mode(&config) {
-                    config.authority_price_e6 = 0;
-                    config.authority_timestamp = 0;
-                }
-                state::write_config(&mut data, &config);
+                handle_set_oracle_authority(program_id, accounts, new_authority)?;
             }
 
             Instruction::PushOraclePrice {
                 price_e6,
                 timestamp,
             } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_authority = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_authority)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                // Hyperp: flush index WITHOUT staleness check.
-                // PushOraclePrice is the recovery path for stale marks —
-                // it must not be blocked by the very staleness it's meant to fix.
-                if is_hyperp {
-                    let push_clock = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = push_clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
-                        );
-                        config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = push_clock.slot;
-                    }
-                    state::write_config(&mut data, &config);
-                    config = state::read_config(&data);
-                }
-                if config.oracle_authority == [0u8; 32] {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-                if config.oracle_authority != a_authority.key.to_bytes() {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                // Validate price (must be positive)
-                if price_e6 == 0 {
-                    return Err(PercolatorError::OracleInvalid.into());
-                }
-
-                // Normalize to engine-space (invert + scale) for ALL markets.
-                // Authority prices must be in the same price space as
-                // Pyth/Chainlink-derived prices (which go through
-                // read_engine_price_e6 → invert → scale).
-                let normalized_price = crate::verify::to_engine_price(
-                    price_e6, config.invert, config.unit_scale,
-                ).ok_or(PercolatorError::OracleInvalid)?;
-
-                // Enforce MAX_ORACLE_PRICE at ingress (engine rejects > MAX internally)
-                if normalized_price > percolator::MAX_ORACLE_PRICE {
-                    return Err(PercolatorError::OracleInvalid.into());
-                }
-
-                // For non-Hyperp markets, require strictly increasing timestamps
-                // anchored to the current clock. This prevents the admin from
-                // walking last_effective_price_e6 in a single burst (each push
-                // must use a later timestamp, and the timestamp must not exceed
-                // the current unix_timestamp from the clock sysvar).
-                if !is_hyperp {
-                    let push_clock = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    // Strict monotonicity: reject equal timestamps
-                    if config.authority_timestamp != 0
-                        && timestamp <= config.authority_timestamp
-                    {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                    // Clock anchoring: timestamp must not be in the future
-                    if timestamp > push_clock.unix_timestamp {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-
-                // Clamp against circuit breaker.
-                // Hyperp: clamp against INDEX (last_effective_price_e6), not
-                //   previous mark. This bounds the mark-index gap to one
-                //   cap-width regardless of how many same-slot pushes occur.
-                //   The index only moves per-slot via clamp_toward_with_dt.
-                // Non-Hyperp: clamp against last_effective_price_e6 baseline.
-                // Accrue to boundary using engine's already-stored rate.
-                // Do NOT overwrite funding_rate_bps_per_slot_last before accrual.
-                if is_hyperp {
-                    let push_clock2 = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        push_clock2.slot, config.last_effective_price_e6,
-                    ).map_err(map_risk_error)?;
-                }
-
-                let clamp_base = config.last_effective_price_e6;
-                let clamped = oracle::clamp_oracle_price(
-                    clamp_base,
-                    normalized_price,
-                    config.oracle_price_cap_e2bps,
-                );
-                config.authority_price_e6 = clamped;
-                if is_hyperp {
-                    let push_clock = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    config.last_mark_push_slot = push_clock.slot as u128;
-                    // Admin push feeds through EWMA like trades do.
-                    // Direct overwrite was removed — it would let a single push
-                    // reset the trade-derived EWMA, defeating smoothing.
-                    // Admin push always gets full weight (pass min_fee as fee_paid)
-                    config.mark_ewma_e6 = crate::verify::ewma_update(
-                        config.mark_ewma_e6, clamped,
-                        config.mark_ewma_halflife_slots,
-                        config.mark_ewma_last_slot, push_clock.slot,
-                        config.mark_min_fee, config.mark_min_fee,
-                    );
-                    config.mark_ewma_last_slot = push_clock.slot;
-                } else {
-                    config.authority_timestamp = timestamp;
-                    // Do NOT write last_effective_price_e6 here.
-                    // That baseline must only be set by external oracle reads
-                    // (crank/trade/withdraw) so admin can't poison it to bypass
-                    // the settlement circuit breaker in ResolveMarket.
-                }
-                // Run end-of-instruction lifecycle (§5.7-5.8) after accrue_market_to.
-                // This finalizes any pending DrainOnly→ResetPending→Normal transitions
-                // triggered by the accrual. Without this, sides could stay DrainOnly
-                // with OI=0 until the next standard-lifecycle instruction.
-                if is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(
-                        &mut ctx,
-                        compute_current_funding_rate(&config),
-                    ) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-                    }
-                }
-                state::write_config(&mut data, &config);
+                handle_push_oracle_price(program_id, accounts, price_e6, timestamp)?;
             }
 
             Instruction::SetOraclePriceCap { max_change_e2bps } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_clock = &accounts[2];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                let mut config = state::read_config(&data);
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-
-                // Flush Hyperp index WITHOUT staleness check (admin path)
-                if is_hyperp {
-                    let clock = Clock::from_account_info(a_clock)?;
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
-                        );
-                        config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
-                    }
-                    state::write_config(&mut data, &config);
-                    config = state::read_config(&data);
-                    // Accrue to boundary using engine's already-stored rate.
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot, config.last_effective_price_e6,
-                    ).map_err(map_risk_error)?;
-                }
-
-                // Hyperp markets must not set cap to 0 — it would freeze index
-                // smoothing (clamp_toward_with_dt returns mark unchanged when cap==0).
-                if is_hyperp && max_change_e2bps == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                // Non-zero cap must be >= per-market floor.
-                if max_change_e2bps != 0
-                    && max_change_e2bps < config.min_oracle_price_cap_e2bps
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                // Non-Hyperp: cap=0 disables clamping, but if the immutable
-                // floor is set, disabling clamping would let PushOraclePrice
-                // walk last_effective_price_e6 arbitrarily, poisoning the
-                // baseline that ResolveMarket checks against. Reject cap=0
-                // when the floor is non-zero.
-                if !is_hyperp
-                    && max_change_e2bps == 0
-                    && config.min_oracle_price_cap_e2bps != 0
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                // Hard ceiling: cap above 100% makes the circuit breaker vacuous
-                if max_change_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                config.oracle_price_cap_e2bps = max_change_e2bps;
-                // Run end-of-instruction lifecycle after accrue + cap change.
-                if is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(
-                        &mut ctx,
-                        compute_current_funding_rate(&config),
-                    ) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-                    }
-                }
-                state::write_config(&mut data, &config);
+                handle_set_oracle_price_cap(program_id, accounts, max_change_e2bps)?;
             }
 
             Instruction::ResolveMarket => {
-                // Resolve market: snapshot resolution slot, set RESOLVED flag.
-                accounts::expect_len(accounts, 4)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_clock = &accounts[2];
-                let a_oracle = &accounts[3];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // Can't re-resolve
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                // Require admin oracle price to be set (authority_price_e6 > 0)
-                let config = state::read_config(&data);
-                if config.authority_price_e6 == 0 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                // Non-Hyperp: require the settlement push to be fresh.
-                // Prevents parking an old price in state and resolving later.
-                if !oracle::is_hyperp_mode(&config) {
-                    let clock_fresh = Clock::from_account_info(a_clock)?;
-                    let push_age = clock_fresh.unix_timestamp
-                        .saturating_sub(config.authority_timestamp);
-                    if push_age < 0 || push_age as u64 > config.max_staleness_secs {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-                // Non-Hyperp: settlement price must be within circuit-breaker
-                // bounds of a FRESH external oracle read. Uses the live
-                // oracle_price_cap_e2bps (not just the immutable floor) so markets
-                // with min_cap=0 but live cap>0 still get the settlement guard.
-                // Hyperp: admin IS the price source, no external baseline.
-                // If the oracle is stale/dead, skip the guard — the admin must
-                // be able to resolve even when the oracle has died (prevents deadlock
-                // on markets with nonzero cap floor + dead oracle).
-                if !oracle::is_hyperp_mode(&config)
-                    && config.oracle_price_cap_e2bps != 0
-                {
-                    let clock_tmp = Clock::from_account_info(a_clock)?;
-                    let oracle_result = oracle::read_engine_price_e6(
-                        a_oracle,
-                        &config.index_feed_id,
-                        clock_tmp.unix_timestamp,
-                        config.max_staleness_secs,
-                        config.conf_filter_bps,
-                        config.invert,
-                        config.unit_scale,
-                    );
-                    match oracle_result {
-                        Ok(fresh_oracle) => {
-                            // Oracle is live — enforce settlement guard
-                            let clamped = oracle::clamp_oracle_price(
-                                fresh_oracle,
-                                config.authority_price_e6,
-                                config.oracle_price_cap_e2bps,
-                            );
-                            if clamped != config.authority_price_e6 {
-                                return Err(PercolatorError::OracleInvalid.into());
-                            }
-                        }
-                        Err(e) => {
-                            // Only skip guard if oracle is genuinely stale/dead.
-                            // Other errors (wrong account, bad data, wrong feed) must
-                            // propagate — otherwise admin can bypass guard by passing
-                            // a broken oracle account.
-                            let stale_err: ProgramError = PercolatorError::OracleStale.into();
-                            if e != stale_err {
-                                return Err(e);
-                            }
-                            // OracleStale = oracle is dead, allow admin to resolve
-                        }
-                    }
-                }
-
-                let clock = Clock::from_account_info(a_clock)?;
-                let mut config = config;
-
-                // Accrue engine to settlement price BEFORE entering resolved mode.
-                // This crystallizes all account states at the settlement price so
-                // force_close_resolved (which takes no price parameter) uses
-                // consistent post-accrual state.
-                if !oracle::is_hyperp_mode(&config) {
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot, config.authority_price_e6,
-                    ).map_err(map_risk_error)?;
-                }
-
-                // Flush Hyperp index to resolution slot WITHOUT staleness check.
-                // Admin must be able to resolve even if mark is stale.
-                if oracle::is_hyperp_mode(&config) {
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
-                        );
-                        config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
-                    }
-                    state::write_config(&mut data, &config);
-                    // Accrue to resolution boundary at the settlement mark price
-                    // (authority_price_e6), NOT the smoothed index. force_close_resolved
-                    // uses K coefficients that must reflect the declared settlement price.
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot, config.authority_price_e6,
-                    ).map_err(map_risk_error)?;
-                    config = state::read_config(&data);
-                }
-
-                config.resolution_slot = clock.slot;
-                state::write_config(&mut data, &config);
-                state::set_resolved(&mut data);
+                handle_resolve_market(program_id, accounts)?;
             }
 
             Instruction::WithdrawInsurance => {
-                // Withdraw insurance fund (admin only, requires RESOLVED and all positions closed)
-                accounts::expect_len(accounts, 6)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_admin_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_vault_pda = &accounts[5];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // Must be resolved
-                if !state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
-                accounts::expect_key(a_vault_pda, &auth)?;
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                // Require all accounts to be fully closed (not just effective_pos_q==0,
-                // which returns 0 for epoch-mismatched stale positions).
-                // Any used account means unsettled state may remain.
-                if engine.num_used_accounts != 0 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                // Get insurance balance and convert to base tokens
-                let insurance_units = engine.insurance_fund.balance.get();
-                if insurance_units == 0 {
-                    return Ok(()); // Nothing to withdraw
-                }
-
-                // Reject if balance exceeds u64 — silent truncation would
-                // zero the engine balance but only pay out a capped amount.
-                let units_u64: u64 = insurance_units
-                    .try_into()
-                    .map_err(|_| PercolatorError::EngineOverflow)?;
-                let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                // Zero out insurance fund and decrement engine.vault
-                engine.insurance_fund.balance = percolator::U128::ZERO;
-                let ins = percolator::U128::new(insurance_units);
-                if ins > engine.vault {
-                    return Err(PercolatorError::EngineInsufficientBalance.into());
-                }
-                engine.vault = engine.vault - ins;
-
-                // Transfer from vault to admin
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_admin_ata,
-                    a_vault_pda,
-                    base_amount,
-                    &signer_seeds,
-                )?;
+                handle_withdraw_insurance(program_id, accounts)?;
             }
 
             Instruction::SetInsuranceWithdrawPolicy {
@@ -7621,815 +5299,43 @@ pub mod processor {
                 max_withdraw_bps,
                 cooldown_slots,
             } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Policy writes oracle/index fields. Only safe when all accounts
-                // are closed — prevents corrupting Hyperp settlement math.
-                if !state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                {
-                    let engine = zc::engine_ref(&data)?;
-                    if engine.num_used_accounts != 0 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                }
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                if min_withdraw_base == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                if max_withdraw_bps == 0 || max_withdraw_bps > 10_000 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                let mut config = state::read_config(&data);
-                if config.unit_scale != 0 && min_withdraw_base % (config.unit_scale as u64) != 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                let packed = pack_ins_withdraw_meta(
-                    max_withdraw_bps,
-                    crate::INS_WITHDRAW_LAST_SLOT_NONE,
-                )
-                    .ok_or(PercolatorError::InvalidConfigParam)?;
-
-                // Reuse these fields in resolved mode for policy state.
-                config.oracle_authority = authority.to_bytes();
-                config.last_effective_price_e6 = min_withdraw_base;
-                config.oracle_price_cap_e2bps = cooldown_slots;
-                config.authority_timestamp = packed;
-                state::write_config(&mut data, &config);
-                // Set explicit flag so WithdrawInsuranceLimited can distinguish
-                // real policy from oracle timestamp bit patterns.
-                state::set_policy_configured(&mut data);
+                handle_set_insurance_withdraw_policy(program_id, accounts, authority, min_withdraw_base, max_withdraw_bps, cooldown_slots)?;
             }
 
             Instruction::WithdrawInsuranceLimited { amount } => {
-                // Limited insurance withdraw (configured authority + min/max/cooldown checks)
-                accounts::expect_len(accounts, 7)?;
-                let a_authority = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_authority_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_vault_pda = &accounts[5];
-                let a_clock = &accounts[6];
-
-                accounts::expect_signer(a_authority)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let resolved = state::is_resolved(&data);
-                let header = state::read_header(&data);
-                let mut config = state::read_config(&data);
-
-                // If immutable insurance_withdraw_max_bps == 0, live-market
-                // withdrawals are disabled. Only resolved markets can withdraw.
-                if config.insurance_withdraw_max_bps == 0 && !resolved {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Use explicit flag to determine if SetInsuranceWithdrawPolicy was called.
-                // Previously inferred from authority_timestamp bit patterns, which an
-                // oracle authority could forge via crafted PushOraclePrice timestamps.
-                let configured = state::is_policy_configured(&data);
-                // Defensive: configured flag should only be set on resolved markets
-                // (SetInsuranceWithdrawPolicy is gated on is_resolved). If this
-                // invariant is ever broken, reject rather than use repurposed fields.
-                if configured && !resolved {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let (stored_bps, stored_last_slot) = if configured {
-                    unpack_ins_withdraw_meta(config.authority_timestamp)
-                } else {
-                    (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
-                };
-                let policy_authority = if configured {
-                    config.oracle_authority
-                } else {
-                    header.admin
-                };
-                let policy_min_base = if configured {
-                    config.last_effective_price_e6
-                } else {
-                    // Default floor should represent at least one withdrawable unit.
-                    // On scaled markets (unit_scale > 1), base amounts must be aligned
-                    // to unit_scale, so a base-min of 1 would otherwise collapse to 0 units.
-                    core::cmp::max(DEFAULT_INSURANCE_WITHDRAW_MIN_BASE, config.unit_scale as u64)
-                };
-                let policy_max_bps = if configured {
-                    stored_bps
-                } else if config.insurance_withdraw_max_bps > 0 {
-                    // Use immutable config value (live or resolved unconfigured)
-                    config.insurance_withdraw_max_bps
-                } else {
-                    DEFAULT_INSURANCE_WITHDRAW_MAX_BPS
-                };
-                let policy_cooldown = if configured {
-                    config.oracle_price_cap_e2bps
-                } else {
-                    DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS
-                };
-                let last_withdraw_slot = if configured {
-                    stored_last_slot
-                } else if config.last_insurance_withdraw_slot > 0 {
-                    // Unconfigured: always use dedicated config field (live or resolved)
-                    config.last_insurance_withdraw_slot
-                } else {
-                    crate::INS_WITHDRAW_LAST_SLOT_NONE
-                };
-
-                if policy_min_base == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                if policy_authority != a_authority.key.to_bytes() {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-                if config.unit_scale != 0 && amount % (config.unit_scale as u64) != 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // On live markets, use config cooldown directly (not max with defaults).
-                // On resolved markets, use stricter of policy and config.
-                let effective_cooldown = if !resolved && config.insurance_withdraw_cooldown_slots > 0 {
-                    config.insurance_withdraw_cooldown_slots
-                } else if config.insurance_withdraw_cooldown_slots > 0 {
-                    core::cmp::max(policy_cooldown, config.insurance_withdraw_cooldown_slots)
-                } else {
-                    policy_cooldown
-                };
-                if last_withdraw_slot != crate::INS_WITHDRAW_LAST_SLOT_NONE
-                    && clock.slot < last_withdraw_slot.saturating_add(effective_cooldown)
-                {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_authority_ata, a_authority.key, &mint)?;
-                accounts::expect_key(a_vault_pda, &auth)?;
-
-                let (units_u64, _) = crate::units::base_to_units(amount, config.unit_scale);
-                let units_requested = units_u64 as u128;
-                if units_requested == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                let (policy_min_units_u64, _) =
-                    crate::units::base_to_units(policy_min_base, config.unit_scale);
-                let policy_min_units = policy_min_units_u64 as u128;
-
-                // `resolved` already computed above
-                {
-                    let engine = zc::engine_mut(&mut data)?;
-                    if resolved {
-                        // Require all accounts fully closed, not just effective_pos_q==0
-                        // (which returns 0 for epoch-mismatched stale positions).
-                        if engine.num_used_accounts != 0 {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                    }
-
-                    // On live markets, require a recent crank so that latent
-                    // losses are reflected in insurance_fund.balance before
-                    // allowing withdrawal. Without this, unsettled losses
-                    // could make the stored balance overstated.
-                    if !resolved {
-                        let staleness = clock.slot.saturating_sub(engine.last_crank_slot);
-                        if staleness > engine.max_crank_staleness_slots {
-                            return Err(PercolatorError::OracleStale.into());
-                        }
-                    }
-
-                    let insurance_units = engine.insurance_fund.balance.get();
-                    if insurance_units == 0 {
-                        return Ok(());
-                    }
-                    if units_requested > insurance_units {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-
-                    // On live markets, cannot withdraw below insurance_floor
-                    if !resolved {
-                        let floor = engine.params.insurance_floor.get();
-                        let post_balance = insurance_units.saturating_sub(units_requested);
-                        if post_balance < floor {
-                            return Err(PercolatorError::EngineInsufficientBalance.into());
-                        }
-                    }
-
-                    // On live markets, policy_max_bps already IS the config value.
-                    // On resolved markets, cap to the stricter of policy and config.
-                    let effective_max_bps = if resolved && config.insurance_withdraw_max_bps > 0 {
-                        core::cmp::min(policy_max_bps, config.insurance_withdraw_max_bps)
-                    } else {
-                        policy_max_bps
-                    };
-
-                    let pct_limited_units =
-                        insurance_units.saturating_mul(effective_max_bps as u128) / 10_000u128;
-                    let max_allowed_units = core::cmp::max(pct_limited_units, policy_min_units);
-                    if units_requested > max_allowed_units {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-
-                    // effective_cooldown already computed and enforced above
-
-                    let req = percolator::U128::new(units_requested);
-                    if req > engine.vault {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-                    engine.insurance_fund.balance = engine.insurance_fund.balance - req;
-                    engine.vault = engine.vault - req;
-                }
-
-                // Persist cooldown slot.
-                if configured {
-                    // Configured policy: pack slot into authority_timestamp
-                    let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                    config.oracle_authority = policy_authority;
-                    config.last_effective_price_e6 = policy_min_base;
-                    config.oracle_price_cap_e2bps = policy_cooldown;
-                    config.authority_timestamp = packed;
-                } else {
-                    // Unconfigured (default): use dedicated field for cooldown
-                    config.last_insurance_withdraw_slot = clock.slot;
-                }
-                state::write_config(&mut data, &config);
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_authority_ata,
-                    a_vault_pda,
-                    amount,
-                    &signer_seeds,
-                )?;
+                handle_withdraw_insurance_limited(program_id, accounts, amount)?;
             }
 
             Instruction::AdminForceCloseAccount { user_idx } => {
-                // Admin force-close an abandoned account after market resolution.
-                // Settles PnL (with haircut for positive), forgives fee debt,
-                // then delegates to engine.close_account_not_atomic() for the rest.
-                accounts::expect_len(accounts, 8)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_vault = &accounts[2];
-                let a_owner_ata = &accounts[3];
-                let a_pda = &accounts[4];
-                let a_token = &accounts[5];
-                let _a_oracle = &accounts[7];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // Must be resolved
-                if !state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                accounts::expect_key(a_pda, &auth)?;
-
-                let _clock = Clock::from_account_info(&accounts[6])?;
-                // Resolved markets use fixed settlement price.
-                let price = config.authority_price_e6;
-                if price == 0 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, user_idx)?;
-
-                // Read account owner pubkey and verify owner ATA
-                let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
-                verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
-
-                let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
-                    .map_err(map_risk_error)?;
-                let amt_units_u64: u64 = amt_units
-                    .try_into()
-                    .map_err(|_| PercolatorError::EngineOverflow)?;
-
-                let base_to_pay =
-                    crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_owner_ata,
-                    a_pda,
-                    base_to_pay,
-                    &signer_seeds,
-                )?;
+                handle_admin_force_close_account(program_id, accounts, user_idx)?;
             }
 
             Instruction::QueryLpFees { lp_idx } => {
-                // §2.2: Read-only query of LP cumulative fees. No state mutation.
-                accounts::expect_len(accounts, 1)?;
-                let a_slab = &accounts[0];
-
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let engine = zc::engine_ref(&data)?;
-                check_idx(engine, lp_idx)?;
-                if !engine.accounts[lp_idx as usize].is_lp() {
-                    return Err(PercolatorError::EngineNotAnLPAccount.into());
-                }
-
-                let fees = engine.accounts[lp_idx as usize].fees_earned_total.get();
-                solana_program::program::set_return_data(&fees.to_le_bytes());
+                handle_query_lp_fees(program_id, accounts, lp_idx)?;
             }
 
             Instruction::ReclaimEmptyAccount { user_idx } => {
-                // Permissionless account reclamation (spec §2.6, §10.7).
-                // Recycles flat/dust accounts without touching side state.
-                accounts::expect_len(accounts, 2)?;
-                let a_slab = &accounts[0];
-                let _a_clock = &accounts[1];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block on resolved markets — unsettled PnL from resolution
-                // may not yet be reflected in capital. Reclaiming before
-                // touch_account_full would forfeit claimable value.
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let clock = Clock::from_account_info(_a_clock)?;
-                let engine = zc::engine_mut(&mut data)?;
-                engine.reclaim_empty_account_not_atomic(user_idx, clock.slot)
-                    .map_err(map_risk_error)?;
-                // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
+                handle_reclaim_empty_account(program_id, accounts, user_idx)?;
             }
 
             Instruction::SettleAccount { user_idx } => {
-                // Standalone account settlement (§10.2). Permissionless.
-                accounts::expect_len(accounts, 3)?;
-                let a_slab = &accounts[0];
-                let a_clock = &accounts[1];
-                let a_oracle = &accounts[2];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-                let clock = Clock::from_account_info(a_clock)?;
-
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_oracle,
-                    )?
-                } else {
-                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
-                };
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-                engine.settle_account_not_atomic(user_idx, price, clock.slot,
-                    compute_current_funding_rate(&config))
-                    .map_err(map_risk_error)?;
+                handle_settle_account(program_id, accounts, user_idx)?;
             }
 
             Instruction::DepositFeeCredits { user_idx, amount } => {
-                // Direct fee-debt repayment (§10.3.1). Owner only.
-                // SECURITY: Read fee debt BEFORE the SPL transfer to reject
-                // overpayment. Without this, excess tokens become stranded
-                // vault surplus with no withdrawal path for the user.
-                accounts::expect_len(accounts, 6)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                // Phase 1: Read fee debt and validate (immutable borrow)
-                // Also verify vault BEFORE the SPL transfer.
-                let (unit_scale, debt_units) = {
-                    let data = a_slab.try_borrow_data()?;
-                    slab_guard(program_id, a_slab, &data)?;
-                    require_initialized(&data)?;
-                    if state::is_resolved(&data) {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    let cfg = state::read_config(&data);
-                    let mint = Pubkey::new_from_array(cfg.collateral_mint);
-                    let auth = accounts::derive_vault_authority_with_bump(
-                        program_id, a_slab.key, cfg.vault_authority_bump,
-                    )?;
-                    verify_vault(a_vault, &auth, &mint,
-                        &Pubkey::new_from_array(cfg.vault_pubkey))?;
-                    verify_token_account(a_user_ata, a_user.key, &mint)?;
-                    let engine = zc::engine_ref(&data)?;
-                    check_idx(engine, user_idx)?;
-                    let owner = engine.accounts[user_idx as usize].owner;
-                    if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                        return Err(PercolatorError::EngineUnauthorized.into());
-                    }
-                    let fc = engine.accounts[user_idx as usize].fee_credits.get();
-                    let debt = if fc < 0 { fc.unsigned_abs() } else { 0u128 };
-                    (cfg.unit_scale, debt)
-                };
-                // data (Ref) dropped here — releases immutable borrow
-
-                // Phase 2: Reject zero, misaligned, or overpayment
-                let (units, dust) = crate::units::base_to_units(amount, unit_scale);
-                if units == 0 || dust != 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-                if (units as u128) > debt_units {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Phase 3: SPL transfer (only after validation)
-                collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
-
-                // Phase 4: Engine deposit_fee_credits (mutable borrow)
-                // Vault already verified in Phase 1.
-                let mut data = state::slab_data_mut(a_slab)?;
-                let config = state::read_config(&data);
-                let clock = Clock::from_account_info(a_clock)?;
-                let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
-                // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
-
-                let engine = zc::engine_mut(&mut data)?;
-                engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
-                    .map_err(map_risk_error)?;
+                handle_deposit_fee_credits(program_id, accounts, user_idx, amount)?;
             }
 
             Instruction::ConvertReleasedPnl { user_idx, amount } => {
-                // Voluntary PnL conversion (§10.4.1). Owner only.
-                accounts::expect_len(accounts, 4)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_clock = &accounts[2];
-                let a_oracle = &accounts[3];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-                let clock = Clock::from_account_info(a_clock)?;
-
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_oracle,
-                    )?
-                } else {
-                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
-                };
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-                check_idx(engine, user_idx)?;
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                // Reject misaligned amounts — silent truncation could lose value
-                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
-                if dust != 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-                engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
-                    compute_current_funding_rate(&config))
-                    .map_err(map_risk_error)?;
+                handle_convert_released_pnl(program_id, accounts, user_idx, amount)?;
             }
 
             Instruction::ResolvePermissionless => {
-                // Permissionless resolution when oracle is actually dead.
-                // Anyone can call. Requires oracle account to prove staleness.
-                accounts::expect_len(accounts, 3)?;
-                let a_slab = &accounts[0];
-                let a_clock = &accounts[1];
-                let a_oracle = &accounts[2];
-
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-
-                if config.permissionless_resolve_stale_slots == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Verify oracle is actually stale RIGHT NOW by trying to read it.
-                // Only OracleStale proves the oracle is dead. Other errors
-                // (wrong account, bad data) don't prove staleness — they could
-                // be an attacker passing garbage to fake oracle death.
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                if !is_hyperp {
-                    let oracle_result = oracle::read_engine_price_e6(
-                        a_oracle, &config.index_feed_id,
-                        clock.unix_timestamp, config.max_staleness_secs,
-                        config.conf_filter_bps, config.invert, config.unit_scale,
-                    );
-                    match oracle_result {
-                        Ok(_) => return Err(ProgramError::InvalidAccountData), // live
-                        Err(e) => {
-                            let stale_err: ProgramError = PercolatorError::OracleStale.into();
-                            if e != stale_err {
-                                return Err(e); // wrong account / bad data — propagate
-                            }
-                            // OracleStale = oracle is actually dead → proceed
-                        }
-                    }
-                } else {
-                    // Hyperp: check mark staleness (last trade or push)
-                    let last_update = core::cmp::max(
-                        config.mark_ewma_last_slot,
-                        config.last_mark_push_slot as u64,
-                    );
-                    let staleness = clock.slot.saturating_sub(last_update);
-                    if staleness < config.permissionless_resolve_stale_slots {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-
-                // Block if an oracle authority is configured AND has pushed recently.
-                // If the authority has never pushed (timestamp=0) or their last push
-                // is stale, the authority is effectively dead and permissionless
-                // resolution should proceed. This prevents the deadlock where:
-                // authority set + external oracle dead = no resolution path.
-                if config.oracle_authority != [0u8; 32] && config.authority_timestamp > 0 {
-                    let authority_age_secs = clock.unix_timestamp
-                        .saturating_sub(config.authority_timestamp);
-                    // Authority is "fresh" if push happened within max_staleness_secs
-                    // (the same staleness window as the external oracle feed).
-                    if authority_age_secs >= 0
-                        && (authority_age_secs as u64) < config.max_staleness_secs
-                    {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                }
-
-                // Require oracle/mark has been dead for the configured delay.
-                // Non-Hyperp: use dedicated last_good_oracle_slot, stamped on every
-                //   successful read_price_clamped across all instruction paths.
-                // Hyperp: use max(mark_ewma_last_slot, last_mark_push_slot) — the
-                //   same signal used for the mark staleness check above, so both
-                //   checks use consistent liveness information.
-                {
-                    let reference_slot = if !is_hyperp {
-                        config.last_good_oracle_slot
-                    } else {
-                        core::cmp::max(
-                            config.mark_ewma_last_slot,
-                            config.last_mark_push_slot as u64,
-                        )
-                    };
-                    let oracle_dead_duration = clock.slot.saturating_sub(reference_slot);
-                    if oracle_dead_duration < config.permissionless_resolve_stale_slots {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-
-                // Flush Hyperp index + accrue to boundary (Bug 1+3 fix)
-                if is_hyperp {
-                    let mark = if config.mark_ewma_e6 > 0 {
-                        config.mark_ewma_e6
-                    } else {
-                        config.authority_price_e6
-                    };
-                    let prev_index = config.last_effective_price_e6;
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        // Use clock.slot (not engine.last_crank_slot) to avoid
-                        // monotonicity failure when current_slot > last_crank_slot
-                        // from trades/withdrawals after the last crank.
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1), mark,
-                            config.oracle_price_cap_e2bps, dt,
-                        );
-                        config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
-                    }
-                    state::write_config(&mut data, &config);
-                    // Accrue at the mark (settlement price), not the smoothed index.
-                    // force_close_resolved uses K coefficients that must reflect mark.
-                    let settle_price = mark.max(1);
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot,
-                        settle_price,
-                    ).map_err(map_risk_error)?;
-                    config = state::read_config(&data);
-                }
-
-                // Settlement price = last oracle price from engine.
-                // Reject only if completely uninitialized (p == 0).
-                // The non-Hyperp init sentinel (p=1) is harmless: if no one ever
-                // traded or cranked, there are no positions to settle. If anyone
-                // did interact, accrue_market_to updated last_oracle_price to the
-                // real price. The sentinel cannot cause incorrect settlement because:
-                // - All resolve paths require crank staleness (no recent activity)
-                // - If the market had activity, last_oracle_price reflects it
-                // - Resolution at p=1 on an empty market is a no-op
-                let last_price = {
-                    let engine = zc::engine_ref(&data)?;
-                    let p = engine.last_oracle_price;
-                    if p == 0 {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                    p
-                };
-
-                // Accrue engine to settlement price before entering resolved mode.
-                // Hyperp already accrued above; non-Hyperp accrues here.
-                if !is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(clock.slot, last_price)
-                        .map_err(map_risk_error)?;
-                }
-
-                // Use clock.slot (not engine.last_crank_slot) — other instructions
-                // advance current_slot past last_crank_slot, so using the stale
-                // crank slot would make resolved touch paths fail monotonic checks.
-                config.resolution_slot = clock.slot;
-                config.authority_price_e6 = last_price;
-                state::write_config(&mut data, &config);
-                state::set_resolved(&mut data);
+                handle_resolve_permissionless(program_id, accounts)?;
             }
 
             Instruction::ForceCloseResolved { user_idx } => {
-                // Permissionless force-close for resolved markets.
-                // Mirrors AdminForceCloseAccount but requires delay and no admin.
-                accounts::expect_len(accounts, 7)?;
-                let a_slab = &accounts[0];
-                let a_vault = &accounts[1];
-                let a_owner_ata = &accounts[2];
-                let a_pda = &accounts[3];
-                let a_token = &accounts[4];
-                let a_clock = &accounts[5];
-                // accounts[6] = oracle (unused but passed for compatibility)
-
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                if !state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                if config.force_close_delay_slots == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                let clock = Clock::from_account_info(a_clock)?;
-                if clock.slot < config.resolution_slot
-                    .saturating_add(config.force_close_delay_slots)
-                {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                let auth = accounts::derive_vault_authority_with_bump(
-                    program_id, a_slab.key, config.vault_authority_bump,
-                )?;
-                verify_vault(
-                    a_vault, &auth, &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                accounts::expect_key(a_pda, &auth)?;
-
-                let price = config.authority_price_e6;
-                if price == 0 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let engine = zc::engine_mut(&mut data)?;
-                check_idx(engine, user_idx)?;
-
-                let owner_pubkey = Pubkey::new_from_array(
-                    engine.accounts[user_idx as usize].owner,
-                );
-                verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
-
-                let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
-                    .map_err(map_risk_error)?;
-
-                let amt_units_u64: u64 = amt_units
-                    .try_into()
-                    .map_err(|_| PercolatorError::EngineOverflow)?;
-                let base_to_pay =
-                    crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token, a_vault, a_owner_ata, a_pda,
-                    base_to_pay, &signer_seeds,
-                )?;
+                handle_force_close_resolved(program_id, accounts, user_idx)?;
             }
 
             // ─── Fork-specific instruction handlers ────────────────────────
@@ -8438,3287 +5344,154 @@ pub mod processor {
                 fee_share_bps,
                 util_curve_enabled,
             } => {
-                accounts::expect_len(accounts, 8)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_lp_vault_state = &accounts[2];
-                let a_lp_vault_mint = &accounts[3];
-                let a_vault_authority = &accounts[4];
-                let a_system = &accounts[5];
-                let a_token = &accounts[6];
-                let a_rent = &accounts[7];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_lp_vault_state)?;
-                accounts::expect_writable(a_lp_vault_mint)?;
-                verify_token_program(a_token)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                if fee_share_bps > 10_000 {
-                    return Err(PercolatorError::LpVaultInvalidFeeShare.into());
-                }
-
-                let data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-                drop(data);
-
-                #[allow(unused_variables)]
-                let (expected_state, state_bump) =
-                    accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                if a_lp_vault_state.data_len() > 0 {
-                    let state_data = a_lp_vault_state.try_borrow_data()?;
-                    if state_data.len() >= 8 {
-                        let magic = u64::from_le_bytes(state_data[..8].try_into().unwrap());
-                        if magic == crate::lp_vault::LP_VAULT_MAGIC {
-                            return Err(PercolatorError::LpVaultAlreadyExists.into());
-                        }
-                    }
-                    drop(state_data);
-                }
-
-                let (expected_mint, mint_bump) =
-                    accounts::derive_lp_vault_mint(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
-
-                let (auth, _vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                accounts::expect_key(a_vault_authority, &auth)?;
-
-                #[cfg(not(feature = "test"))]
-                {
-                    use solana_program::program::invoke_signed;
-                    use solana_program::sysvar::Sysvar;
-
-                    let space = crate::lp_vault::LP_VAULT_STATE_LEN;
-                    let rent = solana_program::rent::Rent::get()?;
-                    let lamports = rent.minimum_balance(space);
-
-                    let state_seeds: &[&[u8]] = &[b"lp_vault", a_slab.key.as_ref(), &[state_bump]];
-                    let create_ix = solana_program::system_instruction::create_account(
-                        a_admin.key,
-                        a_lp_vault_state.key,
-                        lamports,
-                        space as u64,
-                        program_id,
-                    );
-                    invoke_signed(
-                        &create_ix,
-                        &[a_admin.clone(), a_lp_vault_state.clone(), a_system.clone()],
-                        &[state_seeds],
-                    )?;
-                }
-                #[cfg(feature = "test")]
-                {
-                    let _ = a_system;
-                }
-
-                {
-                    let mut state_data = a_lp_vault_state.try_borrow_mut_data()?;
-                    if state_data.len() < crate::lp_vault::LP_VAULT_STATE_LEN {
-                        return Err(ProgramError::AccountDataTooSmall);
-                    }
-                    let mut vault_state = crate::lp_vault::LpVaultState::new_zeroed();
-                    vault_state.magic = crate::lp_vault::LP_VAULT_MAGIC;
-                    vault_state.fee_share_bps = fee_share_bps;
-                    vault_state.epoch = 1;
-                    vault_state.lp_util_curve_enabled = if util_curve_enabled { 1 } else { 0 };
-                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
-                    vault_state.hwm_floor_bps = 5000;
-                    let slab_data = a_slab.try_borrow_data()?;
-                    let engine = zc::engine_ref(&slab_data)?;
-                    // fee_revenue not in current InsuranceFund layout — snapshot is 0
-                    vault_state.last_fee_snapshot = 0u128;
-                    drop(slab_data);
-                    crate::lp_vault::write_lp_vault_state(&mut state_data, &vault_state);
-                }
-
-                let mint_seeds: &[&[u8]] = &[b"lp_vault_mint", a_slab.key.as_ref(), &[mint_bump]];
-                let decimals = 6u8;
-                crate::insurance_lp::create_mint(
-                    a_admin,
-                    a_lp_vault_mint,
-                    a_vault_authority,
-                    a_system,
-                    a_token,
-                    a_rent,
-                    decimals,
-                    mint_seeds,
-                )?;
-
-                msg!(
-                    "LP vault created: fee_share={}bps util_curve={} slab={}",
-                    fee_share_bps,
-                    util_curve_enabled,
-                    a_slab.key
-                );
+                handle_create_lp_vault(program_id, accounts, fee_share_bps, util_curve_enabled)?;
             }
 
             Instruction::LpVaultDeposit { amount } => {
-                accounts::expect_len(accounts, 9)?;
-                let a_depositor = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_depositor_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_lp_vault_mint = &accounts[5];
-                let a_depositor_lp_ata = &accounts[6];
-                let a_vault_authority = &accounts[7];
-                let a_lp_vault_state = &accounts[8];
-
-                accounts::expect_signer(a_depositor)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_depositor_ata)?;
-                accounts::expect_writable(a_vault)?;
-                accounts::expect_writable(a_lp_vault_mint)?;
-                accounts::expect_writable(a_depositor_lp_ata)?;
-                accounts::expect_writable(a_lp_vault_state)?;
-                verify_token_program(a_token)?;
-
-                if amount == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                let slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-
-                if state::is_resolved(&slab_data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                require_not_paused(&slab_data)?;
-
-                let config = state::read_config(&slab_data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_depositor_ata, a_depositor.key, &mint)?;
-
-                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
-                if a_lp_vault_mint.data_len() == 0 {
-                    return Err(PercolatorError::LpVaultNotCreated.into());
-                }
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                accounts::expect_key(a_vault_authority, &auth)?;
-
-                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
-                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                if !vault_state.is_initialized() {
-                    return Err(PercolatorError::LpVaultNotCreated.into());
-                }
-
-                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
-                let capital_before = vault_state.total_capital;
-
-                drop(slab_data);
-                collateral::deposit(a_token, a_depositor_ata, a_vault, a_depositor, amount)?;
-
-                let slab_data = a_slab.try_borrow_data()?;
-                let config = state::read_config(&slab_data);
-                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
-                drop(slab_data);
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                let old_dust = state::read_dust_base(&slab_data);
-                state::write_dust_base(&mut slab_data, old_dust.saturating_add(dust));
-
-                let lp_tokens_to_mint: u64 = if lp_supply == 0 || capital_before == 0 {
-                    if lp_supply > 0 && capital_before == 0 {
-                        vault_state.epoch = vault_state.epoch.saturating_add(1);
-                    }
-                    units
-                } else {
-                    let numerator = (units as u128)
-                        .checked_mul(lp_supply as u128)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                    let result = numerator / capital_before;
-                    if result > u64::MAX as u128 {
-                        return Err(PercolatorError::EngineOverflow.into());
-                    }
-                    result as u64
-                };
-
-                if lp_tokens_to_mint == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                vault_state.total_capital = vault_state
-                    .total_capital
-                    .checked_add(units as u128)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                if vault_state.hwm_floor_bps > 0
-                    && vault_state.total_capital > vault_state.epoch_high_water_tvl
-                {
-                    vault_state.epoch_high_water_tvl = vault_state.total_capital;
-                }
-
-                let engine = zc::engine_mut(&mut slab_data)?;
-                engine.vault = percolator::U128::new(
-                    engine
-                        .vault
-                        .get()
-                        .checked_add(units as u128)
-                        .ok_or(PercolatorError::EngineOverflow)?,
-                );
-                drop(slab_data);
-
-                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
-                drop(vs_data);
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [vault_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                crate::insurance_lp::mint_to(
-                    a_token,
-                    a_lp_vault_mint,
-                    a_depositor_lp_ata,
-                    a_vault_authority,
-                    lp_tokens_to_mint,
-                    &signer_seeds,
-                )?;
-
-                if accounts.len() >= 10 {
-                    let a_creator_lock = &accounts[9];
-                    let (expected_lock_pda, _) = Pubkey::find_program_address(
-                        &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
-                        program_id,
-                    );
-                    if *a_creator_lock.key == expected_lock_pda && a_creator_lock.is_writable {
-                        if let Ok(mut lock_data) = a_creator_lock.try_borrow_mut_data() {
-                            if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
-                                let creator_key = Pubkey::new_from_array(lock_state.creator);
-                                if *a_depositor.key == creator_key {
-                                    let mut new_lock = *lock_state;
-                                    new_lock.lp_amount_locked =
-                                        new_lock.lp_amount_locked.saturating_add(lp_tokens_to_mint);
-                                    new_lock.cumulative_deposited = new_lock
-                                        .cumulative_deposited
-                                        .saturating_add(lp_tokens_to_mint as u64);
-                                    crate::creator_lock::write_state(&mut lock_data, &new_lock);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                msg!(
-                    "LP vault deposit: {} tokens, {} LP shares minted, epoch={}",
-                    amount,
-                    lp_tokens_to_mint,
-                    vault_state.epoch
-                );
+                handle_lp_vault_deposit(program_id, accounts, amount)?;
             }
 
             Instruction::LpVaultWithdraw { lp_amount } => {
-                accounts::expect_len(accounts, 11)?;
-                let a_withdrawer = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_withdrawer_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_lp_vault_mint = &accounts[5];
-                let a_withdrawer_lp_ata = &accounts[6];
-                let a_vault_authority = &accounts[7];
-                let a_lp_vault_state = &accounts[8];
-
-                accounts::expect_signer(a_withdrawer)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_withdrawer_ata)?;
-                accounts::expect_writable(a_vault)?;
-                accounts::expect_writable(a_lp_vault_mint)?;
-                accounts::expect_writable(a_withdrawer_lp_ata)?;
-                accounts::expect_writable(a_lp_vault_state)?;
-                verify_token_program(a_token)?;
-
-                if lp_amount == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                // accounts[9] = creator_lock_pda (existing)
-                // accounts[10] = withdraw_queue_pda (SECURITY H-6)
-                {
-                    let a_creator_lock = &accounts[9];
-                    let (expected_lock_pda, _) = Pubkey::find_program_address(
-                        &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
-                        program_id,
-                    );
-                    accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
-                    if *a_creator_lock.key == expected_lock_pda {
-                        accounts::expect_writable(a_creator_lock)?;
-                        let mut lock_data = a_creator_lock
-                            .try_borrow_mut_data()
-                            .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                        if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
-                            let creator_key = Pubkey::new_from_array(lock_state.creator);
-                            if *a_withdrawer.key == creator_key {
-                                let clock = solana_program::clock::Clock::get()?;
-                                let expired = crate::creator_lock::is_lock_expired(
-                                    clock.slot,
-                                    lock_state.lock_start_slot,
-                                    lock_state.lock_duration_slots,
-                                );
-                                let max_withdraw = crate::creator_lock::max_withdrawable(
-                                    lp_amount,
-                                    lock_state.lp_amount_locked,
-                                    expired,
-                                );
-                                if lp_amount > max_withdraw {
-                                    msg!(
-                                        "CREATOR_LOCK: withdraw {} > max {}",
-                                        lp_amount,
-                                        max_withdraw
-                                    );
-                                    return Err(ProgramError::InvalidArgument);
-                                }
-                                let mut new_lock = *lock_state;
-                                new_lock.cumulative_extracted = new_lock
-                                    .cumulative_extracted
-                                    .saturating_add(lp_amount);
-                                if crate::creator_lock::check_extraction_exceeded(
-                                    new_lock.cumulative_extracted,
-                                    new_lock.cumulative_deposited,
-                                    crate::creator_lock::EXTRACTION_LIMIT_BPS,
-                                ) {
-                                    new_lock.fee_redirect_active = 1;
-                                    msg!("CREATOR_LOCK: fee redirect activated");
-                                }
-                                crate::creator_lock::write_state(&mut lock_data, &new_lock);
-                            }
-                        }
-                    }
-                }
-
-                // SECURITY(H-6): Block instant withdraw when user has an active
-                // withdrawal queue. Without this, the user can queue LP tokens
-                // and then immediately withdraw the same tokens via LpVaultWithdraw,
-                // creating a double-spend on the queued claim.
-                {
-                    let a_withdraw_queue = &accounts[10];
-                    let (expected_queue, _) =
-                        accounts::derive_withdraw_queue(program_id, a_slab.key, a_withdrawer.key);
-                    accounts::expect_key(a_withdraw_queue, &expected_queue)?;
-                    if a_withdraw_queue.data_len() >= crate::lp_vault::WITHDRAW_QUEUE_LEN {
-                        let q_data = a_withdraw_queue
-                            .try_borrow_data()
-                            .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                        if let Some(queue) = crate::lp_vault::read_withdraw_queue(&q_data) {
-                            if queue.is_initialized() {
-                                let unclaimed =
-                                    queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
-                                if unclaimed > 0 {
-                                    msg!(
-                                        "LpVaultWithdraw blocked: active queue has {} unclaimed LP",
-                                        unclaimed
-                                    );
-                                    return Err(
-                                        PercolatorError::WithdrawQueueAlreadyExists.into()
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-
-                let config = state::read_config(&slab_data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_withdrawer_ata, a_withdrawer.key, &mint)?;
-
-                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                accounts::expect_key(a_vault_authority, &auth)?;
-
-                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
-                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                if !vault_state.is_initialized() {
-                    return Err(PercolatorError::LpVaultNotCreated.into());
-                }
-
-                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
-                let capital = vault_state.total_capital;
-
-                if lp_supply == 0 || capital == 0 {
-                    return Err(PercolatorError::LpVaultSupplyMismatch.into());
-                }
-
-                let numerator = (lp_amount as u128)
-                    .checked_mul(capital)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-                let units_to_return = numerator / (lp_supply as u128);
-
-                if units_to_return == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
-                    let remaining = capital
-                        .checked_sub(units_to_return)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                    let floor = vault_state
-                        .epoch_high_water_tvl
-                        .saturating_mul(vault_state.hwm_floor_bps as u128)
-                        / 10_000;
-                    if remaining < floor {
-                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
-                    }
-                }
-
-                let (oi_multiplier, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
-                if oi_multiplier > 0 {
-                    let remaining_capital = capital.saturating_sub(units_to_return);
-                    let engine = zc::engine_ref(&slab_data)?;
-                    let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
-                    let max_oi_after =
-                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
-                    if current_oi > max_oi_after {
-                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
-                    }
-                }
-
-                let units_u64 = if units_to_return > u64::MAX as u128 {
-                    return Err(PercolatorError::EngineOverflow.into());
-                } else {
-                    units_to_return as u64
-                };
-                let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                vault_state.total_capital = capital
-                    .checked_sub(units_to_return)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                let engine = zc::engine_mut(&mut slab_data)?;
-                engine.vault = percolator::U128::new(
-                    engine
-                        .vault
-                        .get()
-                        .checked_sub(units_to_return)
-                        .ok_or(PercolatorError::EngineOverflow)?,
-                );
-                drop(slab_data);
-
-                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
-                drop(vs_data);
-
-                crate::insurance_lp::burn(
-                    a_token,
-                    a_lp_vault_mint,
-                    a_withdrawer_lp_ata,
-                    a_withdrawer,
-                    lp_amount,
-                )?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [vault_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_withdrawer_ata,
-                    a_vault_authority,
-                    base_amount,
-                    &signer_seeds,
-                )?;
-
-                msg!(
-                    "LP vault withdraw: {} LP burned, {} tokens returned, epoch={}",
-                    lp_amount,
-                    base_amount,
-                    vault_state.epoch
-                );
+                handle_lp_vault_withdraw(program_id, accounts, lp_amount)?;
             }
 
             Instruction::LpVaultCrankFees => {
-                if accounts.len() < 2 {
-                    return Err(ProgramError::NotEnoughAccountKeys);
-                }
-                let a_slab = &accounts[0];
-                let a_lp_vault_state = &accounts[1];
-
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_lp_vault_state)?;
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
-                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                if !vault_state.is_initialized() {
-                    return Err(PercolatorError::LpVaultNotCreated.into());
-                }
-
-                let config = state::read_config(&slab_data);
-
-                let engine = zc::engine_mut(&mut slab_data)?;
-                // fee_revenue not in current InsuranceFund layout — always 0
-                let current_fee_revenue = 0u128;
-                let last_snapshot = vault_state.last_fee_snapshot;
-
-                let fee_delta = current_fee_revenue.saturating_sub(last_snapshot);
-                if fee_delta == 0 {
-                    return Err(PercolatorError::LpVaultNoNewFees.into());
-                }
-
-                let (oi_mult_for_util, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
-                let fee_mult_bps: u64 = if vault_state.lp_util_curve_enabled != 0
-                    && oi_mult_for_util > 0
-                {
-                    let vault_balance = engine.vault.get();
-                    let max_oi = vault_balance.saturating_mul(oi_mult_for_util as u128) / 10_000;
-                    let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
-
-                    let util_bps = crate::verify::compute_util_bps(current_oi, max_oi);
-                    let mult = crate::verify::compute_fee_multiplier_bps(util_bps);
-
-                    vault_state.current_fee_mult_bps = mult as u32;
-                    mult
-                } else {
-                    vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
-                    crate::verify::FEE_MULT_BASE_BPS
-                };
-
-                let lp_portion = fee_delta
-                    .saturating_mul(vault_state.fee_share_bps as u128)
-                    .saturating_mul(fee_mult_bps as u128)
-                    / (10_000u128 * 10_000u128);
-
-                if lp_portion > 0 {
-                    let ins_balance = engine.insurance_fund.balance.get();
-                    let actual_transfer = core::cmp::min(lp_portion, ins_balance);
-
-                    engine.insurance_fund.balance =
-                        percolator::U128::new(ins_balance.saturating_sub(actual_transfer));
-
-                    vault_state.total_capital = vault_state
-                        .total_capital
-                        .checked_add(actual_transfer)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                    vault_state.total_fees_distributed = vault_state
-                        .total_fees_distributed
-                        .checked_add(actual_transfer)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                }
-
-                vault_state.last_fee_snapshot = current_fee_revenue;
-                let clock_slot = if accounts.len() > 2 {
-                    Clock::from_account_info(&accounts[2])?.slot
-                } else {
-                    Clock::get()?.slot
-                };
-                vault_state.last_crank_slot = clock_slot;
-                drop(slab_data);
-
-                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
-
-                msg!(
-                    "LP vault fee crank: delta={} mult={}bps lp_portion={} capital={} slot={}",
-                    fee_delta,
-                    fee_mult_bps,
-                    lp_portion,
-                    vault_state.total_capital,
-                    clock_slot
-                );
+                handle_lp_vault_crank_fees(program_id, accounts)?;
             }
 
             Instruction::FundMarketInsurance { amount } => {
-                accounts::expect_len(accounts, 5)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_admin_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-                verify_token_program(a_token)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let config = state::read_config(&data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
-
-                collateral::deposit(a_token, a_admin_ata, a_vault, a_admin, amount)?;
-
-                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
-                let old_dust = state::read_dust_base(&data);
-                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
-
-                let engine = zc::engine_mut(&mut data)?;
-                // Inline fund_market_insurance: add units to insurance fund balance.
-                engine.insurance_fund.balance = percolator::U128::new(
-                    engine
-                        .insurance_fund
-                        .balance
-                        .get()
-                        .checked_add(units as u128)
-                        .ok_or(PercolatorError::EngineOverflow)?,
-                );
-
-                msg!("PERC-306: funded market insurance with {} units", units);
+                handle_fund_market_insurance(program_id, accounts, amount)?;
             }
 
             Instruction::SetInsuranceIsolation { bps } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                if bps > 10_000 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                // set_insurance_isolation_bps: stub — field not in current layout, log only.
-                let _engine = zc::engine_mut(&mut data)?;
-                // config.insurance_isolation_bps not in current layout — no-op write.
-                msg!("PERC-306: set insurance isolation to {} bps", bps);
+                handle_set_insurance_isolation(program_id, accounts, bps)?;
             }
 
             Instruction::ChallengeSettlement { proposed_price_e6 } => {
-                accounts::expect_len(accounts, 7)?;
-                let a_challenger = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_dispute = &accounts[2];
-                let a_challenger_ata = &accounts[3];
-                let a_vault = &accounts[4];
-                let a_token = &accounts[5];
-                let a_system = &accounts[6];
-
-                accounts::expect_signer(a_challenger)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_dispute)?;
-                accounts::expect_writable(a_challenger_ata)?;
-                accounts::expect_writable(a_vault)?;
-                verify_token_program(a_token)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                if !state::is_resolved(&data) {
-                    return Err(PercolatorError::MarketNotResolved.into());
-                }
-
-                let config = state::read_config(&data);
-                drop(data);
-
-                let dispute_window_slots = state::get_dispute_window_slots(&config);
-                if dispute_window_slots == 0 {
-                    return Err(PercolatorError::DisputeWindowClosed.into());
-                }
-                let clock = Clock::get()?;
-                let resolved_slot = state::get_resolved_slot(&config);
-                let window_end = resolved_slot
-                    .checked_add(dispute_window_slots)
-                    .ok_or(PercolatorError::DisputeWindowClosed)?;
-                if clock.slot > window_end {
-                    return Err(PercolatorError::DisputeWindowClosed.into());
-                }
-
-                let (expected_dispute, dispute_bump) =
-                    accounts::derive_dispute(program_id, a_slab.key);
-                accounts::expect_key(a_dispute, &expected_dispute)?;
-
-                if a_dispute.data_len() > 0 {
-                    let d_data = a_dispute.try_borrow_data()?;
-                    if let Some(existing) = crate::dispute::read_dispute(&d_data) {
-                        if existing.is_initialized() {
-                            return Err(PercolatorError::DisputeAlreadyExists.into());
-                        }
-                    }
-                    drop(d_data);
-                }
-
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                verify_token_account(a_challenger_ata, a_challenger.key, &mint)?;
-
-                let dispute_bond_amount = state::get_dispute_bond_amount(&config);
-                if dispute_bond_amount > 0 {
-                    collateral::deposit(
-                        a_token,
-                        a_challenger_ata,
-                        a_vault,
-                        a_challenger,
-                        dispute_bond_amount,
-                    )?;
-                }
-
-                let dispute_len = crate::dispute::DISPUTE_LEN;
-                let rent = solana_program::rent::Rent::get()?;
-                let lamports = rent.minimum_balance(dispute_len);
-
-                let seed1: &[u8] = b"dispute";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [dispute_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                solana_program::program::invoke_signed(
-                    &solana_program::system_instruction::create_account(
-                        a_challenger.key,
-                        a_dispute.key,
-                        lamports,
-                        dispute_len as u64,
-                        program_id,
-                    ),
-                    &[a_challenger.clone(), a_dispute.clone(), a_system.clone()],
-                    &signer_seeds,
-                )?;
-
-                let dispute = crate::dispute::SettlementDispute {
-                    magic: crate::dispute::DISPUTE_MAGIC,
-                    challenger: a_challenger.key.to_bytes(),
-                    proposed_price_e6,
-                    proof_slot: clock.slot,
-                    bond_amount: dispute_bond_amount,
-                    outcome: 0,
-                    _pad: [0; 7],
-                    dispute_slot: clock.slot,
-                    _reserved: [0; 16],
-                };
-
-                let mut d_data = a_dispute.try_borrow_mut_data()?;
-                crate::dispute::write_dispute(&mut d_data, &dispute);
-
-                let settlement_price_e6 = state::get_settlement_price_e6(&config);
-                msg!(
-                    "PERC-314: Settlement challenged: proposed={} vs settlement={}",
-                    proposed_price_e6,
-                    settlement_price_e6
-                );
+                handle_challenge_settlement(program_id, accounts, proposed_price_e6)?;
             }
 
             Instruction::ResolveDispute { accept } => {
-                accounts::expect_len(accounts, 7)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_dispute = &accounts[2];
-                let a_challenger_ata = &accounts[3];
-                let a_vault = &accounts[4];
-                let a_vault_authority = &accounts[5];
-                let a_token = &accounts[6];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_dispute)?;
-                accounts::expect_writable(a_challenger_ata)?;
-                accounts::expect_writable(a_vault)?;
-                verify_token_program(a_token)?;
-
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                let header = state::read_header(&data);
-                let config = state::read_config(&data);
-                drop(data);
-
-                if !crate::verify::admin_ok(header.admin, a_admin.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                let (expected_dispute, _) = accounts::derive_dispute(program_id, a_slab.key);
-                accounts::expect_key(a_dispute, &expected_dispute)?;
-
-                let mut d_data = a_dispute.try_borrow_mut_data()?;
-                let mut dispute = crate::dispute::read_dispute(&d_data)
-                    .ok_or(PercolatorError::NoActiveDispute)?;
-                if !dispute.is_initialized() || dispute.outcome != 0 {
-                    return Err(PercolatorError::NoActiveDispute.into());
-                }
-
-                if accept != 0 {
-                    dispute.outcome = 1;
-
-                    let mut slab_data = state::slab_data_mut(a_slab)?;
-                    let config_w = state::read_config(&slab_data);
-                    // settlement_price_e6 not in current layout — update is no-op
-                    let _ = dispute.proposed_price_e6;
-                    state::write_config(&mut slab_data, &config_w);
-                    drop(slab_data);
-
-                    if dispute.bond_amount > 0 {
-                        let mint = Pubkey::new_from_array(config.collateral_mint);
-
-                        let challenger_key = Pubkey::new_from_array(dispute.challenger);
-                        verify_token_account(a_challenger_ata, &challenger_key, &mint)?;
-                        let (auth, vault_bump) =
-                            accounts::derive_vault_authority(program_id, a_slab.key);
-                        accounts::expect_key(a_vault_authority, &auth)?;
-                        verify_vault(
-                            a_vault,
-                            &auth,
-                            &mint,
-                            &Pubkey::new_from_array(config.vault_pubkey),
-                        )?;
-
-                        let seed1: &[u8] = b"vault";
-                        let seed2: &[u8] = a_slab.key.as_ref();
-                        let bump_arr: [u8; 1] = [vault_bump];
-                        let seed3: &[u8] = &bump_arr;
-                        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                        collateral::withdraw(
-                            a_token,
-                            a_vault,
-                            a_challenger_ata,
-                            a_vault_authority,
-                            dispute.bond_amount,
-                            &signer_seeds,
-                        )?;
-                    }
-
-                    msg!(
-                        "PERC-314: Dispute accepted — settlement updated to {}",
-                        dispute.proposed_price_e6
-                    );
-                } else {
-                    dispute.outcome = 2;
-                    msg!("PERC-314: Dispute rejected — bond forfeited");
-                }
-
-                crate::dispute::write_dispute(&mut d_data, &dispute);
+                handle_resolve_dispute(program_id, accounts, accept)?;
             }
 
             Instruction::DepositLpCollateral {
                 user_idx,
                 lp_amount,
             } => {
-                accounts::expect_len(accounts, 7)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_lp_ata = &accounts[2];
-                let a_lp_vault_mint = &accounts[3];
-                let a_lp_vault_state = &accounts[4];
-                let a_token = &accounts[5];
-                let a_lp_escrow = &accounts[6];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_user_lp_ata)?;
-                accounts::expect_writable(a_lp_escrow)?;
-                verify_token_program(a_token)?;
-
-                if lp_amount == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-                require_not_paused(&slab_data)?;
-
-                let config = state::read_config(&slab_data);
-                if state::get_lp_collateral_enabled(&config) == 0 {
-                    return Err(PercolatorError::LpCollateralDisabled.into());
-                }
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                let vs_data = a_lp_vault_state.try_borrow_data()?;
-                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                let vault_tvl = vault_state.total_capital;
-                drop(vs_data);
-
-                let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
-
-                // SECURITY(H-2): Validate LP escrow is owned by vault authority PDA
-                // and holds the correct LP vault mint. Without this, an attacker can
-                // pass their own token account as escrow, getting engine collateral
-                // credit while retaining control of the LP tokens.
-                let (vault_auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_token_account(a_lp_escrow, &vault_auth, &expected_mint)?;
-
-                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
-
-                let collateral_units = crate::lp_collateral::lp_token_value(
-                    lp_amount,
-                    vault_tvl,
-                    lp_supply,
-                    state::get_lp_collateral_ltv_bps(&config) as u64,
-                );
-
-                if collateral_units == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                let engine = zc::engine_mut(&mut slab_data)?;
-                check_idx(engine, user_idx)?;
-
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                let clock = Clock::get()?;
-
-                engine
-                    .deposit(user_idx, collateral_units, 0, clock.slot)
-                    .map_err(map_risk_error)?;
-
-                engine.vault = percolator::U128::new(
-                    engine
-                        .vault
-                        .get()
-                        .checked_add(collateral_units)
-                        .ok_or(PercolatorError::EngineOverflow)?,
-                );
-                drop(slab_data);
-
-                collateral::deposit(a_token, a_user_lp_ata, a_lp_escrow, a_user, lp_amount)?;
-
-                msg!(
-                    "PERC-315: Deposited {} LP tokens as {} collateral units (LTV={}bps)",
-                    lp_amount,
-                    collateral_units,
-                    state::get_lp_collateral_ltv_bps(&config) as u64
-                );
+                handle_deposit_lp_collateral(program_id, accounts, user_idx, lp_amount)?;
             }
 
             Instruction::WithdrawLpCollateral {
                 user_idx,
                 lp_amount,
             } => {
-                accounts::expect_len(accounts, 8)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_user_lp_ata = &accounts[2];
-                let a_lp_vault_mint = &accounts[3];
-                let a_lp_vault_state = &accounts[4];
-                let a_token = &accounts[5];
-                let a_lp_escrow = &accounts[6];
-                let a_vault_authority = &accounts[7];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_user_lp_ata)?;
-                accounts::expect_writable(a_lp_escrow)?;
-                verify_token_program(a_token)?;
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-                let config = state::read_config(&slab_data);
-
-                let engine = zc::engine_mut(&mut slab_data)?;
-                check_idx(engine, user_idx)?;
-
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                let pos = engine.accounts[user_idx as usize].position_basis_q;
-                if pos != 0 {
-                    return Err(PercolatorError::LpCollateralPositionOpen.into());
-                }
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                drop(slab_data);
-
-                let vs_data = a_lp_vault_state.try_borrow_data()?;
-                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                let vault_tvl = vault_state.total_capital;
-                drop(vs_data);
-
-                let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
-
-                // SECURITY(H-2): Validate LP escrow on withdrawal too (defense-in-depth).
-                let (vault_auth_check, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_token_account(a_lp_escrow, &vault_auth_check, &expected_mint)?;
-
-                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
-
-                let collateral_units = crate::lp_collateral::lp_token_value(
-                    lp_amount,
-                    vault_tvl,
-                    lp_supply,
-                    state::get_lp_collateral_ltv_bps(&config) as u64,
-                );
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                let engine = zc::engine_mut(&mut slab_data)?;
-
-                let clock = Clock::get()?;
-                engine
-                    .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0)
-                    .map_err(map_risk_error)?;
-
-                engine.vault = percolator::U128::new(
-                    engine
-                        .vault
-                        .get()
-                        .checked_sub(collateral_units)
-                        .ok_or(PercolatorError::EngineOverflow)?,
-                );
-                drop(slab_data);
-
-                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                accounts::expect_key(a_vault_authority, &auth)?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [vault_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_lp_escrow,
-                    a_user_lp_ata,
-                    a_vault_authority,
-                    lp_amount,
-                    &signer_seeds,
-                )?;
-
-                msg!(
-                    "PERC-315: Withdrew {} LP tokens ({} collateral units)",
-                    lp_amount,
-                    collateral_units
-                );
+                handle_withdraw_lp_collateral(program_id, accounts, user_idx, lp_amount)?;
             }
 
             Instruction::QueueWithdrawal { lp_amount } => {
-                accounts::expect_len(accounts, 5)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_lp_vault_state = &accounts[2];
-                let a_queue = &accounts[3];
-                let a_system = &accounts[4];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_queue)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                require_not_paused(&data)?;
-                drop(data);
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                let vs_data = a_lp_vault_state.try_borrow_data()?;
-                let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                if !vault_state.is_initialized() {
-                    return Err(PercolatorError::LpVaultNotCreated.into());
-                }
-                let queue_epochs = if vault_state.queue_epochs == 0 {
-                    5u8
-                } else {
-                    vault_state.queue_epochs
-                };
-                drop(vs_data);
-
-                let (expected_queue, queue_bump) =
-                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
-                accounts::expect_key(a_queue, &expected_queue)?;
-
-                if a_queue.data_len() > 0 {
-                    let q_data = a_queue.try_borrow_data()?;
-                    if let Some(existing) = crate::lp_vault::read_withdraw_queue(&q_data) {
-                        if existing.is_initialized() {
-                            return Err(PercolatorError::WithdrawQueueAlreadyExists.into());
-                        }
-                    }
-                    drop(q_data);
-                }
-
-                if lp_amount == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                let queue_len = crate::lp_vault::WITHDRAW_QUEUE_LEN;
-                let rent = solana_program::rent::Rent::get()?;
-                let lamports = rent.minimum_balance(queue_len);
-
-                let seed1: &[u8] = b"withdraw_queue";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let seed3: &[u8] = a_user.key.as_ref();
-                let bump_arr: [u8; 1] = [queue_bump];
-                let seed4: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 4] = [seed1, seed2, seed3, seed4];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                solana_program::program::invoke_signed(
-                    &solana_program::system_instruction::create_account(
-                        a_user.key,
-                        a_queue.key,
-                        lamports,
-                        queue_len as u64,
-                        program_id,
-                    ),
-                    &[a_user.clone(), a_queue.clone(), a_system.clone()],
-                    &signer_seeds,
-                )?;
-
-                let clock = Clock::get()?;
-                let queue = crate::lp_vault::WithdrawQueue {
-                    magic: crate::lp_vault::WITHDRAW_QUEUE_MAGIC,
-                    queued_lp_amount: lp_amount,
-                    queue_start_slot: clock.slot,
-                    epochs_remaining: queue_epochs,
-                    total_epochs: queue_epochs,
-                    _pad: [0; 6],
-                    claimed_so_far: 0,
-                    last_claim_slot: 0,
-                    _reserved: [0; 16],
-                };
-
-                let mut q_data = a_queue.try_borrow_mut_data()?;
-                crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
-
-                msg!(
-                    "PERC-309: Queued {} LP over {} epochs",
-                    lp_amount,
-                    queue_epochs
-                );
+                handle_queue_withdrawal(program_id, accounts, lp_amount)?;
             }
 
             Instruction::ClaimQueuedWithdrawal => {
-                accounts::expect_len(accounts, 10)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_queue = &accounts[2];
-                let a_lp_vault_mint = &accounts[3];
-                let a_user_lp_ata = &accounts[4];
-                let a_vault = &accounts[5];
-                let a_user_ata = &accounts[6];
-                let a_vault_authority = &accounts[7];
-                let a_token = &accounts[8];
-                let a_lp_vault_state = &accounts[9];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_queue)?;
-                accounts::expect_writable(a_lp_vault_mint)?;
-                accounts::expect_writable(a_user_lp_ata)?;
-                accounts::expect_writable(a_vault)?;
-                accounts::expect_writable(a_user_ata)?;
-                accounts::expect_writable(a_lp_vault_state)?;
-                verify_token_program(a_token)?;
-
-                let (expected_queue, _) =
-                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
-                accounts::expect_key(a_queue, &expected_queue)?;
-
-                let mut q_data = a_queue.try_borrow_mut_data()?;
-                let mut queue = crate::lp_vault::read_withdraw_queue(&q_data)
-                    .ok_or(PercolatorError::WithdrawQueueNotFound)?;
-                if !queue.is_initialized() {
-                    return Err(PercolatorError::WithdrawQueueNotFound.into());
-                }
-
-                // SECURITY(CR-2): Enforce one claim per epoch duration window.
-                // Without this, all epochs are claimable in a single slot because
-                // claimable_this_epoch() uses only the epochs_remaining counter
-                // with no clock check.
-                let clock = Clock::get()?;
-                if queue.last_claim_slot > 0
-                    && clock.slot
-                        < queue
-                            .last_claim_slot
-                            .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS)
-                {
-                    msg!(
-                        "ClaimQueuedWithdrawal: epoch not elapsed (slot={}, next={})",
-                        clock.slot,
-                        queue.last_claim_slot
-                            .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS),
-                    );
-                    return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
-                }
-
-                let claimable = queue.claimable_this_epoch();
-                if claimable == 0 {
-                    return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
-                }
-
-                queue.claimed_so_far = queue.claimed_so_far.saturating_add(claimable);
-                queue.epochs_remaining = queue.epochs_remaining.saturating_sub(1);
-                queue.last_claim_slot = clock.slot;
-                crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
-                drop(q_data);
-
-                let slab_data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-                let config = state::read_config(&slab_data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                drop(slab_data);
-
-                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                accounts::expect_key(a_vault_authority, &auth)?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-
-                let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
-
-                let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
-                accounts::expect_key(a_lp_vault_state, &expected_state)?;
-
-                let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
-                let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
-                    .ok_or(PercolatorError::LpVaultNotCreated)?;
-                if !vault_state.is_initialized() {
-                    return Err(PercolatorError::LpVaultNotCreated.into());
-                }
-
-                let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
-                if lp_supply == 0 || vault_state.total_capital == 0 {
-                    return Err(PercolatorError::LpVaultSupplyMismatch.into());
-                }
-
-                let capital_units = (claimable as u128)
-                    .checked_mul(vault_state.total_capital)
-                    .ok_or(PercolatorError::EngineOverflow)?
-                    / (lp_supply as u128);
-
-                if capital_units == 0 {
-                    return Err(PercolatorError::LpVaultZeroAmount.into());
-                }
-
-                if capital_units > u64::MAX as u128 {
-                    return Err(PercolatorError::EngineOverflow.into());
-                }
-
-                let slab_data = a_slab.try_borrow_data()?;
-                let config = state::read_config(&slab_data);
-                // SECURITY(M-8): use units_to_base_checked (matches LpVaultWithdraw).
-                // The saturating variant silently clamps to u64::MAX on overflow.
-                let base_amount = crate::units::units_to_base_checked(
-                    capital_units as u64,
-                    config.unit_scale,
-                )
-                .ok_or(PercolatorError::EngineOverflow)?;
-
-                if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
-                    let remaining = vault_state
-                        .total_capital
-                        .checked_sub(capital_units)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                    let floor = vault_state
-                        .epoch_high_water_tvl
-                        .saturating_mul(vault_state.hwm_floor_bps as u128)
-                        / 10_000;
-                    if remaining < floor {
-                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
-                    }
-                }
-
-                let (oi_multiplier, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
-                if oi_multiplier > 0 {
-                    let remaining_capital = vault_state
-                        .total_capital
-                        .checked_sub(capital_units)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                    let engine = zc::engine_ref(&slab_data)?;
-                    let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
-                    let max_oi_after =
-                        remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
-                    if current_oi > max_oi_after {
-                        return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
-                    }
-                }
-                drop(slab_data);
-
-                vault_state.total_capital = vault_state
-                    .total_capital
-                    .checked_sub(capital_units)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-                crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
-                drop(vs_data);
-
-                let mut slab_data = state::slab_data_mut(a_slab)?;
-                let engine = zc::engine_mut(&mut slab_data)?;
-                engine.vault = percolator::U128::new(
-                    engine
-                        .vault
-                        .get()
-                        .checked_sub(capital_units)
-                        .ok_or(PercolatorError::EngineOverflow)?,
-                );
-                drop(slab_data);
-
-                crate::insurance_lp::burn(
-                    a_token,
-                    a_lp_vault_mint,
-                    a_user_lp_ata,
-                    a_user,
-                    claimable,
-                )?;
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [vault_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_user_ata,
-                    a_vault_authority,
-                    base_amount,
-                    &signer_seeds,
-                )?;
-
-                msg!(
-                    "PERC-309: Claimed {} LP ({} tokens), {} epochs left",
-                    claimable,
-                    base_amount,
-                    queue.epochs_remaining
-                );
+                handle_claim_queued_withdrawal(program_id, accounts)?;
             }
 
             Instruction::CancelQueuedWithdrawal => {
-                accounts::expect_len(accounts, 3)?;
-                let a_user = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_queue = &accounts[2];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_queue)?;
-
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                drop(data);
-
-                let (expected_queue, _) =
-                    accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
-                accounts::expect_key(a_queue, &expected_queue)?;
-
-                let q_data = a_queue.try_borrow_data()?;
-                let queue = crate::lp_vault::read_withdraw_queue(&q_data)
-                    .ok_or(PercolatorError::WithdrawQueueNotFound)?;
-                if !queue.is_initialized() {
-                    return Err(PercolatorError::WithdrawQueueNotFound.into());
-                }
-                let remaining = queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
-                drop(q_data);
-
-                let mut q_data = a_queue.try_borrow_mut_data()?;
-                q_data.fill(0);
-                drop(q_data);
-
-                let mut queue_lamports = a_queue.try_borrow_mut_lamports()?;
-                let mut user_lamports = a_user.try_borrow_mut_lamports()?;
-                **user_lamports = user_lamports
-                    .checked_add(**queue_lamports)
-                    .ok_or(ProgramError::ArithmeticOverflow)?;
-                **queue_lamports = 0;
-
-                msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
+                handle_cancel_queued_withdrawal(program_id, accounts)?;
             }
 
             Instruction::ExecuteAdl { target_idx } => {
-                accounts::expect_len(accounts, 4)?;
-                let a_keeper = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_oracle = &accounts[3];
-                accounts::expect_signer(a_keeper)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // SECURITY H-1: Block ADL on resolved markets — resolved markets
-                // use ForceCloseResolved at settlement price, not ADL at oracle price.
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                {
-                    let header = state::read_header(&data);
-                    require_admin(header.admin, a_keeper.key)?;
-                }
-
-                let mut config = state::read_config(&data);
-
-                let clock = Clock::from_account_info(&accounts[2])?;
-
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    let idx = config.last_effective_price_e6;
-                    if idx == 0 {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                    {
-                        let eng = zc::engine_ref(&data)?;
-                        oracle::check_hyperp_staleness(
-                            eng.current_slot,
-                            eng.max_crank_staleness_slots,
-                            clock.slot,
-                        )?;
-                    }
-                    idx
-                } else {
-                    oracle::read_price_clamped(
-                        &mut config,
-                        a_oracle,
-                        clock.unix_timestamp,
-                    )?
-                };
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                // H-4: Insurance fund must be fully depleted before ADL activates.
-                let insurance_balance = engine.insurance_fund.balance.get();
-                if insurance_balance != 0 {
-                    msg!(
-                        "ADL: insurance_fund.balance={} — not depleted, ADL rejected",
-                        insurance_balance
-                    );
-                    return Err(PercolatorError::InsuranceFundNotDepleted.into());
-                }
-
-                // SECURITY(H-4): Pre-check — reject ADL when PnL clearly within cap.
-                // The definitive check uses post-touch pnl_pos_tot (see below).
-                let cap = state::get_max_pnl_cap(&config) as u128;
-                {
-                    let pnl_pre = engine.pnl_pos_tot;
-                    if cap > 0 && pnl_pre <= cap {
-                        msg!(
-                            "ADL: pnl_pos_tot={} within cap={} — no deleverage needed",
-                            pnl_pre,
-                            cap
-                        );
-                        return Err(ProgramError::InvalidArgument);
-                    }
-                }
-
-                let funding_rate = compute_current_funding_rate(&config);
-
-                let (closed_abs, final_pnl) = engine
-                    .execute_adl_not_atomic(
-                        target_idx as usize,
-                        clock.slot,
-                        price,
-                        funding_rate,
-                    )
-                    .map_err(map_risk_error)?;
-
-                // SECURITY(H-2): Recompute excess from post-touch pnl_pos_tot for accurate logging.
-                let excess = engine.pnl_pos_tot.saturating_sub(cap);
-
-                let closed_lo = closed_abs as u64;
-                let closed_hi = (closed_abs >> 64) as u64;
-                sol_log_64(0xAD1E_0001, target_idx as u64, price, closed_lo, closed_hi);
-
-                msg!(
-                    "ADL: idx={} closed={} excess={} final_pnl={} insurance=0 pnl_pos_tot_after={}",
-                    target_idx,
-                    closed_abs,
-                    excess,
-                    final_pnl,
-                    engine.pnl_pos_tot
-                );
+                handle_execute_adl(program_id, accounts, target_idx)?;
             }
 
             Instruction::CloseStaleSlabs => {
-                accounts::expect_len(accounts, 2)?;
-                let a_dest = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_dest)?;
-                accounts::expect_writable(a_slab)?;
-
-                if a_slab.owner != program_id {
-                    return Err(ProgramError::IllegalOwner);
-                }
-
-                // SECURITY(H-7): Reject slabs with valid sizes — use CloseSlab for those.
-                // Synchronized with slab_guard's accepted sizes. Previous version had:
-                //   - PRE_118/OLDEST using stale offsets (-16/-24 instead of -48/-56)
-                //   - PRE_DEX_POOL_SLAB_LEN missing entirely
-                //   - V1M2_MEDIUM_TRANSITIONAL missing entirely
-                const PRE_DEX_POOL_SLAB_LEN: usize = SLAB_LEN - 32;
-                const PRE_118_SLAB_LEN: usize = SLAB_LEN - 48;
-                const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56;
-                const PRE_ADL_SLAB_LEN: usize = 1025880;
-                const V1M_SMALL_LEN: usize = 65416;
-                const V1M_MEDIUM_LEN: usize = 257512;
-                const V1M_LARGE_LEN: usize = 1025896;
-                const V1M2_MEDIUM_LEN: usize = 323312;
-                const V1M2_MEDIUM_TRANSITIONAL: usize = 323328;
-                let slab_data = a_slab.try_borrow_data()?;
-                let slab_len = slab_data.len();
-                if slab_len == SLAB_LEN
-                    || slab_len == PRE_DEX_POOL_SLAB_LEN
-                    || slab_len == PRE_118_SLAB_LEN
-                    || slab_len == OLDEST_SLAB_LEN
-                    || slab_len == PRE_ADL_SLAB_LEN
-                    || slab_len == V1M_SMALL_LEN
-                    || slab_len == V1M_MEDIUM_LEN
-                    || slab_len == V1M_LARGE_LEN
-                    || slab_len == V1M2_MEDIUM_LEN
-                    || slab_len == V1M2_MEDIUM_TRANSITIONAL
-                {
-                    return Err(PercolatorError::InvalidSlabLen.into());
-                }
-
-                const ADMIN_OFF: usize = 16;
-                const ADMIN_END: usize = ADMIN_OFF + 32;
-
-                if slab_len < ADMIN_END {
-                    return Err(PercolatorError::NotInitialized.into());
-                }
-
-                let magic = u64::from_le_bytes(
-                    slab_data[0..8]
-                        .try_into()
-                        .map_err(|_| PercolatorError::InvalidMagic)?,
-                );
-                if magic != MAGIC {
-                    return Err(PercolatorError::InvalidMagic.into());
-                }
-
-                let admin_bytes: [u8; 32] = slab_data[ADMIN_OFF..ADMIN_END]
-                    .try_into()
-                    .map_err(|_| PercolatorError::InvalidMagic)?;
-                drop(slab_data);
-
-                require_admin(admin_bytes, a_dest.key)?;
-
-                {
-                    let mut data = a_slab.try_borrow_mut_data()?;
-                    data.fill(0);
-                }
-
-                let slab_lamports = a_slab.lamports();
-                **a_slab.lamports.borrow_mut() = 0;
-                **a_dest.lamports.borrow_mut() = a_dest
-                    .lamports()
-                    .checked_add(slab_lamports)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                msg!(
-                    "CloseStaleSlabs: closed stale slab (size={}) reclaimed {} lamports",
-                    slab_len,
-                    slab_lamports,
-                );
+                handle_close_stale_slabs(program_id, accounts)?;
             }
 
             Instruction::ReclaimSlabRent => {
-                // Two modes:
-                //   Mode A (2 accounts): slab is a signer — anyone with the keypair can reclaim.
-                //   Mode B (3 accounts): admin signs — reclaims orphan slabs without the keypair.
-                //     accounts[2] = slab account (not signer), admin verified from header if magic set.
-                let (a_dest, a_slab) = if accounts.len() >= 3 {
-                    // Mode B: admin reclaim for orphan zero-magic slabs
-                    let a_admin = &accounts[0];
-                    let a_slab = &accounts[1];
-                    let a_dest_override = &accounts[2];
-                    accounts::expect_signer(a_admin)?;
-                    accounts::expect_writable(a_slab)?;
-                    accounts::expect_writable(a_dest_override)?;
-
-                    if a_slab.owner != program_id {
-                        return Err(ProgramError::IllegalOwner);
-                    }
-
-                    // For Mode B, verify slab has NO magic (truly orphaned/uninitialized)
-                    let slab_data = a_slab.try_borrow_data()?;
-                    if slab_data.len() >= 8 {
-                        let magic = u64::from_le_bytes(
-                            slab_data[0..8].try_into()
-                                .map_err(|_| PercolatorError::InvalidMagic)?,
-                        );
-                        if magic == MAGIC {
-                            // Initialized slab — use CloseStaleSlabs or CloseOrphanSlab instead
-                            return Err(PercolatorError::AlreadyInitialized.into());
-                        }
-                    }
-                    drop(slab_data);
-
-                    (a_dest_override, a_slab)
-                } else {
-                    // Mode A: original — slab is signer
-                    accounts::expect_len(accounts, 2)?;
-                    let a_dest = &accounts[0];
-                    let a_slab = &accounts[1];
-
-                    accounts::expect_signer(a_dest)?;
-                    accounts::expect_writable(a_dest)?;
-
-                    accounts::expect_signer(a_slab)?;
-                    accounts::expect_writable(a_slab)?;
-
-                    if a_slab.owner != program_id {
-                        return Err(ProgramError::IllegalOwner);
-                    }
-
-                    let slab_data = a_slab.try_borrow_data()?;
-                    if slab_data.len() >= 8 {
-                        let magic = u64::from_le_bytes(
-                            slab_data[0..8].try_into()
-                                .map_err(|_| PercolatorError::InvalidMagic)?,
-                        );
-                        if magic == MAGIC {
-                            return Err(PercolatorError::AlreadyInitialized.into());
-                        }
-                    }
-                    drop(slab_data);
-
-                    (a_dest, a_slab)
-                };
-
-                if a_dest.key == a_slab.key {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                {
-                    let mut data = a_slab.try_borrow_mut_data()?;
-                    data.fill(0);
-                }
-
-                let slab_lamports = a_slab.lamports();
-                **a_slab.lamports.borrow_mut() = 0;
-                **a_dest.lamports.borrow_mut() = a_dest
-                    .lamports()
-                    .checked_add(slab_lamports)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                msg!(
-                    "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab",
-                    slab_lamports,
-                );
+                handle_reclaim_slab_rent(program_id, accounts)?;
             }
 
             Instruction::TransferOwnershipCpi {
                 user_idx,
                 new_owner,
             } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_caller = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_nft_prog = &accounts[2];
-
-                accounts::expect_signer(a_caller)?;
-                accounts::expect_writable(a_slab)?;
-
-                if a_slab.owner != program_id {
-                    return Err(ProgramError::IllegalOwner);
-                }
-
-                if !a_nft_prog.executable {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-                if *a_nft_prog.owner != solana_program::bpf_loader_upgradeable::id()
-                    && *a_nft_prog.owner != solana_program::bpf_loader::id()
-                    && *a_nft_prog.owner != solana_program::bpf_loader_deprecated::id()
-                {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                let (expected_mint_auth, _) = solana_program::pubkey::Pubkey::find_program_address(
-                    &[b"mint_authority"],
-                    a_nft_prog.key,
-                );
-                if a_caller.key != &expected_mint_auth {
-                    solana_program::msg!(
-                        "TransferPositionOwnership rejected: caller {} is not the expected \
-                         mint_authority PDA {} for NFT program {}",
-                        a_caller.key,
-                        expected_mint_auth,
-                        a_nft_prog.key
-                    );
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // SECURITY(CR-1): Use typed engine accessor instead of hardcoded
-                // byte offsets. The old code had three critical bugs:
-                //   1. Read slab_data[8..10] as max_accounts — actually the version field
-                //   2. Hardcoded ACCT_SIZE=240 — actual Account is 320 bytes on SBF
-                //   3. Hardcoded ACCT_OWNER_OFF=184 — stale after Account struct changes
-                // Fix: use zc::engine_mut() + direct struct field access, matching
-                // every other instruction handler in the codebase.
-                let mut slab_data = a_slab.try_borrow_mut_data()?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-
-                let engine = zc::engine_mut(&mut slab_data)?;
-
-                // Validate user_idx is in range and slot is allocated (bitmap).
-                if (user_idx as usize) >= percolator::MAX_ACCOUNTS
-                    || !engine.is_used(user_idx as usize)
-                {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Write new owner via typed struct — compiler resolves correct
-                // field offset for the target architecture (SBF vs native).
-                engine.accounts[user_idx as usize].owner = new_owner;
-
-                msg!(
-                    "TransferPositionOwnership: idx={}, new_owner={}",
-                    user_idx,
-                    Pubkey::new_from_array(new_owner),
-                );
+                handle_transfer_ownership_cpi(program_id, accounts, user_idx, new_owner)?;
             }
 
             Instruction::AuditCrank => {
-                if accounts.is_empty() {
-                    return Err(ProgramError::NotEnoughAccountKeys);
-                }
-                let a_slab = &accounts[0];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let engine = zc::engine_ref(&data)?;
-
-                let mut sum_capital: i128 = 0;
-                let mut sum_pnl_pos: u128 = 0;
-                let mut sum_oi: u128 = 0;
-                for idx in 0..MAX_ACCOUNTS {
-                    if !engine.is_used(idx) {
-                        continue;
-                    }
-                    let acc = &engine.accounts[idx];
-                    sum_capital = sum_capital.saturating_add(acc.capital.get() as i128);
-                    let pnl = acc.pnl;
-                    if pnl > 0 {
-                        sum_pnl_pos = sum_pnl_pos.saturating_add(pnl as u128);
-                    }
-                    let pos = acc.position_basis_q;
-                    sum_oi = sum_oi.saturating_add(pos.unsigned_abs());
-                }
-
-                let mut violation = false;
-
-                let c_tot = engine.c_tot.get();
-                if sum_capital != c_tot as i128 {
-                    msg!("AUDIT_VIOLATION: capital_mismatch");
-                    sol_log_64(sum_capital as u64, c_tot as u64, 0, 0, 0xAD01);
-                    violation = true;
-                }
-
-                let pnl_pos_tot = engine.pnl_pos_tot;
-                if sum_pnl_pos != pnl_pos_tot {
-                    msg!("AUDIT_VIOLATION: pnl_pos_mismatch");
-                    sol_log_64(sum_pnl_pos as u64, pnl_pos_tot as u64, 0, 0, 0xAD02);
-                    violation = true;
-                }
-
-                let total_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
-                if sum_oi != total_oi {
-                    msg!("AUDIT_VIOLATION: oi_mismatch");
-                    sol_log_64(sum_oi as u64, total_oi as u64, 0, 0, 0xAD03);
-                    violation = true;
-                }
-
-                let vault = engine.vault.get();
-                // isolated_balance not in current InsuranceFund layout — use 0
-                let insurance_balance = engine.insurance_fund.balance.get()
-                    .saturating_add(0u128);
-                let required = (c_tot as u128).saturating_add(insurance_balance);
-                if (vault as u128) < required {
-                    msg!("AUDIT_VIOLATION: solvency");
-                    sol_log_64(vault as u64, required as u64, 0, 0, 0xAD05);
-                    violation = true;
-                }
-
-                const AUDIT_CRANK_COOLDOWN_SLOTS: u64 = 150;
-                let current_slot = Clock::get()?.slot;
-                let mut config = state::read_config(&data);
-                if violation {
-                    let last_pause = state::read_last_audit_pause_slot(&config);
-                    if current_slot.saturating_sub(last_pause) < AUDIT_CRANK_COOLDOWN_SLOTS {
-                        msg!(
-                            "AUDIT_CRANK: violation detected but cooldown active \
-                             (last_pause={} current={} cooldown={})",
-                            last_pause,
-                            current_slot,
-                            AUDIT_CRANK_COOLDOWN_SLOTS,
-                        );
-                        return Err(PercolatorError::AuditViolation.into());
-                    }
-                    state::write_audit_status(&mut config, 0xFFFF);
-                    state::write_last_audit_pause_slot(&mut config, current_slot);
-                    state::set_paused(&mut data, true);
-                    state::write_config(&mut data, &config);
-                    msg!("AUDIT_CRANK: VIOLATION DETECTED — market paused");
-                    return Err(PercolatorError::AuditViolation.into());
-                } else {
-                    state::write_audit_status(&mut config, 1);
-                    state::write_config(&mut data, &config);
-                    msg!("AUDIT_CRANK: all invariants passed");
-                }
+                handle_audit_crank(program_id, accounts)?;
             }
 
             Instruction::SetOffsetPair { offset_bps } => {
-                accounts::expect_len(accounts, 5)?;
-                let a_admin = &accounts[0];
-                let a_slab_a = &accounts[1];
-                let a_slab_b = &accounts[2];
-                let a_pair_pda = &accounts[3];
-                let a_system = &accounts[4];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_admin)?;
-                accounts::expect_writable(a_pair_pda)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                accounts::expect_owner(a_slab_a, program_id)?;
-                {
-                    let data_a = a_slab_a.try_borrow_data()?;
-                    if data_a.len() < HEADER_LEN {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    let header = state::read_header(&data_a);
-                    if header.magic != MAGIC {
-                        return Err(PercolatorError::InvalidMagic.into());
-                    }
-                    require_admin(header.admin, a_admin.key)?;
-                }
-
-                accounts::expect_owner(a_slab_b, program_id)?;
-                {
-                    let data_b = a_slab_b.try_borrow_data()?;
-                    if data_b.len() < HEADER_LEN {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    let header_b = state::read_header(&data_b);
-                    if header_b.magic != MAGIC {
-                        return Err(PercolatorError::InvalidMagic.into());
-                    }
-                    require_admin(header_b.admin, a_admin.key)?;
-                }
-
-                let (slab_min_pair, slab_max_pair) =
-                    if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                        (a_slab_a.key, a_slab_b.key)
-                    } else {
-                        (a_slab_b.key, a_slab_a.key)
-                    };
-                let (expected_pda, pair_bump) = Pubkey::find_program_address(
-                    &[b"cmor_pair", slab_min_pair.as_ref(), slab_max_pair.as_ref()],
-                    program_id,
-                );
-                if a_pair_pda.key != &expected_pda {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-
-                if offset_bps > 10_000 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                if a_pair_pda.data_is_empty() {
-                    let lamports = solana_program::rent::Rent::get()?
-                        .minimum_balance(crate::cross_margin::OFFSET_PAIR_LEN);
-                    let bump_bytes = [pair_bump];
-                    let signer_seeds: &[&[u8]] = &[
-                        b"cmor_pair",
-                        slab_min_pair.as_ref(),
-                        slab_max_pair.as_ref(),
-                        &bump_bytes,
-                    ];
-                    solana_program::program::invoke_signed(
-                        &solana_program::system_instruction::create_account(
-                            a_admin.key,
-                            &expected_pda,
-                            lamports,
-                            crate::cross_margin::OFFSET_PAIR_LEN as u64,
-                            program_id,
-                        ),
-                        &[a_admin.clone(), a_pair_pda.clone(), a_system.clone()],
-                        &[signer_seeds],
-                    )?;
-                }
-
-                let mut pair_data = a_pair_pda.try_borrow_mut_data()?;
-                if pair_data.len() < crate::cross_margin::OFFSET_PAIR_LEN {
-                    return Err(ProgramError::AccountDataTooSmall);
-                }
-                let cfg = crate::cross_margin::OffsetPairConfig {
-                    magic: crate::cross_margin::OFFSET_PAIR_MAGIC,
-                    offset_bps,
-                    enabled: 1,
-                    _pad: [0; 5],
-                    _reserved: [0; 16],
-                };
-                crate::cross_margin::write_offset_pair(&mut pair_data, &cfg);
-                msg!("SetOffsetPair: offset_bps={}", offset_bps);
+                handle_set_offset_pair(program_id, accounts, offset_bps)?;
             }
 
             Instruction::AttestCrossMargin {
                 user_idx_a,
                 user_idx_b,
             } => {
-                accounts::expect_len(accounts, 6)?;
-                let a_payer = &accounts[0];
-                let a_slab_a = &accounts[1];
-                let a_slab_b = &accounts[2];
-                let a_attestation = &accounts[3];
-                let a_pair_pda = &accounts[4];
-                let a_system = &accounts[5];
-
-                accounts::expect_signer(a_payer)?;
-                accounts::expect_writable(a_payer)?;
-                accounts::expect_writable(a_attestation)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                accounts::expect_owner(a_slab_a, program_id)?;
-                accounts::expect_owner(a_slab_b, program_id)?;
-
-                let pair_data = a_pair_pda.try_borrow_data()?;
-                let pair_cfg = crate::cross_margin::read_offset_pair(&pair_data)
-                    .ok_or(ProgramError::InvalidAccountData)?;
-                if !pair_cfg.is_initialized() || pair_cfg.enabled == 0 {
-                    return Err(PercolatorError::CrossMarginPairNotFound.into());
-                }
-                let offset_bps = pair_cfg.offset_bps;
-                drop(pair_data);
-
-                let data_a = a_slab_a.try_borrow_data()?;
-                if data_a.len() < ENGINE_OFF + ENGINE_LEN {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let engine_a = zc::engine_ref(&data_a)?;
-                check_idx(engine_a, user_idx_a)?;
-                let pos_a = engine_a.accounts[user_idx_a as usize].position_basis_q;
-                let owner_a = engine_a.accounts[user_idx_a as usize].owner;
-                let slot = engine_a.current_slot;
-                drop(data_a);
-
-                let data_b = a_slab_b.try_borrow_data()?;
-                if data_b.len() < ENGINE_OFF + ENGINE_LEN {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let engine_b = zc::engine_ref(&data_b)?;
-                check_idx(engine_b, user_idx_b)?;
-                let pos_b = engine_b.accounts[user_idx_b as usize].position_basis_q;
-                let owner_b = engine_b.accounts[user_idx_b as usize].owner;
-                drop(data_b);
-
-                if owner_a != owner_b {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                {
-                    let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                        (a_slab_a.key, a_slab_b.key)
-                    } else {
-                        (a_slab_b.key, a_slab_a.key)
-                    };
-                    let (expected_pair_pda, _bump) = Pubkey::find_program_address(
-                        &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
-                        program_id,
-                    );
-                    if a_pair_pda.key != &expected_pair_pda {
-                        return Err(ProgramError::InvalidSeeds);
-                    }
-                }
-
-                let (slab_min_att, slab_max_att) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref()
-                {
-                    (a_slab_a.key, a_slab_b.key)
-                } else {
-                    (a_slab_b.key, a_slab_a.key)
-                };
-                let owner_key = Pubkey::from(owner_a);
-                let (expected_att_pda, att_bump) = Pubkey::find_program_address(
-                    &[
-                        b"cmor",
-                        owner_key.as_ref(),
-                        slab_min_att.as_ref(),
-                        slab_max_att.as_ref(),
-                    ],
-                    program_id,
-                );
-                if a_attestation.key != &expected_att_pda {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-
-                if a_attestation.data_is_empty() {
-                    let lamports = solana_program::rent::Rent::get()?
-                        .minimum_balance(crate::cross_margin::ATTESTATION_LEN);
-                    let bump_bytes = [att_bump];
-                    let signer_seeds: &[&[u8]] = &[
-                        b"cmor",
-                        owner_key.as_ref(),
-                        slab_min_att.as_ref(),
-                        slab_max_att.as_ref(),
-                        &bump_bytes,
-                    ];
-                    solana_program::program::invoke_signed(
-                        &solana_program::system_instruction::create_account(
-                            a_payer.key,
-                            &expected_att_pda,
-                            lamports,
-                            crate::cross_margin::ATTESTATION_LEN as u64,
-                            program_id,
-                        ),
-                        &[a_payer.clone(), a_attestation.clone(), a_system.clone()],
-                        &[signer_seeds],
-                    )?;
-                }
-
-                let mut att_data = a_attestation.try_borrow_mut_data()?;
-                if att_data.len() < crate::cross_margin::ATTESTATION_LEN {
-                    return Err(ProgramError::AccountDataTooSmall);
-                }
-                let att = crate::cross_margin::CrossMarginAttestation {
-                    magic: crate::cross_margin::ATTESTATION_MAGIC,
-                    _align_pad: [0; 8],
-                    user_pos_a: pos_a,
-                    user_pos_b: pos_b,
-                    attested_slot: slot,
-                    offset_bps,
-                    _pad: [0; 6],
-                    owner: owner_a,
-                    slab_a: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                        a_slab_a.key.to_bytes()
-                    } else {
-                        a_slab_b.key.to_bytes()
-                    },
-                    slab_b: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
-                        a_slab_b.key.to_bytes()
-                    } else {
-                        a_slab_a.key.to_bytes()
-                    },
-                };
-                crate::cross_margin::write_attestation(&mut att_data, &att);
-                msg!(
-                    "AttestCrossMargin: pos_a={} pos_b={} offset={}",
-                    pos_a as i64,
-                    pos_b as i64,
-                    offset_bps
-                );
+                handle_attest_cross_margin(program_id, accounts, user_idx_a, user_idx_b)?;
             }
 
             Instruction::AdvanceOraclePhase => {
-                if accounts.is_empty() {
-                    return Err(ProgramError::NotEnoughAccountKeys);
-                }
-                let a_slab = &accounts[0];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let mut config = state::read_config(&data);
-                let clock = Clock::get()?;
-
-                if state::get_vol_margin_scale_bps(&config) > 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-
-                let old_phase = state::get_oracle_phase(&config);
-
-                let has_mature_oracle = crate::verify::is_pyth_pinned_mode(
-                    config.oracle_authority,
-                    config.index_feed_id,
-                );
-
-                let mcs = state::get_market_created_slot(&config);
-                let created = state::effective_created_slot(mcs, clock.slot);
-                if mcs == 0 && old_phase == 0 {
-                    state::set_market_created_slot(&mut config, clock.slot);
-                }
-
-                let (new_phase, transitioned) = state::check_phase_transition(
-                    clock.slot,
-                    created,
-                    old_phase,
-                    state::get_cumulative_volume(&config),
-                    state::get_phase2_delta_slots(&config),
-                    has_mature_oracle,
-                );
-
-                if !transitioned {
-                    state::write_config(&mut data, &config);
-                    msg!("AdvanceOraclePhase: no transition (phase={})", old_phase);
-                } else {
-                    state::set_oracle_phase(&mut config, new_phase);
-
-                    if new_phase == state::ORACLE_PHASE_GROWING {
-                        let delta = clock.slot.saturating_sub(created) as u32;
-                        state::set_phase2_delta_slots(&mut config, delta);
-                    }
-
-                    state::write_config(&mut data, &config);
-                    msg!(
-                        "AdvanceOraclePhase: {} -> {} at slot {}",
-                        old_phase,
-                        new_phase,
-                        clock.slot
-                    );
-                }
+                handle_advance_oracle_phase(program_id, accounts)?;
             }
 
             Instruction::InitSharedVault {
                 epoch_duration_slots,
                 max_market_exposure_bps,
             } => {
-                accounts::expect_len(accounts, 4)?;
-                let a_admin = &accounts[0];
-                let a_shared_vault = &accounts[1];
-                let a_system_program = &accounts[2];
-                let a_slab = &accounts[3];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_shared_vault)?;
-
-                {
-                    let slab_data = state::slab_data_mut(a_slab)?;
-                    slab_guard(program_id, a_slab, &slab_data)?;
-                    require_initialized(&slab_data)?;
-                    let header = state::read_header(&slab_data);
-                    require_admin(header.admin, a_admin.key)?;
-                }
-
-                if *a_system_program.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                let (expected_pda, pda_bump) = Pubkey::find_program_address(
-                    &[crate::shared_vault::SHARED_VAULT_SEED],
-                    program_id,
-                );
-                if *a_shared_vault.key != expected_pda {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-
-                if !a_shared_vault.data_is_empty() {
-                    return Err(ProgramError::AccountAlreadyInitialized);
-                }
-
-                let rent = solana_program::rent::Rent::get()?;
-                let lamports = rent.minimum_balance(crate::shared_vault::SHARED_VAULT_STATE_LEN);
-                let bump_bytes = [pda_bump];
-                let signer_seeds: &[&[u8]] = &[crate::shared_vault::SHARED_VAULT_SEED, &bump_bytes];
-                solana_program::program::invoke_signed(
-                    &solana_program::system_instruction::create_account(
-                        a_admin.key,
-                        &expected_pda,
-                        lamports,
-                        crate::shared_vault::SHARED_VAULT_STATE_LEN as u64,
-                        program_id,
-                    ),
-                    &[
-                        a_admin.clone(),
-                        a_shared_vault.clone(),
-                        a_system_program.clone(),
-                    ],
-                    &[signer_seeds],
-                )?;
-
-                let clock = solana_program::clock::Clock::get()?;
-                let duration = if epoch_duration_slots == 0 {
-                    crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
-                } else {
-                    epoch_duration_slots
-                };
-                let max_bps = if max_market_exposure_bps == 0 {
-                    crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
-                } else {
-                    max_market_exposure_bps.min(10_000)
-                };
-
-                let sv_state = crate::shared_vault::SharedVaultState {
-                    magic: crate::shared_vault::SHARED_VAULT_MAGIC,
-                    epoch_number: 0,
-                    total_capital: 0,
-                    total_allocated: 0,
-                    pending_withdrawals: 0,
-                    epoch_start_slot: clock.slot,
-                    epoch_duration_slots: duration,
-                    max_market_exposure_bps: max_bps,
-                    bump: pda_bump,
-                    _pad: [0; 13],
-                    epoch_snapshot_capital: 0,
-                    epoch_snapshot_pending: 0,
-                };
-                let mut sv_data = a_shared_vault
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                crate::shared_vault::write_vault_state(&mut sv_data, &sv_state);
-
-                msg!(
-                    "PERC-628: SharedVault initialized — epoch_duration={} max_exposure_bps={}",
-                    duration,
-                    max_bps
-                );
+                handle_init_shared_vault(program_id, accounts, epoch_duration_slots, max_market_exposure_bps)?;
             }
 
             Instruction::AllocateMarket { amount } => {
-                accounts::expect_len(accounts, 5)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_shared_vault = &accounts[2];
-                let a_market_alloc = &accounts[3];
-                let a_system_program = &accounts[4];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_shared_vault)?;
-                accounts::expect_writable(a_market_alloc)?;
-
-                let slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-                let header = state::read_header(&slab_data);
-                require_admin(header.admin, a_admin.key)?;
-                drop(slab_data);
-
-                let (expected_sv, _) = Pubkey::find_program_address(
-                    &[crate::shared_vault::SHARED_VAULT_SEED],
-                    program_id,
-                );
-                accounts::expect_key(a_shared_vault, &expected_sv)?;
-
-                let (expected_alloc, alloc_bump) = Pubkey::find_program_address(
-                    &[crate::shared_vault::MARKET_ALLOC_SEED, a_slab.key.as_ref()],
-                    program_id,
-                );
-                if *a_market_alloc.key != expected_alloc {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-
-                let mut sv_data = a_shared_vault
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
-                    .ok_or(ProgramError::UninitializedAccount)?;
-
-                let new_allocation = amount;
-                if !crate::shared_vault::check_exposure_cap(
-                    vault_state.total_capital,
-                    new_allocation,
-                    vault_state.max_market_exposure_bps,
-                ) {
-                    msg!("PERC-628: allocation {} exceeds exposure cap", amount);
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let available = crate::shared_vault::available_for_allocation(
-                    vault_state.total_capital,
-                    vault_state.total_allocated,
-                );
-                if new_allocation > available {
-                    msg!("PERC-628: allocation {} > available {}", amount, available);
-                    return Err(ProgramError::InsufficientFunds);
-                }
-
-                if a_market_alloc.data_is_empty() {
-                    if *a_system_program.key != solana_program::system_program::id() {
-                        return Err(ProgramError::IncorrectProgramId);
-                    }
-                    let rent = solana_program::rent::Rent::get()?;
-                    let lamports = rent.minimum_balance(crate::shared_vault::MARKET_ALLOC_LEN);
-                    let bump_bytes = [alloc_bump];
-                    let signer_seeds: &[&[u8]] = &[
-                        crate::shared_vault::MARKET_ALLOC_SEED,
-                        a_slab.key.as_ref(),
-                        &bump_bytes,
-                    ];
-                    solana_program::program::invoke_signed(
-                        &solana_program::system_instruction::create_account(
-                            a_admin.key,
-                            &expected_alloc,
-                            lamports,
-                            crate::shared_vault::MARKET_ALLOC_LEN as u64,
-                            program_id,
-                        ),
-                        &[
-                            a_admin.clone(),
-                            a_market_alloc.clone(),
-                            a_system_program.clone(),
-                        ],
-                        &[signer_seeds],
-                    )?;
-                }
-
-                let alloc = crate::shared_vault::MarketAllocation {
-                    magic: crate::shared_vault::MARKET_ALLOC_MAGIC,
-                    bump: alloc_bump,
-                    _pad: [0; 7],
-                    allocated_capital: new_allocation,
-                    utilized_capital: 0,
-                };
-                let mut alloc_data = a_market_alloc
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                crate::shared_vault::write_market_alloc(&mut alloc_data, &alloc);
-
-                vault_state.total_allocated =
-                    vault_state.total_allocated.saturating_add(new_allocation);
-                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
-
-                msg!("PERC-628: Market allocated {} from shared vault", amount);
+                handle_allocate_market(program_id, accounts, amount)?;
             }
 
             Instruction::AdvanceEpoch => {
-                accounts::expect_len(accounts, 2)?;
-                let a_shared_vault = &accounts[1];
-
-                accounts::expect_writable(a_shared_vault)?;
-
-                let (expected_sv, _) = Pubkey::find_program_address(
-                    &[crate::shared_vault::SHARED_VAULT_SEED],
-                    program_id,
-                );
-                accounts::expect_key(a_shared_vault, &expected_sv)?;
-
-                let mut sv_data = a_shared_vault
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
-                    .ok_or(ProgramError::UninitializedAccount)?;
-
-                let clock = solana_program::clock::Clock::get()?;
-                if !crate::shared_vault::is_epoch_elapsed(
-                    clock.slot,
-                    vault_state.epoch_start_slot,
-                    vault_state.epoch_duration_slots,
-                ) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                vault_state.epoch_snapshot_capital = vault_state.total_capital;
-                vault_state.epoch_snapshot_pending = vault_state.pending_withdrawals;
-
-                vault_state.epoch_number = vault_state.epoch_number.saturating_add(1);
-                vault_state.epoch_start_slot = clock.slot;
-                vault_state.pending_withdrawals = 0;
-                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
-
-                msg!(
-                    "PERC-628: Epoch advanced to {} at slot {}",
-                    vault_state.epoch_number,
-                    clock.slot,
-                );
+                handle_advance_epoch(program_id, accounts)?;
             }
 
             Instruction::QueueWithdrawalSV { lp_amount } => {
-                accounts::expect_len(accounts, 4)?;
-                let a_user = &accounts[0];
-                let a_shared_vault = &accounts[1];
-                let a_withdraw_req = &accounts[2];
-                let a_system_program = &accounts[3];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_shared_vault)?;
-                accounts::expect_writable(a_withdraw_req)?;
-
-                if lp_amount == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                let (expected_sv, _) = Pubkey::find_program_address(
-                    &[crate::shared_vault::SHARED_VAULT_SEED],
-                    program_id,
-                );
-                accounts::expect_key(a_shared_vault, &expected_sv)?;
-
-                let mut sv_data = a_shared_vault
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
-                    .ok_or(ProgramError::UninitializedAccount)?;
-
-                let epoch_bytes = vault_state.epoch_number.to_le_bytes();
-                let (expected_req, req_bump) = Pubkey::find_program_address(
-                    &[
-                        crate::shared_vault::WITHDRAW_REQ_SEED,
-                        a_shared_vault.key.as_ref(),
-                        a_user.key.as_ref(),
-                        &epoch_bytes,
-                    ],
-                    program_id,
-                );
-                if *a_withdraw_req.key != expected_req {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-
-                if a_withdraw_req.data_is_empty() {
-                    if *a_system_program.key != solana_program::system_program::id() {
-                        return Err(ProgramError::IncorrectProgramId);
-                    }
-                    let rent = solana_program::rent::Rent::get()?;
-                    let lamports = rent.minimum_balance(crate::shared_vault::WITHDRAW_REQ_LEN);
-                    let bump_bytes = [req_bump];
-                    let signer_seeds: &[&[u8]] = &[
-                        crate::shared_vault::WITHDRAW_REQ_SEED,
-                        a_shared_vault.key.as_ref(),
-                        a_user.key.as_ref(),
-                        &epoch_bytes,
-                        &bump_bytes,
-                    ];
-                    solana_program::program::invoke_signed(
-                        &solana_program::system_instruction::create_account(
-                            a_user.key,
-                            &expected_req,
-                            lamports,
-                            crate::shared_vault::WITHDRAW_REQ_LEN as u64,
-                            program_id,
-                        ),
-                        &[
-                            a_user.clone(),
-                            a_withdraw_req.clone(),
-                            a_system_program.clone(),
-                        ],
-                        &[signer_seeds],
-                    )?;
-                }
-
-                {
-                    let req_data = a_withdraw_req
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    if let Some(existing) = crate::shared_vault::read_withdraw_req(&req_data) {
-                        if existing.claimed == 0 {
-                            return Err(ProgramError::AccountAlreadyInitialized);
-                        }
-                    }
-                }
-
-                let req = crate::shared_vault::WithdrawalRequest {
-                    magic: crate::shared_vault::WITHDRAW_REQ_MAGIC,
-                    bump: req_bump,
-                    claimed: 0,
-                    _pad: [0; 6],
-                    lp_amount,
-                    epoch_number: vault_state.epoch_number,
-                };
-                let mut req_data = a_withdraw_req
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                crate::shared_vault::write_withdraw_req(&mut req_data, &req);
-
-                vault_state.pending_withdrawals = crate::shared_vault::queue_withdrawal(
-                    vault_state.pending_withdrawals,
-                    lp_amount,
-                );
-                crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
-
-                msg!(
-                    "PERC-628: Queued withdrawal {} LP for epoch {}",
-                    lp_amount,
-                    vault_state.epoch_number
-                );
+                handle_queue_withdrawal_sv(program_id, accounts, lp_amount)?;
             }
 
             Instruction::ClaimEpochWithdrawal => {
-                accounts::expect_len(accounts, 8)?;
-                let a_user = &accounts[0];
-                let a_shared_vault = &accounts[1];
-                let a_withdraw_req = &accounts[2];
-                let a_slab = &accounts[3];
-                let a_vault = &accounts[4];
-                let a_user_ata = &accounts[5];
-                let a_vault_authority = &accounts[6];
-                let a_token = &accounts[7];
-
-                accounts::expect_signer(a_user)?;
-                accounts::expect_writable(a_shared_vault)?;
-                accounts::expect_writable(a_withdraw_req)?;
-                accounts::expect_writable(a_vault)?;
-                accounts::expect_writable(a_user_ata)?;
-                verify_token_program(a_token)?;
-
-                let (expected_sv, _) = Pubkey::find_program_address(
-                    &[crate::shared_vault::SHARED_VAULT_SEED],
-                    program_id,
-                );
-                accounts::expect_key(a_shared_vault, &expected_sv)?;
-
-                let mut sv_data = a_shared_vault
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
-                    .ok_or(ProgramError::UninitializedAccount)?;
-
-                let clock = solana_program::clock::Clock::get()?;
-                if !crate::shared_vault::is_epoch_elapsed(
-                    clock.slot,
-                    vault_state.epoch_start_slot,
-                    vault_state.epoch_duration_slots,
-                ) {
-                    msg!("PERC-628: epoch not yet elapsed — cannot claim mid-epoch");
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-                let config = state::read_config(&slab_data);
-                let mint = Pubkey::new_from_array(config.collateral_mint);
-                let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(
-                    a_vault,
-                    &auth,
-                    &mint,
-                    &Pubkey::new_from_array(config.vault_pubkey),
-                )?;
-                accounts::expect_key(a_vault_authority, &auth)?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
-                drop(slab_data);
-
-                let mut req_data = a_withdraw_req
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                let req = crate::shared_vault::read_withdraw_req(&req_data)
-                    .ok_or(ProgramError::InvalidAccountData)?;
-
-                if req.claimed != 0 {
-                    msg!("PERC-628: withdrawal already claimed");
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let req_epoch_bytes = req.epoch_number.to_le_bytes();
-                let (expected_req_pda, _) = Pubkey::find_program_address(
-                    &[
-                        crate::shared_vault::WITHDRAW_REQ_SEED,
-                        a_shared_vault.key.as_ref(),
-                        a_user.key.as_ref(),
-                        &req_epoch_bytes,
-                    ],
-                    program_id,
-                );
-                if *a_withdraw_req.key != expected_req_pda {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-                if req.epoch_number >= vault_state.epoch_number {
-                    msg!(
-                        "PERC-628: request epoch {} >= current {} — must wait for epoch advance",
-                        req.epoch_number,
-                        vault_state.epoch_number
-                    );
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let mut updated_req = req;
-                updated_req.claimed = 1;
-                crate::shared_vault::write_withdraw_req(&mut req_data, &updated_req);
-                drop(req_data);
-
-                let payout = crate::shared_vault::compute_proportional_withdrawal(
-                    req.lp_amount,
-                    vault_state.epoch_snapshot_pending,
-                    vault_state.epoch_snapshot_capital,
-                );
-
-                if payout > 0 {
-                    let base_payout =
-                        crate::units::units_to_base_checked(payout, config.unit_scale)
-                            .ok_or(PercolatorError::EngineOverflow)?;
-
-                    let seed1: &[u8] = b"vault";
-                    let seed2: &[u8] = a_slab.key.as_ref();
-                    let bump_arr: [u8; 1] = [vault_bump];
-                    let seed3: &[u8] = &bump_arr;
-                    let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                    let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                    collateral::withdraw(
-                        a_token,
-                        a_vault,
-                        a_user_ata,
-                        a_vault_authority,
-                        base_payout,
-                        &signer_seeds,
-                    )?;
-
-                    vault_state.total_capital =
-                        vault_state.total_capital.saturating_sub(payout as u128);
-                    crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
-
-                    msg!(
-                        "PERC-628: Claim: {} LP → {} base tokens transferred",
-                        req.lp_amount,
-                        base_payout
-                    );
-                } else {
-                    msg!("PERC-628: Claim: {} LP → 0 payout", req.lp_amount);
-                }
+                handle_claim_epoch_withdrawal(program_id, accounts)?;
             }
 
             Instruction::MintPositionNft { user_idx } => {
-                accounts::expect_len(accounts, 10)?;
-                let a_payer = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_nft_pda = &accounts[2];
-                let a_nft_mint = &accounts[3];
-                let a_owner_ata = &accounts[4];
-                let a_owner = &accounts[5];
-                let a_vault_auth = &accounts[6];
-                let a_token22 = &accounts[7];
-                let a_system = &accounts[8];
-                let a_rent = &accounts[9];
-
-                accounts::expect_signer(a_payer)?;
-                accounts::expect_signer(a_owner)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_nft_pda)?;
-                accounts::expect_writable(a_nft_mint)?;
-                accounts::expect_writable(a_owner_ata)?;
-                verify_token22_program(a_token22)?;
-                if *a_system.key != solana_program::system_program::id() {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
-
-                let data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let engine = zc::engine_ref(&data)?;
-                check_idx(engine, user_idx)?;
-                let u_owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(u_owner, a_owner.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                let acct = &engine.accounts[user_idx as usize];
-                let cap = acct.capital.get();
-                let pos = acct.position_basis_q;
-                if cap == 0 && pos == 0 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-                // entry_price not in current layout — use 0 as stub
-                let entry_price_raw: u64 = 0;
-                let pos_size = acct.position_basis_q;
-                let direction = if pos_size >= 0 { "LONG" } else { "SHORT" };
-                drop(data);
-
-                let (expected_nft_pda, nft_bump) =
-                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
-                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
-
-                let (expected_mint, mint_bump) =
-                    crate::position_nft::derive_position_nft_mint(program_id, a_slab.key, user_idx);
-                accounts::expect_key(a_nft_mint, &expected_mint)?;
-
-                let (expected_vault_auth, vault_bump) =
-                    accounts::derive_vault_authority(program_id, a_slab.key);
-                accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
-
-                {
-                    let nft_data = a_nft_pda
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    if nft_data.len() >= crate::position_nft::POSITION_NFT_STATE_LEN {
-                        if let Some(st) = crate::position_nft::read_position_nft_state(&nft_data) {
-                            if st.is_initialized() {
-                                return Err(ProgramError::AccountAlreadyInitialized);
-                            }
-                        }
-                    }
-                }
-
-                {
-                    #[allow(unused_variables)]
-                    let nft_pda_seeds: &[&[u8]] = &[
-                        crate::position_nft::POSITION_NFT_SEED,
-                        a_slab.key.as_ref(),
-                        &user_idx.to_le_bytes(),
-                        &[nft_bump],
-                    ];
-                    let space = crate::position_nft::POSITION_NFT_STATE_LEN;
-                    let rent = solana_program::rent::Rent::get()?;
-                    let lamports = rent.minimum_balance(space);
-                    let create_ix = solana_program::system_instruction::create_account(
-                        a_payer.key,
-                        a_nft_pda.key,
-                        lamports,
-                        space as u64,
-                        program_id,
-                    );
-                    #[cfg(not(feature = "test"))]
-                    {
-                        solana_program::program::invoke_signed(
-                            &create_ix,
-                            &[a_payer.clone(), a_nft_pda.clone(), a_system.clone()],
-                            &[nft_pda_seeds],
-                        )?;
-                    }
-                    let _ = (create_ix, a_system, a_rent);
-                }
-
-                {
-                    let mint_seeds: &[&[u8]] = &[
-                        crate::position_nft::POSITION_NFT_MINT_SEED,
-                        a_slab.key.as_ref(),
-                        &user_idx.to_le_bytes(),
-                        &[mint_bump],
-                    ];
-                    crate::position_nft::create_nft_mint_with_metadata(
-                        a_payer,
-                        a_nft_mint,
-                        a_vault_auth,
-                        a_system,
-                        a_token22,
-                        a_rent,
-                        mint_seeds,
-                        direction,
-                        entry_price_raw,
-                        pos_size,
-                    )?;
-                }
-
-                {
-                    let vault_seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[vault_bump]];
-                    crate::position_nft::mint_nft_to(
-                        a_token22,
-                        a_nft_mint,
-                        a_owner_ata,
-                        a_vault_auth,
-                        &[vault_seeds],
-                    )?;
-                }
-
-                {
-                    let mut nft_data = a_nft_pda
-                        .try_borrow_mut_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    let nft_state = crate::position_nft::PositionNftState {
-                        magic: crate::position_nft::POSITION_NFT_MAGIC,
-                        mint: a_nft_mint.key.to_bytes(),
-                        slab: a_slab.key.to_bytes(),
-                        owner: a_owner.key.to_bytes(),
-                        user_idx,
-                        pending_settlement: 0,
-                        bump: nft_bump,
-                        mint_bump,
-                        _reserved: [0u8; 19],
-                    };
-                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
-                }
-
-                msg!(
-                    "PERC-608: MintPositionNft slab={} user_idx={} owner={} direction={}",
-                    a_slab.key,
-                    user_idx,
-                    a_owner.key,
-                    direction,
-                );
+                handle_mint_position_nft(program_id, accounts, user_idx)?;
             }
 
             Instruction::TransferPositionOwnership { user_idx } => {
-                accounts::expect_len(accounts, 8)?;
-                let a_current_owner = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_nft_pda = &accounts[2];
-                let a_nft_mint = &accounts[3];
-                let a_src_ata = &accounts[4];
-                let a_dst_ata = &accounts[5];
-                let a_new_owner = &accounts[6];
-                let a_token22 = &accounts[7];
-
-                accounts::expect_signer(a_current_owner)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_nft_pda)?;
-                accounts::expect_writable(a_nft_mint)?;
-                accounts::expect_writable(a_src_ata)?;
-                accounts::expect_writable(a_dst_ata)?;
-                verify_token22_program(a_token22)?;
-
-                let slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-
-                {
-                    let engine = zc::engine_ref(&slab_data)?;
-                    check_idx(engine, user_idx)?;
-                }
-
-                let (expected_nft_pda, _) =
-                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
-                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
-
-                let mut nft_state = {
-                    let nft_data = a_nft_pda
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::read_position_nft_state(&nft_data)
-                        .filter(|s| s.is_initialized())
-                        .ok_or(ProgramError::UninitializedAccount)?
-                };
-
-                if nft_state.owner != a_current_owner.key.to_bytes() {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                if nft_state.mint != a_nft_mint.key.to_bytes() {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                if nft_state.pending_settlement != 0 {
-                    msg!("PERC-608: PendingFundingNotSettled — keeper must run settlement crank");
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                drop(slab_data);
-
-                crate::position_nft::transfer_nft(
-                    a_token22,
-                    a_nft_mint,
-                    a_src_ata,
-                    a_dst_ata,
-                    a_current_owner,
-                )?;
-
-                nft_state.owner = a_new_owner.key.to_bytes();
-                {
-                    let mut nft_data = a_nft_pda
-                        .try_borrow_mut_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
-                }
-
-                msg!(
-                    "PERC-608: TransferPositionOwnership slab={} user_idx={} new_owner={}",
-                    a_slab.key,
-                    user_idx,
-                    a_new_owner.key,
-                );
+                handle_transfer_position_ownership(program_id, accounts, user_idx)?;
             }
 
             Instruction::BurnPositionNft { user_idx } => {
-                accounts::expect_len(accounts, 7)?;
-                let a_owner = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_nft_pda = &accounts[2];
-                let a_nft_mint = &accounts[3];
-                let a_owner_ata = &accounts[4];
-                let a_vault_auth = &accounts[5];
-                let a_token22 = &accounts[6];
-
-                accounts::expect_signer(a_owner)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_nft_pda)?;
-                accounts::expect_writable(a_nft_mint)?;
-                accounts::expect_writable(a_owner_ata)?;
-                verify_token22_program(a_token22)?;
-
-                let slab_data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &slab_data)?;
-                require_initialized(&slab_data)?;
-                drop(slab_data);
-
-                let (expected_nft_pda, _) =
-                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
-                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
-
-                let (expected_vault_auth, vault_bump) =
-                    accounts::derive_vault_authority(program_id, a_slab.key);
-                accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
-
-                let nft_state = {
-                    let nft_data = a_nft_pda
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::read_position_nft_state(&nft_data)
-                        .filter(|s| s.is_initialized())
-                        .ok_or(ProgramError::UninitializedAccount)?
-                };
-
-                if nft_state.owner != a_owner.key.to_bytes() {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                if nft_state.mint != a_nft_mint.key.to_bytes() {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                crate::position_nft::burn_nft(a_token22, a_nft_mint, a_owner_ata, a_owner)?;
-
-                {
-                    let vault_seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[vault_bump]];
-                    crate::position_nft::close_nft_mint(
-                        a_token22,
-                        a_nft_mint,
-                        a_owner,
-                        a_vault_auth,
-                        &[vault_seeds],
-                    )?;
-                }
-
-                {
-                    let mut nft_data = a_nft_pda
-                        .try_borrow_mut_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    for b in nft_data.iter_mut() {
-                        *b = 0;
-                    }
-                }
-                {
-                    let lamports = a_nft_pda.lamports();
-                    **a_nft_pda
-                        .try_borrow_mut_lamports()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)? = 0;
-                    **a_owner
-                        .try_borrow_mut_lamports()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)? = a_owner
-                        .lamports()
-                        .checked_add(lamports)
-                        .ok_or(PercolatorError::EngineOverflow)?;
-                }
-
-                msg!(
-                    "PERC-608: BurnPositionNft slab={} user_idx={} owner={}",
-                    a_slab.key,
-                    user_idx,
-                    a_owner.key,
-                );
+                handle_burn_position_nft(program_id, accounts, user_idx)?;
             }
 
             Instruction::SetPendingSettlement { user_idx } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_keeper = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_nft_pda = &accounts[2];
-
-                accounts::expect_signer(a_keeper)?;
-                accounts::expect_writable(a_nft_pda)?;
-
-                {
-                    let slab_data = a_slab
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    slab_guard(program_id, a_slab, &slab_data)?;
-                    require_initialized(&slab_data)?;
-                    let header = state::read_header(&slab_data);
-                    require_admin(header.admin, a_keeper.key)?;
-                }
-
-                let (expected_nft_pda, _) =
-                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
-                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
-
-                let mut nft_state = {
-                    let nft_data = a_nft_pda
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::read_position_nft_state(&nft_data)
-                        .filter(|s| s.is_initialized())
-                        .ok_or(ProgramError::UninitializedAccount)?
-                };
-
-                nft_state.pending_settlement = 1;
-
-                {
-                    let mut nft_data = a_nft_pda
-                        .try_borrow_mut_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
-                }
-
-                msg!(
-                    "PERC-608: SetPendingSettlement slab={} user_idx={}",
-                    a_slab.key,
-                    user_idx,
-                );
+                handle_set_pending_settlement(program_id, accounts, user_idx)?;
             }
 
             Instruction::ClearPendingSettlement { user_idx } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_keeper = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_nft_pda = &accounts[2];
-
-                accounts::expect_signer(a_keeper)?;
-                accounts::expect_writable(a_nft_pda)?;
-
-                {
-                    let slab_data = a_slab
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    slab_guard(program_id, a_slab, &slab_data)?;
-                    require_initialized(&slab_data)?;
-                    let header = state::read_header(&slab_data);
-                    require_admin(header.admin, a_keeper.key)?;
-                }
-
-                let (expected_nft_pda, _) =
-                    crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
-                accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
-
-                let mut nft_state = {
-                    let nft_data = a_nft_pda
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::read_position_nft_state(&nft_data)
-                        .filter(|s| s.is_initialized())
-                        .ok_or(ProgramError::UninitializedAccount)?
-                };
-
-                nft_state.pending_settlement = 0;
-
-                {
-                    let mut nft_data = a_nft_pda
-                        .try_borrow_mut_data()
-                        .map_err(|_| ProgramError::AccountBorrowFailed)?;
-                    crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
-                }
-
-                msg!(
-                    "PERC-608: ClearPendingSettlement slab={} user_idx={}",
-                    a_slab.key,
-                    user_idx,
-                );
+                handle_clear_pending_settlement(program_id, accounts, user_idx)?;
             }
 
             Instruction::SetWalletCap { cap_e6 } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                const MIN_WALLET_CAP_E6: u64 = 1_000;
-                if cap_e6 != 0 && cap_e6 < MIN_WALLET_CAP_E6 {
-                    msg!(
-                        "PERC-8224: SetWalletCap rejected: cap_e6={} is below minimum floor {} \
-                         (use 0 to disable, or >= {} to set a real cap)",
-                        cap_e6,
-                        MIN_WALLET_CAP_E6,
-                        MIN_WALLET_CAP_E6,
-                    );
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                let mut config = state::read_config(&data);
-                state::set_max_wallet_pos_e6(&mut config, cap_e6);
-                state::write_config(&mut data, &config);
-
-                let stored = state::get_max_wallet_pos_e6(&config);
-                msg!(
-                    "PERC-8111: SetWalletCap: cap_e6={} stored={}",
-                    cap_e6,
-                    stored,
-                );
+                handle_set_wallet_cap(program_id, accounts, cap_e6)?;
             }
 
             Instruction::SetOiImbalanceHardBlock { threshold_bps } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                if threshold_bps > 10_000 {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let mut config = state::read_config(&data);
-                state::set_oi_imbalance_hard_block_bps(&mut config, threshold_bps);
-                state::write_config(&mut data, &config);
-
-                let stored = state::get_oi_imbalance_hard_block_bps(&config);
-                msg!(
-                    "PERC-8110: SetOiImbalanceHardBlock: threshold_bps={} stored={}",
-                    threshold_bps,
-                    stored,
-                );
+                handle_set_oi_imbalance_hard_block(program_id, accounts, threshold_bps)?;
             }
 
             Instruction::TopUpKeeperFund { amount } => {
-                // accounts: [0] funder (signer), [1] slab (writable), [2] keeper_fund PDA (writable)
-                // optional: [3] system_program (required when funder is not program-owned)
-                accounts::expect_len(accounts, 3)?;
-                let a_funder = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_keeper_fund = &accounts[2];
-                accounts::expect_signer(a_funder)?;
-                accounts::expect_writable(a_slab)?;
-                accounts::expect_writable(a_keeper_fund)?;
-
-                {
-                    let slab_data = state::slab_data_mut(a_slab)?;
-                    slab_guard(program_id, a_slab, &slab_data)?;
-                    require_initialized(&slab_data)?;
-                }
-
-                let (expected_pda, _bump) = Pubkey::find_program_address(
-                    &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
-                    program_id,
-                );
-                if *a_keeper_fund.key != expected_pda {
-                    return Err(ProgramError::InvalidSeeds);
-                }
-
-                if amount == 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
-                if a_funder.owner != program_id {
-                    if accounts.len() < 4 {
-                        return Err(ProgramError::NotEnoughAccountKeys);
-                    }
-                    let a_system = &accounts[3];
-                    if *a_system.key != solana_program::system_program::id() {
-                        return Err(ProgramError::IncorrectProgramId);
-                    }
-                    solana_program::program::invoke(
-                        &solana_program::system_instruction::transfer(
-                            a_funder.key,
-                            a_keeper_fund.key,
-                            amount,
-                        ),
-                        &[a_funder.clone(), a_keeper_fund.clone(), a_system.clone()],
-                    )?;
-                } else {
-                    let funder_lamports = **a_funder.try_borrow_lamports()?;
-                    if funder_lamports < amount {
-                        return Err(ProgramError::InsufficientFunds);
-                    }
-                    **a_funder.try_borrow_mut_lamports()? = funder_lamports - amount;
-                    **a_keeper_fund.try_borrow_mut_lamports()? = a_keeper_fund
-                        .lamports()
-                        .checked_add(amount)
-                        .ok_or(ProgramError::InsufficientFunds)?;
-                }
-
-                let mut fund_data = a_keeper_fund
-                    .try_borrow_mut_data()
-                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
-
-                if let Some(fund_state) = crate::keeper_fund::read_state(&fund_data) {
-                    let mut new_state = *fund_state;
-                    new_state.balance = new_state.balance.saturating_add(amount);
-                    new_state.total_topped_up = new_state.total_topped_up.saturating_add(amount);
-                    // Clear depleted_pause flag when fund is topped up above zero.
-                    if new_state.depleted_pause != 0
-                        && !crate::keeper_fund::is_depleted(new_state.balance)
-                    {
-                        new_state.depleted_pause = 0;
-                    }
-                    crate::keeper_fund::write_state(&mut fund_data, &new_state);
-                } else {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                msg!("TopUpKeeperFund: amount={}", amount);
+                handle_top_up_keeper_fund(program_id, accounts, amount)?;
             }
 
             // PERC-8400: RescueOrphanVault
@@ -11726,284 +5499,19 @@ pub mod processor {
             // Accounts: [admin(signer), slab(readonly), admin_ata(writable),
             //            vault(writable), token_program, vault_pda]
             Instruction::RescueOrphanVault => {
-                accounts::expect_len(accounts, 6)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_admin_ata = &accounts[2];
-                let a_vault = &accounts[3];
-                let a_token = &accounts[4];
-                let a_vault_pda = &accounts[5];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_admin_ata)?;
-                accounts::expect_writable(a_vault)?;
-                verify_token_program(a_token)?;
-
-                if a_slab.owner != program_id {
-                    return Err(ProgramError::IllegalOwner);
-                }
-
-                let slab_data = a_slab.try_borrow_data()?;
-                if slab_data.len() < 48 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let magic = u64::from_le_bytes(
-                    slab_data[0..8]
-                        .try_into()
-                        .map_err(|_| ProgramError::InvalidAccountData)?,
-                );
-                if magic != MAGIC {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let admin_bytes: [u8; 32] = slab_data[16..48]
-                    .try_into()
-                    .map_err(|_| ProgramError::InvalidAccountData)?;
-                let slab_admin = Pubkey::new_from_array(admin_bytes);
-                if slab_admin != *a_admin.key {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let flags = slab_data[state::FLAGS_OFF];
-                if flags & state::FLAG_RESOLVED == 0 {
-                    solana_program::msg!("RescueOrphanVault rejected: market is not resolved");
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let bump = slab_data[12];
-                drop(slab_data);
-
-                // H-1: Verify vault is owned by SPL Token program.
-                if a_vault.owner != &crate::spl_token::id() {
-                    return Err(ProgramError::IllegalOwner);
-                }
-
-                let (auth, expected_bump) =
-                    accounts::derive_vault_authority(program_id, a_slab.key);
-                if bump != expected_bump {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                accounts::expect_key(a_vault_pda, &auth)?;
-
-                let vault_data = a_vault.try_borrow_data()?;
-                let vault_token = crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
-                if vault_token.owner != auth {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let actual_amount = vault_token.amount;
-                let vault_mint = vault_token.mint;
-                drop(vault_data);
-
-                let admin_ata_data = a_admin_ata.try_borrow_data()?;
-                let admin_token =
-                    crate::spl_token::state::TokenAccountView::unpack(&admin_ata_data)?;
-                if admin_token.owner != *a_admin.key {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                if admin_token.mint != vault_mint {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                drop(admin_ata_data);
-
-                if actual_amount == 0 {
-                    msg!("PERC-8400: vault is empty, nothing to rescue");
-                    return Ok(());
-                }
-
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
-
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_admin_ata,
-                    a_vault_pda,
-                    actual_amount,
-                    &signer_seeds,
-                )?;
-
-                msg!("PERC-8400: rescued {} tokens from orphan vault", actual_amount);
+                handle_rescue_orphan_vault(program_id, accounts)?;
             }
 
             // PERC-8400: CloseOrphanSlab
             // Accounts: [admin(signer,writable), slab(writable), vault(readonly)]
             Instruction::CloseOrphanSlab => {
-                accounts::expect_len(accounts, 3)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_vault = &accounts[2];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                if a_slab.owner != program_id {
-                    return Err(ProgramError::IllegalOwner);
-                }
-
-                {
-                    let mut slab_data = a_slab.try_borrow_mut_data()?;
-                    if slab_data.len() < 48 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-
-                    let magic = u64::from_le_bytes(
-                        slab_data[0..8]
-                            .try_into()
-                            .map_err(|_| ProgramError::InvalidAccountData)?,
-                    );
-                    if magic != MAGIC {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-
-                    let admin_bytes: [u8; 32] = slab_data[16..48]
-                        .try_into()
-                        .map_err(|_| ProgramError::InvalidAccountData)?;
-                    let slab_admin = Pubkey::new_from_array(admin_bytes);
-                    if slab_admin != *a_admin.key {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-
-                    // M-1: Verify vault is owned by SPL Token program.
-                    if a_vault.owner != &crate::spl_token::id() {
-                        return Err(ProgramError::IllegalOwner);
-                    }
-
-                    let vault_data = a_vault
-                        .try_borrow_data()
-                        .map_err(|_| ProgramError::InvalidAccountData)?;
-                    if vault_data.len() < 72 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    let vault_amount = u64::from_le_bytes(
-                        vault_data[64..72]
-                            .try_into()
-                            .map_err(|_| ProgramError::InvalidAccountData)?,
-                    );
-                    if vault_amount > 0 {
-                        msg!("PERC-8400: vault still has {} tokens, rescue first", vault_amount);
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    let vault_owner_bytes: [u8; 32] = vault_data[32..64]
-                        .try_into()
-                        .map_err(|_| ProgramError::InvalidAccountData)?;
-                    let vault_owner = Pubkey::new_from_array(vault_owner_bytes);
-                    let (expected_auth, _) =
-                        accounts::derive_vault_authority(program_id, a_slab.key);
-                    if vault_owner != expected_auth {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    drop(vault_data);
-
-                    for b in slab_data.iter_mut() {
-                        *b = 0;
-                    }
-                }
-
-                let slab_lamports = a_slab.lamports();
-                **a_slab.lamports.borrow_mut() = 0;
-                **a_admin.lamports.borrow_mut() = a_admin
-                    .lamports()
-                    .checked_add(slab_lamports)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-
-                msg!("PERC-8400: closed orphan slab, reclaimed {} lamports", slab_lamports);
+                handle_close_orphan_slab(program_id, accounts)?;
             }
 
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
             // Accounts: [admin(signer), slab(writable), pool_account(readonly)]
             Instruction::SetDexPool { pool } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_pool = &accounts[2];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                // SetDexPool fix: verify pool pubkey matches the pool account key.
-                if pool != *a_pool.key {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                let mut config = state::read_config(&data);
-
-                if !oracle::is_hyperp_mode(&config) {
-                    msg!("SetDexPool: not a HYPERP market (index_feed_id is non-zero)");
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let is_approved_dex = *a_pool.owner == oracle::PUMPSWAP_PROGRAM_ID
-                    || *a_pool.owner == oracle::RAYDIUM_CLMM_PROGRAM_ID
-                    || *a_pool.owner == oracle::METEORA_DLMM_PROGRAM_ID;
-                if !is_approved_dex {
-                    msg!("SetDexPool: pool account not owned by an approved DEX program");
-                    return Err(PercolatorError::OracleInvalid.into());
-                }
-
-                {
-                    let pool_data = a_pool.try_borrow_data()?;
-
-                    let mint_matches = if *a_pool.owner == oracle::PUMPSWAP_PROGRAM_ID {
-                        const PS_OFF_BASE_MINT: usize = 35;
-                        if pool_data.len() < PS_OFF_BASE_MINT + 32 {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                        let base_mint: [u8; 32] =
-                            pool_data[PS_OFF_BASE_MINT..PS_OFF_BASE_MINT + 32]
-                                .try_into()
-                                .unwrap();
-                        base_mint == config.collateral_mint
-                    } else if *a_pool.owner == oracle::RAYDIUM_CLMM_PROGRAM_ID {
-                        const RAYDIUM_OFF_MINT0: usize = 73;
-                        const RAYDIUM_OFF_MINT1: usize = 105;
-                        if pool_data.len() < RAYDIUM_OFF_MINT1 + 32 {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                        let mint0: [u8; 32] = pool_data[RAYDIUM_OFF_MINT0..RAYDIUM_OFF_MINT0 + 32]
-                            .try_into()
-                            .unwrap();
-                        let mint1: [u8; 32] = pool_data[RAYDIUM_OFF_MINT1..RAYDIUM_OFF_MINT1 + 32]
-                            .try_into()
-                            .unwrap();
-                        mint0 == config.collateral_mint || mint1 == config.collateral_mint
-                    } else {
-                        // Meteora DLMM
-                        const METEORA_OFF_X: usize = 81;
-                        const METEORA_OFF_Y: usize = 113;
-                        if pool_data.len() < METEORA_OFF_Y + 32 {
-                            return Err(ProgramError::InvalidAccountData);
-                        }
-                        let x_mint: [u8; 32] = pool_data[METEORA_OFF_X..METEORA_OFF_X + 32]
-                            .try_into()
-                            .unwrap();
-                        let y_mint: [u8; 32] = pool_data[METEORA_OFF_Y..METEORA_OFF_Y + 32]
-                            .try_into()
-                            .unwrap();
-                        x_mint == config.collateral_mint || y_mint == config.collateral_mint
-                    };
-
-                    if !mint_matches {
-                        msg!("SetDexPool: pool mints do not include market collateral_mint");
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                }
-
-                config.dex_pool = pool.to_bytes();
-                state::write_config(&mut data, &config);
-
-                msg!("SetDexPool: pinned pool {} for HYPERP market {}", pool, a_slab.key);
+                handle_set_dex_pool(program_id, accounts, pool)?;
             }
 
             // InitMatcherCtx (Tag 75): CPI to matcher program to initialize a matcher context.
@@ -12022,98 +5530,7346 @@ pub mod processor {
                 fee_to_insurance_bps,
                 skew_spread_mult_bps,
             } => {
-                accounts::expect_len(accounts, 5)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-                let a_matcher_ctx = &accounts[2];
-                let a_matcher_prog = &accounts[3];
-                let a_lp_pda = &accounts[4];
+                handle_init_matcher_ctx(program_id, accounts, lp_idx, kind, trading_fee_bps, base_spread_bps, max_total_bps, impact_k_bps, liquidity_notional_e6, max_fill_abs, max_inventory_abs, fee_to_insurance_bps, skew_spread_mult_bps)?;
+            }
+        }
+        Ok(())
+    }
 
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_matcher_ctx)?;
+    // --- InitMarket ---
+    #[inline(never)]
+    fn handle_init_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        admin: Pubkey,
+        collateral_mint: Pubkey,
+        index_feed_id: [u8; 32],
+        max_staleness_secs: u64,
+        conf_filter_bps: u16,
+        invert: u8,
+        unit_scale: u32,
+        initial_mark_price_e6: u64,
+        max_maintenance_fee_per_slot: u128,
+        max_insurance_floor: u128,
+        min_oracle_price_cap_e2bps: u64,
+        insurance_withdraw_max_bps: u16,
+        insurance_withdraw_cooldown_slots: u64,
+        max_insurance_floor_change_per_day: u128,
+        risk_params: RiskParams,
+        insurance_floor: u128,
+        permissionless_resolve_stale_slots: u64,
+        custom_funding_horizon: Option<u64>,
+        custom_funding_k: Option<u64>,
+        custom_max_premium: Option<i64>,
+        custom_max_per_slot: Option<i64>,
+        mark_min_fee: u64,
+        force_close_delay_slots: u64,
+    ) -> ProgramResult {
+        // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
+        // (feed_id is now passed in instruction data, not as account)
+        accounts::expect_len(accounts, 9)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_mint = &accounts[2];
+        let a_vault = &accounts[3];
 
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
 
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
+        // Ensure instruction data matches the signer
+        if admin != *a_admin.key {
+            return Err(ProgramError::InvalidInstructionData);
+        }
 
-                let engine = zc::engine_ref(&data)?;
-                check_idx(engine, lp_idx)?;
-                let lp_acc = &engine.accounts[lp_idx as usize];
+        // SECURITY (H1): Enforce collateral_mint matches the account
+        // This prevents signers from being confused by mismatched instruction data
+        if collateral_mint != *a_mint.key {
+            return Err(ProgramError::InvalidInstructionData);
+        }
 
-                if lp_acc.matcher_program == [0u8; 32] {
-                    return Err(ProgramError::InvalidArgument);
+        // SECURITY (H2): Validate mint is a real SPL Token mint
+        // Check owner == spl_token::ID and data length == Mint::LEN (82 bytes)
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program_pack::Pack;
+            use spl_token::state::Mint;
+            if *a_mint.owner != spl_token::ID {
+                return Err(ProgramError::IllegalOwner);
+            }
+            if a_mint.data_len() != Mint::LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // Verify mint is initialized by unpacking
+            let mint_data = a_mint.try_borrow_data()?;
+            let _ = Mint::unpack(&mint_data)?;
+        }
+
+        // invert must be 0 or 1 (boolean stored as u8)
+        if invert > 1 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
+        if conf_filter_bps > 10_000 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // Validate unit_scale: reject huge values that make most deposits credit 0 units
+        if !crate::verify::init_market_scale_ok(unit_scale) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // Margin params: initial >= maintenance, both non-zero, initial <= 100%
+        if risk_params.initial_margin_bps == 0
+            || risk_params.maintenance_margin_bps == 0
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if risk_params.initial_margin_bps > 10_000 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // insurance_withdraw_max_bps is a percentage (0..=10_000)
+        if insurance_withdraw_max_bps > 10_000 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // If live withdrawals are enabled, require an explicit cooldown
+        // (0 would fall through to DEFAULT which may surprise the admin).
+        if insurance_withdraw_max_bps > 0 && insurance_withdraw_cooldown_slots == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // max_staleness_secs: reject 0 (would brick oracle reads —
+        // any non-zero age > 0 fails the staleness check).
+        if max_staleness_secs == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Hyperp mode validation: if index_feed_id is all zeros, require initial_mark_price_e6
+        let is_hyperp = index_feed_id == [0u8; 32];
+        if is_hyperp && initial_mark_price_e6 == 0 {
+            // Hyperp mode requires a non-zero initial mark price
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Normalize initial mark price to engine-space (invert + scale).
+        // All Hyperp internal prices must be in engine-space.
+        let initial_mark_price_e6 = if is_hyperp {
+            let p = crate::verify::to_engine_price(initial_mark_price_e6, invert, unit_scale)
+                .ok_or(PercolatorError::OracleInvalid)?;
+            // Enforce MAX_ORACLE_PRICE at genesis — same invariant as runtime ingress
+            if p > percolator::MAX_ORACLE_PRICE {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            p
+        } else {
+            initial_mark_price_e6
+        };
+
+        // Validate per-market admin limits (must be set at init time).
+        // Bounds-check against engine-level constants to prevent admin
+        // from setting values that violate engine invariants.
+        if max_maintenance_fee_per_slot == 0
+            || max_maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if max_insurance_floor == 0
+            || max_insurance_floor > percolator::MAX_VAULT_TVL
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // Validate initial insurance_floor against per-market limit
+        if insurance_floor > max_insurance_floor {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // Oracle cap floor: hard-bounded to MAX (100%)
+        if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // Maintenance fee must not exceed the immutable per-market ceiling.
+        if risk_params.maintenance_fee_per_slot.get() > max_maintenance_fee_per_slot {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Permissionless resolve: if enabled, must exceed max_crank_staleness
+        // to prevent accidental instant-resolution from one missed crank.
+        if permissionless_resolve_stale_slots > 0
+            && permissionless_resolve_stale_slots <= risk_params.max_crank_staleness_slots
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // Liveness: if permissionless resolution is enabled, force_close must
+        // also be enabled. Otherwise abandoned accounts on resolved markets
+        // with burned admin have no cleanup path.
+        if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Validate custom funding parameters (same checks as UpdateConfig).
+        // These are immutable after init for governance-free deployments.
+        if let Some(h) = custom_funding_horizon {
+            if h == 0 {
+                return Err(PercolatorError::InvalidConfigParam.into());
+            }
+        }
+        if let Some(k) = custom_funding_k {
+            if k > 100_000 {
+                return Err(PercolatorError::InvalidConfigParam.into());
+            }
+        }
+        if let Some(mp) = custom_max_premium {
+            if mp < 0 {
+                return Err(PercolatorError::InvalidConfigParam.into());
+            }
+        }
+        if let Some(ms) = custom_max_per_slot {
+            if ms < 0 || ms > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT {
+                return Err(PercolatorError::InvalidConfigParam.into());
+            }
+        }
+        // mark_min_fee upper bound: prevent setting so high that EWMA never updates
+        if mark_min_fee > percolator::MAX_PROTOCOL_FEE_ABS as u64 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+
+        // Check magic BEFORE any unsafe cast — raw bytes may contain
+        // invalid enum discriminants that would be UB if cast to RiskEngine.
+        let header = state::read_header(&data);
+        if header.magic == MAGIC {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+
+        let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_vault_empty(a_vault, &auth, a_mint.key, a_vault.key)?;
+
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+
+        // Initialize engine in-place (zero-copy) to avoid stack overflow.
+        let a_clock = &accounts[5];
+        let a_oracle = &accounts[7];
+        let clock = Clock::from_account_info(a_clock)?;
+        // Engine v12 requires init_oracle_price > 0.
+        // Hyperp: use the normalized initial mark price.
+        // Non-Hyperp: use 1 as sentinel — the real oracle price is
+        // established on the first KeeperCrank via accrue_market_to.
+        // This is safe because no trades can happen before a crank
+        // (require_fresh_crank gate in engine), and the first
+        // accrue_market_to overwrites last_oracle_price.
+        let init_price = if is_hyperp { initial_mark_price_e6 } else { 1 };
+
+        // Prevalidate all engine RiskParams invariants to return
+        // ProgramError instead of panicking inside engine.init_in_place().
+        {
+            let p = &risk_params;
+            if (p.max_accounts as usize) > percolator::MAX_ACCOUNTS || p.max_accounts == 0 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.maintenance_margin_bps > p.initial_margin_bps
+                || p.initial_margin_bps > 10_000
+            {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.min_nonzero_mm_req == 0
+                || p.min_nonzero_mm_req >= p.min_nonzero_im_req
+                || p.min_nonzero_im_req > p.min_initial_deposit.get()
+            {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.min_initial_deposit.get() == 0
+                || p.min_initial_deposit.get() > percolator::MAX_VAULT_TVL
+            {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.min_liquidation_abs.get() > p.liquidation_fee_cap.get()
+                || p.liquidation_fee_cap.get() > percolator::MAX_PROTOCOL_FEE_ABS
+            {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.maintenance_fee_per_slot.get() > percolator::MAX_MAINTENANCE_FEE_PER_SLOT {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if p.insurance_floor.get() > percolator::MAX_VAULT_TVL {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            // new_account_fee must be payable: 0 <= fee <= MAX_VAULT_TVL
+            if p.new_account_fee.get() > percolator::MAX_VAULT_TVL {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+        }
+
+        let engine = zc::engine_mut(&mut data)?;
+        engine.init_in_place(risk_params, clock.slot, init_price);
+        // init_in_place sets last_crank_slot = 0; override to init slot
+        // so first crank doesn't see a huge staleness gap.
+        engine.last_crank_slot = clock.slot;
+
+        let config = MarketConfig {
+            collateral_mint: a_mint.key.to_bytes(),
+            vault_pubkey: a_vault.key.to_bytes(),
+            index_feed_id,
+            max_staleness_secs,
+            conf_filter_bps,
+            vault_authority_bump: bump,
+            invert,
+            unit_scale,
+            // Funding parameters (custom overrides or defaults)
+            funding_horizon_slots: custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS),
+            funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
+            funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
+            funding_max_bps_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_BPS_PER_SLOT),
+            // Threshold parameters (defaults)
+            thresh_floor: DEFAULT_THRESH_FLOOR,
+            thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
+            thresh_update_interval_slots: DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
+            thresh_step_bps: DEFAULT_THRESH_STEP_BPS,
+            thresh_alpha_bps: DEFAULT_THRESH_ALPHA_BPS,
+            thresh_min: DEFAULT_THRESH_MIN,
+            thresh_max: DEFAULT_THRESH_MAX.min(max_insurance_floor),
+            thresh_min_step: DEFAULT_THRESH_MIN_STEP,
+            // Oracle authority (disabled by default - use Pyth/Chainlink)
+            // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
+            oracle_authority: [0u8; 32],
+            authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+            authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
+            // Oracle price circuit breaker
+            // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
+            // Default: disabled for non-Hyperp, 1% per slot for Hyperp
+            oracle_price_cap_e2bps: if is_hyperp {
+                DEFAULT_HYPERP_PRICE_CAP_E2BPS.max(min_oracle_price_cap_e2bps)
+            } else {
+                // Non-Hyperp: start at the immutable floor so the circuit
+                // breaker is active from genesis. 0 floor = no breaker.
+                min_oracle_price_cap_e2bps
+            },
+            last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+            // Per-market admin limits (immutable after init)
+            max_maintenance_fee_per_slot,
+            max_insurance_floor,
+            min_oracle_price_cap_e2bps,
+            // Insurance withdrawal limits (immutable after init)
+            insurance_withdraw_max_bps,
+            _iw_padding: [0u8; 6],
+            insurance_withdraw_cooldown_slots,
+            _iw_padding2: 0,
+            max_insurance_floor_change_per_day,
+            resolution_slot: clock.slot,
+            last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
+            // Hyperp: stamp init slot so stale check works from genesis.
+            // Non-Hyperp: 0 (no mark push concept).
+            last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
+            last_insurance_withdraw_slot: 0,
+            _liw_padding: 0,
+            // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
+            mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+            mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
+            mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
+            _ewma_padding: 0,
+            permissionless_resolve_stale_slots,
+            // Init to clock.slot so permissionless resolution timer starts
+            // from market creation, not slot 0 (prevents immediate resolution
+            // if the oracle happens to be down during market creation).
+            last_good_oracle_slot: clock.slot,
+            mark_min_fee,
+            force_close_delay_slots,
+            // DEX pool pinning: initialized to all-zeros (not set).
+            // Admin must call SetDexPool (tag 74) for HYPERP markets.
+            dex_pool: [0u8; 32],
+        };
+        // Hyperp markets must have non-zero cap for index smoothing
+        if is_hyperp && config.oracle_price_cap_e2bps == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        state::write_config(&mut data, &config);
+
+        let new_header = SlabHeader {
+            magic: MAGIC,
+            version: 0, // unused, no versioning
+            bump,
+            _padding: [0; 3],
+            admin: a_admin.key.to_bytes(),
+            _reserved: [0; 24],
+        };
+        state::write_header(&mut data, &new_header);
+        // Step 4: Explicitly initialize nonce to 0 for determinism
+        state::write_req_nonce(&mut data, 0);
+        // Write market_start_slot (§2.1): captures creation slot for rewards program.
+        // Shares _reserved[8..16] with last_thr_update_slot (initialized to same value).
+        state::write_market_start_slot(&mut data, clock.slot);
+
+        // PERC-623: Optional keeper fund PDA initialization.
+        // accounts[9] = keeper_fund PDA (writable), accounts[10] = system_program
+        // Backward compatible: callers passing only 9 accounts skip this.
+        if accounts.len() >= 11 {
+            let a_keeper_fund = &accounts[9];
+            let a_system_program = &accounts[10];
+            accounts::expect_writable(a_keeper_fund)?;
+
+            if *a_system_program.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+
+            let (expected_pda, pda_bump) = Pubkey::find_program_address(
+                &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            if *a_keeper_fund.key != expected_pda {
+                return Err(ProgramError::InvalidSeeds);
+            }
+
+            let rent = solana_program::rent::Rent::get()?;
+            let rent_lamports =
+                rent.minimum_balance(crate::keeper_fund::KEEPER_FUND_STATE_LEN);
+            let min_fund = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK
+                .saturating_mul(100)
+                .saturating_add(rent_lamports);
+
+            let bump_bytes = [pda_bump];
+            let signer_seeds: &[&[u8]] = &[
+                crate::keeper_fund::KEEPER_FUND_SEED,
+                a_slab.key.as_ref(),
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_admin.key,
+                    &expected_pda,
+                    min_fund,
+                    crate::keeper_fund::KEEPER_FUND_STATE_LEN as u64,
+                    program_id,
+                ),
+                &[
+                    a_admin.clone(),
+                    a_keeper_fund.clone(),
+                    a_system_program.clone(),
+                ],
+                &[signer_seeds],
+            )?;
+
+            let fund_balance = min_fund.saturating_sub(rent_lamports);
+            let default_reward = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK;
+            let fund_state = crate::keeper_fund::KeeperFundState {
+                magic: crate::keeper_fund::KEEPER_FUND_MAGIC,
+                bump: pda_bump,
+                depleted_pause: 0,
+                _pad: [0u8; 6],
+                balance: fund_balance,
+                reward_per_crank: default_reward,
+                total_rewarded: 0,
+                total_topped_up: 0,
+            };
+            let mut fund_data = a_keeper_fund
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::keeper_fund::write_state(&mut fund_data, &fund_state);
+
+            msg!(
+                "PERC-623: KeeperFund initialized — balance={} reward_per_crank={}",
+                fund_balance,
+                default_reward
+            );
+        }
+        Ok(())
+    }
+
+    // --- InitUser ---
+    #[inline(never)]
+    fn handle_init_user<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        fee_payment: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_clock = &accounts[5];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block new users when market is resolved
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        let clock = Clock::from_account_info(a_clock)?;
+
+        // Reject misaligned deposits — dust would be silently donated
+        let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
+        if dust_check != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Transfer base tokens to vault
+        collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
+
+        // Convert base tokens to units for engine
+        let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
+
+        let engine = zc::engine_mut(&mut data)?;
+        // Canonical deposit-based materialization (spec §10.3).
+        let idx = engine.free_head;
+        engine.deposit(idx, units as u128, 0, clock.slot)
+            .map_err(map_risk_error)?;
+        // Charge new_account_fee: deduct from capital → insurance
+        // Tokens are already in the vault from deposit() above, so we
+        // only move the internal accounting (capital → insurance) without
+        // touching engine.vault (which was already incremented by deposit).
+        // Charge new_account_fee: capital → insurance.
+        // engine.set_capital() is test_visible! (private in prod), so manual
+        // adjustment is required. Mirrors set_capital's signed-delta logic.
+        let fee = engine.params.new_account_fee.get();
+        if fee > 0 {
+            let cap = engine.accounts[idx as usize].capital.get();
+            if cap < fee {
+                return Err(PercolatorError::EngineInsufficientBalance.into());
+            }
+            engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
+            engine.c_tot = percolator::U128::new(
+                engine.c_tot.get().checked_sub(fee)
+                    .ok_or(ProgramError::ArithmeticOverflow)?,
+            );
+            let new_ins = engine.insurance_fund.balance.get()
+                .checked_add(fee)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            engine.insurance_fund.balance = percolator::U128::new(new_ins);
+        }
+        engine.set_owner(idx, a_user.key.to_bytes())
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- InitLP ---
+    #[inline(never)]
+    fn handle_init_lp<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        matcher_program: Pubkey,
+        matcher_context: Pubkey,
+        fee_payment: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_clock = &accounts[5];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block new LPs when market is resolved
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        let clock = Clock::from_account_info(a_clock)?;
+
+        // Reject misaligned deposits — dust would be silently donated
+        let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
+        if dust_check != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Transfer base tokens to vault
+        collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
+
+        // Convert base tokens to units for engine
+        let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
+
+        let engine = zc::engine_mut(&mut data)?;
+        let idx = engine.free_head;
+        engine.deposit(idx, units as u128, 0, clock.slot)
+            .map_err(map_risk_error)?;
+        // Charge new_account_fee: capital → insurance (no vault change)
+        // Charge new_account_fee: capital → insurance.
+        // engine.set_capital() is test_visible! (private in prod), so manual
+        // adjustment is required. Mirrors set_capital's signed-delta logic.
+        let fee = engine.params.new_account_fee.get();
+        if fee > 0 {
+            let cap = engine.accounts[idx as usize].capital.get();
+            if cap < fee {
+                return Err(PercolatorError::EngineInsufficientBalance.into());
+            }
+            engine.accounts[idx as usize].capital = percolator::U128::new(cap - fee);
+            engine.c_tot = percolator::U128::new(
+                engine.c_tot.get().checked_sub(fee)
+                    .ok_or(ProgramError::ArithmeticOverflow)?,
+            );
+            let new_ins = engine.insurance_fund.balance.get()
+                .checked_add(fee)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            engine.insurance_fund.balance = percolator::U128::new(new_ins);
+        }
+        // Set LP fields
+        engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
+        engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
+        engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
+        engine.set_owner(idx, a_user.key.to_bytes())
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- DepositCollateral ---
+    #[inline(never)]
+    fn handle_deposit_collateral<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_clock = &accounts[5];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block deposits when market is resolved
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        let clock = Clock::from_account_info(a_clock)?;
+
+        // Reject misaligned deposits — dust would be silently donated
+        let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
+        if dust_check != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Transfer base tokens to vault
+        collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
+
+        // Convert base tokens to units for engine
+        let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        check_idx(engine, user_idx)?;
+
+        // Owner authorization via verify helper (Kani-provable)
+        let owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        engine
+            .deposit(user_idx, units as u128, 0, clock.slot)
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- WithdrawCollateral ---
+    #[inline(never)]
+    fn handle_withdraw_collateral<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 8)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_vault = &accounts[2];
+        let a_user_ata = &accounts[3];
+        let a_vault_pda = &accounts[4];
+        let a_token = &accounts[5];
+        let a_clock = &accounts[6];
+        let a_oracle_idx = &accounts[7];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let mut config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let derived_pda = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        accounts::expect_key(a_vault_pda, &derived_pda)?;
+
+        verify_vault(
+            a_vault,
+            &derived_pda,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        let resolved = state::is_resolved(&data);
+        let clock = Clock::from_account_info(a_clock)?;
+        let price = if resolved {
+            let settlement = config.authority_price_e6;
+            if settlement == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            settlement
+        } else {
+            let is_hyperp = oracle::is_hyperp_mode(&config);
+            let px = if is_hyperp {
+                let eng = zc::engine_ref(&data)?;
+                let last_slot = eng.current_slot;
+                oracle::get_engine_oracle_price_e6(
+                    last_slot, clock.slot, clock.unix_timestamp,
+                    &mut config, a_oracle_idx,
+                )?
+            } else {
+                read_price_and_stamp(&mut config, a_oracle_idx, clock.unix_timestamp, clock.slot)?
+            };
+            state::write_config(&mut data, &config);
+            px
+        };
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        check_idx(engine, user_idx)?;
+
+        // Owner authorization via verify helper (Kani-provable)
+        let owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        // withdraw_not_atomic internally calls touch_account_full.
+        // No separate pre-touch needed — it would run without lifecycle
+        // handling and leave stale side state.
+
+        // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
+        if config.unit_scale != 0 && amount % config.unit_scale as u64 != 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // Convert requested base tokens to units
+        let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
+
+        // Use frozen time on resolved markets
+        let withdraw_slot = if resolved { config.resolution_slot } else { clock.slot };
+        engine
+            .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
+                compute_current_funding_rate(&config))
+            .map_err(map_risk_error)?;
+
+        // Convert units back to base tokens for payout (checked to prevent silent overflow)
+        let base_to_pay =
+            crate::units::units_to_base_checked(units_requested, config.unit_scale)
+                .ok_or(PercolatorError::EngineOverflow)?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_user_ata,
+            a_vault_pda,
+            base_to_pay,
+            &signer_seeds,
+        )?;
+        Ok(())
+    }
+
+    // --- KeeperCrank ---
+    #[inline(never)]
+    fn handle_keeper_crank<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        caller_idx: u16,
+        candidates: alloc::vec::Vec<(u16, Option<percolator::LiquidationPolicy>)>,
+    ) -> ProgramResult {
+        use crate::constants::CRANK_NO_CALLER;
+
+        accounts::expect_len(accounts, 4)?;
+        let a_caller = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_clock = &accounts[2];
+        let a_oracle = &accounts[3];
+
+        // Permissionless mode: caller_idx == u16::MAX means anyone can crank.
+        // Resolved markets are always permissionless (settlement is idempotent).
+        let permissionless = caller_idx == CRANK_NO_CALLER;
+
+        if !permissionless {
+            accounts::expect_signer(a_caller)?;
+        }
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Check if market is resolved - frozen time mode.
+        // NOTE: resolved crank is effectively permissionless regardless of
+        // caller_idx — the resolved path returns before owner-match checks.
+        // This is intentional: settlement is idempotent and no funds move.
+        // All resolved operations use engine.current_slot (frozen at
+        // last pre-resolution crank) instead of clock.slot.
+        if state::is_resolved(&data) {
+            let config = state::read_config(&data);
+            let settlement_price = config.authority_price_e6;
+            if settlement_price == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // Use resolution_slot (snapshotted in ResolveMarket)
+            let frozen_slot = config.resolution_slot;
+
+            // Dust sweep: resolved crank must also sweep dust so
+            // CloseSlab's dust_base == 0 check can eventually pass.
+            let dust_before = state::read_dust_base(&data);
+            let unit_scale = config.unit_scale;
+
+            let engine = zc::engine_mut(&mut data)?;
+
+            // Settle PnL for accounts in a paginated manner.
+            // touch_account_full settles A/K mark-to-market PnL at
+            // settlement price. Position zeroing and account close
+            // happen when users call CloseAccount (close_account_resolved).
+            const BATCH_SIZE: u16 = 8;
+            let start = engine.crank_cursor;
+            let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
+
+            for idx in start..end {
+                if engine.is_used(idx as usize) {
+                    // Best-effort settlement at fixed settlement price.
+                    //
+                    // Convergence argument (verified in engine source):
+                    //   accrue_market_to writes last_oracle_price LAST,
+                    //   after all K coefficient updates. If K updates fail
+                    //   (checked arithmetic), stored price is NOT updated,
+                    //   so the next call recomputes the same delta_p. After
+                    //   a successful completion, subsequent calls with the
+                    //   same fixed price hit the early return (delta_p=0).
+                    //
+                    //   Therefore: partial failure → retry → identical
+                    //   final state as single success. Idempotent after
+                    //   first successful application.
+                    //
+                    // Accounts where touch never succeeds (ADL overflow)
+                    // are force-closed via AdminForceCloseAccount, which
+                    // does best-effort touch then falls through to
+                    // close_account_resolved using stored local state.
+                    // Resolved crank does NOT call touch_account_full.
+                    // touch_account_full_not_atomic can leave partial state on
+                    // error, and aborting on one bad account would stall the
+                    // entire batch. Accounts are settled by ForceCloseResolved
+                    // which handles K-pair fallback atomically.
                 }
+            }
 
-                if lp_acc.matcher_program != a_matcher_prog.key.to_bytes() {
-                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+            // Update crank cursor (do NOT advance current_slot — frozen)
+            engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 {
+                0
+            } else {
+                end
+            };
+
+            // Sweep dust to insurance fund.
+            // On resolved markets, also forgive sub-scale remainder
+            // (worth < 1 engine unit, no engine accounting entry).
+            let forgive_dust = if unit_scale > 0 {
+                let scale = unit_scale as u64;
+                if dust_before >= scale {
+                    let units_to_sweep = dust_before / scale;
+                    engine.top_up_insurance_fund(
+                        units_to_sweep as u128, frozen_slot,
+                    ).map_err(map_risk_error)?;
                 }
+                true
+            } else {
+                false
+            };
 
-                if lp_acc.matcher_context != a_matcher_ctx.key.to_bytes() {
-                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+            // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
+            // Propagate CorruptState (real invariant violation), ignore other
+            // errors (side-reset may fail on frozen ADL state post-resolution).
+            let mut ctx = percolator::InstructionContext::new();
+            match engine.run_end_of_instruction_lifecycle(
+                &mut ctx,
+                compute_current_funding_rate(&config),
+            ) {
+                Ok(()) => {}
+                Err(percolator::RiskError::CorruptState) => {
+                    return Err(map_risk_error(percolator::RiskError::CorruptState));
                 }
+                Err(_) => {} // non-fatal on resolved markets
+            }
 
-                if a_matcher_ctx.owner != a_matcher_prog.key {
-                    return Err(ProgramError::IncorrectProgramId);
-                }
+            // engine borrow ends here (last use above).
+            // Write dust_base AFTER dropping the engine borrow to avoid
+            // aliasing conflict with state::write_dust_base.
+            if forgive_dust && dust_before != 0 {
+                // Forgive any sub-scale remainder — on resolved markets
+                // no new dust can accumulate, so this is terminal cleanup.
+                state::write_dust_base(&mut data, 0);
+            }
 
-                if !a_matcher_prog.executable {
+            return Ok(());
+        }
+
+        let mut config = state::read_config(&data);
+
+        // Read dust before borrowing engine (for dust sweep later)
+        let dust_before = state::read_dust_base(&data);
+        let unit_scale = config.unit_scale;
+
+        let clock = Clock::from_account_info(a_clock)?;
+
+        // Hyperp mode: use get_engine_oracle_price_e6 for rate-limited index smoothing
+        // Otherwise: use read_price_clamped as before
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let engine_last_slot = {
+            let engine = zc::engine_ref(&data)?;
+            engine.current_slot
+        };
+
+        let price = if is_hyperp {
+            // Hyperp mode: update index toward mark with rate limiting
+            oracle::get_engine_oracle_price_e6(
+                engine_last_slot,
+                clock.slot,
+                clock.unix_timestamp,
+                &mut config,
+                a_oracle,
+            )?
+        } else {
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
+        };
+
+        state::write_config(&mut data, &config);
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        // Crank authorization:
+        // - Permissionless mode (caller_idx == u16::MAX): anyone can crank
+        // - Self-crank mode: caller_idx must be a valid, existing account owned by signer
+        if !permissionless {
+            check_idx(engine, caller_idx)?;
+            let stored_owner = engine.accounts[caller_idx as usize].owner;
+            if !crate::verify::owner_ok(stored_owner, a_caller.key.to_bytes()) {
+                return Err(PercolatorError::EngineUnauthorized.into());
+            }
+        }
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: keeper_crank_start");
+            sol_log_compute_units();
+        }
+        let funding_rate = compute_current_funding_rate(&config);
+        let _outcome = engine
+            .keeper_crank_not_atomic(
+                clock.slot,
+                price,
+                &candidates,
+                percolator::LIQ_BUDGET_PER_CRANK,
+                funding_rate,
+            )
+            .map_err(map_risk_error)?;
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: keeper_crank_end");
+            sol_log_compute_units();
+        }
+
+        // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund
+        // Done before copying stats so insurance balance reflects the sweep
+        let remaining_dust = if unit_scale > 0 {
+            let scale = unit_scale as u64;
+            if dust_before >= scale {
+                let units_to_sweep = dust_before / scale;
+                engine
+                    .top_up_insurance_fund(units_to_sweep as u128, clock.slot)
+                    .map_err(map_risk_error)?;
+                Some(dust_before % scale)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Copy stats before threshold update (avoid borrow conflict)
+        let liqs = engine.lifetime_liquidations;
+        let ins_low = engine.insurance_fund.balance.get() as u64;
+
+        // Spec §2.2.1: I_floor is immutable — no auto-update.
+        // Insurance floor is set at InitMarket and never changes.
+        // (EWMA auto-update removed per spec compliance.)
+
+        // Write remaining dust if sweep occurred
+        if let Some(dust) = remaining_dust {
+            state::write_dust_base(&mut data, dust);
+        }
+
+        // Debug: log lifetime counters (sol_log_64: tag=CRANK_STATS, liqs, max_accounts, insurance, 0)
+        // 0xC8A4C5 = "CRANK_STATS" tag; replaces msg!("CRANK_STATS") to save ~300 CU
+        sol_log_64(0xC8A4C5, liqs, MAX_ACCOUNTS as u64, ins_low, 0);
+        Ok(())
+    }
+
+    // --- TradeNoCpi ---
+    #[inline(never)]
+    fn handle_trade_no_cpi<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_idx: u16,
+        user_idx: u16,
+        size: i128,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 5)?;
+        let a_user = &accounts[0];
+        let a_lp = &accounts[1];
+        let a_slab = &accounts[2];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_signer(a_lp)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block trading when market is resolved
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+
+        let clock = Clock::from_account_info(&accounts[3])?;
+        let a_oracle = &accounts[4];
+
+        // Hyperp mode: reject TradeNoCpi to prevent mark price manipulation
+        // All trades must go through TradeCpi with a pinned matcher
+        if oracle::is_hyperp_mode(&config) {
+            return Err(PercolatorError::HyperpTradeNoCpiDisabled.into());
+        }
+
+        // Read oracle price with circuit-breaker clamping
+        let price =
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?;
+        state::write_config(&mut data, &config);
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        check_idx(engine, lp_idx)?;
+        check_idx(engine, user_idx)?;
+
+        // TradeNoCpi: no matcher check. Both sides are bilateral signers,
+        // no CPI is invoked. Matcher config only matters for TradeCpi.
+
+        let u_owner = engine.accounts[user_idx as usize].owner;
+
+        // Owner authorization via verify helper (Kani-provable)
+        if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+        let l_owner = engine.accounts[lp_idx as usize].owner;
+        if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        // Side-mode gating is handled inside engine.execute_trade_not_atomic()
+
+        // Snapshot insurance fund balance for fee-weighted EWMA.
+        // The delta after execute_trade = fees_collected - losses_absorbed.
+        // NOTE: If loss absorption occurs during the same trade (spec §5.4),
+        // delta undercounts the actual fee. This is the conservative direction:
+        // mark is stickier during volatile loss-absorption events, never
+        // more manipulable. A future engine API could expose fee_paid directly.
+        let ins_before = engine.insurance_fund.balance.get();
+
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
+            sol_log_compute_units();
+        }
+        let funding_rate = compute_current_funding_rate(&config);
+        execute_trade_with_matcher(
+            engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
+            funding_rate,
+        ).map_err(map_risk_error)?;
+
+        // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
+        // NOTE: NoOpMatcher fills at oracle price, so mark_ewma converges to oracle
+        // for TradeNoCpi trades. This means TradeNoCpi-only markets have zero premium
+        // and zero funding. Markets that need funding must use TradeCpi with a matcher
+        // that can set exec_price != oracle (creating mark/index divergence).
+        // Only when circuit breaker is active (cap > 0) — without cap,
+        // exec prices are unbounded and EWMA would be manipulable.
+        if config.oracle_price_cap_e2bps > 0 {
+            let clamped_price = oracle::clamp_oracle_price(
+                crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
+                price,
+                config.oracle_price_cap_e2bps,
+            );
+            // fee_paid = actual fee collected into insurance (post - pre).
+            // This is exact: no overestimate from pre-trade capital snapshot.
+            let fee_paid_nocpi = if config.mark_min_fee > 0 {
+                let ins_after = engine.insurance_fund.balance.get();
+                let delta = ins_after.saturating_sub(ins_before);
+                core::cmp::min(delta, u64::MAX as u128) as u64
+            } else { 0u64 };
+            let old_ewma = config.mark_ewma_e6;
+            config.mark_ewma_e6 = crate::verify::ewma_update(
+                old_ewma, clamped_price,
+                config.mark_ewma_halflife_slots,
+                config.mark_ewma_last_slot, clock.slot,
+                fee_paid_nocpi,
+                config.mark_min_fee,
+            );
+            // Only update the EWMA clock when the mark actually moved.
+            // Zero-weight trades must not refresh the clock — that would
+            // shrink future dt and damp legitimate updates.
+            if config.mark_ewma_e6 != old_ewma {
+                config.mark_ewma_last_slot = clock.slot;
+            }
+            // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
+            // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
+        }
+
+        // Write updated config (mark_ewma changed)
+        state::write_config(&mut data, &config);
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
+            sol_log_compute_units();
+        }
+        Ok(())
+    }
+
+    // --- TradeCpi ---
+    #[inline(never)]
+    fn handle_trade_cpi<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_idx: u16,
+        user_idx: u16,
+        size: i128,
+        limit_price_e6: u64, // 0 = no limit (backward compat),
+    ) -> ProgramResult {
+        // Phase 1: Updated account layout - lp_pda must be in accounts
+        accounts::expect_len(accounts, 8)?;
+        let a_user = &accounts[0];
+        let a_lp_owner = &accounts[1];
+        let a_slab = &accounts[2];
+        let a_clock = &accounts[3];
+        let a_oracle = &accounts[4];
+        let a_matcher_prog = &accounts[5];
+        let a_matcher_ctx = &accounts[6];
+        let a_lp_pda = &accounts[7];
+
+        accounts::expect_signer(a_user)?;
+        // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
+        // LP owner delegated trade authorization to the matcher program.
+        // The matcher CPI (via LP PDA invoke_signed) validates the trade.
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_matcher_ctx)?;
+
+        // Matcher shape validation via verify helper (Kani-provable)
+        let matcher_shape = crate::verify::MatcherAccountsShape {
+            prog_executable: a_matcher_prog.executable,
+            ctx_executable: a_matcher_ctx.executable,
+            ctx_owner_is_prog: a_matcher_ctx.owner == a_matcher_prog.key,
+            ctx_len_ok: crate::verify::ctx_len_sufficient(a_matcher_ctx.data_len()),
+        };
+        if !crate::verify::matcher_shape_ok(matcher_shape) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Phase 1: Validate lp_pda is the correct PDA, system-owned, empty data, 0 lamports
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (expected_lp_pda, bump) = Pubkey::find_program_address(
+            &[b"lp", a_slab.key.as_ref(), &lp_bytes],
+            program_id,
+        );
+        // PDA key validation via verify helper (Kani-provable)
+        if !crate::verify::pda_key_matches(
+            expected_lp_pda.to_bytes(),
+            a_lp_pda.key.to_bytes(),
+        ) {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        // PDA key match is sufficient — only this program can sign
+        // for it, so it's always system-owned with zero data.
+
+        // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
+        // Note: Use immutable borrow for reading to avoid ExternalAccountDataModified
+        // Nonce write is deferred until after execute_trade
+        let (lp_account_id, mut config, req_id, lp_matcher_prog, lp_matcher_ctx, engine_current_slot) = {
+            let data = a_slab.try_borrow_data()?;
+            slab_guard(program_id, a_slab, &*data)?;
+            require_initialized(&*data)?;
+
+            // Block trading when market is resolved
+            if state::is_resolved(&*data) {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let config = state::read_config(&*data);
+
+            // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
+            // Nonce advancement via verify helper (Kani-provable)
+            let nonce = state::read_req_nonce(&*data);
+            let req_id = crate::verify::nonce_on_success(nonce);
+
+            let engine = zc::engine_ref(&*data)?;
+
+            check_idx(engine, lp_idx)?;
+            check_idx(engine, user_idx)?;
+
+            // TradeCpi: require lp_idx has matcher config (non-zero matcher_program).
+            // The matcher program/context are used for CPI — zero fields would
+            // cause CPI to fail or route to the wrong program.
+            // This uses matcher config, not account kind, as the LP capability check.
+            if engine.accounts[lp_idx as usize].matcher_program == [0u8; 32] {
+                return Err(PercolatorError::EngineAccountKindMismatch.into());
+            }
+
+            // Owner authorization via verify helper (Kani-provable)
+            let u_owner = engine.accounts[user_idx as usize].owner;
+            if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+                return Err(PercolatorError::EngineUnauthorized.into());
+            }
+            let l_owner = engine.accounts[lp_idx as usize].owner;
+            if !crate::verify::owner_ok(l_owner, a_lp_owner.key.to_bytes()) {
+                return Err(PercolatorError::EngineUnauthorized.into());
+            }
+
+            let lp_acc = &engine.accounts[lp_idx as usize];
+            (
+                lp_acc.account_id,
+                config,
+                req_id,
+                lp_acc.matcher_program,
+                lp_acc.matcher_context,
+                engine.current_slot,
+            )
+        };
+
+        // Matcher identity binding via verify helper (Kani-provable)
+        if !crate::verify::matcher_identity_ok(
+            lp_matcher_prog,
+            lp_matcher_ctx,
+            a_matcher_prog.key.to_bytes(),
+            a_matcher_ctx.key.to_bytes(),
+        ) {
+            return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+        }
+
+        let clock = Clock::from_account_info(a_clock)?;
+        // Oracle price: Hyperp mode applies rate-limited index update
+        // via clamp_toward_with_dt (prevents stale-index manipulation).
+        // Non-Hyperp: standard circuit-breaker clamping.
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            oracle::get_engine_oracle_price_e6(
+                engine_current_slot, clock.slot, clock.unix_timestamp,
+                &mut config, a_oracle,
+            )?
+        } else {
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
+        };
+
+        // Note: We don't zero the matcher_ctx before CPI because we don't own it.
+        // Security is maintained by ABI validation which checks req_id (nonce),
+        // lp_account_id, and oracle_price_e6 all match the request parameters.
+
+        // Stack-allocated CPI data (67 bytes) — avoids heap allocation
+        let mut cpi_data = [0u8; MATCHER_CALL_LEN];
+        cpi_data[0] = MATCHER_CALL_TAG;
+        cpi_data[1..9].copy_from_slice(&req_id.to_le_bytes());
+        cpi_data[9..11].copy_from_slice(&lp_idx.to_le_bytes());
+        cpi_data[11..19].copy_from_slice(&lp_account_id.to_le_bytes());
+        cpi_data[19..27].copy_from_slice(&price.to_le_bytes());
+        cpi_data[27..43].copy_from_slice(&size.to_le_bytes());
+        // bytes 43..67 already zero (padding)
+
+        let metas = [
+            AccountMeta::new_readonly(*a_lp_pda.key, true),
+            AccountMeta::new(*a_matcher_ctx.key, false),
+        ];
+
+        let ix = SolInstruction {
+            program_id: *a_matcher_prog.key,
+            accounts: metas.to_vec(),
+            data: cpi_data.to_vec(),
+        };
+
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
+
+        // Phase 2: Use zc helper for CPI - slab not passed to avoid ExternalAccountDataModified
+        zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, a_matcher_prog, seeds)?;
+
+        let ctx_data = a_matcher_ctx.try_borrow_data()?;
+        let ret = crate::matcher_abi::read_matcher_return(&ctx_data)?;
+        // ABI validation via verify helper (Kani-provable)
+        let ret_fields = crate::verify::MatcherReturnFields {
+            abi_version: ret.abi_version,
+            flags: ret.flags,
+            exec_price_e6: ret.exec_price_e6,
+            exec_size: ret.exec_size,
+            req_id: ret.req_id,
+            lp_account_id: ret.lp_account_id,
+            oracle_price_e6: ret.oracle_price_e6,
+            reserved: ret.reserved,
+        };
+        if !crate::verify::abi_ok(ret_fields, lp_account_id, price, size, req_id) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        drop(ctx_data);
+
+        // User-side slippage protection.
+        // Normalize limit to engine-space (same invert+scale as exec_price).
+        // For inverted markets, inversion is order-reversing: a "better"
+        // raw buy price maps to a larger engine price, so inequalities flip.
+        if limit_price_e6 != 0 && ret.exec_size != 0 {
+            let limit_eng = crate::verify::to_engine_price(
+                limit_price_e6, config.invert, config.unit_scale,
+            ).ok_or(PercolatorError::OracleInvalid)?;
+            let inverted = config.invert != 0;
+            if size > 0 {
+                // Buying: raw user wants exec <= limit (pay no more)
+                // Normal:   exec_eng > limit_eng → reject
+                // Inverted: exec_eng < limit_eng → reject (order flipped)
+                let bad = if inverted {
+                    ret.exec_price_e6 < limit_eng
+                } else {
+                    ret.exec_price_e6 > limit_eng
+                };
+                if bad {
                     return Err(ProgramError::InvalidAccountData);
                 }
+            } else {
+                // Selling: raw user wants exec >= limit (receive no less)
+                // Normal:   exec_eng < limit_eng → reject
+                // Inverted: exec_eng > limit_eng → reject (order flipped)
+                let bad = if inverted {
+                    ret.exec_price_e6 > limit_eng
+                } else {
+                    ret.exec_price_e6 < limit_eng
+                };
+                if bad {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+        }
 
-                let lp_bytes = lp_idx.to_le_bytes();
-                let (expected_lp_pda, bump) = Pubkey::find_program_address(
-                    &[b"lp", a_slab.key.as_ref(), &lp_bytes],
-                    program_id,
+        // Zero-fill: ABI-valid no-op when matcher returns exec_size == 0
+        // with FLAG_PARTIAL_OK. Skip engine call which rejects size_q == 0.
+        // Zero-fill: no trade occurred, so do not persist oracle side effects.
+        // Revert last_effective_price_e6 for ALL markets — prevents repeated
+        // zero-fills from walking the circuit-breaker baseline toward the raw
+        // oracle price (Hyperp: index ratchet, non-Hyperp: baseline walk).
+        // SAFETY: mark_ewma_e6 is NOT reverted here because the EWMA update
+        // happens AFTER this early return (inside the exec_size != 0 branch below).
+        // Zero-fills never touch the EWMA, so no revert is needed.
+        if ret.exec_size == 0 {
+            let mut data = state::slab_data_mut(a_slab)?;
+            let pristine = state::read_config(&data);
+            config.last_effective_price_e6 = pristine.last_effective_price_e6;
+            config.last_hyperp_index_slot = pristine.last_hyperp_index_slot;
+            // Revert last_good_oracle_slot too — zero-fills must not refresh
+            // the oracle-death timer (prevents resolution-delay manipulation).
+            config.last_good_oracle_slot = pristine.last_good_oracle_slot;
+            state::write_config(&mut data, &config);
+            state::write_req_nonce(&mut data, req_id);
+            return Ok(());
+        }
+
+        let exec_price = ret.exec_price_e6;
+        // Reject extreme exec prices that would corrupt engine state
+        // or produce absurd PnL. Must check BEFORE engine call.
+        if exec_price > percolator::MAX_ORACLE_PRICE {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        {
+            let mut data = state::slab_data_mut(a_slab)?;
+            let engine = zc::engine_mut(&mut data)?;
+
+            let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
+
+            // Snapshot insurance for fee-weighted EWMA (delta approach).
+            // NOTE: delta = fees - losses_absorbed. Conservative undercount
+            // during volatile loss-absorption events (see TradeNoCpi comment).
+            let ins_before_cpi = engine.insurance_fund.balance.get();
+
+            #[cfg(feature = "cu-audit")]
+            {
+                msg!("CU_CHECKPOINT: trade_cpi_execute_start");
+                sol_log_compute_units();
+            }
+            let matcher = CpiMatcher {
+                exec_price,
+                exec_size: trade_size,
+            };
+            // Compute funding BEFORE trade (uses pre-fill state per anti-retroactivity)
+            let funding_rate = compute_current_funding_rate(&config);
+            execute_trade_with_matcher(
+                engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
+                funding_rate,
+            ).map_err(map_risk_error)?;
+            #[cfg(feature = "cu-audit")]
+            {
+                msg!("CU_CHECKPOINT: trade_cpi_execute_end");
+                sol_log_compute_units();
+            }
+            // Update trade-derived mark EWMA (all market types).
+            // Only when circuit breaker is active — without cap, exec prices
+            // are unbounded and EWMA would be manipulable.
+            if config.oracle_price_cap_e2bps > 0 {
+                let clamped_exec = oracle::clamp_oracle_price(
+                    crate::verify::mark_ewma_clamp_base(config.last_effective_price_e6),
+                    ret.exec_price_e6,
+                    config.oracle_price_cap_e2bps,
                 );
-                if *a_lp_pda.key != expected_lp_pda {
+                // fee_paid = actual fee collected into insurance (post - pre).
+                let fee_paid_cpi = if config.mark_min_fee > 0 {
+                    let ins_after_cpi = engine.insurance_fund.balance.get();
+                    let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                    core::cmp::min(delta, u64::MAX as u128) as u64
+                } else { 0u64 };
+                let old_ewma_cpi = config.mark_ewma_e6;
+                config.mark_ewma_e6 = crate::verify::ewma_update(
+                    old_ewma_cpi,
+                    clamped_exec,
+                    config.mark_ewma_halflife_slots,
+                    config.mark_ewma_last_slot,
+                    clock.slot,
+                    fee_paid_cpi,
+                    config.mark_min_fee,
+                );
+                // Only update EWMA clock when mark actually moved
+                if config.mark_ewma_e6 != old_ewma_cpi {
+                    config.mark_ewma_last_slot = clock.slot;
+                }
+                // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
+                // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
+            }
+
+            // Hyperp: also update authority_price (legacy mark field)
+            if is_hyperp {
+                config.authority_price_e6 = oracle::clamp_oracle_price(
+                    config.last_effective_price_e6,
+                    ret.exec_price_e6,
+                    config.oracle_price_cap_e2bps,
+                );
+                config.last_mark_push_slot = clock.slot as u128;
+            }
+        }
+        // Engine borrow dropped. Write nonce + config.
+        {
+            let mut data = state::slab_data_mut(a_slab)?;
+            state::write_req_nonce(&mut data, req_id);
+            state::write_config(&mut data, &config);
+        }
+        Ok(())
+    }
+
+    // --- LiquidateAtOracle ---
+    #[inline(never)]
+    fn handle_liquidate_at_oracle<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        target_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 4)?;
+        // AUDIT CRIT-2 FIX: require caller to be a signer
+        accounts::expect_signer(&accounts[0])?;
+        let a_slab = &accounts[1];
+        let a_oracle = &accounts[3];
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block liquidations after market resolution — resolved markets
+        // are in withdraw-only settlement phase.
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+
+        let clock = Clock::from_account_info(&accounts[2])?;
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            // Read engine.current_slot before mutable borrow
+            let eng = zc::engine_ref(&data)?;
+            let last_slot = eng.current_slot;
+            oracle::get_engine_oracle_price_e6(
+                last_slot, clock.slot, clock.unix_timestamp,
+                &mut config, a_oracle,
+            )?
+        } else {
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
+        };
+        state::write_config(&mut data, &config);
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        check_idx(engine, target_idx)?;
+
+        // Debug logging for liquidation (using sol_log_64 for no_std)
+        sol_log_64(target_idx as u64, price, 0, 0, 0); // idx, price
+        {
+            let acc = &engine.accounts[target_idx as usize];
+            sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1); // cap
+            let eff = engine.effective_pos_q(target_idx as usize);
+            let notional = engine.notional(target_idx as usize, price);
+            sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2); // notional, has_pos
+        }
+
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: liquidate_start");
+            sol_log_compute_units();
+        }
+        let _res = engine
+            .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
+                percolator::LiquidationPolicy::FullClose,
+                compute_current_funding_rate(&config))
+            .map_err(map_risk_error)?;
+        sol_log_64(_res as u64, 0, 0, 0, 4); // result
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: liquidate_end");
+            sol_log_compute_units();
+        }
+        Ok(())
+    }
+
+    // --- CloseAccount ---
+    #[inline(never)]
+    fn handle_close_account<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 8)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_vault = &accounts[2];
+        let a_user_ata = &accounts[3];
+        let a_pda = &accounts[4];
+        let a_token = &accounts[5];
+        let a_oracle = &accounts[7];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let mut config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+        accounts::expect_key(a_pda, &auth)?;
+
+        let resolved = state::is_resolved(&data);
+        let clock = Clock::from_account_info(&accounts[6])?;
+        let price = if resolved {
+            let settlement = config.authority_price_e6;
+            if settlement == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            settlement
+        } else {
+            let is_hyperp = oracle::is_hyperp_mode(&config);
+            let px = if is_hyperp {
+                let eng = zc::engine_ref(&data)?;
+                let last_slot = eng.current_slot;
+                oracle::get_engine_oracle_price_e6(
+                    last_slot, clock.slot, clock.unix_timestamp,
+                    &mut config, a_oracle,
+                )?
+            } else {
+                read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
+            };
+            state::write_config(&mut data, &config);
+            px
+        };
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        check_idx(engine, user_idx)?;
+
+        // Owner authorization via verify helper (Kani-provable)
+        let u_owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: close_account_start");
+            sol_log_compute_units();
+        }
+        let amt_units = if resolved {
+            // force_close_resolved handles K-pair PnL, maintenance fees,
+            // loss settlement, and account close internally.
+            // Do NOT pre-touch: touch can fail on epoch-mismatch accounts
+            // that force_close_resolved was specifically designed to handle.
+            engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
+                .map_err(map_risk_error)?
+        } else {
+            engine
+                .close_account_not_atomic(user_idx, clock.slot, price,
+                    compute_current_funding_rate(&config))
+                .map_err(map_risk_error)?
+        };
+        #[cfg(feature = "cu-audit")]
+        {
+            msg!("CU_CHECKPOINT: close_account_end");
+            sol_log_compute_units();
+        }
+        let amt_units_u64: u64 = amt_units
+            .try_into()
+            .map_err(|_| PercolatorError::EngineOverflow)?;
+
+        // Convert units to base tokens for payout (checked to prevent silent overflow)
+        let base_to_pay =
+            crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                .ok_or(PercolatorError::EngineOverflow)?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_user_ata,
+            a_pda,
+            base_to_pay,
+            &signer_seeds,
+        )?;
+        Ok(())
+    }
+
+    // --- TopUpInsurance ---
+    #[inline(never)]
+    fn handle_top_up_insurance<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_clock = &accounts[5];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block insurance top-up when market is resolved
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        // Reject misaligned deposits — dust would be silently donated
+        let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
+        if dust_check != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Transfer base tokens to vault
+        collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
+
+        // Convert base tokens to units for engine
+        let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+
+        let clock = Clock::from_account_info(a_clock)?;
+        let engine = zc::engine_mut(&mut data)?;
+        engine
+            .top_up_insurance_fund(units as u128, clock.slot)
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- UpdateAdmin ---
+    #[inline(never)]
+    fn handle_update_admin<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        new_admin: Pubkey,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        // Zero-address admin permanently burns admin authority (§7 step [3]).
+        // require_admin rejects [0u8;32] so all admin instructions become
+        // permanently inaccessible once set.
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let mut header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        header.admin = new_admin.to_bytes();
+        state::write_header(&mut data, &header);
+        Ok(())
+    }
+
+    // --- CloseSlab ---
+    #[inline(never)]
+    fn handle_close_slab<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_dest = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_vault = &accounts[2];
+        let a_vault_auth = &accounts[3];
+        let a_dest_ata = &accounts[4];
+        let a_token = &accounts[5];
+
+        accounts::expect_signer(a_dest)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        {
+            let mut data = state::slab_data_mut(a_slab)?;
+            slab_guard(program_id, a_slab, &data)?;
+            require_initialized(&data)?;
+
+            // Require resolved — enforce lifecycle ordering
+            if !state::is_resolved(&data) {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let header = state::read_header(&data);
+            require_admin(header.admin, a_dest.key)?;
+
+            let config = state::read_config(&data);
+            let mint = Pubkey::new_from_array(config.collateral_mint);
+            let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+            verify_vault(
+                a_vault,
+                &auth,
+                &mint,
+                &Pubkey::new_from_array(config.vault_pubkey),
+            )?;
+
+            let engine = zc::engine_ref(&data)?;
+            if !engine.vault.is_zero() {
+                return Err(PercolatorError::EngineInsufficientBalance.into());
+            }
+            if !engine.insurance_fund.balance.is_zero() {
+                return Err(PercolatorError::EngineInsufficientBalance.into());
+            }
+            if engine.num_used_accounts != 0 {
+                return Err(PercolatorError::EngineAccountNotFound.into());
+            }
+
+            // Drain any stranded vault tokens (unsolicited transfers or
+            // sub-scale dust) to admin's ATA. This is the terminal cleanup
+            // path — engine accounting is already zero.
+            let vault_data = a_vault.try_borrow_data()?;
+            let vault_token = spl_token::state::Account::unpack(&vault_data)?;
+            let stranded = vault_token.amount;
+            drop(vault_data);
+
+            if stranded > 0 {
+                // Validate admin's token account before drain
+                verify_token_account(a_dest_ata, a_dest.key, &mint)?;
+                // Verify vault authority PDA
+                let expected_auth = Pubkey::create_program_address(
+                    &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]],
+                    program_id,
+                ).map_err(|_| ProgramError::InvalidSeeds)?;
+                if a_vault_auth.key != &expected_auth {
                     return Err(ProgramError::InvalidSeeds);
                 }
 
-                drop(data);
-
-                // Build matcher init CPI data (matcher tag 2 + InitParams, 70 bytes total).
-                let mut cpi_data = [0u8; 70];
-                cpi_data[0] = 2; // MATCHER_INIT_TAG
-                cpi_data[1] = kind;
-                cpi_data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
-                cpi_data[6..10].copy_from_slice(&base_spread_bps.to_le_bytes());
-                cpi_data[10..14].copy_from_slice(&max_total_bps.to_le_bytes());
-                cpi_data[14..18].copy_from_slice(&impact_k_bps.to_le_bytes());
-                cpi_data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
-                cpi_data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
-                cpi_data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
-                cpi_data[66..68].copy_from_slice(&fee_to_insurance_bps.to_le_bytes());
-                cpi_data[68..70].copy_from_slice(&skew_spread_mult_bps.to_le_bytes());
-
-                let metas = [
-                    solana_program::instruction::AccountMeta::new_readonly(
-                        *a_lp_pda.key,
-                        true,
-                    ),
-                    solana_program::instruction::AccountMeta::new(*a_matcher_ctx.key, false),
-                ];
-
-                let ix = solana_program::instruction::Instruction {
-                    program_id: *a_matcher_prog.key,
-                    accounts: metas.to_vec(),
-                    data: cpi_data.to_vec(),
-                };
-
-                let bump_arr = [bump];
-                let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
-
-                solana_program::program::invoke_signed(
-                    &ix,
-                    &[a_lp_pda.clone(), a_matcher_ctx.clone()],
-                    &[seeds],
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+                // Drain stranded vault tokens → admin ATA
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_dest_ata,
+                    a_vault_auth,
+                    stranded,
+                    &signer_seeds,
                 )?;
+            }
 
-                msg!("InitMatcherCtx: initialized matcher context for LP idx {}", lp_idx);
+            // Forgive any remaining dust_base — engine accounting is zero,
+            // and any sub-scale remainder has been drained from the vault.
+            // (dust_base tracks base-unit fractions with no engine entry)
+
+            // Zero out the slab data to prevent reuse
+            for b in data.iter_mut() {
+                *b = 0;
             }
         }
+
+        // Transfer all lamports from slab to destination
+        let slab_lamports = a_slab.lamports();
+        **a_slab.lamports.borrow_mut() = 0;
+        **a_dest.lamports.borrow_mut() = a_dest
+            .lamports()
+            .checked_add(slab_lamports)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        Ok(())
+    }
+
+    // --- UpdateConfig ---
+    #[inline(never)]
+    fn handle_update_config<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        funding_horizon_slots: u64,
+        funding_k_bps: u64,
+        funding_inv_scale_notional_e6: u128,
+        funding_max_premium_bps: i64,
+        funding_max_bps_per_slot: i64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_clock = &accounts[2];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // Validate parameters
+        if funding_horizon_slots == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        // funding_inv_scale_notional_e6: reserved for future use.
+        // Not currently read by funding computation.
+        let _ = funding_inv_scale_notional_e6;
+        // Reject negative funding bounds — reversed clamp bounds panic
+        if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
+            || funding_max_bps_per_slot > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT
+        {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        // Read existing config
+        let mut config = state::read_config(&data);
+
+        if funding_k_bps > 100_000 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        // Flush Hyperp index WITHOUT staleness check (admin recovery path).
+        let clock = Clock::from_account_info(a_clock)?;
+        if oracle::is_hyperp_mode(&config) {
+            let prev_index = config.last_effective_price_e6;
+            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            if mark > 0 && prev_index > 0 {
+                let last_idx_slot = config.last_hyperp_index_slot;
+                let dt = clock.slot.saturating_sub(last_idx_slot);
+                let new_index = oracle::clamp_toward_with_dt(
+                    prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                );
+                config.last_effective_price_e6 = new_index;
+                config.last_hyperp_index_slot = clock.slot;
+            }
+            state::write_config(&mut data, &config);
+        }
+        // Accrue to boundary using engine's already-stored rate.
+        // Do NOT overwrite funding_rate_bps_per_slot_last before accrual —
+        // that would retroactively reprice the elapsed interval.
+        // Both Hyperp and non-Hyperp must accrue before changing funding params.
+        {
+            let accrual_price = if oracle::is_hyperp_mode(&config) {
+                config.last_effective_price_e6
+            } else {
+                // Non-Hyperp: use last oracle price from engine
+                let engine = zc::engine_ref(&data)?;
+                engine.last_oracle_price
+            };
+            if accrual_price > 0 {
+                let engine = zc::engine_mut(&mut data)?;
+                engine.accrue_market_to(clock.slot, accrual_price)
+                    .map_err(map_risk_error)?;
+            }
+        }
+
+        config.funding_horizon_slots = funding_horizon_slots;
+        config.funding_k_bps = funding_k_bps;
+        config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
+        config.funding_max_premium_bps = funding_max_premium_bps;
+        config.funding_max_bps_per_slot = funding_max_bps_per_slot;
+        // Run end-of-instruction lifecycle after accrue + config change.
+        // Finalizes pending resets triggered by the accrual.
+        {
+            let engine = zc::engine_mut(&mut data)?;
+            let mut ctx = percolator::InstructionContext::new();
+            match engine.run_end_of_instruction_lifecycle(
+                &mut ctx,
+                compute_current_funding_rate(&config),
+            ) {
+                Ok(()) => {}
+                Err(percolator::RiskError::CorruptState) => {
+                    return Err(map_risk_error(percolator::RiskError::CorruptState));
+                }
+                Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
+            }
+        }
+        state::write_config(&mut data, &config);
+        Ok(())
+    }
+
+    // --- SetOracleAuthority ---
+    #[inline(never)]
+    fn handle_set_oracle_authority<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        new_authority: Pubkey,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // SECURITY(M-4): Block SetOracleAuthority on Pyth-pinned markets.
+        // Pyth-pinned markets guarantee decentralized oracle pricing.
+        // Setting a non-zero authority would silently switch to admin-oracle
+        // mode, breaking the trust model users signed up for.
+        let mut config = state::read_config(&data);
+        if crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id)
+            && new_authority != Pubkey::default()
+        {
+            msg!("SetOracleAuthority: blocked on Pyth-pinned market");
+            return Err(ProgramError::InvalidArgument);
+        }
+        // Hyperp: reject zero-address unless trade flow has bootstrapped
+        // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
+        // there's no mark price source. With EWMA bootstrapped, the market
+        // can run admin-free on trade-derived mark.
+        if oracle::is_hyperp_mode(&config)
+            && new_authority == Pubkey::default()
+            && config.mark_ewma_e6 == 0
+        {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        config.oracle_authority = new_authority.to_bytes();
+        // Clear stored price when authority changes — except on Hyperp
+        // where authority_price_e6 is the mark price.
+        if !oracle::is_hyperp_mode(&config) {
+            config.authority_price_e6 = 0;
+            config.authority_timestamp = 0;
+        }
+        state::write_config(&mut data, &config);
+        Ok(())
+    }
+
+    // --- PushOraclePrice ---
+    #[inline(never)]
+    fn handle_push_oracle_price<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        price_e6: u64,
+        timestamp: i64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_authority = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_authority)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        // Hyperp: flush index WITHOUT staleness check.
+        // PushOraclePrice is the recovery path for stale marks —
+        // it must not be blocked by the very staleness it's meant to fix.
+        if is_hyperp {
+            let push_clock = Clock::get()
+                .map_err(|_| ProgramError::UnsupportedSysvar)?;
+            let prev_index = config.last_effective_price_e6;
+            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            if mark > 0 && prev_index > 0 {
+                let last_idx_slot = config.last_hyperp_index_slot;
+                let dt = push_clock.slot.saturating_sub(last_idx_slot);
+                let new_index = oracle::clamp_toward_with_dt(
+                    prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                );
+                config.last_effective_price_e6 = new_index;
+                config.last_hyperp_index_slot = push_clock.slot;
+            }
+            state::write_config(&mut data, &config);
+            config = state::read_config(&data);
+        }
+        if config.oracle_authority == [0u8; 32] {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+        if config.oracle_authority != a_authority.key.to_bytes() {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        // Validate price (must be positive)
+        if price_e6 == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // Normalize to engine-space (invert + scale) for ALL markets.
+        // Authority prices must be in the same price space as
+        // Pyth/Chainlink-derived prices (which go through
+        // read_engine_price_e6 → invert → scale).
+        let normalized_price = crate::verify::to_engine_price(
+            price_e6, config.invert, config.unit_scale,
+        ).ok_or(PercolatorError::OracleInvalid)?;
+
+        // Enforce MAX_ORACLE_PRICE at ingress (engine rejects > MAX internally)
+        if normalized_price > percolator::MAX_ORACLE_PRICE {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // For non-Hyperp markets, require strictly increasing timestamps
+        // anchored to the current clock. This prevents the admin from
+        // walking last_effective_price_e6 in a single burst (each push
+        // must use a later timestamp, and the timestamp must not exceed
+        // the current unix_timestamp from the clock sysvar).
+        if !is_hyperp {
+            let push_clock = Clock::get()
+                .map_err(|_| ProgramError::UnsupportedSysvar)?;
+            // Strict monotonicity: reject equal timestamps
+            if config.authority_timestamp != 0
+                && timestamp <= config.authority_timestamp
+            {
+                return Err(PercolatorError::OracleStale.into());
+            }
+            // Clock anchoring: timestamp must not be in the future
+            if timestamp > push_clock.unix_timestamp {
+                return Err(PercolatorError::OracleStale.into());
+            }
+        }
+
+        // Clamp against circuit breaker.
+        // Hyperp: clamp against INDEX (last_effective_price_e6), not
+        //   previous mark. This bounds the mark-index gap to one
+        //   cap-width regardless of how many same-slot pushes occur.
+        //   The index only moves per-slot via clamp_toward_with_dt.
+        // Non-Hyperp: clamp against last_effective_price_e6 baseline.
+        // Accrue to boundary using engine's already-stored rate.
+        // Do NOT overwrite funding_rate_bps_per_slot_last before accrual.
+        if is_hyperp {
+            let push_clock2 = Clock::get()
+                .map_err(|_| ProgramError::UnsupportedSysvar)?;
+            let engine = zc::engine_mut(&mut data)?;
+            engine.accrue_market_to(
+                push_clock2.slot, config.last_effective_price_e6,
+            ).map_err(map_risk_error)?;
+        }
+
+        let clamp_base = config.last_effective_price_e6;
+        let clamped = oracle::clamp_oracle_price(
+            clamp_base,
+            normalized_price,
+            config.oracle_price_cap_e2bps,
+        );
+        config.authority_price_e6 = clamped;
+        if is_hyperp {
+            let push_clock = Clock::get()
+                .map_err(|_| ProgramError::UnsupportedSysvar)?;
+            config.last_mark_push_slot = push_clock.slot as u128;
+            // Admin push feeds through EWMA like trades do.
+            // Direct overwrite was removed — it would let a single push
+            // reset the trade-derived EWMA, defeating smoothing.
+            // Admin push always gets full weight (pass min_fee as fee_paid)
+            config.mark_ewma_e6 = crate::verify::ewma_update(
+                config.mark_ewma_e6, clamped,
+                config.mark_ewma_halflife_slots,
+                config.mark_ewma_last_slot, push_clock.slot,
+                config.mark_min_fee, config.mark_min_fee,
+            );
+            config.mark_ewma_last_slot = push_clock.slot;
+        } else {
+            config.authority_timestamp = timestamp;
+            // Do NOT write last_effective_price_e6 here.
+            // That baseline must only be set by external oracle reads
+            // (crank/trade/withdraw) so admin can't poison it to bypass
+            // the settlement circuit breaker in ResolveMarket.
+        }
+        // Run end-of-instruction lifecycle (§5.7-5.8) after accrue_market_to.
+        // This finalizes any pending DrainOnly→ResetPending→Normal transitions
+        // triggered by the accrual. Without this, sides could stay DrainOnly
+        // with OI=0 until the next standard-lifecycle instruction.
+        if is_hyperp {
+            let engine = zc::engine_mut(&mut data)?;
+            let mut ctx = percolator::InstructionContext::new();
+            match engine.run_end_of_instruction_lifecycle(
+                &mut ctx,
+                compute_current_funding_rate(&config),
+            ) {
+                Ok(()) => {}
+                Err(percolator::RiskError::CorruptState) => {
+                    return Err(map_risk_error(percolator::RiskError::CorruptState));
+                }
+                Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
+            }
+        }
+        state::write_config(&mut data, &config);
+        Ok(())
+    }
+
+    // --- SetOraclePriceCap ---
+    #[inline(never)]
+    fn handle_set_oracle_price_cap<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        max_change_e2bps: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_clock = &accounts[2];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+
+        // Flush Hyperp index WITHOUT staleness check (admin path)
+        if is_hyperp {
+            let clock = Clock::from_account_info(a_clock)?;
+            let prev_index = config.last_effective_price_e6;
+            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            if mark > 0 && prev_index > 0 {
+                let last_idx_slot = config.last_hyperp_index_slot;
+                let dt = clock.slot.saturating_sub(last_idx_slot);
+                let new_index = oracle::clamp_toward_with_dt(
+                    prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                );
+                config.last_effective_price_e6 = new_index;
+                config.last_hyperp_index_slot = clock.slot;
+            }
+            state::write_config(&mut data, &config);
+            config = state::read_config(&data);
+            // Accrue to boundary using engine's already-stored rate.
+            let engine = zc::engine_mut(&mut data)?;
+            engine.accrue_market_to(
+                clock.slot, config.last_effective_price_e6,
+            ).map_err(map_risk_error)?;
+        }
+
+        // Hyperp markets must not set cap to 0 — it would freeze index
+        // smoothing (clamp_toward_with_dt returns mark unchanged when cap==0).
+        if is_hyperp && max_change_e2bps == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        // Non-zero cap must be >= per-market floor.
+        if max_change_e2bps != 0
+            && max_change_e2bps < config.min_oracle_price_cap_e2bps
+        {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        // Non-Hyperp: cap=0 disables clamping, but if the immutable
+        // floor is set, disabling clamping would let PushOraclePrice
+        // walk last_effective_price_e6 arbitrarily, poisoning the
+        // baseline that ResolveMarket checks against. Reject cap=0
+        // when the floor is non-zero.
+        if !is_hyperp
+            && max_change_e2bps == 0
+            && config.min_oracle_price_cap_e2bps != 0
+        {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        // Hard ceiling: cap above 100% makes the circuit breaker vacuous
+        if max_change_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        config.oracle_price_cap_e2bps = max_change_e2bps;
+        // Run end-of-instruction lifecycle after accrue + cap change.
+        if is_hyperp {
+            let engine = zc::engine_mut(&mut data)?;
+            let mut ctx = percolator::InstructionContext::new();
+            match engine.run_end_of_instruction_lifecycle(
+                &mut ctx,
+                compute_current_funding_rate(&config),
+            ) {
+                Ok(()) => {}
+                Err(percolator::RiskError::CorruptState) => {
+                    return Err(map_risk_error(percolator::RiskError::CorruptState));
+                }
+                Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
+            }
+        }
+        state::write_config(&mut data, &config);
+        Ok(())
+    }
+
+    // --- ResolveMarket ---
+    #[inline(never)]
+    fn handle_resolve_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        // Resolve market: snapshot resolution slot, set RESOLVED flag.
+        accounts::expect_len(accounts, 4)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_clock = &accounts[2];
+        let a_oracle = &accounts[3];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // Can't re-resolve
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Require admin oracle price to be set (authority_price_e6 > 0)
+        let config = state::read_config(&data);
+        if config.authority_price_e6 == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // Non-Hyperp: require the settlement push to be fresh.
+        // Prevents parking an old price in state and resolving later.
+        if !oracle::is_hyperp_mode(&config) {
+            let clock_fresh = Clock::from_account_info(a_clock)?;
+            let push_age = clock_fresh.unix_timestamp
+                .saturating_sub(config.authority_timestamp);
+            if push_age < 0 || push_age as u64 > config.max_staleness_secs {
+                return Err(PercolatorError::OracleStale.into());
+            }
+        }
+        // Non-Hyperp: settlement price must be within circuit-breaker
+        // bounds of a FRESH external oracle read. Uses the live
+        // oracle_price_cap_e2bps (not just the immutable floor) so markets
+        // with min_cap=0 but live cap>0 still get the settlement guard.
+        // Hyperp: admin IS the price source, no external baseline.
+        // If the oracle is stale/dead, skip the guard — the admin must
+        // be able to resolve even when the oracle has died (prevents deadlock
+        // on markets with nonzero cap floor + dead oracle).
+        if !oracle::is_hyperp_mode(&config)
+            && config.oracle_price_cap_e2bps != 0
+        {
+            let clock_tmp = Clock::from_account_info(a_clock)?;
+            let oracle_result = oracle::read_engine_price_e6(
+                a_oracle,
+                &config.index_feed_id,
+                clock_tmp.unix_timestamp,
+                config.max_staleness_secs,
+                config.conf_filter_bps,
+                config.invert,
+                config.unit_scale,
+            );
+            match oracle_result {
+                Ok(fresh_oracle) => {
+                    // Oracle is live — enforce settlement guard
+                    let clamped = oracle::clamp_oracle_price(
+                        fresh_oracle,
+                        config.authority_price_e6,
+                        config.oracle_price_cap_e2bps,
+                    );
+                    if clamped != config.authority_price_e6 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                }
+                Err(e) => {
+                    // Only skip guard if oracle is genuinely stale/dead.
+                    // Other errors (wrong account, bad data, wrong feed) must
+                    // propagate — otherwise admin can bypass guard by passing
+                    // a broken oracle account.
+                    let stale_err: ProgramError = PercolatorError::OracleStale.into();
+                    if e != stale_err {
+                        return Err(e);
+                    }
+                    // OracleStale = oracle is dead, allow admin to resolve
+                }
+            }
+        }
+
+        let clock = Clock::from_account_info(a_clock)?;
+        let mut config = config;
+
+        // Accrue engine to settlement price BEFORE entering resolved mode.
+        // This crystallizes all account states at the settlement price so
+        // force_close_resolved (which takes no price parameter) uses
+        // consistent post-accrual state.
+        if !oracle::is_hyperp_mode(&config) {
+            let engine = zc::engine_mut(&mut data)?;
+            engine.accrue_market_to(
+                clock.slot, config.authority_price_e6,
+            ).map_err(map_risk_error)?;
+        }
+
+        // Flush Hyperp index to resolution slot WITHOUT staleness check.
+        // Admin must be able to resolve even if mark is stale.
+        if oracle::is_hyperp_mode(&config) {
+            let prev_index = config.last_effective_price_e6;
+            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            if mark > 0 && prev_index > 0 {
+                let last_idx_slot = config.last_hyperp_index_slot;
+                let dt = clock.slot.saturating_sub(last_idx_slot);
+                let new_index = oracle::clamp_toward_with_dt(
+                    prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                );
+                config.last_effective_price_e6 = new_index;
+                config.last_hyperp_index_slot = clock.slot;
+            }
+            state::write_config(&mut data, &config);
+            // Accrue to resolution boundary at the settlement mark price
+            // (authority_price_e6), NOT the smoothed index. force_close_resolved
+            // uses K coefficients that must reflect the declared settlement price.
+            let engine = zc::engine_mut(&mut data)?;
+            engine.accrue_market_to(
+                clock.slot, config.authority_price_e6,
+            ).map_err(map_risk_error)?;
+            config = state::read_config(&data);
+        }
+
+        config.resolution_slot = clock.slot;
+        state::write_config(&mut data, &config);
+        state::set_resolved(&mut data);
+        Ok(())
+    }
+
+    // --- WithdrawInsurance ---
+    #[inline(never)]
+    fn handle_withdraw_insurance<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        // Withdraw insurance fund (admin only, requires RESOLVED and all positions closed)
+        accounts::expect_len(accounts, 6)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_admin_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_vault_pda = &accounts[5];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // Must be resolved
+        if !state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_admin_ata, a_admin.key, &mint)?;
+        accounts::expect_key(a_vault_pda, &auth)?;
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        // Require all accounts to be fully closed (not just effective_pos_q==0,
+        // which returns 0 for epoch-mismatched stale positions).
+        // Any used account means unsettled state may remain.
+        if engine.num_used_accounts != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Get insurance balance and convert to base tokens
+        let insurance_units = engine.insurance_fund.balance.get();
+        if insurance_units == 0 {
+            return Ok(()); // Nothing to withdraw
+        }
+
+        // Reject if balance exceeds u64 — silent truncation would
+        // zero the engine balance but only pay out a capped amount.
+        let units_u64: u64 = insurance_units
+            .try_into()
+            .map_err(|_| PercolatorError::EngineOverflow)?;
+        let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        // Zero out insurance fund and decrement engine.vault
+        engine.insurance_fund.balance = percolator::U128::ZERO;
+        let ins = percolator::U128::new(insurance_units);
+        if ins > engine.vault {
+            return Err(PercolatorError::EngineInsufficientBalance.into());
+        }
+        engine.vault = engine.vault - ins;
+
+        // Transfer from vault to admin
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_admin_ata,
+            a_vault_pda,
+            base_amount,
+            &signer_seeds,
+        )?;
+        Ok(())
+    }
+
+    // --- SetInsuranceWithdrawPolicy ---
+    #[inline(never)]
+    fn handle_set_insurance_withdraw_policy<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        authority: Pubkey,
+        min_withdraw_base: u64,
+        max_withdraw_bps: u16,
+        cooldown_slots: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Policy writes oracle/index fields. Only safe when all accounts
+        // are closed — prevents corrupting Hyperp settlement math.
+        if !state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        {
+            let engine = zc::engine_ref(&data)?;
+            if engine.num_used_accounts != 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        if min_withdraw_base == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        if max_withdraw_bps == 0 || max_withdraw_bps > 10_000 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        let mut config = state::read_config(&data);
+        if config.unit_scale != 0 && min_withdraw_base % (config.unit_scale as u64) != 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        let packed = pack_ins_withdraw_meta(
+            max_withdraw_bps,
+            crate::INS_WITHDRAW_LAST_SLOT_NONE,
+        )
+            .ok_or(PercolatorError::InvalidConfigParam)?;
+
+        // Reuse these fields in resolved mode for policy state.
+        config.oracle_authority = authority.to_bytes();
+        config.last_effective_price_e6 = min_withdraw_base;
+        config.oracle_price_cap_e2bps = cooldown_slots;
+        config.authority_timestamp = packed;
+        state::write_config(&mut data, &config);
+        // Set explicit flag so WithdrawInsuranceLimited can distinguish
+        // real policy from oracle timestamp bit patterns.
+        state::set_policy_configured(&mut data);
+        Ok(())
+    }
+
+    // --- WithdrawInsuranceLimited ---
+    #[inline(never)]
+    fn handle_withdraw_insurance_limited<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u64,
+    ) -> ProgramResult {
+        // Limited insurance withdraw (configured authority + min/max/cooldown checks)
+        accounts::expect_len(accounts, 7)?;
+        let a_authority = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_authority_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_vault_pda = &accounts[5];
+        let a_clock = &accounts[6];
+
+        accounts::expect_signer(a_authority)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let resolved = state::is_resolved(&data);
+        let header = state::read_header(&data);
+        let mut config = state::read_config(&data);
+
+        // If immutable insurance_withdraw_max_bps == 0, live-market
+        // withdrawals are disabled. Only resolved markets can withdraw.
+        if config.insurance_withdraw_max_bps == 0 && !resolved {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        let clock = Clock::from_account_info(a_clock)?;
+
+        // Use explicit flag to determine if SetInsuranceWithdrawPolicy was called.
+        // Previously inferred from authority_timestamp bit patterns, which an
+        // oracle authority could forge via crafted PushOraclePrice timestamps.
+        let configured = state::is_policy_configured(&data);
+        // Defensive: configured flag should only be set on resolved markets
+        // (SetInsuranceWithdrawPolicy is gated on is_resolved). If this
+        // invariant is ever broken, reject rather than use repurposed fields.
+        if configured && !resolved {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let (stored_bps, stored_last_slot) = if configured {
+            unpack_ins_withdraw_meta(config.authority_timestamp)
+        } else {
+            (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
+        };
+        let policy_authority = if configured {
+            config.oracle_authority
+        } else {
+            header.admin
+        };
+        let policy_min_base = if configured {
+            config.last_effective_price_e6
+        } else {
+            // Default floor should represent at least one withdrawable unit.
+            // On scaled markets (unit_scale > 1), base amounts must be aligned
+            // to unit_scale, so a base-min of 1 would otherwise collapse to 0 units.
+            core::cmp::max(DEFAULT_INSURANCE_WITHDRAW_MIN_BASE, config.unit_scale as u64)
+        };
+        let policy_max_bps = if configured {
+            stored_bps
+        } else if config.insurance_withdraw_max_bps > 0 {
+            // Use immutable config value (live or resolved unconfigured)
+            config.insurance_withdraw_max_bps
+        } else {
+            DEFAULT_INSURANCE_WITHDRAW_MAX_BPS
+        };
+        let policy_cooldown = if configured {
+            config.oracle_price_cap_e2bps
+        } else {
+            DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS
+        };
+        let last_withdraw_slot = if configured {
+            stored_last_slot
+        } else if config.last_insurance_withdraw_slot > 0 {
+            // Unconfigured: always use dedicated config field (live or resolved)
+            config.last_insurance_withdraw_slot
+        } else {
+            crate::INS_WITHDRAW_LAST_SLOT_NONE
+        };
+
+        if policy_min_base == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        if policy_authority != a_authority.key.to_bytes() {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+        if config.unit_scale != 0 && amount % (config.unit_scale as u64) != 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // On live markets, use config cooldown directly (not max with defaults).
+        // On resolved markets, use stricter of policy and config.
+        let effective_cooldown = if !resolved && config.insurance_withdraw_cooldown_slots > 0 {
+            config.insurance_withdraw_cooldown_slots
+        } else if config.insurance_withdraw_cooldown_slots > 0 {
+            core::cmp::max(policy_cooldown, config.insurance_withdraw_cooldown_slots)
+        } else {
+            policy_cooldown
+        };
+        if last_withdraw_slot != crate::INS_WITHDRAW_LAST_SLOT_NONE
+            && clock.slot < last_withdraw_slot.saturating_add(effective_cooldown)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_authority_ata, a_authority.key, &mint)?;
+        accounts::expect_key(a_vault_pda, &auth)?;
+
+        let (units_u64, _) = crate::units::base_to_units(amount, config.unit_scale);
+        let units_requested = units_u64 as u128;
+        if units_requested == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let (policy_min_units_u64, _) =
+            crate::units::base_to_units(policy_min_base, config.unit_scale);
+        let policy_min_units = policy_min_units_u64 as u128;
+
+        // `resolved` already computed above
+        {
+            let engine = zc::engine_mut(&mut data)?;
+            if resolved {
+                // Require all accounts fully closed, not just effective_pos_q==0
+                // (which returns 0 for epoch-mismatched stale positions).
+                if engine.num_used_accounts != 0 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+
+            // On live markets, require a recent crank so that latent
+            // losses are reflected in insurance_fund.balance before
+            // allowing withdrawal. Without this, unsettled losses
+            // could make the stored balance overstated.
+            if !resolved {
+                let staleness = clock.slot.saturating_sub(engine.last_crank_slot);
+                if staleness > engine.max_crank_staleness_slots {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+            }
+
+            let insurance_units = engine.insurance_fund.balance.get();
+            if insurance_units == 0 {
+                return Ok(());
+            }
+            if units_requested > insurance_units {
+                return Err(PercolatorError::EngineInsufficientBalance.into());
+            }
+
+            // On live markets, cannot withdraw below insurance_floor
+            if !resolved {
+                let floor = engine.params.insurance_floor.get();
+                let post_balance = insurance_units.saturating_sub(units_requested);
+                if post_balance < floor {
+                    return Err(PercolatorError::EngineInsufficientBalance.into());
+                }
+            }
+
+            // On live markets, policy_max_bps already IS the config value.
+            // On resolved markets, cap to the stricter of policy and config.
+            let effective_max_bps = if resolved && config.insurance_withdraw_max_bps > 0 {
+                core::cmp::min(policy_max_bps, config.insurance_withdraw_max_bps)
+            } else {
+                policy_max_bps
+            };
+
+            let pct_limited_units =
+                insurance_units.saturating_mul(effective_max_bps as u128) / 10_000u128;
+            let max_allowed_units = core::cmp::max(pct_limited_units, policy_min_units);
+            if units_requested > max_allowed_units {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+
+            // effective_cooldown already computed and enforced above
+
+            let req = percolator::U128::new(units_requested);
+            if req > engine.vault {
+                return Err(PercolatorError::EngineInsufficientBalance.into());
+            }
+            engine.insurance_fund.balance = engine.insurance_fund.balance - req;
+            engine.vault = engine.vault - req;
+        }
+
+        // Persist cooldown slot.
+        if configured {
+            // Configured policy: pack slot into authority_timestamp
+            let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            config.oracle_authority = policy_authority;
+            config.last_effective_price_e6 = policy_min_base;
+            config.oracle_price_cap_e2bps = policy_cooldown;
+            config.authority_timestamp = packed;
+        } else {
+            // Unconfigured (default): use dedicated field for cooldown
+            config.last_insurance_withdraw_slot = clock.slot;
+        }
+        state::write_config(&mut data, &config);
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_authority_ata,
+            a_vault_pda,
+            amount,
+            &signer_seeds,
+        )?;
+        Ok(())
+    }
+
+    // --- AdminForceCloseAccount ---
+    #[inline(never)]
+    fn handle_admin_force_close_account<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        // Admin force-close an abandoned account after market resolution.
+        // Settles PnL (with haircut for positive), forgives fee debt,
+        // then delegates to engine.close_account_not_atomic() for the rest.
+        accounts::expect_len(accounts, 8)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_vault = &accounts[2];
+        let a_owner_ata = &accounts[3];
+        let a_pda = &accounts[4];
+        let a_token = &accounts[5];
+        let _a_oracle = &accounts[7];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // Must be resolved
+        if !state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        accounts::expect_key(a_pda, &auth)?;
+
+        let _clock = Clock::from_account_info(&accounts[6])?;
+        // Resolved markets use fixed settlement price.
+        let price = config.authority_price_e6;
+        if price == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        check_idx(engine, user_idx)?;
+
+        // Read account owner pubkey and verify owner ATA
+        let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
+        verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
+
+        let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
+            .map_err(map_risk_error)?;
+        let amt_units_u64: u64 = amt_units
+            .try_into()
+            .map_err(|_| PercolatorError::EngineOverflow)?;
+
+        let base_to_pay =
+            crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                .ok_or(PercolatorError::EngineOverflow)?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_owner_ata,
+            a_pda,
+            base_to_pay,
+            &signer_seeds,
+        )?;
+        Ok(())
+    }
+
+    // --- QueryLpFees ---
+    #[inline(never)]
+    fn handle_query_lp_fees<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_idx: u16,
+    ) -> ProgramResult {
+        // §2.2: Read-only query of LP cumulative fees. No state mutation.
+        accounts::expect_len(accounts, 1)?;
+        let a_slab = &accounts[0];
+
+        let data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let engine = zc::engine_ref(&data)?;
+        check_idx(engine, lp_idx)?;
+        if !engine.accounts[lp_idx as usize].is_lp() {
+            return Err(PercolatorError::EngineNotAnLPAccount.into());
+        }
+
+        let fees = engine.accounts[lp_idx as usize].fees_earned_total.get();
+        solana_program::program::set_return_data(&fees.to_le_bytes());
+        Ok(())
+    }
+
+    // --- ReclaimEmptyAccount ---
+    #[inline(never)]
+    fn handle_reclaim_empty_account<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        // Permissionless account reclamation (spec §2.6, §10.7).
+        // Recycles flat/dust accounts without touching side state.
+        accounts::expect_len(accounts, 2)?;
+        let a_slab = &accounts[0];
+        let _a_clock = &accounts[1];
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Block on resolved markets — unsettled PnL from resolution
+        // may not yet be reflected in capital. Reclaiming before
+        // touch_account_full would forfeit claimable value.
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let clock = Clock::from_account_info(_a_clock)?;
+        let engine = zc::engine_mut(&mut data)?;
+        engine.reclaim_empty_account_not_atomic(user_idx, clock.slot)
+            .map_err(map_risk_error)?;
+        // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
+        Ok(())
+    }
+
+    // --- SettleAccount ---
+    #[inline(never)]
+    fn handle_settle_account<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        // Standalone account settlement (§10.2). Permissionless.
+        accounts::expect_len(accounts, 3)?;
+        let a_slab = &accounts[0];
+        let a_clock = &accounts[1];
+        let a_oracle = &accounts[2];
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+        let clock = Clock::from_account_info(a_clock)?;
+
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            let eng = zc::engine_ref(&data)?;
+            let last_slot = eng.current_slot;
+            oracle::get_engine_oracle_price_e6(
+                last_slot, clock.slot, clock.unix_timestamp,
+                &mut config, a_oracle,
+            )?
+        } else {
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
+        };
+        state::write_config(&mut data, &config);
+
+        let engine = zc::engine_mut(&mut data)?;
+        engine.settle_account_not_atomic(user_idx, price, clock.slot,
+            compute_current_funding_rate(&config))
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- DepositFeeCredits ---
+    #[inline(never)]
+    fn handle_deposit_fee_credits<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        // Direct fee-debt repayment (§10.3.1). Owner only.
+        // SECURITY: Read fee debt BEFORE the SPL transfer to reject
+        // overpayment. Without this, excess tokens become stranded
+        // vault surplus with no withdrawal path for the user.
+        accounts::expect_len(accounts, 6)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_clock = &accounts[5];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        // Phase 1: Read fee debt and validate (immutable borrow)
+        // Also verify vault BEFORE the SPL transfer.
+        let (unit_scale, debt_units) = {
+            let data = a_slab.try_borrow_data()?;
+            slab_guard(program_id, a_slab, &data)?;
+            require_initialized(&data)?;
+            if state::is_resolved(&data) {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let cfg = state::read_config(&data);
+            let mint = Pubkey::new_from_array(cfg.collateral_mint);
+            let auth = accounts::derive_vault_authority_with_bump(
+                program_id, a_slab.key, cfg.vault_authority_bump,
+            )?;
+            verify_vault(a_vault, &auth, &mint,
+                &Pubkey::new_from_array(cfg.vault_pubkey))?;
+            verify_token_account(a_user_ata, a_user.key, &mint)?;
+            let engine = zc::engine_ref(&data)?;
+            check_idx(engine, user_idx)?;
+            let owner = engine.accounts[user_idx as usize].owner;
+            if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                return Err(PercolatorError::EngineUnauthorized.into());
+            }
+            let fc = engine.accounts[user_idx as usize].fee_credits.get();
+            let debt = if fc < 0 { fc.unsigned_abs() } else { 0u128 };
+            (cfg.unit_scale, debt)
+        };
+        // data (Ref) dropped here — releases immutable borrow
+
+        // Phase 2: Reject zero, misaligned, or overpayment
+        let (units, dust) = crate::units::base_to_units(amount, unit_scale);
+        if units == 0 || dust != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if (units as u128) > debt_units {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Phase 3: SPL transfer (only after validation)
+        collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
+
+        // Phase 4: Engine deposit_fee_credits (mutable borrow)
+        // Vault already verified in Phase 1.
+        let mut data = state::slab_data_mut(a_slab)?;
+        let config = state::read_config(&data);
+        let clock = Clock::from_account_info(a_clock)?;
+        let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+        // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
+
+        let engine = zc::engine_mut(&mut data)?;
+        engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- ConvertReleasedPnl ---
+    #[inline(never)]
+    fn handle_convert_released_pnl<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        // Voluntary PnL conversion (§10.4.1). Owner only.
+        accounts::expect_len(accounts, 4)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_clock = &accounts[2];
+        let a_oracle = &accounts[3];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+        let clock = Clock::from_account_info(a_clock)?;
+
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            let eng = zc::engine_ref(&data)?;
+            let last_slot = eng.current_slot;
+            oracle::get_engine_oracle_price_e6(
+                last_slot, clock.slot, clock.unix_timestamp,
+                &mut config, a_oracle,
+            )?
+        } else {
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
+        };
+        state::write_config(&mut data, &config);
+
+        let engine = zc::engine_mut(&mut data)?;
+        check_idx(engine, user_idx)?;
+        let owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        // Reject misaligned amounts — silent truncation could lose value
+        let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+        if dust != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+        engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
+            compute_current_funding_rate(&config))
+            .map_err(map_risk_error)?;
+        Ok(())
+    }
+
+    // --- ResolvePermissionless ---
+    #[inline(never)]
+    fn handle_resolve_permissionless<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        // Permissionless resolution when oracle is actually dead.
+        // Anyone can call. Requires oracle account to prove staleness.
+        accounts::expect_len(accounts, 3)?;
+        let a_slab = &accounts[0];
+        let a_clock = &accounts[1];
+        let a_oracle = &accounts[2];
+
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+
+        if config.permissionless_resolve_stale_slots == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        let clock = Clock::from_account_info(a_clock)?;
+
+        // Verify oracle is actually stale RIGHT NOW by trying to read it.
+        // Only OracleStale proves the oracle is dead. Other errors
+        // (wrong account, bad data) don't prove staleness — they could
+        // be an attacker passing garbage to fake oracle death.
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        if !is_hyperp {
+            let oracle_result = oracle::read_engine_price_e6(
+                a_oracle, &config.index_feed_id,
+                clock.unix_timestamp, config.max_staleness_secs,
+                config.conf_filter_bps, config.invert, config.unit_scale,
+            );
+            match oracle_result {
+                Ok(_) => return Err(ProgramError::InvalidAccountData), // live
+                Err(e) => {
+                    let stale_err: ProgramError = PercolatorError::OracleStale.into();
+                    if e != stale_err {
+                        return Err(e); // wrong account / bad data — propagate
+                    }
+                    // OracleStale = oracle is actually dead → proceed
+                }
+            }
+        } else {
+            // Hyperp: check mark staleness (last trade or push)
+            let last_update = core::cmp::max(
+                config.mark_ewma_last_slot,
+                config.last_mark_push_slot as u64,
+            );
+            let staleness = clock.slot.saturating_sub(last_update);
+            if staleness < config.permissionless_resolve_stale_slots {
+                return Err(PercolatorError::OracleStale.into());
+            }
+        }
+
+        // Block if an oracle authority is configured AND has pushed recently.
+        // If the authority has never pushed (timestamp=0) or their last push
+        // is stale, the authority is effectively dead and permissionless
+        // resolution should proceed. This prevents the deadlock where:
+        // authority set + external oracle dead = no resolution path.
+        if config.oracle_authority != [0u8; 32] && config.authority_timestamp > 0 {
+            let authority_age_secs = clock.unix_timestamp
+                .saturating_sub(config.authority_timestamp);
+            // Authority is "fresh" if push happened within max_staleness_secs
+            // (the same staleness window as the external oracle feed).
+            if authority_age_secs >= 0
+                && (authority_age_secs as u64) < config.max_staleness_secs
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        // Require oracle/mark has been dead for the configured delay.
+        // Non-Hyperp: use dedicated last_good_oracle_slot, stamped on every
+        //   successful read_price_clamped across all instruction paths.
+        // Hyperp: use max(mark_ewma_last_slot, last_mark_push_slot) — the
+        //   same signal used for the mark staleness check above, so both
+        //   checks use consistent liveness information.
+        {
+            let reference_slot = if !is_hyperp {
+                config.last_good_oracle_slot
+            } else {
+                core::cmp::max(
+                    config.mark_ewma_last_slot,
+                    config.last_mark_push_slot as u64,
+                )
+            };
+            let oracle_dead_duration = clock.slot.saturating_sub(reference_slot);
+            if oracle_dead_duration < config.permissionless_resolve_stale_slots {
+                return Err(PercolatorError::OracleStale.into());
+            }
+        }
+
+        // Flush Hyperp index + accrue to boundary (Bug 1+3 fix)
+        if is_hyperp {
+            let mark = if config.mark_ewma_e6 > 0 {
+                config.mark_ewma_e6
+            } else {
+                config.authority_price_e6
+            };
+            let prev_index = config.last_effective_price_e6;
+            if mark > 0 && prev_index > 0 {
+                let last_idx_slot = config.last_hyperp_index_slot;
+                // Use clock.slot (not engine.last_crank_slot) to avoid
+                // monotonicity failure when current_slot > last_crank_slot
+                // from trades/withdrawals after the last crank.
+                let dt = clock.slot.saturating_sub(last_idx_slot);
+                let new_index = oracle::clamp_toward_with_dt(
+                    prev_index.max(1), mark,
+                    config.oracle_price_cap_e2bps, dt,
+                );
+                config.last_effective_price_e6 = new_index;
+                config.last_hyperp_index_slot = clock.slot;
+            }
+            state::write_config(&mut data, &config);
+            // Accrue at the mark (settlement price), not the smoothed index.
+            // force_close_resolved uses K coefficients that must reflect mark.
+            let settle_price = mark.max(1);
+            let engine = zc::engine_mut(&mut data)?;
+            engine.accrue_market_to(
+                clock.slot,
+                settle_price,
+            ).map_err(map_risk_error)?;
+            config = state::read_config(&data);
+        }
+
+        // Settlement price = last oracle price from engine.
+        // Reject only if completely uninitialized (p == 0).
+        // The non-Hyperp init sentinel (p=1) is harmless: if no one ever
+        // traded or cranked, there are no positions to settle. If anyone
+        // did interact, accrue_market_to updated last_oracle_price to the
+        // real price. The sentinel cannot cause incorrect settlement because:
+        // - All resolve paths require crank staleness (no recent activity)
+        // - If the market had activity, last_oracle_price reflects it
+        // - Resolution at p=1 on an empty market is a no-op
+        let last_price = {
+            let engine = zc::engine_ref(&data)?;
+            let p = engine.last_oracle_price;
+            if p == 0 {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            p
+        };
+
+        // Accrue engine to settlement price before entering resolved mode.
+        // Hyperp already accrued above; non-Hyperp accrues here.
+        if !is_hyperp {
+            let engine = zc::engine_mut(&mut data)?;
+            engine.accrue_market_to(clock.slot, last_price)
+                .map_err(map_risk_error)?;
+        }
+
+        // Use clock.slot (not engine.last_crank_slot) — other instructions
+        // advance current_slot past last_crank_slot, so using the stale
+        // crank slot would make resolved touch paths fail monotonic checks.
+        config.resolution_slot = clock.slot;
+        config.authority_price_e6 = last_price;
+        state::write_config(&mut data, &config);
+        state::set_resolved(&mut data);
+        Ok(())
+    }
+
+    // --- ForceCloseResolved ---
+    #[inline(never)]
+    fn handle_force_close_resolved<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        // Permissionless force-close for resolved markets.
+        // Mirrors AdminForceCloseAccount but requires delay and no admin.
+        accounts::expect_len(accounts, 7)?;
+        let a_slab = &accounts[0];
+        let a_vault = &accounts[1];
+        let a_owner_ata = &accounts[2];
+        let a_pda = &accounts[3];
+        let a_token = &accounts[4];
+        let a_clock = &accounts[5];
+        // accounts[6] = oracle (unused but passed for compatibility)
+
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if !state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        if config.force_close_delay_slots == 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        let clock = Clock::from_account_info(a_clock)?;
+        if clock.slot < config.resolution_slot
+            .saturating_add(config.force_close_delay_slots)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+        let auth = accounts::derive_vault_authority_with_bump(
+            program_id, a_slab.key, config.vault_authority_bump,
+        )?;
+        verify_vault(
+            a_vault, &auth, &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        accounts::expect_key(a_pda, &auth)?;
+
+        let price = config.authority_price_e6;
+        if price == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let engine = zc::engine_mut(&mut data)?;
+        check_idx(engine, user_idx)?;
+
+        let owner_pubkey = Pubkey::new_from_array(
+            engine.accounts[user_idx as usize].owner,
+        );
+        verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
+
+        let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
+            .map_err(map_risk_error)?;
+
+        let amt_units_u64: u64 = amt_units
+            .try_into()
+            .map_err(|_| PercolatorError::EngineOverflow)?;
+        let base_to_pay =
+            crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                .ok_or(PercolatorError::EngineOverflow)?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token, a_vault, a_owner_ata, a_pda,
+            base_to_pay, &signer_seeds,
+        )?;
+        Ok(())
+    }
+
+    // --- CreateLpVault ---
+    #[inline(never)]
+    fn handle_create_lp_vault<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        fee_share_bps: u64,
+        util_curve_enabled: bool,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 8)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_lp_vault_state = &accounts[2];
+        let a_lp_vault_mint = &accounts[3];
+        let a_vault_authority = &accounts[4];
+        let a_system = &accounts[5];
+        let a_token = &accounts[6];
+        let a_rent = &accounts[7];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_lp_vault_state)?;
+        accounts::expect_writable(a_lp_vault_mint)?;
+        verify_token_program(a_token)?;
+        if *a_system.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        if fee_share_bps > 10_000 {
+            return Err(PercolatorError::LpVaultInvalidFeeShare.into());
+        }
+
+        let data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+        drop(data);
+
+        #[allow(unused_variables)]
+        let (expected_state, state_bump) =
+            accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        if a_lp_vault_state.data_len() > 0 {
+            let state_data = a_lp_vault_state.try_borrow_data()?;
+            if state_data.len() >= 8 {
+                let magic = u64::from_le_bytes(state_data[..8].try_into().unwrap());
+                if magic == crate::lp_vault::LP_VAULT_MAGIC {
+                    return Err(PercolatorError::LpVaultAlreadyExists.into());
+                }
+            }
+            drop(state_data);
+        }
+
+        let (expected_mint, mint_bump) =
+            accounts::derive_lp_vault_mint(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+        let (auth, _vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+        accounts::expect_key(a_vault_authority, &auth)?;
+
+        #[cfg(not(feature = "test"))]
+        {
+            use solana_program::program::invoke_signed;
+            use solana_program::sysvar::Sysvar;
+
+            let space = crate::lp_vault::LP_VAULT_STATE_LEN;
+            let rent = solana_program::rent::Rent::get()?;
+            let lamports = rent.minimum_balance(space);
+
+            let state_seeds: &[&[u8]] = &[b"lp_vault", a_slab.key.as_ref(), &[state_bump]];
+            let create_ix = solana_program::system_instruction::create_account(
+                a_admin.key,
+                a_lp_vault_state.key,
+                lamports,
+                space as u64,
+                program_id,
+            );
+            invoke_signed(
+                &create_ix,
+                &[a_admin.clone(), a_lp_vault_state.clone(), a_system.clone()],
+                &[state_seeds],
+            )?;
+        }
+        #[cfg(feature = "test")]
+        {
+            let _ = a_system;
+        }
+
+        {
+            let mut state_data = a_lp_vault_state.try_borrow_mut_data()?;
+            if state_data.len() < crate::lp_vault::LP_VAULT_STATE_LEN {
+                return Err(ProgramError::AccountDataTooSmall);
+            }
+            let mut vault_state = crate::lp_vault::LpVaultState::new_zeroed();
+            vault_state.magic = crate::lp_vault::LP_VAULT_MAGIC;
+            vault_state.fee_share_bps = fee_share_bps;
+            vault_state.epoch = 1;
+            vault_state.lp_util_curve_enabled = if util_curve_enabled { 1 } else { 0 };
+            vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
+            vault_state.hwm_floor_bps = 5000;
+            let slab_data = a_slab.try_borrow_data()?;
+            let engine = zc::engine_ref(&slab_data)?;
+            // fee_revenue not in current InsuranceFund layout — snapshot is 0
+            vault_state.last_fee_snapshot = 0u128;
+            drop(slab_data);
+            crate::lp_vault::write_lp_vault_state(&mut state_data, &vault_state);
+        }
+
+        let mint_seeds: &[&[u8]] = &[b"lp_vault_mint", a_slab.key.as_ref(), &[mint_bump]];
+        let decimals = 6u8;
+        crate::insurance_lp::create_mint(
+            a_admin,
+            a_lp_vault_mint,
+            a_vault_authority,
+            a_system,
+            a_token,
+            a_rent,
+            decimals,
+            mint_seeds,
+        )?;
+
+        msg!(
+            "LP vault created: fee_share={}bps util_curve={} slab={}",
+            fee_share_bps,
+            util_curve_enabled,
+            a_slab.key
+        );
+        Ok(())
+    }
+
+    // --- LpVaultDeposit ---
+    #[inline(never)]
+    fn handle_lp_vault_deposit<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 9)?;
+        let a_depositor = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_depositor_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_lp_vault_mint = &accounts[5];
+        let a_depositor_lp_ata = &accounts[6];
+        let a_vault_authority = &accounts[7];
+        let a_lp_vault_state = &accounts[8];
+
+        accounts::expect_signer(a_depositor)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_depositor_ata)?;
+        accounts::expect_writable(a_vault)?;
+        accounts::expect_writable(a_lp_vault_mint)?;
+        accounts::expect_writable(a_depositor_lp_ata)?;
+        accounts::expect_writable(a_lp_vault_state)?;
+        verify_token_program(a_token)?;
+
+        if amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        let slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+
+        if state::is_resolved(&slab_data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        require_not_paused(&slab_data)?;
+
+        let config = state::read_config(&slab_data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        // Use stored vault_authority_bump (~1500 CU cheaper than find_program_address)
+        let vault_bump = config.vault_authority_bump;
+        let auth = accounts::derive_vault_authority_with_bump(program_id, a_slab.key, vault_bump)?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_depositor_ata, a_depositor.key, &mint)?;
+
+        let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+        if a_lp_vault_mint.data_len() == 0 {
+            return Err(PercolatorError::LpVaultNotCreated.into());
+        }
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        accounts::expect_key(a_vault_authority, &auth)?;
+
+        let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+        let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        if !vault_state.is_initialized() {
+            return Err(PercolatorError::LpVaultNotCreated.into());
+        }
+
+        let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+        let capital_before = vault_state.total_capital;
+
+        drop(slab_data);
+        collateral::deposit(a_token, a_depositor_ata, a_vault, a_depositor, amount)?;
+
+        let slab_data = a_slab.try_borrow_data()?;
+        let config = state::read_config(&slab_data);
+        let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+        drop(slab_data);
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        let old_dust = state::read_dust_base(&slab_data);
+        state::write_dust_base(&mut slab_data, old_dust.saturating_add(dust));
+
+        let lp_tokens_to_mint: u64 = if lp_supply == 0 || capital_before == 0 {
+            if lp_supply > 0 && capital_before == 0 {
+                vault_state.epoch = vault_state.epoch.saturating_add(1);
+            }
+            units
+        } else {
+            let numerator = (units as u128)
+                .checked_mul(lp_supply as u128)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            let result = numerator / capital_before;
+            if result > u64::MAX as u128 {
+                return Err(PercolatorError::EngineOverflow.into());
+            }
+            result as u64
+        };
+
+        if lp_tokens_to_mint == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        vault_state.total_capital = vault_state
+            .total_capital
+            .checked_add(units as u128)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        if vault_state.hwm_floor_bps > 0
+            && vault_state.total_capital > vault_state.epoch_high_water_tvl
+        {
+            vault_state.epoch_high_water_tvl = vault_state.total_capital;
+        }
+
+        let engine = zc::engine_mut(&mut slab_data)?;
+        engine.vault = percolator::U128::new(
+            engine
+                .vault
+                .get()
+                .checked_add(units as u128)
+                .ok_or(PercolatorError::EngineOverflow)?,
+        );
+        drop(slab_data);
+
+        crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+        drop(vs_data);
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [vault_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        crate::insurance_lp::mint_to(
+            a_token,
+            a_lp_vault_mint,
+            a_depositor_lp_ata,
+            a_vault_authority,
+            lp_tokens_to_mint,
+            &signer_seeds,
+        )?;
+
+        if accounts.len() >= 10 {
+            let a_creator_lock = &accounts[9];
+            let (expected_lock_pda, _) = Pubkey::find_program_address(
+                &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            if *a_creator_lock.key == expected_lock_pda && a_creator_lock.is_writable {
+                if let Ok(mut lock_data) = a_creator_lock.try_borrow_mut_data() {
+                    if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                        let creator_key = Pubkey::new_from_array(lock_state.creator);
+                        if *a_depositor.key == creator_key {
+                            let mut new_lock = *lock_state;
+                            new_lock.lp_amount_locked =
+                                new_lock.lp_amount_locked.saturating_add(lp_tokens_to_mint);
+                            new_lock.cumulative_deposited = new_lock
+                                .cumulative_deposited
+                                .saturating_add(lp_tokens_to_mint as u64);
+                            crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 0xD09051 = "DEPOSIT" tag; logs (amount, lp_minted, epoch, 0, 0)
+        sol_log_64(0xD09051, amount, lp_tokens_to_mint, vault_state.epoch, 0);
+        Ok(())
+    }
+
+    // --- LpVaultWithdraw ---
+    #[inline(never)]
+    fn handle_lp_vault_withdraw<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 11)?;
+        let a_withdrawer = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_withdrawer_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_lp_vault_mint = &accounts[5];
+        let a_withdrawer_lp_ata = &accounts[6];
+        let a_vault_authority = &accounts[7];
+        let a_lp_vault_state = &accounts[8];
+
+        accounts::expect_signer(a_withdrawer)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_withdrawer_ata)?;
+        accounts::expect_writable(a_vault)?;
+        accounts::expect_writable(a_lp_vault_mint)?;
+        accounts::expect_writable(a_withdrawer_lp_ata)?;
+        accounts::expect_writable(a_lp_vault_state)?;
+        verify_token_program(a_token)?;
+
+        if lp_amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        // accounts[9] = creator_lock_pda (existing)
+        // accounts[10] = withdraw_queue_pda (SECURITY H-6)
+        {
+            let a_creator_lock = &accounts[9];
+            let (expected_lock_pda, _) = Pubkey::find_program_address(
+                &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
+            if *a_creator_lock.key == expected_lock_pda {
+                accounts::expect_writable(a_creator_lock)?;
+                let mut lock_data = a_creator_lock
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                    let creator_key = Pubkey::new_from_array(lock_state.creator);
+                    if *a_withdrawer.key == creator_key {
+                        let clock = solana_program::clock::Clock::get()?;
+                        let expired = crate::creator_lock::is_lock_expired(
+                            clock.slot,
+                            lock_state.lock_start_slot,
+                            lock_state.lock_duration_slots,
+                        );
+                        let max_withdraw = crate::creator_lock::max_withdrawable(
+                            lp_amount,
+                            lock_state.lp_amount_locked,
+                            expired,
+                        );
+                        if lp_amount > max_withdraw {
+                            msg!(
+                                "CREATOR_LOCK: withdraw {} > max {}",
+                                lp_amount,
+                                max_withdraw
+                            );
+                            return Err(ProgramError::InvalidArgument);
+                        }
+                        let mut new_lock = *lock_state;
+                        new_lock.cumulative_extracted = new_lock
+                            .cumulative_extracted
+                            .saturating_add(lp_amount);
+                        if crate::creator_lock::check_extraction_exceeded(
+                            new_lock.cumulative_extracted,
+                            new_lock.cumulative_deposited,
+                            crate::creator_lock::EXTRACTION_LIMIT_BPS,
+                        ) {
+                            new_lock.fee_redirect_active = 1;
+                            msg!("CREATOR_LOCK: fee redirect activated");
+                        }
+                        crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                    }
+                }
+            }
+        }
+
+        // SECURITY(H-6): Block instant withdraw when user has an active
+        // withdrawal queue. Without this, the user can queue LP tokens
+        // and then immediately withdraw the same tokens via LpVaultWithdraw,
+        // creating a double-spend on the queued claim.
+        {
+            let a_withdraw_queue = &accounts[10];
+            let (expected_queue, _) =
+                accounts::derive_withdraw_queue(program_id, a_slab.key, a_withdrawer.key);
+            accounts::expect_key(a_withdraw_queue, &expected_queue)?;
+            if a_withdraw_queue.data_len() >= crate::lp_vault::WITHDRAW_QUEUE_LEN {
+                let q_data = a_withdraw_queue
+                    .try_borrow_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                if let Some(queue) = crate::lp_vault::read_withdraw_queue(&q_data) {
+                    if queue.is_initialized() {
+                        let unclaimed =
+                            queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
+                        if unclaimed > 0 {
+                            msg!(
+                                "LpVaultWithdraw blocked: active queue has {} unclaimed LP",
+                                unclaimed
+                            );
+                            return Err(
+                                PercolatorError::WithdrawQueueAlreadyExists.into()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+
+        let config = state::read_config(&slab_data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        // Use stored vault_authority_bump (~1500 CU cheaper than find_program_address)
+        let vault_bump = config.vault_authority_bump;
+        let auth = accounts::derive_vault_authority_with_bump(program_id, a_slab.key, vault_bump)?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_withdrawer_ata, a_withdrawer.key, &mint)?;
+
+        let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        accounts::expect_key(a_vault_authority, &auth)?;
+
+        let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+        let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        if !vault_state.is_initialized() {
+            return Err(PercolatorError::LpVaultNotCreated.into());
+        }
+
+        let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+        let capital = vault_state.total_capital;
+
+        if lp_supply == 0 || capital == 0 {
+            return Err(PercolatorError::LpVaultSupplyMismatch.into());
+        }
+
+        let numerator = (lp_amount as u128)
+            .checked_mul(capital)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        let units_to_return = numerator / (lp_supply as u128);
+
+        if units_to_return == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+            let remaining = capital
+                .checked_sub(units_to_return)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            let floor = vault_state
+                .epoch_high_water_tvl
+                .saturating_mul(vault_state.hwm_floor_bps as u128)
+                / 10_000;
+            if remaining < floor {
+                return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+            }
+        }
+
+        let (oi_multiplier, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
+        if oi_multiplier > 0 {
+            let remaining_capital = capital.saturating_sub(units_to_return);
+            let engine = zc::engine_ref(&slab_data)?;
+            let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+            let max_oi_after =
+                remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+            if current_oi > max_oi_after {
+                return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+            }
+        }
+
+        let units_u64 = if units_to_return > u64::MAX as u128 {
+            return Err(PercolatorError::EngineOverflow.into());
+        } else {
+            units_to_return as u64
+        };
+        let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        vault_state.total_capital = capital
+            .checked_sub(units_to_return)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        let engine = zc::engine_mut(&mut slab_data)?;
+        engine.vault = percolator::U128::new(
+            engine
+                .vault
+                .get()
+                .checked_sub(units_to_return)
+                .ok_or(PercolatorError::EngineOverflow)?,
+        );
+        drop(slab_data);
+
+        crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+        drop(vs_data);
+
+        crate::insurance_lp::burn(
+            a_token,
+            a_lp_vault_mint,
+            a_withdrawer_lp_ata,
+            a_withdrawer,
+            lp_amount,
+        )?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [vault_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_withdrawer_ata,
+            a_vault_authority,
+            base_amount,
+            &signer_seeds,
+        )?;
+
+        // 0xD09057 = "WITHDRAW" tag; logs (lp_burned, tokens_returned, epoch, 0, 0)
+        sol_log_64(0xD09057, lp_amount, base_amount, vault_state.epoch, 0);
+        Ok(())
+    }
+
+    // --- LpVaultCrankFees ---
+    #[inline(never)]
+    fn handle_lp_vault_crank_fees<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        if accounts.len() < 2 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let a_slab = &accounts[0];
+        let a_lp_vault_state = &accounts[1];
+
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_lp_vault_state)?;
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+        let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        if !vault_state.is_initialized() {
+            return Err(PercolatorError::LpVaultNotCreated.into());
+        }
+
+        let config = state::read_config(&slab_data);
+
+        let engine = zc::engine_mut(&mut slab_data)?;
+        // fee_revenue not in current InsuranceFund layout — always 0
+        let current_fee_revenue = 0u128;
+        let last_snapshot = vault_state.last_fee_snapshot;
+
+        let fee_delta = current_fee_revenue.saturating_sub(last_snapshot);
+        if fee_delta == 0 {
+            return Err(PercolatorError::LpVaultNoNewFees.into());
+        }
+
+        let (oi_mult_for_util, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
+        let fee_mult_bps: u64 = if vault_state.lp_util_curve_enabled != 0
+            && oi_mult_for_util > 0
+        {
+            let vault_balance = engine.vault.get();
+            let max_oi = vault_balance.saturating_mul(oi_mult_for_util as u128) / 10_000;
+            let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+
+            let util_bps = crate::verify::compute_util_bps(current_oi, max_oi);
+            let mult = crate::verify::compute_fee_multiplier_bps(util_bps);
+
+            vault_state.current_fee_mult_bps = mult as u32;
+            mult
+        } else {
+            vault_state.current_fee_mult_bps = crate::verify::FEE_MULT_BASE_BPS as u32;
+            crate::verify::FEE_MULT_BASE_BPS
+        };
+
+        let lp_portion = fee_delta
+            .saturating_mul(vault_state.fee_share_bps as u128)
+            .saturating_mul(fee_mult_bps as u128)
+            / (10_000u128 * 10_000u128);
+
+        if lp_portion > 0 {
+            let ins_balance = engine.insurance_fund.balance.get();
+            let actual_transfer = core::cmp::min(lp_portion, ins_balance);
+
+            engine.insurance_fund.balance =
+                percolator::U128::new(ins_balance.saturating_sub(actual_transfer));
+
+            vault_state.total_capital = vault_state
+                .total_capital
+                .checked_add(actual_transfer)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            vault_state.total_fees_distributed = vault_state
+                .total_fees_distributed
+                .checked_add(actual_transfer)
+                .ok_or(PercolatorError::EngineOverflow)?;
+        }
+
+        vault_state.last_fee_snapshot = current_fee_revenue;
+        let clock_slot = if accounts.len() > 2 {
+            Clock::from_account_info(&accounts[2])?.slot
+        } else {
+            Clock::get()?.slot
+        };
+        vault_state.last_crank_slot = clock_slot;
+        drop(slab_data);
+
+        crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+
+        // 0xFEEC84 = "FEE_CRANK" tag; logs (delta, mult_bps, lp_portion, capital, slot)
+        // Truncate u128 -> u64 for sol_log_64 (low 64 bits sufficient for debug)
+        sol_log_64(0xFEEC84, fee_delta as u64, fee_mult_bps, lp_portion as u64, vault_state.total_capital as u64);
+        Ok(())
+    }
+
+    // --- FundMarketInsurance ---
+    #[inline(never)]
+    fn handle_fund_market_insurance<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 5)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_admin_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+        verify_token_program(a_token)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let config = state::read_config(&data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+
+        let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_admin_ata, a_admin.key, &mint)?;
+
+        collateral::deposit(a_token, a_admin_ata, a_vault, a_admin, amount)?;
+
+        let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+        let old_dust = state::read_dust_base(&data);
+        state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+        let engine = zc::engine_mut(&mut data)?;
+        // Inline fund_market_insurance: add units to insurance fund balance.
+        engine.insurance_fund.balance = percolator::U128::new(
+            engine
+                .insurance_fund
+                .balance
+                .get()
+                .checked_add(units as u128)
+                .ok_or(PercolatorError::EngineOverflow)?,
+        );
+
+        msg!("PERC-306: funded market insurance with {} units", units);
+        Ok(())
+    }
+
+    // --- SetInsuranceIsolation ---
+    #[inline(never)]
+    fn handle_set_insurance_isolation<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        bps: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        if bps > 10_000 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        // set_insurance_isolation_bps: stub — field not in current layout, log only.
+        let _engine = zc::engine_mut(&mut data)?;
+        // config.insurance_isolation_bps not in current layout — no-op write.
+        msg!("PERC-306: set insurance isolation to {} bps", bps);
+        Ok(())
+    }
+
+    // --- ChallengeSettlement ---
+    #[inline(never)]
+    fn handle_challenge_settlement<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        proposed_price_e6: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 7)?;
+        let a_challenger = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_dispute = &accounts[2];
+        let a_challenger_ata = &accounts[3];
+        let a_vault = &accounts[4];
+        let a_token = &accounts[5];
+        let a_system = &accounts[6];
+
+        accounts::expect_signer(a_challenger)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_dispute)?;
+        accounts::expect_writable(a_challenger_ata)?;
+        accounts::expect_writable(a_vault)?;
+        verify_token_program(a_token)?;
+        if *a_system.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        if !state::is_resolved(&data) {
+            return Err(PercolatorError::MarketNotResolved.into());
+        }
+
+        let config = state::read_config(&data);
+        drop(data);
+
+        let dispute_window_slots = state::get_dispute_window_slots(&config);
+        if dispute_window_slots == 0 {
+            return Err(PercolatorError::DisputeWindowClosed.into());
+        }
+        let clock = Clock::get()?;
+        let resolved_slot = state::get_resolved_slot(&config);
+        let window_end = resolved_slot
+            .checked_add(dispute_window_slots)
+            .ok_or(PercolatorError::DisputeWindowClosed)?;
+        if clock.slot > window_end {
+            return Err(PercolatorError::DisputeWindowClosed.into());
+        }
+
+        let (expected_dispute, dispute_bump) =
+            accounts::derive_dispute(program_id, a_slab.key);
+        accounts::expect_key(a_dispute, &expected_dispute)?;
+
+        if a_dispute.data_len() > 0 {
+            let d_data = a_dispute.try_borrow_data()?;
+            if let Some(existing) = crate::dispute::read_dispute(&d_data) {
+                if existing.is_initialized() {
+                    return Err(PercolatorError::DisputeAlreadyExists.into());
+                }
+            }
+            drop(d_data);
+        }
+
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+        let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        verify_token_account(a_challenger_ata, a_challenger.key, &mint)?;
+
+        let dispute_bond_amount = state::get_dispute_bond_amount(&config);
+        if dispute_bond_amount > 0 {
+            collateral::deposit(
+                a_token,
+                a_challenger_ata,
+                a_vault,
+                a_challenger,
+                dispute_bond_amount,
+            )?;
+        }
+
+        let dispute_len = crate::dispute::DISPUTE_LEN;
+        let rent = solana_program::rent::Rent::get()?;
+        let lamports = rent.minimum_balance(dispute_len);
+
+        let seed1: &[u8] = b"dispute";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [dispute_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        solana_program::program::invoke_signed(
+            &solana_program::system_instruction::create_account(
+                a_challenger.key,
+                a_dispute.key,
+                lamports,
+                dispute_len as u64,
+                program_id,
+            ),
+            &[a_challenger.clone(), a_dispute.clone(), a_system.clone()],
+            &signer_seeds,
+        )?;
+
+        let dispute = crate::dispute::SettlementDispute {
+            magic: crate::dispute::DISPUTE_MAGIC,
+            challenger: a_challenger.key.to_bytes(),
+            proposed_price_e6,
+            proof_slot: clock.slot,
+            bond_amount: dispute_bond_amount,
+            outcome: 0,
+            _pad: [0; 7],
+            dispute_slot: clock.slot,
+            _reserved: [0; 16],
+        };
+
+        let mut d_data = a_dispute.try_borrow_mut_data()?;
+        crate::dispute::write_dispute(&mut d_data, &dispute);
+
+        let settlement_price_e6 = state::get_settlement_price_e6(&config);
+        msg!(
+            "PERC-314: Settlement challenged: proposed={} vs settlement={}",
+            proposed_price_e6,
+            settlement_price_e6
+        );
+        Ok(())
+    }
+
+    // --- ResolveDispute ---
+    #[inline(never)]
+    fn handle_resolve_dispute<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        accept: u8,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 7)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_dispute = &accounts[2];
+        let a_challenger_ata = &accounts[3];
+        let a_vault = &accounts[4];
+        let a_vault_authority = &accounts[5];
+        let a_token = &accounts[6];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_dispute)?;
+        accounts::expect_writable(a_challenger_ata)?;
+        accounts::expect_writable(a_vault)?;
+        verify_token_program(a_token)?;
+
+        let data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        let config = state::read_config(&data);
+        drop(data);
+
+        if !crate::verify::admin_ok(header.admin, a_admin.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        let (expected_dispute, _) = accounts::derive_dispute(program_id, a_slab.key);
+        accounts::expect_key(a_dispute, &expected_dispute)?;
+
+        let mut d_data = a_dispute.try_borrow_mut_data()?;
+        let mut dispute = crate::dispute::read_dispute(&d_data)
+            .ok_or(PercolatorError::NoActiveDispute)?;
+        if !dispute.is_initialized() || dispute.outcome != 0 {
+            return Err(PercolatorError::NoActiveDispute.into());
+        }
+
+        if accept != 0 {
+            dispute.outcome = 1;
+
+            let mut slab_data = state::slab_data_mut(a_slab)?;
+            let config_w = state::read_config(&slab_data);
+            // settlement_price_e6 not in current layout — update is no-op
+            let _ = dispute.proposed_price_e6;
+            state::write_config(&mut slab_data, &config_w);
+            drop(slab_data);
+
+            if dispute.bond_amount > 0 {
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let challenger_key = Pubkey::new_from_array(dispute.challenger);
+                verify_token_account(a_challenger_ata, &challenger_key, &mint)?;
+                let (auth, vault_bump) =
+                    accounts::derive_vault_authority(program_id, a_slab.key);
+                accounts::expect_key(a_vault_authority, &auth)?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [vault_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_challenger_ata,
+                    a_vault_authority,
+                    dispute.bond_amount,
+                    &signer_seeds,
+                )?;
+            }
+
+            msg!(
+                "PERC-314: Dispute accepted — settlement updated to {}",
+                dispute.proposed_price_e6
+            );
+        } else {
+            dispute.outcome = 2;
+            msg!("PERC-314: Dispute rejected — bond forfeited");
+        }
+
+        crate::dispute::write_dispute(&mut d_data, &dispute);
+        Ok(())
+    }
+
+    // --- DepositLpCollateral ---
+    #[inline(never)]
+    fn handle_deposit_lp_collateral<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        lp_amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 7)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_lp_ata = &accounts[2];
+        let a_lp_vault_mint = &accounts[3];
+        let a_lp_vault_state = &accounts[4];
+        let a_token = &accounts[5];
+        let a_lp_escrow = &accounts[6];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_user_lp_ata)?;
+        accounts::expect_writable(a_lp_escrow)?;
+        verify_token_program(a_token)?;
+
+        if lp_amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+        require_not_paused(&slab_data)?;
+
+        let config = state::read_config(&slab_data);
+        if state::get_lp_collateral_enabled(&config) == 0 {
+            return Err(PercolatorError::LpCollateralDisabled.into());
+        }
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        let vs_data = a_lp_vault_state.try_borrow_data()?;
+        let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        let vault_tvl = vault_state.total_capital;
+        drop(vs_data);
+
+        let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+        // SECURITY(H-2): Validate LP escrow is owned by vault authority PDA
+        // and holds the correct LP vault mint. Without this, an attacker can
+        // pass their own token account as escrow, getting engine collateral
+        // credit while retaining control of the LP tokens.
+        let (vault_auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_token_account(a_lp_escrow, &vault_auth, &expected_mint)?;
+
+        let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+
+        let collateral_units = crate::lp_collateral::lp_token_value(
+            lp_amount,
+            vault_tvl,
+            lp_supply,
+            state::get_lp_collateral_ltv_bps(&config) as u64,
+        );
+
+        if collateral_units == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        let engine = zc::engine_mut(&mut slab_data)?;
+        check_idx(engine, user_idx)?;
+
+        let owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        let clock = Clock::get()?;
+
+        engine
+            .deposit(user_idx, collateral_units, 0, clock.slot)
+            .map_err(map_risk_error)?;
+
+        engine.vault = percolator::U128::new(
+            engine
+                .vault
+                .get()
+                .checked_add(collateral_units)
+                .ok_or(PercolatorError::EngineOverflow)?,
+        );
+        drop(slab_data);
+
+        collateral::deposit(a_token, a_user_lp_ata, a_lp_escrow, a_user, lp_amount)?;
+
+        // 0x315D09 = "PERC-315 DEPOSIT" tag; logs (lp_amount, collateral_units, ltv_bps, 0, 0)
+        // Truncate u128 -> u64 for sol_log_64 (low 64 bits sufficient for debug)
+        sol_log_64(0x315D09, lp_amount, collateral_units as u64, state::get_lp_collateral_ltv_bps(&config) as u64, 0);
+        Ok(())
+    }
+
+    // --- WithdrawLpCollateral ---
+    #[inline(never)]
+    fn handle_withdraw_lp_collateral<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        lp_amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 8)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_user_lp_ata = &accounts[2];
+        let a_lp_vault_mint = &accounts[3];
+        let a_lp_vault_state = &accounts[4];
+        let a_token = &accounts[5];
+        let a_lp_escrow = &accounts[6];
+        let a_vault_authority = &accounts[7];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_user_lp_ata)?;
+        accounts::expect_writable(a_lp_escrow)?;
+        verify_token_program(a_token)?;
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+        let config = state::read_config(&slab_data);
+
+        let engine = zc::engine_mut(&mut slab_data)?;
+        check_idx(engine, user_idx)?;
+
+        let owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        let pos = engine.accounts[user_idx as usize].position_basis_q;
+        if pos != 0 {
+            return Err(PercolatorError::LpCollateralPositionOpen.into());
+        }
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        drop(slab_data);
+
+        let vs_data = a_lp_vault_state.try_borrow_data()?;
+        let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        let vault_tvl = vault_state.total_capital;
+        drop(vs_data);
+
+        let (expected_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_mint, &expected_mint)?;
+
+        // SECURITY(H-2): Validate LP escrow on withdrawal too (defense-in-depth).
+        let (vault_auth_check, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_token_account(a_lp_escrow, &vault_auth_check, &expected_mint)?;
+
+        let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+
+        let collateral_units = crate::lp_collateral::lp_token_value(
+            lp_amount,
+            vault_tvl,
+            lp_supply,
+            state::get_lp_collateral_ltv_bps(&config) as u64,
+        );
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        let engine = zc::engine_mut(&mut slab_data)?;
+
+        let clock = Clock::get()?;
+        engine
+            .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0)
+            .map_err(map_risk_error)?;
+
+        engine.vault = percolator::U128::new(
+            engine
+                .vault
+                .get()
+                .checked_sub(collateral_units)
+                .ok_or(PercolatorError::EngineOverflow)?,
+        );
+        drop(slab_data);
+
+        // Use stored vault_authority_bump (~1500 CU cheaper than find_program_address)
+        let vault_bump = config.vault_authority_bump;
+        let auth = accounts::derive_vault_authority_with_bump(program_id, a_slab.key, vault_bump)?;
+        accounts::expect_key(a_vault_authority, &auth)?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [vault_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_lp_escrow,
+            a_user_lp_ata,
+            a_vault_authority,
+            lp_amount,
+            &signer_seeds,
+        )?;
+
+        // 0x315D57 = "PERC-315 WITHDRAW" tag; logs (lp_amount, collateral_units, 0, 0, 0)
+        // Truncate u128 -> u64 for sol_log_64 (low 64 bits sufficient for debug)
+        sol_log_64(0x315D57, lp_amount, collateral_units as u64, 0, 0);
+        Ok(())
+    }
+
+    // --- QueueWithdrawal ---
+    #[inline(never)]
+    fn handle_queue_withdrawal<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 5)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_lp_vault_state = &accounts[2];
+        let a_queue = &accounts[3];
+        let a_system = &accounts[4];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_queue)?;
+        if *a_system.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        require_not_paused(&data)?;
+        drop(data);
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        let vs_data = a_lp_vault_state.try_borrow_data()?;
+        let vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        if !vault_state.is_initialized() {
+            return Err(PercolatorError::LpVaultNotCreated.into());
+        }
+        let queue_epochs = if vault_state.queue_epochs == 0 {
+            5u8
+        } else {
+            vault_state.queue_epochs
+        };
+        drop(vs_data);
+
+        let (expected_queue, queue_bump) =
+            accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+        accounts::expect_key(a_queue, &expected_queue)?;
+
+        if a_queue.data_len() > 0 {
+            let q_data = a_queue.try_borrow_data()?;
+            if let Some(existing) = crate::lp_vault::read_withdraw_queue(&q_data) {
+                if existing.is_initialized() {
+                    return Err(PercolatorError::WithdrawQueueAlreadyExists.into());
+                }
+            }
+            drop(q_data);
+        }
+
+        if lp_amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        let queue_len = crate::lp_vault::WITHDRAW_QUEUE_LEN;
+        let rent = solana_program::rent::Rent::get()?;
+        let lamports = rent.minimum_balance(queue_len);
+
+        let seed1: &[u8] = b"withdraw_queue";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let seed3: &[u8] = a_user.key.as_ref();
+        let bump_arr: [u8; 1] = [queue_bump];
+        let seed4: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 4] = [seed1, seed2, seed3, seed4];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        solana_program::program::invoke_signed(
+            &solana_program::system_instruction::create_account(
+                a_user.key,
+                a_queue.key,
+                lamports,
+                queue_len as u64,
+                program_id,
+            ),
+            &[a_user.clone(), a_queue.clone(), a_system.clone()],
+            &signer_seeds,
+        )?;
+
+        let clock = Clock::get()?;
+        let queue = crate::lp_vault::WithdrawQueue {
+            magic: crate::lp_vault::WITHDRAW_QUEUE_MAGIC,
+            queued_lp_amount: lp_amount,
+            queue_start_slot: clock.slot,
+            epochs_remaining: queue_epochs,
+            total_epochs: queue_epochs,
+            _pad: [0; 6],
+            claimed_so_far: 0,
+            last_claim_slot: 0,
+            _reserved: [0; 16],
+        };
+
+        let mut q_data = a_queue.try_borrow_mut_data()?;
+        crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
+
+        msg!(
+            "PERC-309: Queued {} LP over {} epochs",
+            lp_amount,
+            queue_epochs
+        );
+        Ok(())
+    }
+
+    // --- ClaimQueuedWithdrawal ---
+    #[inline(never)]
+    fn handle_claim_queued_withdrawal<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 10)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_queue = &accounts[2];
+        let a_lp_vault_mint = &accounts[3];
+        let a_user_lp_ata = &accounts[4];
+        let a_vault = &accounts[5];
+        let a_user_ata = &accounts[6];
+        let a_vault_authority = &accounts[7];
+        let a_token = &accounts[8];
+        let a_lp_vault_state = &accounts[9];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_queue)?;
+        accounts::expect_writable(a_lp_vault_mint)?;
+        accounts::expect_writable(a_user_lp_ata)?;
+        accounts::expect_writable(a_vault)?;
+        accounts::expect_writable(a_user_ata)?;
+        accounts::expect_writable(a_lp_vault_state)?;
+        verify_token_program(a_token)?;
+
+        let (expected_queue, _) =
+            accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+        accounts::expect_key(a_queue, &expected_queue)?;
+
+        let mut q_data = a_queue.try_borrow_mut_data()?;
+        let mut queue = crate::lp_vault::read_withdraw_queue(&q_data)
+            .ok_or(PercolatorError::WithdrawQueueNotFound)?;
+        if !queue.is_initialized() {
+            return Err(PercolatorError::WithdrawQueueNotFound.into());
+        }
+
+        // SECURITY(CR-2): Enforce one claim per epoch duration window.
+        // Without this, all epochs are claimable in a single slot because
+        // claimable_this_epoch() uses only the epochs_remaining counter
+        // with no clock check.
+        let clock = Clock::get()?;
+        if queue.last_claim_slot > 0
+            && clock.slot
+                < queue
+                    .last_claim_slot
+                    .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS)
+        {
+            msg!(
+                "ClaimQueuedWithdrawal: epoch not elapsed (slot={}, next={})",
+                clock.slot,
+                queue.last_claim_slot
+                    .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS),
+            );
+            return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
+        }
+
+        let claimable = queue.claimable_this_epoch();
+        if claimable == 0 {
+            return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
+        }
+
+        queue.claimed_so_far = queue.claimed_so_far.saturating_add(claimable);
+        queue.epochs_remaining = queue.epochs_remaining.saturating_sub(1);
+        queue.last_claim_slot = clock.slot;
+        crate::lp_vault::write_withdraw_queue(&mut q_data, &queue);
+        drop(q_data);
+
+        let slab_data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+        let config = state::read_config(&slab_data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+        // Save bump before dropping slab_data (~1500 CU cheaper than find_program_address later)
+        let vault_bump = config.vault_authority_bump;
+        let vault_pubkey = config.vault_pubkey;
+        drop(slab_data);
+
+        // Use stored vault_authority_bump (~1500 CU cheaper than find_program_address)
+        let auth = accounts::derive_vault_authority_with_bump(program_id, a_slab.key, vault_bump)?;
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(vault_pubkey),
+        )?;
+        accounts::expect_key(a_vault_authority, &auth)?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        let (expected_lp_mint, _) = accounts::derive_lp_vault_mint(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_mint, &expected_lp_mint)?;
+
+        let (expected_state, _) = accounts::derive_lp_vault_state(program_id, a_slab.key);
+        accounts::expect_key(a_lp_vault_state, &expected_state)?;
+
+        let mut vs_data = a_lp_vault_state.try_borrow_mut_data()?;
+        let mut vault_state = crate::lp_vault::read_lp_vault_state(&vs_data)
+            .ok_or(PercolatorError::LpVaultNotCreated)?;
+        if !vault_state.is_initialized() {
+            return Err(PercolatorError::LpVaultNotCreated.into());
+        }
+
+        let lp_supply = crate::insurance_lp::read_mint_supply(a_lp_vault_mint)?;
+        if lp_supply == 0 || vault_state.total_capital == 0 {
+            return Err(PercolatorError::LpVaultSupplyMismatch.into());
+        }
+
+        let capital_units = (claimable as u128)
+            .checked_mul(vault_state.total_capital)
+            .ok_or(PercolatorError::EngineOverflow)?
+            / (lp_supply as u128);
+
+        if capital_units == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+
+        if capital_units > u64::MAX as u128 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+
+        let slab_data = a_slab.try_borrow_data()?;
+        let config = state::read_config(&slab_data);
+        // SECURITY(M-8): use units_to_base_checked (matches LpVaultWithdraw).
+        // The saturating variant silently clamps to u64::MAX on overflow.
+        let base_amount = crate::units::units_to_base_checked(
+            capital_units as u64,
+            config.unit_scale,
+        )
+        .ok_or(PercolatorError::EngineOverflow)?;
+
+        if vault_state.hwm_floor_bps > 0 && vault_state.epoch_high_water_tvl > 0 {
+            let remaining = vault_state
+                .total_capital
+                .checked_sub(capital_units)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            let floor = vault_state
+                .epoch_high_water_tvl
+                .saturating_mul(vault_state.hwm_floor_bps as u128)
+                / 10_000;
+            if remaining < floor {
+                return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+            }
+        }
+
+        let (oi_multiplier, _) = unpack_oi_cap(state::get_oi_cap_multiplier_bps(&config));
+        if oi_multiplier > 0 {
+            let remaining_capital = vault_state
+                .total_capital
+                .checked_sub(capital_units)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            let engine = zc::engine_ref(&slab_data)?;
+            let current_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+            let max_oi_after =
+                remaining_capital.saturating_mul(oi_multiplier as u128) / 10_000;
+            if current_oi > max_oi_after {
+                return Err(PercolatorError::LpVaultWithdrawExceedsAvailable.into());
+            }
+        }
+        drop(slab_data);
+
+        vault_state.total_capital = vault_state
+            .total_capital
+            .checked_sub(capital_units)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        crate::lp_vault::write_lp_vault_state(&mut vs_data, &vault_state);
+        drop(vs_data);
+
+        let mut slab_data = state::slab_data_mut(a_slab)?;
+        let engine = zc::engine_mut(&mut slab_data)?;
+        engine.vault = percolator::U128::new(
+            engine
+                .vault
+                .get()
+                .checked_sub(capital_units)
+                .ok_or(PercolatorError::EngineOverflow)?,
+        );
+        drop(slab_data);
+
+        crate::insurance_lp::burn(
+            a_token,
+            a_lp_vault_mint,
+            a_user_lp_ata,
+            a_user,
+            claimable,
+        )?;
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [vault_bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_user_ata,
+            a_vault_authority,
+            base_amount,
+            &signer_seeds,
+        )?;
+
+        // 0x309C1A = "PERC-309 CLAIM" tag; logs (claimable, base_amount, epochs_left, 0, 0)
+        sol_log_64(0x309C1A, claimable, base_amount, queue.epochs_remaining as u64, 0);
+        Ok(())
+    }
+
+    // --- CancelQueuedWithdrawal ---
+    #[inline(never)]
+    fn handle_cancel_queued_withdrawal<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_user = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_queue = &accounts[2];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_queue)?;
+
+        let data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        drop(data);
+
+        let (expected_queue, _) =
+            accounts::derive_withdraw_queue(program_id, a_slab.key, a_user.key);
+        accounts::expect_key(a_queue, &expected_queue)?;
+
+        let q_data = a_queue.try_borrow_data()?;
+        let queue = crate::lp_vault::read_withdraw_queue(&q_data)
+            .ok_or(PercolatorError::WithdrawQueueNotFound)?;
+        if !queue.is_initialized() {
+            return Err(PercolatorError::WithdrawQueueNotFound.into());
+        }
+        let remaining = queue.queued_lp_amount.saturating_sub(queue.claimed_so_far);
+        drop(q_data);
+
+        let mut q_data = a_queue.try_borrow_mut_data()?;
+        q_data.fill(0);
+        drop(q_data);
+
+        let mut queue_lamports = a_queue.try_borrow_mut_lamports()?;
+        let mut user_lamports = a_user.try_borrow_mut_lamports()?;
+        **user_lamports = user_lamports
+            .checked_add(**queue_lamports)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        **queue_lamports = 0;
+
+        msg!("PERC-309: Cancelled, {} LP unclaimed", remaining);
+        Ok(())
+    }
+
+    // --- ExecuteAdl ---
+    #[inline(never)]
+    fn handle_execute_adl<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        target_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 4)?;
+        let a_keeper = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_oracle = &accounts[3];
+        accounts::expect_signer(a_keeper)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // SECURITY H-1: Block ADL on resolved markets — resolved markets
+        // use ForceCloseResolved at settlement price, not ADL at oracle price.
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        {
+            let header = state::read_header(&data);
+            require_admin(header.admin, a_keeper.key)?;
+        }
+
+        let mut config = state::read_config(&data);
+
+        let clock = Clock::from_account_info(&accounts[2])?;
+
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            let idx = config.last_effective_price_e6;
+            if idx == 0 {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            {
+                let eng = zc::engine_ref(&data)?;
+                oracle::check_hyperp_staleness(
+                    eng.current_slot,
+                    eng.max_crank_staleness_slots,
+                    clock.slot,
+                )?;
+            }
+            idx
+        } else {
+            oracle::read_price_clamped(
+                &mut config,
+                a_oracle,
+                clock.unix_timestamp,
+            )?
+        };
+        state::write_config(&mut data, &config);
+
+        let engine = zc::engine_mut(&mut data)?;
+
+        // H-4: Insurance fund must be fully depleted before ADL activates.
+        let insurance_balance = engine.insurance_fund.balance.get();
+        if insurance_balance != 0 {
+            msg!(
+                "ADL: insurance_fund.balance={} — not depleted, ADL rejected",
+                insurance_balance
+            );
+            return Err(PercolatorError::InsuranceFundNotDepleted.into());
+        }
+
+        // SECURITY(H-4): Pre-check — reject ADL when PnL clearly within cap.
+        // The definitive check uses post-touch pnl_pos_tot (see below).
+        let cap = state::get_max_pnl_cap(&config) as u128;
+        {
+            let pnl_pre = engine.pnl_pos_tot;
+            if cap > 0 && pnl_pre <= cap {
+                msg!(
+                    "ADL: pnl_pos_tot={} within cap={} — no deleverage needed",
+                    pnl_pre,
+                    cap
+                );
+                return Err(ProgramError::InvalidArgument);
+            }
+        }
+
+        let funding_rate = compute_current_funding_rate(&config);
+
+        let (closed_abs, final_pnl) = engine
+            .execute_adl_not_atomic(
+                target_idx as usize,
+                clock.slot,
+                price,
+                funding_rate,
+            )
+            .map_err(map_risk_error)?;
+
+        // SECURITY(H-2): Recompute excess from post-touch pnl_pos_tot for accurate logging.
+        let excess = engine.pnl_pos_tot.saturating_sub(cap);
+
+        let closed_lo = closed_abs as u64;
+        let closed_hi = (closed_abs >> 64) as u64;
+        sol_log_64(0xAD1E_0001, target_idx as u64, price, closed_lo, closed_hi);
+
+        // 0xAD1E_0002: ADL summary — (excess_lo, excess_hi, final_pnl_lo, pnl_pos_tot_lo, tag)
+        let excess_lo = excess as u64;
+        let excess_hi = (excess >> 64) as u64;
+        let final_pnl_abs = final_pnl.unsigned_abs();
+        sol_log_64(
+            0xAD1E_0002,
+            excess_lo,
+            excess_hi,
+            final_pnl_abs as u64,
+            engine.pnl_pos_tot as u64,
+        );
+        Ok(())
+    }
+
+    // --- CloseStaleSlabs ---
+    #[inline(never)]
+    fn handle_close_stale_slabs<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_dest = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_dest)?;
+        accounts::expect_writable(a_slab)?;
+
+        if a_slab.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        // SECURITY(H-7): Reject slabs with valid sizes — use CloseSlab for those.
+        // Synchronized with slab_guard's accepted sizes. Previous version had:
+        //   - PRE_118/OLDEST using stale offsets (-16/-24 instead of -48/-56)
+        //   - PRE_DEX_POOL_SLAB_LEN missing entirely
+        //   - V1M2_MEDIUM_TRANSITIONAL missing entirely
+        const PRE_DEX_POOL_SLAB_LEN: usize = SLAB_LEN - 32;
+        const PRE_118_SLAB_LEN: usize = SLAB_LEN - 48;
+        const OLDEST_SLAB_LEN: usize = SLAB_LEN - 56;
+        const PRE_ADL_SLAB_LEN: usize = 1025880;
+        const V1M_SMALL_LEN: usize = 65416;
+        const V1M_MEDIUM_LEN: usize = 257512;
+        const V1M_LARGE_LEN: usize = 1025896;
+        const V1M2_MEDIUM_LEN: usize = 323312;
+        const V1M2_MEDIUM_TRANSITIONAL: usize = 323328;
+        let slab_data = a_slab.try_borrow_data()?;
+        let slab_len = slab_data.len();
+        if slab_len == SLAB_LEN
+            || slab_len == PRE_DEX_POOL_SLAB_LEN
+            || slab_len == PRE_118_SLAB_LEN
+            || slab_len == OLDEST_SLAB_LEN
+            || slab_len == PRE_ADL_SLAB_LEN
+            || slab_len == V1M_SMALL_LEN
+            || slab_len == V1M_MEDIUM_LEN
+            || slab_len == V1M_LARGE_LEN
+            || slab_len == V1M2_MEDIUM_LEN
+            || slab_len == V1M2_MEDIUM_TRANSITIONAL
+        {
+            return Err(PercolatorError::InvalidSlabLen.into());
+        }
+
+        const ADMIN_OFF: usize = 16;
+        const ADMIN_END: usize = ADMIN_OFF + 32;
+
+        if slab_len < ADMIN_END {
+            return Err(PercolatorError::NotInitialized.into());
+        }
+
+        let magic = u64::from_le_bytes(
+            slab_data[0..8]
+                .try_into()
+                .map_err(|_| PercolatorError::InvalidMagic)?,
+        );
+        if magic != MAGIC {
+            return Err(PercolatorError::InvalidMagic.into());
+        }
+
+        let admin_bytes: [u8; 32] = slab_data[ADMIN_OFF..ADMIN_END]
+            .try_into()
+            .map_err(|_| PercolatorError::InvalidMagic)?;
+        drop(slab_data);
+
+        require_admin(admin_bytes, a_dest.key)?;
+
+        {
+            let mut data = a_slab.try_borrow_mut_data()?;
+            data.fill(0);
+        }
+
+        let slab_lamports = a_slab.lamports();
+        **a_slab.lamports.borrow_mut() = 0;
+        **a_dest.lamports.borrow_mut() = a_dest
+            .lamports()
+            .checked_add(slab_lamports)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        msg!(
+            "CloseStaleSlabs: closed stale slab (size={}) reclaimed {} lamports",
+            slab_len,
+            slab_lamports,
+        );
+        Ok(())
+    }
+
+    // --- ReclaimSlabRent ---
+    #[inline(never)]
+    fn handle_reclaim_slab_rent<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        // Two modes:
+        //   Mode A (2 accounts): slab is a signer — anyone with the keypair can reclaim.
+        //   Mode B (3 accounts): admin signs — reclaims orphan slabs without the keypair.
+        //     accounts[2] = slab account (not signer), admin verified from header if magic set.
+        let (a_dest, a_slab) = if accounts.len() >= 3 {
+            // Mode B: admin reclaim for orphan zero-magic slabs
+            let a_admin = &accounts[0];
+            let a_slab = &accounts[1];
+            let a_dest_override = &accounts[2];
+            accounts::expect_signer(a_admin)?;
+            accounts::expect_writable(a_slab)?;
+            accounts::expect_writable(a_dest_override)?;
+
+            if a_slab.owner != program_id {
+                return Err(ProgramError::IllegalOwner);
+            }
+
+            // For Mode B, verify slab has NO magic (truly orphaned/uninitialized)
+            let slab_data = a_slab.try_borrow_data()?;
+            if slab_data.len() >= 8 {
+                let magic = u64::from_le_bytes(
+                    slab_data[0..8].try_into()
+                        .map_err(|_| PercolatorError::InvalidMagic)?,
+                );
+                if magic == MAGIC {
+                    // Initialized slab — use CloseStaleSlabs or CloseOrphanSlab instead
+                    return Err(PercolatorError::AlreadyInitialized.into());
+                }
+            }
+            drop(slab_data);
+
+            (a_dest_override, a_slab)
+        } else {
+            // Mode A: original — slab is signer
+            accounts::expect_len(accounts, 2)?;
+            let a_dest = &accounts[0];
+            let a_slab = &accounts[1];
+
+            accounts::expect_signer(a_dest)?;
+            accounts::expect_writable(a_dest)?;
+
+            accounts::expect_signer(a_slab)?;
+            accounts::expect_writable(a_slab)?;
+
+            if a_slab.owner != program_id {
+                return Err(ProgramError::IllegalOwner);
+            }
+
+            let slab_data = a_slab.try_borrow_data()?;
+            if slab_data.len() >= 8 {
+                let magic = u64::from_le_bytes(
+                    slab_data[0..8].try_into()
+                        .map_err(|_| PercolatorError::InvalidMagic)?,
+                );
+                if magic == MAGIC {
+                    return Err(PercolatorError::AlreadyInitialized.into());
+                }
+            }
+            drop(slab_data);
+
+            (a_dest, a_slab)
+        };
+
+        if a_dest.key == a_slab.key {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        {
+            let mut data = a_slab.try_borrow_mut_data()?;
+            data.fill(0);
+        }
+
+        let slab_lamports = a_slab.lamports();
+        **a_slab.lamports.borrow_mut() = 0;
+        **a_dest.lamports.borrow_mut() = a_dest
+            .lamports()
+            .checked_add(slab_lamports)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        msg!(
+            "ReclaimSlabRent: reclaimed {} lamports from uninitialised slab",
+            slab_lamports,
+        );
+        Ok(())
+    }
+
+    // --- TransferOwnershipCpi ---
+    #[inline(never)]
+    fn handle_transfer_ownership_cpi<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+        new_owner: [u8; 32],
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_caller = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_nft_prog = &accounts[2];
+
+        accounts::expect_signer(a_caller)?;
+        accounts::expect_writable(a_slab)?;
+
+        if a_slab.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        if !a_nft_prog.executable {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        if *a_nft_prog.owner != solana_program::bpf_loader_upgradeable::id()
+            && *a_nft_prog.owner != solana_program::bpf_loader::id()
+            && *a_nft_prog.owner != solana_program::bpf_loader_deprecated::id()
+        {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let (expected_mint_auth, _) = solana_program::pubkey::Pubkey::find_program_address(
+            &[b"mint_authority"],
+            a_nft_prog.key,
+        );
+        if a_caller.key != &expected_mint_auth {
+            solana_program::msg!(
+                "TransferPositionOwnership rejected: caller {} is not the expected \
+                 mint_authority PDA {} for NFT program {}",
+                a_caller.key,
+                expected_mint_auth,
+                a_nft_prog.key
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // SECURITY(CR-1): Use typed engine accessor instead of hardcoded
+        // byte offsets. The old code had three critical bugs:
+        //   1. Read slab_data[8..10] as max_accounts — actually the version field
+        //   2. Hardcoded ACCT_SIZE=240 — actual Account is 320 bytes on SBF
+        //   3. Hardcoded ACCT_OWNER_OFF=184 — stale after Account struct changes
+        // Fix: use zc::engine_mut() + direct struct field access, matching
+        // every other instruction handler in the codebase.
+        let mut slab_data = a_slab.try_borrow_mut_data()?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+
+        let engine = zc::engine_mut(&mut slab_data)?;
+
+        // Validate user_idx is in range and slot is allocated (bitmap).
+        if (user_idx as usize) >= percolator::MAX_ACCOUNTS
+            || !engine.is_used(user_idx as usize)
+        {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Write new owner via typed struct — compiler resolves correct
+        // field offset for the target architecture (SBF vs native).
+        engine.accounts[user_idx as usize].owner = new_owner;
+
+        msg!(
+            "TransferPositionOwnership: idx={}, new_owner={}",
+            user_idx,
+            Pubkey::new_from_array(new_owner),
+        );
+        Ok(())
+    }
+
+    // --- AuditCrank ---
+    #[inline(never)]
+    fn handle_audit_crank<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        if accounts.is_empty() {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let a_slab = &accounts[0];
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let engine = zc::engine_ref(&data)?;
+
+        let mut sum_capital: i128 = 0;
+        let mut sum_pnl_pos: u128 = 0;
+        let mut sum_oi: u128 = 0;
+        for idx in 0..MAX_ACCOUNTS {
+            if !engine.is_used(idx) {
+                continue;
+            }
+            let acc = &engine.accounts[idx];
+            sum_capital = sum_capital.saturating_add(acc.capital.get() as i128);
+            let pnl = acc.pnl;
+            if pnl > 0 {
+                sum_pnl_pos = sum_pnl_pos.saturating_add(pnl as u128);
+            }
+            let pos = acc.position_basis_q;
+            sum_oi = sum_oi.saturating_add(pos.unsigned_abs());
+        }
+
+        let mut violation = false;
+
+        let c_tot = engine.c_tot.get();
+        if sum_capital != c_tot as i128 {
+            // tag=0xAD01: capital_mismatch — sum_capital vs c_tot
+            sol_log_64(sum_capital as u64, c_tot as u64, 0, 0, 0xAD01);
+            violation = true;
+        }
+
+        let pnl_pos_tot = engine.pnl_pos_tot;
+        if sum_pnl_pos != pnl_pos_tot {
+            // tag=0xAD02: pnl_pos_mismatch — sum_pnl_pos vs pnl_pos_tot
+            sol_log_64(sum_pnl_pos as u64, pnl_pos_tot as u64, 0, 0, 0xAD02);
+            violation = true;
+        }
+
+        let total_oi = engine.oi_eff_long_q.saturating_add(engine.oi_eff_short_q);
+        if sum_oi != total_oi {
+            // tag=0xAD03: oi_mismatch — sum_oi vs total_oi
+            sol_log_64(sum_oi as u64, total_oi as u64, 0, 0, 0xAD03);
+            violation = true;
+        }
+
+        let vault = engine.vault.get();
+        // isolated_balance not in current InsuranceFund layout — use 0
+        let insurance_balance = engine.insurance_fund.balance.get()
+            .saturating_add(0u128);
+        let required = (c_tot as u128).saturating_add(insurance_balance);
+        if (vault as u128) < required {
+            // tag=0xAD05: solvency — vault vs required
+            sol_log_64(vault as u64, required as u64, 0, 0, 0xAD05);
+            violation = true;
+        }
+
+        const AUDIT_CRANK_COOLDOWN_SLOTS: u64 = 150;
+        let current_slot = Clock::get()?.slot;
+        let mut config = state::read_config(&data);
+        if violation {
+            let last_pause = state::read_last_audit_pause_slot(&config);
+            if current_slot.saturating_sub(last_pause) < AUDIT_CRANK_COOLDOWN_SLOTS {
+                // tag=0xAD10: cooldown active — last_pause, current_slot, cooldown
+                sol_log_64(last_pause, current_slot, AUDIT_CRANK_COOLDOWN_SLOTS, 0, 0xAD10);
+                return Err(PercolatorError::AuditViolation.into());
+            }
+            state::write_audit_status(&mut config, 0xFFFF);
+            state::write_last_audit_pause_slot(&mut config, current_slot);
+            state::set_paused(&mut data, true);
+            state::write_config(&mut data, &config);
+            // tag=0xAD11: violation detected — market paused at current_slot
+            sol_log_64(0xAD11, current_slot, 0, 0, 0);
+            return Err(PercolatorError::AuditViolation.into());
+        } else {
+            state::write_audit_status(&mut config, 1);
+            state::write_config(&mut data, &config);
+            // tag=0xAD00: all invariants passed at current_slot
+            sol_log_64(0xAD00, current_slot, 0, 0, 0);
+        }
+        Ok(())
+    }
+
+    // --- SetOffsetPair ---
+    #[inline(never)]
+    fn handle_set_offset_pair<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        offset_bps: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 5)?;
+        let a_admin = &accounts[0];
+        let a_slab_a = &accounts[1];
+        let a_slab_b = &accounts[2];
+        let a_pair_pda = &accounts[3];
+        let a_system = &accounts[4];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_admin)?;
+        accounts::expect_writable(a_pair_pda)?;
+        if *a_system.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        accounts::expect_owner(a_slab_a, program_id)?;
+        {
+            let data_a = a_slab_a.try_borrow_data()?;
+            if data_a.len() < HEADER_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let header = state::read_header(&data_a);
+            if header.magic != MAGIC {
+                return Err(PercolatorError::InvalidMagic.into());
+            }
+            require_admin(header.admin, a_admin.key)?;
+        }
+
+        accounts::expect_owner(a_slab_b, program_id)?;
+        {
+            let data_b = a_slab_b.try_borrow_data()?;
+            if data_b.len() < HEADER_LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let header_b = state::read_header(&data_b);
+            if header_b.magic != MAGIC {
+                return Err(PercolatorError::InvalidMagic.into());
+            }
+            require_admin(header_b.admin, a_admin.key)?;
+        }
+
+        let (slab_min_pair, slab_max_pair) =
+            if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                (a_slab_a.key, a_slab_b.key)
+            } else {
+                (a_slab_b.key, a_slab_a.key)
+            };
+        let (expected_pda, pair_bump) = Pubkey::find_program_address(
+            &[b"cmor_pair", slab_min_pair.as_ref(), slab_max_pair.as_ref()],
+            program_id,
+        );
+        if a_pair_pda.key != &expected_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        if offset_bps > 10_000 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        if a_pair_pda.data_is_empty() {
+            let lamports = solana_program::rent::Rent::get()?
+                .minimum_balance(crate::cross_margin::OFFSET_PAIR_LEN);
+            let bump_bytes = [pair_bump];
+            let signer_seeds: &[&[u8]] = &[
+                b"cmor_pair",
+                slab_min_pair.as_ref(),
+                slab_max_pair.as_ref(),
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_admin.key,
+                    &expected_pda,
+                    lamports,
+                    crate::cross_margin::OFFSET_PAIR_LEN as u64,
+                    program_id,
+                ),
+                &[a_admin.clone(), a_pair_pda.clone(), a_system.clone()],
+                &[signer_seeds],
+            )?;
+        }
+
+        let mut pair_data = a_pair_pda.try_borrow_mut_data()?;
+        if pair_data.len() < crate::cross_margin::OFFSET_PAIR_LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        let cfg = crate::cross_margin::OffsetPairConfig {
+            magic: crate::cross_margin::OFFSET_PAIR_MAGIC,
+            offset_bps,
+            enabled: 1,
+            _pad: [0; 5],
+            _reserved: [0; 16],
+        };
+        crate::cross_margin::write_offset_pair(&mut pair_data, &cfg);
+        msg!("SetOffsetPair: offset_bps={}", offset_bps);
+        Ok(())
+    }
+
+    // --- AttestCrossMargin ---
+    #[inline(never)]
+    fn handle_attest_cross_margin<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx_a: u16,
+        user_idx_b: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_payer = &accounts[0];
+        let a_slab_a = &accounts[1];
+        let a_slab_b = &accounts[2];
+        let a_attestation = &accounts[3];
+        let a_pair_pda = &accounts[4];
+        let a_system = &accounts[5];
+
+        accounts::expect_signer(a_payer)?;
+        accounts::expect_writable(a_payer)?;
+        accounts::expect_writable(a_attestation)?;
+        if *a_system.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        accounts::expect_owner(a_slab_a, program_id)?;
+        accounts::expect_owner(a_slab_b, program_id)?;
+
+        let pair_data = a_pair_pda.try_borrow_data()?;
+        let pair_cfg = crate::cross_margin::read_offset_pair(&pair_data)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        if !pair_cfg.is_initialized() || pair_cfg.enabled == 0 {
+            return Err(PercolatorError::CrossMarginPairNotFound.into());
+        }
+        let offset_bps = pair_cfg.offset_bps;
+        drop(pair_data);
+
+        let data_a = a_slab_a.try_borrow_data()?;
+        if data_a.len() < ENGINE_OFF + ENGINE_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let engine_a = zc::engine_ref(&data_a)?;
+        check_idx(engine_a, user_idx_a)?;
+        let pos_a = engine_a.accounts[user_idx_a as usize].position_basis_q;
+        let owner_a = engine_a.accounts[user_idx_a as usize].owner;
+        let slot = engine_a.current_slot;
+        drop(data_a);
+
+        let data_b = a_slab_b.try_borrow_data()?;
+        if data_b.len() < ENGINE_OFF + ENGINE_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let engine_b = zc::engine_ref(&data_b)?;
+        check_idx(engine_b, user_idx_b)?;
+        let pos_b = engine_b.accounts[user_idx_b as usize].position_basis_q;
+        let owner_b = engine_b.accounts[user_idx_b as usize].owner;
+        drop(data_b);
+
+        if owner_a != owner_b {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        {
+            let (slab_min, slab_max) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                (a_slab_a.key, a_slab_b.key)
+            } else {
+                (a_slab_b.key, a_slab_a.key)
+            };
+            let (expected_pair_pda, _bump) = Pubkey::find_program_address(
+                &[b"cmor_pair", slab_min.as_ref(), slab_max.as_ref()],
+                program_id,
+            );
+            if a_pair_pda.key != &expected_pair_pda {
+                return Err(ProgramError::InvalidSeeds);
+            }
+        }
+
+        let (slab_min_att, slab_max_att) = if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref()
+        {
+            (a_slab_a.key, a_slab_b.key)
+        } else {
+            (a_slab_b.key, a_slab_a.key)
+        };
+        let owner_key = Pubkey::from(owner_a);
+        let (expected_att_pda, att_bump) = Pubkey::find_program_address(
+            &[
+                b"cmor",
+                owner_key.as_ref(),
+                slab_min_att.as_ref(),
+                slab_max_att.as_ref(),
+            ],
+            program_id,
+        );
+        if a_attestation.key != &expected_att_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        if a_attestation.data_is_empty() {
+            let lamports = solana_program::rent::Rent::get()?
+                .minimum_balance(crate::cross_margin::ATTESTATION_LEN);
+            let bump_bytes = [att_bump];
+            let signer_seeds: &[&[u8]] = &[
+                b"cmor",
+                owner_key.as_ref(),
+                slab_min_att.as_ref(),
+                slab_max_att.as_ref(),
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_payer.key,
+                    &expected_att_pda,
+                    lamports,
+                    crate::cross_margin::ATTESTATION_LEN as u64,
+                    program_id,
+                ),
+                &[a_payer.clone(), a_attestation.clone(), a_system.clone()],
+                &[signer_seeds],
+            )?;
+        }
+
+        let mut att_data = a_attestation.try_borrow_mut_data()?;
+        if att_data.len() < crate::cross_margin::ATTESTATION_LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        let att = crate::cross_margin::CrossMarginAttestation {
+            magic: crate::cross_margin::ATTESTATION_MAGIC,
+            _align_pad: [0; 8],
+            user_pos_a: pos_a,
+            user_pos_b: pos_b,
+            attested_slot: slot,
+            offset_bps,
+            _pad: [0; 6],
+            owner: owner_a,
+            slab_a: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                a_slab_a.key.to_bytes()
+            } else {
+                a_slab_b.key.to_bytes()
+            },
+            slab_b: if a_slab_a.key.as_ref() <= a_slab_b.key.as_ref() {
+                a_slab_b.key.to_bytes()
+            } else {
+                a_slab_a.key.to_bytes()
+            },
+        };
+        crate::cross_margin::write_attestation(&mut att_data, &att);
+        msg!(
+            "AttestCrossMargin: pos_a={} pos_b={} offset={}",
+            pos_a as i64,
+            pos_b as i64,
+            offset_bps
+        );
+        Ok(())
+    }
+
+    // --- AdvanceOraclePhase ---
+    #[inline(never)]
+    fn handle_advance_oracle_phase<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        if accounts.is_empty() {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let a_slab = &accounts[0];
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let mut config = state::read_config(&data);
+        let clock = Clock::get()?;
+
+        if state::get_vol_margin_scale_bps(&config) > 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
+        let old_phase = state::get_oracle_phase(&config);
+
+        let has_mature_oracle = crate::verify::is_pyth_pinned_mode(
+            config.oracle_authority,
+            config.index_feed_id,
+        );
+
+        let mcs = state::get_market_created_slot(&config);
+        let created = state::effective_created_slot(mcs, clock.slot);
+        if mcs == 0 && old_phase == 0 {
+            state::set_market_created_slot(&mut config, clock.slot);
+        }
+
+        let (new_phase, transitioned) = state::check_phase_transition(
+            clock.slot,
+            created,
+            old_phase,
+            state::get_cumulative_volume(&config),
+            state::get_phase2_delta_slots(&config),
+            has_mature_oracle,
+        );
+
+        if !transitioned {
+            state::write_config(&mut data, &config);
+            msg!("AdvanceOraclePhase: no transition (phase={})", old_phase);
+        } else {
+            state::set_oracle_phase(&mut config, new_phase);
+
+            if new_phase == state::ORACLE_PHASE_GROWING {
+                let delta = clock.slot.saturating_sub(created) as u32;
+                state::set_phase2_delta_slots(&mut config, delta);
+            }
+
+            state::write_config(&mut data, &config);
+            msg!(
+                "AdvanceOraclePhase: {} -> {} at slot {}",
+                old_phase,
+                new_phase,
+                clock.slot
+            );
+        }
+        Ok(())
+    }
+
+    // --- InitSharedVault ---
+    #[inline(never)]
+    fn handle_init_shared_vault<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        epoch_duration_slots: u64,
+        max_market_exposure_bps: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 4)?;
+        let a_admin = &accounts[0];
+        let a_shared_vault = &accounts[1];
+        let a_system_program = &accounts[2];
+        let a_slab = &accounts[3];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_shared_vault)?;
+
+        {
+            let slab_data = state::slab_data_mut(a_slab)?;
+            slab_guard(program_id, a_slab, &slab_data)?;
+            require_initialized(&slab_data)?;
+            let header = state::read_header(&slab_data);
+            require_admin(header.admin, a_admin.key)?;
+        }
+
+        if *a_system_program.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let (expected_pda, pda_bump) = Pubkey::find_program_address(
+            &[crate::shared_vault::SHARED_VAULT_SEED],
+            program_id,
+        );
+        if *a_shared_vault.key != expected_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        if !a_shared_vault.data_is_empty() {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+
+        let rent = solana_program::rent::Rent::get()?;
+        let lamports = rent.minimum_balance(crate::shared_vault::SHARED_VAULT_STATE_LEN);
+        let bump_bytes = [pda_bump];
+        let signer_seeds: &[&[u8]] = &[crate::shared_vault::SHARED_VAULT_SEED, &bump_bytes];
+        solana_program::program::invoke_signed(
+            &solana_program::system_instruction::create_account(
+                a_admin.key,
+                &expected_pda,
+                lamports,
+                crate::shared_vault::SHARED_VAULT_STATE_LEN as u64,
+                program_id,
+            ),
+            &[
+                a_admin.clone(),
+                a_shared_vault.clone(),
+                a_system_program.clone(),
+            ],
+            &[signer_seeds],
+        )?;
+
+        let clock = solana_program::clock::Clock::get()?;
+        let duration = if epoch_duration_slots == 0 {
+            crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS
+        } else {
+            epoch_duration_slots
+        };
+        let max_bps = if max_market_exposure_bps == 0 {
+            crate::shared_vault::DEFAULT_MAX_MARKET_EXPOSURE_BPS
+        } else {
+            max_market_exposure_bps.min(10_000)
+        };
+
+        let sv_state = crate::shared_vault::SharedVaultState {
+            magic: crate::shared_vault::SHARED_VAULT_MAGIC,
+            epoch_number: 0,
+            total_capital: 0,
+            total_allocated: 0,
+            pending_withdrawals: 0,
+            epoch_start_slot: clock.slot,
+            epoch_duration_slots: duration,
+            max_market_exposure_bps: max_bps,
+            bump: pda_bump,
+            _pad: [0; 13],
+            epoch_snapshot_capital: 0,
+            epoch_snapshot_pending: 0,
+        };
+        let mut sv_data = a_shared_vault
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        crate::shared_vault::write_vault_state(&mut sv_data, &sv_state);
+
+        msg!(
+            "PERC-628: SharedVault initialized — epoch_duration={} max_exposure_bps={}",
+            duration,
+            max_bps
+        );
+        Ok(())
+    }
+
+    // --- AllocateMarket ---
+    #[inline(never)]
+    fn handle_allocate_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 5)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_shared_vault = &accounts[2];
+        let a_market_alloc = &accounts[3];
+        let a_system_program = &accounts[4];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_shared_vault)?;
+        accounts::expect_writable(a_market_alloc)?;
+
+        let slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+        let header = state::read_header(&slab_data);
+        require_admin(header.admin, a_admin.key)?;
+        drop(slab_data);
+
+        let (expected_sv, _) = Pubkey::find_program_address(
+            &[crate::shared_vault::SHARED_VAULT_SEED],
+            program_id,
+        );
+        accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+        let (expected_alloc, alloc_bump) = Pubkey::find_program_address(
+            &[crate::shared_vault::MARKET_ALLOC_SEED, a_slab.key.as_ref()],
+            program_id,
+        );
+        if *a_market_alloc.key != expected_alloc {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        let mut sv_data = a_shared_vault
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+            .ok_or(ProgramError::UninitializedAccount)?;
+
+        let new_allocation = amount;
+        if !crate::shared_vault::check_exposure_cap(
+            vault_state.total_capital,
+            new_allocation,
+            vault_state.max_market_exposure_bps,
+        ) {
+            msg!("PERC-628: allocation {} exceeds exposure cap", amount);
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let available = crate::shared_vault::available_for_allocation(
+            vault_state.total_capital,
+            vault_state.total_allocated,
+        );
+        if new_allocation > available {
+            msg!("PERC-628: allocation {} > available {}", amount, available);
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        if a_market_alloc.data_is_empty() {
+            if *a_system_program.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+            let rent = solana_program::rent::Rent::get()?;
+            let lamports = rent.minimum_balance(crate::shared_vault::MARKET_ALLOC_LEN);
+            let bump_bytes = [alloc_bump];
+            let signer_seeds: &[&[u8]] = &[
+                crate::shared_vault::MARKET_ALLOC_SEED,
+                a_slab.key.as_ref(),
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_admin.key,
+                    &expected_alloc,
+                    lamports,
+                    crate::shared_vault::MARKET_ALLOC_LEN as u64,
+                    program_id,
+                ),
+                &[
+                    a_admin.clone(),
+                    a_market_alloc.clone(),
+                    a_system_program.clone(),
+                ],
+                &[signer_seeds],
+            )?;
+        }
+
+        let alloc = crate::shared_vault::MarketAllocation {
+            magic: crate::shared_vault::MARKET_ALLOC_MAGIC,
+            bump: alloc_bump,
+            _pad: [0; 7],
+            allocated_capital: new_allocation,
+            utilized_capital: 0,
+        };
+        let mut alloc_data = a_market_alloc
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        crate::shared_vault::write_market_alloc(&mut alloc_data, &alloc);
+
+        vault_state.total_allocated =
+            vault_state.total_allocated.saturating_add(new_allocation);
+        crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+        msg!("PERC-628: Market allocated {} from shared vault", amount);
+        Ok(())
+    }
+
+    // --- AdvanceEpoch ---
+    #[inline(never)]
+    fn handle_advance_epoch<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_shared_vault = &accounts[1];
+
+        accounts::expect_writable(a_shared_vault)?;
+
+        let (expected_sv, _) = Pubkey::find_program_address(
+            &[crate::shared_vault::SHARED_VAULT_SEED],
+            program_id,
+        );
+        accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+        let mut sv_data = a_shared_vault
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+            .ok_or(ProgramError::UninitializedAccount)?;
+
+        let clock = solana_program::clock::Clock::get()?;
+        if !crate::shared_vault::is_epoch_elapsed(
+            clock.slot,
+            vault_state.epoch_start_slot,
+            vault_state.epoch_duration_slots,
+        ) {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        vault_state.epoch_snapshot_capital = vault_state.total_capital;
+        vault_state.epoch_snapshot_pending = vault_state.pending_withdrawals;
+
+        vault_state.epoch_number = vault_state.epoch_number.saturating_add(1);
+        vault_state.epoch_start_slot = clock.slot;
+        vault_state.pending_withdrawals = 0;
+        crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+        msg!(
+            "PERC-628: Epoch advanced to {} at slot {}",
+            vault_state.epoch_number,
+            clock.slot,
+        );
+        Ok(())
+    }
+
+    // --- QueueWithdrawalSV ---
+    #[inline(never)]
+    fn handle_queue_withdrawal_sv<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 4)?;
+        let a_user = &accounts[0];
+        let a_shared_vault = &accounts[1];
+        let a_withdraw_req = &accounts[2];
+        let a_system_program = &accounts[3];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_shared_vault)?;
+        accounts::expect_writable(a_withdraw_req)?;
+
+        if lp_amount == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let (expected_sv, _) = Pubkey::find_program_address(
+            &[crate::shared_vault::SHARED_VAULT_SEED],
+            program_id,
+        );
+        accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+        let mut sv_data = a_shared_vault
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+            .ok_or(ProgramError::UninitializedAccount)?;
+
+        let epoch_bytes = vault_state.epoch_number.to_le_bytes();
+        let (expected_req, req_bump) = Pubkey::find_program_address(
+            &[
+                crate::shared_vault::WITHDRAW_REQ_SEED,
+                a_shared_vault.key.as_ref(),
+                a_user.key.as_ref(),
+                &epoch_bytes,
+            ],
+            program_id,
+        );
+        if *a_withdraw_req.key != expected_req {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        if a_withdraw_req.data_is_empty() {
+            if *a_system_program.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+            let rent = solana_program::rent::Rent::get()?;
+            let lamports = rent.minimum_balance(crate::shared_vault::WITHDRAW_REQ_LEN);
+            let bump_bytes = [req_bump];
+            let signer_seeds: &[&[u8]] = &[
+                crate::shared_vault::WITHDRAW_REQ_SEED,
+                a_shared_vault.key.as_ref(),
+                a_user.key.as_ref(),
+                &epoch_bytes,
+                &bump_bytes,
+            ];
+            solana_program::program::invoke_signed(
+                &solana_program::system_instruction::create_account(
+                    a_user.key,
+                    &expected_req,
+                    lamports,
+                    crate::shared_vault::WITHDRAW_REQ_LEN as u64,
+                    program_id,
+                ),
+                &[
+                    a_user.clone(),
+                    a_withdraw_req.clone(),
+                    a_system_program.clone(),
+                ],
+                &[signer_seeds],
+            )?;
+        }
+
+        {
+            let req_data = a_withdraw_req
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            if let Some(existing) = crate::shared_vault::read_withdraw_req(&req_data) {
+                if existing.claimed == 0 {
+                    return Err(ProgramError::AccountAlreadyInitialized);
+                }
+            }
+        }
+
+        let req = crate::shared_vault::WithdrawalRequest {
+            magic: crate::shared_vault::WITHDRAW_REQ_MAGIC,
+            bump: req_bump,
+            claimed: 0,
+            _pad: [0; 6],
+            lp_amount,
+            epoch_number: vault_state.epoch_number,
+        };
+        let mut req_data = a_withdraw_req
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        crate::shared_vault::write_withdraw_req(&mut req_data, &req);
+
+        vault_state.pending_withdrawals = crate::shared_vault::queue_withdrawal(
+            vault_state.pending_withdrawals,
+            lp_amount,
+        );
+        crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+        msg!(
+            "PERC-628: Queued withdrawal {} LP for epoch {}",
+            lp_amount,
+            vault_state.epoch_number
+        );
+        Ok(())
+    }
+
+    // --- ClaimEpochWithdrawal ---
+    #[inline(never)]
+    fn handle_claim_epoch_withdrawal<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 8)?;
+        let a_user = &accounts[0];
+        let a_shared_vault = &accounts[1];
+        let a_withdraw_req = &accounts[2];
+        let a_slab = &accounts[3];
+        let a_vault = &accounts[4];
+        let a_user_ata = &accounts[5];
+        let a_vault_authority = &accounts[6];
+        let a_token = &accounts[7];
+
+        accounts::expect_signer(a_user)?;
+        accounts::expect_writable(a_shared_vault)?;
+        accounts::expect_writable(a_withdraw_req)?;
+        accounts::expect_writable(a_vault)?;
+        accounts::expect_writable(a_user_ata)?;
+        verify_token_program(a_token)?;
+
+        let (expected_sv, _) = Pubkey::find_program_address(
+            &[crate::shared_vault::SHARED_VAULT_SEED],
+            program_id,
+        );
+        accounts::expect_key(a_shared_vault, &expected_sv)?;
+
+        let mut sv_data = a_shared_vault
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        let mut vault_state = crate::shared_vault::read_vault_state(&sv_data)
+            .ok_or(ProgramError::UninitializedAccount)?;
+
+        let clock = solana_program::clock::Clock::get()?;
+        if !crate::shared_vault::is_epoch_elapsed(
+            clock.slot,
+            vault_state.epoch_start_slot,
+            vault_state.epoch_duration_slots,
+        ) {
+            msg!("PERC-628: epoch not yet elapsed — cannot claim mid-epoch");
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+        let config = state::read_config(&slab_data);
+        let mint = Pubkey::new_from_array(config.collateral_mint);
+        let (auth, vault_bump) = accounts::derive_vault_authority(program_id, a_slab.key);
+        verify_vault(
+            a_vault,
+            &auth,
+            &mint,
+            &Pubkey::new_from_array(config.vault_pubkey),
+        )?;
+        accounts::expect_key(a_vault_authority, &auth)?;
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
+        drop(slab_data);
+
+        let mut req_data = a_withdraw_req
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+        let req = crate::shared_vault::read_withdraw_req(&req_data)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        if req.claimed != 0 {
+            msg!("PERC-628: withdrawal already claimed");
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let req_epoch_bytes = req.epoch_number.to_le_bytes();
+        let (expected_req_pda, _) = Pubkey::find_program_address(
+            &[
+                crate::shared_vault::WITHDRAW_REQ_SEED,
+                a_shared_vault.key.as_ref(),
+                a_user.key.as_ref(),
+                &req_epoch_bytes,
+            ],
+            program_id,
+        );
+        if *a_withdraw_req.key != expected_req_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        if req.epoch_number >= vault_state.epoch_number {
+            msg!(
+                "PERC-628: request epoch {} >= current {} — must wait for epoch advance",
+                req.epoch_number,
+                vault_state.epoch_number
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut updated_req = req;
+        updated_req.claimed = 1;
+        crate::shared_vault::write_withdraw_req(&mut req_data, &updated_req);
+        drop(req_data);
+
+        let payout = crate::shared_vault::compute_proportional_withdrawal(
+            req.lp_amount,
+            vault_state.epoch_snapshot_pending,
+            vault_state.epoch_snapshot_capital,
+        );
+
+        if payout > 0 {
+            let base_payout =
+                crate::units::units_to_base_checked(payout, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+            let seed1: &[u8] = b"vault";
+            let seed2: &[u8] = a_slab.key.as_ref();
+            let bump_arr: [u8; 1] = [vault_bump];
+            let seed3: &[u8] = &bump_arr;
+            let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+            let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+            collateral::withdraw(
+                a_token,
+                a_vault,
+                a_user_ata,
+                a_vault_authority,
+                base_payout,
+                &signer_seeds,
+            )?;
+
+            vault_state.total_capital =
+                vault_state.total_capital.saturating_sub(payout as u128);
+            crate::shared_vault::write_vault_state(&mut sv_data, &vault_state);
+
+            msg!(
+                "PERC-628: Claim: {} LP → {} base tokens transferred",
+                req.lp_amount,
+                base_payout
+            );
+        } else {
+            msg!("PERC-628: Claim: {} LP → 0 payout", req.lp_amount);
+        }
+        Ok(())
+    }
+
+    // --- MintPositionNft ---
+    #[inline(never)]
+    fn handle_mint_position_nft<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 10)?;
+        let a_payer = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_nft_pda = &accounts[2];
+        let a_nft_mint = &accounts[3];
+        let a_owner_ata = &accounts[4];
+        let a_owner = &accounts[5];
+        let a_vault_auth = &accounts[6];
+        let a_token22 = &accounts[7];
+        let a_system = &accounts[8];
+        let a_rent = &accounts[9];
+
+        accounts::expect_signer(a_payer)?;
+        accounts::expect_signer(a_owner)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_nft_pda)?;
+        accounts::expect_writable(a_nft_mint)?;
+        accounts::expect_writable(a_owner_ata)?;
+        verify_token22_program(a_token22)?;
+        if *a_system.key != solana_program::system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let engine = zc::engine_ref(&data)?;
+        check_idx(engine, user_idx)?;
+        let u_owner = engine.accounts[user_idx as usize].owner;
+        if !crate::verify::owner_ok(u_owner, a_owner.key.to_bytes()) {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        let acct = &engine.accounts[user_idx as usize];
+        let cap = acct.capital.get();
+        let pos = acct.position_basis_q;
+        if cap == 0 && pos == 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+        // entry_price not in current layout — use 0 as stub
+        let entry_price_raw: u64 = 0;
+        let pos_size = acct.position_basis_q;
+        let direction = if pos_size >= 0 { "LONG" } else { "SHORT" };
+        drop(data);
+
+        let (expected_nft_pda, nft_bump) =
+            crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+        accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+        let (expected_mint, mint_bump) =
+            crate::position_nft::derive_position_nft_mint(program_id, a_slab.key, user_idx);
+        accounts::expect_key(a_nft_mint, &expected_mint)?;
+
+        let (expected_vault_auth, vault_bump) =
+            accounts::derive_vault_authority(program_id, a_slab.key);
+        accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
+
+        {
+            let nft_data = a_nft_pda
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            if nft_data.len() >= crate::position_nft::POSITION_NFT_STATE_LEN {
+                if let Some(st) = crate::position_nft::read_position_nft_state(&nft_data) {
+                    if st.is_initialized() {
+                        return Err(ProgramError::AccountAlreadyInitialized);
+                    }
+                }
+            }
+        }
+
+        {
+            #[allow(unused_variables)]
+            let nft_pda_seeds: &[&[u8]] = &[
+                crate::position_nft::POSITION_NFT_SEED,
+                a_slab.key.as_ref(),
+                &user_idx.to_le_bytes(),
+                &[nft_bump],
+            ];
+            let space = crate::position_nft::POSITION_NFT_STATE_LEN;
+            let rent = solana_program::rent::Rent::get()?;
+            let lamports = rent.minimum_balance(space);
+            let create_ix = solana_program::system_instruction::create_account(
+                a_payer.key,
+                a_nft_pda.key,
+                lamports,
+                space as u64,
+                program_id,
+            );
+            #[cfg(not(feature = "test"))]
+            {
+                solana_program::program::invoke_signed(
+                    &create_ix,
+                    &[a_payer.clone(), a_nft_pda.clone(), a_system.clone()],
+                    &[nft_pda_seeds],
+                )?;
+            }
+            let _ = (create_ix, a_system, a_rent);
+        }
+
+        {
+            let mint_seeds: &[&[u8]] = &[
+                crate::position_nft::POSITION_NFT_MINT_SEED,
+                a_slab.key.as_ref(),
+                &user_idx.to_le_bytes(),
+                &[mint_bump],
+            ];
+            crate::position_nft::create_nft_mint_with_metadata(
+                a_payer,
+                a_nft_mint,
+                a_vault_auth,
+                a_system,
+                a_token22,
+                a_rent,
+                mint_seeds,
+                direction,
+                entry_price_raw,
+                pos_size,
+            )?;
+        }
+
+        {
+            let vault_seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[vault_bump]];
+            crate::position_nft::mint_nft_to(
+                a_token22,
+                a_nft_mint,
+                a_owner_ata,
+                a_vault_auth,
+                &[vault_seeds],
+            )?;
+        }
+
+        {
+            let mut nft_data = a_nft_pda
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            let nft_state = crate::position_nft::PositionNftState {
+                magic: crate::position_nft::POSITION_NFT_MAGIC,
+                mint: a_nft_mint.key.to_bytes(),
+                slab: a_slab.key.to_bytes(),
+                owner: a_owner.key.to_bytes(),
+                user_idx,
+                pending_settlement: 0,
+                bump: nft_bump,
+                mint_bump,
+                _reserved: [0u8; 19],
+            };
+            crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+        }
+
+        msg!(
+            "PERC-608: MintPositionNft slab={} user_idx={} owner={} direction={}",
+            a_slab.key,
+            user_idx,
+            a_owner.key,
+            direction,
+        );
+        Ok(())
+    }
+
+    // --- TransferPositionOwnership ---
+    #[inline(never)]
+    fn handle_transfer_position_ownership<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 8)?;
+        let a_current_owner = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_nft_pda = &accounts[2];
+        let a_nft_mint = &accounts[3];
+        let a_src_ata = &accounts[4];
+        let a_dst_ata = &accounts[5];
+        let a_new_owner = &accounts[6];
+        let a_token22 = &accounts[7];
+
+        accounts::expect_signer(a_current_owner)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_nft_pda)?;
+        accounts::expect_writable(a_nft_mint)?;
+        accounts::expect_writable(a_src_ata)?;
+        accounts::expect_writable(a_dst_ata)?;
+        verify_token22_program(a_token22)?;
+
+        let slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+
+        {
+            let engine = zc::engine_ref(&slab_data)?;
+            check_idx(engine, user_idx)?;
+        }
+
+        let (expected_nft_pda, _) =
+            crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+        accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+        let mut nft_state = {
+            let nft_data = a_nft_pda
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::read_position_nft_state(&nft_data)
+                .filter(|s| s.is_initialized())
+                .ok_or(ProgramError::UninitializedAccount)?
+        };
+
+        if nft_state.owner != a_current_owner.key.to_bytes() {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        if nft_state.mint != a_nft_mint.key.to_bytes() {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        if nft_state.pending_settlement != 0 {
+            msg!("PERC-608: PendingFundingNotSettled — keeper must run settlement crank");
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        drop(slab_data);
+
+        crate::position_nft::transfer_nft(
+            a_token22,
+            a_nft_mint,
+            a_src_ata,
+            a_dst_ata,
+            a_current_owner,
+        )?;
+
+        nft_state.owner = a_new_owner.key.to_bytes();
+        {
+            let mut nft_data = a_nft_pda
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+        }
+
+        msg!(
+            "PERC-608: TransferPositionOwnership slab={} user_idx={} new_owner={}",
+            a_slab.key,
+            user_idx,
+            a_new_owner.key,
+        );
+        Ok(())
+    }
+
+    // --- BurnPositionNft ---
+    #[inline(never)]
+    fn handle_burn_position_nft<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 7)?;
+        let a_owner = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_nft_pda = &accounts[2];
+        let a_nft_mint = &accounts[3];
+        let a_owner_ata = &accounts[4];
+        let a_vault_auth = &accounts[5];
+        let a_token22 = &accounts[6];
+
+        accounts::expect_signer(a_owner)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_nft_pda)?;
+        accounts::expect_writable(a_nft_mint)?;
+        accounts::expect_writable(a_owner_ata)?;
+        verify_token22_program(a_token22)?;
+
+        let slab_data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &slab_data)?;
+        require_initialized(&slab_data)?;
+        drop(slab_data);
+
+        let (expected_nft_pda, _) =
+            crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+        accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+        let (expected_vault_auth, vault_bump) =
+            accounts::derive_vault_authority(program_id, a_slab.key);
+        accounts::expect_key(a_vault_auth, &expected_vault_auth)?;
+
+        let nft_state = {
+            let nft_data = a_nft_pda
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::read_position_nft_state(&nft_data)
+                .filter(|s| s.is_initialized())
+                .ok_or(ProgramError::UninitializedAccount)?
+        };
+
+        if nft_state.owner != a_owner.key.to_bytes() {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        if nft_state.mint != a_nft_mint.key.to_bytes() {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        crate::position_nft::burn_nft(a_token22, a_nft_mint, a_owner_ata, a_owner)?;
+
+        {
+            let vault_seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[vault_bump]];
+            crate::position_nft::close_nft_mint(
+                a_token22,
+                a_nft_mint,
+                a_owner,
+                a_vault_auth,
+                &[vault_seeds],
+            )?;
+        }
+
+        {
+            let mut nft_data = a_nft_pda
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            for b in nft_data.iter_mut() {
+                *b = 0;
+            }
+        }
+        {
+            let lamports = a_nft_pda.lamports();
+            **a_nft_pda
+                .try_borrow_mut_lamports()
+                .map_err(|_| ProgramError::AccountBorrowFailed)? = 0;
+            **a_owner
+                .try_borrow_mut_lamports()
+                .map_err(|_| ProgramError::AccountBorrowFailed)? = a_owner
+                .lamports()
+                .checked_add(lamports)
+                .ok_or(PercolatorError::EngineOverflow)?;
+        }
+
+        msg!(
+            "PERC-608: BurnPositionNft slab={} user_idx={} owner={}",
+            a_slab.key,
+            user_idx,
+            a_owner.key,
+        );
+        Ok(())
+    }
+
+    // --- SetPendingSettlement ---
+    #[inline(never)]
+    fn handle_set_pending_settlement<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_keeper = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_nft_pda = &accounts[2];
+
+        accounts::expect_signer(a_keeper)?;
+        accounts::expect_writable(a_nft_pda)?;
+
+        {
+            let slab_data = a_slab
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            slab_guard(program_id, a_slab, &slab_data)?;
+            require_initialized(&slab_data)?;
+            let header = state::read_header(&slab_data);
+            require_admin(header.admin, a_keeper.key)?;
+        }
+
+        let (expected_nft_pda, _) =
+            crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+        accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+        let mut nft_state = {
+            let nft_data = a_nft_pda
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::read_position_nft_state(&nft_data)
+                .filter(|s| s.is_initialized())
+                .ok_or(ProgramError::UninitializedAccount)?
+        };
+
+        nft_state.pending_settlement = 1;
+
+        {
+            let mut nft_data = a_nft_pda
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+        }
+
+        msg!(
+            "PERC-608: SetPendingSettlement slab={} user_idx={}",
+            a_slab.key,
+            user_idx,
+        );
+        Ok(())
+    }
+
+    // --- ClearPendingSettlement ---
+    #[inline(never)]
+    fn handle_clear_pending_settlement<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        user_idx: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_keeper = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_nft_pda = &accounts[2];
+
+        accounts::expect_signer(a_keeper)?;
+        accounts::expect_writable(a_nft_pda)?;
+
+        {
+            let slab_data = a_slab
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            slab_guard(program_id, a_slab, &slab_data)?;
+            require_initialized(&slab_data)?;
+            let header = state::read_header(&slab_data);
+            require_admin(header.admin, a_keeper.key)?;
+        }
+
+        let (expected_nft_pda, _) =
+            crate::position_nft::derive_position_nft(program_id, a_slab.key, user_idx);
+        accounts::expect_key(a_nft_pda, &expected_nft_pda)?;
+
+        let mut nft_state = {
+            let nft_data = a_nft_pda
+                .try_borrow_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::read_position_nft_state(&nft_data)
+                .filter(|s| s.is_initialized())
+                .ok_or(ProgramError::UninitializedAccount)?
+        };
+
+        nft_state.pending_settlement = 0;
+
+        {
+            let mut nft_data = a_nft_pda
+                .try_borrow_mut_data()
+                .map_err(|_| ProgramError::AccountBorrowFailed)?;
+            crate::position_nft::write_position_nft_state(&mut nft_data, &nft_state);
+        }
+
+        msg!(
+            "PERC-608: ClearPendingSettlement slab={} user_idx={}",
+            a_slab.key,
+            user_idx,
+        );
+        Ok(())
+    }
+
+    // --- SetWalletCap ---
+    #[inline(never)]
+    fn handle_set_wallet_cap<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        cap_e6: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        const MIN_WALLET_CAP_E6: u64 = 1_000;
+        if cap_e6 != 0 && cap_e6 < MIN_WALLET_CAP_E6 {
+            msg!(
+                "PERC-8224: SetWalletCap rejected: cap_e6={} is below minimum floor {} \
+                 (use 0 to disable, or >= {} to set a real cap)",
+                cap_e6,
+                MIN_WALLET_CAP_E6,
+                MIN_WALLET_CAP_E6,
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+        state::set_max_wallet_pos_e6(&mut config, cap_e6);
+        state::write_config(&mut data, &config);
+
+        let stored = state::get_max_wallet_pos_e6(&config);
+        msg!(
+            "PERC-8111: SetWalletCap: cap_e6={} stored={}",
+            cap_e6,
+            stored,
+        );
+        Ok(())
+    }
+
+    // --- SetOiImbalanceHardBlock ---
+    #[inline(never)]
+    fn handle_set_oi_imbalance_hard_block<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        threshold_bps: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        if threshold_bps > 10_000 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut config = state::read_config(&data);
+        state::set_oi_imbalance_hard_block_bps(&mut config, threshold_bps);
+        state::write_config(&mut data, &config);
+
+        let stored = state::get_oi_imbalance_hard_block_bps(&config);
+        msg!(
+            "PERC-8110: SetOiImbalanceHardBlock: threshold_bps={} stored={}",
+            threshold_bps,
+            stored,
+        );
+        Ok(())
+    }
+
+    // --- TopUpKeeperFund ---
+    #[inline(never)]
+    fn handle_top_up_keeper_fund<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u64,
+    ) -> ProgramResult {
+        // accounts: [0] funder (signer), [1] slab (writable), [2] keeper_fund PDA (writable)
+        // optional: [3] system_program (required when funder is not program-owned)
+        accounts::expect_len(accounts, 3)?;
+        let a_funder = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_keeper_fund = &accounts[2];
+        accounts::expect_signer(a_funder)?;
+        accounts::expect_writable(a_slab)?;
+        accounts::expect_writable(a_keeper_fund)?;
+
+        {
+            let slab_data = state::slab_data_mut(a_slab)?;
+            slab_guard(program_id, a_slab, &slab_data)?;
+            require_initialized(&slab_data)?;
+        }
+
+        let (expected_pda, _bump) = Pubkey::find_program_address(
+            &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+            program_id,
+        );
+        if *a_keeper_fund.key != expected_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        if amount == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        if a_funder.owner != program_id {
+            if accounts.len() < 4 {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            }
+            let a_system = &accounts[3];
+            if *a_system.key != solana_program::system_program::id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+            solana_program::program::invoke(
+                &solana_program::system_instruction::transfer(
+                    a_funder.key,
+                    a_keeper_fund.key,
+                    amount,
+                ),
+                &[a_funder.clone(), a_keeper_fund.clone(), a_system.clone()],
+            )?;
+        } else {
+            let funder_lamports = **a_funder.try_borrow_lamports()?;
+            if funder_lamports < amount {
+                return Err(ProgramError::InsufficientFunds);
+            }
+            **a_funder.try_borrow_mut_lamports()? = funder_lamports - amount;
+            **a_keeper_fund.try_borrow_mut_lamports()? = a_keeper_fund
+                .lamports()
+                .checked_add(amount)
+                .ok_or(ProgramError::InsufficientFunds)?;
+        }
+
+        let mut fund_data = a_keeper_fund
+            .try_borrow_mut_data()
+            .map_err(|_| ProgramError::AccountBorrowFailed)?;
+
+        if let Some(fund_state) = crate::keeper_fund::read_state(&fund_data) {
+            let mut new_state = *fund_state;
+            new_state.balance = new_state.balance.saturating_add(amount);
+            new_state.total_topped_up = new_state.total_topped_up.saturating_add(amount);
+            // Clear depleted_pause flag when fund is topped up above zero.
+            if new_state.depleted_pause != 0
+                && !crate::keeper_fund::is_depleted(new_state.balance)
+            {
+                new_state.depleted_pause = 0;
+            }
+            crate::keeper_fund::write_state(&mut fund_data, &new_state);
+        } else {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        msg!("TopUpKeeperFund: amount={}", amount);
+        Ok(())
+    }
+
+    // --- RescueOrphanVault ---
+    #[inline(never)]
+    fn handle_rescue_orphan_vault<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 6)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_admin_ata = &accounts[2];
+        let a_vault = &accounts[3];
+        let a_token = &accounts[4];
+        let a_vault_pda = &accounts[5];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_admin_ata)?;
+        accounts::expect_writable(a_vault)?;
+        verify_token_program(a_token)?;
+
+        if a_slab.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        let slab_data = a_slab.try_borrow_data()?;
+        if slab_data.len() < 48 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let magic = u64::from_le_bytes(
+            slab_data[0..8]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        if magic != MAGIC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let admin_bytes: [u8; 32] = slab_data[16..48]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let slab_admin = Pubkey::new_from_array(admin_bytes);
+        if slab_admin != *a_admin.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let flags = slab_data[state::FLAGS_OFF];
+        if flags & state::FLAG_RESOLVED == 0 {
+            solana_program::msg!("RescueOrphanVault rejected: market is not resolved");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let bump = slab_data[12];
+        drop(slab_data);
+
+        // H-1: Verify vault is owned by SPL Token program.
+        if a_vault.owner != &crate::spl_token::id() {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        let (auth, expected_bump) =
+            accounts::derive_vault_authority(program_id, a_slab.key);
+        if bump != expected_bump {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        accounts::expect_key(a_vault_pda, &auth)?;
+
+        let vault_data = a_vault.try_borrow_data()?;
+        let vault_token = crate::spl_token::state::TokenAccountView::unpack(&vault_data)?;
+        if vault_token.owner != auth {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let actual_amount = vault_token.amount;
+        let vault_mint = vault_token.mint;
+        drop(vault_data);
+
+        let admin_ata_data = a_admin_ata.try_borrow_data()?;
+        let admin_token =
+            crate::spl_token::state::TokenAccountView::unpack(&admin_ata_data)?;
+        if admin_token.owner != *a_admin.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if admin_token.mint != vault_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        drop(admin_ata_data);
+
+        if actual_amount == 0 {
+            msg!("PERC-8400: vault is empty, nothing to rescue");
+            return Ok(());
+        }
+
+        let seed1: &[u8] = b"vault";
+        let seed2: &[u8] = a_slab.key.as_ref();
+        let bump_arr: [u8; 1] = [bump];
+        let seed3: &[u8] = &bump_arr;
+        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+        collateral::withdraw(
+            a_token,
+            a_vault,
+            a_admin_ata,
+            a_vault_pda,
+            actual_amount,
+            &signer_seeds,
+        )?;
+
+        msg!("PERC-8400: rescued {} tokens from orphan vault", actual_amount);
+        Ok(())
+    }
+
+    // --- CloseOrphanSlab ---
+    #[inline(never)]
+    fn handle_close_orphan_slab<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_vault = &accounts[2];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        if a_slab.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        {
+            let mut slab_data = a_slab.try_borrow_mut_data()?;
+            if slab_data.len() < 48 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let magic = u64::from_le_bytes(
+                slab_data[0..8]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+            );
+            if magic != MAGIC {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let admin_bytes: [u8; 32] = slab_data[16..48]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            let slab_admin = Pubkey::new_from_array(admin_bytes);
+            if slab_admin != *a_admin.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            // M-1: Verify vault is owned by SPL Token program.
+            if a_vault.owner != &crate::spl_token::id() {
+                return Err(ProgramError::IllegalOwner);
+            }
+
+            let vault_data = a_vault
+                .try_borrow_data()
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            if vault_data.len() < 72 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let vault_amount = u64::from_le_bytes(
+                vault_data[64..72]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+            );
+            if vault_amount > 0 {
+                msg!("PERC-8400: vault still has {} tokens, rescue first", vault_amount);
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let vault_owner_bytes: [u8; 32] = vault_data[32..64]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            let vault_owner = Pubkey::new_from_array(vault_owner_bytes);
+            let (expected_auth, _) =
+                accounts::derive_vault_authority(program_id, a_slab.key);
+            if vault_owner != expected_auth {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            drop(vault_data);
+
+            for b in slab_data.iter_mut() {
+                *b = 0;
+            }
+        }
+
+        let slab_lamports = a_slab.lamports();
+        **a_slab.lamports.borrow_mut() = 0;
+        **a_admin.lamports.borrow_mut() = a_admin
+            .lamports()
+            .checked_add(slab_lamports)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        msg!("PERC-8400: closed orphan slab, reclaimed {} lamports", slab_lamports);
+        Ok(())
+    }
+
+    // --- SetDexPool ---
+    #[inline(never)]
+    fn handle_set_dex_pool<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        pool: Pubkey,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_pool = &accounts[2];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        // SetDexPool fix: verify pool pubkey matches the pool account key.
+        if pool != *a_pool.key {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+
+        if !oracle::is_hyperp_mode(&config) {
+            msg!("SetDexPool: not a HYPERP market (index_feed_id is non-zero)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let is_approved_dex = *a_pool.owner == oracle::PUMPSWAP_PROGRAM_ID
+            || *a_pool.owner == oracle::RAYDIUM_CLMM_PROGRAM_ID
+            || *a_pool.owner == oracle::METEORA_DLMM_PROGRAM_ID;
+        if !is_approved_dex {
+            msg!("SetDexPool: pool account not owned by an approved DEX program");
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        {
+            let pool_data = a_pool.try_borrow_data()?;
+
+            let mint_matches = if *a_pool.owner == oracle::PUMPSWAP_PROGRAM_ID {
+                const PS_OFF_BASE_MINT: usize = 35;
+                if pool_data.len() < PS_OFF_BASE_MINT + 32 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let base_mint: [u8; 32] =
+                    pool_data[PS_OFF_BASE_MINT..PS_OFF_BASE_MINT + 32]
+                        .try_into()
+                        .unwrap();
+                base_mint == config.collateral_mint
+            } else if *a_pool.owner == oracle::RAYDIUM_CLMM_PROGRAM_ID {
+                const RAYDIUM_OFF_MINT0: usize = 73;
+                const RAYDIUM_OFF_MINT1: usize = 105;
+                if pool_data.len() < RAYDIUM_OFF_MINT1 + 32 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let mint0: [u8; 32] = pool_data[RAYDIUM_OFF_MINT0..RAYDIUM_OFF_MINT0 + 32]
+                    .try_into()
+                    .unwrap();
+                let mint1: [u8; 32] = pool_data[RAYDIUM_OFF_MINT1..RAYDIUM_OFF_MINT1 + 32]
+                    .try_into()
+                    .unwrap();
+                mint0 == config.collateral_mint || mint1 == config.collateral_mint
+            } else {
+                // Meteora DLMM
+                const METEORA_OFF_X: usize = 81;
+                const METEORA_OFF_Y: usize = 113;
+                if pool_data.len() < METEORA_OFF_Y + 32 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let x_mint: [u8; 32] = pool_data[METEORA_OFF_X..METEORA_OFF_X + 32]
+                    .try_into()
+                    .unwrap();
+                let y_mint: [u8; 32] = pool_data[METEORA_OFF_Y..METEORA_OFF_Y + 32]
+                    .try_into()
+                    .unwrap();
+                x_mint == config.collateral_mint || y_mint == config.collateral_mint
+            };
+
+            if !mint_matches {
+                msg!("SetDexPool: pool mints do not include market collateral_mint");
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+        }
+
+        config.dex_pool = pool.to_bytes();
+        state::write_config(&mut data, &config);
+
+        msg!("SetDexPool: pinned pool {} for HYPERP market {}", pool, a_slab.key);
+        Ok(())
+    }
+
+    // --- InitMatcherCtx ---
+    #[inline(never)]
+    fn handle_init_matcher_ctx<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        lp_idx: u16,
+        kind: u8,
+        trading_fee_bps: u32,
+        base_spread_bps: u32,
+        max_total_bps: u32,
+        impact_k_bps: u32,
+        liquidity_notional_e6: u128,
+        max_fill_abs: u128,
+        max_inventory_abs: u128,
+        fee_to_insurance_bps: u16,
+        skew_spread_mult_bps: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 5)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_matcher_ctx = &accounts[2];
+        let a_matcher_prog = &accounts[3];
+        let a_lp_pda = &accounts[4];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_matcher_ctx)?;
+
+        let data = a_slab.try_borrow_data()?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let engine = zc::engine_ref(&data)?;
+        check_idx(engine, lp_idx)?;
+        let lp_acc = &engine.accounts[lp_idx as usize];
+
+        if lp_acc.matcher_program == [0u8; 32] {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        if lp_acc.matcher_program != a_matcher_prog.key.to_bytes() {
+            return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+        }
+
+        if lp_acc.matcher_context != a_matcher_ctx.key.to_bytes() {
+            return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+        }
+
+        if a_matcher_ctx.owner != a_matcher_prog.key {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        if !a_matcher_prog.executable {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (expected_lp_pda, bump) = Pubkey::find_program_address(
+            &[b"lp", a_slab.key.as_ref(), &lp_bytes],
+            program_id,
+        );
+        if *a_lp_pda.key != expected_lp_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        drop(data);
+
+        // Build matcher init CPI data (matcher tag 2 + InitParams, 70 bytes total).
+        let mut cpi_data = [0u8; 70];
+        cpi_data[0] = 2; // MATCHER_INIT_TAG
+        cpi_data[1] = kind;
+        cpi_data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
+        cpi_data[6..10].copy_from_slice(&base_spread_bps.to_le_bytes());
+        cpi_data[10..14].copy_from_slice(&max_total_bps.to_le_bytes());
+        cpi_data[14..18].copy_from_slice(&impact_k_bps.to_le_bytes());
+        cpi_data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
+        cpi_data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
+        cpi_data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
+        cpi_data[66..68].copy_from_slice(&fee_to_insurance_bps.to_le_bytes());
+        cpi_data[68..70].copy_from_slice(&skew_spread_mult_bps.to_le_bytes());
+
+        let metas = [
+            solana_program::instruction::AccountMeta::new_readonly(
+                *a_lp_pda.key,
+                true,
+            ),
+            solana_program::instruction::AccountMeta::new(*a_matcher_ctx.key, false),
+        ];
+
+        let ix = solana_program::instruction::Instruction {
+            program_id: *a_matcher_prog.key,
+            accounts: metas.to_vec(),
+            data: cpi_data.to_vec(),
+        };
+
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
+
+        solana_program::program::invoke_signed(
+            &ix,
+            &[a_lp_pda.clone(), a_matcher_ctx.clone()],
+            &[seeds],
+        )?;
+
+        msg!("InitMatcherCtx: initialized matcher context for LP idx {}", lp_idx);
         Ok(())
     }
 }
