@@ -478,7 +478,9 @@ fn trade_notional_e6_from_size(size: i128, price_e6: u64) -> u64 {
 
 /// Maximum age (in slots) for a CMOR attestation to be considered fresh.
 /// ~2 minutes at 400ms slots = 300 slots.
-pub const CMOR_MAX_AGE_SLOTS: u64 = 300;
+/// SECURITY(M-5): Reduced from 300 (~2 min) to 25 (~10s) to limit stale
+/// CMOR attestation window after closing one leg of a hedge.
+pub const CMOR_MAX_AGE_SLOTS: u64 = 25;
 
 /// Apply CMOR cross-margin credit to engine margin params if attestation is
 /// present, fresh, and yields a nonzero credit. Returns the credit_bps applied
