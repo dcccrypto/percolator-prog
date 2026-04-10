@@ -10828,16 +10828,22 @@ pub mod processor {
         // claimable_this_epoch() uses only the epochs_remaining counter
         // with no clock check.
         let clock = Clock::get()?;
-        if queue.last_claim_slot > 0
-            && clock.slot
-                < queue
-                    .last_claim_slot
-                    .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS)
+        // SECURITY(M-8): Use queue_start_slot as reference for the first claim
+        // (when last_claim_slot is 0). Previously, the `> 0` check skipped
+        // time gating entirely on the first claim, allowing instant withdrawal.
+        let reference_slot = if queue.last_claim_slot > 0 {
+            queue.last_claim_slot
+        } else {
+            queue.queue_start_slot
+        };
+        if clock.slot
+            < reference_slot
+                .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS)
         {
             msg!(
                 "ClaimQueuedWithdrawal: epoch not elapsed (slot={}, next={})",
                 clock.slot,
-                queue.last_claim_slot
+                reference_slot
                     .saturating_add(crate::shared_vault::DEFAULT_EPOCH_DURATION_SLOTS),
             );
             return Err(PercolatorError::WithdrawQueueNothingClaimable.into());
