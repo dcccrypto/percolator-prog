@@ -7148,6 +7148,13 @@ pub mod processor {
         check_idx(engine, lp_idx)?;
         check_idx(engine, user_idx)?;
 
+        // Reject same-index trades — using the same engine account slot as
+        // both buyer and seller corrupts position/capital state because the
+        // engine reads and writes the same mutable slot for both sides.
+        if user_idx == lp_idx {
+            return Err(ProgramError::InvalidArgument);
+        }
+
         // TradeNoCpi: no matcher check. Both sides are bilateral signers,
         // no CPI is invoked. Matcher config only matters for TradeCpi.
 
@@ -7310,6 +7317,12 @@ pub mod processor {
 
             check_idx(engine, lp_idx)?;
             check_idx(engine, user_idx)?;
+
+            // Reject same-index trades — using the same engine account slot as
+            // both buyer and seller corrupts position/capital state.
+            if user_idx == lp_idx {
+                return Err(ProgramError::InvalidArgument);
+            }
 
             // TradeCpi: require lp_idx has matcher config (non-zero matcher_program).
             // The matcher program/context are used for CPI — zero fields would
