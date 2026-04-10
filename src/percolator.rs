@@ -975,14 +975,33 @@ pub mod matcher_abi {
         if ctx.len() < 64 {
             return Err(ProgramError::InvalidAccountData);
         }
-        let abi_version = u32::from_le_bytes(ctx[0..4].try_into().unwrap());
-        let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
-        let exec_price_e6 = u64::from_le_bytes(ctx[8..16].try_into().unwrap());
-        let exec_size = i128::from_le_bytes(ctx[16..32].try_into().unwrap());
-        let req_id = u64::from_le_bytes(ctx[32..40].try_into().unwrap());
-        let lp_account_id = u64::from_le_bytes(ctx[40..48].try_into().unwrap());
-        let oracle_price_e6 = u64::from_le_bytes(ctx[48..56].try_into().unwrap());
-        let reserved = u64::from_le_bytes(ctx[56..64].try_into().unwrap());
+        
+        // Safe to unwrap because we've verified ctx.len() >= 64
+        // Each pair of indices is guaranteed to be in bounds
+        let abi_version = u32::from_le_bytes(
+            ctx[0..4].try_into().expect("slice guaranteed by len check")
+        );
+        let flags = u32::from_le_bytes(
+            ctx[4..8].try_into().expect("slice guaranteed by len check")
+        );
+        let exec_price_e6 = u64::from_le_bytes(
+            ctx[8..16].try_into().expect("slice guaranteed by len check")
+        );
+        let exec_size = i128::from_le_bytes(
+            ctx[16..32].try_into().expect("slice guaranteed by len check")
+        );
+        let req_id = u64::from_le_bytes(
+            ctx[32..40].try_into().expect("slice guaranteed by len check")
+        );
+        let lp_account_id = u64::from_le_bytes(
+            ctx[40..48].try_into().expect("slice guaranteed by len check")
+        );
+        let oracle_price_e6 = u64::from_le_bytes(
+            ctx[48..56].try_into().expect("slice guaranteed by len check")
+        );
+        let reserved = u64::from_le_bytes(
+            ctx[56..64].try_into().expect("slice guaranteed by len check")
+        );
 
         Ok(MatcherReturn {
             abi_version,
@@ -1940,7 +1959,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(2);
         *input = rest;
-        Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(2) guarantees bytes.len() == 2
+        Ok(u16::from_le_bytes(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_u32(input: &mut &[u8]) -> Result<u32, ProgramError> {
@@ -1949,7 +1969,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(4);
         *input = rest;
-        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(4) guarantees bytes.len() == 4
+        Ok(u32::from_le_bytes(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_u64(input: &mut &[u8]) -> Result<u64, ProgramError> {
@@ -1958,7 +1979,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(8);
         *input = rest;
-        Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(8) guarantees bytes.len() == 8
+        Ok(u64::from_le_bytes(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_i64(input: &mut &[u8]) -> Result<i64, ProgramError> {
@@ -1967,7 +1989,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(8);
         *input = rest;
-        Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(8) guarantees bytes.len() == 8
+        Ok(i64::from_le_bytes(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_i128(input: &mut &[u8]) -> Result<i128, ProgramError> {
@@ -1976,7 +1999,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(16);
         *input = rest;
-        Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(16) guarantees bytes.len() == 16
+        Ok(i128::from_le_bytes(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_u128(input: &mut &[u8]) -> Result<u128, ProgramError> {
@@ -1985,7 +2009,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(16);
         *input = rest;
-        Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(16) guarantees bytes.len() == 16
+        Ok(u128::from_le_bytes(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_pubkey(input: &mut &[u8]) -> Result<Pubkey, ProgramError> {
@@ -1994,7 +2019,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(32);
         *input = rest;
-        Ok(Pubkey::new_from_array(bytes.try_into().unwrap()))
+        // Safe to unwrap: split_at(32) guarantees bytes.len() == 32
+        Ok(Pubkey::new_from_array(bytes.try_into().expect("split_at guarantees length")))
     }
 
     fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
@@ -2003,7 +2029,8 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(32);
         *input = rest;
-        Ok(bytes.try_into().unwrap())
+        // Safe to unwrap: split_at(32) guarantees bytes.len() == 32
+        Ok(bytes.try_into().expect("split_at guarantees length"))
     }
 
     fn read_risk_params(input: &mut &[u8]) -> Result<(RiskParams, u128), ProgramError> {
@@ -2345,7 +2372,12 @@ pub mod state {
     /// Read the request nonce from the reserved field in slab header.
     /// The nonce is stored at RESERVED_OFF..RESERVED_OFF+8 as little-endian u64.
     pub fn read_req_nonce(data: &[u8]) -> u64 {
-        u64::from_le_bytes(data[RESERVED_OFF..RESERVED_OFF + 8].try_into().unwrap())
+        // Safe to unwrap: RESERVED_OFF + 8 should be within bounds for valid slab headers
+        // but we add defensive expect() for safety
+        match data.get(RESERVED_OFF..RESERVED_OFF + 8) {
+            Some(bytes) => u64::from_le_bytes(bytes.try_into().expect("slice length verified")),
+            None => 0,  // Return 0 for missing/invalid nonce
+        }
     }
 
     /// Write the request nonce to the reserved field in slab header.
