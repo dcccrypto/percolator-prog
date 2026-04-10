@@ -13417,6 +13417,11 @@ pub mod processor {
         config.mark_ewma_e6 = new_mark;
         config.mark_ewma_last_slot = clock.slot;
         config.last_effective_price_e6 = new_index;
+        // SECURITY(M-4): Update last_hyperp_index_slot alongside last_effective_price_e6.
+        // Every other writer (PushOraclePrice, SetOraclePriceCap, get_engine_oracle_price_e6)
+        // updates both together. Without this, the next get_engine_oracle_price_e6 call
+        // computes an inflated dt, allowing the index to converge faster than intended.
+        config.last_hyperp_index_slot = clock.slot;
 
         // Record pool depth for per-epoch OI cap enforcement (no-op in V12_1 layout).
         state::set_last_dex_liquidity_k(&mut config, dex_result.quote_liquidity);
