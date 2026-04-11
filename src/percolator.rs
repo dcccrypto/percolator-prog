@@ -8450,6 +8450,10 @@ pub mod processor {
         let mut data = state::slab_data_mut(a_slab)?;
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
+        // Block resolution during pause — prevents admin from pausing the
+        // market (blocking user exits) then resolving at a manipulated price
+        // while users cannot adjust positions or withdraw.
+        require_not_paused(&data)?;
 
         let header = state::read_header(&data);
         require_admin(header.admin, a_admin.key)?;
