@@ -11455,8 +11455,12 @@ pub mod processor {
             if pnl > 0 {
                 sum_pnl_pos = sum_pnl_pos.saturating_add(pnl as u128);
             }
-            let pos = acc.position_basis_q;
-            sum_oi = sum_oi.saturating_add(pos.unsigned_abs());
+            // SECURITY(H-5): Use effective position (post-ADL scaling), not
+            // raw basis. After ADL, position_basis_q diverges from oi_eff_*_q
+            // aggregates, causing a false-positive OI mismatch that pauses
+            // the market during the exact crisis when it must stay running.
+            let eff = engine.effective_pos_q(idx);
+            sum_oi = sum_oi.saturating_add(eff.unsigned_abs());
         }
 
         let mut violation = false;
