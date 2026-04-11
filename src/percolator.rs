@@ -12550,7 +12550,7 @@ pub mod processor {
         accounts::expect_writable(a_dst_ata)?;
         verify_token22_program(a_token22)?;
 
-        let slab_data = state::slab_data_mut(a_slab)?;
+        let mut slab_data = state::slab_data_mut(a_slab)?;
         slab_guard(program_id, a_slab, &slab_data)?;
         require_initialized(&slab_data)?;
 
@@ -12583,6 +12583,16 @@ pub mod processor {
         if nft_state.pending_settlement != 0 {
             msg!("PERC-608: PendingFundingNotSettled — keeper must run settlement crank");
             return Err(PercolatorError::EngineUnauthorized.into());
+        }
+
+        // Update engine-level owner so the new owner gains full control
+        // (withdraw, trade, close). Done before dropping slab_data and
+        // before the CPI; if the CPI reverts, the whole tx rolls back
+        // atomically. The CPI only touches Token-2022 accounts (mint/ATAs),
+        // not the slab, so no ExternalAccountDataModified risk.
+        {
+            let engine = zc::engine_mut(&mut slab_data)?;
+            engine.accounts[user_idx as usize].owner = a_new_owner.key.to_bytes();
         }
 
         drop(slab_data);
