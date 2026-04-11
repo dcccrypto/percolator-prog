@@ -908,20 +908,32 @@ pub mod zc {
     const SM_LONG_OFF: usize = offset_of!(RiskEngine, side_mode_long);
     /// Offset of side_mode_short within RiskEngine (repr(u8) enum)
     const SM_SHORT_OFF: usize = offset_of!(RiskEngine, side_mode_short);
+    /// Offset of market_mode within RiskEngine (repr(u8) enum)
+    const MM_OFF: usize = offset_of!(RiskEngine, market_mode);
 
-    /// Validate enum discriminants from raw bytes BEFORE casting to &RiskEngine.
+    /// Validate ALL enum discriminants from raw bytes BEFORE casting to &RiskEngine.
     ///
-    /// RiskEngine contains one remaining enum type:
-    ///   - SideMode (2 instances): validated here (O(1))
+    /// RiskEngine contains these types with invalid bit patterns:
+    ///   - SideMode (2 instances): valid 0-2
+    ///   - MarketMode (1 instance): valid 0-1
+    ///   - Account.overflow_older_present / overflow_newest_present (bool):
+    ///     valid 0-1, but per-account validation is O(MAX_ACCOUNTS) so we rely
+    ///     on the slab being program-owned (only typed Rust writes touch these).
     ///
     /// Account.kind was changed from AccountKind enum to plain u8, eliminating
     /// the UB class at the type level — u8 has no invalid representations.
     #[inline]
     fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
+        // SideMode: valid 0 (Normal), 1 (DrainOnly), 2 (ResetPending)
         let sm_long = data[base + SM_LONG_OFF];
         let sm_short = data[base + SM_SHORT_OFF];
         if sm_long > 2 || sm_short > 2 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // MarketMode: valid 0 (Live), 1 (Resolved)
+        let mm = data[base + MM_OFF];
+        if mm > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
@@ -4035,48 +4047,10 @@ pub mod processor {
 
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Settle PnL for accounts in a paginated manner.
-                    // touch_account_full settles A/K mark-to-market PnL at
-                    // settlement price. Position zeroing and account close
-                    // happen when users call CloseAccount (close_account_resolved).
-                    const BATCH_SIZE: u16 = 8;
-                    let start = engine.crank_cursor;
-                    let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
-
-                    for idx in start..end {
-                        if engine.is_used(idx as usize) {
-                            // Best-effort settlement at fixed settlement price.
-                            //
-                            // Convergence argument (verified in engine source):
-                            //   accrue_market_to writes last_oracle_price LAST,
-                            //   after all K coefficient updates. If K updates fail
-                            //   (checked arithmetic), stored price is NOT updated,
-                            //   so the next call recomputes the same delta_p. After
-                            //   a successful completion, subsequent calls with the
-                            //   same fixed price hit the early return (delta_p=0).
-                            //
-                            //   Therefore: partial failure → retry → identical
-                            //   final state as single success. Idempotent after
-                            //   first successful application.
-                            //
-                            // Accounts where touch never succeeds (ADL overflow)
-                            // are force-closed via AdminForceCloseAccount, which
-                            // does best-effort touch then falls through to
-                            // close_account_resolved using stored local state.
-                            // Resolved crank does NOT call touch_account_full.
-                            // touch_account_full_not_atomic can leave partial state on
-                            // error, and aborting on one bad account would stall the
-                            // entire batch. Accounts are settled by ForceCloseResolved
-                            // which handles K-pair fallback atomically.
-                        }
-                    }
-
-                    // Update crank cursor (do NOT advance current_slot — frozen)
-                    engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 {
-                        0
-                    } else {
-                        end
-                    };
+                    // Resolved crank: no per-account settlement here.
+                    // Accounts are settled by ForceCloseResolved / CloseAccount
+                    // which call force_close_resolved_not_atomic atomically.
+                    // The resolved crank only handles dust sweep and lifecycle.
 
                     // Sweep dust to insurance fund.
                     // On resolved markets, also forgive sub-scale remainder
@@ -5654,17 +5628,6 @@ pub mod processor {
                 let clock = Clock::from_account_info(a_clock)?;
                 let mut config = config;
 
-                // Accrue engine to settlement price BEFORE entering resolved mode.
-                // This crystallizes all account states at the settlement price so
-                // force_close_resolved (which takes no price parameter) uses
-                // consistent post-accrual state.
-                if !oracle::is_hyperp_mode(&config) {
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot, config.authority_price_e6,
-                    ).map_err(map_risk_error)?;
-                }
-
                 // Flush Hyperp index to resolution slot WITHOUT staleness check.
                 // Admin must be able to resolve even if mark is stale.
                 if oracle::is_hyperp_mode(&config) {
@@ -5680,15 +5643,15 @@ pub mod processor {
                         config.last_hyperp_index_slot = clock.slot;
                     }
                     state::write_config(&mut data, &config);
-                    // Accrue to resolution boundary at the settlement mark price
-                    // (authority_price_e6), NOT the smoothed index. force_close_resolved
-                    // uses K coefficients that must reflect the declared settlement price.
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot, config.authority_price_e6,
-                    ).map_err(map_risk_error)?;
-                    config = state::read_config(&data);
                 }
+
+                // Call the engine's resolve_market transition.
+                // This does final accrual at settlement price, sets MarketMode::Resolved,
+                // matures all PnL, zeros OI, and drains/finalizes sides.
+                // The engine validates the price deviation band against P_last internally.
+                let engine = zc::engine_mut(&mut data)?;
+                engine.resolve_market(config.authority_price_e6, clock.slot)
+                    .map_err(map_risk_error)?;
 
                 config.resolution_slot = clock.slot;
                 state::write_config(&mut data, &config);
@@ -6517,17 +6480,15 @@ pub mod processor {
                     p
                 };
 
-                // Accrue engine to settlement price before entering resolved mode.
-                // Hyperp already accrued above; non-Hyperp accrues here.
-                if !is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(clock.slot, last_price)
-                        .map_err(map_risk_error)?;
-                }
+                // Call the engine's resolve_market transition.
+                // This does final accrual at settlement price, sets MarketMode::Resolved,
+                // matures all PnL, zeros OI, and drains/finalizes sides.
+                // Hyperp already accrued above for index flush; the engine's resolve_market
+                // will re-accrue (idempotent if same slot+price).
+                let engine = zc::engine_mut(&mut data)?;
+                engine.resolve_market(last_price, clock.slot)
+                    .map_err(map_risk_error)?;
 
-                // Use clock.slot (not engine.last_crank_slot) — other instructions
-                // advance current_slot past last_crank_slot, so using the stale
-                // crank slot would make resolved touch paths fail monotonic checks.
                 config.resolution_slot = clock.slot;
                 config.authority_price_e6 = last_price;
                 state::write_config(&mut data, &config);
