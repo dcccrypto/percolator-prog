@@ -2,14 +2,7 @@
 
 #![no_std]
 #![deny(unsafe_code)]
-
-// SECURITY(L-1): Prevent accidental mainnet deploy with test feature enabled.
-// The test feature bypasses oracle owner checks and replaces token CPIs with
-// in-memory simulation — catastrophic if deployed to mainnet.
-#[cfg(all(feature = "mainnet", feature = "test"))]
-compile_error!("features `mainnet` and `test` are mutually exclusive — never deploy with `test` enabled");
 // Upstream code uses patterns that trigger some clippy lints.
-// These are pre-existing in the upstream codebase, not introduced by our changes.
 #![allow(
     clippy::too_many_arguments,
     clippy::large_enum_variant,
@@ -30,6 +23,12 @@ compile_error!("features `mainnet` and `test` are mutually exclusive — never d
     unused_variables,
     dead_code,
 )]
+
+// SECURITY(L-1): Prevent accidental mainnet deploy with test feature enabled.
+// The test feature bypasses oracle owner checks and replaces token CPIs with
+// in-memory simulation — catastrophic if deployed to mainnet.
+#[cfg(all(feature = "mainnet", feature = "test"))]
+compile_error!("features `mainnet` and `test` are mutually exclusive — never deploy with `test` enabled");
 
 extern crate alloc;
 
