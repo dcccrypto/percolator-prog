@@ -12444,7 +12444,10 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         user_idx: u16,
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 10)?;
+        // Accept 10 or 11 accounts — 11th is Associated Token Program for ATA creation
+        if accounts.len() < 10 {
+            return Err(solana_program::program_error::ProgramError::NotEnoughAccountKeys);
+        }
         let a_payer = &accounts[0];
         let a_slab = &accounts[1];
         let a_nft_pda = &accounts[2];
@@ -12455,6 +12458,7 @@ pub mod processor {
         let a_token22 = &accounts[7];
         let a_system = &accounts[8];
         let a_rent = &accounts[9];
+        let a_ata_program = if accounts.len() > 10 { Some(&accounts[10]) } else { None };
 
         accounts::expect_signer(a_payer)?;
         accounts::expect_signer(a_owner)?;
@@ -12563,6 +12567,41 @@ pub mod processor {
                 entry_price_raw,
                 pos_size,
             )?;
+        }
+
+        // Create the owner's Token-2022 ATA for the NFT mint if it doesn't exist.
+        // The mint was just created above, so the ATA can't exist in a preceding IX.
+        // Uses raw CPI to avoid spl-associated-token-account crate dependency (binary size).
+        #[cfg(not(feature = "test"))]
+        if let Some(ata_prog) = a_ata_program {
+            if a_owner_ata.data_is_empty() || a_owner_ata.lamports() == 0 {
+                // ATA program instruction: CreateAssociatedTokenAccount (no instruction data)
+                use alloc::vec;
+                let create_ata_ix = solana_program::instruction::Instruction {
+                    program_id: *ata_prog.key,
+                    accounts: vec![
+                        solana_program::instruction::AccountMeta::new(*a_payer.key, true),
+                        solana_program::instruction::AccountMeta::new(*a_owner_ata.key, false),
+                        solana_program::instruction::AccountMeta::new_readonly(*a_owner.key, false),
+                        solana_program::instruction::AccountMeta::new_readonly(*a_nft_mint.key, false),
+                        solana_program::instruction::AccountMeta::new_readonly(*a_system.key, false),
+                        solana_program::instruction::AccountMeta::new_readonly(*a_token22.key, false),
+                    ],
+                    data: vec![],
+                };
+                solana_program::program::invoke(
+                    &create_ata_ix,
+                    &[
+                        a_payer.clone(),
+                        a_owner_ata.clone(),
+                        a_owner.clone(),
+                        a_nft_mint.clone(),
+                        a_system.clone(),
+                        a_token22.clone(),
+                        ata_prog.clone(),
+                    ],
+                )?;
+            }
         }
 
         {
