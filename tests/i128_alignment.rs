@@ -9,7 +9,7 @@
 //! Run:       cargo test --release --test i128_alignment -- --nocapture
 
 use litesvm::LiteSVM;
-use percolator::{Account, RiskEngine, RiskParams, I128, U128};
+use percolator::{Account, ReserveCohort, RiskEngine, RiskParams, I128, U128, MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT};
 use solana_sdk::{
     account::Account as SolanaAccount,
     clock::Clock,
@@ -246,8 +246,6 @@ fn test_account_struct_alignment() {
         kind: Account::KIND_USER,
         pnl: -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10i128,
         reserved_pnl: 0xDEAD_BEEF_CAFE_BABEu128,
-        warmup_started_at_slot: 999999,
-        warmup_slope_per_step: 42u128,
         position_basis_q: -1_000_000_000_000i128,
         adl_a_basis: 1_000_000u128,
         adl_k_snap: 0i128,
@@ -256,8 +254,13 @@ fn test_account_struct_alignment() {
         matcher_context: [0xBB; 32],
         owner: [0xCC; 32],
         fee_credits: I128::new(-999),
-        last_fee_slot: 888888,
         fees_earned_total: U128::new(0),
+        exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
+        exact_cohort_count: 0,
+        overflow_older: ReserveCohort::EMPTY,
+        overflow_older_present: false,
+        overflow_newest: ReserveCohort::EMPTY,
+        overflow_newest_present: false,
     };
 
     // Verify all fields round-trip correctly

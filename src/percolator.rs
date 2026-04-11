@@ -1751,7 +1751,7 @@ pub mod ix {
         let new_account_fee = U128::new(read_u128(input)?);
         // Wire format: insurance_floor occupies the old risk_reduction_threshold slot
         let insurance_floor = read_u128(input)?;
-        let maintenance_fee_per_slot = U128::new(read_u128(input)?);
+        let _maintenance_fee_per_slot = U128::new(read_u128(input)?); // removed from engine, kept in wire format
         let max_crank_staleness_slots = read_u64(input)?;
         let liquidation_fee_bps = read_u64(input)?;
         let liquidation_fee_cap = U128::new(read_u128(input)?);
@@ -1766,13 +1766,11 @@ pub mod ix {
         let min_nonzero_mm_req = read_u128(input)?;
         let min_nonzero_im_req = read_u128(input)?;
         let params = RiskParams {
-            warmup_period_slots,
             maintenance_margin_bps,
             initial_margin_bps,
             trading_fee_bps,
             max_accounts,
             new_account_fee,
-            maintenance_fee_per_slot,
             max_crank_staleness_slots,
             liquidation_fee_bps,
             liquidation_fee_cap,
@@ -1781,6 +1779,9 @@ pub mod ix {
             min_nonzero_mm_req,
             min_nonzero_im_req,
             insurance_floor: U128::new(insurance_floor),
+            h_min: warmup_period_slots,
+            h_max: warmup_period_slots,
+            resolve_price_deviation_bps: 1000,
         };
         Ok((params, insurance_floor))
     }
@@ -3044,6 +3045,12 @@ pub mod processor {
         )
     }
 
+    /// Convert bps-per-slot funding rate (i64) to e9-per-slot (i128).
+    /// 1 bps = 0.0001 = 100_000 ppb (parts per billion).
+    fn funding_bps_to_e9(bps: i64) -> i128 {
+        (bps as i128) * 100_000
+    }
+
     // stamp_funding_rate removed — all paths now use engine.run_end_of_instruction_lifecycle
     // or the engine's internal recompute_r_last_from_final_state. No direct field writes.
 
@@ -3055,7 +3062,7 @@ pub mod processor {
         now_slot: u64,
         oracle_price: u64,
         size: i128,
-        funding_rate: i64,
+        funding_rate_e9: i128,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
         let exec = matcher.execute_match(
@@ -3080,6 +3087,7 @@ pub mod processor {
         } else {
             return Err(RiskError::Overflow);
         };
+        let h_lock = engine.params.h_min;
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -3087,7 +3095,8 @@ pub mod processor {
             now_slot,
             abs_size,
             exec.price,
-            funding_rate,
+            funding_rate_e9,
+            h_lock,
         )
     }
 
@@ -3412,11 +3421,6 @@ pub mod processor {
                 // Validate per-market admin limits (must be set at init time).
                 // Bounds-check against engine-level constants to prevent admin
                 // from setting values that violate engine invariants.
-                if max_maintenance_fee_per_slot == 0
-                    || max_maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
                 if max_insurance_floor == 0
                     || max_insurance_floor > percolator::MAX_VAULT_TVL
                 {
@@ -3430,11 +3434,6 @@ pub mod processor {
                 if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // Maintenance fee must not exceed the immutable per-market ceiling.
-                if risk_params.maintenance_fee_per_slot.get() > max_maintenance_fee_per_slot {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-
                 // Permissionless resolve: if enabled, must exceed max_crank_staleness
                 // to prevent accidental instant-resolution from one missed crank.
                 if permissionless_resolve_stale_slots > 0
@@ -3467,7 +3466,7 @@ pub mod processor {
                     }
                 }
                 if let Some(ms) = custom_max_per_slot {
-                    if ms < 0 || ms > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT {
+                    if ms < 0 || funding_bps_to_e9(ms) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT {
                         return Err(PercolatorError::InvalidConfigParam.into());
                     }
                 }
@@ -3542,9 +3541,6 @@ pub mod processor {
                     if p.min_liquidation_abs.get() > p.liquidation_fee_cap.get()
                         || p.liquidation_fee_cap.get() > percolator::MAX_PROTOCOL_FEE_ABS
                     {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
-                    if p.maintenance_fee_per_slot.get() > percolator::MAX_MAINTENANCE_FEE_PER_SLOT {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     if p.insurance_floor.get() > percolator::MAX_VAULT_TVL {
@@ -3964,9 +3960,10 @@ pub mod processor {
 
                 // Use frozen time on resolved markets
                 let withdraw_slot = if resolved { config.resolution_slot } else { clock.slot };
+                let h_lock = engine.params.h_min;
                 engine
                     .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
-                        compute_current_funding_rate(&config))
+                        funding_bps_to_e9(compute_current_funding_rate(&config)), h_lock)
                     .map_err(map_risk_error)?;
 
                 // Convert units back to base tokens for payout (checked to prevent silent overflow)
@@ -4103,7 +4100,7 @@ pub mod processor {
                     let mut ctx = percolator::InstructionContext::new();
                     match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
-                        compute_current_funding_rate(&config),
+                        funding_bps_to_e9(compute_current_funding_rate(&config)),
                     ) {
                         Ok(()) => {}
                         Err(percolator::RiskError::CorruptState) => {
@@ -4176,15 +4173,6 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
-                // Crank discount: halve caller's pending maintenance fee interval.
-                // Applied BEFORE keeper_crank so the caller's own touch sees reduced dt.
-                if !permissionless {
-                    let acct = &mut engine.accounts[caller_idx as usize];
-                    let dt = clock.slot.saturating_sub(acct.last_fee_slot);
-                    if dt > crate::constants::CRANK_REWARD_MIN_DT {
-                        acct.last_fee_slot = acct.last_fee_slot + dt / 2;
-                    }
-                }
                 let mut combined = alloc::vec::Vec::with_capacity(
                     buf.count as usize + candidates.len(),
                 );
@@ -4197,13 +4185,15 @@ pub mod processor {
                 combined.extend_from_slice(&candidates);
 
                 let funding_rate = compute_current_funding_rate(&config);
+                let h_lock = engine.params.h_min;
                 let _outcome = engine
                     .keeper_crank_not_atomic(
                         clock.slot,
                         price,
                         &combined,
                         percolator::LIQ_BUDGET_PER_CRANK,
-                        funding_rate,
+                        funding_bps_to_e9(funding_rate),
+                        h_lock,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
@@ -4380,7 +4370,7 @@ pub mod processor {
                 let funding_rate = compute_current_funding_rate(&config);
                 execute_trade_with_matcher(
                     engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
-                    funding_rate,
+                    funding_bps_to_e9(funding_rate),
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
@@ -4717,7 +4707,7 @@ pub mod processor {
                     let funding_rate = compute_current_funding_rate(&config);
                     execute_trade_with_matcher(
                         engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
-                        funding_rate,
+                        funding_bps_to_e9(funding_rate),
                     ).map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
@@ -4848,10 +4838,12 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: liquidate_start");
                     sol_log_compute_units();
                 }
+                let h_lock = engine.params.h_min;
                 let _res = engine
                     .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
                         percolator::LiquidationPolicy::FullClose,
-                        compute_current_funding_rate(&config))
+                        funding_bps_to_e9(compute_current_funding_rate(&config)),
+                        h_lock)
                     .map_err(map_risk_error)?;
                 sol_log_64(_res as u64, 0, 0, 0, 4); // result
 
@@ -4958,10 +4950,14 @@ pub mod processor {
                     engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                         .map_err(map_risk_error)?
                 } else {
-                    engine
-                        .close_account_not_atomic(user_idx, clock.slot, price,
-                            compute_current_funding_rate(&config))
-                        .map_err(map_risk_error)?
+                    {
+                        let h_lock = engine.params.h_min;
+                        engine
+                            .close_account_not_atomic(user_idx, clock.slot, price,
+                                funding_bps_to_e9(compute_current_funding_rate(&config)),
+                                h_lock)
+                            .map_err(map_risk_error)?
+                    }
                 };
                 #[cfg(feature = "cu-audit")]
                 {
@@ -5216,7 +5212,7 @@ pub mod processor {
                 let _ = funding_inv_scale_notional_e6;
                 // Reject negative funding bounds — reversed clamp bounds panic
                 if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
-                    || funding_max_bps_per_slot > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT
+                    || funding_bps_to_e9(funding_max_bps_per_slot) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
                 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
@@ -5275,7 +5271,7 @@ pub mod processor {
                     let mut ctx = percolator::InstructionContext::new();
                     match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
-                        compute_current_funding_rate(&config),
+                        funding_bps_to_e9(compute_current_funding_rate(&config)),
                     ) {
                         Ok(()) => {}
                         Err(percolator::RiskError::CorruptState) => {
@@ -5467,7 +5463,7 @@ pub mod processor {
                     let mut ctx = percolator::InstructionContext::new();
                     match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
-                        compute_current_funding_rate(&config),
+                        funding_bps_to_e9(compute_current_funding_rate(&config)),
                     ) {
                         Ok(()) => {}
                         Err(percolator::RiskError::CorruptState) => {
@@ -5558,7 +5554,7 @@ pub mod processor {
                     let mut ctx = percolator::InstructionContext::new();
                     match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
-                        compute_current_funding_rate(&config),
+                        funding_bps_to_e9(compute_current_funding_rate(&config)),
                     ) {
                         Ok(()) => {}
                         Err(percolator::RiskError::CorruptState) => {
@@ -6242,8 +6238,10 @@ pub mod processor {
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
+                let h_lock = engine.params.h_min;
                 engine.settle_account_not_atomic(user_idx, price, clock.slot,
-                    compute_current_funding_rate(&config))
+                    funding_bps_to_e9(compute_current_funding_rate(&config)),
+                    h_lock)
                     .map_err(map_risk_error)?;
             }
 
@@ -6364,8 +6362,10 @@ pub mod processor {
                 if dust != 0 {
                     return Err(ProgramError::InvalidArgument);
                 }
+                let h_lock = engine.params.h_min;
                 engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
-                    compute_current_funding_rate(&config))
+                    funding_bps_to_e9(compute_current_funding_rate(&config)),
+                    h_lock)
                     .map_err(map_risk_error)?;
             }
 
