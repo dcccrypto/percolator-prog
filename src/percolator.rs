@@ -1333,6 +1333,9 @@ pub mod ix {
         PauseMarket,
         /// Admin unpause (tag 77). Re-enables all operations.
         UnpauseMarket,
+        /// Close keeper fund PDA and recover lamports to admin (tag 78).
+        /// Requires market to be resolved. Admin only.
+        CloseKeeperFund,
 
         // ─── Fork-specific instructions ────────────────────────────────────
 
@@ -1765,6 +1768,7 @@ pub mod ix {
                 34 => Ok(Instruction::UpdateHyperpMark),
                 76 => Ok(Instruction::PauseMarket),
                 77 => Ok(Instruction::UnpauseMarket),
+                78 => Ok(Instruction::CloseKeeperFund),
                 // Fork-specific instructions
                 57 => {
                     // TopUpKeeperFund
@@ -3370,11 +3374,12 @@ pub mod oracle {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
+        // price_e6 = sqrt_price^2 * 10^(6 + decimals_0 - decimals_1) / 2^128
+        // The exponent accounts for both the e6 output scaling and the decimal difference.
         let decimal_diff = 6i32 + decimals_0 - decimals_1;
 
-        // Compute price_e6 = sqrt^2 * 10^(6 + decimal_diff) / 2^128
         // Must scale BEFORE dividing to avoid precision loss for prices < 2^64.
-        let scale_exp = (6i32 + decimal_diff).max(0) as u32;
+        let scale_exp = decimal_diff.max(0) as u32;
         let scale = 10u128.pow(scale_exp);
         // sqrt fits in 128 bits. sqrt * sqrt_scaled to avoid overflow:
         // Split: price = (sqrt / 2^64)^2 * scale = sqrt^2 * scale / 2^128
@@ -6027,6 +6032,10 @@ pub mod processor {
 
             Instruction::UnpauseMarket => {
                 handle_unpause_market(program_id, accounts)?;
+            }
+
+            Instruction::CloseKeeperFund => {
+                handle_close_keeper_fund(program_id, accounts)?;
             }
 
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
@@ -13588,6 +13597,72 @@ pub mod processor {
 
         state::set_paused(&mut data, false);
         msg!("Market unpaused by admin");
+        Ok(())
+    }
+
+    // --- CloseKeeperFund (tag 78) ---
+    // Closes the keeper fund PDA and recovers all lamports to admin.
+    // Requires: market must be resolved, caller must be admin.
+    // Accounts: [admin(signer,writable), slab(readonly), keeper_fund_pda(writable)]
+    #[inline(never)]
+    fn handle_close_keeper_fund<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 3)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+        let a_keeper_fund = &accounts[2];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_keeper_fund)?;
+
+        // Verify slab ownership and admin authority
+        if a_slab.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let slab_data = a_slab.try_borrow_data()?;
+        if slab_data.len() < 48 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let admin_bytes: [u8; 32] = slab_data[16..48]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let slab_admin = Pubkey::new_from_array(admin_bytes);
+        if slab_admin != *a_admin.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        drop(slab_data);
+
+        // Verify keeper fund PDA
+        let (expected_pda, _bump) = Pubkey::find_program_address(
+            &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
+            program_id,
+        );
+        if a_keeper_fund.key != &expected_pda {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if a_keeper_fund.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        // Zero out keeper fund data
+        {
+            let mut fund_data = a_keeper_fund.try_borrow_mut_data()?;
+            for b in fund_data.iter_mut() {
+                *b = 0;
+            }
+        }
+
+        // Transfer all lamports to admin
+        let fund_lamports = a_keeper_fund.lamports();
+        **a_keeper_fund.lamports.borrow_mut() = 0;
+        **a_admin.lamports.borrow_mut() = a_admin
+            .lamports()
+            .checked_add(fund_lamports)
+            .ok_or(PercolatorError::EngineOverflow)?;
+
+        msg!("Keeper fund closed, {} lamports recovered", fund_lamports);
         Ok(())
     }
 
