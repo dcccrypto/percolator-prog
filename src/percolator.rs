@@ -8547,6 +8547,13 @@ pub mod processor {
 
         config.resolution_slot = clock.slot;
         state::write_config(&mut data, &config);
+
+        // Set engine market_mode to Resolved so force_close_resolved_not_atomic accepts it.
+        {
+            let engine = zc::engine_mut(&mut data)?;
+            engine.market_mode = percolator::MarketMode::Resolved;
+        }
+
         state::set_resolved(&mut data);
         Ok(())
     }
@@ -8998,6 +9005,12 @@ pub mod processor {
         }
 
         let engine = zc::engine_mut(&mut data)?;
+
+        // Migration: if flags say resolved but engine.market_mode is still Live,
+        // set it to Resolved (needed for slabs resolved before this fix).
+        if engine.market_mode == percolator::MarketMode::Live {
+            engine.market_mode = percolator::MarketMode::Resolved;
+        }
 
         check_idx(engine, user_idx)?;
 
