@@ -252,6 +252,7 @@ fn test_account_struct_alignment() {
         adl_a_basis: 1_000_000u128,
         adl_k_snap: 0i128,
         adl_epoch_snap: 0u64,
+        entry_price: 0u64,
         matcher_program: [0xAA; 32],
         matcher_context: [0xBB; 32],
         owner: [0xCC; 32],

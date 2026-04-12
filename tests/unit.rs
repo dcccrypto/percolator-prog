@@ -434,13 +434,11 @@ fn test_struct_sizes() {
     println!("Offset of Account.owner: {}", offset_of!(Account, owner));
     println!("Offset of Account.pnl: {}", offset_of!(Account, pnl));
     println!("Offset of Account.reserved_pnl: {}", offset_of!(Account, reserved_pnl));
-    println!("Offset of Account.warmup_slope_per_step: {}", offset_of!(Account, warmup_slope_per_step));
     println!("Offset of Account.position_basis_q: {}", offset_of!(Account, position_basis_q));
     println!("Offset of Account.adl_a_basis: {}", offset_of!(Account, adl_a_basis));
     println!("Offset of Account.adl_k_snap: {}", offset_of!(Account, adl_k_snap));
     println!("Offset of Account.adl_epoch_snap: {}", offset_of!(Account, adl_epoch_snap));
     println!("Offset of Account.fee_credits: {}", offset_of!(Account, fee_credits));
-    println!("Offset of Account.last_fee_slot: {}", offset_of!(Account, last_fee_slot));
     println!("Offset of Account.fees_earned_total: {}", offset_of!(Account, fees_earned_total));
     println!("Size of RiskEngine: {}", size_of::<RiskEngine>());
     println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
@@ -3224,4 +3222,16 @@ fn test_close_slab_non_admin_rejected() {
         header.magic, MAGIC,
         "Slab should still be initialized after failed close"
     );
+}
+
+#[test]
+fn print_slab_layout() {
+    use percolator_prog::constants::*;
+    eprintln!("HEADER_LEN = {}", HEADER_LEN);
+    eprintln!("CONFIG_LEN = {}", CONFIG_LEN);
+    eprintln!("ENGINE_OFF = {}", ENGINE_OFF);
+    eprintln!("ENGINE_LEN = {}", ENGINE_LEN);
+    eprintln!("RISK_BUF_OFF = {}", RISK_BUF_OFF);
+    eprintln!("RISK_BUF_LEN = {}", RISK_BUF_LEN);
+    eprintln!("SLAB_LEN = {}", SLAB_LEN);
 }

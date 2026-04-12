@@ -167,7 +167,7 @@ mod layout_constants {
     pub const ENGINE_PNL_MATURED_POS_TOT_OFF: usize =
         core::mem::offset_of!(percolator::RiskEngine, pnl_matured_pos_tot);
     pub const ENGINE_LIQ_CURSOR_OFF: usize =
-        core::mem::offset_of!(percolator::RiskEngine, liq_cursor);
+        core::mem::offset_of!(percolator::RiskEngine, gc_cursor);
     pub const ENGINE_NUM_USED_ACCOUNTS_OFF: usize =
         core::mem::offset_of!(percolator::RiskEngine, num_used_accounts);
     pub const ENGINE_NEXT_ACCOUNT_ID_OFF: usize =
@@ -329,9 +329,9 @@ fn layout_engine_field_offsets_pinned() {
         "RiskEngine.pnl_matured_pos_tot offset drift"
     );
     assert_eq!(
-        offset_of!(RiskEngine, liq_cursor),
+        offset_of!(RiskEngine, gc_cursor),
         layout_constants::ENGINE_LIQ_CURSOR_OFF,
-        "RiskEngine.liq_cursor offset drift"
+        "RiskEngine.gc_cursor offset drift"
     );
     assert_eq!(
         offset_of!(RiskEngine, num_used_accounts),
@@ -834,14 +834,14 @@ fn lp_vault_withdraw_decode_round_trip() {
 /// Encodes a RiskParams payload in the exact field order read_risk_params expects.
 /// This must stay in sync with the read_risk_params function in src/percolator.rs.
 fn encode_risk_params_wire(
-    warmup_period_slots: u64,
+    h_min: u64,
     maintenance_margin_bps: u64,
     initial_margin_bps: u64,
     trading_fee_bps: u64,
     max_accounts: u64,
     new_account_fee: u128,
     insurance_floor: u128,        // occupies old risk_reduction_threshold wire slot
-    maintenance_fee_per_slot: u128,
+    // maintenance_fee_per_slot removed in v12.15
     max_crank_staleness_slots: u64,
     liquidation_fee_bps: u64,
     liquidation_fee_cap: u128,
@@ -852,14 +852,14 @@ fn encode_risk_params_wire(
     min_nonzero_im_req: u128,
 ) -> Vec<u8> {
     let mut v = Vec::new();
-    v.extend_from_slice(&warmup_period_slots.to_le_bytes());
+    v.extend_from_slice(&h_min.to_le_bytes());
     v.extend_from_slice(&maintenance_margin_bps.to_le_bytes());
     v.extend_from_slice(&initial_margin_bps.to_le_bytes());
     v.extend_from_slice(&trading_fee_bps.to_le_bytes());
     v.extend_from_slice(&max_accounts.to_le_bytes());
     v.extend_from_slice(&new_account_fee.to_le_bytes());
     v.extend_from_slice(&insurance_floor.to_le_bytes());
-    v.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
+    // maintenance_fee_per_slot removed in v12.15
     v.extend_from_slice(&max_crank_staleness_slots.to_le_bytes());
     v.extend_from_slice(&liquidation_fee_bps.to_le_bytes());
     v.extend_from_slice(&liquidation_fee_cap.to_le_bytes());
@@ -874,14 +874,14 @@ fn encode_risk_params_wire(
 /// Total byte count of the RiskParams wire format.
 /// This is what the SDK must use when sizing InitMarket instruction buffers.
 const RISK_PARAMS_WIRE_LEN: usize =
-    8   // warmup_period_slots (u64)
+    8   // h_min (u64)
   + 8   // maintenance_margin_bps (u64)
   + 8   // initial_margin_bps (u64)
   + 8   // trading_fee_bps (u64)
   + 8   // max_accounts (u64)
   + 16  // new_account_fee (u128)
   + 16  // insurance_floor wire slot (u128)
-  + 16  // maintenance_fee_per_slot (u128)
+    // maintenance_fee_per_slot removed in v12.15
   + 8   // max_crank_staleness_slots (u64)
   + 8   // liquidation_fee_bps (u64)
   + 16  // liquidation_fee_cap (u128)
@@ -906,7 +906,7 @@ fn risk_params_wire_len_is_192_bytes() {
 #[test]
 fn risk_params_encode_wire_produces_correct_byte_count() {
     let wire = encode_risk_params_wire(
-        0, 500, 1000, 0, 64, 0, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
+        0, 500, 1000, 0, 64, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
     );
     assert_eq!(
         wire.len(),
@@ -930,13 +930,13 @@ fn risk_params_three_trailing_fields_are_mandatory() {
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
+    // maintenance_fee_per_slot removed in v12.15
     data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
 
     // Append risk params body but omit the last 3 fields (48 bytes)
     let full_wire = encode_risk_params_wire(
-        0, 500, 1000, 0, 64, 0, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
+        0, 500, 1000, 0, 64, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
     );
     // RISK_PARAMS_WIRE_LEN - 3x16 = 192 - 48 = 144
     let truncated_len = RISK_PARAMS_WIRE_LEN - 48;
@@ -978,12 +978,12 @@ fn risk_params_full_round_trip_via_init_market() {
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot
+    // maintenance_fee_per_slot removed in v12.15
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     data.extend_from_slice(&encode_risk_params_wire(
         warmup, mm_bps, im_bps, fee_bps, max_accts, new_acct_fee, insurance_floor,
-        maint_fee, crank_staleness, liq_fee_bps, liq_fee_cap, liq_buf_bps,
+        crank_staleness, liq_fee_bps, liq_fee_cap, liq_buf_bps,
         min_liq_abs, min_init_deposit, min_nonzero_mm, min_nonzero_im,
     ));
     // Extended tail (82 bytes) — all defaults
@@ -1001,7 +1001,7 @@ fn risk_params_full_round_trip_via_init_market() {
     match Instruction::decode(&data) {
         Ok(Instruction::InitMarket { risk_params, .. }) => {
             // Verify every RiskParams field round-tripped correctly.
-            assert_eq!(risk_params.warmup_period_slots, warmup, "warmup_period_slots");
+            assert_eq!(risk_params.h_min, warmup, "h_min");
             assert_eq!(risk_params.maintenance_margin_bps, mm_bps, "maintenance_margin_bps");
             assert_eq!(risk_params.initial_margin_bps, im_bps, "initial_margin_bps");
             assert_eq!(risk_params.trading_fee_bps, fee_bps, "trading_fee_bps");
@@ -1011,11 +1011,8 @@ fn risk_params_full_round_trip_via_init_market() {
                 new_acct_fee,
                 "new_account_fee"
             );
-            assert_eq!(
-                risk_params.maintenance_fee_per_slot.get(),
-                maint_fee,
-                "maintenance_fee_per_slot"
-            );
+            // maintenance_fee_per_slot assertion removed in v12.15
+            let _ = maint_fee;
             assert_eq!(
                 risk_params.max_crank_staleness_slots,
                 crank_staleness,
@@ -1231,18 +1228,18 @@ fn engine_params_immediately_follows_insurance_fund() {
 
 #[test]
 fn engine_aggregate_fields_relative_order() {
-    // The SDK reads vault, c_tot, pnl_pos_tot, pnl_matured_pos_tot, liq_cursor in order.
+    // The SDK reads vault, c_tot, pnl_pos_tot, pnl_matured_pos_tot, gc_cursor in order.
     // Verify their offsets are strictly increasing.
     let vault_off = offset_of!(RiskEngine, vault);
     let c_tot_off = offset_of!(RiskEngine, c_tot);
     let pnl_pos_off = offset_of!(RiskEngine, pnl_pos_tot);
     let pnl_mat_off = offset_of!(RiskEngine, pnl_matured_pos_tot);
-    let liq_cursor_off = offset_of!(RiskEngine, liq_cursor);
+    let gc_cursor_off = offset_of!(RiskEngine, gc_cursor);
 
     assert!(vault_off < c_tot_off, "vault must precede c_tot");
     assert!(c_tot_off < pnl_pos_off, "c_tot must precede pnl_pos_tot");
     assert!(pnl_pos_off < pnl_mat_off, "pnl_pos_tot must precede pnl_matured_pos_tot");
-    assert!(pnl_mat_off < liq_cursor_off, "pnl_matured_pos_tot must precede liq_cursor");
+    assert!(pnl_mat_off < gc_cursor_off, "pnl_matured_pos_tot must precede gc_cursor");
 }
 
 #[test]
