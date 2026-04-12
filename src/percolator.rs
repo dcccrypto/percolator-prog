@@ -3761,9 +3761,9 @@ pub mod processor {
                 // All resolved operations use engine.current_slot (frozen at
                 // last pre-resolution crank) instead of clock.slot.
                 if state::is_resolved(&data) {
-                    // Use engine's authoritative resolved state, not mutable config.
                     let engine = zc::engine_mut(&mut data)?;
-                    if engine.resolved_price == 0 {
+                    let (resolved_price, _) = engine.resolved_context();
+                    if resolved_price == 0 {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
@@ -4642,9 +4642,8 @@ pub mod processor {
                 let resolved = state::is_resolved(&data);
                 let clock = Clock::from_account_info(&accounts[6])?;
                 let price = if resolved {
-                    // Use engine's authoritative resolved price, not mutable config.
                     let eng = zc::engine_ref(&data)?;
-                    let settlement = eng.resolved_price;
+                    let (settlement, _) = eng.resolved_context();
                     if settlement == 0 {
                         return Err(ProgramError::InvalidAccountData);
                     }
@@ -4861,7 +4860,7 @@ pub mod processor {
                     // prices, influence liquidations/funding, and block permissionless
                     // resolution by staying fresh.
                     // NOTE: do NOT clear config.authority_price_e6 — it may be needed
-                    // for legacy paths. Resolved exits now use engine.resolved_price.
+                    // for legacy paths. Resolved exits now use engine.resolved_context().
                     if config.oracle_authority != [0u8; 32] {
                         config.oracle_authority = [0u8; 32];
                         config.authority_timestamp = 0;
@@ -5929,9 +5928,8 @@ pub mod processor {
                 accounts::expect_key(a_pda, &auth)?;
 
                 let clock = Clock::from_account_info(&accounts[6])?;
-                // Use engine's authoritative resolved price, not mutable config.
                 let engine = zc::engine_mut(&mut data)?;
-                let price = engine.resolved_price;
+                let (price, _) = engine.resolved_context();
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -6394,9 +6392,8 @@ pub mod processor {
                 )?;
                 accounts::expect_key(a_pda, &auth)?;
 
-                // Use engine's authoritative resolved price, not mutable config.
                 let engine = zc::engine_mut(&mut data)?;
-                let price = engine.resolved_price;
+                let (price, _) = engine.resolved_context();
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
