@@ -3211,6 +3211,14 @@ pub mod processor {
                 if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // §14.1: H_max must not exceed permissionless resolve delay.
+                // Otherwise warmup cohorts could mature after the market is already
+                // permissionlessly resolved, creating inconsistent terminal state.
+                if permissionless_resolve_stale_slots > 0
+                    && risk_params.h_max > permissionless_resolve_stale_slots
+                {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 // Validate custom funding parameters (same checks as UpdateConfig).
                 // These are immutable after init for governance-free deployments.
@@ -4074,10 +4082,13 @@ pub mod processor {
                 }
 
                 // Patch engine's stored funding rate with post-EWMA value.
-                // execute_trade used pre-trade funding; now that mark_ewma changed,
-                // recompute so the next interval uses the updated rate.
-                let post_trade_funding = compute_current_funding_rate_e9(&config);
-                engine.funding_rate_e9_per_slot_last = post_trade_funding;
+                // execute_trade_not_atomic stored the pre-EWMA rate via its internal
+                // recompute_r_last_from_final_state. But the wrapper updated mark_ewma
+                // after the engine call (EWMA is wrapper state, not engine state).
+                // Direct field write is necessary because the engine has no post-trade
+                // "re-stamp funding" API. This ensures the next interval accrues at
+                // the rate derived from the updated mark, not the stale pre-trade mark.
+                engine.funding_rate_e9_per_slot_last = compute_current_funding_rate_e9(&config);
 
                 // Collect post-trade positions for risk buffer
                 let user_eff_nocpi = engine.effective_pos_q(user_idx as usize);
@@ -4369,6 +4380,30 @@ pub mod processor {
                 // or produce absurd PnL. Must check BEFORE engine call.
                 if exec_price > percolator::MAX_ORACLE_PRICE {
                     return Err(PercolatorError::OracleInvalid.into());
+                }
+
+                // Anti-off-market execution policy (§14.3):
+                // |exec_price - oracle_price| * 10_000 <= band * oracle_price
+                // where band = max(2 * trading_fee_bps, 100) (at least 1% band).
+                // This prevents the matcher from filling at wildly off-market prices.
+                if exec_price > 0 && price > 0 {
+                    let band_bps = {
+                        let data_ref = a_slab.try_borrow_data()?;
+                        let engine_ref = zc::engine_ref(&data_ref)?;
+                        let fee_bps = engine_ref.params.trading_fee_bps;
+                        core::cmp::max(fee_bps.saturating_mul(2), 100) // at least 1%
+                    };
+                    let diff = if exec_price > price {
+                        exec_price - price
+                    } else {
+                        price - exec_price
+                    };
+                    // diff * 10_000 <= band_bps * price (both sides u128 to avoid overflow)
+                    let lhs = (diff as u128).saturating_mul(10_000);
+                    let rhs = (band_bps as u128).saturating_mul(price as u128);
+                    if lhs > rhs {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
                 }
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
