@@ -82,8 +82,6 @@ pub mod constants {
     pub const RISK_BUF_LEN: usize = size_of::<crate::risk_buffer::RiskBuffer>();
     pub const SLAB_LEN: usize = RISK_BUF_OFF + RISK_BUF_LEN;
 
-    /// Minimum stale slots before crank discount activates.
-    pub const CRANK_REWARD_MIN_DT: u64 = 100;
     /// Progressive scan window per crank.
     pub const RISK_SCAN_WINDOW: usize = 32;
     pub const MATCHER_ABI_VERSION: u32 = 1;
@@ -1471,15 +1469,7 @@ pub mod ix {
         PauseMarket,
         /// Admin unpause (tag 77). Re-enables all operations.
         UnpauseMarket,
-        /// Close keeper fund PDA and recover lamports to admin (tag 78).
-        /// Requires market to be resolved. Admin only.
-        CloseKeeperFund,
-
         // ─── Fork-specific instructions ────────────────────────────────────
-
-        /// PERC-623: Top up keeper fund (permissionless, tag 57).
-        /// Transfers SOL lamports from funder to keeper fund PDA.
-        TopUpKeeperFund { amount: u64 },
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
         /// Reads actual vault token balance and transfers to admin ATA.
@@ -1906,13 +1896,7 @@ pub mod ix {
                 34 => Ok(Instruction::UpdateHyperpMark),
                 76 => Ok(Instruction::PauseMarket),
                 77 => Ok(Instruction::UnpauseMarket),
-                78 => Ok(Instruction::CloseKeeperFund),
                 // Fork-specific instructions
-                57 => {
-                    // TopUpKeeperFund
-                    let amount = read_u64(&mut rest)?;
-                    Ok(Instruction::TopUpKeeperFund { amount })
-                }
                 72 => Ok(Instruction::RescueOrphanVault),
                 73 => Ok(Instruction::CloseOrphanSlab),
                 74 => {
@@ -2015,7 +1999,7 @@ pub mod ix {
                     Ok(Instruction::AttestCrossMargin { user_idx_a, user_idx_b })
                 }
                 56 => Ok(Instruction::AdvanceOraclePhase),
-                // 57 = TopUpKeeperFund (already handled above)
+                // 57 = gap (keeper fund removed)
                 // 58 = TAG_SLASH_CREATION_DEPOSIT — intentionally unimplemented stub
                 59 => {
                     let epoch_duration_slots = read_u64(&mut rest)?;
@@ -4026,72 +4010,6 @@ pub mod collateral {
             TokenAccount::pack(dst_state, &mut dst_data)?;
             Ok(())
         }
-    }
-}
-
-// 9b. mod keeper_fund — PERC-623: Self-Funding Keeper
-pub mod keeper_fund {
-    use bytemuck::{Pod, Zeroable};
-
-    /// Magic bytes for KeeperFundState PDA: "KEEPFUND"
-    pub const KEEPER_FUND_MAGIC: u64 = 0x4B454550_46554E44;
-
-    /// Size of the KeeperFundState account data.
-    pub const KEEPER_FUND_STATE_LEN: usize = core::mem::size_of::<KeeperFundState>();
-
-    /// Default split: 30% of creation deposit goes to keeper fund.
-    pub const KEEPER_FUND_SPLIT_BPS: u64 = 3_000;
-
-    /// Default reward per successful KeeperCrank, denominated in SOL lamports.
-    /// 1_000_000 = 0.001 SOL.
-    pub const DEFAULT_REWARD_PER_CRANK: u64 = 1_000_000;
-
-    /// PDA seed prefix.
-    pub const KEEPER_FUND_SEED: &[u8] = b"keeper_fund";
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Pod, Zeroable)]
-    pub struct KeeperFundState {
-        pub magic: u64,
-        pub bump: u8,
-        /// 1 if market was auto-paused due to keeper fund depletion.
-        /// TopUpKeeperFund only unpauses when this is set, preventing
-        /// accidental clearing of admin pauses.
-        pub depleted_pause: u8,
-        pub _pad: [u8; 6],
-        /// Current fund balance (SOL lamports).
-        pub balance: u64,
-        /// Reward paid to crank caller per successful KeeperCrank.
-        pub reward_per_crank: u64,
-        /// Lifetime total rewards paid out.
-        pub total_rewarded: u64,
-        /// Lifetime total topped up.
-        pub total_topped_up: u64,
-    }
-
-    // Compile-time size check
-    const _: [(); 48] = [(); KEEPER_FUND_STATE_LEN];
-
-    /// Check if fund is depleted (balance == 0).
-    pub fn is_depleted(balance: u64) -> bool {
-        balance == 0
-    }
-
-    /// Read KeeperFundState from account data.
-    pub fn read_state(data: &[u8]) -> Option<&KeeperFundState> {
-        if data.len() < KEEPER_FUND_STATE_LEN {
-            return None;
-        }
-        let state: &KeeperFundState = bytemuck::from_bytes(&data[..KEEPER_FUND_STATE_LEN]);
-        if state.magic != KEEPER_FUND_MAGIC {
-            return None;
-        }
-        Some(state)
-    }
-
-    /// Write KeeperFundState to account data.
-    pub fn write_state(data: &mut [u8], state: &KeeperFundState) {
-        data[..KEEPER_FUND_STATE_LEN].copy_from_slice(bytemuck::bytes_of(state));
     }
 }
 
@@ -6172,10 +6090,6 @@ pub mod processor {
                 handle_set_oi_imbalance_hard_block(program_id, accounts, threshold_bps)?;
             }
 
-            Instruction::TopUpKeeperFund { amount } => {
-                handle_top_up_keeper_fund(program_id, accounts, amount)?;
-            }
-
             // PERC-8400: RescueOrphanVault
             // Layout-agnostic rescue: reads raw bytes from the slab header.
             // Accounts: [admin(signer), slab(readonly), admin_ata(writable),
@@ -6202,10 +6116,6 @@ pub mod processor {
 
             Instruction::UnpauseMarket => {
                 handle_unpause_market(program_id, accounts)?;
-            }
-
-            Instruction::CloseKeeperFund => {
-                handle_close_keeper_fund(program_id, accounts)?;
             }
 
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
@@ -6604,78 +6514,6 @@ pub mod processor {
         // Shares _reserved[8..16] with last_thr_update_slot (initialized to same value).
         state::write_market_start_slot(&mut data, clock.slot);
 
-        // PERC-623: Optional keeper fund PDA initialization.
-        // accounts[9] = keeper_fund PDA (writable), accounts[10] = system_program
-        // Backward compatible: callers passing only 9 accounts skip this.
-        if accounts.len() >= 11 {
-            let a_keeper_fund = &accounts[9];
-            let a_system_program = &accounts[10];
-            accounts::expect_writable(a_keeper_fund)?;
-
-            if *a_system_program.key != solana_program::system_program::id() {
-                return Err(ProgramError::IncorrectProgramId);
-            }
-
-            let (expected_pda, pda_bump) = Pubkey::find_program_address(
-                &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
-                program_id,
-            );
-            if *a_keeper_fund.key != expected_pda {
-                return Err(ProgramError::InvalidSeeds);
-            }
-
-            let rent = solana_program::rent::Rent::get()?;
-            let rent_lamports =
-                rent.minimum_balance(crate::keeper_fund::KEEPER_FUND_STATE_LEN);
-            let min_fund = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK
-                .saturating_mul(100)
-                .saturating_add(rent_lamports);
-
-            let bump_bytes = [pda_bump];
-            let signer_seeds: &[&[u8]] = &[
-                crate::keeper_fund::KEEPER_FUND_SEED,
-                a_slab.key.as_ref(),
-                &bump_bytes,
-            ];
-            solana_program::program::invoke_signed(
-                &solana_program::system_instruction::create_account(
-                    a_admin.key,
-                    &expected_pda,
-                    min_fund,
-                    crate::keeper_fund::KEEPER_FUND_STATE_LEN as u64,
-                    program_id,
-                ),
-                &[
-                    a_admin.clone(),
-                    a_keeper_fund.clone(),
-                    a_system_program.clone(),
-                ],
-                &[signer_seeds],
-            )?;
-
-            let fund_balance = min_fund.saturating_sub(rent_lamports);
-            let default_reward = crate::keeper_fund::DEFAULT_REWARD_PER_CRANK;
-            let fund_state = crate::keeper_fund::KeeperFundState {
-                magic: crate::keeper_fund::KEEPER_FUND_MAGIC,
-                bump: pda_bump,
-                depleted_pause: 0,
-                _pad: [0u8; 6],
-                balance: fund_balance,
-                reward_per_crank: default_reward,
-                total_rewarded: 0,
-                total_topped_up: 0,
-            };
-            let mut fund_data = a_keeper_fund
-                .try_borrow_mut_data()
-                .map_err(|_| ProgramError::AccountBorrowFailed)?;
-            crate::keeper_fund::write_state(&mut fund_data, &fund_state);
-
-            msg!(
-                "PERC-623: KeeperFund initialized — balance={} reward_per_crank={}",
-                fund_balance,
-                default_reward
-            );
-        }
         Ok(())
     }
 
@@ -7254,6 +7092,7 @@ pub mod processor {
         // Debug: log lifetime counters (sol_log_64: tag=CRANK_STATS, liqs, max_accounts, insurance, 0)
         // 0xC8A4C5 = "CRANK_STATS" tag; replaces msg!("CRANK_STATS") to save ~300 CU
         sol_log_64(0xC8A4C5, liqs, MAX_ACCOUNTS as u64, ins_low, 0);
+
         Ok(())
     }
 
@@ -13169,92 +13008,6 @@ pub mod processor {
         Ok(())
     }
 
-    // --- TopUpKeeperFund ---
-    #[inline(never)]
-    fn handle_top_up_keeper_fund<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-        amount: u64,
-    ) -> ProgramResult {
-        // accounts: [0] funder (signer), [1] slab (writable), [2] keeper_fund PDA (writable)
-        // optional: [3] system_program (required when funder is not program-owned)
-        accounts::expect_len(accounts, 3)?;
-        let a_funder = &accounts[0];
-        let a_slab = &accounts[1];
-        let a_keeper_fund = &accounts[2];
-        accounts::expect_signer(a_funder)?;
-        accounts::expect_writable(a_slab)?;
-        accounts::expect_writable(a_keeper_fund)?;
-
-        {
-            let slab_data = state::slab_data_mut(a_slab)?;
-            slab_guard(program_id, a_slab, &slab_data)?;
-            require_initialized(&slab_data)?;
-        }
-
-        let (expected_pda, _bump) = Pubkey::find_program_address(
-            &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
-            program_id,
-        );
-        if *a_keeper_fund.key != expected_pda {
-            return Err(ProgramError::InvalidSeeds);
-        }
-
-        if amount == 0 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        if a_funder.owner != program_id {
-            if accounts.len() < 4 {
-                return Err(ProgramError::NotEnoughAccountKeys);
-            }
-            let a_system = &accounts[3];
-            if *a_system.key != solana_program::system_program::id() {
-                return Err(ProgramError::IncorrectProgramId);
-            }
-            solana_program::program::invoke(
-                &solana_program::system_instruction::transfer(
-                    a_funder.key,
-                    a_keeper_fund.key,
-                    amount,
-                ),
-                &[a_funder.clone(), a_keeper_fund.clone(), a_system.clone()],
-            )?;
-        } else {
-            let funder_lamports = **a_funder.try_borrow_lamports()?;
-            if funder_lamports < amount {
-                return Err(ProgramError::InsufficientFunds);
-            }
-            **a_funder.try_borrow_mut_lamports()? = funder_lamports - amount;
-            **a_keeper_fund.try_borrow_mut_lamports()? = a_keeper_fund
-                .lamports()
-                .checked_add(amount)
-                .ok_or(ProgramError::InsufficientFunds)?;
-        }
-
-        let mut fund_data = a_keeper_fund
-            .try_borrow_mut_data()
-            .map_err(|_| ProgramError::AccountBorrowFailed)?;
-
-        if let Some(fund_state) = crate::keeper_fund::read_state(&fund_data) {
-            let mut new_state = *fund_state;
-            new_state.balance = new_state.balance.saturating_add(amount);
-            new_state.total_topped_up = new_state.total_topped_up.saturating_add(amount);
-            // Clear depleted_pause flag when fund is topped up above zero.
-            if new_state.depleted_pause != 0
-                && !crate::keeper_fund::is_depleted(new_state.balance)
-            {
-                new_state.depleted_pause = 0;
-            }
-            crate::keeper_fund::write_state(&mut fund_data, &new_state);
-        } else {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        msg!("TopUpKeeperFund: amount={}", amount);
-        Ok(())
-    }
-
     // --- RescueOrphanVault ---
     #[inline(never)]
     fn handle_rescue_orphan_vault<'a>(
@@ -13766,72 +13519,6 @@ pub mod processor {
 
         state::set_paused(&mut data, false);
         msg!("Market unpaused by admin");
-        Ok(())
-    }
-
-    // --- CloseKeeperFund (tag 78) ---
-    // Closes the keeper fund PDA and recovers all lamports to admin.
-    // Requires: market must be resolved, caller must be admin.
-    // Accounts: [admin(signer,writable), slab(readonly), keeper_fund_pda(writable)]
-    #[inline(never)]
-    fn handle_close_keeper_fund<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-    ) -> ProgramResult {
-        accounts::expect_len(accounts, 3)?;
-        let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
-        let a_keeper_fund = &accounts[2];
-
-        accounts::expect_signer(a_admin)?;
-        accounts::expect_writable(a_keeper_fund)?;
-
-        // Verify slab ownership and admin authority
-        if a_slab.owner != program_id {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let slab_data = a_slab.try_borrow_data()?;
-        if slab_data.len() < 48 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let admin_bytes: [u8; 32] = slab_data[16..48]
-            .try_into()
-            .map_err(|_| ProgramError::InvalidAccountData)?;
-        let slab_admin = Pubkey::new_from_array(admin_bytes);
-        if slab_admin != *a_admin.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        drop(slab_data);
-
-        // Verify keeper fund PDA
-        let (expected_pda, _bump) = Pubkey::find_program_address(
-            &[crate::keeper_fund::KEEPER_FUND_SEED, a_slab.key.as_ref()],
-            program_id,
-        );
-        if a_keeper_fund.key != &expected_pda {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        if a_keeper_fund.owner != program_id {
-            return Err(ProgramError::IllegalOwner);
-        }
-
-        // Zero out keeper fund data
-        {
-            let mut fund_data = a_keeper_fund.try_borrow_mut_data()?;
-            for b in fund_data.iter_mut() {
-                *b = 0;
-            }
-        }
-
-        // Transfer all lamports to admin
-        let fund_lamports = a_keeper_fund.lamports();
-        **a_keeper_fund.lamports.borrow_mut() = 0;
-        **a_admin.lamports.borrow_mut() = a_admin
-            .lamports()
-            .checked_add(fund_lamports)
-            .ok_or(PercolatorError::EngineOverflow)?;
-
-        msg!("Keeper fund closed, {} lamports recovered", fund_lamports);
         Ok(())
     }
 

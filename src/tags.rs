@@ -102,8 +102,6 @@ pub const TAG_ATTEST_CROSS_MARGIN: u8 = 55;
 /// PERC-622: Advance oracle phase (permissionless crank).
 /// Transitions market through Phase 1→2→3 based on time + volume milestones.
 pub const TAG_ADVANCE_ORACLE_PHASE: u8 = 56;
-/// PERC-623: Top up keeper fund (permissionless).
-pub const TAG_TOPUP_KEEPER_FUND: u8 = 57;
 /// PERC-629: Slash creation deposit.
 ///
 /// UNIMPLEMENTED — reserved for post-launch.
@@ -247,7 +245,6 @@ mod tests {
             TAG_SET_OFFSET_PAIR,
             TAG_ATTEST_CROSS_MARGIN,
             TAG_ADVANCE_ORACLE_PHASE,
-            TAG_TOPUP_KEEPER_FUND,
             TAG_SLASH_CREATION_DEPOSIT,
             TAG_INIT_SHARED_VAULT,
             TAG_ALLOCATE_MARKET,
@@ -338,7 +335,6 @@ mod tests {
             TAG_SET_OFFSET_PAIR,
             TAG_ATTEST_CROSS_MARGIN,
             TAG_ADVANCE_ORACLE_PHASE,
-            TAG_TOPUP_KEEPER_FUND,
             TAG_SLASH_CREATION_DEPOSIT,
             TAG_INIT_SHARED_VAULT,
             TAG_ALLOCATE_MARKET,
