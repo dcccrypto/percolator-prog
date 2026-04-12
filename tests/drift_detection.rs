@@ -137,7 +137,7 @@ mod layout_constants {
     /// CONFIG_LEN: size_of::<MarketConfig>() = 544 bytes
     pub const CONFIG_LEN_EXPECTED: usize = 544;
     /// ACCOUNT_SIZE: size_of::<Account>() = 288 bytes (x86_64); 320 on SBF
-    pub const ACCOUNT_SIZE_EXPECTED: usize = 288;
+    pub const ACCOUNT_SIZE_EXPECTED: usize = 4400; // v12.15: reserve cohort queues
     /// ENGINE_OFF: align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN)
     /// Computed live from the program's own constant — this is intentional:
     /// if the constant changes, the test catches it via other assertions.
@@ -826,8 +826,8 @@ fn encode_risk_params_wire(
     trading_fee_bps: u64,
     max_accounts: u64,
     new_account_fee: u128,
-    insurance_floor: u128,        // occupies old risk_reduction_threshold wire slot
-    // maintenance_fee_per_slot removed in v12.15
+    insurance_floor: u128,
+    h_max: u64,                   // v12.15: replaces maintenance_fee_per_slot high 8 bytes
     max_crank_staleness_slots: u64,
     liquidation_fee_bps: u64,
     liquidation_fee_cap: u128,
@@ -845,7 +845,8 @@ fn encode_risk_params_wire(
     v.extend_from_slice(&max_accounts.to_le_bytes());
     v.extend_from_slice(&new_account_fee.to_le_bytes());
     v.extend_from_slice(&insurance_floor.to_le_bytes());
-    // maintenance_fee_per_slot removed in v12.15
+    v.extend_from_slice(&h_max.to_le_bytes());     // v12.15: h_max (u64)
+    v.extend_from_slice(&0u64.to_le_bytes());      // padding (remaining 8 bytes of old u128 slot)
     v.extend_from_slice(&max_crank_staleness_slots.to_le_bytes());
     v.extend_from_slice(&liquidation_fee_bps.to_le_bytes());
     v.extend_from_slice(&liquidation_fee_cap.to_le_bytes());
@@ -867,7 +868,8 @@ const RISK_PARAMS_WIRE_LEN: usize =
   + 8   // max_accounts (u64)
   + 16  // new_account_fee (u128)
   + 16  // insurance_floor wire slot (u128)
-    // maintenance_fee_per_slot removed in v12.15
+  + 8   // h_max (u64, v12.15)
+  + 8   // h_max padding (u64, remaining old u128 slot)
   + 8   // max_crank_staleness_slots (u64)
   + 8   // liquidation_fee_bps (u64)
   + 16  // liquidation_fee_cap (u128)
@@ -879,8 +881,7 @@ const RISK_PARAMS_WIRE_LEN: usize =
 
 #[test]
 fn risk_params_wire_len_is_192_bytes() {
-    // The SDK documentation and the common test helper both depend on this count.
-    // If the wire format changes, this test must fail to force an update.
+    // 192 bytes: h_max(8) + padding(8) replaced maintenance_fee_per_slot(16), same total
     assert_eq!(
         RISK_PARAMS_WIRE_LEN,
         192,
@@ -892,7 +893,7 @@ fn risk_params_wire_len_is_192_bytes() {
 #[test]
 fn risk_params_encode_wire_produces_correct_byte_count() {
     let wire = encode_risk_params_wire(
-        0, 500, 1000, 0, 64, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
+        0, 500, 1000, 0, 64, 0, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
     );
     assert_eq!(
         wire.len(),
@@ -922,7 +923,7 @@ fn risk_params_three_trailing_fields_are_mandatory() {
 
     // Append risk params body but omit the last 3 fields (48 bytes)
     let full_wire = encode_risk_params_wire(
-        0, 500, 1000, 0, 64, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
+        0, 500, 1000, 0, 64, 0, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
     );
     // RISK_PARAMS_WIRE_LEN - 3x16 = 192 - 48 = 144
     let truncated_len = RISK_PARAMS_WIRE_LEN - 48;
@@ -964,12 +965,13 @@ fn risk_params_full_round_trip_via_init_market() {
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // maintenance_fee_per_slot removed in v12.15
+    data.extend_from_slice(&1_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (legacy wire field, still decoded)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    let h_max: u64 = 0;
     data.extend_from_slice(&encode_risk_params_wire(
         warmup, mm_bps, im_bps, fee_bps, max_accts, new_acct_fee, insurance_floor,
-        crank_staleness, liq_fee_bps, liq_fee_cap, liq_buf_bps,
+        h_max, crank_staleness, liq_fee_bps, liq_fee_cap, liq_buf_bps,
         min_liq_abs, min_init_deposit, min_nonzero_mm, min_nonzero_im,
     ));
     // Extended tail (82 bytes) — all defaults
@@ -1262,15 +1264,16 @@ fn engine_accounts_array_fills_end_of_struct() {
 }
 
 #[test]
-fn engine_slab_len_equals_engine_off_plus_engine_size() {
-    let expected = ENGINE_OFF + size_of::<RiskEngine>();
+fn engine_slab_len_equals_engine_off_plus_engine_size_plus_risk_buf() {
+    let expected = ENGINE_OFF + size_of::<RiskEngine>() + percolator_prog::constants::RISK_BUF_LEN;
     assert_eq!(
         percolator_prog::constants::SLAB_LEN,
         expected,
-        "SLAB_LEN ({}) != ENGINE_OFF ({}) + size_of::<RiskEngine>() ({})",
+        "SLAB_LEN ({}) != ENGINE_OFF ({}) + sizeof(RiskEngine) ({}) + RISK_BUF_LEN ({})",
         percolator_prog::constants::SLAB_LEN,
         ENGINE_OFF,
         size_of::<RiskEngine>(),
+        percolator_prog::constants::RISK_BUF_LEN,
     );
 }
 
