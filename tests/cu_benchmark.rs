@@ -145,7 +145,6 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&risk_reduction_threshold.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -156,7 +155,6 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
     data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
@@ -192,13 +190,14 @@ fn encode_deposit(user_idx: u16, amount: u64) -> Vec<u8> {
     data
 }
 
-fn encode_crank_permissionless(panic: u8) -> Vec<u8> {
-    // Two-phase crank: pass first 128 account indices as candidates
+fn encode_crank_permissionless(_panic: u8) -> Vec<u8> {
+    // format_version=1: (u16 idx, u8 tag) per candidate
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes());
-    data.push(panic);
+    data.push(1u8); // format_version = 1
     for i in 0..128u16 {
         data.extend_from_slice(&i.to_le_bytes());
+        data.push(0u8); // tag 0 = FullClose
     }
     data
 }
@@ -685,7 +684,6 @@ fn encode_close_slab() -> Vec<u8> {
 fn encode_update_config(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
-    funding_inv_scale_notional_e6: u128,
     funding_max_premium_bps: i64,
     funding_max_bps_per_slot: i64,
     thresh_floor: u128,
@@ -700,7 +698,6 @@ fn encode_update_config(
     let mut data = vec![14u8];
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
-    data.extend_from_slice(&funding_inv_scale_notional_e6.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
     data.extend_from_slice(&thresh_floor.to_le_bytes());
@@ -1856,7 +1853,6 @@ fn benchmark_all_instructions() {
             data: encode_update_config(
                 3600,   // funding_horizon_slots
                 100,    // funding_k_bps
-                1_000_000, // funding_inv_scale_notional_e6
                 500,    // funding_max_premium_bps
                 5,      // funding_max_bps_per_slot
                 0,      // thresh_floor

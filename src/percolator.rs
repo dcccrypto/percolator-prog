@@ -1025,13 +1025,9 @@ pub mod error {
             RiskError::InsufficientBalance => PercolatorError::EngineInsufficientBalance,
             RiskError::Undercollateralized => PercolatorError::EngineUndercollateralized,
             RiskError::Unauthorized => PercolatorError::EngineUnauthorized,
-            RiskError::InvalidMatchingEngine => PercolatorError::EngineInvalidMatchingEngine,
             RiskError::PnlNotWarmedUp => PercolatorError::EnginePnlNotWarmedUp,
             RiskError::Overflow => PercolatorError::EngineOverflow,
             RiskError::AccountNotFound => PercolatorError::EngineAccountNotFound,
-            RiskError::NotAnLPAccount => PercolatorError::EngineNotAnLPAccount,
-            RiskError::PositionSizeMismatch => PercolatorError::EnginePositionSizeMismatch,
-            RiskError::AccountKindMismatch => PercolatorError::EngineAccountKindMismatch,
             RiskError::SideBlocked => PercolatorError::EngineRiskReductionOnlyMode,
             RiskError::CorruptState => PercolatorError::EngineCorruptState,
         };
@@ -1233,11 +1229,11 @@ pub mod ix {
                     let min_oracle_price_cap_e2bps = read_u64(&mut rest)?;
                     // Insurance withdrawal limits (immutable after init)
                     let (risk_params, insurance_floor) = read_risk_params(&mut rest)?;
-                    // Extended fields: either ALL present (82 bytes) or NONE.
+                    // Extended fields: either ALL present (66 bytes) or NONE.
                     // No partial tails — prevents silent misparsing of truncated payloads.
-                    // Total: insurance(2+8+16) + permissionless(8) + funding(8+8+8+8) +
-                    //        mark_min_fee(8) + force_close_delay(8) = 82 bytes
-                    const EXTENDED_TAIL_LEN: usize = 2 + 8 + 16 + 8 + 32 + 8 + 8;
+                    // Total: insurance(2+8) + permissionless(8) + funding(8+8+8+8) +
+                    //        mark_min_fee(8) + force_close_delay(8) = 66 bytes
+                    const EXTENDED_TAIL_LEN: usize = 2 + 8 * 8;
                     let (
                         insurance_withdraw_max_bps,
                         insurance_withdraw_cooldown_slots,
@@ -1255,7 +1251,6 @@ pub mod ix {
                         // Full extended payload
                         let iwm = read_u16(&mut rest)?;
                         let iwc = read_u64(&mut rest)?;
-                        let _ = read_u128(&mut rest)?; // max_insurance_floor_change_per_day (removed)
                         let prs = read_u64(&mut rest)?;
                         let fh = read_u64(&mut rest)?;
                         let fk = read_u64(&mut rest)?;
@@ -1331,19 +1326,10 @@ pub mod ix {
                     // KeeperCrank — two-phase: candidates computed off-chain
                     let caller_idx = read_u16(&mut rest)?;
                     let format_version = read_u8(&mut rest)?;
-                    // format_version 0: legacy (bare u16 indices, all FullClose)
-                    // format_version 1: extended (u16 idx + u8 policy_tag per candidate)
+                    // format_version 1: u16 idx + u8 policy_tag per candidate
                     //   policy tag 0 = FullClose, 1 = ExactPartial(u128), 0xFF = touch-only
                     let mut candidates = alloc::vec::Vec::new();
-                    if format_version == 0 {
-                        // Legacy: remaining bytes are bare u16 account indices
-                        while rest.len() >= 2 {
-                            candidates.push((
-                                read_u16(&mut rest)?,
-                                Some(percolator::LiquidationPolicy::FullClose),
-                            ));
-                        }
-                    } else if format_version == 1 {
+                    if format_version == 1 {
                         // Extended: u16 idx + u8 policy tag per candidate
                         while rest.len() >= 3 {
                             let idx = read_u16(&mut rest)?;
@@ -1398,14 +1384,7 @@ pub mod ix {
                     let lp_idx = read_u16(&mut rest)?;
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
-                    // limit_price_e6: exactly 8 bytes or absent (0 = no limit)
-                    let limit_price_e6 = if rest.len() == 8 {
-                        read_u64(&mut rest)?
-                    } else if rest.is_empty() {
-                        0u64
-                    } else {
-                        return Err(ProgramError::InvalidInstructionData);
-                    };
+                    let limit_price_e6 = read_u64(&mut rest)?;
                     Ok(Instruction::TradeCpi {
                         lp_idx,
                         user_idx,
@@ -1426,7 +1405,6 @@ pub mod ix {
                     // UpdateConfig — funding params only
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
-                    let _ = read_u128(&mut rest)?; // funding_inv_scale_notional_e6 (removed)
                     let funding_max_premium_bps = read_i64(&mut rest)?;
                     let funding_max_bps_per_slot = read_i64(&mut rest)?;
                     Ok(Instruction::UpdateConfig {
@@ -1600,8 +1578,7 @@ pub mod ix {
         let max_accounts = read_u64(input)?;
         let new_account_fee = U128::new(read_u128(input)?);
         let insurance_floor = read_u128(input)?;
-        let h_max = read_u64(input)?; // was _maintenance_fee_per_slot (u128) — now h_max (u64)
-        let _h_max_padding = read_u64(input)?; // remaining 8 bytes of old u128 slot
+        let h_max = read_u64(input)?;
         let max_crank_staleness_slots = read_u64(input)?;
         let liquidation_fee_bps = read_u64(input)?;
         let liquidation_fee_cap = U128::new(read_u128(input)?);
@@ -1768,7 +1745,7 @@ pub mod state {
         // ========================================
         // Per-Market Admin Limits (set at InitMarket, immutable)
         // ========================================
-        /// Maximum risk reduction threshold admin can set. Must be > 0 at init.
+        /// Maximum insurance floor admin can set. Must be > 0 at init.
         pub max_insurance_floor: u128,
         /// Minimum oracle price cap (e2bps) admin can set (floor for non-zero values).
         /// 0 = no floor (admin can set any value).
@@ -1784,13 +1761,8 @@ pub mod state {
         pub _iw_padding: [u8; 6],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
-        /// Padding for u128 alignment.
-        pub _iw_padding2: u64,
-        /// Last slot when insurance_floor was changed (for rate-limiting).
-        pub resolution_slot: u64,
-        /// Padding for u128 alignment.
+        pub _iw_padding2: [u64; 2],
         pub last_hyperp_index_slot: u64,
-        /// Insurance floor value at last change (for computing delta).
         pub last_mark_push_slot: u128,
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
@@ -1883,8 +1855,6 @@ pub mod state {
     /// Offset of flags byte in SlabHeader (_padding[0])
     pub const FLAGS_OFF: usize = 13;
 
-    /// Flag bit: Market is resolved (withdraw-only mode)
-    pub const FLAG_RESOLVED: u8 = 1 << 0;
     /// Flag bit: SetInsuranceWithdrawPolicy has been explicitly called.
     /// Prevents WithdrawInsuranceLimited from misinterpreting oracle
     /// timestamps as policy metadata via authority_timestamp bit patterns.
@@ -1902,17 +1872,6 @@ pub mod state {
     /// Write market flags to _padding[0].
     pub fn write_flags(data: &mut [u8], flags: u8) {
         data[FLAGS_OFF] = flags;
-    }
-
-    /// Check if market is resolved (withdraw-only mode).
-    pub fn is_resolved(data: &[u8]) -> bool {
-        read_flags(data) & FLAG_RESOLVED != 0
-    }
-
-    /// Set the resolved flag.
-    pub fn set_resolved(data: &mut [u8]) {
-        let flags = read_flags(data) | FLAG_RESOLVED;
-        write_flags(data, flags);
     }
 
     /// Check if CPI is in progress (reentrancy guard).
@@ -2844,7 +2803,7 @@ pub mod processor {
         let exec = matcher.execute_match(
             &lp.matcher_program,
             &lp.matcher_context,
-            lp.account_id,
+            lp_idx as u64,
             oracle_price,
             size,
         )?;
@@ -3388,8 +3347,7 @@ pub mod processor {
                     insurance_withdraw_max_bps,
                     _iw_padding: [0u8; 6],
                     insurance_withdraw_cooldown_slots,
-                    _iw_padding2: 0,
-                    resolution_slot: clock.slot,
+                    _iw_padding2: [0; 2],
                     last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
                     // Hyperp: stamp init slot so stale check works from genesis.
                     // Non-Hyperp: 0 (no mark push concept).
@@ -3448,7 +3406,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block new users when market is resolved
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 let config = state::read_config(&data);
@@ -3514,7 +3472,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block new LPs when market is resolved
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -3575,7 +3533,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block deposits when market is resolved
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -3658,7 +3616,7 @@ pub mod processor {
                 // Block withdrawals on resolved markets.
                 // The engine's withdraw_not_atomic requires MarketMode::Live.
                 // After resolution, users exit via CloseAccount / ForceCloseResolved.
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -3760,7 +3718,7 @@ pub mod processor {
                 // This is intentional: settlement is idempotent and no funds move.
                 // All resolved operations use engine.current_slot (frozen at
                 // last pre-resolution crank) instead of clock.slot.
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     let engine = zc::engine_mut(&mut data)?;
                     let (resolved_price, _) = engine.resolved_context();
                     if resolved_price == 0 {
@@ -3894,7 +3852,7 @@ pub mod processor {
                 }
 
                 // Copy stats and drop engine mutable borrow
-                let liqs = engine.lifetime_liquidations;
+                let liqs = 0u64;
                 let ins_low = engine.insurance_fund.balance.get() as u64;
                 drop(engine);
 
@@ -3985,7 +3943,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block trading when market is resolved
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -4187,7 +4145,7 @@ pub mod processor {
                     require_initialized(&*data)?;
 
                     // Block trading when market is resolved
-                    if state::is_resolved(&*data) {
+                    if zc::engine_ref(&*data)?.is_resolved() {
                         return Err(ProgramError::InvalidAccountData);
                     }
                     // Reentrancy guard: reject if another CPI is in progress.
@@ -4231,7 +4189,7 @@ pub mod processor {
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
                     (
-                        lp_acc.account_id,
+                        lp_idx as u64,
                         config,
                         config_pre_oracle,
                         req_id,
@@ -4534,7 +4492,7 @@ pub mod processor {
 
                 // Block liquidations after market resolution — resolved markets
                 // are in withdraw-only settlement phase.
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -4639,7 +4597,7 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
                 accounts::expect_key(a_pda, &auth)?;
 
-                let resolved = state::is_resolved(&data);
+                let resolved = zc::engine_ref(&data)?.is_resolved();
                 let clock = Clock::from_account_info(&accounts[6])?;
                 let price = if resolved {
                     let eng = zc::engine_ref(&data)?;
@@ -4682,7 +4640,7 @@ pub mod processor {
                 let amt_units = if resolved {
                     // force_close_resolved handles K-pair PnL, maintenance fees,
                     // loss settlement, and account close internally.
-                    match engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
+                    match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
                         .map_err(map_risk_error)?
                     {
                         percolator::ResolvedCloseResult::Deferred => {
@@ -4757,7 +4715,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block insurance top-up when market is resolved
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -4834,7 +4792,7 @@ pub mod processor {
                         return Err(PercolatorError::InvalidConfigParam.into());
                     }
 
-                    let resolved = state::is_resolved(&data);
+                    let resolved = zc::engine_ref(&data)?.is_resolved();
                     let engine = zc::engine_ref(&data)?;
                     let has_accounts = engine.num_used_accounts > 0;
 
@@ -4891,7 +4849,7 @@ pub mod processor {
                     require_initialized(&data)?;
 
                     // Require resolved — enforce lifecycle ordering
-                    if !state::is_resolved(&data) {
+                    if !zc::engine_ref(&data)?.is_resolved() {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
@@ -5014,7 +4972,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 let header = state::read_header(&data);
@@ -5063,10 +5021,10 @@ pub mod processor {
                         config.last_effective_price_e6
                     } else {
                         // Non-Hyperp: use last oracle price ONLY if engine has seen
-                        // a real oracle (oracle_initialized != 0). Sentinel price 1
+                        // a real oracle (last_oracle_price > 1). Sentinel price 1
                         // from init must never be used for accrual.
                         let engine = zc::engine_ref(&data)?;
-                        if engine.oracle_initialized == 0 { 0 } else { engine.last_oracle_price }
+                        if engine.last_oracle_price > 1 { engine.last_oracle_price } else { 0 }
                     };
                     if accrual_price > 0 {
                         let engine = zc::engine_mut(&mut data)?;
@@ -5109,7 +5067,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5152,7 +5110,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5302,7 +5260,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5400,7 +5358,7 @@ pub mod processor {
                 require_admin(header.admin, a_admin.key)?;
 
                 // Can't re-resolve
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5506,9 +5464,7 @@ pub mod processor {
                 engine.resolve_market(settlement_price, clock.slot)
                     .map_err(map_risk_error)?;
 
-                config.resolution_slot = clock.slot;
                 state::write_config(&mut data, &config);
-                state::set_resolved(&mut data);
             }
 
             Instruction::WithdrawInsurance => {
@@ -5533,7 +5489,7 @@ pub mod processor {
                 require_admin(header.admin, a_admin.key)?;
 
                 // Must be resolved
-                if !state::is_resolved(&data) {
+                if !zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5620,7 +5576,7 @@ pub mod processor {
 
                 // Policy writes oracle/index fields. Only safe when all accounts
                 // are closed — prevents corrupting Hyperp settlement math.
-                if !state::is_resolved(&data) {
+                if !zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 {
@@ -5681,7 +5637,7 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                let resolved = state::is_resolved(&data);
+                let resolved = zc::engine_ref(&data)?.is_resolved();
                 let header = state::read_header(&data);
                 let mut config = state::read_config(&data);
 
@@ -5805,7 +5761,7 @@ pub mod processor {
                     // could make the stored balance overstated.
                     if !resolved {
                         let staleness = clock.slot.saturating_sub(engine.last_crank_slot);
-                        if staleness > engine.max_crank_staleness_slots {
+                        if staleness > engine.params.max_crank_staleness_slots {
                             return Err(PercolatorError::OracleStale.into());
                         }
                     }
@@ -5909,7 +5865,7 @@ pub mod processor {
                 require_admin(header.admin, a_admin.key)?;
 
                 // Must be resolved
-                if !state::is_resolved(&data) {
+                if !zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5938,7 +5894,7 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::Deferred => return Ok(()),
@@ -5998,7 +5954,7 @@ pub mod processor {
                     return Err(PercolatorError::EngineNotAnLPAccount.into());
                 }
 
-                let fees = engine.accounts[lp_idx as usize].fees_earned_total.get();
+                let fees = 0u64;
                 solana_program::program::set_return_data(&fees.to_le_bytes());
             }
 
@@ -6017,7 +5973,7 @@ pub mod processor {
                 // Block on resolved markets — unsettled PnL from resolution
                 // may not yet be reflected in capital. Reclaiming before
                 // touch_account_full would forfeit claimable value.
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -6039,7 +5995,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -6090,7 +6046,7 @@ pub mod processor {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
-                    if state::is_resolved(&data) {
+                    if zc::engine_ref(&data)?.is_resolved() {
                         return Err(ProgramError::InvalidAccountData);
                     }
                     let cfg = state::read_config(&data);
@@ -6152,7 +6108,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -6205,7 +6161,7 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                if state::is_resolved(&data) {
+                if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -6321,7 +6277,7 @@ pub mod processor {
                     if mark > 0 { mark } else { config.authority_price_e6 }
                 } else {
                     let engine = zc::engine_ref(&data)?;
-                    if engine.oracle_initialized == 0 {
+                    if engine.last_oracle_price <= 1 {
                         // Oracle never initialized — only safe if no open positions.
                         // Accounts may exist (deposits-only) but if OI is zero,
                         // there is no position-dependent settlement risk and the
@@ -6342,10 +6298,8 @@ pub mod processor {
                 engine.resolve_market(settlement_price, clock.slot)
                     .map_err(map_risk_error)?;
 
-                config.resolution_slot = clock.slot;
                 config.authority_price_e6 = settlement_price;
                 state::write_config(&mut data, &config);
-                state::set_resolved(&mut data);
             }
 
             Instruction::ForceCloseResolved { user_idx } => {
@@ -6367,16 +6321,20 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                if !state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
+                let resolved_slot = {
+                    let eng = zc::engine_ref(&data)?;
+                    if !eng.is_resolved() {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    eng.resolved_context().1
+                };
 
                 let config = state::read_config(&data);
                 if config.force_close_delay_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 let clock = Clock::from_account_info(a_clock)?;
-                if clock.slot < config.resolution_slot
+                if clock.slot < resolved_slot
                     .saturating_add(config.force_close_delay_slots)
                 {
                     return Err(ProgramError::InvalidAccountData);
@@ -6403,7 +6361,7 @@ pub mod processor {
                     engine.accounts[user_idx as usize].owner,
                 );
 
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::Deferred => return Ok(()),

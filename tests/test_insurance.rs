@@ -1706,8 +1706,6 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     println!("WITHDRAW INSURANCE DECREMENTS ENGINE VAULT: PASSED");
 }
 
-/// SetRiskThreshold with max_insurance_floor_change_per_day == 0 locks the floor.
-/// SetRiskThreshold rate-limit uses actual current value, not stale baseline.
 /// Cooldown enforcement on WithdrawInsuranceLimited (resolved market).
 #[test]
 fn test_insurance_withdraw_cooldown_enforcement() {
@@ -2032,7 +2030,6 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
     // Enable live insurance withdrawals
     data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
     data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
     data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps

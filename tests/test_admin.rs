@@ -757,7 +757,7 @@ fn test_admin_limits_lifecycle() {
     env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     // Step 2: UpdateConfig with thresh_max at limit
-    env.try_update_config_with_params(&admin, 3600, 1_000_000_000_000u128, 1000, 0, 50_000)
+    env.try_update_config_with_params(&admin, 3600, 1000, 0, 50_000)
         .unwrap();
 
     // Step 3: Crank
@@ -968,7 +968,7 @@ fn test_update_config_rejects_negative_funding_max_premium() {
             AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data: encode_update_config(
-            3600, 100, 1_000_000u128,
+            3600, 100,
             -100i64,  // negative funding_max_premium_bps — must be rejected
             10i64,
             0u128, 100, 100, 100, 5000, 0, 1_000_000u128, 1u128,
@@ -1003,7 +1003,7 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
             AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data: encode_update_config(
-            3600, 100, 1_000_000u128,
+            3600, 100,
             100i64,
             -5i64,  // negative funding_max_bps_per_slot — must be rejected
             0u128, 100, 100, 100, 5000, 0, 1_000_000u128, 1u128,
@@ -1113,7 +1113,6 @@ fn test_update_config_rejects_zero_horizon() {
     let result = env.try_update_config_with_params(
         &admin,
         0,                        // funding_horizon_slots = 0 (invalid)
-        1_000_000_000_000u128,    // funding_inv_scale_notional_e6
         1000,                     // thresh_alpha_bps
         0u128,                    // thresh_min
         1_000_000_000_000_000u128, // thresh_max
@@ -1128,31 +1127,6 @@ fn test_update_config_rejects_zero_horizon() {
     assert_eq!(
         config_after, config_before,
         "config must not change on rejected UpdateConfig (zero horizon)"
-    );
-}
-
-/// Spec: UpdateConfig rejects funding_inv_scale_notional_e6 = 0 (would cause division by zero).
-#[test]
-/// funding_inv_scale_notional_e6 is reserved (not read by funding computation).
-/// Zero should be accepted since the field has no runtime effect.
-fn test_update_config_accepts_zero_inv_scale_reserved_field() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let result = env.try_update_config_with_params(
-        &admin,
-        3600,   // funding_horizon_slots (valid)
-        0u128,  // funding_inv_scale_notional_e6 = 0 (reserved, accepted)
-        1000,
-        0u128,
-        1_000_000_000_000_000u128,
-    );
-    assert!(
-        result.is_ok(),
-        "UpdateConfig must accept funding_inv_scale_notional_e6 = 0 (reserved field): {:?}",
-        result,
     );
 }
 

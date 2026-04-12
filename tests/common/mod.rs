@@ -19,7 +19,7 @@ pub use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-pub const SLAB_LEN: usize = 8984144; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
+pub const SLAB_LEN: usize = 8955688; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
 pub const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID
@@ -130,7 +130,7 @@ pub fn make_pyth_data(
 fn append_default_extended_tail(data: &mut Vec<u8>) {
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
+
     data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
@@ -188,7 +188,7 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -231,7 +231,7 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -277,7 +277,7 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     // max_crank_staleness_slots: use bounded value when permissionless resolve is enabled
     // (permissionless_resolve_stale_slots must exceed max_crank_staleness_slots)
     let max_crank = if permissionless_resolve_stale_slots > 0 {
@@ -296,7 +296,7 @@ pub fn encode_init_market_with_cap(
     // Full extended tail (82 bytes)
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
+
     data.extend_from_slice(&permissionless_resolve_stale_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
@@ -405,7 +405,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -416,7 +416,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
+
     data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
     // Custom funding params (required before mark_min_fee)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
@@ -462,7 +462,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -529,13 +529,13 @@ pub fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
 
 pub fn encode_crank_permissionless() -> Vec<u8> {
     // Two-phase crank: pass first 128 account indices as candidates.
-    // In production, the keeper computes the shortlist off-chain.
-    // For tests, we pass a fixed window covering typical test accounts.
+    // format_version=1: (u16 idx, u8 policy_tag) per candidate.
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes()); // caller_idx = permissionless
-    data.push(0u8); // allow_panic = false
+    data.push(1u8); // format_version = 1
     for i in 0..128u16 {
-        data.extend_from_slice(&i.to_le_bytes());
+        data.extend_from_slice(&i.to_le_bytes()); // idx
+        data.push(0u8); // tag 0 = FullClose
     }
     data
 }
@@ -543,9 +543,10 @@ pub fn encode_crank_permissionless() -> Vec<u8> {
 pub fn encode_crank_with_candidates(candidates: &[u16]) -> Vec<u8> {
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes());
-    data.push(0u8);
+    data.push(1u8); // format_version = 1
     for &idx in candidates {
         data.extend_from_slice(&idx.to_le_bytes());
+        data.push(0u8); // tag 0 = FullClose
     }
     data
 }
@@ -1528,7 +1529,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&new_account_fee.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -1571,7 +1572,7 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -1911,7 +1912,6 @@ impl TestEnv {
         // Slab layout: header(72) + config(...)
         // MarketConfig offsets (absolute):
         // funding_horizon_slots: 72 + 112 = 184
-        // funding_inv_scale_notional_e6: 72 + 128 = 200
         // thresh_alpha_bps: 72 + 200 = 272
         // thresh_min: 72 + 208 = 280
         // thresh_max: 72 + 224 = 296
@@ -2536,7 +2536,6 @@ pub fn encode_liquidate(target_idx: u16) -> Vec<u8> {
 pub fn encode_update_config(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
-    funding_inv_scale_notional_e6: u128, // u128!
     funding_max_premium_bps: i64,        // i64!
     funding_max_bps_per_slot: i64,       // i64!
     thresh_floor: u128,
@@ -2551,7 +2550,6 @@ pub fn encode_update_config(
     let mut data = vec![14u8]; // Tag 14: UpdateConfig
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
-    data.extend_from_slice(&funding_inv_scale_notional_e6.to_le_bytes()); // u128
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes()); // i64
     data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes()); // i64
     data.extend_from_slice(&thresh_floor.to_le_bytes());
@@ -2911,13 +2909,11 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Check if market is resolved (read flags from slab header)
+    /// Check if market is resolved (read from engine market_mode)
     pub fn is_market_resolved(&self) -> bool {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // FLAGS_OFF = 13 (offset of flags byte in SlabHeader._padding[0])
-        pub const FLAGS_OFF: usize = 13;
-        pub const FLAG_RESOLVED: u8 = 1 << 0;
-        slab_account.data[FLAGS_OFF] & FLAG_RESOLVED != 0
+        let engine = percolator_prog::zc::engine_ref(&slab_account.data).unwrap();
+        engine.is_resolved()
     }
 
     /// Read insurance fund balance from engine
@@ -2973,7 +2969,6 @@ impl TestEnv {
             data: encode_update_config(
                 3600,                      // funding_horizon_slots
                 100,                       // funding_k_bps
-                1_000_000_000_000u128,     // funding_inv_scale_notional_e6 (u128)
                 100i64,                    // funding_max_premium_bps (i64)
                 10i64,                     // funding_max_bps_per_slot (i64)
                 0u128,                     // thresh_floor (u128)
@@ -3807,8 +3802,8 @@ impl TradeCpiTestEnv {
 
     pub fn is_market_resolved(&self) -> bool {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // FLAGS_OFF = 13, FLAG_RESOLVED = 1
-        slab_data[13] & 1 != 0
+        let engine = percolator_prog::zc::engine_ref(&slab_data).unwrap();
+        engine.is_resolved()
     }
 
     pub fn read_insurance_balance(&self) -> u128 {
@@ -4713,22 +4708,26 @@ impl TestEnv {
 // PEN TEST SUITE ROUND 2: Deep Crank, Funding, Warmup, GC, and Race Attacks
 // ============================================================================
 
-pub fn encode_crank_with_panic(allow_panic: u8) -> Vec<u8> {
+pub fn encode_crank_with_panic(_allow_panic: u8) -> Vec<u8> {
+    // format_version=1, all FullClose
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes());
-    data.push(allow_panic);
+    data.push(1u8); // format_version = 1
     for i in 0..128u16 {
         data.extend_from_slice(&i.to_le_bytes());
+        data.push(0u8); // FullClose
     }
     data
 }
 
 pub fn encode_crank_self(caller_idx: u16) -> Vec<u8> {
+    // format_version=1, all FullClose
     let mut data = vec![5u8];
     data.extend_from_slice(&caller_idx.to_le_bytes());
-    data.push(0u8);
+    data.push(1u8); // format_version = 1
     for i in 0..128u16 {
         data.extend_from_slice(&i.to_le_bytes());
+        data.push(0u8); // FullClose
     }
     data
 }
@@ -4821,7 +4820,7 @@ impl TestEnv {
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
         data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -4901,7 +4900,7 @@ impl TestEnv {
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
         data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -5479,7 +5478,6 @@ impl TestEnv {
         &mut self,
         signer: &Keypair,
         funding_horizon_slots: u64,
-        funding_inv_scale_notional_e6: u128,
         thresh_alpha_bps: u64,
         thresh_min: u128,
         thresh_max: u128,
@@ -5494,7 +5492,6 @@ impl TestEnv {
             data: encode_update_config(
                 funding_horizon_slots,
                 100, // funding_k_bps
-                funding_inv_scale_notional_e6,
                 100i64, // funding_max_premium_bps
                 10i64,  // funding_max_bps_per_slot
                 0u128,  // thresh_floor
@@ -5525,10 +5522,6 @@ impl TestEnv {
 // ============================================================================
 
 /// ATTACK: UpdateConfig with funding_horizon_slots = 0 (division by zero risk).
-/// Expected: Rejected with InvalidConfigParam.
-
-
-/// ATTACK: UpdateConfig with funding_inv_scale_notional_e6 = 0 (division by zero).
 /// Expected: Rejected with InvalidConfigParam.
 
 
@@ -7460,7 +7453,7 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -7547,7 +7540,7 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&insurance_floor.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&0u64.to_le_bytes()); // _h_max_padding
+
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap

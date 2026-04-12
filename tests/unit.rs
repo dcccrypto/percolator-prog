@@ -262,7 +262,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
     encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
-    encode_u128(u128::MAX, &mut data); // max_insurance_floor_change_per_day
+
     encode_u64(0, &mut data); // permissionless_resolve_stale_slots
     encode_u64(500, &mut data); // funding_horizon_slots
     encode_u64(100, &mut data); // funding_k_bps
@@ -311,7 +311,7 @@ fn encode_init_market_invert(
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
     encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
-    encode_u128(u128::MAX, &mut data); // max_insurance_floor_change_per_day
+
     encode_u64(0, &mut data); // permissionless_resolve_stale_slots
     encode_u64(500, &mut data); // funding_horizon_slots
     encode_u64(100, &mut data); // funding_k_bps
@@ -3102,7 +3102,10 @@ fn test_close_slab() {
     assert_eq!(header.magic, MAGIC);
 
     // Mark market as resolved (required by CloseSlab)
-    state::set_resolved(&mut f.slab.data);
+    {
+        let engine = zc::engine_mut(&mut f.slab.data).unwrap();
+        engine.resolve_market(1_000_000, 1).unwrap();
+    }
 
     // Create vault authority PDA and admin's dest ATA for CloseSlab
     let mut vault_auth = TestAccount::new(f.vault_pda, solana_program::system_program::id(), 0, vec![]);
@@ -3168,7 +3171,10 @@ fn test_close_slab_non_admin_rejected() {
     }
 
     // Mark market as resolved (required by CloseSlab)
-    state::set_resolved(&mut f.slab.data);
+    {
+        let engine = zc::engine_mut(&mut f.slab.data).unwrap();
+        engine.resolve_market(1_000_000, 1).unwrap();
+    }
 
     // Attacker tries to close
     let mut attacker = TestAccount::new(

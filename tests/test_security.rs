@@ -2203,7 +2203,6 @@ fn test_attack_update_config_extreme_values() {
         data: encode_update_config(
             1,        // funding_horizon_slots (minimum)
             10000,    // funding_k_bps (100%)
-            1u128,    // funding_inv_scale_notional_e6 (minimum)
             10000i64, // funding_max_premium_bps (max allowed)
             10000i64, // funding_max_bps_per_slot (max allowed - engine caps at ±10k)
             0u128,
@@ -2397,7 +2396,6 @@ fn test_attack_config_zero_funding_horizon() {
     let result = env.try_update_config_with_params(
         &admin,
         0,                     // funding_horizon_slots = 0 (invalid)
-        1_000_000_000_000u128, // normal inv_scale
         1000,                  // normal alpha
         0,
         u128::MAX, // min/max
@@ -2413,31 +2411,6 @@ fn test_attack_config_zero_funding_horizon() {
         "Rejected UpdateConfig must not mutate funding/threshold config"
     );
     assert_eq!(vault_after, vault_before, "Rejected UpdateConfig must not move vault funds");
-}
-
-/// funding_inv_scale_notional_e6 is reserved (not read by funding computation).
-/// Zero is accepted — no division-by-zero risk since the field is unused.
-#[test]
-fn test_config_zero_inv_scale_accepted_reserved() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let result = env.try_update_config_with_params(
-        &admin,
-        3600, // normal horizon
-        0,    // inv_scale = 0 (reserved, accepted)
-        1000, // normal alpha
-        0,
-        u128::MAX,
-    );
-    assert!(
-        result.is_ok(),
-        "Zero inv_scale should be accepted (reserved field): {:?}",
-        result,
-    );
 }
 
 /// ATTACK: Setting oracle authority to [0;32] disables authority price and clears stored price.
@@ -5700,7 +5673,6 @@ fn test_attack_config_extreme_funding_max_bps() {
     let result = env.try_update_config_with_params(
         &admin,
         100,                        // funding_horizon_slots
-        1_000_000_000_000,          // funding_inv_scale
         1000,                       // thresh_alpha_bps
         0,                          // thresh_min
         10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
@@ -13531,7 +13503,6 @@ fn test_attack_resolve_rejects_stale_settlement_push() {
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
     data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps

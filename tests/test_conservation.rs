@@ -794,7 +794,6 @@ fn test_attack_updateconfig_preserves_conservation() {
     let result = env.try_update_config_with_params(
         &admin,
         7200,                       // funding_horizon_slots
-        2_000_000_000_000u128,      // funding_inv_scale
         2000,                       // alpha_bps
         0,
         10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
