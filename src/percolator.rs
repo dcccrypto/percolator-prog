@@ -30,17 +30,16 @@ pub mod constants {
 
     // RiskBuffer: 4-entry persistent cache of highest-notional accounts
     pub const RISK_BUF_CAP: usize = 4;
-    pub const RISK_BUF_EMPTY: u16 = u16::MAX;
+    // RISK_BUF_EMPTY removed — buffer uses zeroed entries, not sentinels
     pub const RISK_BUF_OFF: usize = ENGINE_OFF + ENGINE_LEN;
     pub const RISK_BUF_LEN: usize = size_of::<crate::risk_buffer::RiskBuffer>();
     pub const SLAB_LEN: usize = RISK_BUF_OFF + RISK_BUF_LEN;
 
-    /// Minimum stale slots before crank discount activates.
-    pub const CRANK_REWARD_MIN_DT: u64 = 100;
+    // CRANK_REWARD_MIN_DT removed — crank discount logic removed in v12.15
     /// Progressive scan window per crank.
     pub const RISK_SCAN_WINDOW: usize = 32;
     pub const MATCHER_ABI_VERSION: u32 = 1;
-    pub const MATCHER_CONTEXT_PREFIX_LEN: usize = 64;
+    // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
     pub const MATCHER_CALL_TAG: u8 = 0;
     pub const MATCHER_CALL_LEN: usize = 67;
@@ -2939,7 +2938,7 @@ pub mod processor {
         zc,
     };
     use percolator::{
-        RiskEngine, RiskError, I128, U128, ADL_ONE, MAX_ACCOUNTS,
+        RiskEngine, RiskError, U128, ADL_ONE, MAX_ACCOUNTS,
     };
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
@@ -4077,10 +4076,11 @@ pub mod processor {
                     // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
                     // Propagate CorruptState (real invariant violation), ignore other
                     // errors (side-reset may fail on frozen ADL state post-resolution).
+                    // Pass zero funding rate — market is resolved, no funding accrual.
                     let mut ctx = percolator::InstructionContext::new();
                     match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
-                        compute_current_funding_rate_e9(&config),
+                        0i128, // zero funding on resolved markets
                     ) {
                         Ok(()) => {}
                         Err(percolator::RiskError::CorruptState) => {
@@ -5050,6 +5050,19 @@ pub mod processor {
                 let mut header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
+                // Liveness guard: block admin burn unless the market has a fallback
+                // resolution path. Without this, burning admin on a live market with
+                // permissionless_resolve_stale_slots == 0 creates an irrecoverable
+                // deadlock if the oracle later dies (no admin resolve, no permissionless
+                // resolve → market stuck forever with open positions).
+                if new_admin.to_bytes() == [0u8; 32] {
+                    let config = state::read_config(&data);
+                    let has_permissionless_resolve = config.permissionless_resolve_stale_slots > 0;
+                    if !has_permissionless_resolve && !state::is_resolved(&data) {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                }
+
                 header.admin = new_admin.to_bytes();
                 state::write_header(&mut data, &header);
             }
@@ -5651,12 +5664,24 @@ pub mod processor {
                     state::write_config(&mut data, &config);
                 }
 
+                // Determine canonical settlement price.
+                // Hyperp: use mark EWMA (smoothed observable price) for consistency
+                // between admin and permissionless resolution paths. If EWMA is
+                // uninitialized, fall back to authority_price_e6.
+                // Non-Hyperp: use authority_price_e6 (admin-pushed settlement price).
+                let settlement_price = if oracle::is_hyperp_mode(&config) {
+                    let mark = config.mark_ewma_e6;
+                    if mark > 0 { mark } else { config.authority_price_e6 }
+                } else {
+                    config.authority_price_e6
+                };
+
                 // Call the engine's resolve_market transition.
                 // This does final accrual at settlement price, sets MarketMode::Resolved,
                 // matures all PnL, zeros OI, and drains/finalizes sides.
                 // The engine validates the price deviation band against P_last internally.
                 let engine = zc::engine_mut(&mut data)?;
-                engine.resolve_market(config.authority_price_e6, clock.slot)
+                engine.resolve_market(settlement_price, clock.slot)
                     .map_err(map_risk_error)?;
 
                 config.resolution_slot = clock.slot;
@@ -6435,7 +6460,7 @@ pub mod processor {
                     }
                 }
 
-                // Flush Hyperp index + accrue to boundary (Bug 1+3 fix)
+                // Flush Hyperp index toward mark before resolution.
                 if is_hyperp {
                     let mark = if config.mark_ewma_e6 > 0 {
                         config.mark_ewma_e6
@@ -6445,9 +6470,6 @@ pub mod processor {
                     let prev_index = config.last_effective_price_e6;
                     if mark > 0 && prev_index > 0 {
                         let last_idx_slot = config.last_hyperp_index_slot;
-                        // Use clock.slot (not engine.last_crank_slot) to avoid
-                        // monotonicity failure when current_slot > last_crank_slot
-                        // from trades/withdrawals after the last crank.
                         let dt = clock.slot.saturating_sub(last_idx_slot);
                         let new_index = oracle::clamp_toward_with_dt(
                             prev_index.max(1), mark,
@@ -6457,27 +6479,15 @@ pub mod processor {
                         config.last_hyperp_index_slot = clock.slot;
                     }
                     state::write_config(&mut data, &config);
-                    // Accrue at the mark (settlement price), not the smoothed index.
-                    // force_close_resolved uses K coefficients that must reflect mark.
-                    let settle_price = mark.max(1);
-                    let engine = zc::engine_mut(&mut data)?;
-                    engine.accrue_market_to(
-                        clock.slot,
-                        settle_price,
-                    ).map_err(map_risk_error)?;
-                    config = state::read_config(&data);
                 }
 
-                // Settlement price = last oracle price from engine.
-                // Reject only if completely uninitialized (p == 0).
-                // The non-Hyperp init sentinel (p=1) is harmless: if no one ever
-                // traded or cranked, there are no positions to settle. If anyone
-                // did interact, accrue_market_to updated last_oracle_price to the
-                // real price. The sentinel cannot cause incorrect settlement because:
-                // - All resolve paths require crank staleness (no recent activity)
-                // - If the market had activity, last_oracle_price reflects it
-                // - Resolution at p=1 on an empty market is a no-op
-                let last_price = {
+                // Determine canonical settlement price.
+                // Hyperp: use mark EWMA (same as ResolveMarket Hyperp path).
+                // Non-Hyperp: use engine.last_oracle_price (last accrued price).
+                let settlement_price = if is_hyperp {
+                    let mark = config.mark_ewma_e6;
+                    if mark > 0 { mark } else { config.authority_price_e6 }
+                } else {
                     let engine = zc::engine_ref(&data)?;
                     let p = engine.last_oracle_price;
                     if p == 0 {
@@ -6486,17 +6496,13 @@ pub mod processor {
                     p
                 };
 
-                // Call the engine's resolve_market transition.
-                // This does final accrual at settlement price, sets MarketMode::Resolved,
-                // matures all PnL, zeros OI, and drains/finalizes sides.
-                // Hyperp already accrued above for index flush; the engine's resolve_market
-                // will re-accrue (idempotent if same slot+price).
+                // Call engine resolve_market with canonical settlement price.
                 let engine = zc::engine_mut(&mut data)?;
-                engine.resolve_market(last_price, clock.slot)
+                engine.resolve_market(settlement_price, clock.slot)
                     .map_err(map_risk_error)?;
 
                 config.resolution_slot = clock.slot;
-                config.authority_price_e6 = last_price;
+                config.authority_price_e6 = settlement_price;
                 state::write_config(&mut data, &config);
                 state::set_resolved(&mut data);
             }
