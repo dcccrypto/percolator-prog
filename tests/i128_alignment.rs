@@ -9,7 +9,7 @@
 //! Run:       cargo test --release --test i128_alignment -- --nocapture
 
 use litesvm::LiteSVM;
-use percolator::{Account, ReserveCohort, RiskEngine, RiskParams, I128, U128, MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT};
+use percolator::{Account, RiskEngine, RiskParams, I128, U128};
 use solana_sdk::{
     account::Account as SolanaAccount,
     clock::Clock,
@@ -241,7 +241,6 @@ fn test_account_struct_alignment() {
 
     // Create an account with known values
     let account = Account {
-        account_id: 12345,
         capital: U128::new(0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210),
         kind: Account::KIND_USER,
         pnl: -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10i128,
@@ -249,18 +248,22 @@ fn test_account_struct_alignment() {
         position_basis_q: -1_000_000_000_000i128,
         adl_a_basis: 1_000_000u128,
         adl_k_snap: 0i128,
+        f_snap: 0i128,
         adl_epoch_snap: 0u64,
         matcher_program: [0xAA; 32],
         matcher_context: [0xBB; 32],
         owner: [0xCC; 32],
         fee_credits: I128::new(-999),
-        fees_earned_total: U128::new(0),
-        exact_reserve_cohorts: [ReserveCohort::EMPTY; MAX_EXACT_RESERVE_COHORTS_PER_ACCOUNT],
-        exact_cohort_count: 0,
-        overflow_older: ReserveCohort::EMPTY,
-        overflow_older_present: 0,
-        overflow_newest: ReserveCohort::EMPTY,
-        overflow_newest_present: 0,
+        sched_present: 0,
+        sched_remaining_q: 0,
+        sched_anchor_q: 0,
+        sched_start_slot: 0,
+        sched_horizon: 0,
+        sched_release_q: 0,
+        pending_present: 0,
+        pending_remaining_q: 0,
+        pending_horizon: 0,
+        pending_created_slot: 0,
     };
 
     // Verify all fields round-trip correctly

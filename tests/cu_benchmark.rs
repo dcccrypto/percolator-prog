@@ -32,7 +32,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 19640; // MAX_ACCOUNTS=64 - native 128-bit fields
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 8951296; // MAX_ACCOUNTS=2048 - v12.15 Account with reserve cohort queues
+const SLAB_LEN: usize = 1451816; // MAX_ACCOUNTS=2048 - v12.15 Account (streamlined)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;

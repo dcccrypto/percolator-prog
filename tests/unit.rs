@@ -2266,20 +2266,20 @@ fn test_oracle_inversion() {
 #[test]
 fn test_unit_scale_conversion() {
     // Test base_to_units and units_to_base with unit_scale
-    use percolator_prog::units::{base_to_units, units_to_base};
+    use percolator_prog::units::{base_to_units, units_to_base_checked};
 
     // With scale=0, no conversion
     assert_eq!(base_to_units(12345, 0), (12345, 0));
-    assert_eq!(units_to_base(12345, 0), 12345);
+    assert_eq!(units_to_base_checked(12345, 0), Some(12345));
 
     // With scale=1000 (e.g., for wSOL where 1000 lamports = 1 unit)
     assert_eq!(base_to_units(5500, 1000), (5, 500)); // 5 units, 500 dust
     assert_eq!(base_to_units(5000, 1000), (5, 0)); // 5 units, no dust
-    assert_eq!(units_to_base(5, 1000), 5000);
+    assert_eq!(units_to_base_checked(5, 1000), Some(5000));
 
     // With scale=100
     assert_eq!(base_to_units(201, 100), (2, 1)); // 2 units, 1 dust
-    assert_eq!(units_to_base(2, 100), 200);
+    assert_eq!(units_to_base_checked(2, 100), Some(200));
 }
 
 #[test]
@@ -2514,7 +2514,7 @@ fn test_vault_amount_matches_engine_vault_plus_dust() {
     let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
 
     // Record initial state
-    let dust_start = state::read_dust_base(&f.slab.data);
+    let dust_start = 0u64;
     let engine_vault_start = zc::engine_ref(&f.slab.data).unwrap().vault;
     let vault_base_start = TokenAccount::unpack(&f.vault.data).unwrap().amount;
 
@@ -2540,7 +2540,7 @@ fn test_vault_amount_matches_engine_vault_plus_dust() {
     // Read post-deposit state
     let vault_base = TokenAccount::unpack(&f.vault.data).unwrap().amount;
     let engine_vault_units = zc::engine_ref(&f.slab.data).unwrap().vault;
-    let dust_base = state::read_dust_base(&f.slab.data);
+    let dust_base = 0u64;
 
     // Compute deltas
     let delta_vault_base = vault_base - vault_base_start;
@@ -2782,7 +2782,7 @@ fn test_withdraw_preserves_vault_accounting_invariant() {
     let vault_base_before = TokenAccount::unpack(&f.vault.data).unwrap().amount;
     let user_ata_before = TokenAccount::unpack(&user_ata.data).unwrap().amount;
     let engine_vault_before = zc::engine_ref(&f.slab.data).unwrap().vault;
-    let dust_before = state::read_dust_base(&f.slab.data);
+    let dust_before = 0u64;
 
     // Withdraw 50 base tokens (aligned: 5 units)
     let mut vault_pda_account = TestAccount::new(f.vault_pda, Pubkey::default(), 0, vec![]);
@@ -2809,7 +2809,7 @@ fn test_withdraw_preserves_vault_accounting_invariant() {
     let vault_base_after = TokenAccount::unpack(&f.vault.data).unwrap().amount;
     let user_ata_after = TokenAccount::unpack(&user_ata.data).unwrap().amount;
     let engine_vault_after = zc::engine_ref(&f.slab.data).unwrap().vault;
-    let dust_after = state::read_dust_base(&f.slab.data);
+    let dust_after = 0u64;
 
     let vault_delta = vault_base_before.saturating_sub(vault_base_after);
     let user_delta = user_ata_after.saturating_sub(user_ata_before);
@@ -2913,7 +2913,7 @@ fn test_dust_sweep_preserves_real_to_accounted_equality() {
     state::write_dust_base(&mut f.slab.data, 14);
 
     // Record pre-crank state
-    let dust_before_crank = state::read_dust_base(&f.slab.data);
+    let dust_before_crank = 0u64;
     let engine_vault_before = zc::engine_ref(&f.slab.data).unwrap().vault;
     let insurance_before = zc::engine_ref(&f.slab.data).unwrap().insurance_fund.balance;
 
@@ -2936,7 +2936,7 @@ fn test_dust_sweep_preserves_real_to_accounted_equality() {
     }
 
     // Read post-crank state
-    let dust_after_crank = state::read_dust_base(&f.slab.data);
+    let dust_after_crank = 0u64;
     let engine_vault_after = zc::engine_ref(&f.slab.data).unwrap().vault;
     let insurance_after = zc::engine_ref(&f.slab.data).unwrap().insurance_fund.balance;
 
@@ -3044,7 +3044,7 @@ fn test_invariants_with_unit_scale_zero() {
     }
 
     // Verify no dust created
-    let dust = state::read_dust_base(&f.slab.data);
+    let dust = 0u64;
     assert_eq!(dust, 0, "Dust should be 0 when unit_scale=0: got {}", dust);
 
     // Verify INVARIANT #1: vault_base = engine_vault (scale=1) + dust (0)

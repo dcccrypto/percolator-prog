@@ -6386,7 +6386,6 @@ fn test_attack_funding_extreme_k_bps_capped() {
         data: encode_update_config(
             100,                        // funding_horizon_slots
             100_000,                    // funding_k_bps (max allowed = 1000x)
-            1_000_000_000_000,          // funding_inv_scale
             100,                        // funding_max_premium_bps
             10,                         // funding_max_bps_per_slot
             0u128,                      // thresh_floor
@@ -6469,7 +6468,6 @@ fn test_attack_funding_extreme_max_premium_capped() {
         data: encode_update_config(
             100,                        // funding_horizon_slots
             100,                        // funding_k_bps
-            1_000_000_000_000,          // funding_inv_scale
             i64::MAX,                   // funding_max_premium_bps (extreme!)
             10,                         // funding_max_bps_per_slot
             0u128,                      // thresh_floor
@@ -6552,7 +6550,6 @@ fn test_attack_funding_extreme_max_bps_per_slot() {
         data: encode_update_config(
             100,                        // funding_horizon_slots
             100,                        // funding_k_bps
-            1_000_000_000_000,          // funding_inv_scale
             100,                        // funding_max_premium_bps
             i64::MAX,                   // funding_max_bps_per_slot (extreme!)
             0u128,                      // thresh_floor
