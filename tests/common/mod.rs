@@ -2909,11 +2909,19 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Check if market is resolved (read from engine market_mode)
+    /// Check if market is resolved. Since engine_ref uses native struct layout
+    /// which differs from BPF, we check resolved_price > 0 as a proxy.
+    /// resolved_price is only set by engine.resolve_market().
     pub fn is_market_resolved(&self) -> bool {
-        let slab_account = self.svm.get_account(&self.slab).unwrap();
-        let engine = percolator_prog::zc::engine_ref(&slab_account.data).unwrap();
-        engine.is_resolved()
+        // resolved_price is a u64 in the engine. Its offset relative to ENGINE_OFF
+        // can be inferred: it's 8 bytes before resolved_slot, which is 8 bytes before
+        // resolved_payout_h_num. We know c_tot is at ENGINE+184.
+        // Working back: c_tot(184) - last_crank(8) - ready_pad(8) - h_den(16) - h_num(16) - resolved_slot(8) - resolved_price(8)
+        // = 184 - 64 = 120. resolved_price at ENGINE+120.
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        let off = 584 + 120; // ENGINE_OFF + resolved_price offset
+        let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
+        rp > 0
     }
 
     /// Read insurance fund balance from engine
@@ -3802,9 +3810,10 @@ impl TradeCpiTestEnv {
     }
 
     pub fn is_market_resolved(&self) -> bool {
-        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        let engine = percolator_prog::zc::engine_ref(&slab_data).unwrap();
-        engine.is_resolved()
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        let off = 584 + 120; // ENGINE_OFF + resolved_price offset (BPF)
+        let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
+        rp > 0
     }
 
     pub fn read_insurance_balance(&self) -> u128 {
@@ -5114,7 +5123,7 @@ impl TestEnv {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 584 + 9264;
         const ACCOUNT_SIZE: usize = 352;
-        const FEE_CREDITS_OFFSET: usize = 240;
+        const FEE_CREDITS_OFFSET: usize = 224;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
         if slab_data.len() < off + 16 {
             return 0;
@@ -5165,12 +5174,14 @@ impl TestEnv {
     }
 
     /// Read account kind (u8) for an account slot.
-    /// kind is at offset 24 within Account (0 = User, 1 = LP).
+    /// kind is at offset 16 within Account in BPF layout:
+    ///   capital: U128 ([u64;2]) = 16 bytes at offset 0
+    ///   kind: u8 at offset 16
     pub fn read_account_kind(&self, idx: u16) -> u8 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 584 + 9264;
         const ACCOUNT_SIZE: usize = 352;
-        const KIND_OFFSET: usize = 24;
+        const KIND_OFFSET: usize = 16;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
         if slab_data.len() < off + 1 {
             return 0;
@@ -5184,7 +5195,7 @@ impl TestEnv {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 584 + 9264;
         const ACCOUNT_SIZE: usize = 352;
-        const MATCHER_PROG_OFFSET: usize = 144;
+        const MATCHER_PROG_OFFSET: usize = 128;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&slab_data[off..off + 32]);
@@ -5197,7 +5208,7 @@ impl TestEnv {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 584 + 9264;
         const ACCOUNT_SIZE: usize = 352;
-        const MATCHER_CTX_OFFSET: usize = 176;
+        const MATCHER_CTX_OFFSET: usize = 160;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&slab_data[off..off + 32]);

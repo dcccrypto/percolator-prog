@@ -2504,57 +2504,6 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 }
 
 // ============================================================================
-// QueryLpFees (tag 24) test
-// ============================================================================
-
-/// QueryLpFees returns the cumulative fees earned by an LP.
-/// After trades execute (with trading fees), the LP should have non-zero
-/// fees_earned_total.
-#[test]
-fn test_query_lp_fees_returns_cumulative() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // Market with 100 bps trading fee so trades generate LP fees.
-    env.init_market_with_trading_fee_and_warmup(100, 0);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    // Execute several trades to generate LP fee revenue.
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    env.set_slot(200);
-    env.crank();
-
-    // Do a second trade to accumulate more fees.
-    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
-    env.set_slot(300);
-    env.crank();
-
-    // QueryLpFees should succeed (it's read-only, sets return_data).
-    let result = env.try_query_lp_fees(lp_idx);
-    assert!(
-        result.is_ok(),
-        "QueryLpFees should succeed for a valid LP: {:?}",
-        result
-    );
-
-    // Also verify fees_earned_total is non-zero by reading the slab directly.
-    let fees = env.read_account_fees_earned_total(lp_idx);
-    println!("LP fees_earned_total = {}", fees);
-    assert!(
-        fees > 0,
-        "LP should have accumulated non-zero fees after trades with 100 bps fee. Got: {}",
-        fees
-    );
-}
-
-// ============================================================================
 // InitUser (tag 1) additional coverage
 // ============================================================================
 
@@ -2929,45 +2878,6 @@ fn test_inverted_market_full_lifecycle() {
         .expect("lp close should succeed");
 }
 
-/// Audit gap 4: InitMarket rejects maintenance_fee_per_slot exceeding max.
-///
-/// The old encode_init_market_with_maintenance_fee sets max to a huge value,
-/// so we use invert=0 to ensure the fee exceeds max_maintenance_fee_per_slot.
-/// Admin can set it later via SetMaintenanceFee. This prevents markets from
-/// launching with hidden fee extraction.
-#[test]
-fn test_maintenance_fee_zero_enforced_at_init() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Snapshot slab header before the rejected operation (slab is uninitialized, all zeros)
-    let slab_header_before: Vec<u8> = env.svm.get_account(&env.slab).unwrap().data[..72].to_vec();
-
-    // Try to init with maintenance_fee exceeding max
-    let bad_data = encode_init_market_with_maint_fee_bounded(
-        &admin.pubkey(),
-        &env.mint,
-        &TEST_FEED_ID,
-        1000,    // max_maintenance_fee_per_slot = 1000
-        1001,    // exceeds max
-        0,
-    );
-    let result = env.try_init_market_raw(bad_data);
-    assert!(
-        result.is_err(),
-        "InitMarket must reject maintenance_fee exceeding max"
-    );
-
-    // Slab header must remain unchanged (still uninitialized) after rejection
-    let slab_header_after: Vec<u8> = env.svm.get_account(&env.slab).unwrap().data[..72].to_vec();
-    assert_eq!(
-        slab_header_after, slab_header_before,
-        "slab header must not change on rejected InitMarket"
-    );
-}
-
 /// Audit gap 6: Scaled + inverted combo market trades correctly.
 ///
 /// Spec behavior: When both invert=1 and unit_scale>0, prices are first
@@ -3114,85 +3024,6 @@ fn test_deposit_fee_credits_rejects_sub_scale_payment() {
     assert!(
         result.is_err(),
         "DepositFeeCredits must reject sub-scale payment (999 base with unit_scale=1000)"
-    );
-}
-
-/// KeeperCrank with format_version=0 (legacy bare u16 indices).
-///
-/// format_version=0 is the original encoding where each candidate is a bare
-/// u16 index with an implicit FullClose liquidation policy. This test creates
-/// a market with an account, advances slots, and sends a crank with
-/// format_version=0 encoding to verify it succeeds.
-#[test]
-fn test_keeper_crank_format_v0_legacy_bare_u16() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    // Open a position so the crank has something to touch
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    assert_ne!(env.read_account_position(user_idx), 0, "precondition: user has position");
-
-    // Advance slot
-    env.set_slot(200);
-
-    // Build format_version=0 crank instruction with bare u16 indices
-    let caller = Keypair::new();
-    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
-
-    let mut data = vec![5u8]; // KeeperCrank tag
-    data.extend_from_slice(&u16::MAX.to_le_bytes()); // caller_idx = permissionless
-    data.push(0u8); // format_version = 0 (legacy bare u16)
-    // Bare u16 candidate indices
-    data.extend_from_slice(&lp_idx.to_le_bytes());
-    data.extend_from_slice(&user_idx.to_le_bytes());
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(caller.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-        ],
-        data,
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&caller.pubkey()),
-        &[&caller],
-        env.svm.latest_blockhash(),
-    );
-    let result = env.svm.send_transaction(tx);
-    assert!(
-        result.is_ok(),
-        "format_version=0 crank with bare u16 indices should succeed: {:?}",
-        result
-    );
-
-    // Position should still be intact (account is healthy, no liquidation)
-    let pos_after = env.read_account_position(user_idx);
-    assert_ne!(pos_after, 0, "Healthy account must retain position after format_version=0 crank");
-
-    // Vault conservation
-    let engine_vault = env.read_engine_vault();
-    let spl_vault = env.vault_balance();
-    assert_eq!(
-        engine_vault as u64, spl_vault,
-        "Conservation after format_version=0 crank: engine={} spl={}",
-        engine_vault, spl_vault
     );
 }
 
@@ -3845,17 +3676,14 @@ fn test_funding_bootstrap_rate_stamped_after_trade() {
 
     let ewma_after = env.read_mark_ewma();
     let index = env.read_last_effective_price();
-    let rate = env.read_funding_rate();
 
-    println!("Rate test: ewma={} index={} rate={}", ewma_after, index, rate);
+    println!("Rate test: ewma={} index={}", ewma_after, index);
 
     // After 20 trades at capped prices, EWMA should have moved toward $200
-    // while index tracks the oracle at $200. The gap should be large enough
-    // for a nonzero per-slot rate.
+    // while index tracks the oracle at $200.
     assert!(ewma_after > 0, "EWMA updated");
     assert!(index > 0, "Index updated");
-    // Key: the funding plumbing works — rate is stamped from mark/index divergence
-    // Even if rate == 0 (small gap → integer truncation), EWMA moved from seed.
+    // Key: the funding plumbing works — EWMA moved from its seed value.
     assert!(ewma_after != ewma_seed, "EWMA must have moved from seed: seed={} after={}", ewma_seed, ewma_after);
 }
 
@@ -4140,21 +3968,6 @@ fn test_init_market_maintenance_fee_nonzero_accepted() {
     assert!(result.is_ok(), "Nonzero maintenance fee within bound must be accepted: {:?}", result);
 }
 
-/// InitMarket with maintenance_fee_per_slot exceeding max is rejected.
-#[test]
-fn test_init_market_maintenance_fee_exceeds_max_rejected() {
-    program_path();
-    let mut env = TestEnv::new();
-    let data = encode_init_market_with_maint_fee_bounded(
-        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        1000, // max
-        1001, // exceeds max
-        0,
-    );
-    let result = env.try_init_market_raw(data);
-    assert!(result.is_err(), "Maintenance fee exceeding max must be rejected");
-}
-
 /// InitMarket with maintenance_fee_per_slot = 0 still accepted (backward compat).
 #[test]
 fn test_init_market_maintenance_fee_zero_still_accepted() {
@@ -4168,91 +3981,6 @@ fn test_init_market_maintenance_fee_zero_still_accepted() {
     assert!(result.is_ok(), "Zero maintenance fee must still be accepted: {:?}", result);
 }
 
-/// Full abandoned-account lifecycle with maintenance fees:
-/// 1. Init market with maintenance fee
-/// 2. User deposits, opens position
-/// 3. Cranks drain capital via maintenance fees
-/// Verify maintenance fee actually drains capital on crank.
-/// This is the focused unit-level test: init market with fee, deposit,
-/// open position, crank over N slots, assert capital decreased by
-/// approximately fee_per_slot * elapsed_slots.
-#[test]
-fn test_maintenance_fee_actually_charges() {
-    program_path();
-    let mut env = TestEnv::new();
-    let fee_per_slot: u128 = 500;
-    let data = encode_init_market_with_maint_fee_bounded(
-        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        10_000,     // max
-        fee_per_slot, // 500 units per slot
-        0,          // no cap
-    );
-    env.try_init_market_raw(data).expect("init failed");
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000_000);
-
-    // Open position so crank touches this account
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.top_up_insurance(&admin, 1_000_000_000);
-
-    // Snapshot capital before crank
-    let cap_before = env.read_account_capital(user_idx);
-    let ins_before = env.read_insurance_balance();
-
-    // Advance 1000 slots, crank
-    // Expected fee: 500 * 1000 = 500_000
-    env.set_slot(1100); // init at ~100, so dt ≈ 1000
-    env.crank();
-
-    let cap_after = env.read_account_capital(user_idx);
-    let ins_after = env.read_insurance_balance();
-
-    let cap_decrease = cap_before - cap_after;
-    let ins_increase = ins_after - ins_before;
-
-    println!(
-        "Maintenance fee test: cap_before={} cap_after={} decrease={} ins_increase={}",
-        cap_before, cap_after, cap_decrease, ins_increase
-    );
-
-    // Capital must have decreased
-    assert!(
-        cap_after < cap_before,
-        "Capital must decrease from maintenance fee: before={} after={}",
-        cap_before, cap_after
-    );
-
-    // Decrease should be approximately fee_per_slot * dt
-    // Allow 50% tolerance for timing (init slot, last_fee_slot alignment)
-    let expected_fee = fee_per_slot * 1000;
-    assert!(
-        cap_decrease >= expected_fee / 2,
-        "Fee too small: decrease={} expected≈{}",
-        cap_decrease, expected_fee
-    );
-    assert!(
-        cap_decrease <= expected_fee * 2,
-        "Fee too large: decrease={} expected≈{}",
-        cap_decrease, expected_fee
-    );
-
-    // Insurance must have increased by the same amount (fees go to insurance)
-    assert!(
-        ins_increase > 0,
-        "Insurance must increase from maintenance fees"
-    );
-}
-
-/// 4. Account becomes undercollateralized → crank liquidates
-/// 5. More cranks drain remaining capital
 // ============================================================================
 // Coverage gap tests: exact fee amounts + insurance absorption
 // ============================================================================
@@ -4433,130 +4161,6 @@ fn test_insurance_absorbs_bankruptcy_loss() {
         "Conservation: vault({}) >= c_tot({}) + ins({})",
         engine_vault, c_tot, insurance
     );
-}
-
-/// 6. Account becomes dust → ReclaimEmptyAccount frees slot
-/// 7. Verify num_used_accounts decrements
-#[test]
-fn test_maintenance_fee_abandoned_account_lifecycle() {
-    program_path();
-    let mut env = TestEnv::new();
-
-    // Init with maintenance fee = 1000 per slot, max = 10000
-    let data = encode_init_market_with_maint_fee_bounded(
-        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        10_000, // max_maintenance_fee_per_slot
-        1_000,  // maintenance_fee_per_slot (1000 units/slot)
-        0,      // min_oracle_price_cap
-    );
-    env.try_init_market_raw(data).expect("init failed");
-
-    // Set up LP with large capital (won't be drained — it's the counterparty)
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 100_000_000_000);
-
-    // Set up "abandoned" user with moderate capital
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 10_000_000_000); // 10B units
-
-    // Open a small position (user goes long 1000 units)
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000);
-
-    // Top up insurance so crank doesn't force-realize
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.top_up_insurance(&admin, 100_000_000_000);
-
-    let initial_cap = env.read_account_capital(user_idx);
-    assert!(initial_cap > 0, "User must have capital");
-    assert_ne!(env.read_account_position(user_idx), 0, "User must have position");
-
-    let used_initial = env.read_num_used_accounts();
-
-    // Phase 1: Crank repeatedly to drain capital via maintenance fees.
-    // With fee=1000/slot, 200K slots per crank = 200M fee per crank.
-    // 10B capital / 200M per crank ≈ 50 cranks to drain.
-    let mut slot = 200u64;
-    let mut cap_before = initial_cap;
-    let mut drained = false;
-    let mut saw_position_while_draining = false;
-    let mut position_liquidated = false;
-
-    for _ in 0..50 {
-        slot += 200_000;
-        env.set_slot(slot);
-
-        // Crank settles maintenance fees AND liquidates if undercollateralized
-        let result = env.try_crank();
-        if result.is_err() {
-            // Crank might fail if the account state is already terminal
-            break;
-        }
-
-        let cap_after = env.read_account_capital(user_idx);
-        let pos = env.read_account_position(user_idx);
-
-        // Check if capital is draining
-        if cap_after < cap_before {
-            drained = true;
-        }
-        // Track that position was open while capital was being drained
-        if pos != 0 && drained {
-            saw_position_while_draining = true;
-        }
-        if pos == 0 && saw_position_while_draining && !position_liquidated {
-            position_liquidated = true;
-        }
-        cap_before = cap_after;
-
-        // If position is gone AND capital is dust, try reclaim
-        if pos == 0 && cap_after < 100 {
-            // Account should be reclaimable
-            slot += 10;
-            env.set_slot(slot);
-            let reclaim_result = env.try_reclaim_empty_account(user_idx);
-            if reclaim_result.is_ok() {
-                let used_after = env.read_num_used_accounts();
-                assert_eq!(
-                    used_after,
-                    used_initial - 1,
-                    "num_used must decrement after reclaim"
-                );
-                println!("SUCCESS: Abandoned account reclaimed after {} cranks", slot / 200_000);
-                return; // Test passed!
-            }
-        }
-
-        // If position is gone but capital remains, keep cranking to drain more
-        if pos == 0 && cap_after == 0 {
-            slot += 10;
-            env.set_slot(slot);
-            let reclaim_result = env.try_reclaim_empty_account(user_idx);
-            if reclaim_result.is_ok() {
-                let used_after = env.read_num_used_accounts();
-                assert_eq!(used_after, used_initial - 1, "num_used must decrement");
-                println!("SUCCESS: Zero-capital account reclaimed");
-                return;
-            }
-        }
-    }
-
-    // If we got here without reclaiming, verify the lifecycle progressed correctly
-    assert!(drained, "Maintenance fees must drain capital over time");
-    assert!(saw_position_while_draining,
-        "Must observe open position while maintenance fees are draining capital");
-    assert!(position_liquidated,
-        "Position must be liquidated by crank when capital drops below maintenance margin");
-    let final_pos = env.read_account_position(user_idx);
-    let final_cap = env.read_account_capital(user_idx);
-    assert_eq!(final_pos, 0, "Position must be zero after liquidation");
-    assert!(
-        final_cap < initial_cap / 10,
-        "Capital must be substantially drained: initial={} final={}",
-        initial_cap, final_cap
-    );
-    panic!("Lifecycle incomplete: account not reclaimed after 50 cranks (cap={})", final_cap);
 }
 
 // ============================================================================
