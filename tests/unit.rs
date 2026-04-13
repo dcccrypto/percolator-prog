@@ -471,6 +471,29 @@ fn test_struct_sizes() {
     println!("ENGINE_OFF: {}", percolator_prog::constants::ENGINE_OFF);
     println!("ENGINE_LEN: {}", percolator_prog::constants::ENGINE_LEN);
     println!("SLAB_LEN: {}", percolator_prog::constants::SLAB_LEN);
+
+    // Print MarketConfig layout
+    println!("HEADER_LEN: {}", percolator_prog::constants::HEADER_LEN);
+    println!("CONFIG_LEN: {}", percolator_prog::constants::CONFIG_LEN);
+    println!("Offset of last_effective_price_e6: {}", offset_of!(state::MarketConfig, last_effective_price_e6));
+    println!("Slab offset of last_effective_price_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, last_effective_price_e6));
+    println!("Offset of authority_price_e6: {}", offset_of!(state::MarketConfig, authority_price_e6));
+    println!("Slab offset of authority_price_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, authority_price_e6));
+    println!("Offset of oracle_price_cap_e2bps: {}", offset_of!(state::MarketConfig, oracle_price_cap_e2bps));
+    println!("Slab offset of oracle_price_cap_e2bps: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, oracle_price_cap_e2bps));
+    println!("Offset of max_staleness_secs: {}", offset_of!(state::MarketConfig, max_staleness_secs));
+    println!("Slab offset of max_staleness_secs: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, max_staleness_secs));
+    println!("Offset of RiskEngine.side_mode_long: {}", offset_of!(RiskEngine, side_mode_long));
+    println!("Slab offset of side_mode_long: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, side_mode_long));
+    // MarketConfig field offsets for admin limits test
+    println!("Offset of maintenance_fee_per_slot: {}", offset_of!(state::MarketConfig, maintenance_fee_per_slot));
+    println!("Slab offset of maintenance_fee_per_slot: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, maintenance_fee_per_slot));
+    println!("Offset of max_insurance_floor: {}", offset_of!(state::MarketConfig, max_insurance_floor));
+    println!("Slab offset of max_insurance_floor: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, max_insurance_floor));
+    println!("Offset of min_oracle_price_cap_e2bps: {}", offset_of!(state::MarketConfig, min_oracle_price_cap_e2bps));
+    println!("Slab offset of min_oracle_price_cap_e2bps: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, min_oracle_price_cap_e2bps));
+    println!("Offset of mark_ewma_e6: {}", offset_of!(state::MarketConfig, mark_ewma_e6));
+    println!("Slab offset of mark_ewma_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, mark_ewma_e6));
 }
 
 #[test]

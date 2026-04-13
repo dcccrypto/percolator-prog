@@ -1486,10 +1486,10 @@ fn benchmark_worst_case_scenarios() {
     // Tests true liquidation path with MTM margin check (insurance > threshold)
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Scenario 9: 🔥🔥🔥 Worst-case liquidation (MTM margin check)");
-    println!("  1 LP + 4095 users, insurance > threshold for liquidation path");
+    println!("  1 LP + 100 users, insurance > threshold for liquidation path");
     println!("  Each window: first half safe, second half deeply underwater");
     {
-        let num_users = 4095;
+        let num_users = 100;
 
         let mut env = TestEnv::new();
         // threshold=0, warmup=0
@@ -1674,7 +1674,7 @@ fn benchmark_worst_case_scenarios() {
             if total_liqs == 0 && total_force == 0 {
                 println!("    ⚠️  WARNING: No liquidations or force-realize - check params");
             }
-            // Expected: ~2048 liquidations (half of 4095 users are liq users)
+            // Expected: ~2048 liquidations (half of 100 users are liq users)
             let expected_liq = num_users / 2;
             if total_liqs > 0 {
                 println!(

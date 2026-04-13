@@ -435,7 +435,9 @@ fn test_update_admin_zero_accepted_for_burn() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // Use init_market_with_cap with permissionless resolve + force_close_delay
+    // because admin burn requires both for live markets (liveness guard).
+    env.init_market_with_cap(0, 10_000, 100);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
@@ -644,27 +646,37 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // Per-market admin limits
-    data.extend_from_slice(&1000u128.to_le_bytes()); // max_maintenance_fee = 1000
-    data.extend_from_slice(&50_000u128.to_le_bytes()); // max_risk_threshold = 50_000
+    // Per-market admin limits (current wire format)
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
+    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams with values AT the limits (equality)
-    data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
+    // RiskParams
+    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&50_000u128.to_le_bytes()); // risk_reduction_threshold == limit
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee (must be 0 per §8.2)
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
+    data.extend_from_slice(&0u64.to_le_bytes()); // h_max (must be >= h_min=0)
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
+    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    // Extended tail (required for v2 format)
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -775,28 +787,26 @@ fn test_admin_limits_lifecycle() {
 
     // Step 6: Verify limit fields in config haven't been corrupted
     let slab = env.svm.get_account(&env.slab).unwrap();
-    // max_risk_threshold is at HEADER_LEN(72) + offset within MarketConfig
-    // New fields are at the end of MarketConfig: after last_effective_price_e6
-    // MarketConfig field offsets (repr(C), u128 align 16 on x86_64):
-    // max_maintenance_fee_per_slot: u128 @ config offset 320
-    // max_risk_threshold: u128 @ config offset 336
-    // min_oracle_price_cap_e2bps: u64 @ config offset 352
-    const MAX_MAINT_FEE_OFF: usize = 72 + 320;
-    const MAX_RISK_THR_OFF: usize = 72 + 336;
-    const MIN_OPC_OFF: usize = 72 + 352;
+    // BPF slab offsets: HEADER_LEN(72) + config field offset
+    // maintenance_fee_per_slot: u128 @ config offset 352
+    // max_insurance_floor: u128 @ config offset 208
+    // min_oracle_price_cap_e2bps: u64 @ config offset 224
+    const MAINT_FEE_OFF: usize = 72 + 352;
+    const MAX_INS_FLOOR_OFF: usize = 72 + 208;
+    const MIN_OPC_OFF: usize = 72 + 224;
 
-    let max_maint = u128::from_le_bytes(
-        slab.data[MAX_MAINT_FEE_OFF..MAX_MAINT_FEE_OFF + 16].try_into().unwrap(),
+    let maint_fee = u128::from_le_bytes(
+        slab.data[MAINT_FEE_OFF..MAINT_FEE_OFF + 16].try_into().unwrap(),
     );
-    let max_risk = u128::from_le_bytes(
-        slab.data[MAX_RISK_THR_OFF..MAX_RISK_THR_OFF + 16].try_into().unwrap(),
+    let max_ins = u128::from_le_bytes(
+        slab.data[MAX_INS_FLOOR_OFF..MAX_INS_FLOOR_OFF + 16].try_into().unwrap(),
     );
     let min_opc = u64::from_le_bytes(
         slab.data[MIN_OPC_OFF..MIN_OPC_OFF + 8].try_into().unwrap(),
     );
 
-    assert_eq!(max_maint, 1000, "max_maintenance_fee_per_slot should be preserved");
-    assert_eq!(max_risk, 50_000, "max_risk_threshold should be preserved");
+    assert_eq!(maint_fee, 1000, "maintenance_fee_per_slot should be preserved");
+    assert_eq!(max_ins, 50_000, "max_insurance_floor should be preserved");
     assert_eq!(min_opc, 5000, "min_oracle_price_cap_e2bps should be preserved");
 
     println!("ADMIN LIMITS LIFECYCLE: PASSED");

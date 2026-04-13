@@ -820,7 +820,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     // Before Bug #9 fix, dt=0 caused clamp_toward_with_dt to return mark
     // instead of index, allowing the index to jump to mark in a single slot.
     let slab_data = svm.get_account(&slab).unwrap().data;
-    const INDEX_OFF: usize = 384; // last_effective_price_e6 offset in config
+    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_after = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert_eq!(
         index_after, initial_price_e6,
@@ -858,7 +858,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
 
     // Read default oracle_price_cap_e2bps (1% per slot = 10_000 e2bps)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = 72 + 304; // config offset + cap field offset
+    const CAP_OFF: usize = 72 + 192; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
     let cap_e2bps =
         u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
     assert_eq!(cap_e2bps, 10_000, "default cap should be 10_000 e2bps (1% per slot)");
@@ -872,8 +872,8 @@ fn test_hyperp_index_smoothing_rate_limited() {
     env.try_push_oracle_price(&admin, 200_000_000, 200).expect("push");
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const MARK_OFF: usize = 72 + 288;
-    const INDEX_OFF: usize = 72 + 312;
+    const MARK_OFF: usize = 72 + 304; // HEADER_LEN(72) + offset_of!(MarketConfig, mark_ewma_e6)(304)
+    const INDEX_OFF: usize = 72 + 200; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
 
     // Advance 10 slots and crank. Index should move toward mark.
     let dt: u64 = 10;

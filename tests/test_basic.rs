@@ -4356,7 +4356,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.push(1u8); // invert=1 (SOL/USD)
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-        data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maint_fee
+        data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
         data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_ins_floor
         data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap = 1%
         // RiskParams with 10 bps trading fee
@@ -4366,20 +4366,19 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&10u64.to_le_bytes()); // trading_fee_bps = 10 (0.1%)
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
-        data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-        data.extend_from_slice(&0u128.to_le_bytes()); // maint_fee
+        data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
+        data.extend_from_slice(&0u64.to_le_bytes()); // h_max (must be >= h_min=0)
         let max_crank = 99u64; // permissionless > max_crank
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
-        data.extend_from_slice(&100u64.to_le_bytes()); // liq_buffer_bps
+        data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
         data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
         data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-        data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_ins_floor_change
         data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
         // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon

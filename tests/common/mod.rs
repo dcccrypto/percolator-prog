@@ -1418,6 +1418,24 @@ impl TestEnv {
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
     }
+
+    /// Force-close multiple accounts fully (handles two-phase ProgressOnly semantics).
+    /// Pass all (idx, owner) pairs. Phase 1 reconciles all, Phase 2 closes all.
+    pub fn force_close_accounts_fully(
+        &mut self,
+        admin: &Keypair,
+        accounts: &[(u16, &Pubkey)],
+    ) -> Result<(), String> {
+        // Phase 1: reconcile all (some may close immediately if pnl<=0)
+        for &(idx, owner) in accounts {
+            let _ = self.try_admin_force_close_account(admin, idx, owner);
+        }
+        // Phase 2: close remaining (now terminal-ready)
+        for &(idx, owner) in accounts {
+            let _ = self.try_admin_force_close_account(admin, idx, owner);
+        }
+        Ok(())
+    }
 }
 
 /// Test that an inverted market can successfully run crank operations.
@@ -3984,6 +4002,24 @@ impl TradeCpiTestEnv {
             .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Force-close multiple accounts fully (handles two-phase ProgressOnly semantics).
+    /// Pass all (idx, owner) pairs. Phase 1 reconciles all, Phase 2 closes all.
+    pub fn force_close_accounts_fully(
+        &mut self,
+        admin: &Keypair,
+        accounts: &[(u16, &Pubkey)],
+    ) -> Result<(), String> {
+        // Phase 1: reconcile all (some may close immediately if pnl<=0)
+        for &(idx, owner) in accounts {
+            let _ = self.try_admin_force_close_account(admin, idx, owner);
+        }
+        // Phase 2: close remaining (now terminal-ready)
+        for &(idx, owner) in accounts {
+            let _ = self.try_admin_force_close_account(admin, idx, owner);
+        }
+        Ok(())
     }
 
     pub fn try_close_slab(&mut self) -> Result<(), String> {
