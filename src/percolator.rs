@@ -3834,20 +3834,28 @@ pub mod processor {
                 if config.maintenance_fee_per_slot > 0 {
                     let dt = clock.slot.saturating_sub(config.last_fee_charge_slot);
                     if dt > 0 {
-                        let fee_per_account = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
-                        // Charge each candidate that was processed by the crank.
-                        // Use the combined list (buffer + external candidates) to match
-                        // which accounts were touched.
+                        // Cap fee to MAX_PROTOCOL_FEE_ABS to prevent saturating_mul
+                        // from producing values the engine rejects (N2 fix).
+                        let raw_fee = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
+                        let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
+                        // Deduplicate combined list to prevent double-charging accounts
+                        // that appear in both the risk buffer and caller candidates (N1/Issue 3).
+                        let mut charged = [false; 64]; // bitmap for first 64 indices
                         for &(cidx, _) in combined.iter() {
-                            if (cidx as usize) < percolator::MAX_ACCOUNTS
-                                && engine.is_used(cidx as usize)
-                            {
-                                // Best-effort: ignore errors (account may have been
-                                // liquidated or closed during this crank).
-                                let _ = engine.charge_account_fee_not_atomic(
-                                    cidx, fee_per_account, clock.slot,
-                                );
+                            let ci = cidx as usize;
+                            if ci >= percolator::MAX_ACCOUNTS || !engine.is_used(ci) {
+                                continue;
                             }
+                            // Skip if already charged (dedup)
+                            if ci < 64 {
+                                if charged[ci] { continue; }
+                                charged[ci] = true;
+                            }
+                            // Best-effort: ignore errors (account may have been
+                            // liquidated or closed during this crank).
+                            let _ = engine.charge_account_fee_not_atomic(
+                                cidx, fee_per_account, clock.slot,
+                            );
                         }
                         config.last_fee_charge_slot = clock.slot;
                     }
@@ -4026,8 +4034,15 @@ pub mod processor {
                         core::cmp::min(delta, u64::MAX as u128) as u64
                     } else { 0u64 };
                     let old_ewma = config.mark_ewma_e6;
+                    // N4 fix: seed EWMA at oracle price on first trade (not exec price).
+                    // Prevents attacker from imprinting a biased mark on the first fill.
+                    let ewma_price = if old_ewma == 0 && config.last_effective_price_e6 > 0 {
+                        config.last_effective_price_e6
+                    } else {
+                        clamped_price
+                    };
                     config.mark_ewma_e6 = crate::verify::ewma_update(
-                        old_ewma, clamped_price,
+                        old_ewma, ewma_price,
                         config.mark_ewma_halflife_slots,
                         config.mark_ewma_last_slot, clock.slot,
                         fee_paid_nocpi,
@@ -4415,9 +4430,15 @@ pub mod processor {
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else { 0u64 };
                         let old_ewma_cpi = config.mark_ewma_e6;
+                        // N4 fix: seed at oracle on first trade
+                        let ewma_price_cpi = if old_ewma_cpi == 0 && config.last_effective_price_e6 > 0 {
+                            config.last_effective_price_e6
+                        } else {
+                            clamped_exec
+                        };
                         config.mark_ewma_e6 = crate::verify::ewma_update(
                             old_ewma_cpi,
-                            clamped_exec,
+                            ewma_price_cpi,
                             config.mark_ewma_halflife_slots,
                             config.mark_ewma_last_slot,
                             clock.slot,
