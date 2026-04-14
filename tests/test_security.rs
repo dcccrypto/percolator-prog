@@ -638,9 +638,9 @@ fn test_attack_trade_risk_increase_when_gated() {
     // But the diff is not uniform. Use the read_num_used helper's ENGINE offset (472)
     // and compute empirically. The oi_eff_long/short pair (32 bytes) precedes side_mode.
     // From code analysis: BPF side_mode_long at engine offset ~488.
-    // Slab absolute = 472 + 488 = 960.
+    // Slab absolute = 472 + 960 = 960.
     // Fallback: try the value and if the trade still works, try adjacent offsets.
-    const SIDE_MODE_LONG_OFF: usize = 472 + 496; // BPF ENGINE_OFF + BPF offset of side_mode_long
+    const SIDE_MODE_LONG_OFF: usize = 472 + 536; // BPF ENGINE_OFF + BPF offset of side_mode_long
     {
         let original_slab = env
             .svm

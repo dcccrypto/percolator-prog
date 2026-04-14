@@ -23,8 +23,8 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
-// SLAB_LEN for production BPF (MAX_ACCOUNTS=2048, v12.15 Account with reserve cohort queues)
-const SLAB_LEN: usize = 1451800;
+// SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
+const SLAB_LEN: usize = 1451848;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

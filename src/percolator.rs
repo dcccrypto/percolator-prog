@@ -268,9 +268,11 @@ pub mod verify {
     }
 
     /// Nonce update on success: advances by 1.
+    /// Returns None if the nonce would overflow (u64::MAX reached).
+    /// Overflow must reject the trade — wrapping would reopen old request IDs.
     #[inline]
-    pub fn nonce_on_success(old: u64) -> u64 {
-        old.wrapping_add(1)
+    pub fn nonce_on_success(old: u64) -> Option<u64> {
+        old.checked_add(1)
     }
 
     /// Nonce update on failure: unchanged.
@@ -396,9 +398,14 @@ pub mod verify {
         if !abi_ok {
             return TradeCpiDecision::Reject;
         }
+        // 6. Nonce overflow check
+        let new_nonce = match nonce_on_success(old_nonce) {
+            Some(n) => n,
+            None => return TradeCpiDecision::Reject,
+        };
         // All checks passed - accept the trade
         TradeCpiDecision::Accept {
-            new_nonce: nonce_on_success(old_nonce),
+            new_nonce,
             chosen_size: cpi_trade_size(exec_size, 0), // 0 is placeholder for requested_size
         }
     }
@@ -514,8 +521,11 @@ pub mod verify {
         if !identity_ok {
             return TradeCpiDecision::Reject;
         }
-        // 5. Compute req_id from nonce and validate ABI
-        let req_id = nonce_on_success(old_nonce);
+        // 5. Compute req_id from nonce (reject on overflow) and validate ABI
+        let req_id = match nonce_on_success(old_nonce) {
+            Some(n) => n,
+            None => return TradeCpiDecision::Reject,
+        };
         if !abi_ok(ret, lp_account_id, oracle_price_e6, req_size, req_id) {
             return TradeCpiDecision::Reject;
         }
@@ -1848,6 +1858,18 @@ pub mod state {
         data[RESERVED_OFF..RESERVED_OFF + 8].copy_from_slice(&nonce.to_le_bytes());
     }
 
+    /// Read the monotonic materialization counter from _reserved[8..16].
+    /// Incremented on every InitUser/InitLP to provide stable account identity
+    /// that survives slot reuse after GC reclamation.
+    pub fn read_mat_counter(data: &[u8]) -> u64 {
+        u64::from_le_bytes(data[RESERVED_OFF + 8..RESERVED_OFF + 16].try_into().unwrap())
+    }
+
+    /// Write the materialization counter.
+    pub fn write_mat_counter(data: &mut [u8], counter: u64) {
+        data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&counter.to_le_bytes());
+    }
+
     // ========================================
     // Market Flags (stored in _padding[0] at offset 13)
     // ========================================
@@ -1863,6 +1885,10 @@ pub mod state {
     /// Set before matcher CPI, cleared after. Any reentrant instruction
     /// that sees this flag must abort.
     pub const FLAG_CPI_IN_PROGRESS: u8 = 1 << 2;
+    /// Flag bit: engine has received a real oracle price (not the init sentinel).
+    /// Set on first successful oracle read (crank/trade/settle).
+    /// Eliminates the "price 1 means uninitialized" sentinel overload.
+    pub const FLAG_ORACLE_INITIALIZED: u8 = 1 << 3;
 
     /// Read market flags from _padding[0].
     pub fn read_flags(data: &[u8]) -> u8 {
@@ -1899,6 +1925,17 @@ pub mod state {
     /// Set the policy-configured flag.
     pub fn set_policy_configured(data: &mut [u8]) {
         let flags = read_flags(data) | FLAG_POLICY_CONFIGURED;
+        write_flags(data, flags);
+    }
+
+    /// Check if engine has received a real oracle price.
+    pub fn is_oracle_initialized(data: &[u8]) -> bool {
+        read_flags(data) & FLAG_ORACLE_INITIALIZED != 0
+    }
+
+    /// Mark engine as having received a real oracle price.
+    pub fn set_oracle_initialized(data: &mut [u8]) {
+        let flags = read_flags(data) | FLAG_ORACLE_INITIALIZED;
         write_flags(data, flags);
     }
 
@@ -2800,10 +2837,14 @@ pub mod processor {
         funding_rate_e9: i128,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
+        // Instance-stable LP identity (see TradeCpi handler)
+        let owner_prefix = u64::from_le_bytes(
+            lp.owner[0..8].try_into().unwrap(),
+        );
         let exec = matcher.execute_match(
             &lp.matcher_program,
             &lp.matcher_context,
-            lp_idx as u64,
+            lp_idx as u64 ^ owner_prefix,
             oracle_price,
             size,
         )?;
@@ -3392,6 +3433,10 @@ pub mod processor {
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
                 state::write_req_nonce(&mut data, 0);
+                // Hyperp: oracle is initialized from genesis (mark IS the oracle)
+                if is_hyperp {
+                    state::set_oracle_initialized(&mut data);
+                }
             }
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 6)?;
@@ -3777,6 +3822,12 @@ pub mod processor {
                 };
 
                 state::write_config(&mut data, &config);
+                // Mark oracle as initialized on first successful read.
+                // The crank is always the first instruction that reads oracle
+                // after init (require_fresh_crank gate blocks trades before crank).
+                if !state::is_oracle_initialized(&data) {
+                    state::set_oracle_initialized(&mut data);
+                }
 
                 // Read risk buffer BEFORE engine borrow (disjoint regions,
                 // but borrow checker can't see that).
@@ -4176,8 +4227,10 @@ pub mod processor {
 
                     // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
                     // Nonce advancement via verify helper (Kani-provable)
+                    // Reject if nonce would overflow — wrapping reopens old request IDs.
                     let nonce = state::read_req_nonce(&*data);
-                    let req_id = crate::verify::nonce_on_success(nonce);
+                    let req_id = crate::verify::nonce_on_success(nonce)
+                        .ok_or(PercolatorError::EngineOverflow)?;
 
                     let engine = zc::engine_ref(&*data)?;
 
@@ -4203,8 +4256,14 @@ pub mod processor {
                     }
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
+                    // Instance-stable LP identity: XOR slot index with owner prefix.
+                    // Changes on re-materialization (new owner at same slot),
+                    // preventing stale matcher state from binding to a reused slot.
+                    let owner_prefix = u64::from_le_bytes(
+                        lp_acc.owner[0..8].try_into().unwrap(),
+                    );
                     (
-                        lp_idx as u64,
+                        lp_idx as u64 ^ owner_prefix,
                         config,
                         config_pre_oracle,
                         req_id,
@@ -4979,10 +5038,13 @@ pub mod processor {
                 funding_max_premium_bps,
                 funding_max_bps_per_slot,
             } => {
+                // Accept 3 or 4 accounts: (admin, slab, clock[, oracle]).
+                // Optional oracle enables authoritative accrual on non-Hyperp markets.
                 accounts::expect_len(accounts, 3)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_clock = &accounts[2];
+                let a_oracle_opt = if accounts.len() > 3 { Some(&accounts[3]) } else { None };
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
@@ -5037,12 +5099,28 @@ pub mod processor {
                 {
                     let accrual_price = if oracle::is_hyperp_mode(&config) {
                         config.last_effective_price_e6
+                    } else if let Some(a_oracle) = a_oracle_opt {
+                        // Authoritative path: fresh oracle read for non-Hyperp.
+                        // Also updates last_effective_price_e6 (circuit-breaker baseline)
+                        // and stamps oracle liveness for permissionless resolve tracking.
+                        match read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot) {
+                            Ok(price) => {
+                                if !state::is_oracle_initialized(&data) {
+                                    state::set_oracle_initialized(&mut data);
+                                }
+                                state::write_config(&mut data, &config);
+                                price
+                            }
+                            Err(_) => {
+                                // Oracle read failed — fall back to engine state.
+                                let engine = zc::engine_ref(&data)?;
+                                if state::is_oracle_initialized(&data) { engine.last_oracle_price } else { 0 }
+                            }
+                        }
                     } else {
-                        // Non-Hyperp: use last oracle price ONLY if engine has seen
-                        // a real oracle (last_oracle_price > 1). Sentinel price 1
-                        // from init must never be used for accrual.
+                        // No oracle account provided — best-effort from engine state.
                         let engine = zc::engine_ref(&data)?;
-                        if engine.last_oracle_price > 1 { engine.last_oracle_price } else { 0 }
+                        if state::is_oracle_initialized(&data) { engine.last_oracle_price } else { 0 }
                     };
                     if accrual_price > 0 {
                         let engine = zc::engine_mut(&mut data)?;
@@ -5058,16 +5136,14 @@ pub mod processor {
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
                 // Run end-of-instruction lifecycle after accrue + config change.
                 // Finalizes pending resets triggered by the accrual.
+                // Propagate ALL errors — on live markets, lifecycle failures
+                // indicate real problems (partial state already committed via
+                // zero-copy mutation, so we must reject to avoid silent corruption).
                 {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-                    }
+                    engine.run_end_of_instruction_lifecycle(&mut ctx)
+                        .map_err(map_risk_error)?;
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5251,13 +5327,8 @@ pub mod processor {
                 if is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-                    }
+                    engine.run_end_of_instruction_lifecycle(&mut ctx)
+                        .map_err(map_risk_error)?;
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5337,16 +5408,12 @@ pub mod processor {
 
                 config.oracle_price_cap_e2bps = max_change_e2bps;
                 // Run end-of-instruction lifecycle after accrue + cap change.
+                // Propagate ALL errors on live markets.
                 if is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-                    }
+                    engine.run_end_of_instruction_lifecycle(&mut ctx)
+                        .map_err(map_risk_error)?;
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5375,7 +5442,7 @@ pub mod processor {
                 }
 
                 // Require admin oracle price to be set (authority_price_e6 > 0)
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 if config.authority_price_e6 == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -5389,17 +5456,15 @@ pub mod processor {
                         return Err(PercolatorError::OracleStale.into());
                     }
                 }
-                // Non-Hyperp: settlement price must be within circuit-breaker
-                // bounds of a FRESH external oracle read. Uses the live
-                // oracle_price_cap_e2bps (not just the immutable floor) so markets
-                // with min_cap=0 but live cap>0 still get the settlement guard.
-                // Hyperp: admin IS the price source, no external baseline.
-                // If the oracle is stale/dead, skip the guard — the admin must
-                // be able to resolve even when the oracle has died (prevents deadlock
-                // on markets with nonzero cap floor + dead oracle).
-                if !oracle::is_hyperp_mode(&config)
-                    && config.oracle_price_cap_e2bps != 0
-                {
+                // Read fresh external oracle for two purposes:
+                // 1. Settlement circuit-breaker guard (when cap > 0)
+                // 2. Pass as live_oracle_price to engine for self-synchronizing
+                //    final accrual and deviation band check
+                // Hyperp: admin IS the price source; live_oracle = index.
+                // Non-Hyperp: always try to read fresh oracle; fall back to
+                // engine.last_oracle_price only if oracle is genuinely dead.
+                let mut fresh_live_oracle: Option<u64> = None;
+                if !oracle::is_hyperp_mode(&config) {
                     let clock_tmp = Clock::from_account_info(a_clock)?;
                     let oracle_result = oracle::read_engine_price_e6(
                         a_oracle,
@@ -5412,14 +5477,25 @@ pub mod processor {
                     );
                     match oracle_result {
                         Ok(fresh_oracle) => {
-                            // Oracle is live — enforce settlement guard
-                            let clamped = oracle::clamp_oracle_price(
+                            fresh_live_oracle = Some(fresh_oracle);
+                            // Update the circuit-breaker baseline from this fresh read
+                            // so compute_current_funding_rate_e9 uses the freshest index.
+                            config.last_effective_price_e6 = oracle::clamp_oracle_price(
+                                config.last_effective_price_e6,
                                 fresh_oracle,
-                                config.authority_price_e6,
                                 config.oracle_price_cap_e2bps,
                             );
-                            if clamped != config.authority_price_e6 {
-                                return Err(PercolatorError::OracleInvalid.into());
+                            // Settlement guard: when cap > 0, settlement price
+                            // must be within circuit-breaker bounds of fresh oracle.
+                            if config.oracle_price_cap_e2bps != 0 {
+                                let clamped = oracle::clamp_oracle_price(
+                                    fresh_oracle,
+                                    config.authority_price_e6,
+                                    config.oracle_price_cap_e2bps,
+                                );
+                                if clamped != config.authority_price_e6 {
+                                    return Err(PercolatorError::OracleInvalid.into());
+                                }
                             }
                         }
                         Err(e) => {
@@ -5431,7 +5507,7 @@ pub mod processor {
                             if e != stale_err {
                                 return Err(e);
                             }
-                            // OracleStale = oracle is dead, allow admin to resolve
+                            // OracleStale = oracle is dead, fall back to engine state
                         }
                     }
                 }
@@ -5469,14 +5545,20 @@ pub mod processor {
                 };
 
                 // Call the engine's resolve_market transition.
-                // This does final accrual at settlement price, sets MarketMode::Resolved,
+                // This does final accrual at live_oracle_price, sets MarketMode::Resolved,
                 // matures all PnL, zeros OI, and drains/finalizes sides.
-                // For non-Hyperp: use the fresh oracle price read earlier (if available)
-                // as live_oracle_price for the engine's deviation band check.
-                // For Hyperp or when oracle was stale/dead: fall back to engine.last_oracle_price.
+                // Non-Hyperp: use the fresh external oracle read from above.
+                //   Falls back to engine.last_oracle_price only if oracle is dead.
+                // Hyperp: use the (just-flushed) index as live oracle.
                 let engine = zc::engine_mut(&mut data)?;
-                let live_oracle = engine.last_oracle_price;
-                engine.resolve_market(
+                let live_oracle = if let Some(fresh) = fresh_live_oracle {
+                    fresh
+                } else if oracle::is_hyperp_mode(&config) {
+                    config.last_effective_price_e6
+                } else {
+                    engine.last_oracle_price
+                };
+                engine.resolve_market_not_atomic(
                     settlement_price,
                     live_oracle,
                     clock.slot,
@@ -6296,11 +6378,10 @@ pub mod processor {
                     if mark > 0 { mark } else { config.authority_price_e6 }
                 } else {
                     let engine = zc::engine_ref(&data)?;
-                    if engine.last_oracle_price <= 1 {
+                    if !state::is_oracle_initialized(&data) {
                         // Oracle never initialized — only safe if no open positions.
                         // Accounts may exist (deposits-only) but if OI is zero,
-                        // there is no position-dependent settlement risk and the
-                        // sentinel price is harmless.
+                        // there is no position-dependent settlement risk.
                         if engine.oi_eff_long_q > 0 || engine.oi_eff_short_q > 0 {
                             return Err(PercolatorError::OracleInvalid.into());
                         }
@@ -6313,11 +6394,16 @@ pub mod processor {
                 };
 
                 // Call engine resolve_market with canonical settlement price.
-                // Pass engine.last_oracle_price as live_oracle_price for meaningful
-                // deviation band check.
+                // Permissionless: oracle is confirmed dead, so use engine.last_oracle_price
+                // (last known good price) as live_oracle for the deviation band.
+                // Hyperp: use the (just-flushed) index as live oracle.
                 let engine = zc::engine_mut(&mut data)?;
-                let live_oracle = engine.last_oracle_price;
-                engine.resolve_market(
+                let live_oracle = if oracle::is_hyperp_mode(&config) {
+                    config.last_effective_price_e6
+                } else {
+                    engine.last_oracle_price
+                };
+                engine.resolve_market_not_atomic(
                     settlement_price,
                     live_oracle,
                     clock.slot,

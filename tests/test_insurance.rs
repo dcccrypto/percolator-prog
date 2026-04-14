@@ -134,6 +134,8 @@ fn test_limited_insurance_withdraw_defaults_enforced() {
     let insurance_before = env.read_insurance_balance();
     assert_eq!(insurance_before, 10_000_000_000, "precondition: insurance seeded");
 
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve must succeed before insurance withdraw");
     assert!(env.is_market_resolved(), "market should be resolved");
@@ -212,6 +214,8 @@ fn test_limited_insurance_withdraw_custom_policy_enforced() {
         .expect("oracle price push must succeed");
 
     env.top_up_insurance(&admin, 10_000_000_000);
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve must succeed before policy update");
 
@@ -330,6 +334,8 @@ fn test_limited_insurance_withdraw_cooldown_enforced_from_slot_zero() {
         .expect("oracle price push must succeed");
 
     env.top_up_insurance(&admin, 10_000_000_000);
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve must succeed before policy update");
 
@@ -391,6 +397,8 @@ fn test_limited_insurance_withdraw_min_floor_when_percent_cap_small() {
         .expect("oracle price push must succeed");
 
     env.top_up_insurance(&admin, 10_000);
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve must succeed before policy update");
 
@@ -460,6 +468,8 @@ fn test_limited_insurance_withdraw_default_min_floor_respects_unit_scale() {
         "precondition: insurance should be seeded in scaled units"
     );
 
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve must succeed before limited withdraw");
 
@@ -539,6 +549,8 @@ fn test_limited_insurance_withdraw_failed_attempts_do_not_arm_cooldown() {
         .expect("oracle price push must succeed");
 
     env.top_up_insurance(&admin, 10_000_000_000);
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve must succeed before policy update");
 
@@ -635,6 +647,8 @@ fn test_limited_insurance_policy_validation_and_resolution_gates() {
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
     env.top_up_insurance(&admin, 1_000_000_000);
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("resolve should succeed");
 
@@ -804,6 +818,8 @@ fn test_admin_withdraw_insurance_bypasses_limited_policy() {
     env.top_up_insurance(&admin, 10_000_000_000);
     assert_eq!(env.read_insurance_balance(), 10_000_000_000, "precondition: insurance seeded");
 
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin).expect("resolve");
     assert!(env.is_market_resolved(), "market should be resolved");
 
@@ -1043,6 +1059,8 @@ fn test_attack_topup_insurance_after_resolution() {
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
+    env.set_slot(100);
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("market resolution setup must succeed");
 
@@ -1720,6 +1738,8 @@ fn test_insurance_withdraw_cooldown_enforcement() {
     env.set_slot(1);
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+    env.set_slot(200);
+    env.crank();
     env.try_resolve_market(&admin).unwrap();
 
     // Configure: 100% per withdrawal, 1000 slot cooldown
@@ -1755,6 +1775,8 @@ fn test_insurance_withdraw_bps_cap() {
     env.set_slot(1);
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+    env.set_slot(200);
+    env.crank();
     env.try_resolve_market(&admin).unwrap();
 
     // Configure: max 50% (5000 bps) per withdrawal

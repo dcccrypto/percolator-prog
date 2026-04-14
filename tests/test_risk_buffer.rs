@@ -802,3 +802,138 @@ fn test_buffer_only_liquidation_no_external_candidates() {
 //          test_deposit_does_not_settle_pending_maintenance_fee
 // ============================================================================
 
+
+#[test]
+fn test_calibrate_bpf_offsets() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    let eng = 472usize; // ENGINE_OFF
+
+    // Find num_used=2 + free_head=2
+    for off in 0..2000 {
+        let nu = u16::from_le_bytes(d[eng+off..eng+off+2].try_into().unwrap());
+        let fh = u16::from_le_bytes(d[eng+off+2..eng+off+4].try_into().unwrap());
+        if nu == 2 && fh == 2 { println!("NUM_USED: ENGINE+{}", off); }
+    }
+    // Find ADL_ONE=1_000_000 as u128 in engine fixed region
+    let adl_one = 1_000_000u128.to_le_bytes();
+    for off in 0..1500 {
+        if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == adl_one {
+            println!("ADL_ONE: ENGINE+{}", off);
+        }
+    }
+    // Find c_tot near 110B
+    for off in (0..500).step_by(8) {
+        if eng+off+16 > d.len() { break; }
+        let v = u128::from_le_bytes(d[eng+off..eng+off+16].try_into().unwrap());
+        if v > 100_000_000_000 && v < 120_000_000_000 {
+            println!("C_TOT candidate: ENGINE+{} = {}", off, v);
+        }
+    }
+    // Find insurance=1B
+    let ins = 1_000_000_000u128.to_le_bytes();
+    for off in 0..100 {
+        if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == ins {
+            println!("INSURANCE: ENGINE+{}", off);
+        }
+    }
+}
+
+#[test]
+fn test_find_adl_offsets() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+    // Don't trade — ADL mults should be ADL_ONE = 1_000_000
+    env.crank(); // just crank
+    
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    let eng = 472usize;
+    let adl_one = 1_000_000u128.to_le_bytes();
+    println!("=== ADL_ONE scan (400-700) ===");
+    for off in (400..700).step_by(8) {
+        if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == adl_one {
+            println!("ADL_ONE at ENGINE+{}", off);
+        }
+    }
+    // Also find epoch values (small u64s)
+    println!("=== Small u64 scan (470-550) ===");
+    for off in (470..550).step_by(8) {
+        if eng+off+8 <= d.len() {
+            let v = u64::from_le_bytes(d[eng+off..eng+off+8].try_into().unwrap());
+            if v > 0 && v < 10 { println!("u64={} at ENGINE+{}", v, off); }
+        }
+    }
+}
+
+#[test]
+fn test_find_adl_correct_value() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+    env.crank();
+    
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    let eng = 472usize;
+    let adl_one = 1_000_000_000_000_000u128.to_le_bytes();
+    for off in (300..700).step_by(8) {
+        if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == adl_one {
+            println!("ADL_ONE(10^15) at ENGINE+{}", off);
+        }
+    }
+    // Also find in Account for a_basis
+    let accts_off = eng + 9424;
+    for idx in 0..3u16 {
+        let acc = accts_off + (idx as usize) * 352;
+        for off in (60..100).step_by(8) {
+            if acc+off+16 <= d.len() && d[acc+off..acc+off+16] == adl_one {
+                println!("a_basis ADL_ONE at ACCT[{}]+{}", idx, off);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_find_adl_bytes() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    // No LP, no user — just init market and check engine defaults
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    let eng = 472usize;
+    let target = [0x00u8, 0x80, 0xC6, 0xA4, 0x7E, 0x8D, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    for off in 0..2000 {
+        if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == target {
+            println!("ADL_ONE bytes at ENGINE+{}", off);
+        }
+    }
+}

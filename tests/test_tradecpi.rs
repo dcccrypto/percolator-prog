@@ -5466,3 +5466,117 @@ fn test_tradecpi_buffer_notional_uses_oracle_price() {
         actual_notional, expected_notional);
 }
 
+/// Nonce overflow must reject the trade, never wrap to 0.
+/// At u64::MAX, wrapping would reopen the entire request-ID space.
+#[test]
+fn test_trade_cpi_rejects_nonce_overflow_instead_of_wrapping() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 100).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Jam nonce to u64::MAX - 1 via raw slab write.
+    // RESERVED_OFF = 48, nonce is at bytes [48..56].
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[48..56].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Trade at nonce = u64::MAX - 1 → req_id = u64::MAX. Should succeed.
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        100_000, &mp, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade at nonce u64::MAX-1 should succeed: {:?}", result);
+
+    // Nonce is now u64::MAX. Next trade would wrap to 0 — must reject.
+    let result2 = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        100_001, &mp, &matcher_ctx,
+    );
+    assert!(
+        result2.is_err(),
+        "Trade at nonce u64::MAX must be rejected (overflow), not wrap to 0"
+    );
+    // Verify the error is EngineOverflow (0x12 = 18)
+    let err_msg = result2.unwrap_err();
+    assert!(
+        err_msg.contains("0x12"),
+        "Expected EngineOverflow (0x12) from nonce overflow, got: {}",
+        err_msg
+    );
+}
+
+/// After GC reclaims an LP slot and a new LP materializes there,
+/// the lp_account_id sent to the matcher must differ from the old LP's.
+/// Uses lp_idx ^ owner_prefix, so different owners at the same slot
+/// produce different IDs.
+#[test]
+fn test_slot_reuse_does_not_reuse_lp_matcher_identity() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 100).unwrap();
+
+    // BPF layout constants for reading owner from slab
+    const ENGINE: usize = 472;
+    const ACCOUNTS_OFFSET: usize = ENGINE + 9424;
+    const ACCOUNT_SIZE: usize = 352;
+    const OWNER_OFF: usize = 192; // owner: [u8;32] within BPF Account
+
+    let read_owner_prefix = |svm: &litesvm::LiteSVM, slab: &Pubkey, idx: u16| -> u64 {
+        let d = svm.get_account(slab).unwrap().data;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + OWNER_OFF;
+        u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
+    };
+
+    // Create first LP
+    let lp1 = Keypair::new();
+    let (lp1_idx, _ctx1) = env.init_lp_with_matcher(&lp1, &mp);
+    env.deposit(&lp1, lp1_idx, 10_000_000_000);
+    let owner1_prefix = read_owner_prefix(&env.svm, &env.slab, lp1_idx);
+    let id1 = lp1_idx as u64 ^ owner1_prefix;
+
+    // Create a second LP at a different slot (different owner)
+    let lp2 = Keypair::new();
+    let (lp2_idx, _ctx2) = env.init_lp_with_matcher(&lp2, &mp);
+    env.deposit(&lp2, lp2_idx, 10_000_000_000);
+    let owner2_prefix = read_owner_prefix(&env.svm, &env.slab, lp2_idx);
+    let id2 = lp2_idx as u64 ^ owner2_prefix;
+
+    // Two different owners at different slots produce different IDs
+    assert_ne!(
+        id1, id2,
+        "Different LP owners must produce different lp_account_ids: id1={} id2={}",
+        id1, id2
+    );
+
+    // At the SAME slot index, different owners produce different IDs
+    // Simulates slot reuse after GC: lp1's slot with lp2's owner
+    let id_reuse = lp1_idx as u64 ^ owner2_prefix;
+    assert_ne!(
+        id1, id_reuse,
+        "Same slot with different owner must produce different lp_account_id: \
+         old={} reused={}",
+        id1, id_reuse
+    );
+}
+

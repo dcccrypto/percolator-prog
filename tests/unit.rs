@@ -3254,3 +3254,36 @@ fn test_close_slab_non_admin_rejected() {
         "Slab should still be initialized after failed close"
     );
 }
+
+// ============================================================================
+// Nonce overflow tests
+// ============================================================================
+
+#[test]
+fn test_nonce_on_success_normal() {
+    assert_eq!(percolator_prog::verify::nonce_on_success(0), Some(1));
+    assert_eq!(percolator_prog::verify::nonce_on_success(42), Some(43));
+    assert_eq!(percolator_prog::verify::nonce_on_success(u64::MAX - 1), Some(u64::MAX));
+}
+
+#[test]
+fn test_nonce_on_success_rejects_overflow() {
+    assert_eq!(
+        percolator_prog::verify::nonce_on_success(u64::MAX),
+        None,
+        "nonce_on_success(u64::MAX) must return None, not wrap to 0"
+    );
+}
+
+#[test]
+fn test_nonce_overflow_does_not_reopen_request_id_space() {
+    // The point: if nonce wrapped, req_id 0 would be reissued,
+    // and a matcher holding a stale response with req_id=0 could replay it.
+    // With checked_add, this is blocked.
+    let at_max = percolator_prog::verify::nonce_on_success(u64::MAX);
+    assert!(at_max.is_none(), "Must reject at u64::MAX");
+
+    // Verify the previous value still works
+    let before_max = percolator_prog::verify::nonce_on_success(u64::MAX - 1);
+    assert_eq!(before_max, Some(u64::MAX), "u64::MAX-1 should advance to u64::MAX");
+}
