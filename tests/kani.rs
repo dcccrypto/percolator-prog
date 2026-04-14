@@ -28,13 +28,9 @@ use percolator_prog::matcher_abi::{
 use percolator_prog::oracle::{clamp_oracle_price, clamp_toward_with_dt};
 use percolator_prog::verify::{
     abi_ok,
-    // New: Dust math
-    accumulate_dust,
     // Fee-weighted EWMA
     ewma_update,
     admin_ok,
-    // New: Unit scale conversion math
-    base_to_units,
     cpi_trade_size,
     decide_admin_op,
     decide_crank,
@@ -54,23 +50,13 @@ use percolator_prog::verify::{
     matcher_shape_ok,
     nonce_on_failure,
     nonce_on_success,
-    oracle_feed_id_ok,
     owner_ok,
     pda_key_matches,
     // New: Oracle unit scale math
     scale_price_e6,
     // Account validation helpers
     signer_ok,
-    // Decision helpers for program-level coupling proofs
-    single_owner_authorized,
     slab_shape_ok,
-    sweep_dust,
-    trade_authorized,
-    units_to_base,
-    // New: Withdraw alignment
-    withdraw_amount_aligned,
-    // New: WithdrawInsurance vault accounting
-    withdraw_insurance_vault,
     writable_ok,
     MatcherAccountsShape,
     // ABI validation from real inputs
@@ -482,60 +468,10 @@ fn kani_cpi_uses_exec_size() {
 // =============================================================================
 
 // =============================================================================
-// J. PER-INSTRUCTION AUTHORIZATION (4 proofs)
+// J. PER-INSTRUCTION AUTHORIZATION
+// (Removed: single_owner_authorized and trade_authorized harnesses —
+//  verify functions deleted from wrapper)
 // =============================================================================
-
-/// Prove: single-owner instruction rejects on mismatch
-#[kani::proof]
-fn kani_single_owner_mismatch_rejected() {
-    let stored: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    kani::assume(stored != signer);
-
-    assert!(
-        !single_owner_authorized(stored, signer),
-        "single-owner instruction must reject on mismatch"
-    );
-}
-
-/// Prove: single-owner instruction accepts on match
-#[kani::proof]
-fn kani_single_owner_match_accepted() {
-    let owner: [u8; 32] = kani::any();
-
-    assert!(
-        single_owner_authorized(owner, owner),
-        "single-owner instruction must accept on match"
-    );
-}
-
-/// Prove: trade rejects when user owner mismatch
-#[kani::proof]
-fn kani_trade_rejects_user_mismatch() {
-    let user_owner: [u8; 32] = kani::any();
-    let user_signer: [u8; 32] = kani::any();
-    let lp_owner: [u8; 32] = kani::any();
-    kani::assume(user_owner != user_signer);
-
-    assert!(
-        !trade_authorized(user_owner, user_signer, lp_owner, lp_owner),
-        "trade must reject when user owner doesn't match"
-    );
-}
-
-/// Prove: trade rejects when LP owner mismatch
-#[kani::proof]
-fn kani_trade_rejects_lp_mismatch() {
-    let user_owner: [u8; 32] = kani::any();
-    let lp_owner: [u8; 32] = kani::any();
-    let lp_signer: [u8; 32] = kani::any();
-    kani::assume(lp_owner != lp_signer);
-
-    assert!(
-        !trade_authorized(user_owner, user_owner, lp_owner, lp_signer),
-        "trade must reject when LP owner doesn't match"
-    );
-}
 
 // =============================================================================
 // L. TRADECPI DECISION COUPLING - CRITICAL
@@ -904,25 +840,8 @@ fn kani_len_ok_universal() {
 // =============================================================================
 
 // =============================================================================
-// S. ORACLE FEED_ID AND SLAB SHAPE (4 proofs)
+// S. SLAB SHAPE (oracle_feed_id_ok removed — verify function deleted)
 // =============================================================================
-
-/// Universal: oracle_feed_id_ok == (expected == provided)
-///
-/// CODE-EQUALS-SPEC: The body of `oracle_feed_id_ok` IS `expected == provided`.
-/// This proof asserts the function equals its own body for all symbolic [u8;32]
-/// inputs. Fully symbolic; provides regression protection if the function body
-/// is modified.
-#[kani::proof]
-fn kani_oracle_feed_id_universal() {
-    let expected: [u8; 32] = kani::any();
-    let provided: [u8; 32] = kani::any();
-    assert_eq!(
-        oracle_feed_id_ok(expected, provided),
-        expected == provided,
-        "oracle_feed_id_ok must equal (expected == provided)"
-    );
-}
 
 /// Prove: valid slab shape is accepted
 ///
@@ -1520,377 +1439,18 @@ fn kani_invert_monotonic() {
 }
 
 // =============================================================================
-// AB. UNIT CONVERSION ALGEBRA PROOFS (8 proofs)
+// AB. UNIT CONVERSION ALGEBRA PROOFS
+// (Removed: base_to_units, units_to_base harnesses — verify functions deleted)
 // =============================================================================
 
-/// Prove: base_to_units conservation: units*scale + dust == base (when scale > 0)
-///
-/// SAT tractability bound: the proved property (Euclidean division conservation:
-/// units*scale + dust == base) holds for all u64 inputs by definition of
-/// floor-division. The assume bound keeps verification tractable for the CBMC
-/// solver; the mathematical guarantee is universal.
-#[kani::proof]
-fn kani_base_to_units_conservation() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap base to keep quotient small for SAT solver
-    let base: u64 = kani::any();
-    kani::assume(base <= (scale as u64) * KANI_MAX_QUOTIENT);
-
-    let (units, dust) = base_to_units(base, scale);
-
-    // Conservation: units * scale + dust == base
-    let reconstructed = (units as u128) * (scale as u128) + (dust as u128);
-    assert_eq!(
-        reconstructed, base as u128,
-        "units*scale + dust must equal base"
-    );
-}
-
-/// Prove: dust < scale when scale > 0
-///
-/// SAT tractability bound: the proved property (remainder bound: dust < scale)
-/// holds for all u64 inputs by definition of the `%` operator. The assume bound
-/// keeps verification tractable for the CBMC solver; the mathematical guarantee
-/// is universal.
-#[kani::proof]
-fn kani_base_to_units_dust_bound() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap base to keep quotient small for SAT solver
-    let base: u64 = kani::any();
-    kani::assume(base <= (scale as u64) * KANI_MAX_QUOTIENT);
-
-    let (_, dust) = base_to_units(base, scale);
-
-    assert!(dust < scale as u64, "dust must be < scale");
-}
-
-/// Prove: scale==0 returns (base, 0)
-#[kani::proof]
-fn kani_base_to_units_scale_zero() {
-    let base: u64 = kani::any();
-
-    let (units, dust) = base_to_units(base, 0);
-
-    assert_eq!(units, base, "scale==0 must return units==base");
-    assert_eq!(dust, 0, "scale==0 must return dust==0");
-}
-
-/// Prove: units_to_base roundtrip (without overflow)
-///
-/// SAT tractability bound: the proved property (roundtrip: base_to_units(units*scale)
-/// == (units, 0)) holds for all non-overflowing inputs by Euclidean division.
-/// The assume bound prevents overflow in `units * scale` and keeps verification
-/// tractable for the CBMC solver. The non-overflow boundary is `units <= u64::MAX / scale`;
-/// the current bound is more conservative but ensures SAT tractability.
-#[kani::proof]
-fn kani_units_roundtrip() {
-    let units: u64 = kani::any();
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-    // Cap quotient to keep division tractable for SAT solver
-    kani::assume(units <= KANI_MAX_QUOTIENT);
-
-    let base = units_to_base(units, scale);
-    let (recovered_units, dust) = base_to_units(base, scale);
-
-    assert_eq!(recovered_units, units, "roundtrip must preserve units");
-    assert_eq!(dust, 0, "roundtrip must have no dust");
-}
-
-/// Prove: units_to_base with scale==0 returns units unchanged
-#[kani::proof]
-fn kani_units_to_base_scale_zero() {
-    let units: u64 = kani::any();
-
-    let base = units_to_base(units, 0);
-
-    assert_eq!(base, units, "scale==0 must return units unchanged");
-}
-
-/// Prove: base_to_units is monotonic: base1 < base2 => units1 <= units2
-///
-/// SAT tractability bound: the proved property (Euclidean division monotonicity)
-/// holds for all u64 inputs by definition of floor-division. The assume bound
-/// keeps verification tractable for the CBMC solver; the mathematical guarantee
-/// is universal.
-#[kani::proof]
-fn kani_base_to_units_monotonic() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap both bases to keep quotients small
-    let base1: u64 = kani::any();
-    let base2: u64 = kani::any();
-    kani::assume(base1 <= (scale as u64) * KANI_MAX_QUOTIENT);
-    kani::assume(base2 <= (scale as u64) * KANI_MAX_QUOTIENT);
-    kani::assume(base1 < base2);
-
-    let (units1, _) = base_to_units(base1, scale);
-    let (units2, _) = base_to_units(base2, scale);
-
-    assert!(units1 <= units2, "base_to_units must be monotonic");
-}
-
-/// Prove: units_to_base is strictly monotonic when products don't overflow.
-/// NOTE: At saturation (units * scale >= u64::MAX), both return u64::MAX,
-/// breaking strict monotonicity. This proof bounds inputs to non-saturating range.
-/// Production code should use units_to_base_checked to detect overflow.
-///
-/// SAT tractability bound: the proved property (strict monotonicity in the
-/// non-saturating domain) follows from floor-division when multiplication does
-/// not overflow. The assume bound excludes the saturation regime and keeps
-/// verification tractable for the CBMC solver. The saturation regime
-/// (both return u64::MAX) is documented above and is correct-by-design.
-#[kani::proof]
-fn kani_units_to_base_monotonic_bounded() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap units to keep products below overflow threshold
-    let units1: u64 = kani::any();
-    let units2: u64 = kani::any();
-    kani::assume(units1 <= KANI_MAX_QUOTIENT);
-    kani::assume(units2 <= KANI_MAX_QUOTIENT);
-    kani::assume(units1 < units2);
-
-    // Within these bounds, no saturation occurs
-    let base1 = units_to_base(units1, scale);
-    let base2 = units_to_base(units2, scale);
-
-    assert!(
-        base1 < base2,
-        "units_to_base is strictly monotonic when not saturating"
-    );
-}
-
-/// Prove: scale==0 preserves monotonicity for base_to_units
-#[kani::proof]
-fn kani_base_to_units_monotonic_scale_zero() {
-    let base1: u64 = kani::any();
-    let base2: u64 = kani::any();
-    kani::assume(base1 < base2);
-
-    let (units1, _) = base_to_units(base1, 0);
-    let (units2, _) = base_to_units(base2, 0);
-
-    assert!(
-        units1 < units2,
-        "scale==0 must preserve strict monotonicity"
-    );
-}
-
 // =============================================================================
-// AC. WITHDRAW ALIGNMENT PROOFS (3 proofs)
+// AC. WITHDRAW ALIGNMENT PROOFS
+// (Removed: withdraw_amount_aligned harnesses — verify function deleted)
 // =============================================================================
 
-/// Prove: misaligned amount rejects when scale != 0
-/// Constructs misaligned amount directly to avoid expensive % in SAT solver
-///
-/// SAT tractability bound: the proved property (alignment check: amount % scale != 0
-/// => reject) holds for all u64 inputs by definition of the `%` operator. The
-/// assume bound limits `q` to prevent `q * scale` overflow and keeps verification
-/// tractable for the CBMC solver. The no-overflow assumption is made explicit below.
-#[kani::proof]
-fn kani_withdraw_misaligned_rejects() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 1); // scale==1 means everything is aligned
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Construct misaligned: amount = q*scale + r where 0 < r < scale
-    let q: u64 = kani::any();
-    let r: u64 = kani::any();
-    kani::assume(q <= KANI_MAX_QUOTIENT);
-    kani::assume(r > 0);
-    kani::assume(r < scale as u64);
-    // Explicit no-overflow guard: q * scale must not wrap, and adding r must not wrap.
-    kani::assume(q.checked_mul(scale as u64).map_or(false, |v| v <= u64::MAX - r));
-    let amount = q * (scale as u64) + r;
-
-    let aligned = withdraw_amount_aligned(amount, scale);
-
-    assert!(!aligned, "misaligned amount must be rejected");
-}
-
-/// Prove: aligned amount accepts when scale != 0
-///
-/// SAT tractability bound: the proved property (alignment acceptance: amount % scale == 0
-/// when amount = units * scale) holds for all non-overflowing inputs by Euclidean division.
-/// The assume bound prevents `units * scale` overflow and keeps verification tractable
-/// for the CBMC solver; the mathematical guarantee is universal within the non-overflow domain.
-#[kani::proof]
-fn kani_withdraw_aligned_accepts() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap units to keep product small
-    let units: u64 = kani::any();
-    kani::assume(units <= KANI_MAX_QUOTIENT);
-
-    let amount = units * (scale as u64);
-    let aligned = withdraw_amount_aligned(amount, scale);
-
-    assert!(aligned, "aligned amount must be accepted");
-}
-
-/// Prove: scale==0 always aligned
-#[kani::proof]
-fn kani_withdraw_scale_zero_always_aligned() {
-    let amount: u64 = kani::any();
-
-    let aligned = withdraw_amount_aligned(amount, 0);
-
-    assert!(aligned, "scale==0 must always be aligned");
-}
-
+// AD. DUST MATH PROOFS
+// (Removed: sweep_dust, accumulate_dust, base_to_units harnesses — verify functions deleted)
 // =============================================================================
-// AD. DUST MATH PROOFS (8 proofs)
-// =============================================================================
-
-/// Prove: sweep_dust conservation: units*scale + rem == dust (scale > 0)
-///
-/// SAT tractability bound: the proved property (Euclidean division conservation:
-/// units*scale + rem == dust) holds for all u64 inputs by definition of
-/// floor-division. The assume bound keeps verification tractable for the CBMC
-/// solver; the mathematical guarantee is universal.
-#[kani::proof]
-fn kani_sweep_dust_conservation() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap dust to keep quotient small
-    let dust: u64 = kani::any();
-    kani::assume(dust <= (scale as u64) * KANI_MAX_QUOTIENT);
-
-    let (units, rem) = sweep_dust(dust, scale);
-
-    let reconstructed = (units as u128) * (scale as u128) + (rem as u128);
-    assert_eq!(
-        reconstructed, dust as u128,
-        "units*scale + rem must equal dust"
-    );
-}
-
-/// Prove: sweep_dust rem < scale (scale > 0)
-///
-/// SAT tractability bound: the proved property (remainder bound: rem < scale)
-/// holds for all u64 inputs by definition of the `%` operator. The assume bound
-/// keeps verification tractable for the CBMC solver; the mathematical guarantee
-/// is universal.
-#[kani::proof]
-fn kani_sweep_dust_rem_bound() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Cap dust to keep quotient small
-    let dust: u64 = kani::any();
-    kani::assume(dust <= (scale as u64) * KANI_MAX_QUOTIENT);
-
-    let (_, rem) = sweep_dust(dust, scale);
-
-    assert!(rem < scale as u64, "remaining dust must be < scale");
-}
-
-/// Prove: if dust < scale, then units==0 and rem==dust
-#[kani::proof]
-fn kani_sweep_dust_below_threshold() {
-    let dust: u64 = kani::any();
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-    kani::assume(dust < scale as u64);
-
-    let (units, rem) = sweep_dust(dust, scale);
-
-    assert_eq!(units, 0, "dust < scale must yield units==0");
-    assert_eq!(rem, dust, "dust < scale must yield rem==dust");
-}
-
-/// Prove: sweep_dust with scale==0 returns (dust, 0)
-#[kani::proof]
-fn kani_sweep_dust_scale_zero() {
-    let dust: u64 = kani::any();
-
-    let (units, rem) = sweep_dust(dust, 0);
-
-    assert_eq!(units, dust, "scale==0 must return units==dust");
-    assert_eq!(rem, 0, "scale==0 must return rem==0");
-}
-
-/// Prove: accumulate_dust is saturating (no overflow)
-///
-/// CODE-EQUALS-SPEC: The body of `accumulate_dust` IS `old.saturating_add(added)`.
-/// This proof asserts the function equals its own body for all symbolic inputs.
-/// Fully symbolic; provides regression protection if the implementation is replaced
-/// with a non-saturating variant.
-#[kani::proof]
-fn kani_accumulate_dust_saturates() {
-    let old: u64 = kani::any();
-    let added: u64 = kani::any();
-
-    let result = accumulate_dust(old, added);
-
-    assert_eq!(
-        result,
-        old.saturating_add(added),
-        "accumulate_dust must match saturating_add"
-    );
-}
-
-/// Prove: scale==0 policy - base_to_units never produces dust
-/// This is the foundation of the "no dust when scale==0" invariant
-#[kani::proof]
-fn kani_scale_zero_policy_no_dust() {
-    let base: u64 = kani::any();
-
-    let (_, dust) = base_to_units(base, 0);
-
-    assert_eq!(dust, 0, "scale==0 must NEVER produce dust");
-}
-
-/// Prove: scale==0 policy - sweep never leaves remainder
-/// Combined with no-dust production, this ensures dust stays 0
-#[kani::proof]
-fn kani_scale_zero_policy_sweep_complete() {
-    let dust: u64 = kani::any();
-
-    let (_, rem) = sweep_dust(dust, 0);
-
-    assert_eq!(rem, 0, "scale==0 sweep must leave no remainder");
-}
-
-/// Prove: scale==0 end-to-end - deposit + accumulate + sweep cycle works correctly
-/// Strengthened: includes symbolic old_dust via accumulate_dust before sweep
-#[kani::proof]
-fn kani_scale_zero_policy_end_to_end() {
-    let base: u64 = kani::any();
-    let old_dust: u64 = kani::any();
-
-    // Deposit converts base to units + dust
-    let (_, new_dust) = base_to_units(base, 0);
-    assert_eq!(new_dust, 0, "deposit with scale==0 must produce no dust");
-
-    // Accumulate any pre-existing dust (simulates multiple deposits)
-    let accumulated = accumulate_dust(old_dust, new_dust);
-
-    // Sweep accumulated dust
-    let (swept_units, final_rem) = sweep_dust(accumulated, 0);
-
-    // With scale==0, sweep returns all dust as units with no remainder
-    assert_eq!(swept_units, accumulated, "scale==0 sweep must return all dust as units");
-    assert_eq!(final_rem, 0, "sweep with scale==0 must leave no remainder");
-}
 
 // =============================================================================
 // AE. UNIVERSAL GATE ORDERING PROOFS FOR TRADECPI (6 proofs)
@@ -2317,36 +1877,9 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
 // =============================================================================
 
 // Note: Removed kani_unit_conversion_deterministic (purity test).
-// Rust pure functions are deterministic by language guarantee —
-// calling base_to_units twice with the same inputs cannot differ.
-// No Kani proof needed for a compile-time structural property.
-
 // Note: Removed kani_scale_validation_pure (purity test).
-// Same reasoning: init_market_scale_ok is a pure function.
-// Purity is enforced by Rust's type system (no &mut, no globals).
-
-/// Unit conversion: if dust==0 after base_to_units, roundtrip is exact
-/// Constructs base = q * scale directly to avoid expensive % in SAT solver
-#[kani::proof]
-fn kani_units_roundtrip_exact_when_no_dust() {
-    let scale: u32 = kani::any();
-    kani::assume(scale > 0);
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // Construct base as exact multiple of scale (no dust case)
-    let q: u64 = kani::any();
-    kani::assume(q <= KANI_MAX_QUOTIENT);
-    let base = q * (scale as u64);
-
-    let (units, dust) = base_to_units(base, scale);
-    assert_eq!(dust, 0, "base = q*scale must have no dust");
-
-    let recovered = units_to_base(units, scale);
-    assert_eq!(recovered, base, "roundtrip must be exact when dust==0");
-}
-
-// kani_universal_panic_requires_admin removed — allow_panic is dead
-// (runtime ignores it, model no longer includes it).
+// Note: Removed kani_units_roundtrip_exact_when_no_dust (base_to_units/units_to_base deleted).
+// Note: kani_universal_panic_requires_admin removed — allow_panic is dead.
 
 // =============================================================================
 // AJ. END-TO-END FORCED ACCEPTANCE FOR FROM_RET PATH
@@ -2458,12 +1991,9 @@ fn kani_init_market_scale_valid_range() {
 //
 // The proofs use ACTUAL PRODUCTION CODE from the percolator library:
 // - percolator::RiskEngine::mark_pnl_for_position (the real mark_pnl calculation)
-// - percolator_prog::verify::base_to_units (the real unit conversion)
 //
 // This section documents the historical bug mechanism and anchors production
 // formulas used by the post-fix proofs below.
-
-// Note: base_to_units is already imported at top of file from percolator_prog::verify
 
 /// Compute position value using the SAME FORMULA as production code.
 /// This replicates percolator::RiskEngine::is_above_margin_bps_mtm exactly.
@@ -2606,63 +2136,7 @@ fn kani_scale_price_e6_identity_for_scale_leq_1() {
     );
 }
 
-/// Prove that production base_to_units and scale_price_e6 use the SAME divisor
-/// AND that this preserves conservative margin behavior.
-///
-/// The fix works because:
-/// - capital_units = base_tokens / unit_scale  (via base_to_units)
-/// - oracle_scaled = oracle_price / unit_scale (via scale_price_e6)
-///
-/// Both divide by the same unit_scale, so margin ratios are preserved.
-/// Uses u16 multipliers + u8 scale/pos for SAT tractability (deep multiplication chains).
-///
-/// SAT tractability bound: the structural equivalence (both functions divide by
-/// unit_scale) is proved for scale in 2..16 and u16-bounded inputs. The property
-/// is structurally obvious from the function bodies; the bound is required to keep
-/// the 3-deep multiplication chain tractable for the CBMC solver.
-#[kani::proof]
-fn kani_scale_price_and_base_to_units_use_same_divisor() {
-    // u16 multipliers + u8 scale/pos keep the 3-deep chain SAT-tractable
-    let scale_raw: u8 = kani::any();
-    let base_mult: u16 = kani::any();
-    let price_mult: u16 = kani::any();
-    let pos_raw: u8 = kani::any();
-
-    kani::assume(scale_raw >= 2);
-    kani::assume(scale_raw <= 16);
-    kani::assume(base_mult >= 1);
-    kani::assume(price_mult >= 1);
-    kani::assume(pos_raw >= 1);
-
-    let unit_scale = scale_raw as u32;
-    let base_tokens = (base_mult as u64) * (unit_scale as u64);
-    let oracle_price = (price_mult as u64) * (unit_scale as u64);
-    let position_size = pos_raw as u128;
-
-    // Call PRODUCTION functions
-    let (capital_units, _dust) = base_to_units(base_tokens, unit_scale);
-    let oracle_scaled = scale_price_e6(oracle_price, unit_scale).unwrap();
-
-    // Both should divide by unit_scale
-    assert_eq!(
-        capital_units,
-        base_tokens / unit_scale as u64,
-        "base_to_units must compute base / unit_scale"
-    );
-    assert_eq!(
-        oracle_scaled,
-        oracle_price / unit_scale as u64,
-        "scale_price_e6 must compute price / unit_scale"
-    );
-
-    // Margin ratio preservation: scaled position value never exceeds unscaled
-    let pv_unscaled = position_size * oracle_price as u128 / 1_000_000;
-    let pv_scaled = position_size * oracle_scaled as u128 / 1_000_000;
-    assert!(
-        pv_scaled * unit_scale as u128 <= pv_unscaled,
-        "scaled position value must be conservative (floor rounding)"
-    );
-}
+// Removed: kani_scale_price_and_base_to_units_use_same_divisor (base_to_units deleted)
 
 /// Prove scaled-price math preserves conservative margin behavior under unit scaling.
 /// Uses u16 multipliers + u8 scale/bps for SAT tractability.
@@ -3023,74 +2497,8 @@ fn kani_clamp_toward_saturation_paths() {
 
 // =========================================================================
 // WithdrawInsurance vault accounting proofs
+// (Removed: withdraw_insurance_vault harnesses — verify function deleted)
 // =========================================================================
-
-/// Prove: withdraw_insurance_vault correctly decrements vault by insurance amount.
-/// For all valid inputs (insurance <= vault), vault_after == vault_before - insurance.
-#[kani::proof]
-fn kani_withdraw_insurance_vault_correct() {
-    let vault_before: u128 = kani::any();
-    let insurance: u128 = kani::any();
-
-    // Precondition: insurance must not exceed vault
-    kani::assume(insurance <= vault_before);
-
-    let result = withdraw_insurance_vault(vault_before, insurance);
-    assert!(result.is_some(), "must succeed when insurance <= vault");
-    assert_eq!(
-        result.unwrap(),
-        vault_before - insurance,
-        "vault must be decremented by exact insurance amount"
-    );
-}
-
-/// Prove: withdraw_insurance_vault returns None when insurance exceeds vault.
-#[kani::proof]
-fn kani_withdraw_insurance_vault_overflow() {
-    let vault_before: u128 = kani::any();
-    let insurance: u128 = kani::any();
-
-    // Precondition: insurance exceeds vault
-    kani::assume(insurance > vault_before);
-
-    let result = withdraw_insurance_vault(vault_before, insurance);
-    assert!(result.is_none(), "must fail when insurance > vault");
-}
-
-/// Prove: After withdraw_insurance, if all capital is already withdrawn,
-/// vault reaches zero (enabling CloseSlab).
-/// Prove complete result characterization for withdraw_insurance_vault:
-/// - `Some(vault_after)` iff insurance <= vault_before, with exact subtraction
-/// - `None` iff insurance > vault_before
-#[kani::proof]
-fn kani_withdraw_insurance_vault_result_characterization() {
-    let vault_before: u128 = kani::any();
-    let insurance: u128 = kani::any();
-
-    match withdraw_insurance_vault(vault_before, insurance) {
-        Some(vault_after) => {
-            assert!(
-                insurance <= vault_before,
-                "success requires insurance <= vault_before"
-            );
-            assert_eq!(
-                vault_after,
-                vault_before - insurance,
-                "success path must perform exact subtraction"
-            );
-            assert!(
-                vault_after <= vault_before,
-                "withdrawal must not increase vault balance"
-            );
-        }
-        None => {
-            assert!(
-                insurance > vault_before,
-                "failure is only possible when insurance exceeds vault"
-            );
-        }
-    }
-}
 
 // =============================================================================
 // INDUCTIVE: Full-domain algebraic properties
