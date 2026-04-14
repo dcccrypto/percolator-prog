@@ -37,7 +37,7 @@ pub mod spl_token;
 
 use solana_program::declare_id;
 
-declare_id!("Perco1ator111111111111111111111111111111111");
+declare_id!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
 
 /// Instruction tag constants — single source of truth for CPI callers.
 #[path = "tags.rs"]
