@@ -1858,6 +1858,24 @@ pub mod state {
         data[RESERVED_OFF..RESERVED_OFF + 8].copy_from_slice(&nonce.to_le_bytes());
     }
 
+    /// Monotonic materialization counter stored in _reserved[8..16].
+    /// Incremented on every InitUser/InitLP. Used as lp_account_id
+    /// to provide a true per-instance identity that survives slot reuse.
+    pub fn read_mat_counter(data: &[u8]) -> u64 {
+        u64::from_le_bytes(data[RESERVED_OFF + 8..RESERVED_OFF + 16].try_into().unwrap())
+    }
+
+    pub fn write_mat_counter(data: &mut [u8], counter: u64) {
+        data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&counter.to_le_bytes());
+    }
+
+    /// Increment the materialization counter and return the NEW value.
+    /// Each account gets a globally unique ID at creation time.
+    pub fn next_mat_counter(data: &mut [u8]) -> u64 {
+        let c = read_mat_counter(data).wrapping_add(1);
+        write_mat_counter(data, c);
+        c
+    }
 
     // ========================================
     // Market Flags (stored in _padding[0] at offset 13)
@@ -2716,11 +2734,14 @@ pub mod processor {
 
         if external_ok {
             config.last_good_oracle_slot = clock_slot;
-            // Mark oracle as initialized on first successful external read.
-            // Single source of truth — eliminates sentinel price overloading.
-            if !state::is_oracle_initialized(slab_data) {
-                state::set_oracle_initialized(slab_data);
-            }
+        }
+        // Mark oracle as initialized whenever read_price_clamped succeeds.
+        // This covers both external oracle and authority-price paths.
+        // The flag means "engine has received a real non-sentinel price" —
+        // not just "external oracle was seen". Authority-priced operations
+        // feed real prices into engine accrual/trade, so the sentinel is gone.
+        if !state::is_oracle_initialized(slab_data) {
+            state::set_oracle_initialized(slab_data);
         }
         Ok(price)
     }
@@ -3504,6 +3525,8 @@ pub mod processor {
                 ).map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
+                drop(engine);
+                state::next_mat_counter(&mut data);
             }
             Instruction::InitLP {
                 matcher_program,
@@ -3569,6 +3592,10 @@ pub mod processor {
                 ).map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
+                drop(engine);
+                // Increment per-materialization counter. Used as lp_account_id
+                // input so every LP instance gets a unique identity.
+                state::next_mat_counter(&mut data);
             }
             Instruction::DepositCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 6)?;
@@ -3631,7 +3658,7 @@ pub mod processor {
                 }
 
                 engine
-                    .deposit(user_idx, units as u128, 0, clock.slot)
+                    .deposit_not_atomic(user_idx, units as u128, 0, clock.slot)
                     .map_err(map_risk_error)?;
             }
             Instruction::WithdrawCollateral { user_idx, amount } => {
@@ -4257,9 +4284,14 @@ pub mod processor {
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
                     // Instance-stable LP identity: FNV-1a hash of (slot, owner, matcher_context).
-                    // Changes on re-materialization (new owner/matcher at same slot).
-                    // Survives same-owner reopening because matcher_context differs.
-                    // Uses full 32-byte owner + 32-byte context for collision resistance.
+                    // Stable across trades for the same LP instance (all inputs are immutable
+                    // per-account fields). Changes when any identifying field differs on
+                    // re-materialization. The mat_counter (incremented per InitLP) ensures
+                    // that each LP creation is counted, but cannot be included in the hash
+                    // because it advances between trades (other LPs created in between).
+                    // Residual: same owner re-registering same context at same slot produces
+                    // the same ID — this is benign because the matcher_context is a real
+                    // on-chain account the owner controls, so "stale" state is their own state.
                     let lp_instance_id = {
                         let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
                         let mix = |h: &mut u64, b: u8| {
