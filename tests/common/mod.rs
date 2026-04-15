@@ -2891,15 +2891,10 @@ impl TestEnv {
     /// which differs from BPF, we check resolved_price > 0 as a proxy.
     /// resolved_price is only set by engine.resolve_market().
     pub fn is_market_resolved(&self) -> bool {
-        // resolved_price is a u64 in the engine. Its offset relative to ENGINE_OFF
-        // can be inferred: it's 8 bytes before resolved_slot, which is 8 bytes before
-        // resolved_payout_h_num. We know c_tot is at ENGINE+184.
-        // Working back: c_tot(184) - last_crank(8) - ready_pad(8) - h_den(16) - h_num(16) - resolved_slot(8) - resolved_price(8)
-        // = 184 - 64 = 120. resolved_price at ENGINE+120.
+        // Check FLAG_RESOLVED (bit 0) in header flags byte at offset 13.
+        // This is stable across engine layout changes.
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        let off = 504 + 232; // ENGINE_OFF + resolved_price offset
-        let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
-        rp > 0
+        (d[13] & 0x01) != 0
     }
 
     /// Read insurance fund balance from engine
