@@ -10654,9 +10654,19 @@ pub mod processor {
         let mut slab_data = state::slab_data_mut(a_slab)?;
         let engine = zc::engine_mut(&mut slab_data)?;
 
+        // Pull stored last oracle price (handler has no oracle account in its ABI).
+        // Hyperp markets use the EWMA index baseline; non-hyperp use the engine-cached
+        // last oracle price. Mirrors the no-fresh-oracle pattern at line 8029.
+        let accrual_price = if oracle::is_hyperp_mode(&config) {
+            config.last_effective_price_e6
+        } else {
+            engine.last_oracle_price
+        };
+        let funding_rate = compute_current_funding_rate_e9(&config);
+
         let clock = Clock::get()?;
         engine
-            .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0)
+            .withdraw_not_atomic(user_idx, collateral_units, accrual_price, clock.slot, funding_rate)
             .map_err(map_risk_error)?;
 
         engine.vault = percolator::U128::new(
