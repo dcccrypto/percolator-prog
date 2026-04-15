@@ -1,0 +1,49 @@
+[package]
+name = "percolator-prog-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.percolator-prog]
+path = ".."
+# "test" feature exposes fuzz_helpers and reduces MIN_INIT_MARKET_SEED to 0
+# so decode paths are fully exercised without hitting the seed-deposit guard.
+features = ["test"]
+
+# ── Fuzz targets ──────────────────────────────────────────────────────────────
+# Each target is compiled as a standalone binary driven by libFuzzer.
+# DO NOT set test/doc/bench = true — they must remain false for cargo-fuzz.
+
+[[bin]]
+name = "fuzz_instruction_decode"
+path = "fuzz_targets/fuzz_instruction_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_risk_params"
+path = "fuzz_targets/fuzz_risk_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_slab_header"
+path = "fuzz_targets/fuzz_slab_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_account_parsing"
+path = "fuzz_targets/fuzz_account_parsing.rs"
+test = false
+doc = false
+bench = false

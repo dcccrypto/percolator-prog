@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 //! Unit tests for percolator-prog
 //!
 //! These tests verify the Solana program wrapper's instruction handling,
@@ -433,6 +434,14 @@ fn test_struct_sizes() {
     println!("Size of Account: {}", size_of::<Account>());
     println!("Offset of Account.kind: {}", offset_of!(Account, kind));
     println!("Offset of Account.owner: {}", offset_of!(Account, owner));
+    println!("Offset of Account.pnl: {}", offset_of!(Account, pnl));
+    println!("Offset of Account.reserved_pnl: {}", offset_of!(Account, reserved_pnl));
+    println!("Offset of Account.position_basis_q: {}", offset_of!(Account, position_basis_q));
+    println!("Offset of Account.adl_a_basis: {}", offset_of!(Account, adl_a_basis));
+    println!("Offset of Account.adl_k_snap: {}", offset_of!(Account, adl_k_snap));
+    println!("Offset of Account.adl_epoch_snap: {}", offset_of!(Account, adl_epoch_snap));
+    println!("Offset of Account.fee_credits: {}", offset_of!(Account, fee_credits));
+    println!("Offset of Account.f_snap: {}", offset_of!(Account, f_snap));
     println!("Size of RiskEngine: {}", size_of::<RiskEngine>());
     println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
 
@@ -460,6 +469,12 @@ fn test_struct_sizes() {
         "Offset of RiskEngine.used: {}",
         offset_of!(RiskEngine, used)
     );
+    println!("Offset of RiskEngine.adl_mult_long: {}", offset_of!(RiskEngine, adl_mult_long));
+    println!("Offset of RiskEngine.adl_mult_short: {}", offset_of!(RiskEngine, adl_mult_short));
+    println!("Offset of RiskEngine.adl_epoch_long: {}", offset_of!(RiskEngine, adl_epoch_long));
+    println!("Offset of RiskEngine.adl_epoch_short: {}", offset_of!(RiskEngine, adl_epoch_short));
+    println!("Offset of RiskEngine.num_used_accounts: {}", offset_of!(RiskEngine, num_used_accounts));
+    println!("Offset of RiskEngine.insurance_fund: {}", offset_of!(RiskEngine, insurance_fund));
 
     // Print the SBF constant (note: this is x86_64 value when run as native test)
     println!(
@@ -3277,13 +3292,21 @@ fn test_nonce_on_success_rejects_overflow() {
 
 #[test]
 fn test_nonce_overflow_does_not_reopen_request_id_space() {
-    // The point: if nonce wrapped, req_id 0 would be reissued,
-    // and a matcher holding a stale response with req_id=0 could replay it.
-    // With checked_add, this is blocked.
     let at_max = percolator_prog::verify::nonce_on_success(u64::MAX);
     assert!(at_max.is_none(), "Must reject at u64::MAX");
 
-    // Verify the previous value still works
     let before_max = percolator_prog::verify::nonce_on_success(u64::MAX - 1);
     assert_eq!(before_max, Some(u64::MAX), "u64::MAX-1 should advance to u64::MAX");
+}
+
+#[test]
+fn print_slab_layout() {
+    use percolator_prog::constants::*;
+    eprintln!("HEADER_LEN = {}", HEADER_LEN);
+    eprintln!("CONFIG_LEN = {}", CONFIG_LEN);
+    eprintln!("ENGINE_OFF = {}", ENGINE_OFF);
+    eprintln!("ENGINE_LEN = {}", ENGINE_LEN);
+    eprintln!("RISK_BUF_OFF = {}", RISK_BUF_OFF);
+    eprintln!("RISK_BUF_LEN = {}", RISK_BUF_LEN);
+    eprintln!("SLAB_LEN = {}", SLAB_LEN);
 }

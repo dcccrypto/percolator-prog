@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("sbf", "bpf"))', 'cfg(kani)', 'cfg(target_os, values("solana"))', 'cfg(feature, values("custom-heap", "custom-panic"))'] }
+
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "percolator_prog"
@@ -14,10 +17,15 @@ no-entrypoint = []
 test-sbf = []
 test = ["percolator/test"]  # Use MAX_ACCOUNTS=64 for tests
 cu-audit = []  # Enable compute unit checkpoints for CU auditing
+small = ["percolator/small"]    # MAX_ACCOUNTS=256 (~0.68 SOL)
+medium = ["percolator/medium"]  # MAX_ACCOUNTS=1024 (~2.7 SOL)
+mainnet = []                    # Mainnet build — enables compile-time guards
 
 [dependencies]
 solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "1.0", features = ["no-entrypoint"] }
+spl-token-metadata-interface = { version = "0.2" }
 thiserror = "1.0"
 bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
 pyth-sdk-solana = "0.10"
@@ -27,10 +35,17 @@ num-derive = "0.4"
 num-traits = "0.2"
 percolator = { path = "../percolator" }
 
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+
 [dev-dependencies]
 bincode = "1"
 solana-sdk = "1.18"
 solana-client = "1.18"
+solana-program-runtime = "1.18"
 rand = "0.8"
 rand_xorshift = "0.3"
 proptest = "1.4"

@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::doc_markdown, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 //! Shared test infrastructure for integration tests.
 
 pub use litesvm::LiteSVM;
@@ -5108,19 +5108,6 @@ impl TestEnv {
         i128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
     }
 
-    /// Read fees_earned_total (u128) for an account slot.
-    /// fees_earned_total is at offset 264 within Account.
-    pub fn read_account_fees_earned_total(&self, idx: u16) -> u128 {
-        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9424;
-        const ACCOUNT_SIZE: usize = 352;
-        const FEES_EARNED_OFFSET: usize = 264;
-        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEES_EARNED_OFFSET;
-        if slab_data.len() < off + 16 {
-            return 0;
-        }
-        u128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
-    }
 
     /// Read warmup_started_at_slot (u64) for an account slot.
     /// warmup_started_at_slot is at offset 64 within Account.

@@ -2513,8 +2513,11 @@ dependencies = [
  "shellexpand",
  "solana-client",
  "solana-program 1.18.26",
+ "solana-program-runtime",
  "solana-sdk",
  "spl-token",
+ "spl-token-2022",
+ "spl-token-metadata-interface",
  "thiserror 1.0.69",
  "tokio",
 ]
