@@ -33,7 +33,12 @@ pub mod constants {
     // RISK_BUF_EMPTY removed — buffer uses zeroed entries, not sentinels
     pub const RISK_BUF_OFF: usize = ENGINE_OFF + ENGINE_LEN;
     pub const RISK_BUF_LEN: usize = size_of::<crate::risk_buffer::RiskBuffer>();
-    pub const SLAB_LEN: usize = RISK_BUF_OFF + RISK_BUF_LEN;
+    /// Per-account materialization generation table.
+    /// Stores the global mat_counter value assigned at InitUser/InitLP.
+    /// Used as lp_account_id for per-instance identity across slot reuse.
+    pub const GEN_TABLE_OFF: usize = RISK_BUF_OFF + RISK_BUF_LEN;
+    pub const GEN_TABLE_LEN: usize = percolator::MAX_ACCOUNTS * 8; // u64 per slot
+    pub const SLAB_LEN: usize = GEN_TABLE_OFF + GEN_TABLE_LEN;
 
     // CRANK_REWARD_MIN_DT removed — crank discount logic removed in v12.15
     /// Progressive scan window per crank.
@@ -1975,6 +1980,19 @@ pub mod state {
         let src = bytemuck::bytes_of(buf);
         data[RISK_BUF_OFF..RISK_BUF_OFF + RISK_BUF_LEN].copy_from_slice(src);
     }
+
+    /// Read per-account materialization generation (u64).
+    /// Returns 0 for never-materialized slots (zero-initialized slab).
+    pub fn read_account_generation(data: &[u8], idx: u16) -> u64 {
+        let off = crate::constants::GEN_TABLE_OFF + (idx as usize) * 8;
+        u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+    }
+
+    /// Write per-account materialization generation.
+    pub fn write_account_generation(data: &mut [u8], idx: u16, gen: u64) {
+        let off = crate::constants::GEN_TABLE_OFF + (idx as usize) * 8;
+        data[off..off + 8].copy_from_slice(&gen.to_le_bytes());
+    }
 }
 
 // 7. mod units - base token/units conversion at instruction boundaries
@@ -2848,26 +2866,13 @@ pub mod processor {
         oracle_price: u64,
         size: i128,
         funding_rate_e9: i128,
+        lp_account_id: u64,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
-        // Instance-stable LP identity: FNV-1a hash of (slot, owner, matcher_context).
-        // Must match TradeCpi handler's computation exactly.
-        let lp_instance_id = {
-            let mut h: u64 = 0xcbf29ce484222325;
-            let mix = |h: &mut u64, b: u8| {
-                *h ^= b as u64;
-                *h = h.wrapping_mul(0x100000001b3);
-            };
-            mix(&mut h, lp_idx as u8);
-            mix(&mut h, (lp_idx >> 8) as u8);
-            for &b in lp.owner.iter() { mix(&mut h, b); }
-            for &b in lp.matcher_context.iter() { mix(&mut h, b); }
-            h
-        };
         let exec = matcher.execute_match(
             &lp.matcher_program,
             &lp.matcher_context,
-            lp_instance_id,
+            lp_account_id,
             oracle_price,
             size,
         )?;
@@ -3523,7 +3528,8 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
                 drop(engine);
-                state::next_mat_counter(&mut data);
+                let gen = state::next_mat_counter(&mut data);
+                state::write_account_generation(&mut data, idx, gen);
             }
             Instruction::InitLP {
                 matcher_program,
@@ -3590,9 +3596,8 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
                 drop(engine);
-                // Increment per-materialization counter. Used as lp_account_id
-                // input so every LP instance gets a unique identity.
-                state::next_mat_counter(&mut data);
+                let gen = state::next_mat_counter(&mut data);
+                state::write_account_generation(&mut data, idx, gen);
             }
             Instruction::DepositCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 6)?;
@@ -4062,6 +4067,9 @@ pub mod processor {
                     read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data)?;
                 state::write_config(&mut data, &config);
 
+                // Read LP generation before engine borrow
+                let lp_gen = state::read_account_generation(&data, lp_idx);
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, lp_idx)?;
@@ -4099,7 +4107,7 @@ pub mod processor {
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 execute_trade_with_matcher(
                     engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
-                    funding_rate_e9,
+                    funding_rate_e9, lp_gen,
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
@@ -4293,27 +4301,10 @@ pub mod processor {
                     }
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
-                    // Instance-stable LP identity: FNV-1a hash of (slot, owner, matcher_context).
-                    // Stable across trades for the same LP instance (all inputs are immutable
-                    // per-account fields). Changes when any identifying field differs on
-                    // re-materialization. The mat_counter (incremented per InitLP) ensures
-                    // that each LP creation is counted, but cannot be included in the hash
-                    // because it advances between trades (other LPs created in between).
-                    // Residual: same owner re-registering same context at same slot produces
-                    // the same ID — this is benign because the matcher_context is a real
-                    // on-chain account the owner controls, so "stale" state is their own state.
-                    let lp_instance_id = {
-                        let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
-                        let mix = |h: &mut u64, b: u8| {
-                            *h ^= b as u64;
-                            *h = h.wrapping_mul(0x100000001b3); // FNV prime
-                        };
-                        mix(&mut h, lp_idx as u8);
-                        mix(&mut h, (lp_idx >> 8) as u8);
-                        for &b in lp_acc.owner.iter() { mix(&mut h, b); }
-                        for &b in lp_acc.matcher_context.iter() { mix(&mut h, b); }
-                        h
-                    };
+                    // Per-materialization instance ID from generation table.
+                    // Assigned at InitLP, immutable for the lifetime of this LP instance.
+                    // Different for every materialization even at the same slot.
+                    let lp_instance_id = state::read_account_generation(&*data, lp_idx);
                     (
                         lp_instance_id,
                         config,
@@ -4526,7 +4517,7 @@ pub mod processor {
                     let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                     execute_trade_with_matcher(
                         engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
-                        funding_rate_e9,
+                        funding_rate_e9, lp_account_id,
                     ).map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
@@ -4808,6 +4799,10 @@ pub mod processor {
 
                 // Remove from risk buffer (drop engine borrow first to release data)
                 drop(engine);
+                // Live close processes a real oracle price through the engine
+                if !resolved && !state::is_oracle_initialized(&data) {
+                    state::set_oracle_initialized(&mut data);
+                }
                 {
                     let mut buf = state::read_risk_buffer(&data);
                     buf.remove(user_idx);

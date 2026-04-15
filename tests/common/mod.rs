@@ -19,7 +19,7 @@ pub use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-pub const SLAB_LEN: usize = 1451848; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
+pub const SLAB_LEN: usize = 1484616; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
 pub const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -7607,12 +7607,16 @@ impl TestEnv {
     }
 
     /// Read the risk buffer from the slab.
-    /// Uses SLAB_LEN - RISK_BUF_LEN as the offset (buffer is at end of slab).
+    /// Read risk buffer from BPF slab layout.
+    /// Buffer is at (SLAB_LEN - GEN_TABLE_LEN - RISK_BUF_LEN) in BPF.
+    /// We use the BPF-specific offset: the risk buffer sits right before the
+    /// generation table, and the gen table is at the end of the slab.
     pub fn read_risk_buffer(&self) -> percolator_prog::risk_buffer::RiskBuffer {
         use bytemuck::Zeroable;
         let d = self.svm.get_account(&self.slab).unwrap().data;
         let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
-        let buf_off = SLAB_LEN - buf_size;
+        let gen_table_size = 4096 * 8; // MAX_ACCOUNTS * sizeof(u64)
+        let buf_off = SLAB_LEN - gen_table_size - buf_size;
         let mut buf = percolator_prog::risk_buffer::RiskBuffer::zeroed();
         bytemuck::bytes_of_mut(&mut buf).copy_from_slice(&d[buf_off..buf_off + buf_size]);
         buf
