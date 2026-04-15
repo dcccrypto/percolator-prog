@@ -5766,6 +5766,28 @@ pub mod processor {
         Ok(())
     }
 
+    /// Canonical SPL Associated Token Account program ID.
+    /// Declared inline to avoid pulling the `spl-associated-token-account` crate
+    /// (its instruction module bloats the program binary).
+    const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+        solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+    /// Verify the associated token program account is the canonical SPL ATA program.
+    /// Skip in tests to allow mock accounts.
+    #[allow(unused_variables)]
+    fn verify_ata_program(a_ata_prog: &AccountInfo) -> Result<(), ProgramError> {
+        #[cfg(not(feature = "test"))]
+        {
+            if *a_ata_prog.key != ASSOCIATED_TOKEN_PROGRAM_ID {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+            if !a_ata_prog.executable {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn process_instruction<'a, 'b>(
         program_id: &Pubkey,
         accounts: &'b [AccountInfo<'a>],
@@ -12504,6 +12526,9 @@ pub mod processor {
         // Uses raw CPI to avoid spl-associated-token-account crate dependency (binary size).
         #[cfg(not(feature = "test"))]
         if let Some(ata_prog) = a_ata_program {
+            // Verify before invoking — the ATA program key is otherwise
+            // attacker-controlled and would be invoked with payer signer.
+            verify_ata_program(ata_prog)?;
             if a_owner_ata.data_is_empty() || a_owner_ata.lamports() == 0 {
                 // ATA program instruction: CreateAssociatedTokenAccount (no instruction data)
                 use alloc::vec;
