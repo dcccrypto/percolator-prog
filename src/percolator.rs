@@ -3518,6 +3518,15 @@ pub mod oracle {
         let decimals_0 = data[RAYDIUM_CLMM_OFF_DECIMALS0] as i32;
         let decimals_1 = data[RAYDIUM_CLMM_OFF_DECIMALS1] as i32;
 
+        // Bound decimals to prevent panic in 10u128.pow() below.
+        // u128::MAX ~ 10^38.5, so any decimal_diff above ~38 panic-aborts the
+        // program. Mirrors the MAX_EXPO_ABS guards used by the Pyth and
+        // Chainlink decoders. With decimals capped at 18, decimal_diff stays
+        // in [-12, 24] and both pow() sites are trivially safe.
+        if decimals_0 > MAX_EXPO_ABS || decimals_1 > MAX_EXPO_ABS {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
         let sqrt_price_x64 = u128::from_le_bytes(
             data[RAYDIUM_CLMM_OFF_SQRT_PRICE_X64..RAYDIUM_CLMM_OFF_SQRT_PRICE_X64 + 16]
                 .try_into()
