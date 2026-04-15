@@ -284,6 +284,21 @@ fn test_attack_premarket_force_close_pnl_conservation() {
     }
     let total_pnl_before = lp_pnl_before + user_pnl_before_sum;
 
+    // Flatten positions before resolution (v12.17 requirement)
+    env.set_slot(200);
+    env.crank();
+    for (user, user_idx) in &users {
+        let pos = env.read_account_position(*user_idx);
+        if pos != 0 {
+            let _ = env.try_trade_cpi(
+                user, &lp.pubkey(), lp_idx, *user_idx,
+                -pos, &matcher_prog, &matcher_ctx,
+            );
+        }
+    }
+    env.set_slot(210);
+    env.crank();
+
     // Resolve at different price to create PnL
     env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap(); // 50% up
     env.try_resolve_market(&admin).unwrap();

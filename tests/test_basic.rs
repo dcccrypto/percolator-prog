@@ -508,14 +508,15 @@ fn test_matcher_init_vamm_passive_mode() {
     };
     svm.set_account(ctx_pubkey, ctx_account).unwrap();
 
-    // Create LP PDA placeholder (stored in context for signature verification)
-    let lp_pda = Pubkey::new_unique();
+    // Create LP keypair (matcher requires LP PDA to sign init)
+    let lp_kp = Keypair::new();
+    let lp_pda = lp_kp.pubkey();
 
     // Initialize in Passive mode
     let ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, false), // LP PDA
+            AccountMeta::new_readonly(lp_pda, true), // LP PDA (must sign)
             AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(
@@ -533,7 +534,7 @@ fn test_matcher_init_vamm_passive_mode() {
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), ix],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &lp_kp],
         svm.latest_blockhash(),
     );
 
@@ -584,7 +585,7 @@ fn test_matcher_call_after_init() {
     let init_ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp.pubkey(), false), // LP PDA
+            AccountMeta::new_readonly(lp.pubkey(), true), // LP PDA (must sign)
             AccountMeta::new(ctx_pubkey, false),           // Context account
         ],
         data: encode_init_vamm(
@@ -602,7 +603,7 @@ fn test_matcher_call_after_init() {
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), init_ix],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &lp],
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx).expect("Init failed");
@@ -682,14 +683,15 @@ fn test_matcher_rejects_double_init() {
     };
     svm.set_account(ctx_pubkey, ctx_account).unwrap();
 
-    // Create LP PDA placeholder
-    let lp_pda = Pubkey::new_unique();
+    // Create LP keypair (matcher requires signer)
+    let lp_kp = Keypair::new();
+    let lp_pda = lp_kp.pubkey();
 
     // First init succeeds
     let ix1 = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, false), // LP PDA
+            AccountMeta::new_readonly(lp_pda, true), // LP PDA (must sign)
             AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
@@ -698,7 +700,7 @@ fn test_matcher_rejects_double_init() {
     let tx1 = Transaction::new_signed_with_payer(
         &[cu_ix(), ix1],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &lp_kp],
         svm.latest_blockhash(),
     );
     let result1 = svm.send_transaction(tx1);
@@ -708,7 +710,7 @@ fn test_matcher_rejects_double_init() {
     let ix2 = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, false), // LP PDA
+            AccountMeta::new_readonly(lp_pda, true), // LP PDA (must sign)
             AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
@@ -717,7 +719,7 @@ fn test_matcher_rejects_double_init() {
     let tx2 = Transaction::new_signed_with_payer(
         &[cu_ix(), ix2],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &lp_kp],
         svm.latest_blockhash(),
     );
     let result2 = svm.send_transaction(tx2);
@@ -765,7 +767,7 @@ fn test_matcher_vamm_mode_with_impact() {
     let init_ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp.pubkey(), false), // LP PDA
+            AccountMeta::new_readonly(lp.pubkey(), true), // LP PDA (must sign)
             AccountMeta::new(ctx_pubkey, false),           // Context account
         ],
         data: encode_init_vamm(
@@ -783,7 +785,7 @@ fn test_matcher_vamm_mode_with_impact() {
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), init_ix],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &lp],
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx).expect("Init failed");

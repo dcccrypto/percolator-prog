@@ -2211,7 +2211,7 @@ pub fn encode_init_vamm(
     max_fill_abs: u128,
     max_inventory_abs: u128,
 ) -> Vec<u8> {
-    let mut data = vec![0u8; 66];
+    let mut data = vec![0u8; 70]; // 66 + fee_to_insurance_bps(2) + skew_spread_mult_bps(2)
     data[0] = MATCHER_INIT_VAMM_TAG;
     data[1] = mode as u8;
     data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
@@ -2221,7 +2221,39 @@ pub fn encode_init_vamm(
     data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
     data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
     data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
+    // fee_to_insurance_bps at [66..68] = 0, skew_spread_mult_bps at [68..70] = 0
     data
+}
+
+/// Encode percolator's InitMatcherCtx instruction (Tag 75)
+/// This goes to the *percolator* program, which CPIs into the matcher with
+/// the LP PDA as a PDA signer.
+pub fn encode_init_matcher_ctx(
+    lp_idx: u16,
+    kind: u8,
+    trading_fee_bps: u32,
+    base_spread_bps: u32,
+    max_total_bps: u32,
+    impact_k_bps: u32,
+    liquidity_notional_e6: u128,
+    max_fill_abs: u128,
+    max_inventory_abs: u128,
+    fee_to_insurance_bps: u16,
+    skew_spread_mult_bps: u16,
+) -> Vec<u8> {
+    let mut d = vec![75u8]; // tag 75
+    d.extend_from_slice(&lp_idx.to_le_bytes());
+    d.push(kind);
+    d.extend_from_slice(&trading_fee_bps.to_le_bytes());
+    d.extend_from_slice(&base_spread_bps.to_le_bytes());
+    d.extend_from_slice(&max_total_bps.to_le_bytes());
+    d.extend_from_slice(&impact_k_bps.to_le_bytes());
+    d.extend_from_slice(&liquidity_notional_e6.to_le_bytes());
+    d.extend_from_slice(&max_fill_abs.to_le_bytes());
+    d.extend_from_slice(&max_inventory_abs.to_le_bytes());
+    d.extend_from_slice(&fee_to_insurance_bps.to_le_bytes());
+    d.extend_from_slice(&skew_spread_mult_bps.to_le_bytes());
+    d
 }
 
 /// Encode a matcher call instruction (Tag 0)
@@ -3278,36 +3310,8 @@ impl TradeCpiTestEnv {
             )
             .unwrap();
 
-        // Initialize the matcher context with LP PDA
-        let init_ix = Instruction {
-            program_id: *matcher_prog,
-            accounts: vec![
-                AccountMeta::new_readonly(lp_pda, false), // LP PDA (stored for signature verification)
-                AccountMeta::new(ctx, false),             // Context account
-            ],
-            data: encode_init_vamm(
-                MatcherMode::Passive,
-                5,
-                10,
-                200,
-                0,
-                0,
-                1_000_000_000_000, // max fill
-                0,
-            ),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), init_ix],
-            Some(&owner.pubkey()),
-            &[owner],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .expect("init matcher context failed");
-
-        // Now init LP in percolator with this matcher
+        // Step 1: Init LP in percolator (registers matcher_program + matcher_context
+        // in the slab LP account).
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3331,6 +3335,45 @@ impl TradeCpiTestEnv {
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
         self.account_count += 1;
+
+        // Step 2: Use percolator's InitMatcherCtx (tag 75) to CPI-init the matcher
+        // context.  The LP PDA is passed as a PDA signer by the percolator
+        // program, satisfying the matcher's signer requirement.
+        let admin = &self.payer;
+        let init_ctx_ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),       // admin (signer)
+                AccountMeta::new_readonly(self.slab, false),  // slab
+                AccountMeta::new(ctx, false),                 // matcher_ctx (writable)
+                AccountMeta::new_readonly(*matcher_prog, false), // matcher_prog
+                AccountMeta::new_readonly(lp_pda, false),     // lp_pda
+            ],
+            data: encode_init_matcher_ctx(
+                idx,                    // lp_idx
+                MatcherMode::Passive as u8, // kind
+                5,                      // trading_fee_bps
+                10,                     // base_spread_bps
+                200,                    // max_total_bps
+                0,                      // impact_k_bps
+                0,                      // liquidity_notional_e6
+                1_000_000_000_000,      // max_fill_abs
+                0,                      // max_inventory_abs
+                0,                      // fee_to_insurance_bps
+                0,                      // skew_spread_mult_bps
+            ),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), init_ctx_ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("init matcher context failed");
+
         (idx, ctx)
     }
 
@@ -3697,6 +3740,31 @@ impl TradeCpiTestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    /// v12.17: flatten positions via an opposing TradeCpi before resolution.
+    /// After resolution, AdminForceCloseAccount requires position == 0.
+    pub fn flatten_positions_via_trade(
+        &mut self,
+        user: &Keypair,
+        lp_owner: &Pubkey,
+        lp_idx: u16,
+        user_idx: u16,
+        matcher_prog: &Pubkey,
+        matcher_ctx: &Pubkey,
+    ) {
+        let user_pos = self.read_account_position(user_idx);
+        if user_pos != 0 {
+            let _ = self.try_trade_cpi(
+                user,
+                lp_owner,
+                lp_idx,
+                user_idx,
+                -user_pos,
+                matcher_prog,
+                matcher_ctx,
+            );
+        }
+    }
+
     pub fn try_resolve_market(&mut self, admin: &Keypair) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
@@ -3783,17 +3851,17 @@ impl TradeCpiTestEnv {
     }
 
     pub fn is_market_resolved(&self) -> bool {
+        // Check FLAG_RESOLVED (bit 0) in header flags byte at offset 13.
+        // This is stable across engine layout changes.
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        let off = 504 + 232; // ENGINE_OFF + resolved_price offset (BPF)
-        let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
-        rp > 0
+        (d[13] & 0x01) != 0
     }
 
     pub fn read_insurance_balance(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF = 504
-        // RiskEngine layout: vault(U128=16) + insurance_fund(balance(U128=16))
-        // So insurance_fund.balance is at 504 + 16 = 520
+        // ENGINE_OFF = 504, InsuranceFund.balance is at offset 16 within engine
+        // (vault is 16 bytes at 0, insurance_fund starts at 16)
+        // InsuranceFund { balance: U128, ... } - balance is first field
         pub const INSURANCE_BALANCE_OFFSET: usize = 504 + 16;
         u128::from_le_bytes(
             slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET + 16]
