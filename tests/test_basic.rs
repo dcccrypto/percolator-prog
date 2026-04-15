@@ -487,7 +487,7 @@ fn test_idle_account_can_close_after_crank() {
 fn test_matcher_init_vamm_passive_mode() {
     let path = matcher_program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
 
@@ -556,7 +556,7 @@ fn test_matcher_init_vamm_passive_mode() {
 fn test_matcher_call_after_init() {
     let path = matcher_program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let payer = Keypair::new();
     let lp = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
@@ -661,7 +661,7 @@ fn test_matcher_call_after_init() {
 fn test_matcher_rejects_double_init() {
     let path = matcher_program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
 
@@ -733,7 +733,7 @@ fn test_matcher_rejects_double_init() {
 fn test_matcher_vamm_mode_with_impact() {
     let path = matcher_program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let payer = Keypair::new();
     let lp = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();

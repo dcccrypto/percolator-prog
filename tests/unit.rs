@@ -3310,3 +3310,106 @@ fn print_slab_layout() {
     eprintln!("RISK_BUF_LEN = {}", RISK_BUF_LEN);
     eprintln!("SLAB_LEN = {}", SLAB_LEN);
 }
+
+/// Print native (x86_64) struct offsets. Note: BPF offsets differ due to u128 align=8 vs 16.
+/// BPF offsets must be determined empirically or by manual calculation.
+#[test]
+fn print_offsets() {
+    use std::mem::offset_of;
+    use percolator::{RiskEngine, Account};
+    use percolator_prog::constants::*;
+
+    eprintln!("=== ENGINE_OFF = {} ===", ENGINE_OFF);
+    eprintln!("ACCOUNT_SIZE = {}", ACCOUNT_SIZE);
+    eprintln!();
+    eprintln!("--- RiskEngine field offsets ---");
+    eprintln!("vault = {}", offset_of!(RiskEngine, vault));
+    eprintln!("insurance_fund = {}", offset_of!(RiskEngine, insurance_fund));
+    eprintln!("params = {}", offset_of!(RiskEngine, params));
+    eprintln!("current_slot = {}", offset_of!(RiskEngine, current_slot));
+    eprintln!("market_mode = {}", offset_of!(RiskEngine, market_mode));
+    eprintln!("resolved_price = {}", offset_of!(RiskEngine, resolved_price));
+    eprintln!("resolved_slot = {}", offset_of!(RiskEngine, resolved_slot));
+    eprintln!("resolved_payout_h_num = {}", offset_of!(RiskEngine, resolved_payout_h_num));
+    eprintln!("resolved_payout_h_den = {}", offset_of!(RiskEngine, resolved_payout_h_den));
+    eprintln!("resolved_payout_ready = {}", offset_of!(RiskEngine, resolved_payout_ready));
+    eprintln!("resolved_k_long_terminal_delta = {}", offset_of!(RiskEngine, resolved_k_long_terminal_delta));
+    eprintln!("resolved_k_short_terminal_delta = {}", offset_of!(RiskEngine, resolved_k_short_terminal_delta));
+    eprintln!("resolved_live_price = {}", offset_of!(RiskEngine, resolved_live_price));
+    eprintln!("last_crank_slot = {}", offset_of!(RiskEngine, last_crank_slot));
+    eprintln!("c_tot = {}", offset_of!(RiskEngine, c_tot));
+    eprintln!("pnl_pos_tot = {}", offset_of!(RiskEngine, pnl_pos_tot));
+    eprintln!("pnl_matured_pos_tot = {}", offset_of!(RiskEngine, pnl_matured_pos_tot));
+    eprintln!("gc_cursor = {}", offset_of!(RiskEngine, gc_cursor));
+    eprintln!("adl_mult_long = {}", offset_of!(RiskEngine, adl_mult_long));
+    eprintln!("adl_mult_short = {}", offset_of!(RiskEngine, adl_mult_short));
+    eprintln!("adl_coeff_long = {}", offset_of!(RiskEngine, adl_coeff_long));
+    eprintln!("adl_coeff_short = {}", offset_of!(RiskEngine, adl_coeff_short));
+    eprintln!("adl_epoch_long = {}", offset_of!(RiskEngine, adl_epoch_long));
+    eprintln!("adl_epoch_short = {}", offset_of!(RiskEngine, adl_epoch_short));
+    eprintln!("adl_epoch_start_k_long = {}", offset_of!(RiskEngine, adl_epoch_start_k_long));
+    eprintln!("adl_epoch_start_k_short = {}", offset_of!(RiskEngine, adl_epoch_start_k_short));
+    eprintln!("oi_eff_long_q = {}", offset_of!(RiskEngine, oi_eff_long_q));
+    eprintln!("oi_eff_short_q = {}", offset_of!(RiskEngine, oi_eff_short_q));
+    eprintln!("side_mode_long = {}", offset_of!(RiskEngine, side_mode_long));
+    eprintln!("side_mode_short = {}", offset_of!(RiskEngine, side_mode_short));
+    eprintln!("stored_pos_count_long = {}", offset_of!(RiskEngine, stored_pos_count_long));
+    eprintln!("stored_pos_count_short = {}", offset_of!(RiskEngine, stored_pos_count_short));
+    eprintln!("stale_account_count_long = {}", offset_of!(RiskEngine, stale_account_count_long));
+    eprintln!("stale_account_count_short = {}", offset_of!(RiskEngine, stale_account_count_short));
+    eprintln!("phantom_dust_bound_long_q = {}", offset_of!(RiskEngine, phantom_dust_bound_long_q));
+    eprintln!("phantom_dust_bound_short_q = {}", offset_of!(RiskEngine, phantom_dust_bound_short_q));
+    eprintln!("materialized_account_count = {}", offset_of!(RiskEngine, materialized_account_count));
+    eprintln!("neg_pnl_account_count = {}", offset_of!(RiskEngine, neg_pnl_account_count));
+    eprintln!("last_oracle_price = {}", offset_of!(RiskEngine, last_oracle_price));
+    eprintln!("fund_px_last = {}", offset_of!(RiskEngine, fund_px_last));
+    eprintln!("last_market_slot = {}", offset_of!(RiskEngine, last_market_slot));
+    eprintln!("f_long_num = {}", offset_of!(RiskEngine, f_long_num));
+    eprintln!("f_short_num = {}", offset_of!(RiskEngine, f_short_num));
+    eprintln!("f_epoch_start_long_num = {}", offset_of!(RiskEngine, f_epoch_start_long_num));
+    eprintln!("f_epoch_start_short_num = {}", offset_of!(RiskEngine, f_epoch_start_short_num));
+    eprintln!("used = {}", offset_of!(RiskEngine, used));
+    eprintln!("num_used_accounts = {}", offset_of!(RiskEngine, num_used_accounts));
+    eprintln!("free_head = {}", offset_of!(RiskEngine, free_head));
+    eprintln!("next_free = {}", offset_of!(RiskEngine, next_free));
+    eprintln!("accounts = {}", offset_of!(RiskEngine, accounts));
+    eprintln!();
+    eprintln!("--- Account field offsets ---");
+    eprintln!("Account.capital = {}", offset_of!(Account, capital));
+    eprintln!("Account.kind = {}", offset_of!(Account, kind));
+    eprintln!("Account.pnl = {}", offset_of!(Account, pnl));
+    eprintln!("Account.reserved_pnl = {}", offset_of!(Account, reserved_pnl));
+    eprintln!("Account.position_basis_q = {}", offset_of!(Account, position_basis_q));
+    eprintln!("Account.adl_a_basis = {}", offset_of!(Account, adl_a_basis));
+    eprintln!("Account.adl_k_snap = {}", offset_of!(Account, adl_k_snap));
+    eprintln!("Account.f_snap = {}", offset_of!(Account, f_snap));
+    eprintln!("Account.adl_epoch_snap = {}", offset_of!(Account, adl_epoch_snap));
+    eprintln!("Account.matcher_program = {}", offset_of!(Account, matcher_program));
+    eprintln!("Account.matcher_context = {}", offset_of!(Account, matcher_context));
+    eprintln!("Account.owner = {}", offset_of!(Account, owner));
+    eprintln!("Account.fee_credits = {}", offset_of!(Account, fee_credits));
+    eprintln!("Account.sched_present = {}", offset_of!(Account, sched_present));
+    eprintln!("Account.sched_remaining_q = {}", offset_of!(Account, sched_remaining_q));
+    eprintln!("Account.sched_anchor_q = {}", offset_of!(Account, sched_anchor_q));
+    eprintln!("Account.sched_start_slot = {}", offset_of!(Account, sched_start_slot));
+    eprintln!("Account.sched_horizon = {}", offset_of!(Account, sched_horizon));
+    eprintln!("Account.sched_release_q = {}", offset_of!(Account, sched_release_q));
+    eprintln!("Account.pending_present = {}", offset_of!(Account, pending_present));
+    eprintln!("Account.pending_remaining_q = {}", offset_of!(Account, pending_remaining_q));
+    eprintln!("Account.pending_horizon = {}", offset_of!(Account, pending_horizon));
+    eprintln!("Account.pending_created_slot = {}", offset_of!(Account, pending_created_slot));
+    eprintln!();
+    eprintln!("--- RiskParams field offsets ---");
+    use percolator::RiskParams;
+    eprintln!("RiskParams.insurance_floor = {}", offset_of!(RiskParams, insurance_floor));
+    eprintln!("RiskParams.maintenance_fee_per_slot (in MarketConfig) -- check separately");
+    // Also print MarketConfig maintenance_fee_per_slot offset
+    use percolator_prog::state::MarketConfig;
+    eprintln!("MarketConfig size = {}", std::mem::size_of::<MarketConfig>());
+    eprintln!("SlabHeader size = {}", std::mem::size_of::<percolator_prog::state::SlabHeader>());
+    eprintln!();
+    eprintln!("--- MarketConfig field offsets ---");
+    eprintln!("MarketConfig.maintenance_fee_per_slot = {}", offset_of!(MarketConfig, maintenance_fee_per_slot));
+    eprintln!("MarketConfig.max_insurance_floor = {}", offset_of!(MarketConfig, max_insurance_floor));
+    eprintln!("MarketConfig.min_oracle_price_cap_e2bps = {}", offset_of!(MarketConfig, min_oracle_price_cap_e2bps));
+}

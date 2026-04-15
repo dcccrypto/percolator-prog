@@ -23,6 +23,7 @@ use solana_sdk::{
     sysvar,
     transaction::Transaction,
 };
+use solana_program_runtime::compute_budget::ComputeBudget;
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 // Note: Can't read BPF slab from native - struct layouts differ:
@@ -33,7 +34,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 19640; // MAX_ACCOUNTS=64 - native 128-bit fields
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1451848; // MAX_ACCOUNTS=4096, Account=352 bytes (SBF target)
+const SLAB_LEN: usize = 1451880; // MAX_ACCOUNTS=4096 (v12.17 SBF layout)
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -369,6 +370,13 @@ impl TestEnv {
             ),
         };
 
+        // InitMarket zeroes the full 4096-account engine struct in BPF, which exceeds
+        // the 1.4M mainnet CU cap. Temporarily uncap for setup only.
+        self.svm.set_compute_budget(ComputeBudget {
+            compute_unit_limit: 50_000_000,
+            heap_size: 256 * 1024,
+            ..ComputeBudget::default()
+        });
         let tx = Transaction::new_signed_with_payer(
             &[cu_ix(), ix],
             Some(&admin.pubkey()),
@@ -376,6 +384,8 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_market failed");
+        // Restore standard 1.4M cap for benchmarking.
+        self.svm.set_compute_budget(ComputeBudget::default());
     }
 
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {

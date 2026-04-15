@@ -745,7 +745,7 @@ fn test_attack_multi_crank_funding_conservation() {
     // Engine vault should still be total deposited amount
     let engine_vault = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[472..488].try_into().unwrap()) // BPF ENGINE_OFF=472, vault at engine offset 0
+        u128::from_le_bytes(slab.data[504..520].try_into().unwrap()) // BPF ENGINE_OFF=504, vault at engine offset 0
     };
     assert_eq!(
         engine_vault, 20_000_000_200,
@@ -787,7 +787,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_before = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[472..488].try_into().unwrap()) // BPF ENGINE_OFF=472, vault at engine offset 0
+        u128::from_le_bytes(slab.data[504..520].try_into().unwrap()) // BPF ENGINE_OFF=504, vault at engine offset 0
     };
 
     // UpdateConfig with different parameters
@@ -811,7 +811,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_after = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[472..488].try_into().unwrap()) // BPF ENGINE_OFF=472, vault at engine offset 0
+        u128::from_le_bytes(slab.data[504..520].try_into().unwrap()) // BPF ENGINE_OFF=504, vault at engine offset 0
     };
 
     // Conservation: UpdateConfig must not change vault balances

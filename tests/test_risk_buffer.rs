@@ -820,7 +820,7 @@ fn test_calibrate_bpf_offsets() {
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
     
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    let eng = 472usize; // ENGINE_OFF
+    let eng = 504usize; // ENGINE_OFF
 
     // Find num_used=2 + free_head=2
     for off in 0..2000 {
@@ -869,7 +869,7 @@ fn test_find_adl_offsets() {
     env.crank(); // just crank
     
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    let eng = 472usize;
+    let eng = 504usize;
     let adl_one = 1_000_000u128.to_le_bytes();
     println!("=== ADL_ONE scan (400-700) ===");
     for off in (400..700).step_by(8) {
@@ -903,7 +903,7 @@ fn test_find_adl_correct_value() {
     env.crank();
     
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    let eng = 472usize;
+    let eng = 504usize;
     let adl_one = 1_000_000_000_000_000u128.to_le_bytes();
     for off in (300..700).step_by(8) {
         if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == adl_one {
@@ -929,7 +929,7 @@ fn test_find_adl_bytes() {
     env.init_market_with_invert(0);
     // No LP, no user — just init market and check engine defaults
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    let eng = 472usize;
+    let eng = 504usize;
     let target = [0x00u8, 0x80, 0xC6, 0xA4, 0x7E, 0x8D, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     for off in 0..2000 {
         if eng+off+16 <= d.len() && d[eng+off..eng+off+16] == target {

@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 fn test_hyperp_rejects_zero_initial_mark_price() {
     let path = program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -173,7 +173,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
 fn test_hyperp_init_market_with_valid_price() {
     let path = program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -328,7 +328,7 @@ fn test_hyperp_init_market_with_valid_price() {
 fn test_hyperp_init_market_with_inverted_price() {
     let path = program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -652,7 +652,7 @@ fn test_critical_set_oracle_price_cap_authorization() {
 fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     let path = program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);

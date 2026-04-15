@@ -623,25 +623,8 @@ fn test_attack_trade_risk_increase_when_gated() {
     env.deposit(&user, user_idx, 10_000_000_000);
 
     // Directly set side_mode_long = DrainOnly (1) in the slab raw bytes.
-    // SBF uses 8-byte u128 alignment (unlike x86-64 which uses 16-byte).
-    // ENGINE_OFF = 440.  Within RiskEngine (SBF layout):
-    //   oi_eff_long_q:  U256 (32 bytes) at engine offset 472, ends at 504
-    //   oi_eff_short_q: U256 (32 bytes) at engine offset 504, ends at 536
-    //   side_mode_long: u8 at engine offset 424 (BPF, native 128-bit)
-    // => slab absolute offset = 520 + 488 = 864
-    // BPF layout: ENGINE_OFF=472, side_mode_long at engine offset
-    // from BPF build. Compute: OI fields (oi_eff_long/short) are the last u128
-    // pair before side_mode_long. Search for the pattern.
-    // BPF accounts at engine+9376, native at engine+9408, diff=32.
-    // side_mode_long is immediately after oi_eff_short_q (u128).
-    // BPF oi fields pack tighter. Use BPF ACCOUNTS_OFFSET pattern:
-    // native side_mode_long=512, native accounts=9408, BPF accounts=9376 (diff 32).
-    // But the diff is not uniform. Use the read_num_used helper's ENGINE offset (472)
-    // and compute empirically. The oi_eff_long/short pair (32 bytes) precedes side_mode.
-    // From code analysis: BPF side_mode_long at engine offset ~488.
-    // Slab absolute = 472 + 960 = 960.
-    // Fallback: try the value and if the trade still works, try adjacent offsets.
-    const SIDE_MODE_LONG_OFF: usize = 472 + 536; // BPF ENGINE_OFF + BPF offset of side_mode_long
+    // v12.17 layout: ENGINE_OFF=504, side_mode_long at engine offset 536 (BPF)
+    const SIDE_MODE_LONG_OFF: usize = 504 + 536; // BPF ENGINE_OFF + BPF offset of side_mode_long
     {
         let original_slab = env
             .svm
@@ -9168,7 +9151,7 @@ fn test_attack_trade_exceeds_margin_capacity() {
 fn test_attack_init_market_admin_mismatch() {
     let path = program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -9281,7 +9264,7 @@ fn test_attack_init_market_admin_mismatch() {
 fn test_attack_init_market_mint_mismatch() {
     let path = program_path();
 
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);

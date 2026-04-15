@@ -839,7 +839,6 @@ fn encode_risk_params_wire(
     v.extend_from_slice(&new_account_fee.to_le_bytes());
     v.extend_from_slice(&insurance_floor.to_le_bytes());
     v.extend_from_slice(&h_max.to_le_bytes());     // v12.15: h_max (u64)
-    v.extend_from_slice(&0u64.to_le_bytes());      // padding (remaining 8 bytes of old u128 slot)
     v.extend_from_slice(&max_crank_staleness_slots.to_le_bytes());
     v.extend_from_slice(&liquidation_fee_bps.to_le_bytes());
     v.extend_from_slice(&liquidation_fee_cap.to_le_bytes());
@@ -862,7 +861,6 @@ const RISK_PARAMS_WIRE_LEN: usize =
   + 16  // new_account_fee (u128)
   + 16  // insurance_floor wire slot (u128)
   + 8   // h_max (u64, v12.15)
-  + 8   // h_max padding (u64, remaining old u128 slot)
   + 8   // max_crank_staleness_slots (u64)
   + 8   // liquidation_fee_bps (u64)
   + 16  // liquidation_fee_cap (u128)
@@ -873,12 +871,12 @@ const RISK_PARAMS_WIRE_LEN: usize =
   + 16; // min_nonzero_im_req (u128)
 
 #[test]
-fn risk_params_wire_len_is_192_bytes() {
-    // 192 bytes: h_max(8) + padding(8) replaced maintenance_fee_per_slot(16), same total
+fn risk_params_wire_len_is_184_bytes() {
+    // 184 bytes: v12.17 removed h_max padding (was 192 with 8-byte pad)
     assert_eq!(
         RISK_PARAMS_WIRE_LEN,
-        192,
-        "RiskParams wire format byte count changed: got {}, expected 192",
+        184,
+        "RiskParams wire format byte count changed: got {}, expected 184",
         RISK_PARAMS_WIRE_LEN
     );
 }
@@ -967,10 +965,9 @@ fn risk_params_full_round_trip_via_init_market() {
         h_max, crank_staleness, liq_fee_bps, liq_fee_cap, liq_buf_bps,
         min_liq_abs, min_init_deposit, min_nonzero_mm, min_nonzero_im,
     ));
-    // Extended tail (82 bytes) — all defaults
+    // Extended tail (66 bytes) — all defaults
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor_change_per_day
     data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps

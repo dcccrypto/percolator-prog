@@ -817,7 +817,7 @@ fn test_admin_limits_lifecycle() {
 #[test]
 fn test_init_market_rejects_vault_with_delegate() {
     program_path();
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     svm.add_program(program_id, &std::fs::read(program_path()).unwrap());
 
@@ -891,7 +891,7 @@ fn test_init_market_rejects_vault_with_delegate() {
 #[test]
 fn test_init_market_rejects_vault_with_close_authority() {
     program_path();
-    let mut svm = LiteSVM::new();
+    let mut svm = common::new_test_svm();
     let program_id = Pubkey::new_unique();
     svm.add_program(program_id, &std::fs::read(program_path()).unwrap());
 

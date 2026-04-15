@@ -21,11 +21,12 @@ use solana_sdk::{
     sysvar,
     transaction::Transaction,
 };
+use solana_program_runtime::compute_budget::ComputeBudget;
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1451848;
+const SLAB_LEN: usize = 1451880;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -474,6 +475,11 @@ fn test_bpf_i128_alignment() {
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
+    svm.set_compute_budget(ComputeBudget {
+        compute_unit_limit: 50_000_000, // 50M CUs — unoptimized test build needs more
+        heap_size: 256 * 1024,
+        ..ComputeBudget::default()
+    });
 
     let payer = Keypair::new();
     let slab = Pubkey::new_unique();
