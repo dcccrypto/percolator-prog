@@ -1871,10 +1871,11 @@ pub mod state {
 
     /// Increment the materialization counter and return the NEW value.
     /// Each account gets a globally unique ID at creation time.
-    pub fn next_mat_counter(data: &mut [u8]) -> u64 {
-        let c = read_mat_counter(data).wrapping_add(1);
+    pub fn next_mat_counter(data: &mut [u8]) -> Result<u64, ProgramError> {
+        let c = read_mat_counter(data).checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
         write_mat_counter(data, c);
-        c
+        Ok(c)
     }
 
     // ========================================
@@ -3523,7 +3524,7 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
                 drop(engine);
-                state::next_mat_counter(&mut data);
+                state::next_mat_counter(&mut data)?;
             }
             Instruction::InitLP {
                 matcher_program,
@@ -3592,7 +3593,7 @@ pub mod processor {
                 drop(engine);
                 // Increment per-materialization counter. Used as lp_account_id
                 // input so every LP instance gets a unique identity.
-                state::next_mat_counter(&mut data);
+                state::next_mat_counter(&mut data)?;
             }
             Instruction::DepositCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 6)?;
