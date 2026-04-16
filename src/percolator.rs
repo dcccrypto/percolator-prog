@@ -6732,8 +6732,8 @@ pub mod processor {
         // Convert requested base tokens to units
         let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
 
-        // Use frozen time on resolved markets
-        let withdraw_slot = if resolved { state::get_resolved_slot(&config) } else { clock.slot };
+        // Use frozen time on resolved markets (engine.current_slot is frozen at resolution)
+        let withdraw_slot = if resolved { engine.current_slot } else { clock.slot };
         let h_lock = engine.params.h_min;
         engine
             .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
@@ -6805,8 +6805,8 @@ pub mod processor {
                 return Err(ProgramError::InvalidAccountData);
             }
 
-            // Use resolution_slot (snapshotted in ResolveMarket)
-            let frozen_slot = state::get_resolved_slot(&config);
+            // Use resolution_slot (engine.current_slot is frozen at resolution boundary)
+            let frozen_slot = zc::engine_ref(&data)?.current_slot;
 
             // Dust sweep: resolved crank must also sweep dust so
             // CloseSlab's dust_base == 0 check can eventually pass.
@@ -8427,7 +8427,6 @@ pub mod processor {
             config = state::read_config(&data);
         }
 
-        state::set_resolved_slot(&mut config, clock.slot);
         state::write_config(&mut data, &config);
 
         // Set engine market_mode to Resolved so force_close_resolved_not_atomic accepts it.
@@ -9341,7 +9340,6 @@ pub mod processor {
         // Use clock.slot (not engine.last_crank_slot) — other instructions
         // advance current_slot past last_crank_slot, so using the stale
         // crank slot would make resolved touch paths fail monotonic checks.
-        state::set_resolved_slot(&mut config, clock.slot);
         config.authority_price_e6 = last_price;
         state::write_config(&mut data, &config);
         state::set_resolved(&mut data);
@@ -9382,9 +9380,8 @@ pub mod processor {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
         let clock = Clock::from_account_info(a_clock)?;
-        if clock.slot < state::get_resolved_slot(&config)
-            .saturating_add(config.force_close_delay_slots)
-        {
+        let resolved_slot = zc::engine_ref(&data)?.current_slot;
+        if clock.slot < resolved_slot.saturating_add(config.force_close_delay_slots) {
             return Err(ProgramError::InvalidAccountData);
         }
 
@@ -10238,7 +10235,10 @@ pub mod processor {
             return Err(PercolatorError::DisputeWindowClosed.into());
         }
         let clock = Clock::get()?;
-        let resolved_slot = state::get_resolved_slot(&config);
+        let resolved_slot = {
+            let data2 = a_slab.try_borrow_data()?;
+            zc::engine_ref(&data2)?.current_slot
+        };
         let window_end = resolved_slot
             .checked_add(dispute_window_slots)
             .ok_or(PercolatorError::DisputeWindowClosed)?;
