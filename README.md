@@ -1,6 +1,8 @@
 # Percolator (Solana Program)
 
-> **Mainnet beta.** Live on Solana mainnet at `ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv`. Internal security audit complete (25 findings, 12 fixed, 5 deferred). Squads multisig migration pending before removing beta designation.
+> **DISCLAIMER: EXPERIMENTAL SOFTWARE — NOT AUDITED**
+>
+> This code has **NOT been externally audited**. Do NOT use in production or with real funds. This is experimental software provided for learning and research purposes only. Use at your own risk.
 
 Percolator is a minimal Solana program that wraps the `percolator` crate's `RiskEngine` inside a single on-chain **slab** account and exposes a small, composable instruction set for deploying and operating perpetual markets.
 
