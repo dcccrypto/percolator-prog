@@ -5795,6 +5795,7 @@ pub mod processor {
 
             Instruction::WithdrawInsuranceLimited { amount } => {
                 // Limited insurance withdraw (configured authority + min/max/cooldown checks)
+                // Accept 7 or 8 accounts: optional oracle for same-instruction accrual
                 accounts::expect_len(accounts, 7)?;
                 let a_authority = &accounts[0];
                 let a_slab = &accounts[1];
@@ -5803,6 +5804,7 @@ pub mod processor {
                 let a_token = &accounts[4];
                 let a_vault_pda = &accounts[5];
                 let a_clock = &accounts[6];
+                let a_oracle_opt = if accounts.len() > 7 { Some(&accounts[7]) } else { None };
 
                 accounts::expect_signer(a_authority)?;
                 accounts::expect_writable(a_slab)?;
@@ -5930,17 +5932,55 @@ pub mod processor {
                         }
                     }
 
-                    // On live markets, require a recent crank so that latent
-                    // losses are reflected in insurance_fund.balance before
-                    // allowing withdrawal. Without this, unsettled losses
-                    // could make the stored balance overstated.
+                    // On live markets, realize latent losses before reading insurance.
+                    // Authoritative path: if oracle account is provided, do same-instruction
+                    // accrue_market_to to update insurance balance with fresh price impact.
+                    // Fallback: require a recent crank (stale-accounting proxy).
                     if !resolved {
-                        let staleness = clock.slot.saturating_sub(engine.last_crank_slot);
-                        if staleness > engine.params.max_crank_staleness_slots {
-                            return Err(PercolatorError::OracleStale.into());
+                        if let Some(a_oracle) = a_oracle_opt {
+                            // Fresh oracle accrual — realizes losses at current price
+                            let is_hyperp = oracle::is_hyperp_mode(&config);
+                            let accrual_price = if is_hyperp {
+                                let last_slot = engine.current_slot;
+                                drop(engine);
+                                let px = oracle::get_engine_oracle_price_e6(
+                                    last_slot, clock.slot, clock.unix_timestamp,
+                                    &mut config, a_oracle,
+                                )?;
+                                state::write_config(&mut data, &config);
+                                px
+                            } else {
+                                drop(engine);
+                                let px = read_price_and_stamp(
+                                    &mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data,
+                                )?;
+                                state::write_config(&mut data, &config);
+                                px
+                            };
+                            {
+                                let engine = zc::engine_mut(&mut data)?;
+                                engine.accrue_market_to(
+                                    clock.slot, accrual_price,
+                                    compute_current_funding_rate_e9(&config),
+                                ).map_err(map_risk_error)?;
+                            }
+                            if !state::is_oracle_initialized(&data) {
+                                state::set_oracle_initialized(&mut data);
+                            }
+                            // Re-borrow engine for subsequent checks
+                        } else {
+                            // No oracle: require recent crank as freshness proxy
+                            let staleness = clock.slot.saturating_sub(engine.last_crank_slot);
+                            if staleness > engine.params.max_crank_staleness_slots {
+                                return Err(PercolatorError::OracleStale.into());
+                            }
+                            drop(engine);
                         }
+                    } else {
+                        drop(engine);
                     }
 
+                    let engine = zc::engine_mut(&mut data)?;
                     let insurance_units = engine.insurance_fund.balance.get();
                     if insurance_units == 0 {
                         return Ok(());
