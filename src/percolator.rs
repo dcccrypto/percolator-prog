@@ -1419,8 +1419,10 @@ pub mod ix {
 
         /// PERC-306: Fund per-market isolated insurance balance (tag 41).
         FundMarketInsurance { amount: u64 },
-        /// PERC-306: Set insurance isolation BPS for a market (tag 42).
-        SetInsuranceIsolation { bps: u16 },
+        // Tag 42 (SetInsuranceIsolation): removed. Was a no-op stub — the field
+        // `insurance_isolation_bps` was never wired into MarketConfig, so the
+        // handler logged but never persisted state. Kept TAG_SET_INSURANCE_ISOLATION
+        // in tags.rs to reserve the tag space; decode returns InvalidInstructionData.
         /// PERC-314: Challenge settlement price (tag 43).
         ChallengeSettlement { proposed_price_e6: u64 },
         /// PERC-314: Resolve dispute (admin) (tag 44).
@@ -1822,10 +1824,7 @@ pub mod ix {
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::FundMarketInsurance { amount })
                 }
-                42 => {
-                    let bps = read_u16(&mut rest)?;
-                    Ok(Instruction::SetInsuranceIsolation { bps })
-                }
+                // Tag 42 (SetInsuranceIsolation): removed. See Instruction enum comment.
                 43 => {
                     let proposed_price_e6 = read_u64(&mut rest)?;
                     Ok(Instruction::ChallengeSettlement { proposed_price_e6 })
@@ -2586,11 +2585,8 @@ pub mod state {
     #[inline]
     pub fn set_settlement_price_e6(_config: &mut MarketConfig, _v: u64) {}
 
-    /// Insurance isolation BPS — 0 means no isolation.
-    #[inline]
-    pub fn get_insurance_isolation_bps(_config: &MarketConfig) -> u16 { 0 }
-    #[inline]
-    pub fn set_insurance_isolation_bps(_config: &mut MarketConfig, _v: u16) {}
+    // Insurance isolation BPS stubs removed — field not in MarketConfig layout
+    // and handler (tag 42) was removed. Field was never persisted.
 
     /// LP collateral enabled — 0 means disabled.
     #[inline]
@@ -5820,10 +5816,6 @@ pub mod processor {
 
             Instruction::FundMarketInsurance { amount } => {
                 handle_fund_market_insurance(program_id, accounts, amount)?;
-            }
-
-            Instruction::SetInsuranceIsolation { bps } => {
-                handle_set_insurance_isolation(program_id, accounts, bps)?;
             }
 
             Instruction::ChallengeSettlement { proposed_price_e6 } => {
@@ -10204,36 +10196,7 @@ pub mod processor {
         Ok(())
     }
 
-    // --- SetInsuranceIsolation ---
-    #[inline(never)]
-    fn handle_set_insurance_isolation<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-        bps: u16,
-    ) -> ProgramResult {
-        accounts::expect_len(accounts, 2)?;
-        let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
-
-        accounts::expect_signer(a_admin)?;
-        accounts::expect_writable(a_slab)?;
-
-        let mut data = state::slab_data_mut(a_slab)?;
-        slab_guard(program_id, a_slab, &data)?;
-        require_initialized(&data)?;
-        let header = state::read_header(&data);
-        require_admin(header.admin, a_admin.key)?;
-
-        if bps > 10_000 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        // set_insurance_isolation_bps: stub — field not in current layout, log only.
-        let _engine = zc::engine_mut(&mut data)?;
-        // config.insurance_isolation_bps not in current layout — no-op write.
-        msg!("PERC-306: set insurance isolation to {} bps", bps);
-        Ok(())
-    }
+    // SetInsuranceIsolation handler removed — was a no-op stub (tag 42).
 
     // --- ChallengeSettlement ---
     #[inline(never)]
