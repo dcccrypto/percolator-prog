@@ -3850,6 +3850,11 @@ pub mod processor {
                     engine.current_slot
                 };
 
+                // Capture pre-oracle-read funding rate for anti-retroactivity (§5.5).
+                // The rate for interval [last_market_slot, now_slot] must reflect
+                // mark vs index DURING that interval, not the post-read state.
+                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
+
                 let price = if is_hyperp {
                     // Hyperp mode: update index toward mark with rate limiting
                     oracle::get_engine_oracle_price_e6(
@@ -3898,7 +3903,6 @@ pub mod processor {
                 }
                 combined.extend_from_slice(&candidates);
 
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 let h_lock = engine.params.h_min;
                 let _outcome = engine
                     .keeper_crank_not_atomic(
@@ -3906,7 +3910,7 @@ pub mod processor {
                         price,
                         &combined,
                         percolator::LIQ_BUDGET_PER_CRANK,
-                        funding_rate_e9,
+                        funding_rate_e9_pre,
                         h_lock,
                     )
                     .map_err(map_risk_error)?;
@@ -3943,11 +3947,12 @@ pub mod processor {
                                 if (charged[word] >> bit) & 1 == 1 { continue; }
                                 charged[word] |= 1u64 << bit;
                             }
-                            // Best-effort: ignore errors (account may have been
-                            // liquidated or closed during this crank).
-                            let _ = engine.charge_account_fee_not_atomic(
+                            // Propagate errors — engine's _not_atomic contract means
+                            // Err may leave partial state. Swallowing would commit
+                            // partial mutations with last_fee_charge_slot advanced.
+                            engine.charge_account_fee_not_atomic(
                                 cidx, fee_per_account, clock.slot,
-                            );
+                            ).map_err(map_risk_error)?;
                         }
                         config.last_fee_charge_slot = clock.slot;
                     }
@@ -4066,6 +4071,9 @@ pub mod processor {
                     return Err(PercolatorError::HyperpTradeNoCpiDisabled.into());
                 }
 
+                // Capture pre-read funding rate for anti-retroactivity (§5.5)
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+
                 // Read oracle price with circuit-breaker clamping
                 let price =
                     read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data)?;
@@ -4105,7 +4113,6 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
                     sol_log_compute_units();
                 }
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 execute_trade_with_matcher(
                     engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
                     funding_rate_e9, 0, // NoOpMatcher ignores lp_account_id
@@ -4332,6 +4339,9 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
+                // Capture pre-read funding rate for anti-retroactivity (§5.5)
+                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
+
                 // Oracle price: Hyperp mode applies rate-limited index update
                 // via clamp_toward_with_dt (prevents stale-index manipulation).
                 // Non-Hyperp: standard circuit-breaker clamping.
@@ -4518,11 +4528,10 @@ pub mod processor {
                         exec_price,
                         exec_size: trade_size,
                     };
-                    // Compute funding BEFORE trade (uses pre-fill state per anti-retroactivity)
-                    let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                    // Use pre-oracle-read funding rate (anti-retroactivity §5.5)
                     execute_trade_with_matcher(
                         engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
-                        funding_rate_e9, lp_account_id,
+                        funding_rate_e9_pre, lp_account_id,
                     ).map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
@@ -5627,7 +5636,13 @@ pub mod processor {
                 } else if oracle::is_hyperp_mode(&config) {
                     config.last_effective_price_e6
                 } else if oracle_initialized {
-                    engine.last_oracle_price
+                    // Oracle is dead — use settlement_price as live_oracle so the
+                    // engine's deviation band check is self-consistent (vacuous).
+                    // The admin-pushed price already passed the circuit-breaker guard
+                    // when the oracle was live. Using stale engine.last_oracle_price
+                    // here would create a deadlock: admin cannot resolve when the push
+                    // diverged from the stale engine price by more than the band.
+                    settlement_price
                 } else {
                     // Oracle never initialized — cannot resolve with sentinel price.
                     return Err(PercolatorError::OracleInvalid.into());
