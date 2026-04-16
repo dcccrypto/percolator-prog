@@ -6637,6 +6637,10 @@ pub mod processor {
         engine
             .deposit_not_atomic(user_idx, units as u128, 0, clock.slot)
             .map_err(map_risk_error)?;
+        drop(engine);
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
@@ -6736,6 +6740,11 @@ pub mod processor {
             .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
                 compute_current_funding_rate_e9(&config), h_lock)
             .map_err(map_risk_error)?;
+        drop(engine);
+
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
 
         // Convert units back to base tokens for payout (checked to prevent silent overflow)
         let base_to_pay =
@@ -6852,6 +6861,9 @@ pub mod processor {
                 state::write_dust_base(&mut data, 0);
             }
 
+            if !state::is_oracle_initialized(&data) {
+                state::set_oracle_initialized(&mut data);
+            }
             return Ok(());
         }
 
@@ -6954,6 +6966,9 @@ pub mod processor {
         // 0xC8A4C5 = "CRANK_STATS" tag; replaces msg!("CRANK_STATS") to save ~300 CU
         sol_log_64(0xC8A4C5, 0, MAX_ACCOUNTS as u64, ins_low, 0);
 
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
@@ -7100,6 +7115,9 @@ pub mod processor {
 
         // Write updated config (mark_ewma changed)
         state::write_config(&mut data, &config);
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         #[cfg(feature = "cu-audit")]
         {
             msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
@@ -7457,6 +7475,9 @@ pub mod processor {
             let mut data = state::slab_data_mut(a_slab)?;
             state::write_req_nonce(&mut data, req_id);
             state::write_config(&mut data, &config);
+            if !state::is_oracle_initialized(&data) {
+                state::set_oracle_initialized(&mut data);
+            }
         }
         Ok(())
     }
@@ -7532,6 +7553,9 @@ pub mod processor {
         {
             msg!("CU_CHECKPOINT: liquidate_end");
             sol_log_compute_units();
+        }
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
         }
         Ok(())
     }
@@ -7613,6 +7637,7 @@ pub mod processor {
             msg!("CU_CHECKPOINT: close_account_start");
             sol_log_compute_units();
         }
+        let mut need_set_oracle_init = false;
         let amt_units = if resolved {
             // force_close_resolved handles K-pair PnL, maintenance fees,
             // loss settlement, and account close internally.
@@ -7630,11 +7655,17 @@ pub mod processor {
             }
         } else {
             let h_lock = engine.params.h_min;
-            engine
+            let result = engine
                 .close_account_not_atomic(user_idx, clock.slot, price,
                     compute_current_funding_rate_e9(&config), h_lock)
-                .map_err(map_risk_error)?
+                .map_err(map_risk_error)?;
+            need_set_oracle_init = true;
+            result
         };
+        drop(engine);
+        if need_set_oracle_init && !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         #[cfg(feature = "cu-audit")]
         {
             msg!("CU_CHECKPOINT: close_account_end");
@@ -9038,6 +9069,9 @@ pub mod processor {
         engine.settle_account_not_atomic(user_idx, price, clock.slot,
             compute_current_funding_rate_e9(&config), h_lock)
             .map_err(map_risk_error)?;
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
@@ -9177,6 +9211,9 @@ pub mod processor {
         engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
             compute_current_funding_rate_e9(&config), h_lock)
             .map_err(map_risk_error)?;
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
@@ -11124,13 +11161,18 @@ pub mod processor {
         let excess_lo = excess as u64;
         let excess_hi = (excess >> 64) as u64;
         let final_pnl_abs = final_pnl.unsigned_abs();
+        let pnl_pos_tot = engine.pnl_pos_tot;
+        drop(engine);
         sol_log_64(
             0xAD1E_0002,
             excess_lo,
             excess_hi,
             final_pnl_abs as u64,
-            engine.pnl_pos_tot as u64,
+            pnl_pos_tot as u64,
         );
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
