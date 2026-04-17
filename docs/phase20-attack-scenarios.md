@@ -96,33 +96,31 @@ Absolute paths referenced:
 
 ---
 
-## 8. Admin key compromise blast radius (post Phase-E two-step)
+## 8. Admin key compromise blast radius (post Phase-E two-step + Phase G oracle removal)
 
 **Setup:** single admin key is compromised; enumerate what attacker does in one transaction.
 
-**One-tx capabilities** (all guarded by `require_admin` at `percolator-prog/src/percolator.rs:5598-5600`):
+**One-tx capabilities** (all guarded by `require_admin`):
 - `UpdateConfig` (tag 14, admin-only funding knobs)
-- `SetOracleAuthority` (tag 16) — BLOCKED on Pyth-pinned markets at `:8331-8339`.
-- `PushOraclePrice` (tag 17) — subject to `oracle_price_cap_e2bps` per-slot circuit breaker.
-- `ResolveMarket` (tag 19) — requires fresh `authority_timestamp` (`:8653-8658`) and must match fresh oracle within cap at `:8668-8704`; blocked while paused at `:8635`.
-- `WithdrawInsurance` / `WithdrawInsuranceLimited` — require RESOLVED AND `num_used_accounts == 0` (`:8810-8812`); cannot drain while users exist.
+- ~~`SetOracleAuthority` (tag 16)~~ — **PERMANENTLY REMOVED in Phase G (commit 4ab59f0).** Tag now returns `InvalidInstructionData`. Markets read live oracle (Pyth/Chainlink) or DEX-fed Hyperp EWMA only.
+- ~~`PushOraclePrice` (tag 17)~~ — **PERMANENTLY REMOVED in Phase G (commit 4ab59f0).** Tag now returns `InvalidInstructionData`. Hyperp bootstrap moved to first-touch DEX seeding inside `UpdateHyperpMark`.
+- `ResolveMarket` (tag 19) — Phase G rewrite: settlement price comes from live Pyth/Chainlink read at resolution time, not from a pushed price. Falls back to `last_effective_price_e6` only if the oracle is dead. Blocked while paused.
+- `WithdrawInsurance` / `WithdrawInsuranceLimited` — require RESOLVED AND `num_used_accounts == 0`; cannot drain while users exist.
 - `Pause/Unpause`, `SetMaxPnlCap`, `SetDispute*`, `SetLpCollateral*`.
-- `UpdateAdmin` — Phase E at `:7992-8049`. In the two-step case the admin can only *set* `pending_admin`; the rotation only completes when the proposed key signs `AcceptAdmin` at `:8056-8093`. Burn path (`new_admin == default`) also requires both `permissionless_resolve_stale_slots` AND `force_close_delay_slots` to be nonzero (`:8020-8030`) so burning cannot brick funds.
+- `UpdateAdmin` — Phase E. In the two-step case the admin can only *set* `pending_admin`; the rotation only completes when the proposed key signs `AcceptAdmin`. Burn path (`new_admin == default`) requires both `permissionless_resolve_stale_slots` AND `force_close_delay_slots` to be nonzero so burning cannot brick funds.
 
-**Confirmed reduction:** a single compromised key cannot rotate admin to an attacker key atomically — the attacker must also produce an `AcceptAdmin` signature from the target key. `WithdrawInsurance*` still gated behind resolve + all-accounts-closed, so a single-tx drain is not reachable. `PushOraclePrice` + `ResolveMarket` is the sharpest remaining single-tx attack but is bounded by `oracle_price_cap_e2bps`, `DEFAULT_HYPERP_PRICE_CAP_E2BPS` (`:112`), staleness (`:8656`), and the cross-check against fresh external oracle (`:8668-8704`). See THREAT_MODEL.md:21-35 for the authorized-capabilities enumeration (which matches the on-chain surface).
+**Confirmed reduction:** a single compromised key cannot rotate admin to an attacker key atomically — the attacker must also produce an `AcceptAdmin` signature from the target key. `WithdrawInsurance*` is gated behind resolve + all-accounts-closed, so a single-tx drain is not reachable. **The previous sharpest single-tx attack — `PushOraclePrice` + `ResolveMarket` — is no longer reachable: the program rejects tag 17 unconditionally.** Settlement is now an admin-triggered call to the live oracle, not an admin-controlled value. See THREAT_MODEL.md:21-35 for the authorized-capabilities enumeration.
 
-**Verdict:** Blast radius reduced per Phase E.
-**Residual risks:** (a) admin can still pause markets indefinitely (DoS, not theft); (b) `SetMaxPnlCap` can be set to force/skip ADL; (c) on Hyperp markets with `invert=0` and a live push, admin can push near the per-slot cap repeatedly to drift settlement price before resolving (bounded by cap per slot and the resolve-time fresh-push guard). Mitigation: Squads multisig migration (THREAT_MODEL.md:35).
+**Verdict:** Blast radius reduced per Phase E + Phase G. Admin-driven oracle drift (the Phase G motivator) is fully closed.
+**Residual risks:** (a) admin can pause markets indefinitely (DoS, not theft — recovery via Squads multisig); (b) `SetMaxPnlCap` can be set to force/skip ADL; (c) admin can still call `ResolveMarket` at any moment, locking settlement at whatever the live oracle reports — but the price source itself is no longer admin-controlled. Mitigation for residual admin powers: Squads multisig migration (THREAT_MODEL.md:35).
 
 ---
 
 ## Summary
 
-- 7 of 8 scenarios are blocked by in-program guards with clear file:line citations.
-- Scenario 8 retains residual surface around pause/DoS and admin-driven oracle drift within circuit-breaker bounds; planned mitigation is Squads multisig per THREAT_MODEL.md.
-- No novel exploit path surfaced in scenarios 1-7 during this review.
-
-**Note on Phase G status:** scenario 8's "admin oracle drift" residual risk is the primary motivation for Phase G (removing `SetOracleAuthority` + `PushOraclePrice` entirely). That work is scoped for a dedicated future session due to the 362-test-call-site migration cost.
+- All 8 scenarios are blocked by in-program guards with clear file:line citations.
+- Scenario 8's "admin oracle drift" residual risk is **fully closed by Phase G** (commits 4ab59f0 + 996b9e1): tags 16 and 17 permanently removed, ResolveMarket now reads the live oracle directly. Remaining admin powers (pause, ADL toggle, resolve trigger) are operational rather than oracle-trust surfaces and are mitigated by Squads multisig migration per THREAT_MODEL.md.
+- No novel exploit path surfaced during this review.
 
 ## Open inspection targets for a follow-on phase:
 - `execute_adl_not_atomic` budget interaction with repeated calls in the same tx (not probed here).
