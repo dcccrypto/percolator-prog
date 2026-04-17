@@ -2893,13 +2893,18 @@ pub mod oracle {
     const PYTH_VERIFICATION_FULL: u16 = 1;
 
     // Chainlink OCR2 State/Aggregator account layout offsets
-    // Note: Different from the Transmissions ring buffer format in older docs
-    const CL_MIN_LEN: usize = 224; // Minimum required length
+    // Note: Different from the Transmissions ring buffer format in older docs.
+    //
+    // 2026-04-17 fix (pre-audit Phase 3): CL_MIN_LEN was 224, but CL_OFF_ANSWER
+    // at 216 is an i128 (16 bytes) requiring data[216..232]. Any account with
+    // length in [224, 232) passed the gate and then panicked on slice OOB,
+    // creating a DoS-by-panic vector. Raised to 232 to fit the answer field.
+    const CL_MIN_LEN: usize = 232; // Minimum required length (answer ends at 232)
     const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
                                         // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
                                         // The actual price data is stored directly at tail:
     const CL_OFF_TIMESTAMP: usize = 208; // u64 - unix timestamp (seconds)
-    const CL_OFF_ANSWER: usize = 216; // i128 - price answer
+    const CL_OFF_ANSWER: usize = 216; // i128 - price answer (16 bytes, ends at 232)
 
     // Maximum supported exponent to prevent overflow (10^18 fits in u128)
     const MAX_EXPO_ABS: i32 = 18;
