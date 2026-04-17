@@ -6790,6 +6790,11 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
+        // SECURITY: paused markets must halt all state-changing ops including
+        // keeper cranks (matches upstream fix 3c95f03). Without this, a paused
+        // market still accrues funding and settles positions via keeper activity.
+        require_not_paused(&data)?;
+
         // Check if market is resolved - frozen time mode.
         // NOTE: resolved crank is effectively permissionless regardless of
         // caller_idx — the resolved path returns before owner-match checks.
@@ -12467,6 +12472,23 @@ pub mod processor {
         if flags & state::FLAG_RESOLVED == 0 {
             solana_program::msg!("RescueOrphanVault rejected: market is not resolved");
             return Err(ProgramError::InvalidAccountData);
+        }
+
+        // SECURITY: block rescue while user positions still exist (matches
+        // upstream fix 3c95f03, WithdrawInsurance guard at L8528). Without
+        // this, a compromised admin on a resolved market could drain the
+        // entire vault — including user collateral — before users have had
+        // a chance to force-close their positions. This was the most
+        // critical admin vulnerability in the threat model.
+        {
+            let engine = zc::engine_ref(&slab_data)?;
+            if engine.num_used_accounts != 0 {
+                solana_program::msg!(
+                    "RescueOrphanVault rejected: {} positions still open",
+                    engine.num_used_accounts
+                );
+                return Err(ProgramError::InvalidAccountData);
+            }
         }
 
         let bump = slab_data[12];
