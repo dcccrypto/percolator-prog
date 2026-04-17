@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1484624;
+const SLAB_LEN: usize = 1492816;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

@@ -1228,7 +1228,7 @@ pub mod ix {
                 .split_first()
                 .ok_or(ProgramError::InvalidInstructionData)?;
 
-            match tag {
+            let result = match tag {
                 0 => {
                     // InitMarket
                     let admin = read_pubkey(&mut rest)?;
@@ -1501,7 +1501,19 @@ pub mod ix {
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
+            };
+            // Trailing-byte guard: every tag above fully consumes its expected
+            // payload. Anything left over is either a malformed client payload
+            // or a future-version wire format the current program cannot safely
+            // interpret. Reject rather than silently ignore — accepting stray
+            // bytes is an ABI footgun that turns into a semantic drift bug as
+            // soon as any instruction grows an optional tail field.
+            // (Tag 0 / InitMarket has its own extended-tail check before
+            //  returning; this final check is a belt-and-braces second line.)
+            if result.is_ok() && !rest.is_empty() {
+                return Err(ProgramError::InvalidInstructionData);
             }
+            result
         }
     }
 
@@ -2429,7 +2441,6 @@ pub mod oracle {
         price_ai: &AccountInfo,
         now_unix_ts: i64,
     ) -> Result<u64, ProgramError> {
-        // Always try to read external oracle to update baseline
         let external = read_engine_price_e6(
             price_ai,
             &config.index_feed_id,
@@ -2439,7 +2450,19 @@ pub mod oracle {
             config.invert,
             config.unit_scale,
         );
+        read_price_clamped_with_external(config, external, now_unix_ts)
+    }
 
+    /// Same clamp/authority logic as `read_price_clamped`, but takes the
+    /// already-parsed external oracle result. Lets callers that need both the
+    /// external Ok/Err signal and the clamped price share a single Pyth parse
+    /// (saves ~2K CU on hot paths like TradeNoCpi / WithdrawCollateral /
+    /// KeeperCrank that previously parsed the oracle twice).
+    pub fn read_price_clamped_with_external(
+        config: &mut super::state::MarketConfig,
+        external: Result<u64, ProgramError>,
+        now_unix_ts: i64,
+    ) -> Result<u64, ProgramError> {
         // Update baseline from external oracle only (never from authority)
         if let Ok(ext_price) = external {
             let clamped_ext = clamp_oracle_price(
@@ -2772,7 +2795,11 @@ pub mod processor {
         clock_slot: u64,
         slab_data: &mut [u8],
     ) -> Result<u64, ProgramError> {
-        let external_ok = oracle::read_engine_price_e6(
+        // Single Pyth/Chainlink parse shared between the "did the external read
+        // succeed?" signal (used to stamp last_good_oracle_slot) and the clamped
+        // price computation. Previously this called read_engine_price_e6 twice:
+        // once directly, then again inside read_price_clamped.
+        let external = oracle::read_engine_price_e6(
             a_oracle,
             &config.index_feed_id,
             clock_unix_ts,
@@ -2780,9 +2807,12 @@ pub mod processor {
             config.conf_filter_bps,
             config.invert,
             config.unit_scale,
-        ).is_ok();
+        );
+        let external_ok = external.is_ok();
 
-        let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts)?;
+        let price = oracle::read_price_clamped_with_external(
+            config, external, clock_unix_ts,
+        )?;
 
         if external_ok {
             config.last_good_oracle_slot = clock_slot;
@@ -2792,6 +2822,7 @@ pub mod processor {
         // only true after the engine processes it via accrue_market_to or similar.
         // Setting it on wrapper read alone would be unsound because zero-fill
         // and other early-return paths skip the engine call.
+        let _ = slab_data; // reserved for future per-read slab stamping
         Ok(price)
     }
 
@@ -4020,12 +4051,14 @@ pub mod processor {
                     if dt > 0 {
                         let raw_fee = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
                         let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
-                        // Work-proportional scan: iterate the engine's used[] bitmap
-                        // words and visit only set bits. CU stays proportional to the
-                        // number of live accounts rather than MAX_ACCOUNTS, which
-                        // matters for sparse markets (and is required for the crank
-                        // to fit inside the per-tx compute budget at larger caps).
+                        // Work-proportional scan: iterate engine.used[] set bits.
                         const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
+                        // Fee-cursor safety: advance last_fee_charge_slot only if
+                        // every used account was actually charged for the interval.
+                        // Swallowing a per-account error AND advancing the cursor
+                        // loses that account's interval forever; record any skip
+                        // and refuse to advance when it happens.
+                        let mut all_charged = true;
                         for word_idx in 0..BITMAP_WORDS {
                             let mut bits = engine.used[word_idx];
                             while bits != 0 {
@@ -4047,11 +4080,19 @@ pub mod processor {
                                     Err(percolator::RiskError::Unauthorized) => {
                                         return Err(map_risk_error(percolator::RiskError::Unauthorized));
                                     }
-                                    Err(_) => {} // per-account issue — skip, continue
+                                    Err(_) => {
+                                        // Per-account issue (e.g. insolvent account).
+                                        // Don't brick the crank, but also don't
+                                        // silently advance the cursor past this
+                                        // account's unpaid interval.
+                                        all_charged = false;
+                                    }
                                 }
                             }
                         }
-                        config.last_fee_charge_slot = clock.slot;
+                        if all_charged {
+                            config.last_fee_charge_slot = clock.slot;
+                        }
                     }
                 }
 
@@ -4113,10 +4154,22 @@ pub mod processor {
                     }
                     buf.recompute_min();
 
-                    // Phase C: progressive discovery scan
-                    let scan_start = buf.scan_cursor as usize;
+                    // Phase C: progressive discovery scan.
+                    // Wrap on the MARKET's configured capacity (params.max_accounts),
+                    // not the compile-time MAX_ACCOUNTS. Otherwise a small market
+                    // (e.g. max_accounts=64) wastes cranks walking slots 64..4095
+                    // that by construction can never be in use — the risk buffer
+                    // would take thousands of cranks to rediscover a newly-risky
+                    // low-indexed account after the cursor passed it.
+                    let scan_mod = engine.params.max_accounts as usize;
+                    let scan_mod = if scan_mod == 0 || scan_mod > percolator::MAX_ACCOUNTS {
+                        percolator::MAX_ACCOUNTS
+                    } else {
+                        scan_mod
+                    };
+                    let scan_start = (buf.scan_cursor as usize) % scan_mod;
                     for offset in 0..crate::constants::RISK_SCAN_WINDOW {
-                        let idx = (scan_start + offset) % percolator::MAX_ACCOUNTS;
+                        let idx = (scan_start + offset) % scan_mod;
                         if !engine.is_used(idx) { continue; }
                         let eff = engine.effective_pos_q(idx);
                         if eff == 0 { continue; }
@@ -4126,7 +4179,7 @@ pub mod processor {
                         buf.upsert(idx as u16, notional);
                     }
                     buf.scan_cursor = ((scan_start + crate::constants::RISK_SCAN_WINDOW)
-                        % percolator::MAX_ACCOUNTS) as u16;
+                        % scan_mod) as u16;
 
                     // Phase D: ingest caller-supplied candidates
                     for &(cidx, _) in candidates.iter() {
@@ -6312,7 +6365,14 @@ pub mod processor {
                     return Err(PercolatorError::EngineNotAnLPAccount.into());
                 }
 
-                let fees = 0u64;
+                // Return the LP's earned (positive) fee credit balance. Debt
+                // is represented as a negative value in the engine; we clamp to
+                // zero for the u64 wire format. Fee credits cannot exceed
+                // realistic u64 range for any live market; saturate as a
+                // defensive bound rather than truncating silently.
+                let fc = engine.accounts[lp_idx as usize].fee_credits.get();
+                let earned = if fc > 0 { fc as u128 } else { 0u128 };
+                let fees: u64 = if earned > u64::MAX as u128 { u64::MAX } else { earned as u64 };
                 solana_program::program::set_return_data(&fees.to_le_bytes());
             }
 
