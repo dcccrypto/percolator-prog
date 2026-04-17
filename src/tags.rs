@@ -179,6 +179,19 @@ pub const TAG_INIT_MATCHER_CTX: u8 = 75;
 pub const TAG_PAUSE_MARKET: u8 = 76;
 /// Admin unpause — re-enables all operations.
 pub const TAG_UNPAUSE_MARKET: u8 = 77;
+/// PERC-305 / SECURITY(H-4): Set PnL cap for ADL pre-check (admin only).
+/// Data: tag(1) + cap(8) = 9 bytes. 0 = cap disabled.
+pub const TAG_SET_MAX_PNL_CAP: u8 = 78;
+/// PERC-309: Set OI cap multiplier for LP withdrawal limits (admin only).
+/// Data: tag(1) + packed_u64(8) = 9 bytes. Packed: lo32=multiplier_bps, hi32=soft_cap_bps.
+/// 0 = enforcement disabled.
+pub const TAG_SET_OI_CAP_MULTIPLIER: u8 = 79;
+/// PERC-314: Set dispute params for ChallengeSettlement (admin only).
+/// Data: tag(1) + window_slots(8) + bond_amount(8) = 17 bytes. Window 0 = disabled.
+pub const TAG_SET_DISPUTE_PARAMS: u8 = 80;
+/// PERC-315: Set LP collateral params for DepositLpCollateral (admin only).
+/// Data: tag(1) + enabled(1) + ltv_bps(2) = 4 bytes. enabled=0 blocks new deposits.
+pub const TAG_SET_LP_COLLATERAL_PARAMS: u8 = 81;
 
 #[cfg(test)]
 mod tests {
@@ -265,6 +278,10 @@ mod tests {
             TAG_INIT_MATCHER_CTX,
             TAG_PAUSE_MARKET,
             TAG_UNPAUSE_MARKET,
+            TAG_SET_MAX_PNL_CAP,
+            TAG_SET_OI_CAP_MULTIPLIER,
+            TAG_SET_DISPUTE_PARAMS,
+            TAG_SET_LP_COLLATERAL_PARAMS,
         ];
 
         for i in 0..tags.len() {
@@ -356,6 +373,10 @@ mod tests {
             TAG_INIT_MATCHER_CTX,
             TAG_PAUSE_MARKET,
             TAG_UNPAUSE_MARKET,
+            TAG_SET_MAX_PNL_CAP,
+            TAG_SET_OI_CAP_MULTIPLIER,
+            TAG_SET_DISPUTE_PARAMS,
+            TAG_SET_LP_COLLATERAL_PARAMS,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)

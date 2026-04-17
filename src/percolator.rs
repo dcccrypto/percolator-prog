@@ -1375,6 +1375,16 @@ pub mod ix {
         PauseMarket,
         /// Admin unpause (tag 77). Re-enables all operations.
         UnpauseMarket,
+        /// PERC-305 / SECURITY(H-4): Set PnL cap for ADL pre-check (tag 78, admin).
+        /// 0 = cap disabled.
+        SetMaxPnlCap { cap: u64 },
+        /// PERC-309: Set OI cap multiplier for LP withdrawal limits (tag 79, admin).
+        /// Packed u64: lo32 = multiplier_bps, hi32 = soft_cap_bps. 0 = disabled.
+        SetOiCapMultiplier { packed: u64 },
+        /// PERC-314: Set dispute params (tag 80, admin). window_slots=0 disables disputes.
+        SetDisputeParams { window_slots: u64, bond_amount: u64 },
+        /// PERC-315: Set LP collateral params (tag 81, admin). enabled=0 blocks new deposits.
+        SetLpCollateralParams { enabled: u8, ltv_bps: u16 },
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -1766,6 +1776,28 @@ pub mod ix {
                 34 => Ok(Instruction::UpdateHyperpMark),
                 76 => Ok(Instruction::PauseMarket),
                 77 => Ok(Instruction::UnpauseMarket),
+                78 => {
+                    // SetMaxPnlCap — data: tag(1) + cap(8) = 9 bytes
+                    let cap = read_u64(&mut rest)?;
+                    Ok(Instruction::SetMaxPnlCap { cap })
+                }
+                79 => {
+                    // SetOiCapMultiplier — data: tag(1) + packed(8) = 9 bytes
+                    let packed = read_u64(&mut rest)?;
+                    Ok(Instruction::SetOiCapMultiplier { packed })
+                }
+                80 => {
+                    // SetDisputeParams — data: tag(1) + window_slots(8) + bond_amount(8) = 17 bytes
+                    let window_slots = read_u64(&mut rest)?;
+                    let bond_amount = read_u64(&mut rest)?;
+                    Ok(Instruction::SetDisputeParams { window_slots, bond_amount })
+                }
+                81 => {
+                    // SetLpCollateralParams — data: tag(1) + enabled(1) + ltv_bps(2) = 4 bytes
+                    let enabled = read_u8(&mut rest)?;
+                    let ltv_bps = read_u16(&mut rest)?;
+                    Ok(Instruction::SetLpCollateralParams { enabled, ltv_bps })
+                }
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
                 73 => Ok(Instruction::CloseOrphanSlab),
@@ -6065,6 +6097,26 @@ pub mod processor {
 
             Instruction::UnpauseMarket => {
                 handle_unpause_market(program_id, accounts)?;
+            }
+
+            // Tag 78: SetMaxPnlCap — ADL pre-check cap (PERC-305 / SECURITY(H-4))
+            Instruction::SetMaxPnlCap { cap } => {
+                handle_set_max_pnl_cap(program_id, accounts, cap)?;
+            }
+
+            // Tag 79: SetOiCapMultiplier — LP withdrawal OI cap (PERC-309)
+            Instruction::SetOiCapMultiplier { packed } => {
+                handle_set_oi_cap_multiplier(program_id, accounts, packed)?;
+            }
+
+            // Tag 80: SetDisputeParams — ChallengeSettlement config (PERC-314)
+            Instruction::SetDisputeParams { window_slots, bond_amount } => {
+                handle_set_dispute_params(program_id, accounts, window_slots, bond_amount)?;
+            }
+
+            // Tag 81: SetLpCollateralParams — LP collateral toggle + LTV (PERC-315)
+            Instruction::SetLpCollateralParams { enabled, ltv_bps } => {
+                handle_set_lp_collateral_params(program_id, accounts, enabled, ltv_bps)?;
             }
 
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
@@ -13055,6 +13107,151 @@ pub mod processor {
 
         state::set_paused(&mut data, false);
         msg!("Market unpaused by admin");
+        Ok(())
+    }
+
+    // --- SetMaxPnlCap (tag 78) ---
+    // PERC-305 / SECURITY(H-4): Set PnL cap for ADL pre-check.
+    // 0 = cap disabled (ADL always runs when insurance depleted).
+    #[inline(never)]
+    fn handle_set_max_pnl_cap<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        cap: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        let mut config = state::read_config(&data);
+        state::set_max_pnl_cap(&mut config, cap);
+        state::write_config(&mut data, &config);
+
+        msg!("PERC-305: max_pnl_cap set to {}", cap);
+        Ok(())
+    }
+
+    // --- SetOiCapMultiplier (tag 79) ---
+    // PERC-309: Packed u64: lo32 = multiplier_bps, hi32 = soft_cap_bps.
+    // 0 = enforcement disabled.
+    #[inline(never)]
+    fn handle_set_oi_cap_multiplier<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        packed: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // Validate: both fields must fit in u32 (that's the packing invariant).
+        // No semantic range check here — the unpacking in lp_vault clamps values.
+        let mut config = state::read_config(&data);
+        state::set_oi_cap_multiplier_bps(&mut config, packed);
+        state::write_config(&mut data, &config);
+
+        let mult = (packed & 0xFFFF_FFFF) as u32;
+        let soft_cap = (packed >> 32) as u32;
+        msg!("PERC-309: oi_cap_multiplier set (mult_bps={} soft_cap_bps={})", mult, soft_cap);
+        Ok(())
+    }
+
+    // --- SetDisputeParams (tag 80) ---
+    // PERC-314: Set dispute window + bond. window_slots=0 disables disputes.
+    #[inline(never)]
+    fn handle_set_dispute_params<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        window_slots: u64,
+        bond_amount: u64,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // Sanity caps to prevent DoS via absurd values:
+        // window_slots max ~= 2M (about 8 days at 400ms slots). Anything larger
+        // would freeze the market's settlement forever.
+        const MAX_DISPUTE_WINDOW_SLOTS: u64 = 2_000_000;
+        if window_slots > MAX_DISPUTE_WINDOW_SLOTS {
+            msg!("SetDisputeParams: window_slots {} > max {}", window_slots, MAX_DISPUTE_WINDOW_SLOTS);
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let mut config = state::read_config(&data);
+        state::set_dispute_window_slots(&mut config, window_slots);
+        state::set_dispute_bond_amount(&mut config, bond_amount);
+        state::write_config(&mut data, &config);
+
+        msg!("PERC-314: dispute params set (window={} slots, bond={})", window_slots, bond_amount);
+        Ok(())
+    }
+
+    // --- SetLpCollateralParams (tag 81) ---
+    // PERC-315: Set LP collateral toggle + LTV. enabled=0 blocks new deposits.
+    #[inline(never)]
+    fn handle_set_lp_collateral_params<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        enabled: u8,
+        ltv_bps: u16,
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        let header = state::read_header(&data);
+        require_admin(header.admin, a_admin.key)?;
+
+        // enabled must be 0 or 1 (strict boolean). ltv_bps capped at 10000 (100%).
+        if enabled > 1 {
+            msg!("SetLpCollateralParams: enabled must be 0 or 1, got {}", enabled);
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if ltv_bps > 10_000 {
+            msg!("SetLpCollateralParams: ltv_bps {} > 10000", ltv_bps);
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let mut config = state::read_config(&data);
+        state::set_lp_collateral_enabled(&mut config, enabled);
+        state::set_lp_collateral_ltv_bps(&mut config, ltv_bps);
+        state::write_config(&mut data, &config);
+
+        msg!("PERC-315: lp_collateral params set (enabled={}, ltv_bps={})", enabled, ltv_bps);
         Ok(())
     }
 

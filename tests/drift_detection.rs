@@ -70,6 +70,8 @@ use percolator_prog::{
         TAG_INIT_MATCHER_CTX,
         TAG_INIT_SHARED_VAULT,
         TAG_INIT_USER,
+        TAG_PAUSE_MARKET,
+        TAG_UNPAUSE_MARKET,
         TAG_KEEPER_CRANK,
         TAG_LIQUIDATE_AT_ORACLE,
         TAG_LP_VAULT_CRANK_FEES,
@@ -89,7 +91,11 @@ use percolator_prog::{
         TAG_SET_DEX_POOL,
         TAG_SET_INSURANCE_ISOLATION,
         TAG_SET_INSURANCE_WITHDRAW_POLICY,
+        TAG_SET_LP_COLLATERAL_PARAMS,
         TAG_SET_MAINTENANCE_FEE,
+        TAG_SET_MAX_PNL_CAP,
+        TAG_SET_OI_CAP_MULTIPLIER,
+        TAG_SET_DISPUTE_PARAMS,
         TAG_SET_OFFSET_PAIR,
         TAG_SET_OI_IMBALANCE_HARD_BLOCK,
         TAG_SET_ORACLE_AUTHORITY,
@@ -429,6 +435,12 @@ fn all_tags() -> &'static [u8] {
         TAG_CLOSE_ORPHAN_SLAB,             // 73
         TAG_SET_DEX_POOL,                  // 74
         TAG_INIT_MATCHER_CTX,              // 75
+        TAG_PAUSE_MARKET,                  // 76
+        TAG_UNPAUSE_MARKET,                // 77
+        TAG_SET_MAX_PNL_CAP,               // 78
+        TAG_SET_OI_CAP_MULTIPLIER,         // 79
+        TAG_SET_DISPUTE_PARAMS,            // 80
+        TAG_SET_LP_COLLATERAL_PARAMS,      // 81
     ]
 }
 
@@ -539,6 +551,12 @@ fn tags_match_numeric_values() {
     assert_eq!(TAG_CLOSE_ORPHAN_SLAB, 73u8);
     assert_eq!(TAG_SET_DEX_POOL, 74u8);
     assert_eq!(TAG_INIT_MATCHER_CTX, 75u8);
+    assert_eq!(TAG_PAUSE_MARKET, 76u8);
+    assert_eq!(TAG_UNPAUSE_MARKET, 77u8);
+    assert_eq!(TAG_SET_MAX_PNL_CAP, 78u8);
+    assert_eq!(TAG_SET_OI_CAP_MULTIPLIER, 79u8);
+    assert_eq!(TAG_SET_DISPUTE_PARAMS, 80u8);
+    assert_eq!(TAG_SET_LP_COLLATERAL_PARAMS, 81u8);
 }
 
 /// Tags whose decode arm is unit (tag-only, no additional bytes).
