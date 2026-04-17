@@ -2785,12 +2785,24 @@ pub mod state {
         let mut buf = crate::risk_buffer::RiskBuffer::zeroed();
         let src = &data[RISK_BUF_OFF..RISK_BUF_OFF + RISK_BUF_LEN];
         bytemuck::bytes_of_mut(&mut buf).copy_from_slice(src);
-        // Sanitize: clamp count to RISK_BUF_CAP to prevent OOB panics
-        // from corrupted slab data in keeper hot paths.
+        // Full sanitization against corrupted slab data:
+        // 1. Clamp count
         if buf.count as usize > crate::constants::RISK_BUF_CAP {
             buf.count = crate::constants::RISK_BUF_CAP as u8;
         }
-        // Clamp scan_cursor to valid range
+        // 2. Zero entries past count
+        for i in buf.count as usize..crate::constants::RISK_BUF_CAP {
+            buf.entries[i] = crate::risk_buffer::RiskEntry::zeroed();
+        }
+        // 3. Filter invalid idx values (iterate in reverse, swap-remove)
+        for i in (0..buf.count as usize).rev() {
+            if buf.entries[i].idx as usize >= percolator::MAX_ACCOUNTS {
+                buf.remove(buf.entries[i].idx);
+            }
+        }
+        // 4. Recompute min_notional from sanitized entries
+        buf.recompute_min();
+        // 5. Clamp scan_cursor
         if buf.scan_cursor as usize >= percolator::MAX_ACCOUNTS {
             buf.scan_cursor = 0;
         }
@@ -6894,6 +6906,8 @@ pub mod processor {
 
         let resolved = state::is_resolved(&data);
         let clock = Clock::from_account_info(a_clock)?;
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if resolved {
             let settlement = config.authority_price_e6;
             if settlement == 0 {
@@ -6943,7 +6957,7 @@ pub mod processor {
         let h_lock = engine.params.h_min;
         engine
             .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
-                compute_current_funding_rate_e9(&config), h_lock)
+                funding_rate_e9, h_lock)
             .map_err(map_risk_error)?;
         drop(engine);
 
@@ -7724,6 +7738,8 @@ pub mod processor {
 
         let clock = Clock::from_account_info(&accounts[2])?;
         let is_hyperp = oracle::is_hyperp_mode(&config);
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if is_hyperp {
             // Read engine.current_slot before mutable borrow
             let eng = zc::engine_ref(&data)?;
@@ -7760,7 +7776,7 @@ pub mod processor {
         let _res = engine
             .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
                 percolator::LiquidationPolicy::FullClose,
-                compute_current_funding_rate_e9(&config), h_lock)
+                funding_rate_e9, h_lock)
             .map_err(map_risk_error)?;
         sol_log_64(_res as u64, 0, 0, 0, 4); // result
         #[cfg(feature = "cu-audit")]
@@ -7814,6 +7830,8 @@ pub mod processor {
 
         let resolved = state::is_resolved(&data);
         let clock = Clock::from_account_info(&accounts[6])?;
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if resolved {
             let settlement = config.authority_price_e6;
             if settlement == 0 {
@@ -7871,7 +7889,7 @@ pub mod processor {
             let h_lock = engine.params.h_min;
             let result = engine
                 .close_account_not_atomic(user_idx, clock.slot, price,
-                    compute_current_funding_rate_e9(&config), h_lock)
+                    funding_rate_e9, h_lock)
                 .map_err(map_risk_error)?;
             need_set_oracle_init = true;
             result
@@ -8243,6 +8261,9 @@ pub mod processor {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
 
+        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+
         // Flush Hyperp index WITHOUT staleness check (admin recovery path).
         let clock = Clock::from_account_info(a_clock)?;
         if oracle::is_hyperp_mode(&config) {
@@ -8273,8 +8294,7 @@ pub mod processor {
             };
             if accrual_price > 0 {
                 let engine = zc::engine_mut(&mut data)?;
-                engine.accrue_market_to(clock.slot, accrual_price,
-                        compute_current_funding_rate_e9(&config))
+                engine.accrue_market_to(clock.slot, accrual_price, funding_rate_e9)
                     .map_err(map_risk_error)?;
             }
         }
@@ -8380,6 +8400,8 @@ pub mod processor {
 
         let mut config = state::read_config(&data);
         let is_hyperp = oracle::is_hyperp_mode(&config);
+        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         // Hyperp: flush index WITHOUT staleness check.
         // PushOraclePrice is the recovery path for stale marks —
         // it must not be blocked by the very staleness it's meant to fix.
@@ -8459,7 +8481,7 @@ pub mod processor {
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
                 push_clock2.slot, config.last_effective_price_e6,
-                compute_current_funding_rate_e9(&config),
+                funding_rate_e9,
             ).map_err(map_risk_error)?;
         }
 
@@ -8538,6 +8560,8 @@ pub mod processor {
 
         let mut config = state::read_config(&data);
         let is_hyperp = oracle::is_hyperp_mode(&config);
+        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
 
         // Flush Hyperp index WITHOUT staleness check (admin path)
         if is_hyperp {
@@ -8559,7 +8583,7 @@ pub mod processor {
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
                 clock.slot, config.last_effective_price_e6,
-                compute_current_funding_rate_e9(&config),
+                funding_rate_e9,
             ).map_err(map_risk_error)?;
         }
 
@@ -8702,6 +8726,8 @@ pub mod processor {
 
         let clock = Clock::from_account_info(a_clock)?;
         let mut config = config;
+        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
 
         // Accrue engine to settlement price BEFORE entering resolved mode.
         // This crystallizes all account states at the settlement price so
@@ -8711,7 +8737,7 @@ pub mod processor {
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
                 clock.slot, config.authority_price_e6,
-                compute_current_funding_rate_e9(&config),
+                funding_rate_e9,
             ).map_err(map_risk_error)?;
         }
 
@@ -8736,7 +8762,7 @@ pub mod processor {
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
                 clock.slot, config.authority_price_e6,
-                compute_current_funding_rate_e9(&config),
+                funding_rate_e9,
             ).map_err(map_risk_error)?;
             config = state::read_config(&data);
         }
@@ -9065,6 +9091,8 @@ pub mod processor {
             // stale-crank fallback is removed for live markets — it cannot detect
             // adverse price movement that has not yet been cranked into the engine.
             if !resolved {
+                // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 let a_oracle = a_oracle_opt
                     .ok_or(PercolatorError::OracleInvalid)?;
                 let is_hyperp = oracle::is_hyperp_mode(&config);
@@ -9089,7 +9117,7 @@ pub mod processor {
                     let engine = zc::engine_mut(&mut data)?;
                     engine.accrue_market_to(
                         clock.slot, accrual_price,
-                        compute_current_funding_rate_e9(&config),
+                        funding_rate_e9,
                     ).map_err(map_risk_error)?;
                 }
                 // Run lifecycle after accrual (matches UpdateConfig/PushOraclePrice/SetOraclePriceCap).
@@ -9374,6 +9402,8 @@ pub mod processor {
         let clock = Clock::from_account_info(a_clock)?;
 
         let is_hyperp = oracle::is_hyperp_mode(&config);
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if is_hyperp {
             let eng = zc::engine_ref(&data)?;
             let last_slot = eng.current_slot;
@@ -9389,7 +9419,7 @@ pub mod processor {
         let engine = zc::engine_mut(&mut data)?;
         let h_lock = engine.params.h_min;
         engine.settle_account_not_atomic(user_idx, price, clock.slot,
-            compute_current_funding_rate_e9(&config), h_lock)
+            funding_rate_e9, h_lock)
             .map_err(map_risk_error)?;
         if !state::is_oracle_initialized(&data) {
             state::set_oracle_initialized(&mut data);
@@ -9505,6 +9535,8 @@ pub mod processor {
         let clock = Clock::from_account_info(a_clock)?;
 
         let is_hyperp = oracle::is_hyperp_mode(&config);
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if is_hyperp {
             let eng = zc::engine_ref(&data)?;
             let last_slot = eng.current_slot;
@@ -9531,7 +9563,7 @@ pub mod processor {
         }
         let h_lock = engine.params.h_min;
         engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
-            compute_current_funding_rate_e9(&config), h_lock)
+            funding_rate_e9, h_lock)
             .map_err(map_risk_error)?;
         if !state::is_oracle_initialized(&data) {
             state::set_oracle_initialized(&mut data);
@@ -9562,6 +9594,8 @@ pub mod processor {
         }
 
         let mut config = state::read_config(&data);
+        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
 
         if config.permissionless_resolve_stale_slots == 0 {
             return Err(PercolatorError::InvalidConfigParam.into());
@@ -9669,7 +9703,7 @@ pub mod processor {
             engine.accrue_market_to(
                 clock.slot,
                 settle_price,
-                compute_current_funding_rate_e9(&config),
+                funding_rate_e9,
             ).map_err(map_risk_error)?;
             config = state::read_config(&data);
         }
@@ -9696,8 +9730,7 @@ pub mod processor {
         // Hyperp already accrued above; non-Hyperp accrues here.
         if !is_hyperp {
             let engine = zc::engine_mut(&mut data)?;
-            engine.accrue_market_to(clock.slot, last_price,
-                    compute_current_funding_rate_e9(&config))
+            engine.accrue_market_to(clock.slot, last_price, funding_rate_e9)
                 .map_err(map_risk_error)?;
         }
 
@@ -11375,6 +11408,8 @@ pub mod processor {
         let mut config = state::read_config(&data);
 
         let clock = Clock::from_account_info(&accounts[2])?;
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
 
         let is_hyperp = oracle::is_hyperp_mode(&config);
         let price = if is_hyperp {
@@ -11429,7 +11464,8 @@ pub mod processor {
             }
         }
 
-        let funding_rate = compute_current_funding_rate_e9(&config);
+        // Use pre-oracle-read funding rate (anti-retroactivity §5.5)
+        let funding_rate = funding_rate_e9_pre;
         let h_lock = engine.params.h_min;
 
 
