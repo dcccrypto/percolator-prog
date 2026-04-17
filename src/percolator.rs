@@ -2530,10 +2530,9 @@ pub mod state {
         write_flags(data, flags);
     }
 
-    /// Write market_start_slot into _reserved[8..16] at InitMarket time.
-    pub fn write_market_start_slot(data: &mut [u8], slot: u64) {
-        data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
-    }
+    // write_market_start_slot removed (SP-2, 2026-04-17) — it wrote to
+    // _reserved[8..16] which now stores mat_counter. The write was corrupting
+    // mat_counter at market creation. The slot value was never read elsewhere.
 
     /// Read accumulated dust (base token remainder) from _reserved[16..24].
     pub fn read_dust_base(data: &[u8]) -> u64 {
@@ -6514,9 +6513,13 @@ pub mod processor {
         state::write_header(&mut data, &new_header);
         // Step 4: Explicitly initialize nonce to 0 for determinism
         state::write_req_nonce(&mut data, 0);
-        // Write market_start_slot (§2.1): captures creation slot for rewards program.
-        // Shares _reserved[8..16] with last_thr_update_slot (initialized to same value).
-        state::write_market_start_slot(&mut data, clock.slot);
+        // SP-2 fix (2026-04-17): removed write_market_start_slot(clock.slot).
+        // It wrote to _reserved[8..16], the same byte range now used by
+        // mat_counter (PERC-623). The stale write was corrupting the counter
+        // at market creation, causing the first InitUser to receive
+        // mat_counter = (creation_slot + 1) instead of 1. The field was never
+        // read as "market_start_slot" — no finding about slot-tracked rewards
+        // was consuming it, so removing is safe.
 
         Ok(())
     }
@@ -7386,8 +7389,29 @@ pub mod processor {
             }
 
             let lp_acc = &engine.accounts[lp_idx as usize];
-            // Instance-stable LP identity: FNV-1a hash of (lp_idx, owner, matcher_context).
-            // account_id field removed in v12.17; use deterministic hash instead.
+            // Instance-stable LP identity for matcher CPI binding: FNV-1a hash
+            // of (lp_idx, owner, matcher_context). account_id field removed in
+            // v12.17; use deterministic hash instead.
+            //
+            // F-6 DECISION (audit 2026-04-16): This FNV identity is intentionally
+            // SEPARATE from the gen_table identity (state::read_account_generation)
+            // used by TradeNoCpi at L7184. The two serve different purposes:
+            //
+            //   - gen_table (mat_counter): strictly monotonic, increments on
+            //     every InitUser/InitLP. Used for internal lifecycle tracking
+            //     (e.g., detecting slot reuse across account closures).
+            //
+            //   - FNV identity (here): deterministic function of current LP
+            //     bytes. Used by the matcher to identify "which LP context
+            //     should receive this trade." Stable across CPI round-trips,
+            //     does not need to distinguish instance generations because
+            //     matcher_context is already rotated on each InitLP.
+            //
+            // Unifying them would require either (a) embedding gen_table in the
+            // matcher ABI (breaks existing matcher binaries) or (b) collapsing
+            // gen_table semantics into FNV (loses slot-reuse detection). Neither
+            // is preferable to the current dual scheme. Documented here so the
+            // divergence isn't flagged again as a bug.
             let lp_instance_id = {
                 let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
                 let mix = |h: &mut u64, b: u8| {
