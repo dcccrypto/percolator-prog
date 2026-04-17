@@ -23,8 +23,7 @@ pub const TAG_UPDATE_ADMIN: u8 = 12;
 pub const TAG_CLOSE_SLAB: u8 = 13;
 pub const TAG_UPDATE_CONFIG: u8 = 14;
 pub const TAG_SET_MAINTENANCE_FEE: u8 = 15;
-pub const TAG_SET_ORACLE_AUTHORITY: u8 = 16;
-pub const TAG_PUSH_ORACLE_PRICE: u8 = 17;
+// Tags 16-17: admin-push oracle permanently removed (Phase G). Slots left unused; do NOT reuse or renumber.
 pub const TAG_SET_ORACLE_PRICE_CAP: u8 = 18;
 pub const TAG_RESOLVE_MARKET: u8 = 19;
 pub const TAG_WITHDRAW_INSURANCE: u8 = 20;
@@ -221,8 +220,6 @@ mod tests {
             TAG_CLOSE_SLAB,
             TAG_UPDATE_CONFIG,
             TAG_SET_MAINTENANCE_FEE,
-            TAG_SET_ORACLE_AUTHORITY,
-            TAG_PUSH_ORACLE_PRICE,
             TAG_SET_ORACLE_PRICE_CAP,
             TAG_RESOLVE_MARKET,
             TAG_WITHDRAW_INSURANCE,
@@ -316,8 +313,6 @@ mod tests {
             TAG_CLOSE_SLAB,
             TAG_UPDATE_CONFIG,
             TAG_SET_MAINTENANCE_FEE,
-            TAG_SET_ORACLE_AUTHORITY,
-            TAG_PUSH_ORACLE_PRICE,
             TAG_SET_ORACLE_PRICE_CAP,
             TAG_RESOLVE_MARKET,
             TAG_WITHDRAW_INSURANCE,

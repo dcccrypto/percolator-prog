@@ -320,7 +320,7 @@ pub mod verify {
     }
 
     /// Admin authorization: admin must be non-zero (not burned) and match signer.
-    /// Used by: UpdateAdmin, UpdateConfig, SetOracleAuthority
+    /// Used by: UpdateAdmin, UpdateConfig
     #[inline]
     pub fn admin_ok(admin: [u8; 32], signer: [u8; 32]) -> bool {
         admin != [0u8; 32] && admin == signer
@@ -697,7 +697,7 @@ pub mod verify {
         }
     }
 
-    /// Decision for admin operations (UpdateAdmin, UpdateConfig, SetOracleAuthority, etc.).
+    /// Decision for admin operations (UpdateAdmin, UpdateConfig, etc.).
     #[inline]
     pub fn decide_admin_op(admin: [u8; 32], signer: [u8; 32]) -> SimpleDecision {
         if admin_ok(admin, signer) {
@@ -755,7 +755,7 @@ pub mod verify {
     /// Convert a raw oracle price to engine-space: invert then scale.
     /// All Hyperp internal prices (authority_price_e6, last_effective_price_e6)
     /// must be in engine-space. Apply this at every ingress point:
-    /// InitMarket, PushOraclePrice, TradeCpi mark-update.
+    /// InitMarket, TradeCpi mark-update.
     #[inline]
     pub fn to_engine_price(raw: u64, invert: u8, unit_scale: u32) -> Option<u64> {
         let after_invert = invert_price_e6(raw, invert)?;
@@ -884,13 +884,14 @@ pub mod verify {
         FEE_MULT_BASE_BPS + util_bps
     }
 
-    /// Returns true if the market uses a pinned (authority) oracle rather than Pyth.
-    /// A market with a non-zero oracle_authority and zero index_feed_id is pinned.
+    /// Returns true if the market uses an external (Pyth/Chainlink) oracle feed.
+    /// Admin-push oracle has been permanently removed (Phase G).
+    /// _oracle_authority is kept as a parameter to avoid call-site churn but is always zero.
     #[inline]
-    pub fn is_pyth_pinned_mode(oracle_authority: [u8; 32], index_feed_id: [u8; 32]) -> bool {
-        // Pyth-pinned: non-zero authority AND non-zero feed ID (actual Pyth feed).
-        // Hyperp mode (feed_id=[0;32]) is NOT Pyth-pinned — admin can change oracle authority.
-        oracle_authority != [0u8; 32] && index_feed_id != [0u8; 32]
+    pub fn is_pyth_pinned_mode(_oracle_authority: [u8; 32], index_feed_id: [u8; 32]) -> bool {
+        // Pyth-pinned: non-zero external feed ID.
+        // oracle_authority is always [0;32] since Phase G removed admin-push.
+        index_feed_id != [0u8; 32]
     }
 }
 
@@ -1295,25 +1296,13 @@ pub mod ix {
             funding_max_premium_bps: i64,
             funding_max_bps_per_slot: i64,
         },
-        /// Set the oracle price authority (admin only).
-        /// Authority can push prices instead of requiring Pyth/Chainlink.
-        /// Pass zero pubkey to disable and require Pyth/Chainlink.
-        SetOracleAuthority {
-            new_authority: Pubkey,
-        },
-        /// Push oracle price (oracle authority only).
-        /// Stores the price for use by crank/trade operations.
-        PushOraclePrice {
-            price_e6: u64,
-            timestamp: i64,
-        },
         /// Set oracle price circuit breaker cap (admin only).
         /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
         SetOraclePriceCap {
             max_change_e2bps: u64,
         },
-        /// Resolve market: force-close all positions at admin oracle price, enter withdraw-only mode.
-        /// Admin only. Uses authority_price_e6 as settlement price.
+        /// Resolve market: force-close all positions at live oracle price, enter withdraw-only mode.
+        /// Admin only. Reads live oracle at resolution time (Phase G: admin-push removed).
         ResolveMarket,
         /// Withdraw insurance fund balance (admin only, requires RESOLVED flag).
         WithdrawInsurance,
@@ -1705,20 +1694,8 @@ pub mod ix {
                         funding_max_bps_per_slot,
                     })
                 }
-                16 => {
-                    // SetOracleAuthority
-                    let new_authority = read_pubkey(&mut rest)?;
-                    Ok(Instruction::SetOracleAuthority { new_authority })
-                }
-                17 => {
-                    // PushOraclePrice
-                    let price_e6 = read_u64(&mut rest)?;
-                    let timestamp = read_i64(&mut rest)?;
-                    Ok(Instruction::PushOraclePrice {
-                        price_e6,
-                        timestamp,
-                    })
-                }
+                // Tags 16 and 17 permanently removed (Phase G: admin-push oracle).
+                16 | 17 => Err(ProgramError::InvalidInstructionData),
                 18 => {
                     // SetOraclePriceCap
                     let max_change_e2bps = read_u64(&mut rest)?;
@@ -3218,32 +3195,6 @@ pub mod oracle {
         Ok(engine_price)
     }
 
-    /// Check if authority-pushed price is available and fresh.
-    /// Returns Some(price_e6) if authority is set and price is within staleness bounds.
-    /// Returns None if no authority is set or price is stale.
-    ///
-    /// Note: The stored authority_price_e6 is already in the correct format (e6, scaled).
-    pub fn read_authority_price(
-        config: &super::state::MarketConfig,
-        now_unix_ts: i64,
-        max_staleness_secs: u64,
-    ) -> Option<u64> {
-        // No authority set
-        if config.oracle_authority == [0u8; 32] {
-            return None;
-        }
-        // No price pushed yet
-        if config.authority_price_e6 == 0 {
-            return None;
-        }
-        // Check staleness
-        let age = now_unix_ts.saturating_sub(config.authority_timestamp);
-        if age < 0 || age as u64 > max_staleness_secs {
-            return None;
-        }
-        Some(config.authority_price_e6)
-    }
-
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
     /// Units: 1_000_000 e2bps = 100%. 0 = disabled (no cap). last_price == 0 = first-time.
     pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_e2bps: u64) -> u64 {
@@ -3259,21 +3210,16 @@ pub mod oracle {
 
     /// Read oracle price with circuit-breaker clamping.
     ///
-    /// The baseline (`last_effective_price_e6`) is ONLY updated from external
-    /// oracle reads (Pyth/Chainlink). Authority-pushed prices are used as the
-    /// returned effective price but do NOT contaminate the baseline. This
-    /// prevents the admin from ratcheting the baseline via push+crank interleaving.
-    ///
-    /// When the circuit breaker is configured (min_oracle_price_cap_e2bps > 0),
-    /// the external oracle read MUST succeed whenever authority pricing is used.
-    /// This prevents callers from bypassing the fresh external anchor by
-    /// supplying a bad/stale oracle account.
+    /// Admin-push oracle has been permanently removed (Phase G).
+    /// All prices come from Pyth/Chainlink via read_engine_price_e6.
+    /// The baseline (`last_effective_price_e6`) is updated on every successful
+    /// external read and used as the returned effective price.
     pub fn read_price_clamped(
         config: &mut super::state::MarketConfig,
         price_ai: &AccountInfo,
         now_unix_ts: i64,
     ) -> Result<u64, ProgramError> {
-        // Always try to read external oracle to update baseline
+        // Read from external oracle (Pyth/Chainlink)
         let external = read_engine_price_e6(
             price_ai,
             &config.index_feed_id,
@@ -3284,7 +3230,7 @@ pub mod oracle {
             config.unit_scale,
         );
 
-        // Update baseline from external oracle only (never from authority)
+        // Update baseline from external oracle read
         if let Ok(ext_price) = external {
             let clamped_ext = clamp_oracle_price(
                 config.last_effective_price_e6,
@@ -3294,24 +3240,6 @@ pub mod oracle {
             config.last_effective_price_e6 = clamped_ext;
         }
 
-        // Return the authority price if fresh, otherwise the external price
-        if let Some(auth_price) = read_authority_price(config, now_unix_ts, config.max_staleness_secs) {
-            // When the live circuit breaker is active, require the external
-            // oracle to have succeeded. Uses the active cap (not the immutable
-            // floor) so zero-floor markets with a live breaker are also protected.
-            if config.oracle_price_cap_e2bps != 0 && external.is_err() {
-                return external; // propagate the external oracle error
-            }
-            // Authority price is clamped against the (now-updated) external baseline
-            let clamped_auth = clamp_oracle_price(
-                config.last_effective_price_e6,
-                auth_price,
-                config.oracle_price_cap_e2bps,
-            );
-            return Ok(clamped_auth);
-        }
-
-        // No authority: use external price (already clamped above)
         match external {
             Ok(_) => Ok(config.last_effective_price_e6),
             Err(e) => Err(e),
@@ -3375,20 +3303,14 @@ pub mod oracle {
     ) -> Result<u64, ProgramError> {
         // Hyperp mode: index_feed_id == 0
         if is_hyperp_mode(config) {
-            // Mark source: prefer trade-derived EWMA, fall back to authority push
-            let mark = if config.mark_ewma_e6 > 0 {
-                config.mark_ewma_e6
-            } else {
-                config.authority_price_e6
-            };
+            // Mark source: trade-derived EWMA only (admin-push permanently removed, Phase G).
+            // Cold-start seeding is handled by UpdateHyperpMark on first call.
+            let mark = config.mark_ewma_e6;
             if mark == 0 {
                 return Err(super::error::PercolatorError::OracleInvalid.into());
             }
-            // Staleness: keyed off last trade OR last authority push (whichever is newer)
-            let last_update = core::cmp::max(
-                config.mark_ewma_last_slot,
-                config.last_mark_push_slot as u64,
-            );
+            // Staleness: keyed off last trade update slot
+            let last_update = config.mark_ewma_last_slot;
             let last_push = last_update;
             if last_push > 0 {
                 let max_stale_slots = if config.max_staleness_secs > u64::MAX / 3 {
@@ -5899,18 +5821,6 @@ pub mod processor {
                 handle_update_config(program_id, accounts, funding_horizon_slots, funding_k_bps, funding_max_premium_bps, funding_max_bps_per_slot)?;
             }
 
-            Instruction::SetOracleAuthority { new_authority } => {
-                handle_set_oracle_authority(program_id, accounts, new_authority)?;
-
-            }
-
-            Instruction::PushOraclePrice {
-                price_e6,
-                timestamp,
-            } => {
-                handle_push_oracle_price(program_id, accounts, price_e6, timestamp)?;
-            }
-
             Instruction::SetOraclePriceCap { max_change_e2bps } => {
                 handle_set_oracle_price_cap(program_id, accounts, max_change_e2bps)?;
             }
@@ -8277,7 +8187,7 @@ pub mod processor {
         let clock = Clock::from_account_info(a_clock)?;
         if oracle::is_hyperp_mode(&config) {
             let prev_index = config.last_effective_price_e6;
-            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            let mark = config.mark_ewma_e6;
             if mark > 0 && prev_index > 0 {
                 let last_idx_slot = config.last_hyperp_index_slot;
                 let dt = clock.slot.saturating_sub(last_idx_slot);
@@ -8329,219 +8239,6 @@ pub mod processor {
         Ok(())
     }
 
-    // --- SetOracleAuthority ---
-    #[inline(never)]
-    fn handle_set_oracle_authority<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-        new_authority: Pubkey,
-    ) -> ProgramResult {
-        accounts::expect_len(accounts, 2)?;
-        let a_admin = &accounts[0];
-        let a_slab = &accounts[1];
-
-        accounts::expect_signer(a_admin)?;
-        accounts::expect_writable(a_slab)?;
-
-        let mut data = state::slab_data_mut(a_slab)?;
-        slab_guard(program_id, a_slab, &data)?;
-        require_initialized(&data)?;
-        if state::is_resolved(&data) {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let header = state::read_header(&data);
-        require_admin(header.admin, a_admin.key)?;
-
-        // SECURITY(M-4): Block SetOracleAuthority on Pyth-pinned markets.
-        // Pyth-pinned markets guarantee decentralized oracle pricing.
-        // Setting a non-zero authority would silently switch to admin-oracle
-        // mode, breaking the trust model users signed up for.
-        let mut config = state::read_config(&data);
-        if crate::verify::is_pyth_pinned_mode(config.oracle_authority, config.index_feed_id)
-            && new_authority != Pubkey::default()
-        {
-            msg!("SetOracleAuthority: blocked on Pyth-pinned market");
-            return Err(ProgramError::InvalidArgument);
-        }
-        // Hyperp: reject zero-address unless trade flow has bootstrapped
-        // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
-        // there's no mark price source. With EWMA bootstrapped, the market
-        // can run admin-free on trade-derived mark.
-        if oracle::is_hyperp_mode(&config)
-            && new_authority == Pubkey::default()
-            && config.mark_ewma_e6 == 0
-        {
-            return Err(PercolatorError::InvalidConfigParam.into());
-        }
-        config.oracle_authority = new_authority.to_bytes();
-        // Clear stored price when authority changes — except on Hyperp
-        // where authority_price_e6 is the mark price.
-        if !oracle::is_hyperp_mode(&config) {
-            config.authority_price_e6 = 0;
-            config.authority_timestamp = 0;
-        }
-        state::write_config(&mut data, &config);
-        Ok(())
-    }
-
-    // --- PushOraclePrice ---
-    #[inline(never)]
-    fn handle_push_oracle_price<'a>(
-        program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],
-        price_e6: u64,
-        timestamp: i64,
-    ) -> ProgramResult {
-        accounts::expect_len(accounts, 2)?;
-        let a_authority = &accounts[0];
-        let a_slab = &accounts[1];
-
-        accounts::expect_signer(a_authority)?;
-        accounts::expect_writable(a_slab)?;
-
-        let mut data = state::slab_data_mut(a_slab)?;
-        slab_guard(program_id, a_slab, &data)?;
-        require_initialized(&data)?;
-        if state::is_resolved(&data) {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let mut config = state::read_config(&data);
-        let is_hyperp = oracle::is_hyperp_mode(&config);
-        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
-        let funding_rate_e9 = compute_current_funding_rate_e9(&config);
-        // Hyperp: flush index WITHOUT staleness check.
-        // PushOraclePrice is the recovery path for stale marks —
-        // it must not be blocked by the very staleness it's meant to fix.
-        if is_hyperp {
-            let push_clock = Clock::get()
-                .map_err(|_| ProgramError::UnsupportedSysvar)?;
-            let prev_index = config.last_effective_price_e6;
-            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
-            if mark > 0 && prev_index > 0 {
-                let last_idx_slot = config.last_hyperp_index_slot;
-                let dt = push_clock.slot.saturating_sub(last_idx_slot);
-                let new_index = oracle::clamp_toward_with_dt(
-                    prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
-                );
-                config.last_effective_price_e6 = new_index;
-                config.last_hyperp_index_slot = push_clock.slot;
-            }
-            state::write_config(&mut data, &config);
-            config = state::read_config(&data);
-        }
-        if config.oracle_authority == [0u8; 32] {
-            return Err(PercolatorError::EngineUnauthorized.into());
-        }
-        if config.oracle_authority != a_authority.key.to_bytes() {
-            return Err(PercolatorError::EngineUnauthorized.into());
-        }
-
-        // Validate price (must be positive)
-        if price_e6 == 0 {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-
-        // Normalize to engine-space (invert + scale) for ALL markets.
-        // Authority prices must be in the same price space as
-        // Pyth/Chainlink-derived prices (which go through
-        // read_engine_price_e6 → invert → scale).
-        let normalized_price = crate::verify::to_engine_price(
-            price_e6, config.invert, config.unit_scale,
-        ).ok_or(PercolatorError::OracleInvalid)?;
-
-        // Enforce MAX_ORACLE_PRICE at ingress (engine rejects > MAX internally)
-        if normalized_price > percolator::MAX_ORACLE_PRICE {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-
-        // For non-Hyperp markets, require strictly increasing timestamps
-        // anchored to the current clock. This prevents the admin from
-        // walking last_effective_price_e6 in a single burst (each push
-        // must use a later timestamp, and the timestamp must not exceed
-        // the current unix_timestamp from the clock sysvar).
-        if !is_hyperp {
-            let push_clock = Clock::get()
-                .map_err(|_| ProgramError::UnsupportedSysvar)?;
-            // Strict monotonicity: reject equal timestamps
-            if config.authority_timestamp != 0
-                && timestamp <= config.authority_timestamp
-            {
-                return Err(PercolatorError::OracleStale.into());
-            }
-            // Clock anchoring: timestamp must not be in the future
-            if timestamp > push_clock.unix_timestamp {
-                return Err(PercolatorError::OracleStale.into());
-            }
-        }
-
-        // Clamp against circuit breaker.
-        // Hyperp: clamp against INDEX (last_effective_price_e6), not
-        //   previous mark. This bounds the mark-index gap to one
-        //   cap-width regardless of how many same-slot pushes occur.
-        //   The index only moves per-slot via clamp_toward_with_dt.
-        // Non-Hyperp: clamp against last_effective_price_e6 baseline.
-        // Accrue to boundary using engine's already-stored rate.
-        // Do NOT overwrite funding_rate_bps_per_slot_last before accrual.
-        if is_hyperp {
-            let push_clock2 = Clock::get()
-                .map_err(|_| ProgramError::UnsupportedSysvar)?;
-            let engine = zc::engine_mut(&mut data)?;
-            engine.accrue_market_to(
-                push_clock2.slot, config.last_effective_price_e6,
-                funding_rate_e9,
-            ).map_err(map_risk_error)?;
-        }
-
-        let clamp_base = config.last_effective_price_e6;
-        let clamped = oracle::clamp_oracle_price(
-            clamp_base,
-            normalized_price,
-            config.oracle_price_cap_e2bps,
-        );
-        config.authority_price_e6 = clamped;
-        if is_hyperp {
-            let push_clock = Clock::get()
-                .map_err(|_| ProgramError::UnsupportedSysvar)?;
-            config.last_mark_push_slot = push_clock.slot as u128;
-            // Admin push feeds through EWMA like trades do.
-            // Direct overwrite was removed — it would let a single push
-            // reset the trade-derived EWMA, defeating smoothing.
-            // Admin push always gets full weight (pass min_fee as fee_paid)
-            config.mark_ewma_e6 = crate::verify::ewma_update(
-                config.mark_ewma_e6, clamped,
-                config.mark_ewma_halflife_slots,
-                config.mark_ewma_last_slot, push_clock.slot,
-                config.mark_min_fee, config.mark_min_fee,
-            );
-            config.mark_ewma_last_slot = push_clock.slot;
-        } else {
-            config.authority_timestamp = timestamp;
-            // Do NOT write last_effective_price_e6 here.
-            // That baseline must only be set by external oracle reads
-            // (crank/trade/withdraw) so admin can't poison it to bypass
-            // the settlement circuit breaker in ResolveMarket.
-        }
-        // Run end-of-instruction lifecycle (§5.7-5.8) after accrue_market_to.
-        // This finalizes any pending DrainOnly→ResetPending→Normal transitions
-        // triggered by the accrual. Without this, sides could stay DrainOnly
-        // with OI=0 until the next standard-lifecycle instruction.
-        if is_hyperp {
-            let engine = zc::engine_mut(&mut data)?;
-            let mut ctx = percolator::InstructionContext::new();
-            match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                Ok(()) => {}
-                Err(percolator::RiskError::CorruptState) => {
-                    return Err(map_risk_error(percolator::RiskError::CorruptState));
-                }
-                Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-            }
-        }
-        state::write_config(&mut data, &config);
-        Ok(())
-    }
-
     // --- SetOraclePriceCap ---
     #[inline(never)]
     fn handle_set_oracle_price_cap<'a>(
@@ -8576,7 +8273,7 @@ pub mod processor {
         if is_hyperp {
             let clock = Clock::from_account_info(a_clock)?;
             let prev_index = config.last_effective_price_e6;
-            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            let mark = config.mark_ewma_e6;
             if mark > 0 && prev_index > 0 {
                 let last_idx_slot = config.last_hyperp_index_slot;
                 let dt = clock.slot.saturating_sub(last_idx_slot);
@@ -8671,90 +8368,83 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Require admin oracle price to be set (authority_price_e6 > 0)
-        let config = state::read_config(&data);
-        if config.authority_price_e6 == 0 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        // Non-Hyperp: require the settlement push to be fresh.
-        // Prevents parking an old price in state and resolving later.
-        if !oracle::is_hyperp_mode(&config) {
-            let clock_fresh = Clock::from_account_info(a_clock)?;
-            let push_age = clock_fresh.unix_timestamp
-                .saturating_sub(config.authority_timestamp);
-            if push_age < 0 || push_age as u64 > config.max_staleness_secs {
-                return Err(PercolatorError::OracleStale.into());
+        // Phase G: settlement price comes from the live oracle at resolution time
+        // (admin-push oracle permanently removed). Falls back to last_effective_price_e6
+        // if oracle is dead so admin can still resolve a market with a dead oracle.
+        // Stores the settlement price in authority_price_e6 so ForceCloseResolved/
+        // WithdrawInsurance callers that read that field continue to work.
+        let clock = Clock::from_account_info(a_clock)?;
+        let mut config = state::read_config(&data);
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+
+        let settlement_price: u64 = if is_hyperp {
+            // Hyperp: settlement price is the current EWMA mark.
+            let mark = config.mark_ewma_e6;
+            if mark == 0 {
+                return Err(PercolatorError::OracleInvalid.into());
             }
-        }
-        // Non-Hyperp: settlement price must be within circuit-breaker
-        // bounds of a FRESH external oracle read. Uses the live
-        // oracle_price_cap_e2bps (not just the immutable floor) so markets
-        // with min_cap=0 but live cap>0 still get the settlement guard.
-        // Hyperp: admin IS the price source, no external baseline.
-        // If the oracle is stale/dead, skip the guard — the admin must
-        // be able to resolve even when the oracle has died (prevents deadlock
-        // on markets with nonzero cap floor + dead oracle).
-        if !oracle::is_hyperp_mode(&config)
-            && config.oracle_price_cap_e2bps != 0
-        {
-            let clock_tmp = Clock::from_account_info(a_clock)?;
+            mark
+        } else {
+            // Non-Hyperp: read live oracle; fall back to last_effective_price_e6 on stale.
             let oracle_result = oracle::read_engine_price_e6(
                 a_oracle,
                 &config.index_feed_id,
-                clock_tmp.unix_timestamp,
+                clock.unix_timestamp,
                 config.max_staleness_secs,
                 config.conf_filter_bps,
                 config.invert,
                 config.unit_scale,
             );
             match oracle_result {
-                Ok(fresh_oracle) => {
-                    // Oracle is live — enforce settlement guard
-                    let clamped = oracle::clamp_oracle_price(
-                        fresh_oracle,
-                        config.authority_price_e6,
+                Ok(live_price) => {
+                    let settlement = oracle::clamp_oracle_price(
+                        config.last_effective_price_e6,
+                        live_price,
                         config.oracle_price_cap_e2bps,
                     );
-                    if clamped != config.authority_price_e6 {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
+                    config.last_effective_price_e6 = settlement;
+                    settlement
                 }
                 Err(e) => {
-                    // Only skip guard if oracle is genuinely stale/dead.
-                    // Other errors (wrong account, bad data, wrong feed) must
-                    // propagate — otherwise admin can bypass guard by passing
-                    // a broken oracle account.
                     let stale_err: ProgramError = PercolatorError::OracleStale.into();
                     if e != stale_err {
                         return Err(e);
                     }
-                    // OracleStale = oracle is dead, allow admin to resolve
+                    // Oracle dead: fall back to last known good price
+                    if config.last_effective_price_e6 == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    config.last_effective_price_e6
                 }
             }
-        }
+        };
 
-        let clock = Clock::from_account_info(a_clock)?;
-        let mut config = config;
-        // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
+        // Phase H §5.5 anti-retroactivity: capture funding rate before any
+        // mutation that affects funding-rate inputs.
         let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+
+        // Store settlement price in authority_price_e6 so existing callers
+        // (ForceCloseResolved, WithdrawInsurance, accrue_market_to below) work unchanged.
+        config.authority_price_e6 = settlement_price;
 
         // Accrue engine to settlement price BEFORE entering resolved mode.
         // This crystallizes all account states at the settlement price so
         // force_close_resolved (which takes no price parameter) uses
         // consistent post-accrual state.
-        if !oracle::is_hyperp_mode(&config) {
+        if !is_hyperp {
+            state::write_config(&mut data, &config);
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
-                clock.slot, config.authority_price_e6,
-                funding_rate_e9,
+                clock.slot, settlement_price, funding_rate_e9,
             ).map_err(map_risk_error)?;
+            config = state::read_config(&data);
         }
 
         // Flush Hyperp index to resolution slot WITHOUT staleness check.
         // Admin must be able to resolve even if mark is stale.
-        if oracle::is_hyperp_mode(&config) {
+        if is_hyperp {
             let prev_index = config.last_effective_price_e6;
-            let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
+            let mark = config.mark_ewma_e6;
             if mark > 0 && prev_index > 0 {
                 let last_idx_slot = config.last_hyperp_index_slot;
                 let dt = clock.slot.saturating_sub(last_idx_slot);
@@ -8765,13 +8455,10 @@ pub mod processor {
                 config.last_hyperp_index_slot = clock.slot;
             }
             state::write_config(&mut data, &config);
-            // Accrue to resolution boundary at the settlement mark price
-            // (authority_price_e6), NOT the smoothed index. force_close_resolved
-            // uses K coefficients that must reflect the declared settlement price.
+            // Accrue to settlement mark price
             let engine = zc::engine_mut(&mut data)?;
             engine.accrue_market_to(
-                clock.slot, config.authority_price_e6,
-                funding_rate_e9,
+                clock.slot, settlement_price, funding_rate_e9,
             ).map_err(map_risk_error)?;
             config = state::read_config(&data);
         }
@@ -9642,23 +9329,6 @@ pub mod processor {
             let staleness = clock.slot.saturating_sub(last_update);
             if staleness < config.permissionless_resolve_stale_slots {
                 return Err(PercolatorError::OracleStale.into());
-            }
-        }
-
-        // Block if an oracle authority is configured AND has pushed recently.
-        // If the authority has never pushed (timestamp=0) or their last push
-        // is stale, the authority is effectively dead and permissionless
-        // resolution should proceed. This prevents the deadlock where:
-        // authority set + external oracle dead = no resolution path.
-        if config.oracle_authority != [0u8; 32] && config.authority_timestamp > 0 {
-            let authority_age_secs = clock.unix_timestamp
-                .saturating_sub(config.authority_timestamp);
-            // Authority is "fresh" if push happened within max_staleness_secs
-            // (the same staleness window as the external oracle feed).
-            if authority_age_secs >= 0
-                && (authority_age_secs as u64) < config.max_staleness_secs
-            {
-                return Err(ProgramError::InvalidAccountData);
             }
         }
 
@@ -13056,14 +12726,6 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Bootstrap guard: admin must seed initial mark via PushOraclePrice first.
-        // When prev_mark==0 the circuit breaker has no reference to clamp against,
-        // so a thin-pool attacker could set an arbitrary initial mark.
-        if config.authority_price_e6 == 0 {
-            msg!("UpdateHyperpMark: market not bootstrapped (prev_mark==0), use PushOraclePrice first");
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-
         // Resolved markets don't need mark updates
         if state::is_resolved(&data) {
             return Ok(());
@@ -13189,7 +12851,27 @@ pub mod processor {
         }
 
         let dex_price = dex_result.price_e6;
-        let prev_mark = config.authority_price_e6;
+
+        // Cold-start: mark_ewma_e6 == 0 means this market was never bootstrapped
+        // (pre-Phase G market that used PushOraclePrice for seeding, or brand new market
+        // where InitMarket set initial_mark_price_e6 = 0). Seed directly from DEX price.
+        if config.mark_ewma_e6 == 0 {
+            config.authority_price_e6 = dex_price;
+            config.mark_ewma_e6 = dex_price;
+            config.mark_ewma_last_slot = clock.slot;
+            config.last_effective_price_e6 = dex_price;
+            config.last_hyperp_index_slot = clock.slot;
+            state::set_last_dex_liquidity_k(&mut config, dex_result.quote_liquidity);
+            state::write_config(&mut data, &config);
+            msg!(
+                "UpdateHyperpMark: cold-start seed dex_price={} pool_depth={}",
+                dex_price,
+                dex_result.quote_liquidity,
+            );
+            return Ok(());
+        }
+
+        let prev_mark = config.mark_ewma_e6;
 
         // SECURITY: Max deviation clamp — clamp DEX spot price to ±5% band around
         // current EMA mark. Flash-loan attacks are clamped rather than rejected
