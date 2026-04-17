@@ -1385,6 +1385,9 @@ pub mod ix {
         SetDisputeParams { window_slots: u64, bond_amount: u64 },
         /// PERC-315: Set LP collateral params (tag 81, admin). enabled=0 blocks new deposits.
         SetLpCollateralParams { enabled: u8, ltv_bps: u16 },
+        /// Phase E: Accept a pending admin transfer (tag 82).
+        /// Signer must match config.pending_admin. No payload.
+        AcceptAdmin,
         // ─── Fork-specific instructions ────────────────────────────────────
 
         /// PERC-8400: Rescue orphan vault (admin only, tag 72).
@@ -1798,6 +1801,7 @@ pub mod ix {
                     let ltv_bps = read_u16(&mut rest)?;
                     Ok(Instruction::SetLpCollateralParams { enabled, ltv_bps })
                 }
+                82 => Ok(Instruction::AcceptAdmin),
                 // Fork-specific instructions
                 72 => Ok(Instruction::RescueOrphanVault),
                 73 => Ok(Instruction::CloseOrphanSlab),
@@ -2373,6 +2377,19 @@ pub mod state {
         /// Padding to align new-fields block to 8-byte boundary for clean
         /// alignment of any future u64/u128 fields appended after.
         pub _new_fields_pad: [u8; 4],
+
+        // ========================================
+        // Two-step admin transfer (Phase E, 2026-04-17)
+        // ========================================
+
+        /// Pending admin pubkey for two-step ownership transfer.
+        /// - UpdateAdmin with non-zero new_admin sets this field; the current
+        ///   admin remains authoritative until AcceptAdmin swaps them.
+        /// - AcceptAdmin requires the signer to match pending_admin exactly.
+        /// - UpdateAdmin with default() still burns immediately (one-way door,
+        ///   requires permissionless_resolve_stale_slots > 0).
+        /// - All-zeros: no transfer pending.
+        pub pending_admin: [u8; 32],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -6118,6 +6135,11 @@ pub mod processor {
                 handle_set_lp_collateral_params(program_id, accounts, enabled, ltv_bps)?;
             }
 
+            // Tag 82: AcceptAdmin — second half of two-step UpdateAdmin (Phase E)
+            Instruction::AcceptAdmin => {
+                handle_accept_admin(program_id, accounts)?;
+            }
+
             // PERC-SetDexPool (Tag 74): Pin admin-approved DEX pool for HYPERP markets.
             // Accounts: [admin(signer), slab(writable), pool_account(readonly)]
             Instruction::SetDexPool { pool } => {
@@ -6495,6 +6517,9 @@ pub mod processor {
             _lp_collateral_pad0: 0,
             lp_collateral_ltv_bps: 0,
             _new_fields_pad: [0u8; 4],
+            // Two-step admin transfer (Phase E, 2026-04-17).
+            // No transfer pending at market creation.
+            pending_admin: [0u8; 32],
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -7937,6 +7962,16 @@ pub mod processor {
     }
 
     // --- UpdateAdmin ---
+    // Two-step transfer model (Phase E, 2026-04-17):
+    //   - new_admin == default()  → immediate BURN (one-way door)
+    //                                preserved for §7 step [3] semantics
+    //   - new_admin != default()  → set pending_admin ONLY; current admin
+    //                                retains authority until AcceptAdmin (tag 82)
+    //                                is called by the new admin.
+    // Rationale: A compromised single-key admin can no longer rotate to an
+    // attacker-controlled key in one transaction. The attacker must also
+    // produce a signature from that key, which reveals the attack and gives
+    // legitimate operators time to respond.
     #[inline(never)]
     fn handle_update_admin<'a>(
         program_id: &Pubkey,
@@ -7950,39 +7985,93 @@ pub mod processor {
         accounts::expect_signer(a_admin)?;
         accounts::expect_writable(a_slab)?;
 
-        // Zero-address admin permanently burns admin authority (§7 step [3]).
-        // require_admin rejects [0u8;32] so all admin instructions become
-        // permanently inaccessible once set.
-
         let mut data = state::slab_data_mut(a_slab)?;
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
-        let mut header = state::read_header(&data);
+        let header = state::read_header(&data);
         require_admin(header.admin, a_admin.key)?;
 
-        // SECURITY(R4-H1): Reject admin burn (zero pubkey) when no
-        // permissionless resolution path exists. Without this guard,
-        // burning admin on a market with permissionless_resolve_stale_slots=0
-        // permanently bricks all user funds — no one can resolve the market,
-        // force-close positions, or withdraw insurance.
         if new_admin == Pubkey::default() {
-            let config = state::read_config(&data);
+            // Immediate burn path — preserved for one-way admin burn.
+            // SECURITY(R4-H1): Reject admin burn when no permissionless
+            // resolution path exists. Without this guard, burning admin on
+            // a market with permissionless_resolve_stale_slots=0 permanently
+            // bricks all user funds — no one can resolve the market,
+            // force-close positions, or withdraw insurance.
+            let mut config = state::read_config(&data);
             if config.permissionless_resolve_stale_slots == 0
                 || config.force_close_delay_slots == 0
             {
                 msg!(
-                    "UpdateAdmin: cannot burn admin without permissionless \
+                    "UpdateAdmin burn: cannot burn without permissionless \
                      resolve ({}) and force-close ({}) paths enabled",
                     config.permissionless_resolve_stale_slots,
                     config.force_close_delay_slots,
                 );
                 return Err(ProgramError::InvalidArgument);
             }
+            // Clear any pending transfer when burning.
+            config.pending_admin = [0u8; 32];
+            state::write_config(&mut data, &config);
+
+            let mut header = header;
+            header.admin = [0u8; 32];
+            state::write_header(&mut data, &header);
+            msg!("UpdateAdmin: admin burned (irreversible)");
+            return Ok(());
         }
 
-        header.admin = new_admin.to_bytes();
+        // Two-step transfer: set pending_admin only. Current admin still
+        // has full authority until AcceptAdmin (tag 82) is invoked by
+        // new_admin. Overwrites any previous pending transfer.
+        let mut config = state::read_config(&data);
+        config.pending_admin = new_admin.to_bytes();
+        state::write_config(&mut data, &config);
+        msg!("UpdateAdmin: transfer proposed, new admin must call AcceptAdmin");
+        Ok(())
+    }
+
+    // --- AcceptAdmin (tag 82) ---
+    // Second half of two-step admin transfer. The proposed new admin must
+    // sign this instruction to complete the transfer. Clears pending_admin
+    // on success so each transfer requires a fresh UpdateAdmin proposal.
+    #[inline(never)]
+    fn handle_accept_admin<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        accounts::expect_len(accounts, 2)?;
+        let a_new_admin = &accounts[0];
+        let a_slab = &accounts[1];
+
+        accounts::expect_signer(a_new_admin)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        let mut config = state::read_config(&data);
+        // Reject if no transfer is pending.
+        if config.pending_admin == [0u8; 32] {
+            msg!("AcceptAdmin: no pending admin transfer");
+            return Err(ProgramError::InvalidArgument);
+        }
+        // Signer must match the pending admin exactly.
+        if config.pending_admin != a_new_admin.key.to_bytes() {
+            msg!("AcceptAdmin: signer does not match pending_admin");
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Swap in: header.admin becomes pending_admin, clear pending.
+        let mut header = state::read_header(&data);
+        header.admin = config.pending_admin;
+        config.pending_admin = [0u8; 32];
+
         state::write_header(&mut data, &header);
+        state::write_config(&mut data, &config);
+        msg!("AcceptAdmin: admin rotated successfully");
         Ok(())
     }
 

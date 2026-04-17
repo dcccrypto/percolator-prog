@@ -623,8 +623,8 @@ fn test_attack_trade_risk_increase_when_gated() {
     env.deposit(&user, user_idx, 10_000_000_000);
 
     // Directly set side_mode_long = DrainOnly (1) in the slab raw bytes.
-    // v12.17 layout: ENGINE_OFF=504, side_mode_long at engine offset 536 (BPF)
-    const SIDE_MODE_LONG_OFF: usize = 504 + 536; // BPF ENGINE_OFF + BPF offset of side_mode_long
+    // v12.17+Phase A/E layout: ENGINE_OFF=584, side_mode_long at engine offset 536 (BPF)
+    const SIDE_MODE_LONG_OFF: usize = 584 + 536; // BPF ENGINE_OFF (Phase A +48 + Phase E +32) + side_mode_long
     {
         let original_slab = env
             .svm
@@ -5613,11 +5613,11 @@ fn test_attack_old_admin_blocked_after_transfer() {
 
     env.crank();
 
-    // Transfer admin
-    env.try_update_admin(&old_admin, &new_admin.pubkey())
-        .unwrap();
+    // Phase E (2026-04-17): two-step transfer — rotate + accept.
+    env.try_rotate_admin(&old_admin, &new_admin).unwrap();
 
     // Old admin should fail
+    env.svm.expire_blockhash();
     let old_result = env.try_update_admin(&old_admin, &old_admin.pubkey());
     assert!(
         old_result.is_err(),
@@ -5625,6 +5625,7 @@ fn test_attack_old_admin_blocked_after_transfer() {
     );
 
     // New admin should succeed
+    env.svm.expire_blockhash();
     let new_result = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(
         new_result.is_ok(),
@@ -7810,10 +7811,11 @@ fn test_attack_update_admin_old_admin_rejected() {
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
 
-    // Transfer admin to new_admin
-    env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
+    // Phase E (2026-04-17): two-step transfer — rotate + accept.
+    env.try_rotate_admin(&admin, &new_admin).unwrap();
 
     // Old admin tries admin operation - should fail
+    env.svm.expire_blockhash();
     let slab_before_old_admin_attempt = env.svm.get_account(&env.slab).unwrap().data;
     let result = env.try_update_admin(&admin, &admin.pubkey());
     assert!(
@@ -7827,6 +7829,7 @@ fn test_attack_update_admin_old_admin_rejected() {
     );
 
     // New admin can do it
+    env.svm.expire_blockhash();
     let result = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(
         result.is_ok(),
@@ -8023,8 +8026,13 @@ fn test_attack_close_account_after_roundtrip_pnl() {
     assert_eq!(cap, 0, "Capital should be zero after close");
 }
 
-/// ATTACK: UpdateAdmin to same address (no-op).
-/// Should succeed without side effects.
+/// ATTACK: UpdateAdmin to same address, then Accept — round-trip no-op on effective state.
+///
+/// Phase E (2026-04-17): UpdateAdmin now writes pending_admin instead of the header,
+/// so "update to self" writes pending_admin=admin into the config. After AcceptAdmin,
+/// pending_admin is cleared and header.admin is unchanged. End-to-end the effective
+/// state matches (admin still authoritative, no fund movement, num_used unchanged),
+/// even though the intermediate slab bytes reflect the pending proposal.
 #[test]
 fn test_attack_update_admin_same_address_noop() {
     program_path();
@@ -8033,37 +8041,41 @@ fn test_attack_update_admin_same_address_noop() {
     env.init_market_with_invert(0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    const HEADER_CONFIG_LEN: usize = 584;
-    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let spl_vault_before = env.vault_balance();
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data.clone();
 
-    // Update admin to same address
-    env.try_update_admin(&admin, &admin.pubkey()).unwrap();
+    // Two-step: propose self-transfer, then accept. Net: no change to effective admin.
+    env.try_rotate_admin(&admin, &admin).unwrap();
+
     let slab_after = env.svm.get_account(&env.slab).unwrap().data;
     let used_after = env.read_num_used_accounts();
     let spl_vault_after = env.vault_balance();
-    assert_eq!(
-        &slab_after[..HEADER_CONFIG_LEN],
-        &slab_before[..HEADER_CONFIG_LEN],
-        "Self-update admin should be a no-op on slab header/config bytes"
-    );
+
+    // End-to-end invariants:
     assert_eq!(
         used_after, used_before,
-        "Self-update admin must not change num_used_accounts"
+        "Self-rotate admin must not change num_used_accounts"
     );
     assert_eq!(
         spl_vault_after, spl_vault_before,
-        "Self-update admin must not move vault funds"
+        "Self-rotate admin must not move vault funds"
+    );
+    // Slab bytes should match after AcceptAdmin clears pending_admin (which was set
+    // to admin and then cleared). The effective state is identical.
+    assert_eq!(
+        slab_after, slab_before,
+        "Full self-rotate admin (propose + accept) should restore slab bytes"
     );
 
     // Non-admin must still be rejected
+    env.svm.expire_blockhash();
     let random = Keypair::new();
     env.svm.airdrop(&random.pubkey(), 1_000_000_000).unwrap();
     let non_admin_result = env.try_update_admin(&random, &random.pubkey());
     assert!(
         non_admin_result.is_err(),
-        "Self-update admin must not broaden admin permissions"
+        "Self-rotate admin must not broaden admin permissions"
     );
 }
 
@@ -13017,17 +13029,22 @@ fn test_attack_rapid_admin_transfers() {
     env.svm.airdrop(&admin2.pubkey(), 5_000_000_000).unwrap();
     env.svm.airdrop(&admin3.pubkey(), 5_000_000_000).unwrap();
 
+    // Phase E (2026-04-17): two-step transfers — propose + accept per hop.
     // Chain: admin1 -> admin2 -> admin3
-    env.try_update_admin(&admin1, &admin2.pubkey()).unwrap();
-    env.try_update_admin(&admin2, &admin3.pubkey()).unwrap();
+    env.try_rotate_admin(&admin1, &admin2).unwrap();
+    env.svm.expire_blockhash();
+    env.try_rotate_admin(&admin2, &admin3).unwrap();
 
     // Only admin3 should work now
+    env.svm.expire_blockhash();
     let r1 = env.try_update_admin(&admin1, &admin1.pubkey());
     assert!(r1.is_err(), "Admin1 should be locked out");
 
+    env.svm.expire_blockhash();
     let r2 = env.try_update_admin(&admin2, &admin2.pubkey());
     assert!(r2.is_err(), "Admin2 should be locked out");
 
+    env.svm.expire_blockhash();
     let r3 = env.try_update_admin(&admin3, &admin3.pubkey());
     assert!(r3.is_ok(), "Admin3 should be active: {:?}", r3);
 }

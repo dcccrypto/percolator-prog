@@ -760,7 +760,7 @@ fn test_attack_multi_crank_funding_conservation() {
     // Engine vault should still be total deposited amount
     let engine_vault = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[504..520].try_into().unwrap()) // BPF ENGINE_OFF=504, vault at engine offset 0
+        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
     };
     assert_eq!(
         engine_vault, 20_000_000_200,
@@ -802,7 +802,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_before = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[504..520].try_into().unwrap()) // BPF ENGINE_OFF=504, vault at engine offset 0
+        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
     };
 
     // UpdateConfig with different parameters
@@ -826,7 +826,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_after = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[504..520].try_into().unwrap()) // BPF ENGINE_OFF=504, vault at engine offset 0
+        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
     };
 
     // Conservation: UpdateConfig must not change vault balances
@@ -2160,17 +2160,20 @@ fn test_property_authorization_exhaustive() {
         vault_before, vault_after
     );
 
-    // --- Admin chain: verify old admin locked out ---
+    // --- Admin chain: verify old admin locked out after two-step transfer (Phase E) ---
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
-    env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
+    // Phase E: UpdateAdmin only proposes; AcceptAdmin completes the transfer.
+    env.try_rotate_admin(&admin, &new_admin).unwrap();
 
+    env.svm.expire_blockhash();
     let r = env.try_update_admin(&admin, &admin.pubkey());
     assert!(
         r.is_err(),
         "A5: Old admin should be locked out after transfer"
     );
 
+    env.svm.expire_blockhash();
     let r = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(r.is_ok(), "A6: New admin should work after transfer");
 

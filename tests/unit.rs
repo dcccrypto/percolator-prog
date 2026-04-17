@@ -2160,10 +2160,26 @@ fn test_admin_rotate() {
     let mut admin_b_account =
         TestAccount::new(new_admin_b, solana_program::system_program::id(), 0, vec![]).signer();
 
-    // Admin A rotates to admin B
+    // Phase E (2026-04-17): two-step transfer — propose then accept.
+    // Admin A proposes admin B.
     {
         let accounts = vec![f.admin.to_info(), f.slab.to_info()];
         process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin_b)).unwrap();
+    }
+
+    // After propose: header.admin is still A, pending_admin = B.
+    let header_pending = state::read_header(&f.slab.data);
+    assert_eq!(
+        header_pending.admin,
+        f.admin.key.to_bytes(),
+        "Phase E: header.admin unchanged until AcceptAdmin"
+    );
+
+    // Admin B accepts to complete the transfer.
+    {
+        let accounts = vec![admin_b_account.to_info(), f.slab.to_info()];
+        // AcceptAdmin = tag 82, no payload.
+        process_instruction(&f.program_id, &accounts, &[82u8]).unwrap();
     }
 
     // Verify admin is now B
@@ -2172,11 +2188,19 @@ fn test_admin_rotate() {
 
     // Create new admin C
     let new_admin_c = Pubkey::new_unique();
+    let mut admin_c_account =
+        TestAccount::new(new_admin_c, solana_program::system_program::id(), 0, vec![]).signer();
 
-    // Admin B rotates to admin C (proves rotation actually took effect)
+    // Admin B proposes admin C
     {
         let accounts = vec![admin_b_account.to_info(), f.slab.to_info()];
         process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin_c)).unwrap();
+    }
+
+    // Admin C accepts
+    {
+        let accounts = vec![admin_c_account.to_info(), f.slab.to_info()];
+        process_instruction(&f.program_id, &accounts, &[82u8]).unwrap();
     }
 
     // Verify admin is now C

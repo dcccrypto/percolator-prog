@@ -96,6 +96,7 @@ use percolator_prog::{
         TAG_SET_MAX_PNL_CAP,
         TAG_SET_OI_CAP_MULTIPLIER,
         TAG_SET_DISPUTE_PARAMS,
+        TAG_ACCEPT_ADMIN,
         TAG_SET_OFFSET_PAIR,
         TAG_SET_OI_IMBALANCE_HARD_BLOCK,
         TAG_SET_ORACLE_AUTHORITY,
@@ -141,11 +142,9 @@ mod layout_constants {
     /// HEADER_LEN: size_of::<SlabHeader>() = 72 bytes
     pub const HEADER_LEN_EXPECTED: usize = 72;
     /// CONFIG_LEN: size_of::<MarketConfig>()
-    // 2026-04-17: CONFIG_LEN extended from 432 → 480 by pre-audit hygiene Phase A.
-    // Added 48 bytes: 5×u64 + u8 + u8 pad + u16 + 4×u8 pad for 7 new config fields
-    // (max_pnl_cap, last_audit_pause_slot, oi_cap_multiplier_bps, dispute_window_slots,
-    // dispute_bond_amount, lp_collateral_enabled, lp_collateral_ltv_bps).
-    pub const CONFIG_LEN_EXPECTED: usize = 480;
+    // 2026-04-17: CONFIG_LEN extended from 432 → 480 by Phase A (7 new fields),
+    // then 480 → 512 by Phase E (+32 bytes for pending_admin for two-step UpdateAdmin).
+    pub const CONFIG_LEN_EXPECTED: usize = 512;
     /// ACCOUNT_SIZE: size_of::<Account>() — v12.17 two-bucket warmup
     pub const ACCOUNT_SIZE_EXPECTED: usize = 368;
     /// ENGINE_OFF: align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN)
@@ -441,6 +440,7 @@ fn all_tags() -> &'static [u8] {
         TAG_SET_OI_CAP_MULTIPLIER,         // 79
         TAG_SET_DISPUTE_PARAMS,            // 80
         TAG_SET_LP_COLLATERAL_PARAMS,      // 81
+        TAG_ACCEPT_ADMIN,                  // 82
     ]
 }
 
@@ -557,6 +557,7 @@ fn tags_match_numeric_values() {
     assert_eq!(TAG_SET_OI_CAP_MULTIPLIER, 79u8);
     assert_eq!(TAG_SET_DISPUTE_PARAMS, 80u8);
     assert_eq!(TAG_SET_LP_COLLATERAL_PARAMS, 81u8);
+    assert_eq!(TAG_ACCEPT_ADMIN, 82u8);
 }
 
 /// Tags whose decode arm is unit (tag-only, no additional bytes).
@@ -577,6 +578,7 @@ fn unit_variant_tags_decode_successfully() {
         TAG_ADVANCE_EPOCH,            // 63
         TAG_RESCUE_ORPHAN_VAULT,      // 72
         TAG_CLOSE_ORPHAN_SLAB,        // 73
+        TAG_ACCEPT_ADMIN,             // 82
     ];
     for &tag in unit_tags {
         let result = Instruction::decode(&[tag]);

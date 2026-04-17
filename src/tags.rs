@@ -192,6 +192,10 @@ pub const TAG_SET_DISPUTE_PARAMS: u8 = 80;
 /// PERC-315: Set LP collateral params for DepositLpCollateral (admin only).
 /// Data: tag(1) + enabled(1) + ltv_bps(2) = 4 bytes. enabled=0 blocks new deposits.
 pub const TAG_SET_LP_COLLATERAL_PARAMS: u8 = 81;
+/// Phase E (2026-04-17): Accept a pending admin transfer (second half of
+/// two-step UpdateAdmin). Signer MUST be the address in config.pending_admin.
+/// Data: tag(1) = 1 byte. No payload.
+pub const TAG_ACCEPT_ADMIN: u8 = 82;
 
 #[cfg(test)]
 mod tests {
@@ -282,6 +286,7 @@ mod tests {
             TAG_SET_OI_CAP_MULTIPLIER,
             TAG_SET_DISPUTE_PARAMS,
             TAG_SET_LP_COLLATERAL_PARAMS,
+            TAG_ACCEPT_ADMIN,
         ];
 
         for i in 0..tags.len() {
@@ -377,6 +382,7 @@ mod tests {
             TAG_SET_OI_CAP_MULTIPLIER,
             TAG_SET_DISPUTE_PARAMS,
             TAG_SET_LP_COLLATERAL_PARAMS,
+            TAG_ACCEPT_ADMIN,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)

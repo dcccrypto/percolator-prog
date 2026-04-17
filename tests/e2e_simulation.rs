@@ -125,10 +125,11 @@ fn phase1_market_creation(env: &mut TestEnv) -> (Keypair, u16, Pubkey) {
     // Step 1 — verify SLAB_LEN is the SBF value (not x86)
     // The account is already allocated at SLAB_LEN in TestEnv::new().
     // If SLAB_LEN were the wrong value, InitMarket would fail with ConstraintRaw.
+    // 2026-04-17: v12.17 + Phase A (+48) + Phase E (+32) = 1_484_728 for MAX_ACCOUNTS=4096.
     println!("[1] SLAB_LEN = {} bytes", SLAB_LEN);
-    assert_eq!(SLAB_LEN, 1_484_648,
-        "SLAB_LEN mismatch: must match SBF layout (1_484_648 for MAX_ACCOUNTS=4096, v12.17 + gen table)");
-    println!("    SLAB_LEN verified: SBF layout (1_484_648)");
+    assert_eq!(SLAB_LEN, 1_484_728,
+        "SLAB_LEN mismatch: must match SBF layout (1_484_728 = v12.17 + Phase A/E MarketConfig extension)");
+    println!("    SLAB_LEN verified: SBF layout (1_484_728)");
 
     // Step 2 — InitMarket with full 352-byte payload.
     // encode_init_market_full_v2 produces opcode(1) + admin(32) + mint(32) +
@@ -758,9 +759,11 @@ fn test_init_market_payload_size() {
 /// be wrong. This test catches that regression.
 #[test]
 fn test_slab_len_is_sbf_value() {
-    // Known good value for MAX_ACCOUNTS=4096 with dex_pool field + gen table, SBF 32-bit layout.
-    // Update this constant if the struct layout changes (and update common/mod.rs too).
-    const EXPECTED_SLAB_LEN: usize = 1_484_648;
+    // 2026-04-17: MarketConfig extended by pre-audit hygiene Phase A (+48 bytes for
+    // 7 new fields) and Phase E (+32 bytes for pending_admin two-step transfer).
+    // New SBF value: 1_484_728 = 1_484_648 + 80.
+    // Update this constant (and common/mod.rs SLAB_LEN) if layout changes again.
+    const EXPECTED_SLAB_LEN: usize = 1_484_728;
     assert_eq!(SLAB_LEN, EXPECTED_SLAB_LEN,
         "SLAB_LEN mismatch: constant is {} but expected SBF value {}. \
          Did struct layout change? Run `cargo build-sbf` and recompute.",
