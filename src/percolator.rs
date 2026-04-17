@@ -2795,14 +2795,26 @@ pub mod state {
 
     /// Read per-account materialization generation (u64).
     /// Returns 0 for never-materialized slots (zero-initialized slab).
+    ///
+    /// 2026-04-17 hardening (Phase 19): returns 0 on out-of-range idx rather
+    /// than panicking on slice OOB. Callers verify idx via check_idx() before
+    /// engine access, but defense-in-depth prevents a future caller bug from
+    /// becoming a DoS-by-panic (matches the pattern fixed in Chainlink reader).
     pub fn read_account_generation(data: &[u8], idx: u16) -> u64 {
         let off = crate::constants::GEN_TABLE_OFF + (idx as usize) * 8;
+        if off + 8 > data.len() {
+            return 0;
+        }
         u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
     }
 
     /// Write per-account materialization generation.
+    /// Silently no-ops on out-of-range idx (same defensive posture as the reader).
     pub fn write_account_generation(data: &mut [u8], idx: u16, gen: u64) {
         let off = crate::constants::GEN_TABLE_OFF + (idx as usize) * 8;
+        if off + 8 > data.len() {
+            return;
+        }
         data[off..off + 8].copy_from_slice(&gen.to_le_bytes());
     }
 }
