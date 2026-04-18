@@ -4734,8 +4734,7 @@ fn test_tradecpi_zero_fill_succeeds() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(mp, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -5332,8 +5331,7 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(mp, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -5484,8 +5482,7 @@ fn test_tradecpi_zero_fill_advances_engine_time() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(mp, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };

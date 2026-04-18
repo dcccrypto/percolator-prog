@@ -1085,8 +1085,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -1130,8 +1129,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, fee),
         };
@@ -1161,7 +1159,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -1753,7 +1751,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(fee),
         };
@@ -3397,8 +3395,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(*matcher_prog, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher_prog, &ctx, 100),
         };
@@ -3435,8 +3432,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(*matcher_prog, false),
-                AccountMeta::new_readonly(*matcher_ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher_prog, matcher_ctx, 100),
         };
@@ -3468,7 +3464,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -4511,7 +4507,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -5295,7 +5291,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(fee),
         };
@@ -5330,8 +5326,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(*matcher, false),
-                AccountMeta::new_readonly(*ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher, ctx, fee),
         };
@@ -5748,7 +5743,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&Pubkey::new_unique(), &Pubkey::new_unique(), 100),
         };

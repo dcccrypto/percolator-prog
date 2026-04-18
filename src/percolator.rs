@@ -1281,9 +1281,11 @@ pub mod ix {
         /// does pure catchup (up to CATCHUP_CHUNKS_MAX chunks) and commits
         /// unconditionally, letting callers incrementally close the gap.
         ///
-        /// Anyone can call. Takes slab + oracle + clock. For markets with a
-        /// confirmed-dead oracle, use ResolvePermissionless instead — its
-        /// Degenerate arm bypasses accrue entirely.
+        /// Anyone can call. Takes slab + clock (no oracle account — see
+        /// runtime handler for the pre-observation rate/price used per
+        /// chunk). For markets with a confirmed-dead oracle, use
+        /// ResolvePermissionless instead — its Degenerate arm bypasses
+        /// accrue entirely.
         CatchupAccrue,
     }
 
@@ -3031,23 +3033,20 @@ pub mod processor {
     ///
     /// No-op when `maintenance_fee_per_slot == 0`.
     ///
-    /// Fee-anchor correctness: the engine's public entrypoint
-    /// `sync_account_fee_to_slot_not_atomic(idx, now_slot, rate)` is
-    /// self-advancing — on Live it executes
-    /// `self.current_slot = now_slot` BEFORE deriving the anchor, so the
-    /// internal constraint `fee_slot_anchor <= current_slot` is satisfied
-    /// by construction every time. The wrapper therefore does NOT need the
-    /// main market clock to already be at `now_slot` before this call; the
-    /// ONLY external precondition is the accrual envelope
-    /// `now_slot - last_market_slot <= max_accrual_dt_slots`, which
-    /// `catchup_accrue` upstream guarantees.
+    /// Invariant: capital-sensitive operations MUST fully accrue the
+    /// market (advance `last_market_slot` to `now_slot`) before syncing
+    /// per-account fees. Oracle-backed paths satisfy this via
+    /// `ensure_market_accrued_to_now` upstream. No-oracle paths (Deposit,
+    /// DepositFeeCredits, InitUser, InitLP, TopUpInsurance,
+    /// ReclaimEmptyAccount) cannot advance `last_market_slot` (no price /
+    /// rate available), so they MUST pass an anchor that is already
+    /// accrued — use `sync_account_fee_bounded_to_market` below rather
+    /// than calling this helper with a wall-clock slot.
     ///
-    /// In particular, on a 1-slot gap where `engine.current_slot == 100`
-    /// and `now_slot == 101`, the engine moves `current_slot` to 101
-    /// itself and uses 101 as the anchor — no rejection. The regression
-    /// test
-    /// `test_fee_markets_survive_one_slot_gap_on_every_accrue_path`
-    /// exercises this on every fee-bearing path.
+    /// Calling this with `now_slot > engine.last_market_slot` creates a
+    /// `current_slot > last_market_slot` split that later breaks the
+    /// accrual envelope: the next oracle-backed instruction will see an
+    /// inflated `clock.slot - last_market_slot` dt and fail Overflow.
     fn sync_account_fee(
         engine: &mut RiskEngine,
         config: &MarketConfig,
@@ -3066,6 +3065,37 @@ pub mod processor {
             .map_err(map_risk_error)
     }
 
+    /// Fee-sync variant for no-oracle instructions. Caps the fee anchor
+    /// at `engine.last_market_slot`, leaving full realization of fees
+    /// accrued over `[last_market_slot, clock.slot]` to the next
+    /// oracle-backed instruction. Prevents the `current_slot >
+    /// last_market_slot` split that would otherwise brick later
+    /// accrual.
+    ///
+    /// Acceptable trade-off: fees from the unaccrued tail are realized
+    /// slightly later (on the next trade/crank/withdraw) instead of now.
+    /// Correctness is preserved because the engine's per-account
+    /// `last_fee_slot` still advances monotonically to the
+    /// already-accrued boundary; subsequent sync calls cover the rest.
+    fn sync_account_fee_bounded_to_market(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        wallclock_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        let anchor = core::cmp::min(wallclock_slot, engine.last_market_slot);
+        engine
+            .sync_account_fee_to_slot_not_atomic(
+                idx,
+                anchor,
+                config.maintenance_fee_per_slot,
+            )
+            .map_err(map_risk_error)
+    }
+
     /// Maximum number of max_dt chunks the in-line catchup can advance per
     /// instruction. Bounded by CU budget — each `accrue_market_to` is cheap
     /// but not free. For gaps beyond this, callers must use the dedicated
@@ -3077,12 +3107,22 @@ pub mod processor {
     const CATCHUP_CHUNKS_MAX: u32 = 20;
 
     /// Pre-chunk market-clock advancement when the gap since the last
-    /// engine operation exceeds `params.max_accrual_dt_slots`. The engine
-    /// rejects any single `accrue_market_to` whose dt exceeds the envelope
-    /// (spec §1.4), so every accrue-bearing instruction (KeeperCrank,
-    /// TradeCpi, TradeNoCpi, Withdraw, Liquidate, Close, Settle, Convert,
-    /// live Insurance withdraw, Ordinary ResolveMarket, UpdateConfig) must
-    /// close that gap before its own accrue.
+    /// engine *accrue* exceeds `params.max_accrual_dt_slots`. The engine
+    /// rejects any single `accrue_market_to` whose funding-active dt
+    /// exceeds the envelope (spec §1.4 / §5.5 clause 6), so every
+    /// accrue-bearing instruction (KeeperCrank, TradeCpi, TradeNoCpi,
+    /// Withdraw, Liquidate, Close, Settle, Convert, live Insurance
+    /// withdraw, Ordinary ResolveMarket, UpdateConfig) must close that
+    /// gap before its own accrue.
+    ///
+    /// Cursor: loops on `engine.last_market_slot`, NOT `current_slot`.
+    /// `last_market_slot` is the only cursor `accrue_market_to` uses to
+    /// compute `total_dt = now_slot - last_market_slot`; `current_slot`
+    /// can be advanced by non-accruing public endpoints (fee sync on Live,
+    /// deposit/top-up without oracle) so it does not track market accrual.
+    /// Earlier versions chunked from `current_slot`, which after any
+    /// no-oracle self-advance would under-report the real gap and let the
+    /// caller's own `accrue_market_to` hit Overflow on the residual.
     ///
     /// Caller supplies the catchup price and funding rate. Typical usage:
     /// the pre-oracle-read funding rate (`funding_rate_e9_pre`) and the
@@ -3111,7 +3151,7 @@ pub mod processor {
         if max_dt == 0 {
             return Ok(());
         }
-        if now_slot <= engine.current_slot {
+        if now_slot <= engine.last_market_slot {
             return Ok(());
         }
         // Market never had a real oracle observation — nothing to catch up.
@@ -3123,7 +3163,7 @@ pub mod processor {
         // stored last_oracle_price. accrue_market_to rejects price == 0.
         let chunk_price = if price > 0 { price } else { engine.last_oracle_price };
         let mut chunks: u32 = 0;
-        while now_slot.saturating_sub(engine.current_slot) > max_dt {
+        while now_slot.saturating_sub(engine.last_market_slot) > max_dt {
             if chunks >= CATCHUP_CHUNKS_MAX {
                 // Refuse to proceed — silently returning Ok here would let
                 // the caller's main accrue hit Overflow on the residual
@@ -3133,7 +3173,7 @@ pub mod processor {
                 // commits progress without attempting the main op.
                 return Err(PercolatorError::CatchupRequired.into());
             }
-            let step = engine.current_slot.saturating_add(max_dt);
+            let step = engine.last_market_slot.saturating_add(max_dt);
             engine
                 .accrue_market_to(step, chunk_price, funding_rate_e9)
                 .map_err(map_risk_error)?;
@@ -3982,13 +4022,18 @@ pub mod processor {
                 state::set_oracle_initialized(&mut data);
             }
             Instruction::InitUser { fee_payment } => {
-                accounts::expect_len(accounts, 6)?;
+                // Account layout (7th account is oracle — required so we can
+                // fully accrue the market before materialization, seeding the
+                // new account's last_fee_slot at clock.slot without creating
+                // a current_slot > last_market_slot split).
+                accounts::expect_len(accounts, 7)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
                 let a_token = &accounts[4];
                 let a_clock = &accounts[5];
+                let a_oracle = &accounts[6];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -4030,12 +4075,32 @@ pub mod processor {
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
-                // No pre-materialization flush needed. Engine v12.18.4 seeds
-                // the new account's last_fee_slot at the materialization slot
-                // (Goal 47 — new accounts never back-charged), so the per-account
-                // cursor keeps the new slot from paying fees for time before
-                // it existed.
+                // Fully accrue market to clock.slot BEFORE materialization.
+                // This seeds the new account's last_fee_slot at clock.slot
+                // (engine's Goal 47 — no back-charge) AND keeps the canonical
+                // invariant `current_slot == last_market_slot`. Without this,
+                // deposit_not_atomic's self-advance of current_slot past a
+                // stale last_market_slot would brick the next accrue-bearing
+                // op (the dt check would exceed max_accrual_dt_slots).
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let eng = zc::engine_ref(&data)?;
+                    let last_slot = eng.current_slot;
+                    oracle::get_engine_oracle_price_e6(
+                        last_slot, clock.slot, clock.unix_timestamp,
+                        &mut config, a_oracle,
+                    )?
+                } else {
+                    read_price_and_stamp(
+                        &mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data,
+                    )?
+                };
+                state::write_config(&mut data, &config);
+
                 let engine = zc::engine_mut(&mut data)?;
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+
                 // Engine v12.18.1 (§10.2): deposit is the canonical materialization
                 // path. It materializes the account at `idx` iff not already used and
                 // amount >= min_initial_deposit. We allocate the next free slot by
@@ -4051,6 +4116,9 @@ pub mod processor {
                     .map_err(map_risk_error)?;
                 // kind defaults to KIND_USER from materialize_at — no write needed.
                 drop(engine);
+                if !state::is_oracle_initialized(&data) {
+                    state::set_oracle_initialized(&mut data);
+                }
                 let gen = state::next_mat_counter(&mut data)
                     .ok_or(PercolatorError::EngineOverflow)?;
                 state::write_account_generation(&mut data, idx, gen);
@@ -4060,13 +4128,15 @@ pub mod processor {
                 matcher_context,
                 fee_payment,
             } => {
-                accounts::expect_len(accounts, 6)?;
+                // 7th account = oracle (see InitUser for rationale).
+                accounts::expect_len(accounts, 7)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
                 let a_token = &accounts[4];
                 let a_clock = &accounts[5];
+                let a_oracle = &accounts[6];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -4109,9 +4179,29 @@ pub mod processor {
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
-                // No pre-materialization flush needed — engine v12.18.4 seeds
-                // the new LP's last_fee_slot at materialization (Goal 47).
+                // Fully accrue market to clock.slot BEFORE materialization
+                // (see InitUser for rationale — preserves the no-back-charge
+                // invariant AND the canonical current_slot == last_market
+                // _slot invariant).
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let eng = zc::engine_ref(&data)?;
+                    let last_slot = eng.current_slot;
+                    oracle::get_engine_oracle_price_e6(
+                        last_slot, clock.slot, clock.unix_timestamp,
+                        &mut config, a_oracle,
+                    )?
+                } else {
+                    read_price_and_stamp(
+                        &mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data,
+                    )?
+                };
+                state::write_config(&mut data, &config);
+
                 let engine = zc::engine_mut(&mut data)?;
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+
                 // Engine v12.18.1 (§10.2): deposit is the canonical materialization.
                 // We materialize a free slot as a User (engine default), then stamp
                 // the LP-specific fields (kind, matcher_program, matcher_context)
@@ -4130,6 +4220,9 @@ pub mod processor {
                 engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
                 engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
                 drop(engine);
+                if !state::is_oracle_initialized(&data) {
+                    state::set_oracle_initialized(&mut data);
+                }
                 let gen = state::next_mat_counter(&mut data)
                     .ok_or(PercolatorError::EngineOverflow)?;
                 state::write_account_generation(&mut data, idx, gen);
@@ -4194,13 +4287,26 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                // Realize due maintenance fees on the acting account before
-                // the deposit so capital reflects pre-fee reality. No-op when
-                // maintenance_fee_per_slot == 0.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                // No-oracle path: cap fee anchor and deposit now_slot at
+                // `engine.last_market_slot`. Advancing `current_slot` past
+                // `last_market_slot` (via either sync_account_fee_to_slot
+                // _not_atomic or deposit_not_atomic, both of which
+                // self-advance current_slot) would break the accrual
+                // envelope for the next oracle-backed instruction:
+                // `dt = clock.slot - last_market_slot` would exceed
+                // max_accrual_dt_slots. Full fee realization for the
+                // tail `(last_market_slot, clock.slot]` happens on the
+                // next oracle-backed instruction (Withdraw/Trade/Crank/
+                // Close/etc.) via `ensure_market_accrued_to_now`.
+                let bounded_now = core::cmp::min(
+                    clock.slot, engine.last_market_slot,
+                );
+                sync_account_fee_bounded_to_market(
+                    engine, &config, user_idx, clock.slot,
+                )?;
 
                 engine
-                    .deposit_not_atomic(user_idx, units as u128, 0, clock.slot)
+                    .deposit_not_atomic(user_idx, units as u128, 0, bounded_now)
                     .map_err(map_risk_error)?;
             }
             Instruction::WithdrawCollateral { user_idx, amount } => {
@@ -5572,8 +5678,14 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
                 let engine = zc::engine_mut(&mut data)?;
+                // No-oracle path: cap at last_market_slot. top_up_insurance
+                // _fund self-advances current_slot; unbounded advance would
+                // brick the next accrue-bearing op.
+                let bounded_now = core::cmp::min(
+                    clock.slot, engine.last_market_slot,
+                );
                 engine
-                    .top_up_insurance_fund(units as u128, clock.slot)
+                    .top_up_insurance_fund(units as u128, bounded_now)
                     .map_err(map_risk_error)?;
             }
             Instruction::UpdateAdmin { new_admin } => {
@@ -6979,7 +7091,13 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(_a_clock)?;
                 let engine = zc::engine_mut(&mut data)?;
-                engine.reclaim_empty_account_not_atomic(user_idx, clock.slot)
+                // No-oracle path: cap at last_market_slot. reclaim self
+                // -advances current_slot; unbounded would split the
+                // cursors and brick the next accrue-bearing op.
+                let bounded_now = core::cmp::min(
+                    clock.slot, engine.last_market_slot,
+                );
+                engine.reclaim_empty_account_not_atomic(user_idx, bounded_now)
                     .map_err(map_risk_error)?;
                 // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
             }
@@ -7083,8 +7201,11 @@ pub mod processor {
                     if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
-                    // Realize maintenance-fee debt first.
-                    sync_account_fee(engine, &cfg, user_idx, clock.slot)?;
+                    // No-oracle path: sync fees at an anchor bounded by
+                    // engine.last_market_slot (see sync_account_fee doc).
+                    sync_account_fee_bounded_to_market(
+                        engine, &cfg, user_idx, clock.slot,
+                    )?;
                     let fc = engine.accounts[user_idx as usize].fee_credits.get();
                     let debt = if fc < 0 { fc.unsigned_abs() } else { 0u128 };
                     (cfg.unit_scale, debt)
@@ -7103,16 +7224,21 @@ pub mod processor {
                 // Phase 3: SPL transfer (only after validation)
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Phase 4: book the repayment in the engine. Fees were already
-                // synced in Phase 1 at the same clock.slot — deposit_fee_credits
-                // at the same slot is a no-op on fee_slot, so this is safe.
+                // Phase 4: book the repayment in the engine. The engine's
+                // deposit_fee_credits self-advances current_slot, so bound
+                // its now_slot at last_market_slot too — matches the fee
+                // sync above and avoids the current_slot > last_market_slot
+                // split that would brick the next oracle-backed op's accrue.
                 let mut data = state::slab_data_mut(a_slab)?;
                 let config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
                 let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
                 let _ = &config; // Phase 1 synced; no second sync needed.
-                engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
+                let bounded_now = core::cmp::min(
+                    clock.slot, engine.last_market_slot,
+                );
+                engine.deposit_fee_credits(user_idx, units2 as u128, bounded_now)
                     .map_err(map_risk_error)?;
             }
 
@@ -7535,18 +7661,34 @@ pub mod processor {
                 // Callers invoke this as many times as needed until any
                 // accrue-bearing instruction can succeed.
                 //
-                // Signal-free interval semantics — does NOT read the
-                // oracle and does NOT mutate config. Uses
-                // engine.last_oracle_price and rate = 0 for every chunk.
-                // Rationale: during a long idle window there is no
-                // observed mark/index signal; the "correct" funding rate
-                // is conceptually zero (same convention as the Degenerate
-                // arm of ResolvePermissionless). Reading the oracle here
-                // and persisting the observation into config while the
-                // engine can only catch up partway would retroactively
-                // apply post-observation state (index/mark) to earlier
-                // engine slots on subsequent partial calls — the exact
-                // retroactivity concern the auditor called out.
+                // Pre-observation semantics — does NOT read the oracle
+                // and does NOT mutate config. The chunk price is
+                // `engine.last_oracle_price` (P_last) and the chunk
+                // funding rate is `compute_current_funding_rate_e9(
+                // config_as_stored)` — i.e., the rate derivable from the
+                // CURRENT-persisted mark_ewma / last_effective_price,
+                // which by construction is the pre-idle state (no call
+                // of this instruction mutates config). This preserves
+                // two invariants simultaneously:
+                //
+                //   (a) Anti-retroactivity: the rate applied to engine
+                //       slots [N, N+max_dt] is the rate that was "in
+                //       force" just before this instruction observed
+                //       anything. Equivalent to what an ordinary
+                //       accrue-bearing instruction would use via
+                //       funding_rate_e9_pre.
+                //   (b) No funding erasure across long idle: markets with
+                //       a stored nonzero mark/index premium continue to
+                //       accrue funding during the idle gap at that stored
+                //       rate. An attacker cannot "erase" funding owed to
+                //       the counterparty by calling CatchupAccrue — the
+                //       rate is the same rate a trade would have
+                //       observed.
+                //   (c) Multi-call idempotence: config is never mutated
+                //       here, so each partial CatchupAccrue computes the
+                //       SAME rate from the SAME config state. No
+                //       observation from call N leaks onto engine slots
+                //       advanced during calls < N.
                 //
                 // For Hyperp, config.last_hyperp_index_slot is advanced
                 // to match engine.current_slot after catchup. This keeps
@@ -7576,6 +7718,13 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
 
+                // Snapshot config for rate computation. We do NOT mutate
+                // or re-persist it — the pre-idle mark/index state stays
+                // exactly as it was, keeping the chunk rate stable across
+                // partial CatchupAccrue calls.
+                let config_snapshot = state::read_config(&data);
+                let chunk_rate = compute_current_funding_rate_e9(&config_snapshot);
+
                 let engine = zc::engine_mut(&mut data)?;
                 // Engine has no oracle observation yet → nothing to
                 // "advance past". This matches catchup_accrue's own
@@ -7584,28 +7733,26 @@ pub mod processor {
                 if engine.last_oracle_price == 0 {
                     return Ok(());
                 }
-                // Use stored P_last as the chunk price and rate=0 (signal
-                // free). Mechanical time advance only — no observation
-                // persisted to config.
                 let chunk_price = engine.last_oracle_price;
-                let chunk_rate: i128 = 0;
 
-                // Cap the target to engine.current_slot +
+                // Cap the target to engine.last_market_slot +
                 // CATCHUP_CHUNKS_MAX × max_dt so this call commits
                 // partial progress even when the full gap can't be
-                // closed in one instruction.
+                // closed in one instruction. Uses last_market_slot (not
+                // current_slot) because that's the cursor accrue_market
+                // _to actually advances.
                 let max_dt = engine.params.max_accrual_dt_slots;
                 let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64)
                     .saturating_mul(max_dt);
                 let target = core::cmp::min(
                     clock.slot,
-                    engine.current_slot.saturating_add(max_step_per_call),
+                    engine.last_market_slot.saturating_add(max_step_per_call),
                 );
-                if target > engine.current_slot {
+                if target > engine.last_market_slot {
                     catchup_accrue(engine, target, chunk_price, chunk_rate)?;
                     // Close the residual to `target` so this call advances
                     // by FULL CATCHUP_CHUNKS_MAX × max_dt chunks.
-                    if target > engine.current_slot {
+                    if target > engine.last_market_slot {
                         engine
                             .accrue_market_to(target, chunk_price, chunk_rate)
                             .map_err(map_risk_error)?;
@@ -7614,8 +7761,8 @@ pub mod processor {
                     // the last short residual to clock.slot. Otherwise
                     // leave engine at `target` — subsequent CatchupAccrue
                     // calls close the remainder.
-                    if clock.slot > engine.current_slot
-                        && clock.slot.saturating_sub(engine.current_slot) <= max_dt
+                    if clock.slot > engine.last_market_slot
+                        && clock.slot.saturating_sub(engine.last_market_slot) <= max_dt
                     {
                         engine
                             .accrue_market_to(clock.slot, chunk_price, chunk_rate)

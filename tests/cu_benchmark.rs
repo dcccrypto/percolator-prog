@@ -416,8 +416,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -445,7 +444,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -754,7 +753,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_col, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -850,7 +849,7 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_col, false),
+                    AccountMeta::new_readonly(env.pyth_index, false),
                 ],
                 data: encode_init_user(100),
             };
@@ -917,7 +916,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1140,7 +1139,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1254,7 +1253,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1359,7 +1358,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1512,7 +1511,7 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_col, false),
+                    AccountMeta::new_readonly(env.pyth_index, false),
                 ],
                 data: encode_init_user(100),
             };
