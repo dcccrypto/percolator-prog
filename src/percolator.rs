@@ -52,6 +52,24 @@ pub mod constants {
     /// Bounds the absolute payout so a crank over a long interval or a huge
     /// used-account bitmap cannot drain insurance in a single call.
     pub const CRANK_REWARD_ACCOUNT_CAP: u128 = 16;
+
+    // ── Engine envelope constants (wrapper-owned, immutable per deployment) ──
+    //
+    // These values populate the engine's per-market RiskParams envelope at
+    // InitMarket. They are NOT decoded from instruction data and NOT admin-
+    // configurable — every deployment uses these exact values. The envelope
+    // invariant
+    //   ADL_ONE * MAX_ORACLE_PRICE * MAX_ABS_FUNDING_E9_PER_SLOT *
+    //     MAX_ACCRUAL_DT_SLOTS <= i128::MAX
+    // must hold: 1e15 * 1e12 * 1e6 * 1e5 = 1e38 < i128::MAX (≈1.7e38). ✓
+    //
+    // Surface them here as named constants so operators and auditors can see
+    // exactly what values ship, rather than having them buried inside the
+    // RiskParams literal in read_risk_params.
+    /// Max dt allowed in a single `accrue_market_to` call (spec §1.4).
+    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 100_000;
+    /// Max |funding_rate_e9_per_slot| the engine will accrue (spec §1.4).
+    pub const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 1_000_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
@@ -1646,13 +1664,13 @@ pub mod ix {
             h_min,
             h_max,
             resolve_price_deviation_bps,
-            // Envelope: ADL_ONE * MAX_ORACLE_PRICE * rate * dt <= i128::MAX
-            // 1e15 * 1e12 * 1e6 * 1e5 = 1e38 < i128::MAX (1.7e38). ✓
-            max_accrual_dt_slots: 100_000,
-            max_abs_funding_e9_per_slot: 1_000_000,
-            // Active-positions cap per side (§1.4). Default: same as max_accounts
-            // so no extra cap above the account limit — admins can tighten via
-            // UpdateConfig in the future without changing the wire layout.
+            // Envelope is fixed by wrapper deployment, not market-specified.
+            // See `crate::constants::{MAX_ACCRUAL_DT_SLOTS,
+            // MAX_ABS_FUNDING_E9_PER_SLOT}` for the invariant proof.
+            max_accrual_dt_slots: crate::constants::MAX_ACCRUAL_DT_SLOTS,
+            max_abs_funding_e9_per_slot: crate::constants::MAX_ABS_FUNDING_E9_PER_SLOT,
+            // Active-positions cap per side (§1.4). Mirrors max_accounts —
+            // no tighter per-side limit is enforced by the wrapper today.
             max_active_positions_per_side: max_accounts,
         };
         Ok((params, insurance_floor))
@@ -2931,7 +2949,6 @@ pub mod processor {
             .sync_account_fee_to_slot_not_atomic(
                 idx,
                 now_slot,
-                now_slot,
                 config.maintenance_fee_per_slot,
             )
             .map_err(map_risk_error)
@@ -2962,7 +2979,6 @@ pub mod processor {
                 engine
                     .sync_account_fee_to_slot_not_atomic(
                         idx as u16,
-                        now_slot,
                         now_slot,
                         config.maintenance_fee_per_slot,
                     )
@@ -3044,10 +3060,10 @@ pub mod processor {
         // so margin checks see post-fee capital. No-op when fee rate is 0.
         if maintenance_fee_per_slot > 0 {
             engine.sync_account_fee_to_slot_not_atomic(
-                a, now_slot, now_slot, maintenance_fee_per_slot,
+                a, now_slot, maintenance_fee_per_slot,
             )?;
             engine.sync_account_fee_to_slot_not_atomic(
-                b, now_slot, now_slot, maintenance_fee_per_slot,
+                b, now_slot, maintenance_fee_per_slot,
             )?;
         }
         engine.execute_trade_not_atomic(
@@ -5086,12 +5102,10 @@ pub mod processor {
                 }
                 let amt_units = if resolved {
                     // force_close_resolved handles K-pair PnL, maintenance fees,
-                    // loss settlement, and account close internally.
-                    // Engine v12.18.5+: the inner reconcile step requires
-                    // now_slot <= resolved_slot (§9.9). clock.slot keeps
-                    // advancing after resolution, so pass resolved_slot instead.
-                    let (_, resolved_slot) = engine.resolved_context();
-                    match engine.force_close_resolved_not_atomic(user_idx, resolved_slot)
+                    // loss settlement, and account close internally. Engine
+                    // v12.18.6+: signature is (idx,) — the engine pulls the
+                    // resolved_slot from its own state (§9.9).
+                    match engine.force_close_resolved_not_atomic(user_idx)
                         .map_err(map_risk_error)?
                     {
                         percolator::ResolvedCloseResult::ProgressOnly => {
@@ -6460,12 +6474,10 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
-                // Engine v12.18.5+: reconcile_resolved_not_atomic bounds
-                // `now_slot <= resolved_slot` (spec §9.9 — once Resolved,
-                // current_slot must not advance past the resolution boundary).
-                // Pass resolved_slot, not clock.slot, which has continued to
-                // advance after the market froze.
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, resolved_slot)
+                // Engine v12.18.6+: slot argument removed — the engine pulls
+                // resolved_slot from its own state (§9.9).
+                let _ = resolved_slot;
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -6847,25 +6859,17 @@ pub mod processor {
                 }
 
                 // Flush Hyperp index toward mark before resolution.
-                if is_hyperp {
-                    let mark = if config.mark_ewma_e6 > 0 {
-                        config.mark_ewma_e6
-                    } else {
-                        config.authority_price_e6
-                    };
-                    let prev_index = config.last_effective_price_e6;
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1), mark,
-                            config.oracle_price_cap_e2bps, dt,
-                        );
-                        config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
-                    }
-                    state::write_config(&mut data, &config);
-                }
+                // Hyperp index-flush REMOVED from the permissionless path.
+                // Engine v12.18.5+ Degenerate arm enforces
+                //     live_oracle_price == engine.last_oracle_price   (spec §9.8)
+                // Advancing config.last_effective_price_e6 via clamp_toward_with_dt
+                // and then passing that new value as live_oracle would violate
+                // that equality, so the engine would reject with Overflow.
+                // Permissionless resolution is by construction the
+                // "signal-free interval" branch: we feed the engine its own
+                // stored P_last and no new information. (Admin ResolveMarket
+                // still flushes the index on its own path, where the ORDINARY
+                // branch accrues through the new index.)
 
                 // Determine canonical settlement price.
                 // Hyperp: use mark EWMA (same as ResolveMarket Hyperp path).
@@ -6894,16 +6898,11 @@ pub mod processor {
                 // Both inputs to engine.resolve_market_not_atomic therefore use their
                 // degenerate values:
                 //   live_oracle_price = P_last = engine.last_oracle_price
-                //     (Hyperp: the just-flushed internal index)
+                //     (same value for Hyperp and non-Hyperp — the engine's stored
+                //      last price, NOT the flushed config index)
                 //   funding_rate_e9 = 0        (signal-free interval)
-                // This mirrors the degenerate arm of ResolveMarket and is intentionally
-                // distinct from the ordinary self-synchronizing path.
                 let engine = zc::engine_mut(&mut data)?;
-                let live_oracle_p_last = if oracle::is_hyperp_mode(&config) {
-                    config.last_effective_price_e6
-                } else {
-                    engine.last_oracle_price
-                };
+                let live_oracle_p_last = engine.last_oracle_price;
                 // ResolvePermissionless is always the Degenerate arm by design
                 // (engine's Goal 51 explicit selector).
                 engine.resolve_market_not_atomic(
@@ -6977,8 +6976,9 @@ pub mod processor {
                     engine.accounts[user_idx as usize].owner,
                 );
 
-                // Engine v12.18.5+ (§9.9): reconcile requires now_slot ≤ resolved_slot.
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, resolved_slot)
+                // Engine v12.18.6+ (§9.9): slot arg removed; engine uses resolved_slot.
+                let _ = resolved_slot;
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
