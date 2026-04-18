@@ -4283,17 +4283,24 @@ pub mod processor {
                     if reward > 0 {
                         // Conservation: insurance − r, caller.capital + r,
                         // c_tot + r keeps vault ≥ c_tot + insurance + net_pnl
-                        // intact. Direct field writes are safe here because
-                        // caller_idx has been validated as a signer-owned used
-                        // slot (by the auth block above) and we just re-checked
-                        // is_used() to confirm the crank didn't liquidate it.
-                        engine.insurance_fund.balance = U128::new(ins_now - reward);
+                        // intact. Use checked_add on the two growing fields
+                        // (silent saturation would mask an invariant break).
+                        // reward ≤ ins_now ≤ MAX_VAULT_TVL, so both additions
+                        // are economically bounded, but we still fail loudly
+                        // on any unexpected overflow rather than silently
+                        // clipping at u128::MAX.
                         let ci = caller_idx as usize;
                         let cap_prev = engine.accounts[ci].capital.get();
-                        engine.accounts[ci].capital =
-                            U128::new(cap_prev.saturating_add(reward));
+                        let cap_next = cap_prev
+                            .checked_add(reward)
+                            .ok_or(PercolatorError::EngineOverflow)?;
                         let c_tot_prev = engine.c_tot.get();
-                        engine.c_tot = U128::new(c_tot_prev.saturating_add(reward));
+                        let c_tot_next = c_tot_prev
+                            .checked_add(reward)
+                            .ok_or(PercolatorError::EngineOverflow)?;
+                        engine.insurance_fund.balance = U128::new(ins_now - reward);
+                        engine.accounts[ci].capital = U128::new(cap_next);
+                        engine.c_tot = U128::new(c_tot_next);
                     }
                 }
 
@@ -5943,6 +5950,19 @@ pub mod processor {
                                 fresh_oracle,
                                 config.oracle_price_cap_e2bps,
                             );
+                            // NOTE on design: pass the RAW fresh oracle (not the
+                            // clamped value) as the engine's live_oracle_price.
+                            // The resolve deviation band
+                            // (`resolve_price_deviation_bps`, spec §9.8 step 7)
+                            // is intended to reject settlement when the
+                            // admin-chosen price has drifted too far from the
+                            // *actual* live market. Feeding the clamped value
+                            // instead would let admin settle against a
+                            // circuit-breaker-suppressed reference after a real
+                            // oracle jump, locking in a stale price. The
+                            // circuit breaker protects ongoing live operation;
+                            // resolution is a one-shot terminal event where
+                            // the raw oracle is the right signal.
                             // B3 fix: the spec's settlement deviation band is
                             // `resolve_price_deviation_bps` (plain bps, max
                             // MAX_RESOLVE_PRICE_DEVIATION_BPS=10_000), not the
@@ -6686,10 +6706,14 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
-                // Phase 1: Read fee debt and validate (immutable borrow)
-                // Also verify vault BEFORE the SPL transfer.
+                // Phase 1: sync latent maintenance fees and read post-sync
+                // debt. Done under a mutable borrow so sync_account_fee can
+                // realize fees accrued since last_fee_slot BEFORE we compare
+                // `amount` against the outstanding-debt cap. Otherwise a user
+                // with zero realized debt but nonzero latent fees would get
+                // their legitimate repayment rejected as overpayment.
                 let (unit_scale, debt_units) = {
-                    let data = a_slab.try_borrow_data()?;
+                    let mut data = state::slab_data_mut(a_slab)?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
                     if zc::engine_ref(&data)?.is_resolved() {
@@ -6703,17 +6727,21 @@ pub mod processor {
                     verify_vault(a_vault, &auth, &mint,
                         &Pubkey::new_from_array(cfg.vault_pubkey))?;
                     verify_token_account(a_user_ata, a_user.key, &mint)?;
-                    let engine = zc::engine_ref(&data)?;
+                    let clock = Clock::from_account_info(a_clock)?;
+
+                    let engine = zc::engine_mut(&mut data)?;
                     check_idx(engine, user_idx)?;
                     let owner = engine.accounts[user_idx as usize].owner;
                     if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
+                    // Realize maintenance-fee debt first.
+                    sync_account_fee(engine, &cfg, user_idx, clock.slot)?;
                     let fc = engine.accounts[user_idx as usize].fee_credits.get();
                     let debt = if fc < 0 { fc.unsigned_abs() } else { 0u128 };
                     (cfg.unit_scale, debt)
                 };
-                // data (Ref) dropped here — releases immutable borrow
+                // slab_data_mut released; OK to do SPL transfer next.
 
                 // Phase 2: Reject zero, misaligned, or overpayment
                 let (units, dust) = crate::units::base_to_units(amount, unit_scale);
@@ -6727,18 +6755,15 @@ pub mod processor {
                 // Phase 3: SPL transfer (only after validation)
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Phase 4: Engine deposit_fee_credits (mutable borrow)
-                // Vault already verified in Phase 1.
+                // Phase 4: book the repayment in the engine. Fees were already
+                // synced in Phase 1 at the same clock.slot — deposit_fee_credits
+                // at the same slot is a no-op on fee_slot, so this is safe.
                 let mut data = state::slab_data_mut(a_slab)?;
                 let config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
                 let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
-                // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
-
                 let engine = zc::engine_mut(&mut data)?;
-                // Realize due maintenance fees BEFORE repaying fee debt, so
-                // the outstanding-debt check reflects every accrued slot.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                let _ = &config; // Phase 1 synced; no second sync needed.
                 engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }

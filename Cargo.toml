@@ -12,7 +12,6 @@ path = "src/percolator.rs"
 [features]
 no-entrypoint = []
 test-sbf = []
-test = ["percolator/test"]  # Use MAX_ACCOUNTS=64 for tests
 cu-audit = []  # Enable compute unit checkpoints for CU auditing
 
 [dependencies]
