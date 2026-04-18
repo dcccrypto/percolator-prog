@@ -4148,42 +4148,28 @@ pub mod processor {
                 // lifecycle (side-mode drain detection / resets / health
                 // reconciliation) observes fee-induced state.
                 //
-                // Crank reward: measure the insurance delta the sweep produced,
-                // pay CRANK_REWARD_BPS (50 %) of it back to the non-permissionless
-                // caller as capital, capped at CRANK_REWARD_ACCOUNT_CAP accounts'
-                // worth of one-slot fees. All other protocol fees (trading,
-                // liquidation, resolution) continue to flow only to insurance.
+                // Crank reward: pay CRANK_REWARD_BPS (50 %) of the maintenance-
+                // fee sweep delta back to the non-permissionless caller as
+                // capital, capped at CRANK_REWARD_ACCOUNT_CAP accounts' worth
+                // of one-slot fees. Trading, liquidation, and resolution fees
+                // continue to flow only to insurance (sweep_delta is captured
+                // BEFORE keeper_crank_not_atomic so those fees don't inflate
+                // the reward).
+                //
+                // Reward is paid AFTER keeper_crank_not_atomic. Paying it
+                // before would let a borderline caller self-rescue: the capital
+                // bump would change the account's maintenance-margin health
+                // before the crank's liquidation pass evaluated it. Paying it
+                // after leaves the crank's risk decisions on pre-reward state,
+                // and a caller who got liquidated inside the crank (slot no
+                // longer used) simply doesn't collect the reward.
                 let ins_before = engine.insurance_fund.balance.get();
                 sweep_maintenance_fees(engine, &config, clock.slot)?;
-                if !permissionless && config.maintenance_fee_per_slot > 0 {
-                    let ins_after = engine.insurance_fund.balance.get();
-                    let delta = ins_after.saturating_sub(ins_before);
-                    // reward_raw = delta * bps / 10_000 in wide math.
-                    let mut reward = delta
-                        .saturating_mul(crate::constants::CRANK_REWARD_BPS)
-                        / 10_000u128;
-                    // Absolute cap: N accounts' worth of one-slot fees.
-                    let cap = crate::constants::CRANK_REWARD_ACCOUNT_CAP
-                        .saturating_mul(config.maintenance_fee_per_slot);
-                    if reward > cap { reward = cap; }
-                    // Never pay out more than insurance currently holds.
-                    if reward > ins_after { reward = ins_after; }
-                    if reward > 0 {
-                        // caller_idx is a validated used account (checked_idx +
-                        // owner_ok fired above when !permissionless), so direct
-                        // field writes here are safe.
-                        // Conservation: insurance −r, caller.capital +r, c_tot +r
-                        // keeps the `vault >= c_tot + insurance + net_pnl`
-                        // invariant whole.
-                        engine.insurance_fund.balance = U128::new(ins_after - reward);
-                        let ci = caller_idx as usize;
-                        let cap_prev = engine.accounts[ci].capital.get();
-                        let cap_next = cap_prev.saturating_add(reward);
-                        engine.accounts[ci].capital = U128::new(cap_next);
-                        let c_tot_prev = engine.c_tot.get();
-                        engine.c_tot = U128::new(c_tot_prev.saturating_add(reward));
-                    }
-                }
+                let sweep_delta = engine
+                    .insurance_fund
+                    .balance
+                    .get()
+                    .saturating_sub(ins_before);
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
@@ -4202,6 +4188,52 @@ pub mod processor {
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_end");
                     sol_log_compute_units();
+                }
+
+                // Pay the crank reward AFTER keeper_crank_not_atomic has run
+                // all liquidation / lifecycle logic. The sweep_delta was
+                // captured pre-crank, so the reward is bounded only by the
+                // maintenance-fee collection on this call, not by incidental
+                // insurance growth from liquidation fees.
+                //
+                // Skip conditions:
+                //   - permissionless caller (no account to credit)
+                //   - fee feature disabled (nothing swept)
+                //   - zero sweep delta (first crank of a fresh market)
+                //   - caller_idx was liquidated during the crank and is no
+                //     longer a used slot (cannot pay capital to a freed slot)
+                if !permissionless
+                    && config.maintenance_fee_per_slot > 0
+                    && sweep_delta > 0
+                    && engine.is_used(caller_idx as usize)
+                {
+                    let mut reward = sweep_delta
+                        .saturating_mul(crate::constants::CRANK_REWARD_BPS)
+                        / 10_000u128;
+                    let cap = crate::constants::CRANK_REWARD_ACCOUNT_CAP
+                        .saturating_mul(config.maintenance_fee_per_slot);
+                    if reward > cap {
+                        reward = cap;
+                    }
+                    let ins_now = engine.insurance_fund.balance.get();
+                    if reward > ins_now {
+                        reward = ins_now;
+                    }
+                    if reward > 0 {
+                        // Conservation: insurance − r, caller.capital + r,
+                        // c_tot + r keeps vault ≥ c_tot + insurance + net_pnl
+                        // intact. Direct field writes are safe here because
+                        // caller_idx has been validated as a signer-owned used
+                        // slot (by the auth block above) and we just re-checked
+                        // is_used() to confirm the crank didn't liquidate it.
+                        engine.insurance_fund.balance = U128::new(ins_now - reward);
+                        let ci = caller_idx as usize;
+                        let cap_prev = engine.accounts[ci].capital.get();
+                        engine.accounts[ci].capital =
+                            U128::new(cap_prev.saturating_add(reward));
+                        let c_tot_prev = engine.c_tot.get();
+                        engine.c_tot = U128::new(c_tot_prev.saturating_add(reward));
+                    }
                 }
 
                 // Copy stats and drop engine mutable borrow
@@ -5055,7 +5087,11 @@ pub mod processor {
                 let amt_units = if resolved {
                     // force_close_resolved handles K-pair PnL, maintenance fees,
                     // loss settlement, and account close internally.
-                    match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
+                    // Engine v12.18.5+: the inner reconcile step requires
+                    // now_slot <= resolved_slot (§9.9). clock.slot keeps
+                    // advancing after resolution, so pass resolved_slot instead.
+                    let (_, resolved_slot) = engine.resolved_context();
+                    match engine.force_close_resolved_not_atomic(user_idx, resolved_slot)
                         .map_err(map_risk_error)?
                     {
                         percolator::ResolvedCloseResult::ProgressOnly => {
@@ -6413,9 +6449,9 @@ pub mod processor {
                 )?;
                 accounts::expect_key(a_pda, &auth)?;
 
-                let clock = Clock::from_account_info(&accounts[6])?;
+                let _clock = Clock::from_account_info(&accounts[6])?;
                 let engine = zc::engine_mut(&mut data)?;
-                let (price, _) = engine.resolved_context();
+                let (price, resolved_slot) = engine.resolved_context();
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -6424,7 +6460,12 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
+                // Engine v12.18.5+: reconcile_resolved_not_atomic bounds
+                // `now_slot <= resolved_slot` (spec §9.9 — once Resolved,
+                // current_slot must not advance past the resolution boundary).
+                // Pass resolved_slot, not clock.slot, which has continued to
+                // advance after the market froze.
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, resolved_slot)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -6926,7 +6967,7 @@ pub mod processor {
                 accounts::expect_key(a_pda, &auth)?;
 
                 let engine = zc::engine_mut(&mut data)?;
-                let (price, _) = engine.resolved_context();
+                let (price, resolved_slot) = engine.resolved_context();
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -6936,7 +6977,8 @@ pub mod processor {
                     engine.accounts[user_idx as usize].owner,
                 );
 
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
+                // Engine v12.18.5+ (§9.9): reconcile requires now_slot ≤ resolved_slot.
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, resolved_slot)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
