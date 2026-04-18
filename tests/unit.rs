@@ -494,6 +494,12 @@ fn test_struct_sizes() {
     println!("Slab offset of min_oracle_price_cap_e2bps: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, min_oracle_price_cap_e2bps));
     println!("Offset of mark_ewma_e6: {}", offset_of!(state::MarketConfig, mark_ewma_e6));
     println!("Slab offset of mark_ewma_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, mark_ewma_e6));
+    println!("Offset of last_oracle_price: {}", offset_of!(RiskEngine, last_oracle_price));
+    println!("Slab offset of last_oracle_price: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_oracle_price));
+    println!("Offset of last_market_slot: {}", offset_of!(RiskEngine, last_market_slot));
+    println!("Slab offset of last_market_slot: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_market_slot));
+    println!("Offset of first_observed_stale_slot: {}", offset_of!(state::MarketConfig, first_observed_stale_slot));
+    println!("Slab offset of first_observed_stale_slot: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, first_observed_stale_slot));
 }
 
 #[test]

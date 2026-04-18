@@ -2740,8 +2740,12 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Permissionless resolution (anyone can call when oracle is dead)
-    pub fn try_resolve_permissionless(&mut self) -> Result<(), String> {
+    /// Raw single-call ResolvePermissionless. Production semantics: first call
+    /// during a stale window stamps `first_observed_stale_slot` and returns
+    /// OracleStale; a second call after `permissionless_resolve_stale_slots`
+    /// have elapsed succeeds. Tests asserting specific single-call behavior
+    /// (e.g., rejecting a premature resolve after idle) should use this.
+    pub fn try_resolve_permissionless_once(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
         let ix = Instruction {
@@ -2760,6 +2764,32 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+    }
+
+    /// Permissionless resolution convenience helper simulating a real keeper:
+    /// observe stale → wait permissionless_resolve_stale_slots → resolve.
+    /// The wrapper now requires two observations of a stale oracle separated
+    /// by the configured delay to prevent premature resolution after a long
+    /// idle period followed by a short oracle hiccup. This helper performs
+    /// both observations with an artificial clock advance between them so
+    /// existing tests don't have to manually orchestrate the two-phase flow.
+    pub fn try_resolve_permissionless(&mut self) -> Result<(), String> {
+        // First observation — stamps first_observed_stale_slot, returns stale.
+        // Idempotent on repeated calls within the same stale window.
+        let _ = self.try_resolve_permissionless_once();
+        // Advance clock past permissionless_resolve_stale_slots so the second
+        // call passes the duration check. Reads the configured delay from the
+        // slab via the program's own state layout.
+        let delay = {
+            let slab = self.svm.get_account(&self.slab).unwrap();
+            percolator_prog::state::read_config(&slab.data).permissionless_resolve_stale_slots
+        };
+        let mut clk = self.svm.get_sysvar::<solana_sdk::clock::Clock>();
+        clk.slot = clk.slot.saturating_add(delay).saturating_add(1);
+        clk.unix_timestamp = clk.unix_timestamp.saturating_add(delay as i64 + 1);
+        self.svm.set_sysvar(&clk);
+        // Second observation — duration check passes, market resolves.
+        self.try_resolve_permissionless_once()
     }
 
     /// Try ForceCloseResolved instruction (permissionless, requires resolved + delay)

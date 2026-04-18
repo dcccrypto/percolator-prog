@@ -1838,8 +1838,16 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// Padding for alignment.
-        pub _liw_padding: u64,
+        /// First slot on which ResolvePermissionless observed the external oracle
+        /// as stale (non-Hyperp only). 0 = not currently observing staleness.
+        /// Cleared on every successful external oracle read so a live-but-idle
+        /// market cannot be prematurely resolved after a short oracle hiccup.
+        /// Stamped on the first stale observation, so continuous-death duration
+        /// is measured from that observation (not from the last-good stamp,
+        /// which only advances when some instruction reads the oracle).
+        /// Repurposed from the former `_liw_padding` (same 8-byte slot, same
+        /// wire offset). Legacy zero initialization is the correct sentinel.
+        pub first_observed_stale_slot: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -2540,6 +2548,12 @@ pub mod oracle {
                 config.oracle_price_cap_e2bps,
             );
             config.last_effective_price_e6 = clamped_ext;
+            // Any successful external read proves the oracle is currently live,
+            // so reset the permissionless-resolve staleness observation. This
+            // prevents a premature resolve after a long idle period + a short
+            // oracle hiccup — the continuous-death window only starts from the
+            // first in-window stale observation, not the last successful read.
+            config.first_observed_stale_slot = 0;
         }
 
         // Return the authority price if fresh, otherwise the external price
@@ -3746,7 +3760,7 @@ pub mod processor {
                     // Non-Hyperp: 0 (no mark push concept).
                     last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
                     last_insurance_withdraw_slot: 0,
-                    _liw_padding: 0,
+                    first_observed_stale_slot: 0,
                     // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
                     mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
@@ -4862,27 +4876,52 @@ pub mod processor {
                 }
 
                 // Zero-fill: ABI-valid no-op when matcher returns exec_size == 0
-                // with FLAG_PARTIAL_OK. Skip engine call which rejects size_q == 0.
-                // Zero-fill: no trade occurred, so do not persist oracle side effects.
-                // Revert last_effective_price_e6 for ALL markets — prevents repeated
-                // zero-fills from walking the circuit-breaker baseline toward the raw
-                // oracle price (Hyperp: index ratchet, non-Hyperp: baseline walk).
-                // SAFETY: mark_ewma_e6 is NOT reverted here because the EWMA update
-                // happens AFTER this early return (inside the exec_size != 0 branch below).
-                // Zero-fills never touch the EWMA, so no revert is needed.
+                // with FLAG_PARTIAL_OK. The engine's trade path is skipped
+                // (size_q == 0 would be rejected), but we DO advance the
+                // engine's market clock via accrue_market_to so the wrapper's
+                // newly-advanced index is not retroactively applied.
+                //
+                // Why accrue on a zero-fill: we cannot safely revert the index
+                // (last_effective_price_e6, last_hyperp_index_slot) because
+                // doing so re-opens the dt-accumulation attack where repeated
+                // zero-fills roll back the index clock, then a real trade
+                // snaps the index with a huge accumulated dt. So the index
+                // legitimately advances. But advancing the index without
+                // advancing engine time means the next trade/crank computes
+                // funding against the new index and applies it retroactively
+                // over [old engine.last_market_slot, now] — breaking the
+                // anti-retroactivity rule enforced elsewhere.
+                //
+                // Fix: call engine.accrue_market_to(now_slot, price,
+                //   funding_rate_e9_pre). This uses the PRE-oracle-read rate
+                // (computed against the old index/mark) so funding accrued
+                // over [engine.last_market_slot, clock.slot] reflects the
+                // rate that was actually in effect. The engine then advances
+                // to clock.slot with last_oracle_price = price, matching the
+                // config's advanced index state.
+                //
+                // mark_ewma_e6 is NOT updated on zero-fill (the EWMA update
+                // below is inside the exec_size != 0 branch). That's correct:
+                // no trade executed, so there's no exec price to feed the EWMA.
                 if ret.exec_size == 0 {
+                    let mut data = state::slab_data_mut(a_slab)?;
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine
+                        .accrue_market_to(clock.slot, price, funding_rate_e9_pre)
+                        .map_err(map_risk_error)?;
                     // Restore pre-oracle config, but preserve oracle/index state
                     // that legitimately advanced during the instruction:
                     // - last_good_oracle_slot: liveness proof from successful read
                     // - last_effective_price_e6: index legitimately moved toward mark
-                    // - last_hyperp_index_slot: prevents dt-accumulation attack where
-                    //   repeated zero-fills revert the index clock, then a real trade
-                    //   snaps the index with a huge accumulated dt
-                    let mut data = state::slab_data_mut(a_slab)?;
+                    // - last_hyperp_index_slot: prevents dt-accumulation attack
+                    // - first_observed_stale_slot: cleared by successful read,
+                    //   must stay cleared so permissionless-resolve sees the
+                    //   live-oracle observation
                     let mut restored = config_pre_oracle;
                     restored.last_good_oracle_slot = config.last_good_oracle_slot;
                     restored.last_effective_price_e6 = config.last_effective_price_e6;
                     restored.last_hyperp_index_slot = config.last_hyperp_index_slot;
+                    restored.first_observed_stale_slot = config.first_observed_stale_slot;
                     state::write_config(&mut data, &restored);
                     state::write_req_nonce(&mut data, req_id);
                     return Ok(());
@@ -6907,6 +6946,20 @@ pub mod processor {
                 // Only OracleStale proves the oracle is dead. Other errors
                 // (wrong account, bad data) don't prove staleness — they could
                 // be an attacker passing garbage to fake oracle death.
+                //
+                // Two-phase design (non-Hyperp): the first stale observation
+                // STAMPS first_observed_stale_slot and returns Ok with NO
+                // market state change. The caller must re-invoke after the
+                // configured delay to actually resolve. This guarantees the
+                // continuous-death window was observed on-chain (a single
+                // observation only proves "stale now", not "stale throughout
+                // the required window"). Returning Ok on the stamp call is
+                // essential — returning Err would roll back the stamp and
+                // leave the market unresolvable.
+                //
+                // Callers detect resolution via is_resolved() on the slab; a
+                // successful ResolvePermissionless call may or may not have
+                // caused resolution depending on phase.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 if !is_hyperp {
                     let oracle_result = oracle::read_engine_price_e6(
@@ -6915,17 +6968,42 @@ pub mod processor {
                         config.conf_filter_bps, config.invert, config.unit_scale,
                     );
                     match oracle_result {
-                        Ok(_) => return Err(ProgramError::InvalidAccountData), // live
+                        Ok(_) => {
+                            // Oracle is live right now: the market is healthy.
+                            // Clear any prior stale stamp — the continuous-death
+                            // window must measure UNINTERRUPTED staleness only.
+                            // Return Ok so the observation (live-clear) persists.
+                            if config.first_observed_stale_slot != 0 {
+                                config.first_observed_stale_slot = 0;
+                                state::write_config(&mut data, &config);
+                            }
+                            return Ok(());
+                        }
                         Err(e) => {
                             let stale_err: ProgramError = PercolatorError::OracleStale.into();
                             if e != stale_err {
                                 return Err(e); // wrong account / bad data — propagate
                             }
-                            // OracleStale = oracle is actually dead → proceed
+                            // Oracle is stale RIGHT NOW. On the FIRST stale
+                            // observation of this dead window, stamp the slot
+                            // and return Ok WITHOUT resolving. A second call
+                            // after permissionless_resolve_stale_slots have
+                            // elapsed will see the stamp, pass the duration
+                            // check, and perform the actual resolution.
+                            if config.first_observed_stale_slot == 0 {
+                                config.first_observed_stale_slot = clock.slot;
+                                state::write_config(&mut data, &config);
+                                return Ok(());
+                            }
+                            // Repeated stale observation — fall through to the
+                            // duration check and (if window elapsed) resolve.
                         }
                     }
                 } else {
-                    // Hyperp: check mark staleness (last trade or push)
+                    // Hyperp: check mark staleness (last trade or push).
+                    // The reference slot (mark_ewma_last_slot / last_mark_push_slot)
+                    // already tracks continuous mark-liveness on-chain, so no
+                    // two-phase observation is needed — a single check suffices.
                     let last_update = core::cmp::max(
                         config.mark_ewma_last_slot,
                         config.last_mark_push_slot as u64,
@@ -6954,21 +7032,32 @@ pub mod processor {
                 }
 
                 // Require oracle/mark has been dead for the configured delay.
-                // Non-Hyperp: use dedicated last_good_oracle_slot, stamped on every
-                //   successful read_price_clamped across all instruction paths.
+                // Non-Hyperp: measure from first_observed_stale_slot. That field
+                //   was just stamped if this is the first stale observation (in
+                //   which case we already returned above) or was stamped by a
+                //   prior ResolvePermissionless call. Any successful external
+                //   read since then would have cleared it via
+                //   read_price_clamped_with_external, so a non-zero value here
+                //   proves continuous staleness over
+                //     [first_observed_stale_slot, clock.slot].
+                //   This fixes the prior bug where last_good_oracle_slot (only
+                //   advanced on a successful read) could show a huge dead window
+                //   after a long idle period even when the oracle had been live.
                 // Hyperp: use max(mark_ewma_last_slot, last_mark_push_slot) — the
                 //   same signal used for the mark staleness check above, so both
                 //   checks use consistent liveness information.
                 {
-                    let reference_slot = if !is_hyperp {
-                        config.last_good_oracle_slot
+                    let oracle_dead_duration = if !is_hyperp {
+                        // Non-zero by construction (we stamped and returned above
+                        // if it was zero), but saturating_sub is belt-and-braces.
+                        clock.slot.saturating_sub(config.first_observed_stale_slot)
                     } else {
-                        core::cmp::max(
+                        let reference_slot = core::cmp::max(
                             config.mark_ewma_last_slot,
                             config.last_mark_push_slot as u64,
-                        )
+                        );
+                        clock.slot.saturating_sub(reference_slot)
                     };
-                    let oracle_dead_duration = clock.slot.saturating_sub(reference_slot);
                     if oracle_dead_duration < config.permissionless_resolve_stale_slots {
                         return Err(PercolatorError::OracleStale.into());
                     }
