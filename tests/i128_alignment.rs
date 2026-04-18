@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1492816;
+const SLAB_LEN: usize = 1525584;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -264,6 +264,7 @@ fn test_account_struct_alignment() {
         pending_remaining_q: 0,
         pending_horizon: 0,
         pending_created_slot: 0,
+        last_fee_slot: 0,
     };
 
     // Verify all fields round-trip correctly
