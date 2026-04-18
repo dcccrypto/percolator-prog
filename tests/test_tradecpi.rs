@@ -5427,12 +5427,9 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
 fn test_tradecpi_zero_fill_advances_engine_time() {
     // BPF layout offset for engine.last_market_slot. BPF ENGINE_OFF=472 with
     // u128 align=8 (tighter than native align=16). last_market_slot sits at
-    // engine offset 648, giving absolute slab offset 472+648=1120. This is
-    // determined empirically by probing for the effective-clock value in
-    // the slab after a crank. accrue_market_to advances last_market_slot to
-    // now_slot, so a zero-fill that properly calls accrue will bump this
-    // field from the pre-fill effective-slot to the zero-fill effective-slot.
-    const LAST_MARKET_SLOT_OFF: usize = 1120;
+    // engine offset 656 after v12.18.x added RiskParams::min_funding_lifetime_slots
+    // (+8 vs the prior 648), giving absolute slab offset 472+656=1128.
+    const LAST_MARKET_SLOT_OFF: usize = 1128;
 
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;

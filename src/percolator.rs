@@ -1703,6 +1703,12 @@ pub mod ix {
             // Active-positions cap per side (§1.4). Mirrors max_accounts —
             // no tighter per-side limit is enforced by the wrapper today.
             max_active_positions_per_side: max_accounts,
+            // Cumulative-funding lifetime (§1.4 v12.18.x). Envelope matches
+            // per-call `max_accrual_dt_slots` at minimum; wrapper uses the
+            // same value because wrapper-deployed markets don't configure
+            // a separate cumulative horizon. The engine asserts this at
+            // init_engine_state and at every accrue.
+            min_funding_lifetime_slots: crate::constants::MAX_ACCRUAL_DT_SLOTS,
         };
         Ok((params, insurance_floor))
     }
@@ -3011,6 +3017,24 @@ pub mod processor {
     /// KeeperCrank sweeps the rest.
     ///
     /// No-op when `maintenance_fee_per_slot == 0`.
+    ///
+    /// Fee-anchor correctness: the engine's public entrypoint
+    /// `sync_account_fee_to_slot_not_atomic(idx, now_slot, rate)` is
+    /// self-advancing — on Live it executes
+    /// `self.current_slot = now_slot` BEFORE deriving the anchor, so the
+    /// internal constraint `fee_slot_anchor <= current_slot` is satisfied
+    /// by construction every time. The wrapper therefore does NOT need the
+    /// main market clock to already be at `now_slot` before this call; the
+    /// ONLY external precondition is the accrual envelope
+    /// `now_slot - last_market_slot <= max_accrual_dt_slots`, which
+    /// `catchup_accrue` upstream guarantees.
+    ///
+    /// In particular, on a 1-slot gap where `engine.current_slot == 100`
+    /// and `now_slot == 101`, the engine moves `current_slot` to 101
+    /// itself and uses 101 as the anchor — no rejection. The regression
+    /// test
+    /// `test_fee_markets_survive_one_slot_gap_on_every_accrue_path`
+    /// exercises this on every fee-bearing path.
     fn sync_account_fee(
         engine: &mut RiskEngine,
         config: &MarketConfig,
@@ -3020,12 +3044,6 @@ pub mod processor {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
-        // Anchor the fee-slot at now_slot. The engine enforces
-        // last_fee_slot <= fee_slot_anchor <= current_slot on Live and
-        // <= resolved_slot on Resolved; both bounds hold here because the
-        // caller has already accrued market time to now_slot via a prior
-        // engine _not_atomic call (or, for instructions like Deposit, the
-        // deposit itself does it internally).
         engine
             .sync_account_fee_to_slot_not_atomic(
                 idx,
@@ -7153,12 +7171,19 @@ pub mod processor {
                 // Clear any prior stamp and return Ok (no resolution).
                 // If authority is stale / never pushed / not configured: fall
                 // through to the external-oracle observation flow below.
+                //
+                // Boundary: `age <= max_staleness_secs` matches the oracle
+                // helper `read_authority_price` (which rejects with
+                // `age > max_staleness_secs`), so at the boundary slot both
+                // paths agree the authority is fresh. Using `<` here would
+                // let permissionless resolve fire against an authority price
+                // that normal reads still accept.
                 let authority_is_fresh = config.oracle_authority != [0u8; 32]
                     && config.authority_timestamp > 0
                     && {
                         let age = clock.unix_timestamp
                             .saturating_sub(config.authority_timestamp);
-                        age >= 0 && (age as u64) < config.max_staleness_secs
+                        age >= 0 && (age as u64) <= config.max_staleness_secs
                     };
                 if authority_is_fresh {
                     if config.first_observed_stale_slot != 0 {
@@ -7525,14 +7550,26 @@ pub mod processor {
                     // for the chunks, same policy as the in-line catchups.
                     catchup_accrue(engine, target, price, funding_rate_e9)?;
 
-                    // If the full clock.slot is within envelope after the
-                    // chunked catchup, do a final accrue to clock.slot so
-                    // last_market_slot / last_oracle_price reflect the
-                    // freshest read. Otherwise leave engine at the chunked
-                    // boundary — subsequent CatchupAccrue calls will close
-                    // the remainder.
-                    if clock.slot.saturating_sub(engine.current_slot) <= max_dt
-                        && clock.slot > engine.current_slot
+                    // catchup_accrue's loop exits when the remaining gap to
+                    // `target` is ≤ max_dt, so the engine can be as much as
+                    // `max_dt` slots short of `target`. Close that residual
+                    // here so one CatchupAccrue call advances the FULL
+                    // CATCHUP_CHUNKS_MAX × max_dt per call (previously the
+                    // residual was silently abandoned, losing one chunk per
+                    // invocation on large gaps).
+                    if target > engine.current_slot {
+                        engine
+                            .accrue_market_to(target, price, funding_rate_e9)
+                            .map_err(map_risk_error)?;
+                    }
+
+                    // If the full clock.slot is now within envelope, close
+                    // the last short residual to clock.slot so last_market
+                    // _slot / last_oracle_price reflect the freshest read.
+                    // Otherwise leave engine at `target` — subsequent
+                    // CatchupAccrue calls will close the remainder.
+                    if clock.slot > engine.current_slot
+                        && clock.slot.saturating_sub(engine.current_slot) <= max_dt
                     {
                         engine
                             .accrue_market_to(clock.slot, price, funding_rate_e9)

@@ -30,7 +30,7 @@ use std::path::PathBuf;
 // SLAB_LEN / MAX_ACCOUNTS: production BPF values. The wrapper's `"test"`
 // feature (which compiled the engine with MAX_ACCOUNTS=64 for native unit
 // tests) has been removed; integration tests go through the BPF binary.
-const SLAB_LEN: usize = 1525584; // MAX_ACCOUNTS=4096, Account=360 bytes (SBF target) + gen table
+const SLAB_LEN: usize = 1525592; // v12.18.x: +8 bytes for RiskParams::min_funding_lifetime_slots
 const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)

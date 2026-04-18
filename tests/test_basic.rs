@@ -4858,6 +4858,64 @@ fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
     );
 }
 
+/// Disproof (extended) — exactly the shape the auditor described in the
+/// final pass: market at slot 100, user exists, clock advances to 101,
+/// maintenance_fee > 0. Every fee-bearing accrue path MUST succeed.
+/// Extends the existing 1-slot-gap test with a larger-gap variant and
+/// an explicit assertion per-instruction, so a regression anywhere
+/// between "sync_account_fee_to_slot_not_atomic reject" and "wrapper
+/// envelope" surfaces as the failing path.
+#[test]
+fn test_fee_sync_anchor_accepts_future_now_slot_for_every_path() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, 1_000, 0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // One user. Seed the engine at slot 100 via a crank so
+    // engine.current_slot == 100 at the start of the test proper.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    env.set_slot(0); // clock = 100
+    env.crank();
+
+    // Exact auditor shape #1: advance clock by ONE slot. engine.current_slot
+    // still points at the last crank. sync_account_fee(..., clock.slot)
+    // MUST succeed — the engine self-advances current_slot to clock.slot.
+    env.set_slot(1); // clock = 101; engine.current_slot still 100
+    env.try_withdraw(&user, user_idx, 100)
+        .expect("WithdrawCollateral after 1-slot gap (fees ON) MUST succeed");
+
+    env.set_slot(2);
+    env.try_deposit(&user, user_idx, 500)
+        .expect("DepositCollateral after 1-slot gap (fees ON) MUST succeed");
+
+    env.set_slot(3);
+    env.crank(); // KeeperCrank after 1-slot gap
+
+    // Larger gap (within max_dt=100_000). Exercises the exact path the
+    // auditor called out as the "even after catchup" failure.
+    env.set_slot(50_000);
+    env.try_withdraw(&user, user_idx, 100)
+        .expect("WithdrawCollateral after 50k-slot gap (fees ON) MUST succeed");
+
+    // Close path — crank first to keep engine and config aligned, then
+    // withdraw fully and close.
+    env.set_slot(50_001);
+    env.crank();
+    env.set_slot(50_002);
+    // Withdraw remaining deposited amount, then close.
+    env.try_close_account(&user, user_idx)
+        .expect("CloseAccount after 50k-slot gap (fees ON) MUST succeed");
+}
+
 /// Disproof of the "fee sync ordering" audit claim: with maintenance fees
 /// enabled, a 1-slot gap before the next KeeperCrank / WithdrawCollateral /
 /// DepositCollateral MUST NOT cause the instruction to reject with
