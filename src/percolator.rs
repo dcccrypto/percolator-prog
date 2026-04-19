@@ -1281,11 +1281,15 @@ pub mod ix {
         /// does pure catchup (up to CATCHUP_CHUNKS_MAX chunks) and commits
         /// unconditionally, letting callers incrementally close the gap.
         ///
-        /// Anyone can call. Takes slab + clock (no oracle account — see
-        /// runtime handler for the pre-observation rate/price used per
-        /// chunk). For markets with a confirmed-dead oracle, use
-        /// ResolvePermissionless instead — its Degenerate arm bypasses
-        /// accrue entirely.
+        /// Anyone can call. Takes slab + clock + oracle (3 accounts).
+        /// The oracle is REQUIRED — a successful read proves the market
+        /// is live before any accrual is applied, routing dead-oracle
+        /// markets exclusively through ResolvePermissionless (whose
+        /// Degenerate arm settles at rate = 0). Calls that CAN reach
+        /// clock.slot persist the fresh observation; calls that can
+        /// only partially advance use the read as a liveness proof
+        /// but discard the observed price/index to avoid applying
+        /// post-observation state to earlier engine slots.
         CatchupAccrue,
     }
 
@@ -7888,13 +7892,11 @@ pub mod processor {
                     state::write_config(&mut data, &config);
                 } else {
                     // PARTIAL: use stored P_last throughout (NOT the
-                    // fresh price) and DO NOT persist config mutations.
-                    // The target is the call's max reachable slot; the
-                    // residual "close to target" step uses stored
-                    // P_last so engine.last_oracle_price is unchanged.
-                    // Subsequent CatchupAccrue calls observe freshly
-                    // and the last one (which CAN finish) persists the
-                    // final observation.
+                    // fresh price) and DO NOT persist the time-travel
+                    // -sensitive oracle/index fields. Subsequent
+                    // CatchupAccrue calls will observe freshly and the
+                    // last one (which CAN finish) installs the final
+                    // observation.
                     let stored_p_last = engine.last_oracle_price;
                     let target = engine.last_market_slot.saturating_add(max_step_per_call);
                     catchup_accrue(engine, target, stored_p_last, funding_rate_e9_pre)?;
@@ -7903,27 +7905,33 @@ pub mod processor {
                             .accrue_market_to(target, stored_p_last, funding_rate_e9_pre)
                             .map_err(map_risk_error)?;
                     }
-                    // Restore pre-read config — discards the fresh
-                    // observation's price/index/stamp mutations. This
-                    // is the critical anti-retroactivity step.
+                    // Rollback selectively: roll back price/index state
+                    // that would retroactively apply a post-observation
+                    // index to pre-observation engine slots, but PRESERVE
+                    // liveness-recovery evidence from the successful
+                    // read. Otherwise a partial catchup during an idle
+                    // market's oracle recovery would resurrect an old
+                    // `first_observed_stale_slot`, potentially letting
+                    // ResolvePermissionless span two disjoint stale
+                    // windows as if they were continuous.
                     //
-                    // Rationale for discarding EVEN liveness fields
-                    // (e.g., last_good_oracle_slot,
-                    // first_observed_stale_slot clearing): the
-                    // successful oracle read proves the market is live
-                    // RIGHT NOW, but persisting that evidence while the
-                    // engine is still 3M slots behind creates a
-                    // mismatch — permissionless-resolve logic uses
-                    // first_observed_stale_slot to measure continuous
-                    // death; clearing it here would suppress a real
-                    // prior stale-observation window if the oracle
-                    // had just recovered. Safer to let the NEXT
-                    // observation (in the final/COMPLETE call) persist
-                    // liveness evidence once the engine has also caught
-                    // up. Note: CatchupAccrue itself only requires a
-                    // successful read; it doesn't care whether the
-                    // stale stamp is cleared this call.
-                    state::write_config(&mut data, &config_pre);
+                    // Fields rolled back (price/index — time-travel risk):
+                    //   - last_effective_price_e6     (baseline)
+                    //   - last_hyperp_index_slot      (Hyperp index clock)
+                    //
+                    // Fields preserved from the fresh read (liveness):
+                    //   - first_observed_stale_slot   (cleared to 0 by
+                    //       a successful external read; must stay 0
+                    //       since the market IS live right now)
+                    //   - last_good_oracle_slot       (stamp proving
+                    //       external oracle was observed live this call)
+                    //
+                    // All other fields come from config_pre (no changes
+                    // expected from the oracle read anyway).
+                    let mut restored = config_pre;
+                    restored.first_observed_stale_slot = config.first_observed_stale_slot;
+                    restored.last_good_oracle_slot = config.last_good_oracle_slot;
+                    state::write_config(&mut data, &restored);
                 }
 
                 if !state::is_oracle_initialized(&data) {
