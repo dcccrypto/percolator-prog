@@ -5681,6 +5681,11 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
                         sol_log_compute_units();
                     }
+                    // Capture pre-trade EWMA so both the EWMA-clock refresh
+                    // (inside the cap-active branch) and the Hyperp
+                    // liveness refresh (after the block) can check
+                    // whether the mark actually moved.
+                    let old_ewma_cpi = config.mark_ewma_e6;
                     // Update trade-derived mark EWMA (all market types).
                     // Only when circuit breaker is active — without cap, exec prices
                     // are unbounded and EWMA would be manipulable.
@@ -5696,7 +5701,6 @@ pub mod processor {
                             let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else { 0u64 };
-                        let old_ewma_cpi = config.mark_ewma_e6;
                         // N4 fix: seed at oracle on first trade
                         let ewma_price_cpi = if old_ewma_cpi == 0 && config.last_effective_price_e6 > 0 {
                             config.last_effective_price_e6
@@ -5720,14 +5724,25 @@ pub mod processor {
                         // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
                     }
 
-                    // Hyperp: also update authority_price (legacy mark field)
+                    // Hyperp: also update authority_price (legacy mark field).
+                    // Liveness rule (strict): only refresh last_mark_push_slot
+                    // when the EWMA actually moved. A trade whose fee did not
+                    // meet mark_min_fee or whose price equals the prior EWMA
+                    // is NOT a meaningful mark update, so it must not extend
+                    // the Hyperp oracle-liveness timer. Otherwise a cheap
+                    // attacker could submit dust wash trades indefinitely to
+                    // keep a dead Hyperp market "alive" while no real price
+                    // discovery happens — same no-liveness-extension rule
+                    // that mark_ewma_last_slot already follows just above.
                     if is_hyperp {
                         config.authority_price_e6 = oracle::clamp_oracle_price(
                             config.last_effective_price_e6,
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
-                        config.last_mark_push_slot = clock.slot as u128;
+                        if config.mark_ewma_e6 != old_ewma_cpi {
+                            config.last_mark_push_slot = clock.slot as u128;
+                        }
                     }
                 }
                 // Engine borrow dropped.
@@ -6104,6 +6119,21 @@ pub mod processor {
 
                 let mut header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
+
+                // Hard-timeout gate: consistent with the "no config
+                // mutations after terminal stale" rule. The market is
+                // dead; transferring admin or burning it does not
+                // change that. If the admin wants to burn before the
+                // market matures, they must do so earlier. After
+                // maturity, the only meaningful action is resolution.
+                {
+                    let clock_gate = Clock::get()
+                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
+                    let cfg_gate = state::read_config(&data);
+                    if oracle::permissionless_stale_matured(&cfg_gate, clock_gate.slot) {
+                        return Err(PercolatorError::OracleStale.into());
+                    }
+                }
 
                 // Admin-burn liveness guard. Burning admin is irreversible;
                 // once set the slab has no privileged governance. The oracle
@@ -6498,6 +6528,15 @@ pub mod processor {
 
                 // Update oracle authority in config
                 let mut config = state::read_config(&data);
+                // Hard-timeout gate: consistent with other live config
+                // mutators (SetOraclePriceCap, UpdateConfig) — no admin
+                // changes to price-path configuration on a terminally
+                // stale market. Users exit via resolve.
+                let clock_gate = Clock::get()
+                    .map_err(|_| ProgramError::UnsupportedSysvar)?;
+                if oracle::permissionless_stale_matured(&config, clock_gate.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
                 // Hyperp: reject zero-address unless trade flow has bootstrapped
                 // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
                 // there's no mark price source. With EWMA bootstrapped, the market
@@ -6779,9 +6818,22 @@ pub mod processor {
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
 
-                // Flush Hyperp index WITHOUT staleness check (admin path)
+                // Hard-timeout gate: SetOraclePriceCap's Hyperp branch
+                // flushes the index and calls accrue_market_to, both
+                // of which mutate engine.last_oracle_price. After
+                // maturity, admin must not be able to shift the
+                // terminal settlement anchor — resolve through
+                // Degenerate at the engine's already-accrued P_last
+                // instead.
+                let clock = Clock::from_account_info(a_clock)?;
+                if oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+
+                // Flush Hyperp index (admin path; no external staleness
+                // check — the hard-timeout gate above handles the
+                // terminal case).
                 if is_hyperp {
-                    let clock = Clock::from_account_info(a_clock)?;
                     let prev_index = config.last_effective_price_e6;
                     let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
                     if mark > 0 && prev_index > 0 {
@@ -7762,6 +7814,14 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(_a_clock)?;
+                // Hard-timeout gate: "dead means dead" — no live
+                // mutations past the stale horizon. Users exit via
+                // ResolvePermissionless + resolved-market close paths.
+                let config = state::read_config(&data);
+                if oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+
                 let engine = zc::engine_mut(&mut data)?;
                 // No-oracle path: cap at last_market_slot. reclaim self
                 // -advances current_slot; unbounded would split the
