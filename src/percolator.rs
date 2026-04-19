@@ -2220,7 +2220,10 @@ pub mod oracle {
 
     // Chainlink OCR2 State/Aggregator account layout offsets
     // Note: Different from the Transmissions ring buffer format in older docs
-    const CL_MIN_LEN: usize = 224; // Minimum required length
+    // Must cover the last byte the parser reads: CL_OFF_ANSWER (216) + 16
+    // bytes for the i128 answer = 232. The prior `224` let a truncated
+    // Chainlink-owned feed (length 224..231) panic on the answer slice.
+    const CL_MIN_LEN: usize = 232;
     const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
                                         // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
                                         // The actual price data is stored directly at tail:
@@ -3159,9 +3162,25 @@ pub mod processor {
         if engine.last_oracle_price == 0 {
             return Ok(());
         }
-        // Use the caller's price if it's valid (> 0), otherwise the engine's
-        // stored last_oracle_price. accrue_market_to rejects price == 0.
-        let chunk_price = if price > 0 { price } else { engine.last_oracle_price };
+        // Catchup chunks use the engine's STORED last_oracle_price, not the
+        // caller's fresh `price`. Rationale: accrue_market_to's funding math
+        // (engine §5.5) uses `fund_px_last` (the price at call entry) for
+        // the fund_num_total = fund_px * rate * dt transfer, then sets
+        // fund_px_last to the caller's `oracle_price`. If we used the fresh
+        // price for every chunk:
+        //   chunk 1: fund_px_0 = stored_P, total = stored_P * rate * max_dt,
+        //            fund_px_last := fresh
+        //   chunk 2: fund_px_0 = fresh,    total = fresh     * rate * max_dt
+        //   ...
+        // yielding a mathematically different transfer than a single-call
+        // accrue (which would use stored_P throughout). Using stored_P for
+        // every chunk keeps fund_px_last pinned at stored_P across the
+        // chunked path, so the chunked sum equals the single-call transfer:
+        //   stored_P * rate * total_dt (up to the caller's final boundary).
+        // The caller's final accrue_market_to(now_slot, fresh, rate) then
+        // applies fresh only to the residual, as a single-call accrue would.
+        let chunk_price = engine.last_oracle_price;
+        let _ = price; // caller's price used only by their final accrue_market_to
         let mut chunks: u32 = 0;
         while now_slot.saturating_sub(engine.last_market_slot) > max_dt {
             if chunks >= CATCHUP_CHUNKS_MAX {
@@ -4594,6 +4613,41 @@ pub mod processor {
                     .get()
                     .saturating_sub(ins_before);
 
+                // Sweep cursor may not have touched every liquidation
+                // candidate in `combined`. keeper_crank_not_atomic runs
+                // health checks on these accounts and MUST see post-fee
+                // equity (wrapper invariant: recurring fees realized
+                // before health-sensitive ops). Explicitly sync each
+                // candidate that hasn't already hit the cursor this call.
+                //
+                // Linear dedup in `combined` order, capped at
+                // LIQ_BUDGET_PER_CRANK (64). Duplicates are safe to
+                // sync-twice at the same anchor — it's idempotent at the
+                // engine level — but we avoid the CU anyway. O(n²) dedup
+                // is negligible at n ≤ 64 and avoids a 4KB stack array
+                // that BPF's small stack wouldn't tolerate.
+                if config.maintenance_fee_per_slot > 0 {
+                    let cap = percolator::LIQ_BUDGET_PER_CRANK as usize;
+                    for pos in 0..combined.len().min(cap) {
+                        let idx = combined[pos].0;
+                        let i = idx as usize;
+                        if i >= percolator::MAX_ACCOUNTS { continue; }
+                        let mut dup = false;
+                        for prior in 0..pos {
+                            if combined[prior].0 == idx { dup = true; break; }
+                        }
+                        if dup { continue; }
+                        if !engine.is_used(i) { continue; }
+                        engine
+                            .sync_account_fee_to_slot_not_atomic(
+                                idx,
+                                clock.slot,
+                                config.maintenance_fee_per_slot,
+                            )
+                            .map_err(map_risk_error)?;
+                    }
+                }
+
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
                 let _outcome = engine
@@ -5555,7 +5609,18 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // force_close_resolved handles K-pair PnL, maintenance fees,
+                    // Realize recurring maintenance fees to the resolved
+                    // anchor BEFORE force_close_resolved. Engine's
+                    // force_close_resolved_not_atomic does NOT itself sync
+                    // the fee cursor; without this call an account could
+                    // reach terminal close with unpaid fees accrued over
+                    // [last_fee_slot, resolved_slot]. On Resolved mode
+                    // sync_account_fee_to_slot_not_atomic anchors at
+                    // resolved_slot automatically, so passing clock.slot is
+                    // safe (the engine clamps to resolved_slot internally).
+                    // No-op when maintenance_fee_per_slot == 0.
+                    sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                    // force_close_resolved handles K-pair PnL,
                     // loss settlement, and account close internally. Engine
                     // v12.18.6+: signature is (idx,) — the engine pulls the
                     // resolved_slot from its own state (§9.9).
@@ -6996,6 +7061,13 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
+                // Realize recurring maintenance fees to the resolved anchor
+                // BEFORE force_close_resolved. Engine's
+                // force_close_resolved_not_atomic does not itself sync the
+                // fee cursor. On Resolved mode sync anchors at resolved_slot
+                // automatically. No-op when maintenance_fee_per_slot == 0.
+                sync_account_fee(engine, &config, user_idx, resolved_slot)?;
+
                 // Engine v12.18.6+: slot argument removed — the engine pulls
                 // resolved_slot from its own state (§9.9).
                 let _ = resolved_slot;
@@ -7608,6 +7680,12 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(
                     engine.accounts[user_idx as usize].owner,
                 );
+
+                // Realize recurring maintenance fees to resolved_slot
+                // BEFORE force_close_resolved (Finding 4). Engine does not
+                // sync the fee cursor inside force_close. No-op when
+                // maintenance_fee_per_slot == 0.
+                sync_account_fee(engine, &config, user_idx, resolved_slot)?;
 
                 // Engine v12.18.6+ (§9.9): slot arg removed; engine uses resolved_slot.
                 let _ = resolved_slot;
