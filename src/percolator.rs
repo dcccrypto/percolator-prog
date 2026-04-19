@@ -3791,13 +3791,23 @@ pub mod processor {
                 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // Envelope compatibility: a permissionless-resolve call accrues
-                // over the interval [engine.last_market_slot, clock.slot]. The
-                // engine refuses to accrue over dt > params.max_accrual_dt_slots
-                // (Overflow). If the configured stale threshold could therefore
-                // produce an interval the engine rejects, permissionless
-                // resolution becomes unreachable exactly when it is needed most.
-                // Force the two numbers to be compatible at init time.
+                // Envelope compatibility — conservative product bound kept
+                // even though ResolvePermissionless itself bypasses
+                // accrue_market_to via the engine's Degenerate arm (which
+                // runs at rate = 0 and jumps last_market_slot to now_slot
+                // without an envelope check). Reasoning for keeping it:
+                //  (a) Admin ResolveMarket's Ordinary arm DOES accrue,
+                //      and the engine's envelope check can reject if dt
+                //      exceeds max_accrual_dt_slots. Keeping this check
+                //      at init time keeps the two configs aligned so any
+                //      resolve path — admin or permissionless — can be
+                //      reached without hitting an envelope-rejection.
+                //  (b) It's a sanity ceiling on how long a healthy market
+                //      can stay unresolved; a stale threshold larger than
+                //      the envelope would imply "wait N days before
+                //      resolving" without ever re-accruing the market in
+                //      that window, which usually indicates misconfiguration.
+                // Not required for safety of the permissionless path alone.
                 if permissionless_resolve_stale_slots > 0
                     && permissionless_resolve_stale_slots > risk_params.max_accrual_dt_slots
                 {
@@ -7765,28 +7775,38 @@ pub mod processor {
                 // prior race where CatchupAccrue (nonzero rate) could
                 // settle the same dead interval that
                 // ResolvePermissionless would settle at rate 0 —
-                // non-deterministic settlement, depending on which
-                // lands first.
+                // non-deterministic settlement.
                 //
-                // Mirrors the ordinary in-line accrue path used by
-                // trades/cranks:
+                // Two modes:
                 //
-                //   1. Capture pre-read funding rate (anti-retroactivity).
-                //   2. Read oracle via get_engine_oracle_price_e6 (Hyperp,
-                //      advances index toward mark with clamp_toward_with
-                //      _dt) or read_price_and_stamp (non-Hyperp). Fails
-                //      if oracle is stale / wrong account / etc.
-                //   3. Chunk accrue up to CATCHUP_CHUNKS_MAX × max_dt
-                //      using stored `engine.last_oracle_price` as chunk
-                //      price (see catchup_accrue for rationale) and the
-                //      pre-read rate. Caller's `target` boundary uses
-                //      fresh price.
-                //   4. If clock.slot is within envelope, final accrue to
-                //      clock.slot with fresh price. Otherwise leave
-                //      engine at `target` — subsequent calls close the
-                //      remainder.
+                //   COMPLETE — the instruction can advance the engine all
+                //   the way to clock.slot in this single call
+                //   (gap ≤ CATCHUP_CHUNKS_MAX × max_dt). Behaves like any
+                //   ordinary inline accrue-bearing op: oracle read mutates
+                //   config, pre-read rate chunks the historical interval
+                //   at stored P_last, final accrue to clock.slot installs
+                //   the fresh observation. Persist mutated config.
                 //
-                // Takes slab + clock + oracle. No user signer.
+                //   PARTIAL  — the gap is too large to finish in one
+                //   call. Oracle is STILL read (liveness proof), but the
+                //   observation is NOT persisted: no fresh price enters
+                //   the engine, no config.last_effective_price_e6 /
+                //   last_hyperp_index_slot / last_good_oracle_slot update
+                //   leaks into later calls whose catchup hasn't reached
+                //   the observation slot yet. The engine mechanically
+                //   advances through `target` using stored P_last +
+                //   pre-read rate only. Subsequent CatchupAccrue calls
+                //   observe freshly, and the LAST call (which reaches
+                //   clock.slot) persists the final observation.
+                //
+                // This splits prevents the time-travel that would occur
+                // if a partial catchup wrote the current observation
+                // immediately: later catchups would compute funding
+                // using the already-advanced config index, retroactively
+                // applying post-observation state to pre-observation
+                // engine slots.
+                //
+                // Takes slab + clock + oracle.
                 accounts::expect_len(accounts, 3)?;
                 let a_slab = &accounts[0];
                 let a_clock = &accounts[1];
@@ -7798,26 +7818,27 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                // Market must be Live. Resolved markets don't need catchup
-                // (engine time is frozen; force-close and close paths use
-                // the resolved slot directly).
                 if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                let mut config = state::read_config(&data);
 
-                // Capture pre-read funding rate (anti-retroactivity §5.5).
+                // Snapshot pre-read config (MarketConfig is Pod+Copy, so
+                // this is a byte-copy — cheap). Used to restore in PARTIAL
+                // mode so the oracle observation is not persisted until
+                // the FINAL catchup call that actually reaches clock.slot.
+                let config_pre = state::read_config(&data);
+                let mut config = config_pre;
+
+                // Pre-read funding rate (anti-retroactivity §5.5).
                 let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
 
-                // Oracle read — proves market is live. Failure routes
-                // caller to ResolvePermissionless. The read itself moves
-                // config's oracle/index state (for Hyperp, advances index
-                // toward mark via clamp_toward_with_dt; for non-Hyperp,
-                // clamps external price against baseline).
+                // Oracle read — proves market is live. Mutates `config`
+                // locally (clamp/stamp for non-Hyperp, clamp-toward for
+                // Hyperp). Failure routes caller to ResolvePermissionless.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
+                let fresh_price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
                     let last_slot = eng.current_slot;
                     oracle::get_engine_oracle_price_e6(
@@ -7829,55 +7850,80 @@ pub mod processor {
                         &mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data,
                     )?
                 };
-                state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
 
-                // Engine has never been seeded with a real oracle
-                // observation — nothing to catch up past. The caller's
-                // next ordinary operation will seed last_oracle_price.
+                // Engine never seeded — nothing to catch up past. The
+                // caller's next ordinary op will seed last_oracle_price.
+                // Persist the fresh observation since there's nothing to
+                // "leak into" historically.
                 if engine.last_oracle_price == 0 {
+                    state::write_config(&mut data, &config);
                     if !state::is_oracle_initialized(&data) {
                         state::set_oracle_initialized(&mut data);
                     }
                     return Ok(());
                 }
 
-                // Cap target to last_market_slot + CATCHUP_CHUNKS_MAX ×
-                // max_dt so a single call commits partial progress on
-                // huge gaps. Uses last_market_slot (canonical accrue
-                // cursor), not current_slot.
+                // Decide COMPLETE vs PARTIAL based on whether one call can
+                // close the full gap.
                 let max_dt = engine.params.max_accrual_dt_slots;
                 let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64)
                     .saturating_mul(max_dt);
-                let target = core::cmp::min(
-                    clock.slot,
-                    engine.last_market_slot.saturating_add(max_step_per_call),
-                );
-                if target > engine.last_market_slot {
-                    // catchup_accrue chunks with stored P_last + pre-read
-                    // rate (see its doc). target == last_market_slot +
-                    // CATCHUP_CHUNKS_MAX × max_dt might leave a residual
-                    // up to max_dt short of target — close it below.
-                    catchup_accrue(engine, target, price, funding_rate_e9_pre)?;
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                let can_finish = gap <= max_step_per_call;
+
+                if can_finish {
+                    // COMPLETE: chunk to clock.slot using stored P_last
+                    // (per catchup_accrue's invariant — keeps fund_px
+                    // _last pinned across chunks). Final residual
+                    // accrue installs fresh_price. Persist the mutated
+                    // config so the observation is recorded.
+                    catchup_accrue(engine, clock.slot, fresh_price, funding_rate_e9_pre)?;
+                    if clock.slot > engine.last_market_slot {
+                        engine
+                            .accrue_market_to(clock.slot, fresh_price, funding_rate_e9_pre)
+                            .map_err(map_risk_error)?;
+                    }
+                    state::write_config(&mut data, &config);
+                } else {
+                    // PARTIAL: use stored P_last throughout (NOT the
+                    // fresh price) and DO NOT persist config mutations.
+                    // The target is the call's max reachable slot; the
+                    // residual "close to target" step uses stored
+                    // P_last so engine.last_oracle_price is unchanged.
+                    // Subsequent CatchupAccrue calls observe freshly
+                    // and the last one (which CAN finish) persists the
+                    // final observation.
+                    let stored_p_last = engine.last_oracle_price;
+                    let target = engine.last_market_slot.saturating_add(max_step_per_call);
+                    catchup_accrue(engine, target, stored_p_last, funding_rate_e9_pre)?;
                     if target > engine.last_market_slot {
-                        // Close the residual chunk. Uses fresh `price`
-                        // as this step is the caller's "final boundary"
-                        // from catchup_accrue's perspective.
                         engine
-                            .accrue_market_to(target, price, funding_rate_e9_pre)
+                            .accrue_market_to(target, stored_p_last, funding_rate_e9_pre)
                             .map_err(map_risk_error)?;
                     }
-                    // If clock.slot is now within envelope, close to
-                    // clock.slot. Otherwise leave engine at target —
-                    // subsequent CatchupAccrue calls finish the work.
-                    if clock.slot > engine.last_market_slot
-                        && clock.slot.saturating_sub(engine.last_market_slot) <= max_dt
-                    {
-                        engine
-                            .accrue_market_to(clock.slot, price, funding_rate_e9_pre)
-                            .map_err(map_risk_error)?;
-                    }
+                    // Restore pre-read config — discards the fresh
+                    // observation's price/index/stamp mutations. This
+                    // is the critical anti-retroactivity step.
+                    //
+                    // Rationale for discarding EVEN liveness fields
+                    // (e.g., last_good_oracle_slot,
+                    // first_observed_stale_slot clearing): the
+                    // successful oracle read proves the market is live
+                    // RIGHT NOW, but persisting that evidence while the
+                    // engine is still 3M slots behind creates a
+                    // mismatch — permissionless-resolve logic uses
+                    // first_observed_stale_slot to measure continuous
+                    // death; clearing it here would suppress a real
+                    // prior stale-observation window if the oracle
+                    // had just recovered. Safer to let the NEXT
+                    // observation (in the final/COMPLETE call) persist
+                    // liveness evidence once the engine has also caught
+                    // up. Note: CatchupAccrue itself only requires a
+                    // successful read; it doesn't care whether the
+                    // stale stamp is cleared this call.
+                    state::write_config(&mut data, &config_pre);
                 }
 
                 if !state::is_oracle_initialized(&data) {
