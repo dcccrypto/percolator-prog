@@ -4635,26 +4635,47 @@ pub mod processor {
                 // health checks on these accounts and MUST see post-fee
                 // equity (wrapper invariant: recurring fees realized
                 // before health-sensitive ops). Explicitly sync each
-                // candidate that hasn't already hit the cursor this call.
+                // candidate that the engine will process.
                 //
-                // Linear dedup in `combined` order, capped at
-                // LIQ_BUDGET_PER_CRANK (64). Duplicates are safe to
-                // sync-twice at the same anchor — it's idempotent at the
-                // engine level — but we avoid the CU anyway. O(n²) dedup
-                // is negligible at n ≤ 64 and avoids a 4KB stack array
-                // that BPF's small stack wouldn't tolerate.
+                // Budget accounting MUST MIRROR keeper_crank_not_atomic's:
+                // invalid / out-of-range / unused entries are SKIPPED
+                // without consuming the attempts budget (engine §10.6).
+                // If we instead capped by array position (min(cap)), an
+                // attacker could pad the front of `combined` with 64
+                // invalid indices so the real target at position 65 is
+                // never fee-synced — but the engine's crank would still
+                // skip the invalid entries and reach the target, running
+                // its health check on stale fee debt. The loop below
+                // counts `attempts` exactly like the engine: valid
+                // existing candidates consume budget; others don't.
+                //
+                // Dedup is also mirrored: the engine treats duplicates as
+                // separate attempts (it re-processes the same idx twice
+                // on consecutive entries, which is idempotent at the same
+                // anchor). The wrapper skips duplicate SYNC calls purely
+                // to save CU — dedup is within the loop, not the budget.
                 if config.maintenance_fee_per_slot > 0 {
                     let cap = percolator::LIQ_BUDGET_PER_CRANK as usize;
-                    for pos in 0..combined.len().min(cap) {
-                        let idx = combined[pos].0;
+                    let mut synced: [u16; percolator::LIQ_BUDGET_PER_CRANK as usize]
+                        = [u16::MAX; percolator::LIQ_BUDGET_PER_CRANK as usize];
+                    let mut synced_count = 0usize;
+                    let mut attempts = 0usize;
+                    for &(idx, _policy) in combined.iter() {
+                        if attempts >= cap { break; }
                         let i = idx as usize;
+                        // Invalid / unused entries DON'T consume attempts —
+                        // matches engine's candidate-processing loop.
                         if i >= percolator::MAX_ACCOUNTS { continue; }
-                        let mut dup = false;
-                        for prior in 0..pos {
-                            if combined[prior].0 == idx { dup = true; break; }
-                        }
-                        if dup { continue; }
                         if !engine.is_used(i) { continue; }
+                        // Valid existing candidate: counts against the
+                        // engine's per-crank budget. Sync before the
+                        // engine health-checks it, deduped to save CU.
+                        attempts += 1;
+                        let mut already = false;
+                        for j in 0..synced_count {
+                            if synced[j] == idx { already = true; break; }
+                        }
+                        if already { continue; }
                         engine
                             .sync_account_fee_to_slot_not_atomic(
                                 idx,
@@ -4662,6 +4683,8 @@ pub mod processor {
                                 config.maintenance_fee_per_slot,
                             )
                             .map_err(map_risk_error)?;
+                        synced[synced_count] = idx;
+                        synced_count += 1;
                     }
                 }
 
@@ -4705,11 +4728,19 @@ pub mod processor {
                     let mut reward = sweep_delta
                         .saturating_mul(crate::constants::CRANK_REWARD_BPS)
                         / 10_000u128;
-                    // Never pay out more than insurance currently holds (post-
-                    // crank balance, since liquidation may have drained it).
+                    // Cap reward by post-crank EXCESS OVER THE INSURANCE
+                    // FLOOR, not raw balance. Matches the engine's own
+                    // insurance-loss path semantics (available =
+                    // balance - insurance_floor). Without this, a crank
+                    // where the sweep briefly raised insurance above the
+                    // floor but a liquidation drained the excess back to
+                    // (or below) the floor could still pay the reward
+                    // out of floor-protected reserves.
                     let ins_now = engine.insurance_fund.balance.get();
-                    if reward > ins_now {
-                        reward = ins_now;
+                    let floor = engine.params.insurance_floor.get();
+                    let available_reward = ins_now.saturating_sub(floor);
+                    if reward > available_reward {
+                        reward = available_reward;
                     }
                     if reward > 0 {
                         // Conservation: insurance − r, caller.capital + r,
@@ -4732,6 +4763,23 @@ pub mod processor {
                         engine.insurance_fund.balance = U128::new(ins_now - reward);
                         engine.accounts[ci].capital = U128::new(cap_next);
                         engine.c_tot = U128::new(c_tot_next);
+                    }
+
+                    // Belt-and-suspenders: the reward may never cause a
+                    // floor breach. A market can legitimately sit below
+                    // floor (e.g. after an earlier insurance-loss event),
+                    // so we can't assert `balance >= floor` universally.
+                    // Instead, enforce the MINIMUM-MONOTONIC property:
+                    //   post_balance >= min(ins_now, floor)
+                    // i.e., reward never moved us closer to zero than the
+                    // floor (when we were above floor) and never moved us
+                    // at all (when we were already at/below floor — cap
+                    // zeroed reward). Violation = cap math regression.
+                    let post_balance = engine.insurance_fund.balance.get();
+                    let lower_bound = core::cmp::min(ins_now, floor);
+                    debug_assert!(post_balance >= lower_bound);
+                    if post_balance < lower_bound {
+                        return Err(PercolatorError::EngineCorruptState.into());
                     }
                 }
 
