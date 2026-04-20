@@ -406,6 +406,29 @@ u128 range. The engine's envelope invariant (spec §1.4) guarantees
 all arithmetic stays under i128::MAX (~1.7×10^38) across the full
 product of (size × price × rate × lifetime).
 
+### D31. Account slot DoS by single attacker
+
+**Hypothesis**: Attacker creates min_initial_deposit-sized accounts
+until all `params.max_accounts` slots are full. No other user can
+init. Market is bricked.
+
+**Why discarded** (not a fund-theft vuln, operational):
+- Attacker does NOT lose funds — they can CloseAccount any time to
+  recover their deposits. Funds are LOCKED during the DoS, not
+  stolen or trapped.
+- `max_accounts` is operator-configured at init (up to 4096).
+  Operators who want higher DoS resistance set max_accounts high
+  AND/OR require higher min_initial_deposit so the attack costs more.
+- A DoS-sized attack on a market with max_accounts=4096 and
+  min_initial_deposit=100 base tokens costs the attacker
+  ~409_600 base tokens of locked capital for however long they
+  choose to maintain the DoS.
+- No existing user's funds or positions are affected. Existing users
+  can continue to trade, close, liquidate. Only NEW user onboarding
+  is blocked.
+- Spec §2.2 documents max_accounts as an operator choice. Not a
+  protocol bug; an economic-model consideration.
+
 ### D22. Dust-capital account remains operational
 
 **Hypothesis**: User's capital drops below min_initial_deposit (e.g.,
