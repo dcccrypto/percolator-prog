@@ -337,3 +337,55 @@ Remaining angles for future sweeps:
 - Specific funding rate edge: rate = MAX_ABS_FUNDING_E9_PER_SLOT
   with opposing OI of MAX_VAULT_TVL. Finding the test infrastructure
   for this was out-of-scope for this sweep.
+
+### D17. Multi-ix tx: deposit then withdraw same tx bypasses oracle
+
+**Hypothesis**: User submits a tx with [Deposit, Withdraw] ixs in
+sequence. Deposit skips oracle (pure capital). Withdraw requires
+oracle. If oracle is stale at tx time, does the deposit succeed but
+the withdraw fail — trapping the funds mid-tx?
+
+**Why discarded (and not a vuln)**: Solana txs are atomic. If the
+Withdraw ix fails, ALL ixs roll back — deposit too. The user's
+tokens return to their ATA. No funds trapped.
+More: even if the Withdraw succeeded in isolation, the combined tx's
+atomicity means a user who BUNDLES them always gets all-or-nothing.
+User can also just call Deposit alone; fails gracefully.
+
+### D18. Crank + Trade race within same tx
+
+**Hypothesis**: Tx with [Crank, TradeCpi]. Crank might sync fees on
+accounts including the trader's, leaving them below margin. Then
+Trade's margin check fails. No attack — just a user paying their
+own fees before trading. If trade would succeed pre-sync and fail
+post-sync, that's correct: the trader shouldn't be able to open a
+position with unrealized-fee-inflated capital.
+
+**Why discarded**: By design. Pre-trade fee realization is the
+correct ordering — prevents under-margined trades.
+
+### D19. Sweep_empty_market_surplus on non-empty state
+
+**Hypothesis**: `sweep_empty_market_surplus_to_insurance` (engine
+line ~3100s) is called at close/reclaim paths. It should be a
+no-op when there are still used accounts or non-zero c_tot. Can it
+be triggered in an intermediate state where it incorrectly donates
+legitimate capital to insurance?
+
+**Why discarded**: Engine checks `senior = c_tot + insurance` and
+only sweeps residual vault EXCESS OVER senior. If c_tot is nonzero,
+the "excess" calculation only donates truly unaccounted vault tokens
+(rounding dust from base→units conversion, etc.). Legitimate capital
+stays in c_tot, not "surplus."
+
+### D20. Free-slot recycling + gen counter collision
+
+**Hypothesis**: User A at idx=5 closes account. Slot freed. User B
+inits at idx=5 (same slot reused). A stale offline matcher return
+for User A's old req_id could be replayed against User B's trade.
+
+**Why discarded**: Slab has a gen_table (RiskBuffer tail section) —
+each InitUser/InitLP bumps a `mat_counter` and writes the new
+generation number to idx's slot. `lp_account_id` in TradeCpi
+matcher ABI uses this generation. An old matcher return with A's
+generation won't match B's generation; abi_ok validation rejects.
