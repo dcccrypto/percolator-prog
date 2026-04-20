@@ -2793,7 +2793,22 @@ fn test_init_user_survives_stale_oracle() {
 
     // InitUser must succeed despite the stale pyth account.
     let user = solana_sdk::signature::Keypair::new();
-    let _user_idx = env.init_user(&user);
+    let user_idx = env.init_user(&user);
+
+    // Stronger assertion: the account must be FUNCTIONAL after a
+    // stale-oracle init — subsequent no-oracle ops (DepositCollateral)
+    // must also succeed without the oracle being refreshed. If init
+    // had silently fallen through to a partial state (e.g., account
+    // slot taken but last_fee_slot wrong), this would surface as an
+    // Overflow/Undercollateralized/etc. downstream.
+    // deposit() panics on failure — which IS the negative signal
+    // we want if the stale-oracle init left the account in a broken
+    // state.
+    env.deposit(&user, user_idx, 100);
+    assert!(
+        env.read_account_capital(user_idx) >= 200,
+        "account must carry both the init fee_payment and the follow-up deposit"
+    );
 }
 
 /// Companion: InitLP also stays live through an oracle outage under the
@@ -2811,17 +2826,64 @@ fn test_init_lp_survives_stale_oracle() {
     });
 
     let lp = solana_sdk::signature::Keypair::new();
-    let _lp_idx = env.init_lp(&lp);
+    let lp_idx = env.init_lp(&lp);
+
+    // LP account must be functional post-init (same reasoning as
+    // InitUser above).
+    env.deposit(&lp, lp_idx, 100);
+    assert!(
+        env.read_account_capital(lp_idx) >= 200,
+        "LP account must carry both the init fee_payment and the follow-up deposit"
+    );
 }
 
-// Note: ReclaimEmptyAccount now syncs maintenance fees before the
-// reclaim-eligibility check (spec §10.7 wrapper rule). Existing
-// reclaim tests (test_reclaim_rejects_account_with_capital,
-// test_reclaim_rejects_account_with_position,
-// test_reclaim_blocked_on_resolved, test_reclaim_empty_account)
-// exercise the pre-reclaim path and continue to pass — any regression
-// in the sync insertion (monotonicity, envelope, etc.) would surface
-// as an Overflow/Undercollateralized on those tests.
+/// Regression companion to test_top_up_insurance_survives_current
+/// _slot_above_last_market_slot. ReclaimEmptyAccount received the
+/// same monotonicity floor (bounded_now = max(min(clock, lms),
+/// current_slot)) plus a pre-reclaim fee sync; both must respect
+/// engine monotonicity when a prior no-oracle op has split
+/// current_slot past last_market_slot.
+///
+/// Tight observable: reclaim must not surface EngineOverflow (0x12)
+/// — the failure mode the pre-fix bounded_now would produce. An
+/// Undercollateralized (0xe) rejection from the engine's capital
+/// check is fine and expected for a fresh user; that's the engine's
+/// own reclaim-eligibility gate, not a wrapper monotonicity defect.
+#[test]
+fn test_reclaim_survives_current_slot_above_last_market_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    // Fully accrue to slot 100 so current_slot == last_market_slot.
+    env.set_slot(100);
+    env.crank();
+
+    // Split: a no-oracle op at slot 200 advances current_slot to 200
+    // without moving last_market_slot.
+    env.set_slot(200);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    // Reclaim. The engine will reject with Undercollateralized (0xe)
+    // because the user's fresh capital equals min_initial_deposit —
+    // that's an engine-eligibility rejection, not a wrapper defect.
+    // What we're checking is that we DON'T get Custom(18) (Overflow),
+    // which is what the pre-fix bounded_now would produce.
+    match env.try_reclaim_empty_account(user_idx) {
+        Ok(()) => {} // capital happened to be below min — fine.
+        Err(e) => assert!(
+            !e.contains("0x12"),
+            "reclaim must not fail on monotonicity (EngineOverflow, 0x12). \
+             An eligibility rejection (Undercollateralized, 0xe) is fine. \
+             Got: {}", e,
+        ),
+    }
+}
 
 /// Regression: TopUpInsurance's bounded-slot computation must not
 /// regress below engine.current_slot. A prior no-oracle op

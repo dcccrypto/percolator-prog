@@ -5871,6 +5871,18 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
         "PushOraclePrice past maturity must surface OracleStale (0x6), got: {}", err,
     );
 
+    // TradeCpi must also reject — same hard-timeout gate. This is the
+    // important one: the RESOLVE-ONLY intent is that user-facing
+    // trading is terminally dead post-maturity, not just admin ops.
+    let err = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000, &matcher_prog, &matcher_ctx,
+    ).expect_err("TradeCpi must reject past perm_resolve maturity");
+    assert!(
+        err.contains("0x6"),
+        "TradeCpi past maturity must surface OracleStale (0x6), got: {}", err,
+    );
+
     // CatchupAccrue must also reject — it routes through
     // get_engine_oracle_price_e6 which honors the hard-timeout gate.
     let err = env.try_catchup_accrue()
@@ -5924,36 +5936,39 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     // recoverable.
     env.try_push_oracle_price(&admin, 1_020_000, 10 + 299)
         .expect("PushOraclePrice must succeed before perm_resolve maturity");
-
-    // Market must remain live.
     assert!(
         !env.is_market_resolved(),
         "market must still be live before perm_resolve maturity"
     );
+
+    // Stronger assertion: "market stays live" means more than "push
+    // didn't error" — a subsequent TradeCpi at the same slot must also
+    // succeed. If the market had silently slipped into a frozen state
+    // (e.g. get_engine_oracle_price_e6 refusing price reads on the
+    // trade path), this follow-up trade would fail. This is the
+    // end-to-end recoverability check the original audit flagged.
+    env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000, &matcher_prog, &matcher_ctx,
+    ).expect("TradeCpi must succeed on a freshly-revived market");
 }
 
-/// Test 3: Init rejects perm_resolve configurations larger than the
-/// catchup-budget (CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS). The
-/// general-purpose `perm_resolve <= max_accrual_dt_slots` check is
-/// strictly tighter, so in practice this catches the same bad
-/// configurations via that earlier guard — the assertion here is that
-/// the outcome is a clean init rejection rather than a partially-
-/// initialized market.
+/// Test 3: Init rejects Hyperp perm_resolve values too large to
+/// recover within the accrue envelope. In the current code the general
+/// `perm_resolve <= risk_params.max_accrual_dt_slots` guard (100_000)
+/// is strictly tighter than the new Hyperp catchup-budget guard
+/// (CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS = 2_000_000), so the
+/// general guard always fires first. The substantive assertion this
+/// test makes is that init REJECTS any Hyperp perm_resolve past the
+/// accrue envelope — we pick a value above the general bound so the
+/// test is meaningful regardless of which guard fires.
 #[test]
-fn test_hyperp_init_rejects_permissionless_window_larger_than_recoverable_gap() {
+fn test_hyperp_init_rejects_permissionless_window_past_accrue_envelope() {
     let mut env = TradeCpiTestEnv::new();
-    // CATCHUP_CHUNKS_MAX = 20, MAX_ACCRUAL_DT_SLOTS = 100_000 →
-    // recoverable_gap = 2_000_000. Pick perm_resolve just over that.
-    let too_large: u64 = 20u64.saturating_mul(100_000).saturating_add(1);
-    let err = env.try_init_market_hyperp_with_stale(
+    let too_large: u64 = 100_001; // MAX_ACCRUAL_DT_SLOTS + 1
+    env.try_init_market_hyperp_with_stale(
         1_000_000,
-        86_400, // max_staleness_secs (generous, doesn't matter here)
+        86_400,
         too_large,
-    ).expect_err("init must reject perm_resolve larger than catchup budget");
-    // InvalidInstructionData maps to Custom-free ProgramError in litesvm
-    // — the assert is that init rejected, not which specific guard fired.
-    assert!(
-        err.contains("InvalidInstructionData") || err.contains("InvalidArgument"),
-        "expected init rejection, got: {}", err,
-    );
+    ).expect_err("init must reject perm_resolve past the accrue envelope");
 }
