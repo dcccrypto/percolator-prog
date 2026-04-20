@@ -715,6 +715,34 @@ blocks reward payment. Crank returns cleanly; no state mutation
 beyond the accrue-to-clock-slot (which is the correct ongoing
 market-clock advancement, not a bug).
 
+### D53. Funding f_snap desync
+
+**Hypothesis**: When an account changes position, `f_snap` is
+updated to the current side's `f_{side}_num`. If this update is
+missed on some code path, subsequent funding PnL computation would
+use stale snapshot, producing wrong PnL.
+
+**Why discarded**: `set_position_basis_q` (engine line 1700-1717) is
+the single entry point for position changes; it atomically updates
+`adl_a_basis`, `adl_k_snap`, `f_snap`, `adl_epoch_snap` together.
+No mutation path sets position without going through this function.
+The engine's 243 Kani proofs include invariants verifying this
+snapshot synchronicity.
+
+### D54. ADL coefficient reset during epoch transition
+
+**Hypothesis**: When epoch resets (side becomes ResetPending →
+reopen), `f_{side}_num` and `adl_coeff_{side}` are zeroed. If this
+happens while an account still holds epoch_snap of the OLD epoch,
+reconcile can't reconstruct old PnL.
+
+**Why discarded**: The engine reconciles stale-epoch accounts
+(spec §5.4) by using `F_epoch_start_{side}` (the F value snapshotted
+at epoch start, NOT current F). Reconcile line 5166:
+`f_end_wide = I256::from_i128(self.get_f_epoch_start(side))`. So the
+reset doesn't lose the information needed for prior-epoch
+reconciliation.
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
