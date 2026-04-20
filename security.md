@@ -509,6 +509,46 @@ new - old`, and applies delta. After each call,
 `last_oracle_price = new`. Subsequent calls use the updated value.
 Telescoping sum equals the total mark movement. No double-counting.
 
+### D37. Tiny trades with zero-rounded fees
+
+**Hypothesis**: Trade with size_q = 1 (smallest unit) produces a
+notional so small that the trading fee rounds to 0 in integer
+arithmetic. Attacker does billions of tiny trades for free to
+manipulate state.
+
+**Why discarded**:
+- Zero-fee trades contribute ZERO weight to the mark EWMA
+  (fee-weighted update). No EWMA manipulation possible.
+- Each tiny trade is still a full tx with Solana-level fees (lamports).
+  Economic cost to the attacker scales with trade count.
+- Position changes of 1-unit size are too small to meaningfully
+  affect any other account's health or funding.
+- Fee-rounding is asymmetric (ceil) — protocol rounds fees UP when
+  possible (`mul_div_ceil_u128`), minimizing free rides.
+
+### D38. Double-crank same slot
+
+**Hypothesis**: Two keepers call KeeperCrank at the same slot.
+Double-accrual, double fee-sweep, double reward.
+
+**Why discarded**: Solana tx linearization. First tx lands, accrues
+market to the slot. Second tx sees already-accrued state;
+`accrue_market_to` with dt=0 is a no-op early return (engine line
+2162). Maintenance fee sweep on second call finds nothing to sweep
+(first drained the budget). No double-counting.
+
+### D39. Slab lamport drain-induced garbage collection
+
+**Hypothesis**: Attacker somehow drains slab's lamports below rent
+exemption, Solana garbage-collects the slab mid-operation, data is
+lost.
+
+**Why discarded**: No wrapper path drains slab lamports except
+CloseSlab (gated by close_authority + num_used_accounts=0). InitMarket
+pays rent at creation. The slab stays rent-exempt throughout its
+lifecycle. Solana-level account deletion is not reachable from the
+wrapper's API surface.
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
