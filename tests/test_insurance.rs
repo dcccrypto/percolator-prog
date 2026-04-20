@@ -2143,3 +2143,127 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
     );
 }
 
+
+/// Regression for audit #3: UpdateAuthority(kind=ORACLE) must NOT
+/// corrupt the limited-insurance policy state when is_policy_configured
+/// is set. The policy packs (max_bps, last_withdraw_slot) into
+/// config.authority_timestamp and min_withdraw_base into
+/// config.last_effective_price_e6 — these are repurposed-resolved-mode
+/// oracle fields. An earlier version of the ORACLE handler zeroed
+/// authority_timestamp/price unconditionally on non-Hyperp, which
+/// would break subsequent WithdrawInsuranceLimited calls.
+#[test]
+fn test_update_authority_oracle_preserves_configured_policy_metadata() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Must enable cap before configuring oracle authority (weaker-
+    // authority invariant).
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+
+    // Top up and resolve — SetInsuranceWithdrawPolicy requires resolved.
+    env.top_up_insurance(&admin, 10_000_000_000);
+    env.set_slot(100);
+    env.crank();
+    env.try_resolve_market(&admin).unwrap();
+
+    // Configure the limited-insurance policy.
+    // (authority arg is a no-op under the 4-way split.)
+    env.try_set_insurance_withdraw_policy(
+        &admin,
+        &admin.pubkey(),
+        100_000_000, // min_withdraw_base
+        500,         // max_withdraw_bps = 5%
+        10,          // cooldown_slots
+    )
+    .expect("policy configured");
+
+    // Read policy-packed fields before the authority-change operation.
+    const AUTH_TS_OFF: usize = 320;   // HEADER_LEN(136) + authority_timestamp(184)
+    const LAST_EFF_OFF: usize = 336;  // HEADER_LEN(136) + last_effective_price_e6(200)
+    let (ts_before, min_base_before) = {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        (
+            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
+            u64::from_le_bytes(slab[LAST_EFF_OFF..LAST_EFF_OFF + 8].try_into().unwrap()),
+        )
+    };
+    assert_ne!(ts_before, 0, "policy packed metadata must be non-zero after configure");
+    assert_eq!(min_base_before, 100_000_000, "min_withdraw_base parked in last_effective_price_e6");
+
+    // Rotate oracle authority. New current = admin (initialized to admin
+    // at init); we transfer to a fresh key via two-sig handover.
+    let new_oracle = Keypair::new();
+    env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle))
+        .expect("oracle authority rotation must succeed even with policy configured");
+
+    // Policy metadata must be INTACT after the authority change.
+    let (ts_after, min_base_after) = {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        (
+            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
+            u64::from_le_bytes(slab[LAST_EFF_OFF..LAST_EFF_OFF + 8].try_into().unwrap()),
+        )
+    };
+    assert_eq!(
+        ts_after, ts_before,
+        "UpdateAuthority(ORACLE) MUST NOT clear authority_timestamp when \
+         policy is configured — the field packs policy metadata here",
+    );
+    assert_eq!(
+        min_base_after, min_base_before,
+        "UpdateAuthority(ORACLE) MUST NOT overwrite last_effective_price_e6 \
+         when policy is configured — field holds min_withdraw_base",
+    );
+}
+
+/// Negative-path companion: when NO policy is configured, the ORACLE
+/// authority change still clears stored price/timestamp (matches the
+/// pre-policy-configured intended behavior). Verifies the
+/// is_policy_configured gate does NOT over-extend.
+#[test]
+fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+
+    // No SetInsuranceWithdrawPolicy call — is_policy_configured stays false.
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + authority_price_e6(176)
+    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + authority_timestamp(184)
+    let (price_before, ts_before) = {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        (
+            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
+            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
+        )
+    };
+    assert!(price_before > 0, "authority price populated by push");
+    assert!(ts_before > 0, "authority timestamp populated by push");
+
+    // Rotate oracle authority.
+    let new_oracle = Keypair::new();
+    env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle))
+        .expect("oracle rotation must succeed");
+
+    // Under the no-policy branch, the clear fires as before.
+    let (price_after, ts_after) = {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        (
+            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
+            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
+        )
+    };
+    assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
+    assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
+}

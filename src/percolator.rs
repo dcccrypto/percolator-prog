@@ -3964,9 +3964,22 @@ pub mod processor {
             }
             AUTHORITY_ORACLE => {
                 config.oracle_authority = new_bytes;
-                if !oracle::is_hyperp_mode(&config) {
-                    // Clear stored price on authority change — prevents
-                    // carrying over a prior authority's last push.
+                // Clear stored price on authority change for non-Hyperp
+                // markets — prevents carrying over a prior authority's
+                // last push. SKIP the clear when a limited-insurance
+                // policy is configured: in that resolved-mode state,
+                // config.authority_price_e6 and config.authority_timestamp
+                // are REPURPOSED to hold the policy's min_withdraw_base
+                // and packed (max_bps, last_withdraw_slot). Zeroing them
+                // would corrupt the policy metadata while leaving
+                // FLAG_POLICY_CONFIGURED set, breaking subsequent
+                // WithdrawInsuranceLimited calls. is_policy_configured
+                // requires is_resolved at set time, so the oracle is
+                // already terminal here and the push-state it would
+                // nominally guard no longer matters.
+                if !oracle::is_hyperp_mode(&config)
+                    && !state::is_policy_configured(&data)
+                {
                     config.authority_price_e6 = 0;
                     config.authority_timestamp = 0;
                 }
