@@ -935,6 +935,30 @@ with off-curve requirement. The probability of hitting all-zero
 not as a valid active signer. Even if collision occurred, no path
 grants privileges to it.
 
+## Key operator recommendation (not a protocol bug)
+
+The one genuine finding from this adversarial session is OPERATIONAL,
+not a protocol flaw: `MAX_ABS_FUNDING_E9_PER_SLOT = 10^6` (10 bps/
+slot = 21,600%/day at max rate) is mathematically bounded by the
+engine's i128 envelope, but 500x higher than real-world perp
+funding caps (Binance/dYdX ~0.02 bps/slot).
+
+An admin-compromised market with oracle_authority can push funding
+at 10 bps/slot, draining users who don't close fast. This is:
+- Within the protocol's documented trust model (admin-configurable
+  within envelope)
+- Mitigable via: burn admin, or deploy with a lower per-market cap
+  via custom_max_per_slot at InitMarket
+
+Operator recommendation: deploy with custom_max_per_slot ≤ 1 bps/
+slot (100_000 in e9 units) to align with real-world funding caps
+and reduce the admin-abuse surface even without burning admin.
+This is a 10x reduction from the envelope max.
+
+Separately, for true rug-proof deployments: burn admin post-init.
+The UpdateConfig path then has no authorized signer, so
+funding params become immutable.
+
 ## Audit completion status
 
 **54 concrete attack hypotheses probed across three rounds.** Every
