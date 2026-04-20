@@ -338,6 +338,34 @@ within a single account's lifetime, not across re-init. Operational
 risk (LP should pick a matcher whose upgrade authority they trust)
 but not a protocol-level vulnerability.
 
+### D26. WithdrawInsurance drains user funds
+
+**Hypothesis**: Admin (as insurance_authority) calls WithdrawInsurance
+while users still have open accounts, stealing what users believe is
+their capital via the shared vault balance.
+
+**Why discarded**: The handler (src/percolator.rs:7529-7531) checks
+`if engine.num_used_accounts != 0 → reject`. Admin must wait for
+every user account to close (via AdminForceCloseAccount or user
+self-close) before withdrawing insurance. At num_used_accounts=0,
+c_tot=0, pnl_pos_tot=0 (further asserted lines 7546-7550), the vault
+contents are not owed to any user — withdrawing is correct
+accounting.
+
+### D27. WithdrawInsurance with burned insurance_authority traps funds
+
+**Hypothesis**: Admin burns insurance_authority before the market
+has drained. Later all users close. Insurance balance is nonzero
+but nobody can call WithdrawInsurance (require_admin rejects zero).
+
+**Why discarded**: Not a user-fund-theft vulnerability — it's the
+protocol's own excess capital trapped. The design is intentional:
+operators who want "rug-proof for users" can burn
+insurance_authority at init, knowing that insurance will never be
+paid out. Users' individual claims are already withdrawable via
+close/force-close. The trapped insurance is structurally designed
+to be inaccessible.
+
 ### D22. Dust-capital account remains operational
 
 **Hypothesis**: User's capital drops below min_initial_deposit (e.g.,
