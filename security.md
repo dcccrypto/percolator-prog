@@ -886,6 +886,55 @@ existing defenses, or (c) requires admin-key compromise (which the
 burn-admin feature mitigates). No ship-blocking protocol-level
 vulnerability identified.
 
+### D58. Dust-window griefing via rapid reclaim
+
+**Threat**: User deposits exactly min_initial_deposit. Attacker
+waits a few slots for maintenance fees to accumulate, then calls
+ReclaimEmptyAccount. Sync drains fees; capital drops below min;
+reclaim eligibility passes; user's dust goes to insurance.
+
+**Why classified as known behavior (D12 variant)**:
+- This is spec §2.6 dormant-account cleanup — the user deposited
+  the MINIMUM, so any fee accrual pushes them to reclaimable dust.
+- User's mitigation: deposit more than min_initial_deposit so
+  fee-window eats less than the buffer.
+- Maintenance fee is admin-configurable. Markets with fee=0 are
+  immune (no dust drain).
+- My sync-before-reclaim fix made this attack faster, but the end
+  state (user loses dust to insurance) is unchanged from the pre-
+  fix behavior once crank eventually syncs their fees.
+- Discussed in D12. Same analysis applies.
+
+### D59. All-losers-never-close post-resolve trap
+
+**Threat**: Post-resolve, winners can only Phase-2-close after ALL
+losers have Phase-1-reconciled (terminal_ready). If some losers
+never get force-closed, winners' funds are locked forever.
+
+**Why discarded**:
+- ForceCloseResolved is PERMISSIONLESS past force_close_delay_slots.
+  Any keeper can close any account.
+- MAX_FORCE_CLOSE_DELAY_SLOTS = 10_000_000 (≈46 days at 0.4s/slot)
+  caps the admin's choice.
+- Phase 1 reconcile (which decrements neg_pnl_account_count) works
+  on any account regardless of capital state — it only zeros the
+  position and settles losses.
+- Worst case: winners wait up to MAX_FORCE_CLOSE_DELAY_SLOTS (46
+  days) before they can force-close losers. Not permanent.
+
+### D60. PDA collision to all-zero pubkey
+
+**Threat**: A PDA derivation accidentally produces all-zero pubkey.
+`admin_ok` rejects zero admin, but other checks might treat zero
+as "unset" differently.
+
+**Why discarded**: find_program_address uses sha256-based hashing
+with off-curve requirement. The probability of hitting all-zero
+(2^-256) is astronomically low. Additionally, `admin_ok` (line
+339-341) and owner checks consistently treat zero as "unset/burned",
+not as a valid active signer. Even if collision occurred, no path
+grants privileges to it.
+
 ## Audit completion status
 
 **54 concrete attack hypotheses probed across three rounds.** Every
