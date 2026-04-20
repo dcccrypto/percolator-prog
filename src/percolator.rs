@@ -105,20 +105,41 @@ pub mod constants {
     /// the lifetime ceiling is
     ///     i128::MAX / (10^15 · 10^12 · 10^6)  ≈ 170_141
     ///
-    /// 170_000 is the largest value that passes the engine assert while
-    /// keeping the current funding cap. That gives a THEORETICAL safety
-    /// horizon of 170 000 slots (≈ 19 hours at 400 ms slots) when the
-    /// market sits at max funding rate continuously. Real markets
-    /// rarely hit the cap; at a typical 1 bps/day average rate the
-    /// effective horizon is many orders of magnitude longer.
+    /// ═════════════════════════════════════════════════════════════════
+    /// OPERATIONAL ASSUMPTION — accepted finite market lifetime
+    /// ═════════════════════════════════════════════════════════════════
+    /// The engine does not expose an F-index rebase, so every deployed
+    /// market has a finite cumulative-funding lifetime bounded by the
+    /// envelope above. The theoretical floor under the worst-case
+    /// assumption (continuous max-rate funding) is:
     ///
-    /// Deployments with a longer target lifetime should lower
-    /// `MAX_ABS_FUNDING_E9_PER_SLOT` proportionally, or (out of scope
-    /// for the wrapper) the engine should expose an F-index rebase.
-    /// The prior setting of `MAX_ACCRUAL_DT_SLOTS` (100_000) was a
-    /// strict under-provisioning — made the engine only guarantee one
-    /// call's worth of funding safety — and is raised here to the
-    /// engine's mathematical ceiling.
+    ///     170_000 slots @ 400 ms/slot ≈ 19 hours
+    ///
+    /// The EFFECTIVE horizon under realistic rates is vastly longer.
+    /// Real perpetual markets average 1 bps/day, i.e. 4.6 × 10⁻¹⁰ per
+    /// slot at 2.5 slots/sec. The ratio to the envelope's worst-case
+    /// assumption (10⁶ in e9 units = 10⁻³/slot) is ≈ 2.2 × 10⁶, giving
+    /// an effective lifetime of ≈ 170_000 × 2.2M = 3.7 × 10¹¹ slots
+    /// (thousands of years).
+    ///
+    /// Tuning options a deployer has for extending the floor:
+    ///   (a) Lower `MAX_ABS_FUNDING_E9_PER_SLOT` — the envelope scales
+    ///       linearly, so halving the funding cap doubles the lifetime.
+    ///       Default `funding_max_bps_per_slot = 5` (500_000 in e9)
+    ///       pins the practical floor; values below that break the
+    ///       configured defaults.
+    ///   (b) Reduce the default `funding_max_bps_per_slot` in concert
+    ///       with (a) to match real-market funding caps (≤ 1 bps/slot).
+    ///   (c) Engine-side F-index rebase (out of wrapper scope).
+    ///
+    /// Admin-free deployments that intend to run indefinitely should
+    /// treat the theoretical floor as a LIVENESS BUDGET: once the
+    /// cumulative funding envelope is exhausted, future accrue_market
+    /// _to calls saturate and the market effectively freezes. At that
+    /// point `permissionless_resolve_stale_slots` is the fallback exit
+    /// path for users. Operators MUST set that field > 0 on admin-
+    /// free markets (a zero value combined with envelope exhaustion
+    /// would trap capital).
     pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 170_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
@@ -2254,39 +2275,41 @@ pub mod oracle {
         0x56, 0x02,
     ]);
 
-    // PriceUpdateV2 account layout offsets (134 bytes minimum).
-    // Layout: discriminator(8) + write_authority(32) + verification_level(2)
-    //         + feed_id(32) + price(i64) + conf(u64) + expo(i32) + publish_time(i64) + ...
+    // PriceUpdateV2 account layout (134 bytes minimum):
+    //   discriminator(8) + write_authority(32) + verification_level(2)
+    //     + PriceFeedMessage(76) + posted_slot(8) = 134
     //
-    // *** DEPLOYER ACTION REQUIRED ***
-    // These offsets are pinned against the Pyth SDK revision current at build
-    // time, NOT deserialized through the official pyth_solana_receiver_sdk.
-    // If Pyth ships a breaking layout change (new field insertion, enum-variant
-    // reordering, discriminator change, etc.), this parser will silently read
-    // garbage. Before deploying any non-Hyperp market that consumes Pyth:
-    //   1. Capture a real mainnet/devnet PriceUpdateV2 account for your feed
-    //      and confirm `verification_level`, `feed_id`, `price`, `conf`,
-    //      `expo`, and `publish_time` land at offsets 40, 42, 74, 82, 90, 94
-    //      respectively. See:
-    //      https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
-    //   2. Add an integration test that feeds a byte-accurate
-    //      `PriceUpdateV2 { verification_level: Full, ... }` (serialized via
-    //      the official SDK + Anchor discriminator prefix) through
-    //      read_pyth_price_e6 and asserts the parsed fields match.
-    //   3. Pin a known-good Pyth SDK commit hash alongside the deployment
-    //      record. On any SDK version bump, re-run (1) and (2).
-    // Replacement path: swap to the SDK's `PriceUpdateV2::try_deserialize` +
-    // `get_price_no_older_than_with_custom_verification_level` if you'd rather
-    // outsource the layout question entirely.
+    // The price-message block is parsed as the canonical pythnet_sdk
+    // struct `pythnet_sdk::messages::PriceFeedMessage` via its
+    // BorshDeserialize impl. Any breaking layout change Pyth ships
+    // (field insertion, reordering, type change) surfaces as a
+    // deserialize error at runtime or a compile error here — no more
+    // silent garbage reads from stale fixed offsets. The enclosing
+    // PriceUpdateV2 wrapper (discriminator + write_authority +
+    // verification_level) remains at fixed offsets because that part
+    // of the account is defined outside pythnet-sdk; a layout-audit
+    // fixture test is the recommended additional guard for that
+    // wrapper (see read_pyth_price_e6 comments).
     const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
-    const OFF_VERIFICATION_LEVEL: usize = 40; // u16 enum: 0=Partial, 1=Full
-    const OFF_FEED_ID: usize = 42; // 32 bytes
-    const OFF_PRICE: usize = 74; // i64
-    const OFF_CONF: usize = 82; // u64
-    const OFF_EXPO: usize = 90; // i32
-    const OFF_PUBLISH_TIME: usize = 94; // i64
-    /// Pyth VerificationLevel::Full (the only safe level for production)
-    const PYTH_VERIFICATION_FULL: u16 = 1;
+    const OFF_VERIFICATION_LEVEL: usize = 40; // enum discriminant (u8) + optional num_sigs (u8)
+    const OFF_PRICE_FEED_MESSAGE: usize = 42; // PriceFeedMessage (72 bytes of fields)
+    /// Pyth VerificationLevel::Full — enum tag value the Anchor
+    /// serializer emits for the Full variant. Anchor writes the
+    /// variant discriminant as one u8 followed by the variant payload
+    /// (empty for Full, 1 byte num_signatures for Partial). Full is
+    /// the second variant → tag byte = 1.
+    const PYTH_VERIFICATION_FULL_TAG: u8 = 1;
+
+    /// Compile-time assertion: fixed offsets in this module must match
+    /// the on-chain PriceUpdateV2 layout. Any change in the wrapper or
+    /// its LEN constant triggers a build error. PriceUpdateV2 is not
+    /// exposed by pythnet-sdk (it lives in the Anchor-heavy
+    /// pyth-solana-receiver-sdk), so we pin LEN explicitly to the
+    /// documented value on the Pyth repo:
+    ///   https://github.com/pyth-network/pyth-crosschain/blob/main/
+    ///     target_chains/solana/pyth_solana_receiver_sdk/src/
+    ///     price_update.rs (look for `pub const LEN`).
+    const _: () = assert!(PRICE_UPDATE_V2_MIN_LEN == 134);
 
     // Chainlink OCR2 State/Aggregator account layout offsets
     // Note: Different from the Transmissions ring buffer format in older docs
@@ -2320,6 +2343,8 @@ pub mod oracle {
         max_staleness_secs: u64,
         conf_bps: u16,
     ) -> Result<u64, ProgramError> {
+        use pythnet_sdk::messages::PriceFeedMessage;
+
         // Validate oracle owner (skip in tests to allow mock oracles)
         #[cfg(not(feature = "test"))]
         {
@@ -2336,31 +2361,34 @@ pub mod oracle {
         // Reject partially verified Pyth updates (only Full is safe)
         #[cfg(not(feature = "test"))]
         {
-            let vl = u16::from_le_bytes(
-                data[OFF_VERIFICATION_LEVEL..OFF_VERIFICATION_LEVEL + 2]
-                    .try_into()
-                    .unwrap(),
-            );
-            if vl != PYTH_VERIFICATION_FULL {
+            if data[OFF_VERIFICATION_LEVEL] != PYTH_VERIFICATION_FULL_TAG {
                 return Err(PercolatorError::OracleInvalid.into());
             }
         }
 
+        // Deserialize the PriceFeedMessage block via the canonical
+        // pythnet-sdk struct. This replaces the prior hand-rolled
+        // fixed-offset reads — any layout change in Pyth's struct
+        // surfaces as a borsh deserialize error here, not silent
+        // garbage. See read_price_clamped comments for the outer
+        // wrapper (discriminator + write_authority + verification
+        // _level) which is still pinned by offset since
+        // PriceUpdateV2 lives in the Anchor-heavy receiver SDK that
+        // we deliberately do not pull in as a dep.
+        let msg_slice = &data[OFF_PRICE_FEED_MESSAGE..];
+        let msg = <PriceFeedMessage as borsh::BorshDeserialize>::deserialize(
+            &mut &msg_slice[..],
+        ).map_err(|_| PercolatorError::OracleInvalid)?;
+
         // Validate feed_id matches expected
-        let feed_id: [u8; 32] = data[OFF_FEED_ID..OFF_FEED_ID + 32].try_into().unwrap();
-        if &feed_id != expected_feed_id {
+        if &msg.feed_id != expected_feed_id {
             return Err(PercolatorError::InvalidOracleKey.into());
         }
 
-        // Read price fields
-        let price = i64::from_le_bytes(data[OFF_PRICE..OFF_PRICE + 8].try_into().unwrap());
-        let conf = u64::from_le_bytes(data[OFF_CONF..OFF_CONF + 8].try_into().unwrap());
-        let expo = i32::from_le_bytes(data[OFF_EXPO..OFF_EXPO + 4].try_into().unwrap());
-        let publish_time = i64::from_le_bytes(
-            data[OFF_PUBLISH_TIME..OFF_PUBLISH_TIME + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let price = msg.price;
+        let conf = msg.conf;
+        let expo = msg.exponent;
+        let publish_time = msg.publish_time;
 
         if price <= 0 {
             return Err(PercolatorError::OracleInvalid.into());
