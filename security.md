@@ -468,6 +468,47 @@ MAX_VAULT_TVL in RiskParams validation), but does not prescribe a
 minimum floor — it's left to operator economics. Not a protocol
 bug.
 
+### D34. Same-slot oracle price oscillation
+
+**Hypothesis**: Multiple ixs in a single tx see different oracle
+prices (via re-reads or oscillation). Attacker constructs a same-
+slot tx that opens a position at one price then closes at another
+within the same block, profiting from the oscillation.
+
+**Why discarded**:
+- Pyth prices update at most once per slot (deterministic within a
+  tx).
+- Hyperp mark updates only on successful trades. One trade per tx
+  affects the mark for future txs, not the current one.
+- Authority push is admin-initiated, not attacker-controllable in
+  the same tx as a trade.
+- No path allows an attacker to change the oracle state between ixs
+  within their own tx without being the oracle authority.
+
+### D35. Scan cursor starvation
+
+**Hypothesis**: KeeperCrank's scan_cursor could be manipulated to
+skip specific accounts, letting an insolvent account avoid
+liquidation.
+
+**Why discarded**: The cursor is modular (`word_cursor = (word_cursor
++ 1) % BITMAP_WORDS`). All slots are eventually visited. Scan order
+is deterministic per cursor state; no one can "skip" an account
+persistently. Additionally, LiquidateAtOracle is callable directly
+by any keeper without going through crank — so no liquidation is
+dependent on crank scanning.
+
+### D36. accrue_market_to same-slot different-price MTM
+
+**Hypothesis**: Within a single slot, multiple accrue calls with
+different prices could cause double-counted mark-to-market deltas.
+
+**Why discarded**: accrue_market_to's mark-to-market step uses
+`current_price = self.last_oracle_price`, computes `delta_p =
+new - old`, and applies delta. After each call,
+`last_oracle_price = new`. Subsequent calls use the updated value.
+Telescoping sum equals the total mark movement. No double-counting.
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
