@@ -745,7 +745,7 @@ reconciliation.
 
 ## Audit completion status
 
-**16 concrete attack hypotheses probed across two rounds.** Every
+**54 concrete attack hypotheses probed across three rounds.** Every
 candidate discarded under inspection. No ship-blocking findings.
 
 ### Coverage
