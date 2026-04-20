@@ -2765,6 +2765,64 @@ fn test_reclaim_blocked_on_resolved() {
     );
 }
 
+/// Spec §10.2: account creation via deposit is a pure capital transfer
+/// that MUST NOT require a fresh oracle read. Before the fix, InitUser/
+/// InitLP read the oracle and fully accrued the market, which meant a
+/// stale feed (oracle publish_time older than max_staleness_secs) could
+/// block new-user and new-LP onboarding even while the market itself
+/// was within the permissionless-resolve horizon. Under the fix, the
+/// path is gated only by `permissionless_stale_matured` (the terminal
+/// hard-timeout) and the engine's live-accrual envelope — both of which
+/// stay satisfied through typical oracle outages.
+#[test]
+fn test_init_user_survives_stale_oracle() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Advance clock well past max_staleness_secs (86400s = 86400 slots
+    // in the test harness where 1 slot = 1 second) WITHOUT updating the
+    // pyth publish_time. Under the prior oracle-dependent InitUser, any
+    // oracle read would fail OracleStale. We bypass the test harness's
+    // set_slot helper because it refreshes pyth publish_time to match.
+    env.svm.set_sysvar(&solana_sdk::clock::Clock {
+        slot: 100_000,
+        unix_timestamp: 100_000,
+        ..Default::default()
+    });
+
+    // InitUser must succeed despite the stale pyth account.
+    let user = solana_sdk::signature::Keypair::new();
+    let _user_idx = env.init_user(&user);
+}
+
+/// Companion: InitLP also stays live through an oracle outage under the
+/// pure-deposit materialization path.
+#[test]
+fn test_init_lp_survives_stale_oracle() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    env.svm.set_sysvar(&solana_sdk::clock::Clock {
+        slot: 100_000,
+        unix_timestamp: 100_000,
+        ..Default::default()
+    });
+
+    let lp = solana_sdk::signature::Keypair::new();
+    let _lp_idx = env.init_lp(&lp);
+}
+
+// Note: ReclaimEmptyAccount now syncs maintenance fees before the
+// reclaim-eligibility check (spec §10.7 wrapper rule). Existing
+// reclaim tests (test_reclaim_rejects_account_with_capital,
+// test_reclaim_rejects_account_with_position,
+// test_reclaim_blocked_on_resolved, test_reclaim_empty_account)
+// exercise the pre-reclaim path and continue to pass — any regression
+// in the sync insertion (monotonicity, envelope, etc.) would surface
+// as an Overflow/Undercollateralized on those tests.
+
 // ============================================================================
 // QueryLpFees (tag 24) additional coverage
 // ============================================================================
