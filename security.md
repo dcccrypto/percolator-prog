@@ -549,6 +549,42 @@ pays rent at creation. The slab stays rent-exempt throughout its
 lifecycle. Solana-level account deletion is not reachable from the
 wrapper's API surface.
 
+### D40. Nonce replay after failed TradeCpi
+
+**Hypothesis**: TradeCpi computes req_id but fails after the CPI
+(before `write_req_nonce`). Nonce isn't advanced. Next attempt
+reuses req_id — could a stale matcher return match and allow a
+replay?
+
+**Why discarded**: Tx atomicity. If TradeCpi errors, ALL state
+writes (including matcher_ctx if matcher wrote to it) roll back.
+The matcher_ctx reverts to its pre-tx state. Nonce counter also
+reverts. Next tx starts from the pre-fail state; no stale matcher
+return data exists to replay against.
+
+### D41. `num_used_accounts` desync
+
+**Hypothesis**: free_slot / materialize_at updates `num_used_accounts`.
+Could a failure path leave the counter out of sync with the
+`used` bitmap, causing permanent slot leaks or overcounting?
+
+**Why discarded**: materialize_at (engine line 1149+) has extensive
+on-failure decrement rollback (lines 1172, 1182, 1196, 1201, 1206,
+1211, 1215). free_slot uses `checked_sub` (line 1137) against the
+counter. Any inconsistency would surface as CorruptState immediately,
+not a silent leak.
+
+### D42. TradeCpi zero-fill burns nonces without executing trades
+
+**Hypothesis**: Attacker abuses zero-fill returns (exec_size=0 +
+PARTIAL_OK) to increment the req_nonce indefinitely, eventually
+exhausting the u64 space and bricking trading via
+`nonce_on_success → None`.
+
+**Why discarded**: u64 nonce space = 2^64. At 1 trade per 400ms slot,
+exhausting takes ~234 billion years. Each nonce burn is a full tx
+with Solana-level fees. Economic impossibility, not a protocol flaw.
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
