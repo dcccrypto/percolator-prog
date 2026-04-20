@@ -1515,13 +1515,16 @@ pub fn encode_withdraw_insurance() -> Vec<u8> {
 }
 
 pub fn encode_set_insurance_withdraw_policy(
-    authority: &Pubkey,
+    _authority: &Pubkey, // deprecated: WithdrawInsuranceLimited is now
+                         // signed by header.insurance_authority (the
+                         // scoped 4-way-auth slot). Kept in the fn
+                         // signature for call-site compatibility —
+                         // value is ignored.
     min_withdraw_base: u64,
     max_withdraw_bps: u16,
     cooldown_slots: u64,
 ) -> Vec<u8> {
     let mut data = vec![22u8];
-    data.extend_from_slice(authority.as_ref());
     data.extend_from_slice(&min_withdraw_base.to_le_bytes());
     data.extend_from_slice(&max_withdraw_bps.to_le_bytes());
     data.extend_from_slice(&cooldown_slots.to_le_bytes());
@@ -2490,11 +2493,11 @@ impl TestEnv {
 // CRITICAL SECURITY TESTS - L7 DEEP DIVE
 // ============================================================================
 
-// Instruction encoders for admin operations
+// Legacy encoders — the on-chain UpdateAdmin (tag 12) and
+// SetOracleAuthority (tag 16) instructions were deleted. These
+// helpers now route through UpdateAuthority (tag 32).
 pub fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8]; // Tag 12: UpdateAdmin
-    data.extend_from_slice(new_admin.as_ref());
-    data
+    encode_update_authority(AUTHORITY_ADMIN, new_admin)
 }
 
 pub fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
@@ -2504,9 +2507,7 @@ pub fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
 }
 
 pub fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    let mut data = vec![16u8]; // Tag 16: SetOracleAuthority
-    data.extend_from_slice(new_authority.as_ref());
-    data
+    encode_update_authority(AUTHORITY_ORACLE, new_authority)
 }
 
 // 4-way authority split constants (must match src/percolator.rs)
@@ -2574,12 +2575,31 @@ pub fn encode_update_config(
 }
 
 impl TestEnv {
-    /// Try UpdateAdmin instruction
+    /// Legacy try_update_admin — routes through UpdateAuthority (tag 32).
+    ///
+    /// Supports self-transfer (new_admin == signer.pubkey()) and burn
+    /// (new_admin == Pubkey::default()) with only the current signer's
+    /// signature. Cross-Keypair transfers (new_admin is a different
+    /// key) will fail at Solana's missing-signature check because the
+    /// new-authority signature isn't produced here — use
+    /// try_update_authority(&cur, AUTHORITY_ADMIN, Some(&new_kp))
+    /// directly for those. Most legacy call-sites are self-transfers
+    /// or burns.
     pub fn try_update_admin(&mut self, signer: &Keypair, new_admin: &Pubkey) -> Result<(), String> {
+        let is_burn = *new_admin == Pubkey::default();
+        let is_self = *new_admin == signer.pubkey();
+        // Mark new as signer only on self-transfer (one tx sig covers
+        // both slots). Cross-Keypair transfers are marked non-signer
+        // and the program rejects at expect_signer — this matches
+        // the "negative test expects rejection" pattern used by
+        // legacy call-sites. Positive cross-Keypair transfers should
+        // use try_update_authority directly with Some(&new_kp).
+        let new_is_signer = !is_burn && is_self;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(*new_admin, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_admin(new_admin),
@@ -2681,10 +2701,19 @@ impl TestEnv {
         signer: &Keypair,
         new_authority: &Pubkey,
     ) -> Result<(), String> {
+        // Routes through UpdateAuthority (tag 32). Self-transfer and
+        // burn work with just the current signer; cross-Keypair
+        // transfers are marked non-signer (program rejects at
+        // expect_signer) to match legacy "negative-test expects
+        // rejection" semantics.
+        let is_burn = *new_authority == Pubkey::default();
+        let is_self = *new_authority == signer.pubkey();
+        let new_is_signer = !is_burn && is_self;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(*new_authority, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_set_oracle_authority(new_authority),
@@ -3810,10 +3839,14 @@ impl TradeCpiTestEnv {
         admin: &Keypair,
         new_authority: &Pubkey,
     ) -> Result<(), String> {
+        let is_burn = *new_authority == Pubkey::default();
+        let is_self = *new_authority == admin.pubkey();
+        let new_is_signer = !is_burn && is_self;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(*new_authority, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_set_oracle_authority(new_authority),
@@ -3823,6 +3856,49 @@ impl TradeCpiTestEnv {
             &[cu_ix(), ix],
             Some(&admin.pubkey()),
             &[admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// UpdateAuthority helper on TradeCpiTestEnv — mirrors the one on
+    /// TestEnv. Supports two-sig handover (current + new both sign)
+    /// when new_kp is Some, and single-sig burn when None.
+    pub fn try_update_authority(
+        &mut self,
+        current: &Keypair,
+        kind: u8,
+        new_kp: Option<&Keypair>,
+    ) -> Result<(), String> {
+        let new_pubkey = match new_kp {
+            Some(kp) => kp.pubkey(),
+            None => Pubkey::default(),
+        };
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(current.pubkey(), true),
+                AccountMeta::new(new_pubkey, new_kp.is_some()),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_update_authority(kind, &new_pubkey),
+        };
+        let signers: Vec<&Keypair> = if let Some(kp) = new_kp {
+            if kp.pubkey() == current.pubkey() {
+                vec![current]
+            } else {
+                vec![current, kp]
+            }
+        } else {
+            vec![current]
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&current.pubkey()),
+            &signers,
             self.svm.latest_blockhash(),
         );
         self.svm

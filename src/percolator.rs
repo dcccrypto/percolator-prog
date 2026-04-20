@@ -1217,10 +1217,7 @@ pub mod ix {
             size: i128,
             limit_price_e6: u64, // 0 = no limit (backward compat)
         },
-        UpdateAdmin {
-            new_admin: Pubkey,
-        },
-        /// Close the market slab and recover SOL to admin.
+        /// Close the market slab and recover SOL to close_authority.
         /// Requires: no active accounts, no vault funds, no insurance funds.
         CloseSlab,
         /// Update configurable funding parameters. Admin only.
@@ -1229,12 +1226,6 @@ pub mod ix {
             funding_k_bps: u64,
             funding_max_premium_bps: i64,
             funding_max_bps_per_slot: i64,
-        },
-        /// Set the oracle price authority (admin only).
-        /// Authority can push prices instead of requiring Pyth/Chainlink.
-        /// Pass zero pubkey to disable and require Pyth/Chainlink.
-        SetOracleAuthority {
-            new_authority: Pubkey,
         },
         /// Push oracle price (oracle authority only).
         /// Stores the price for use by crank/trade operations.
@@ -1253,13 +1244,18 @@ pub mod ix {
         /// Withdraw insurance fund balance (admin only, requires RESOLVED flag).
         WithdrawInsurance,
         /// Set limited insurance-withdraw policy (admin only, resolved market).
+        /// The policy's bounded-withdraw authority is the SCOPED
+        /// `header.insurance_authority`, unified with the unbounded
+        /// WithdrawInsurance path. Admin sets the policy's numerical
+        /// parameters; insurance_authority (set separately via
+        /// UpdateAuthority) signs the actual withdrawals.
         SetInsuranceWithdrawPolicy {
-            authority: Pubkey,
             min_withdraw_base: u64,
             max_withdraw_bps: u16,
             cooldown_slots: u64,
         },
         /// Withdraw insurance under configured min/max/cooldown constraints.
+        /// Signed by `header.insurance_authority`.
         WithdrawInsuranceLimited {
             amount: u64,
         },
@@ -1544,11 +1540,8 @@ pub mod ix {
                         limit_price_e6,
                     })
                 }
-                12 => {
-                    // UpdateAdmin
-                    let new_admin = read_pubkey(&mut rest)?;
-                    Ok(Instruction::UpdateAdmin { new_admin })
-                }
+                // Tag 12 (UpdateAdmin) deleted — use UpdateAuthority
+                // { kind: AUTHORITY_ADMIN } (tag 32).
                 13 => {
                     // CloseSlab
                     Ok(Instruction::CloseSlab)
@@ -1566,11 +1559,8 @@ pub mod ix {
                         funding_max_bps_per_slot,
                     })
                 }
-                16 => {
-                    // SetOracleAuthority
-                    let new_authority = read_pubkey(&mut rest)?;
-                    Ok(Instruction::SetOracleAuthority { new_authority })
-                }
+                // Tag 16 (SetOracleAuthority) deleted — use
+                // UpdateAuthority { kind: AUTHORITY_ORACLE } (tag 32).
                 17 => {
                     // PushOraclePrice
                     let price_e6 = read_u64(&mut rest)?;
@@ -1592,12 +1582,10 @@ pub mod ix {
                     Ok(Instruction::AdminForceCloseAccount { user_idx })
                 }
                 22 => {
-                    let authority = read_pubkey(&mut rest)?;
                     let min_withdraw_base = read_u64(&mut rest)?;
                     let max_withdraw_bps = read_u16(&mut rest)?;
                     let cooldown_slots = read_u64(&mut rest)?;
                     Ok(Instruction::SetInsuranceWithdrawPolicy {
-                        authority,
                         min_withdraw_base,
                         max_withdraw_bps,
                         cooldown_slots,
@@ -3872,10 +3860,16 @@ pub mod processor {
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
 
-        // Hard-timeout gate (consistent with other config mutators).
-        // Matured markets are terminal; authority changes are
-        // meaningless past that point.
-        {
+        let new_bytes = new_pubkey.to_bytes();
+        let is_burn = new_bytes == [0u8; 32];
+
+        // Hard-timeout gate for NON-BURN updates only. Burns strictly
+        // REMOVE power and are the mechanism operators use to reach
+        // the fully admin-free terminal state — blocking them past
+        // maturity would permanently trap a market in a partially-
+        // burned state. Transfers (non-burn) past maturity are still
+        // rejected, consistent with "matured markets are terminal."
+        if !is_burn {
             let clock_gate = Clock::get()
                 .map_err(|_| ProgramError::UnsupportedSysvar)?;
             let cfg_gate = state::read_config(&data);
@@ -3883,9 +3877,6 @@ pub mod processor {
                 return Err(PercolatorError::OracleStale.into());
             }
         }
-
-        let new_bytes = new_pubkey.to_bytes();
-        let is_burn = new_bytes == [0u8; 32];
 
         // New pubkey must consent unless this is a burn.
         if !is_burn {
@@ -4383,9 +4374,19 @@ pub mod processor {
                     funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
                     funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
                     funding_max_bps_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_BPS_PER_SLOT),
-                    // Oracle authority (disabled by default - use Pyth/Chainlink)
-                    // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
-                    oracle_authority: [0u8; 32],
+                    // Oracle authority defaults to the creator's pubkey
+                    // (super-admin by default, consistent with
+                    // insurance_authority and close_authority). The
+                    // admin can transfer it to a separate key or burn
+                    // it via UpdateAuthority { kind: AUTHORITY_ORACLE }.
+                    // Under the weaker-authority model, non-Hyperp
+                    // markets with a nonzero oracle_authority must
+                    // have oracle_price_cap_e2bps > 0 — this is
+                    // checked at PushOraclePrice time (live defense)
+                    // and at UpdateAuthority(ORACLE) time (set-time
+                    // invariant). Hyperp markets use the cap for
+                    // index smoothing and always require cap > 0.
+                    oracle_authority: a_admin.key.to_bytes(),
                     authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
                     // Oracle price circuit breaker
@@ -6304,119 +6305,6 @@ pub mod processor {
                     .top_up_insurance_fund(units as u128, bounded_now)
                     .map_err(map_risk_error)?;
             }
-            Instruction::UpdateAdmin { new_admin } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                // Zero-address admin permanently burns admin authority (§7 step [3]).
-                // require_admin rejects [0u8;32] so all admin instructions become
-                // permanently inaccessible once set.
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let mut header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // Hard-timeout gate: consistent with the "no config
-                // mutations after terminal stale" rule. The market is
-                // dead; transferring admin or burning it does not
-                // change that. If the admin wants to burn before the
-                // market matures, they must do so earlier. After
-                // maturity, the only meaningful action is resolution.
-                {
-                    let clock_gate = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    let cfg_gate = state::read_config(&data);
-                    if oracle::permissionless_stale_matured(&cfg_gate, clock_gate.slot) {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-
-                // Admin-burn liveness guard. Burning admin is irreversible;
-                // once set the slab has no privileged governance. The oracle
-                // AUTHORITY role is explicitly SEPARATE and WEAKER (Model 1):
-                // it may keep pushing prices after admin is burned, but it
-                // is bounded by the circuit-breaker cap so it cannot walk
-                // the effective price arbitrarily. Insurance-withdrawal
-                // policy is kept distinct from oracle authority so a burned
-                // admin cannot be "revived" through an economic channel.
-                //
-                // Invariants enforced at burn time:
-                //   (a) No insurance-withdraw policy configured — that
-                //       channel would let the configured withdraw authority
-                //       drain insurance forever after burn.
-                //   (b) Live markets have both permissionless paths wired
-                //       (resolve_stale_slots > 0 AND force_close_delay > 0)
-                //       so the market lifecycle can complete without admin.
-                //   (c) Resolved markets with open accounts have
-                //       force_close_delay > 0 so abandoned accounts can be
-                //       cleaned up without admin intervention.
-                //   (d) Non-Hyperp markets with a retained oracle_authority
-                //       must have a non-zero oracle_price_cap_e2bps — the
-                //       authority is only weaker than admin when its
-                //       effect on the effective price is capped. This is
-                //       also enforced at SetOracleAuthority /
-                //       SetOraclePriceCap / InitMarket (defense in depth).
-                //
-                // Unified hard-timeout stale-oracle recovery: once admin
-                // is burned, any market (Pyth Pull / Chainlink / Hyperp)
-                // becomes TERMINALLY dead once
-                //   clock.slot - last_good_oracle_slot (non-Hyperp) or
-                //   clock.slot - max(mark_ewma_last_slot,
-                //                    last_mark_push_slot) (Hyperp)
-                // reaches permissionless_resolve_stale_slots. Anyone
-                // can then resolve via ResolvePermissionless at
-                // engine.last_oracle_price. All live mutators reject
-                // past the hard timeout (no deposits, no top-ups, no
-                // pushes, no trades, no config updates), so users can
-                // only exit via resolved-market close paths. Operators
-                // pick permissionless_resolve_stale_slots to match
-                // their market's expected activity.
-                if new_admin.to_bytes() == [0u8; 32] {
-                    let config = state::read_config(&data);
-
-                    if state::is_policy_configured(&data) {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-
-                    let resolved = zc::engine_ref(&data)?.is_resolved();
-                    let engine = zc::engine_ref(&data)?;
-                    let has_accounts = engine.num_used_accounts > 0;
-
-                    if !resolved {
-                        let has_permissionless_resolve = config.permissionless_resolve_stale_slots > 0;
-                        let has_permissionless_force_close = config.force_close_delay_slots > 0;
-                        if !has_permissionless_resolve || !has_permissionless_force_close {
-                            return Err(PercolatorError::InvalidConfigParam.into());
-                        }
-                    } else if has_accounts {
-                        if config.force_close_delay_slots == 0 {
-                            return Err(PercolatorError::InvalidConfigParam.into());
-                        }
-                    }
-
-                    // Weaker-authority invariant: retained non-Hyperp authority
-                    // must be cap-bounded. Hyperp authority pushes the mark
-                    // directly via EWMA and is bounded by other Hyperp guards
-                    // (clamp_toward_with_dt uses the same cap field but the
-                    // init-time check already requires cap != 0 for Hyperp).
-                    if !oracle::is_hyperp_mode(&config)
-                        && config.oracle_authority != [0u8; 32]
-                        && config.oracle_price_cap_e2bps == 0
-                    {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
-                }
-
-                header.admin = new_admin.to_bytes();
-                state::write_header(&mut data, &header);
-            }
 
             Instruction::CloseSlab => {
                 accounts::expect_len(accounts, 6)?;
@@ -6716,67 +6604,6 @@ pub mod processor {
                 state::write_config(&mut data, &config);
             }
 
-            Instruction::SetOracleAuthority { new_authority } => {
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if zc::engine_ref(&data)?.is_resolved() {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                // Update oracle authority in config
-                let mut config = state::read_config(&data);
-                // Hard-timeout gate: consistent with other live config
-                // mutators (SetOraclePriceCap, UpdateConfig) — no admin
-                // changes to price-path configuration on a terminally
-                // stale market. Users exit via resolve.
-                let clock_gate = Clock::get()
-                    .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                if oracle::permissionless_stale_matured(&config, clock_gate.slot) {
-                    return Err(PercolatorError::OracleStale.into());
-                }
-                // Hyperp: reject zero-address unless trade flow has bootstrapped
-                // the EWMA (mark_ewma_e6 > 0). Without trades AND no authority,
-                // there's no mark price source. With EWMA bootstrapped, the market
-                // can run admin-free on trade-derived mark.
-                if oracle::is_hyperp_mode(&config)
-                    && new_authority == Pubkey::default()
-                    && config.mark_ewma_e6 == 0
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                // Weaker-authority invariant (Model 1): non-Hyperp markets that
-                // enable oracle authority MUST also have a non-zero circuit
-                // breaker cap. Without the cap, authority can set the effective
-                // price to any value on every push (clamp_oracle_price is a
-                // no-op when cap == 0), which would make authority strictly
-                // as powerful as admin rather than a bounded fallback. This
-                // is what lets admin burn safely while leaving authority alive.
-                if !oracle::is_hyperp_mode(&config)
-                    && new_authority != Pubkey::default()
-                    && config.oracle_price_cap_e2bps == 0
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                config.oracle_authority = new_authority.to_bytes();
-                // Clear stored price when authority changes — except on Hyperp
-                // where authority_price_e6 is the mark price.
-                if !oracle::is_hyperp_mode(&config) {
-                    config.authority_price_e6 = 0;
-                    config.authority_timestamp = 0;
-                }
-                state::write_config(&mut data, &config);
-            }
 
             Instruction::PushOraclePrice {
                 price_e6,
@@ -7524,7 +7351,6 @@ pub mod processor {
             }
 
             Instruction::SetInsuranceWithdrawPolicy {
-                authority,
                 min_withdraw_base,
                 max_withdraw_bps,
                 cooldown_slots,
@@ -7573,8 +7399,16 @@ pub mod processor {
                 )
                     .ok_or(PercolatorError::InvalidConfigParam)?;
 
-                // Reuse these fields in resolved mode for policy state.
-                config.oracle_authority = authority.to_bytes();
+                // Policy numerical state is parked in resolved-mode
+                // oracle fields (the market is past resolve; oracle
+                // state is no longer semantically meaningful). The
+                // POLICY AUTHORITY field (previously oracle_authority)
+                // is DROPPED — WithdrawInsuranceLimited is signed by
+                // the scoped `header.insurance_authority`, unified
+                // with the unbounded WithdrawInsurance path. Admin
+                // sets the numerical caps here; the insurance_authority
+                // key (managed via UpdateAuthority) signs actual
+                // withdrawals.
                 config.last_effective_price_e6 = min_withdraw_base;
                 config.oracle_price_cap_e2bps = cooldown_slots;
                 config.authority_timestamp = packed;
@@ -7656,11 +7490,13 @@ pub mod processor {
                 } else {
                     (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
                 };
-                let policy_authority = if configured {
-                    config.oracle_authority
-                } else {
-                    header.admin
-                };
+                // Unified authorization: both the configured-policy path
+                // and the unconfigured-default path use the scoped
+                // `header.insurance_authority`. This kills the old
+                // overload of `config.oracle_authority` as a secondary
+                // policy-authority slot — oracle authority is strictly
+                // the price-push role, nothing else.
+                let policy_authority = header.insurance_authority;
                 let policy_min_base = if configured {
                     config.last_effective_price_e6
                 } else {
@@ -7842,10 +7678,12 @@ pub mod processor {
 
                 // Persist cooldown slot.
                 if configured {
-                    // Configured policy: pack slot into authority_timestamp
+                    // Configured policy: pack slot into authority_timestamp.
+                    // oracle_authority is NOT written here — it's the
+                    // separate oracle-push role, unrelated to the
+                    // insurance-withdraw policy after the 4-way split.
                     let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
                         .ok_or(PercolatorError::EngineOverflow)?;
-                    config.oracle_authority = policy_authority;
                     config.last_effective_price_e6 = policy_min_base;
                     config.oracle_price_cap_e2bps = policy_cooldown;
                     config.authority_timestamp = packed;

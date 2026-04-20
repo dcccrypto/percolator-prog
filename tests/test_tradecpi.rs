@@ -2621,7 +2621,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     env.svm
         .airdrop(&old_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_set_oracle_authority(&admin, &old_authority.pubkey())
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&old_authority))
         .unwrap();
     env.try_push_oracle_price(&old_authority, 1_000_000, 1000)
         .unwrap();
@@ -2649,12 +2649,13 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     );
     assert!(result.is_ok(), "Trade should succeed");
 
-    // Change oracle authority
+    // Change oracle authority — current authority (old_authority)
+    // must sign, along with new_authority (two-sig handover).
     let new_authority = Keypair::new();
     env.svm
         .airdrop(&new_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_set_oracle_authority(&admin, &new_authority.pubkey())
+    env.try_update_authority(&old_authority, AUTHORITY_ORACLE, Some(&new_authority))
         .unwrap();
 
     // Old authority should no longer be able to push prices

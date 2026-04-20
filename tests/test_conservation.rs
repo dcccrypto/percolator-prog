@@ -2149,9 +2149,11 @@ fn test_property_authorization_exhaustive() {
     );
 
     // --- Admin chain: verify old admin locked out ---
+    // Cross-Keypair transfer requires the two-sig handover — both
+    // current and new keys sign. Use try_update_authority directly.
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
-    env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin)).unwrap();
 
     let r = env.try_update_admin(&admin, &admin.pubkey());
     assert!(

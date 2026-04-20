@@ -237,7 +237,9 @@ fn test_limited_insurance_withdraw_custom_policy_enforced() {
         "non-admin authority must not be able to configure withdraw policy"
     );
 
-    // Policy: delegated authority, min=100M, max=5%, cooldown=10 slots.
+    // Policy numerical caps: admin sets min=100M, max=5%, cooldown=10 slots.
+    // (authority arg is a no-op under the 4-way split — insurance_authority
+    // is set separately via UpdateAuthority.)
     let set_policy =
         env.try_set_insurance_withdraw_policy(&admin, &delegated.pubkey(), 100_000_000, 500, 10);
     assert!(
@@ -245,6 +247,11 @@ fn test_limited_insurance_withdraw_custom_policy_enforced() {
         "admin should configure limited insurance withdraw policy: {:?}",
         set_policy
     );
+
+    // Delegate insurance_authority to the new key — this is the
+    // 4-way-split equivalent of the old policy-authority field.
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegated))
+        .expect("delegate insurance_authority");
 
     // Delegated authority still cannot mutate limits/authority.
     let delegated_mutation_attempt = env.try_set_insurance_withdraw_policy(
@@ -559,13 +566,18 @@ fn test_limited_insurance_withdraw_failed_attempts_do_not_arm_cooldown() {
         .airdrop(&delegated.pubkey(), 1_000_000_000)
         .expect("airdrop delegated authority");
 
-    // 5% cap, 10-slot cooldown.
+    // 5% cap, 10-slot cooldown (authority arg is ignored under the
+    // 4-way split — insurance_authority is transferred separately).
     env.try_set_insurance_withdraw_policy(&admin, &delegated.pubkey(), 1, 500, 10)
         .expect("policy setup should succeed");
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegated))
+        .expect("delegate insurance_authority");
 
     env.set_slot(7);
 
     // Unauthorized signer must fail and must not consume cooldown state.
+    // After the delegation above, admin is no longer insurance_authority,
+    // so admin's attempt here is the unauthorized path.
     let unauthorized = env.try_withdraw_insurance_limited(&admin, 100_000_000);
     assert!(
         unauthorized.is_err(),
@@ -823,17 +835,27 @@ fn test_admin_withdraw_insurance_bypasses_limited_policy() {
     env.try_resolve_market(&admin).expect("resolve");
     assert!(env.is_market_resolved(), "market should be resolved");
 
-    // Configure a restrictive limited policy: delegated authority, 1% max, 100k-slot cooldown
+    // Configure the limited policy's bps cap + cooldown (admin sets
+    // the numerical policy; authority is the scoped
+    // insurance_authority, NOT a separate policy-authority field).
     let delegated = Keypair::new();
     env.svm.airdrop(&delegated.pubkey(), 1_000_000_000).expect("airdrop delegated");
     env.try_set_insurance_withdraw_policy(
         &admin,
-        &delegated.pubkey(),
+        &delegated.pubkey(), // ignored in the new ABI (kept for helper API compat)
         1,       // min_withdraw_base
         100,     // max_withdraw_bps = 1%
         100_000, // cooldown_slots
     )
     .expect("set policy");
+
+    // Delegate insurance_authority to the target key so it can sign
+    // both the bounded (WithdrawInsuranceLimited) and unbounded
+    // (WithdrawInsurance) paths — the unbounded path's rejection for
+    // `delegated` below is gated on admin-level lifecycle constraints,
+    // not on authority.
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegated))
+        .expect("delegate insurance_authority");
 
     // Delegated authority can only withdraw 1%
     env.set_slot(1);
@@ -841,7 +863,18 @@ fn test_admin_withdraw_insurance_bypasses_limited_policy() {
     assert!(limited.is_ok(), "delegated 1% withdraw should succeed: {:?}", limited);
     assert_eq!(env.read_insurance_balance(), 9_900_000_000, "insurance after limited withdraw");
 
-    // Delegated authority cannot use Tag 20 (requires admin)
+    // Delegated authority cannot use Tag 20 (the unbounded path) because
+    // the live market's policy state + is_policy_configured flag
+    // forces the bounded-only branch even for unbounded calls by the
+    // same key. Under the 4-way split with insurance_authority ==
+    // delegated, both paths check the same key — so this test's
+    // "delegate cannot bypass limits" assertion now depends on the
+    // bounded-policy lifecycle gating, not on authority distinction.
+    // Re-transfer insurance_authority BACK to admin to make Tag 20
+    // succeed only for admin, and Tag 20 by `delegated` reject at
+    // the authority check.
+    env.try_update_authority(&delegated, AUTHORITY_INSURANCE, Some(&admin))
+        .expect("transfer insurance_authority back to admin");
     let delegated_tag20 = env.try_withdraw_insurance(&delegated);
     assert!(
         delegated_tag20.is_err(),

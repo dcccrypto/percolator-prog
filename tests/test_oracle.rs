@@ -583,8 +583,11 @@ fn test_critical_admin_oracle_authority() {
     env.try_set_oracle_price_cap(&admin, 10_000)
         .expect("admin must enable cap before setting authority");
 
-    // Admin sets oracle authority - should succeed now that cap is set
-    let result = env.try_set_oracle_authority(&admin, &oracle_authority.pubkey());
+    // Admin transfers oracle authority to a separate key (cross-Keypair
+    // two-sig handover under the 4-way split).
+    let result = env.try_update_authority(
+        &admin, AUTHORITY_ORACLE, Some(&oracle_authority),
+    );
     assert!(
         result.is_ok(),
         "Admin should set oracle authority: {:?}",

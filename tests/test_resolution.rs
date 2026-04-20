@@ -2305,16 +2305,18 @@ fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
     // doesn't need to warp far.
     env.init_market_with_cap(0, 10_000, 50);
 
-    // No SetOracleAuthority call — the market has oracle_authority==0.
-    // Under the old policy this would make ResolvePermissionless reject
-    // on Pyth-Pull; under the unified policy it's irrelevant. Read via
-    // the config helper so we don't depend on hard-coded field offsets.
+    // Under the 4-way split, oracle_authority defaults to admin at
+    // init. Burn it so the test exercises the "no authority
+    // configured" permissionless-resolve path.
+    let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_update_authority(&admin_kp, AUTHORITY_ORACLE, None)
+        .expect("burn oracle_authority");
     {
         let slab = env.svm.get_account(&env.slab).unwrap();
         let config = percolator_prog::state::read_config(&slab.data);
         assert_eq!(
             config.oracle_authority, [0u8; 32],
-            "precondition: market has no oracle authority configured",
+            "precondition: oracle_authority burned",
         );
     }
 

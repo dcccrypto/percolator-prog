@@ -35,8 +35,11 @@ fn test_critical_update_admin_authorization() {
     );
     println!("UpdateAdmin by non-admin: REJECTED (correct)");
 
-    // Real admin changes admin - should succeed
-    let result = env.try_update_admin(&admin, &new_admin.pubkey());
+    // Real admin changes admin (cross-Keypair transfer requires both
+    // current admin and new admin to sign — use try_update_authority
+    // with Some(&new_kp) for the two-sig handover).
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    let result = env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin));
     assert!(
         result.is_ok(),
         "Admin should be able to change admin: {:?}",
@@ -48,8 +51,8 @@ fn test_critical_update_admin_authorization() {
     let result = env.try_update_admin(&admin, &admin.pubkey());
     assert!(result.is_err(), "Old admin should no longer have authority");
 
-    // New admin can exercise authority (proves transfer actually happened)
-    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    // New admin can exercise authority (proves transfer actually happened).
+    // new_admin was airdropped at line 41 above.
     let result = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(
         result.is_ok(),
@@ -1445,12 +1448,12 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
     env.try_update_authority(&admin, AUTHORITY_CLOSE, Some(&close_delegate))
         .expect("admin still acts on close_authority after insurance_authority burn");
 
-    // admin → admin role self-transfer should also still work.
-    // Re-verified via UpdateAdmin (legacy alias) for defense-in-depth.
+    // admin → new admin transfer should also still work (proves the
+    // admin kind is independent of the insurance-authority burn).
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_admin(&admin, &new_admin.pubkey())
-        .expect("legacy UpdateAdmin still works for admin kind");
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin))
+        .expect("admin transfer still works after insurance_authority burn");
 }
 
 /// Admin-burn liveness guard still applies via UpdateAuthority(kind=ADMIN):

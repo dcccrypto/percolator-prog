@@ -504,11 +504,13 @@ fn test_attack_oracle_authority_wrong_signer() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    // Admin sets oracle authority
+    // Admin sets oracle authority (cross-Keypair: two-sig handover).
+    // Enable cap first for the weaker-authority invariant.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     let authority = Keypair::new();
     env.svm.airdrop(&authority.pubkey(), 1_000_000_000).unwrap();
-    let result = env.try_set_oracle_authority(&admin, &authority.pubkey());
+    let result = env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&authority));
     assert!(result.is_ok(), "Admin should set oracle authority");
 
     // Wrong signer tries to push price
@@ -2443,20 +2445,23 @@ fn test_attack_oracle_authority_disable_clears_price() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Set oracle authority and push a price
+    // Set oracle authority and push a price (cross-Keypair: two-sig handover).
+    // Enable the circuit-breaker cap first — weaker-authority invariant
+    // requires non-Hyperp markets with a configured authority to have cap > 0.
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     let authority = Keypair::new();
     env.svm.airdrop(&authority.pubkey(), 1_000_000_000).unwrap();
-    env.try_set_oracle_authority(&admin, &authority.pubkey())
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&authority))
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&authority, 200_000_000, 100)
         .expect("oracle price push must succeed");
 
-    // Now disable oracle authority by setting to [0;32]
-    let zero = Pubkey::new_from_array([0u8; 32]);
-    let result = env.try_set_oracle_authority(&admin, &zero);
+    // Now disable oracle authority — the CURRENT authority (which was
+    // transferred to `authority` above) must sign the burn.
+    let result = env.try_update_authority(&authority, AUTHORITY_ORACLE, None);
     assert!(
         result.is_ok(),
-        "Admin should disable oracle authority: {:?}",
+        "Oracle authority should be able to burn itself: {:?}",
         result
     );
 
@@ -2502,19 +2507,21 @@ fn test_attack_oracle_authority_change_with_positions() {
     // Open position
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
 
-    // Set authority and push price
+    // Set authority and push price (cross-Keypair: two-sig handover).
+    // Enable cap first to satisfy the weaker-authority invariant.
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     let auth1 = Keypair::new();
     env.svm.airdrop(&auth1.pubkey(), 1_000_000_000).unwrap();
-    env.try_set_oracle_authority(&admin, &auth1.pubkey())
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&auth1))
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&auth1, 200_000_000, 100)
         .expect("oracle price push must succeed");
 
-    // Change to new authority
+    // Change to new authority — transfer from auth1 (current) to auth2 (new)
     let auth2 = Keypair::new();
     env.svm.airdrop(&auth2.pubkey(), 1_000_000_000).unwrap();
-    env.try_set_oracle_authority(&admin, &auth2.pubkey())
-        .expect("oracle authority setup must succeed");
+    env.try_update_authority(&auth1, AUTHORITY_ORACLE, Some(&auth2))
+        .expect("oracle authority rotation must succeed");
 
     // Old authority can't push anymore
     let result = env.try_push_oracle_price(&auth1, 250_000_000, 200);
@@ -2571,7 +2578,8 @@ fn test_attack_oracle_cap_zero_disables_clamping() {
     env.try_set_oracle_price_cap(&admin, 10_000)
         .expect("enabling cap must succeed");
     let alt_authority = Keypair::new();
-    env.try_set_oracle_authority_raw(&admin, &alt_authority.pubkey())
+    env.svm.airdrop(&alt_authority.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&alt_authority))
         .expect("authority with cap>0 must succeed");
     let err = env
         .try_set_oracle_price_cap(&admin, 0)
@@ -4079,30 +4087,13 @@ fn test_attack_update_admin_to_zero_locks_out() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Set admin to zero - now allowed for admin burn (spec §7)
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-        ],
-        data: {
-            let mut d = vec![12u8]; // UpdateAdmin tag
-            d.extend_from_slice(zero_pubkey.as_ref());
-            d
-        },
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[&admin],
-        env.svm.latest_blockhash(),
-    );
-    let result = env.svm.send_transaction(tx);
+    // Burn admin via UpdateAuthority (tag 32, kind=ADMIN, new=zero,
+    // single-sig). Legacy UpdateAdmin tag 12 was deleted.
+    let result = env.try_update_authority(&admin, AUTHORITY_ADMIN, None);
     assert!(
         result.is_ok(),
-        "UpdateAdmin to zero should succeed (admin burn)"
+        "Admin burn via UpdateAuthority must succeed: {:?}",
+        result
     );
 
     // Admin is now burned - all admin instructions must fail
@@ -5629,8 +5620,8 @@ fn test_attack_old_admin_blocked_after_transfer() {
 
     env.crank();
 
-    // Transfer admin
-    env.try_update_admin(&old_admin, &new_admin.pubkey())
+    // Transfer admin (cross-Keypair: two-sig handover)
+    env.try_update_authority(&old_admin, AUTHORITY_ADMIN, Some(&new_admin))
         .unwrap();
 
     // Old admin should fail
@@ -7829,8 +7820,8 @@ fn test_attack_update_admin_old_admin_rejected() {
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
 
-    // Transfer admin to new_admin
-    env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
+    // Transfer admin to new_admin (cross-Keypair: two-sig handover)
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin)).unwrap();
 
     // Old admin tries admin operation - should fail
     let slab_before_old_admin_attempt = env.svm.get_account(&env.slab).unwrap().data;
@@ -7881,9 +7872,18 @@ fn test_attack_set_oracle_authority_to_zero_disables_push() {
         "Hyperp with bootstrapped EWMA should accept zero authority: {:?}",
         zero_result);
 
-    // Set to a different non-zero authority instead
+    // Under the 4-way split, burning oracle_authority is a
+    // one-way operation — the zero slot has no current authority
+    // so no one can re-set it. Admin's attempt to set a new
+    // authority here must fail.
     let new_auth = Keypair::new();
-    env.try_set_oracle_authority(&admin, &new_auth.pubkey()).unwrap();
+    env.svm.airdrop(&new_auth.pubkey(), 1_000_000_000).unwrap();
+    let reset_result = env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_auth));
+    assert!(
+        reset_result.is_err(),
+        "Burned oracle_authority must not be resettable by admin: {:?}",
+        reset_result,
+    );
     const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
@@ -13060,9 +13060,9 @@ fn test_attack_rapid_admin_transfers() {
     env.svm.airdrop(&admin2.pubkey(), 5_000_000_000).unwrap();
     env.svm.airdrop(&admin3.pubkey(), 5_000_000_000).unwrap();
 
-    // Chain: admin1 -> admin2 -> admin3
-    env.try_update_admin(&admin1, &admin2.pubkey()).unwrap();
-    env.try_update_admin(&admin2, &admin3.pubkey()).unwrap();
+    // Chain: admin1 -> admin2 -> admin3 (cross-Keypair: two-sig handover)
+    env.try_update_authority(&admin1, AUTHORITY_ADMIN, Some(&admin2)).unwrap();
+    env.try_update_authority(&admin2, AUTHORITY_ADMIN, Some(&admin3)).unwrap();
 
     // Only admin3 should work now
     let r1 = env.try_update_admin(&admin1, &admin1.pubkey());
