@@ -517,43 +517,84 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
 }
 
 /// Weaker-authority invariant: SetOracleAuthority on a non-Hyperp
-/// market with oracle_price_cap_e2bps == 0 must reject a non-zero
-/// authority. Without the cap, authority can move the effective price
-/// arbitrarily on every push (clamp_oracle_price is a no-op when
-/// cap == 0) — that would make authority an admin-equivalent, not a
-/// bounded fallback, and break the assumption that let UpdateAdmin burn
-/// safely with a retained authority.
-///
-/// Under the init-time invariant (non-Hyperp + min_cap=0 →
-/// oracle_authority defaults to ZERO), the rejection now happens
-/// earlier: require_admin fails because the current ORACLE slot is
-/// zero. The test verifies this stronger property — such a market is
-/// PERMANENTLY unable to have oracle authority configured (zero is
-/// terminal under UpdateAuthority).
+/// Resolvability invariant: a non-Hyperp market with
+///   min_oracle_price_cap_e2bps == 0   AND
+///   permissionless_resolve_stale_slots == 0
+/// has NO resolve path. Admin ResolveMarket needs a pushed
+/// authority_price_e6; under the init-time default, oracle_authority is
+/// zero when min_cap == 0 — so nobody can push and the admin path dies
+/// instantly. ResolvePermissionless is disabled when perm_resolve == 0.
+/// The init must reject this combo outright rather than create a
+/// permanently-bricked market.
 #[test]
-fn test_set_oracle_authority_rejects_nonzero_on_non_hyperp_with_cap_zero() {
+fn test_init_rejects_non_hyperp_with_no_resolve_path() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 0, 0);
+    let data = common::encode_init_market_with_cap(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0, // invert=0 (non-Hyperp)
+        0, // min_oracle_price_cap_e2bps
+        0, // permissionless_resolve_stale_slots
+    );
+    let err = env
+        .try_init_market_raw(data)
+        .expect_err("init must reject non-Hyperp + cap=0 + perm_resolve=0");
+    assert!(
+        err.contains("0x1a"),
+        "expected InvalidConfigParam, got: {}", err,
+    );
+}
+
+/// Positive complement: same (cap=0) market with perm_resolve > 0 is
+/// allowed. The perm-stale branch of ResolveMarket settles at
+/// engine.last_oracle_price and does not require authority_price_e6,
+/// so the market retains a resolve path even with oracle_authority = 0.
+#[test]
+fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // encode_init_market_with_cap auto-sets max_crank_staleness and
+    // force_close_delay when perm_resolve > 0. perm_resolve must be
+    // <= MAX_ACCRUAL_DT_SLOTS = 100_000.
+    let data = common::encode_init_market_with_cap(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0,      // invert (non-Hyperp)
+        0,      // min_oracle_price_cap_e2bps
+        50_000, // permissionless_resolve_stale_slots
+    );
+    env.try_init_market_raw(data)
+        .expect("non-Hyperp + cap=0 + perm_resolve>0 must init OK");
+}
+
+/// Burn guard: UpdateAuthority may not zero oracle_authority on a non-
+/// Hyperp market when perm_resolve == 0. The burn would remove the only
+/// path that populates authority_price_e6 (PushOraclePrice), and
+/// perm_resolve == 0 means ResolvePermissionless never matures — every
+/// subsequent ResolveMarket call would reject on authority_price_e6 == 0.
+#[test]
+fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Non-Hyperp, cap > 0 (so oracle_authority is admin at init),
+    // perm_resolve == 0.
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // oracle_authority is zero at init (new invariant). require_admin
-    // rejects any signer.
+    // Attempt to burn oracle authority. Must reject.
     let err = env
-        .try_set_oracle_authority_raw(&admin, &admin.pubkey())
-        .expect_err(
-            "UpdateAuthority(ORACLE) must reject — non-Hyperp + \
-             min_cap==0 markets have oracle_authority = 0 at init \
-             and zero is terminal",
-        );
-    // EngineUnauthorized (0xf) or InvalidConfigParam (0x1a) both
-    // indicate rejection. The earlier-failing error under the new
-    // invariant is 0xf.
+        .try_update_authority(&admin, common::AUTHORITY_ORACLE, None)
+        .expect_err("oracle-authority burn must reject without perm_resolve");
     assert!(
-        err.contains("0xf") || err.contains("0x1a"),
-        "expected rejection error, got: {}", err,
+        err.contains("0x1a"),
+        "expected InvalidConfigParam, got: {}", err,
     );
 }
 
@@ -779,7 +820,9 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     // Per-market admin limits (current wire format)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Non-Hyperp + cap=0 + perm_resolve=0 is rejected by the
+    // resolvability invariant; ship cap=MAX to satisfy it.
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps

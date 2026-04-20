@@ -59,6 +59,18 @@ pub mod constants {
     /// it pays for its full elapsed interval in one charge.
     pub const FEE_SWEEP_BUDGET: usize = 128;
 
+    // Compile-time invariant: the crank's total fee-sync budget
+    // (FEE_SWEEP_BUDGET) must accommodate the engine's per-crank
+    // liquidation/candidate-sync allowance. The candidate-sync path
+    // caps itself at min(LIQ_BUDGET_PER_CRANK, FEE_SWEEP_BUDGET); if
+    // the engine constant were raised above the wrapper constant the
+    // belt-and-braces min() would silently under-apply the engine
+    // budget. Assert the relation so a mismatch is a build error.
+    const _: () = assert!(
+        (percolator::LIQ_BUDGET_PER_CRANK as usize) <= FEE_SWEEP_BUDGET,
+        "LIQ_BUDGET_PER_CRANK must not exceed FEE_SWEEP_BUDGET"
+    );
+
     // ── Engine envelope constants (wrapper-owned, immutable per deployment) ──
     //
     // These values populate the engine's per-market RiskParams envelope at
@@ -3928,6 +3940,20 @@ pub mod processor {
                 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                // Non-Hyperp resolvability: burning oracle_authority
+                // removes the only path that can populate authority_
+                // price_e6 (PushOraclePrice). Admin ResolveMarket then
+                // only works if perm_resolve is also configured — the
+                // perm-stale terminal branch uses engine.last_oracle_
+                // price instead of authority_price_e6. Refuse the
+                // burn if perm_resolve == 0, otherwise the market
+                // loses every resolve path the moment this tx lands.
+                if !oracle::is_hyperp_mode(&config)
+                    && is_burn
+                    && config.permissionless_resolve_stale_slots == 0
+                {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
             }
             AUTHORITY_INSURANCE | AUTHORITY_CLOSE => {
                 // No per-kind invariants. Burning is a legitimate
@@ -4205,6 +4231,31 @@ pub mod processor {
                     if permissionless_resolve_stale_slots > max_stale_slots {
                         return Err(ProgramError::InvalidInstructionData);
                     }
+                }
+
+                // Non-Hyperp resolvability invariant. A non-Hyperp market
+                // resolves by one of two paths:
+                //   (a) admin ResolveMarket, which requires a non-zero
+                //       authority_price_e6. The only way to populate that
+                //       field is PushOraclePrice, which in turn requires a
+                //       non-zero oracle_authority AND oracle_price_cap_
+                //       e2bps > 0. The init-time default of oracle_
+                //       authority is zero when min_oracle_price_cap_e2bps
+                //       == 0, so a zero cap removes path (a) forever.
+                //   (b) ResolvePermissionless, gated by permissionless_
+                //       stale_matured which returns false when perm_
+                //       resolve == 0.
+                // Refuse init configurations that start without BOTH
+                // paths. This preserves the "dead means resolvable"
+                // invariant for non-Hyperp markets regardless of later
+                // authority burns. Hyperp is exempt — mark is trade-
+                // sourced and the Hyperp dead-zone guard above handles
+                // its own resolvability.
+                if !is_hyperp
+                    && permissionless_resolve_stale_slots == 0
+                    && min_oracle_price_cap_e2bps == 0
+                {
+                    return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
                 // Validate custom funding parameters (same checks as UpdateConfig).

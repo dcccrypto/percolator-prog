@@ -1569,7 +1569,7 @@ fn test_position_flip_minimal_equity() {
 fn test_liquidation_reduces_position_and_charges_fee() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 0, 0); // liquidation test: no cap for large price moves
+    env.init_market_with_cap(0, 1_000_000, 0); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1772,7 +1772,7 @@ fn test_partial_withdrawal_with_position_succeeds() {
 fn test_keeper_crank_format_v1_full_close() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 0, 0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap; unrestricted for $138→$120 move
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -3729,8 +3729,10 @@ fn test_funding_bootstrap_inverted_market() {
 fn test_funding_no_cap_means_no_ewma() {
     program_path();
     let mut env = TestEnv::new();
-    // cap = 0 means EWMA is disabled
-    env.init_market_with_cap(0, 0, 0);
+    // cap = 0 means EWMA is disabled. Pair with perm_resolve > 0 so the
+    // market still has a resolve path (non-Hyperp + cap=0 + perm=0 is
+    // now rejected at init as unresolvable).
+    env.init_market_with_cap(0, 0, 50_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4075,7 +4077,7 @@ fn test_trading_fee_exact_amounts() {
 fn test_liquidation_fee_goes_to_insurance() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 0, 0); // liquidation test: no cap for large price moves
+    env.init_market_with_cap(0, 1_000_000, 0); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);

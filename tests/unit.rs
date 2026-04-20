@@ -244,7 +244,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
     encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
-    encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
+    encode_u64(1_000_000, &mut data); // min_oracle_price_cap_e2bps (resolvability invariant: cap>0 satisfies guard)
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);   // warmup_period_slots
     encode_u64(500, &mut data); // maintenance_margin_bps (must be < initial_margin_bps)
@@ -293,7 +293,7 @@ fn encode_init_market_invert(
     // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
     encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
-    encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
+    encode_u64(1_000_000, &mut data); // min_oracle_price_cap_e2bps (resolvability invariant: cap>0 satisfies guard)
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);    // warmup_period_slots
     encode_u64(500, &mut data);  // maintenance_margin_bps (must be < initial_margin_bps)
@@ -390,7 +390,9 @@ fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
 }
 
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8];
+    // UpdateAuthority { kind: AUTHORITY_ADMIN = 0, new_pubkey }
+    let mut data = vec![32u8];
+    data.push(0u8); // AUTHORITY_ADMIN
     encode_pubkey(new_admin, &mut data);
     data
 }
@@ -896,101 +898,11 @@ fn test_funding_rate_is_zero_rate_profile() {
     // The old compute_inventory_funding_bps_per_slot was dead code and was removed.
 }
 
-// --- Admin Rotation Tests ---
-
-#[test]
-fn test_admin_rotate() {
-    let mut f = setup_market();
-    let init_data = encode_init_market(&f, 100);
-
-    // Init market with admin A
-    {
-        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
-        let accounts = vec![
-            f.admin.to_info(),
-            f.slab.to_info(),
-            f.mint.to_info(),
-            f.vault.to_info(),
-            f.token_prog.to_info(),
-            f.clock.to_info(),
-            f.rent.to_info(),
-            f.pyth_index.to_info(),
-            f.system.to_info(),
-        ];
-        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
-    }
-
-    // Verify initial admin is set
-    let header = state::read_header(&f.slab.data);
-    assert_eq!(header.admin, f.admin.key.to_bytes());
-
-    // Create new admin B
-    let new_admin_b = Pubkey::new_unique();
-    let mut admin_b_account =
-        TestAccount::new(new_admin_b, solana_program::system_program::id(), 0, vec![]).signer();
-
-    // Admin A rotates to admin B
-    {
-        let accounts = vec![f.admin.to_info(), f.slab.to_info()];
-        process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin_b)).unwrap();
-    }
-
-    // Verify admin is now B
-    let header = state::read_header(&f.slab.data);
-    assert_eq!(header.admin, new_admin_b.to_bytes());
-
-    // Create new admin C
-    let new_admin_c = Pubkey::new_unique();
-
-    // Admin B rotates to admin C (proves rotation actually took effect)
-    {
-        let accounts = vec![admin_b_account.to_info(), f.slab.to_info()];
-        process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin_c)).unwrap();
-    }
-
-    // Verify admin is now C
-    let header = state::read_header(&f.slab.data);
-    assert_eq!(header.admin, new_admin_c.to_bytes());
-}
-
-#[test]
-fn test_non_admin_cannot_rotate() {
-    let mut f = setup_market();
-    let init_data = encode_init_market(&f, 100);
-
-    // Init market with admin A
-    {
-        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
-        let accounts = vec![
-            f.admin.to_info(),
-            f.slab.to_info(),
-            f.mint.to_info(),
-            f.vault.to_info(),
-            f.token_prog.to_info(),
-            f.clock.to_info(),
-            f.rent.to_info(),
-            f.pyth_index.to_info(),
-            f.system.to_info(),
-        ];
-        process_instruction(&f.program_id, &accounts, &init_data).unwrap();
-    }
-
-    // Attacker tries to rotate admin
-    let attacker = Pubkey::new_unique();
-    let mut attacker_account =
-        TestAccount::new(attacker, solana_program::system_program::id(), 0, vec![]).signer();
-    let new_admin = Pubkey::new_unique();
-
-    {
-        let accounts = vec![attacker_account.to_info(), f.slab.to_info()];
-        let res = process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin));
-        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
-    }
-
-    // Verify admin unchanged
-    let header = state::read_header(&f.slab.data);
-    assert_eq!(header.admin, f.admin.key.to_bytes());
-}
+// Admin rotation coverage lives in the integration suite
+// (tests/test_admin.rs::test_update_authority_*). The native unit
+// harness here cannot host the Clock sysvar that UpdateAuthority's
+// hard-timeout gate requires, so these tests were removed when
+// UpdateAdmin (tag 12) was replaced by UpdateAuthority (tag 32).
 
 #[test]
 fn test_oracle_inversion() {

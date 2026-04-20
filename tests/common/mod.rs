@@ -178,7 +178,10 @@ pub fn encode_init_market_with_conf_bps(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: ship max cap for non-Hyperp since the
+    // default tail has perm_resolve=0.
+    let default_cap: u64 = if feed_id == &[0u8; 32] { 0 } else { 1_000_000 };
+    data.extend_from_slice(&default_cap.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -221,7 +224,14 @@ pub fn encode_init_market_full_v2(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
+    // rejected at init. Default tail uses perm_resolve=0, so non-Hyperp
+    // feeds need cap > 0. Hyperp (feed_id all-zero) is exempt and can
+    // carry cap=0 — the wrapper promotes to DEFAULT_HYPERP_PRICE_CAP
+    // at init.
+    let is_hyperp = feed_id == &[0u8; 32];
+    let default_cap: u64 = if is_hyperp { 0 } else { 1_000_000 };
+    data.extend_from_slice(&default_cap.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -454,7 +464,17 @@ pub fn encode_init_market_with_maint_fee_bounded(
     // per-account fee accrual via sync_account_fee_to_slot_not_atomic).
     data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
+    // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
+    // rejected at init. This helper's tail uses perm_resolve=0, so
+    // promote cap=0 callers to the max cap (100%/read — essentially
+    // unrestricted) instead of failing init. Callers that want to
+    // exercise cap semantics should use a different encoder.
+    let cap = if min_oracle_price_cap_e2bps == 0 {
+        1_000_000
+    } else {
+        min_oracle_price_cap_e2bps
+    };
+    data.extend_from_slice(&cap.to_le_bytes());
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -1565,7 +1585,11 @@ pub fn encode_init_market_with_warmup(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
+    // rejected at init. Default tail has perm_resolve=0, so ship max
+    // cap to satisfy the invariant without restricting test oracle
+    // moves.
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
@@ -4929,7 +4953,8 @@ impl TestEnv {
         // Per-market admin limits (uncapped defaults for tests)
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
         data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-        data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+        // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
+        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
         // RiskParams
         data.extend_from_slice(&0u64.to_le_bytes()); // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -5010,7 +5035,8 @@ impl TestEnv {
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
         data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-        data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+        // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
+        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
         data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
         data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
@@ -7659,7 +7685,8 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
