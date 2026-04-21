@@ -5426,7 +5426,7 @@ fn test_tradecpi_zero_fill_advances_engine_time() {
     // grew from 72→136 (+64 for insurance_authority + close_authority),
     // so ENGINE_OFF is now 568. last_market_slot at engine offset 656,
     // absolute slab offset 568+656=1192.
-    const LAST_MARKET_SLOT_OFF: usize = 1192;
+    const LAST_MARKET_SLOT_OFF: usize = 1224;
 
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;
