@@ -2474,3 +2474,120 @@ fn test_deposit_rejected_after_hard_timeout_matures() {
     );
 }
 
+
+// ============================================================================
+// SIMD-0047 LastRestartSlot integration: a post-init cluster restart must
+// freeze the market at the last cached pre-restart oracle price.
+// ============================================================================
+
+/// On `InitMarket`, the wrapper snapshots the current `LastRestartSlot`
+/// sysvar reading into `config.init_restart_slot`. LiteSVM initializes the
+/// sysvar to zero by default, so fresh markets start with `init_restart_slot
+/// == 0` and any non-zero `LastRestartSlot::get()` triggers restart
+/// detection.
+#[test]
+fn test_init_market_snapshots_last_restart_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Bump the sysvar BEFORE init so we observe the snapshot, not the default.
+    env.svm.set_sysvar(&solana_sdk::sysvar::last_restart_slot::LastRestartSlot {
+        last_restart_slot: 42,
+    });
+
+    env.init_market_with_invert(0);
+
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let cfg = percolator_prog::state::read_config(&slab.data);
+    assert_eq!(
+        cfg.init_restart_slot, 42,
+        "InitMarket must capture the current LastRestartSlot sysvar reading"
+    );
+}
+
+/// A cluster restart after InitMarket makes the market permissionless-
+/// resolvable immediately, regardless of the slot-based staleness window.
+/// Resolution must settle at the last cached oracle price (pre-restart).
+#[test]
+fn test_cluster_restart_freezes_market_at_last_oracle_price() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Default LastRestartSlot (0) is snapshotted into init_restart_slot.
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Push a baseline price while the cluster is "healthy".
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup");
+    env.try_push_oracle_price(&admin, 138_000_000, 100)
+        .expect("baseline price push");
+
+    // Crank so the engine's last_oracle_price is stamped from this push.
+    env.set_slot(100);
+    env.crank();
+
+    let cfg_before = percolator_prog::state::read_config(
+        &env.svm.get_account(&env.slab).unwrap().data,
+    );
+    assert_eq!(
+        cfg_before.init_restart_slot, 0,
+        "sanity: init_restart_slot captured from default LiteSVM sysvar"
+    );
+
+    // Without a cluster restart, try_resolve_permissionless_once must fail —
+    // the hard-timeout window hasn't matured and no restart has been seen.
+    let early = env.try_resolve_permissionless_once();
+    assert!(
+        early.is_err(),
+        "pre-restart resolve attempt must fail (window not matured)"
+    );
+
+    // Simulate cluster hard-fork restart: bump LastRestartSlot past the
+    // snapshotted value.
+    env.svm.set_sysvar(&solana_sdk::sysvar::last_restart_slot::LastRestartSlot {
+        last_restart_slot: 1,
+    });
+
+    // Now the market is dead. Resolve immediately, no clock advance needed.
+    env.try_resolve_permissionless_once()
+        .expect("post-restart resolve must succeed immediately");
+
+    // Settlement price must equal the last cached pre-restart oracle price:
+    // the baseline push of 138_000_000 µUSD that the crank stamped into
+    // engine.last_oracle_price. The resolve handler mirrors that into
+    // config.authority_price_e6, which is readable by anyone.
+    let slab_after = env.svm.get_account(&env.slab).unwrap();
+    let cfg_after = percolator_prog::state::read_config(&slab_after.data);
+    assert_eq!(
+        cfg_after.authority_price_e6, 138_000_000,
+        "resolved market must settle at the last cached pre-restart oracle price"
+    );
+}
+
+/// The symmetric case: without any restart, the existing slot-based
+/// permissionless-resolve path must still require the window to mature.
+/// This guards against accidental regression where our restart hook
+/// collapses into "always stale."
+#[test]
+fn test_no_restart_preserves_slot_based_stale_window() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup");
+    env.try_push_oracle_price(&admin, 138_000_000, 100)
+        .expect("price push");
+    env.set_slot(100);
+    env.crank();
+
+    // No sysvar bump; LastRestartSlot remains at its init-time snapshot (0).
+    // Immediate resolve must fail — we still require the slot-staleness
+    // window to elapse.
+    let result = env.try_resolve_permissionless_once();
+    assert!(
+        result.is_err(),
+        "without a restart, permissionless resolve must wait for slot-staleness window"
+    );
+}

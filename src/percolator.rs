@@ -1216,6 +1216,10 @@ pub mod error {
         /// Caller must run the dedicated `CatchupAccrue` instruction one
         /// or more times to commit incremental progress, then retry.
         CatchupRequired,
+        /// Deposit rejected: post-deposit `c_tot` would exceed
+        /// `tvl_insurance_cap_mult * insurance_fund.balance`.
+        /// Only triggered when the admin has enabled the cap via UpdateConfig.
+        DepositCapExceeded,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1334,6 +1338,9 @@ pub mod ix {
             funding_k_bps: u64,
             funding_max_premium_bps: i64,
             funding_max_e9_per_slot: i64,
+            /// Admin-opt-in deposit cap multiplier. 0 disables the check.
+            /// See `MarketConfig.tvl_insurance_cap_mult`.
+            tvl_insurance_cap_mult: u16,
         },
         /// Push oracle price (oracle authority only).
         /// Stores the price for use by crank/trade operations.
@@ -1668,16 +1675,18 @@ pub mod ix {
                     Ok(Instruction::CloseSlab)
                 }
                 14 => {
-                    // UpdateConfig — funding params only
+                    // UpdateConfig — funding params + TVL:insurance cap
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
                     let funding_max_premium_bps = read_i64(&mut rest)?;
                     let funding_max_e9_per_slot = read_i64(&mut rest)?;
+                    let tvl_insurance_cap_mult = read_u16(&mut rest)?;
                     Ok(Instruction::UpdateConfig {
                         funding_horizon_slots,
                         funding_k_bps,
                         funding_max_premium_bps,
                         funding_max_e9_per_slot,
+                        tvl_insurance_cap_mult,
                     })
                 }
                 // Tag 16 (SetOracleAuthority) deleted — use
@@ -2069,8 +2078,15 @@ pub mod state {
         /// Max bps of insurance fund withdrawable per withdrawal (1-10000).
         /// 0 = disabled (no live-market withdrawals allowed).
         pub insurance_withdraw_max_bps: u16,
-        /// Padding for alignment.
-        pub _iw_padding: [u8; 6],
+        /// Admin-opt-in deposit cap: total user capital `c_tot` after a
+        /// deposit must satisfy `c_tot_new <= tvl_insurance_cap_mult *
+        /// insurance_fund.balance`. 0 disables the check (default).
+        /// Tuned by admin via UpdateConfig; typical production values are
+        /// 10–100 (mature perp DEXs run ~20× insurance coverage).
+        pub tvl_insurance_cap_mult: u16,
+        /// Padding for alignment (was [u8; 6]; shrunk when
+        /// tvl_insurance_cap_mult claimed 2 bytes of the former slot).
+        pub _iw_padding: [u8; 4],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
         pub _iw_padding2: [u64; 2],
@@ -4671,7 +4687,8 @@ pub mod processor {
                     min_oracle_price_cap_e2bps,
                     // Insurance withdrawal limits (immutable after init)
                     insurance_withdraw_max_bps,
-                    _iw_padding: [0u8; 6],
+                    tvl_insurance_cap_mult: 0, // disabled at init; admin opts in via UpdateConfig
+                    _iw_padding: [0u8; 4],
                     insurance_withdraw_cooldown_slots,
                     _iw_padding2: [0; 2],
                     last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
@@ -4951,6 +4968,26 @@ pub mod processor {
                 let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
                 if dust_check != 0 {
                     return Err(ProgramError::InvalidArgument);
+                }
+
+                // TVL:insurance cap (admin opt-in). Enforced BEFORE the
+                // SPL transfer so rejected deposits don't move funds.
+                // Formula: `c_tot_new <= k * insurance_fund.balance`.
+                // k=0 disables the check; nonzero k with zero insurance
+                // means no deposits accepted — operator is expected to
+                // seed insurance (via TopUpInsurance or fee accumulation)
+                // before enabling or raising k.
+                if config.tvl_insurance_cap_mult > 0 {
+                    let (units_for_cap, _) =
+                        crate::units::base_to_units(amount, config.unit_scale);
+                    let engine_r = zc::engine_ref(&data)?;
+                    let ins = engine_r.insurance_fund.balance.get();
+                    let c_tot_now = engine_r.c_tot.get();
+                    let cap = ins.saturating_mul(config.tvl_insurance_cap_mult as u128);
+                    let c_tot_new = c_tot_now.saturating_add(units_for_cap as u128);
+                    if c_tot_new > cap {
+                        return Err(PercolatorError::DepositCapExceeded.into());
+                    }
                 }
 
                 // Transfer base tokens to vault
@@ -6785,6 +6822,7 @@ pub mod processor {
                 funding_k_bps,
                 funding_max_premium_bps,
                 funding_max_e9_per_slot,
+                tvl_insurance_cap_mult,
             } => {
                 // Accounts: (admin, slab, clock, oracle).
                 // For non-Hyperp markets the oracle is REQUIRED. Allowing the
@@ -6940,6 +6978,7 @@ pub mod processor {
                 config.funding_k_bps = funding_k_bps;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_e9_per_slot = funding_max_e9_per_slot;
+                config.tvl_insurance_cap_mult = tvl_insurance_cap_mult;
                 // Engine v12.18.1: accrue_market_to only updates market-global state
                 // (K/F/slot_last). No per-account touches means no resets to
                 // schedule or finalize, so the end-of-instruction lifecycle — which
@@ -8123,7 +8162,12 @@ pub mod processor {
 
                 let mut config = state::read_config(&data);
 
-                if config.permissionless_resolve_stale_slots == 0 {
+                // A post-init cluster-restart (SIMD-0047 LastRestartSlot
+                // bump) freezes the market unconditionally — bypass the
+                // "feature disabled" gate so markets with no slot-based
+                // staleness window can still be resolved after a restart.
+                let restarted = oracle::cluster_restarted_since_init(&config);
+                if !restarted && config.permissionless_resolve_stale_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 

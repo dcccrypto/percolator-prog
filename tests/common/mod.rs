@@ -2638,6 +2638,29 @@ pub fn encode_update_config(
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes()); // i64
     data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes()); // i64
+    // tvl_insurance_cap_mult (u16). Default-helper path keeps the cap
+    // disabled (0); dedicated helper encode_update_config_with_cap
+    // sets it explicitly.
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data
+}
+
+/// Variant of encode_update_config that sets the admin-opt-in deposit cap
+/// (tvl_insurance_cap_mult). 0 disables; nonzero enforces
+/// `c_tot_new <= k * insurance_fund.balance` on DepositCollateral.
+pub fn encode_update_config_with_cap(
+    funding_horizon_slots: u64,
+    funding_k_bps: u64,
+    funding_max_premium_bps: i64,
+    funding_max_e9_per_slot: i64,
+    tvl_insurance_cap_mult: u16,
+) -> Vec<u8> {
+    let mut data = vec![14u8]; // Tag 14: UpdateConfig
+    data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
+    data.extend_from_slice(&funding_k_bps.to_le_bytes());
+    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
+    data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
+    data.extend_from_slice(&tvl_insurance_cap_mult.to_le_bytes());
     data
 }
 

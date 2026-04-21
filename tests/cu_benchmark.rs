@@ -695,6 +695,7 @@ fn encode_update_config(
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes()); // tvl_insurance_cap_mult (disabled)
     data
 }
 

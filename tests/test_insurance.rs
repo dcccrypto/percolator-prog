@@ -1222,3 +1222,165 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
     assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
 }
+
+// ============================================================================
+// TVL:insurance deposit cap (admin opt-in)
+// ============================================================================
+//
+// `MarketConfig.tvl_insurance_cap_mult` gates DepositCollateral such that
+// post-deposit `c_tot <= k * insurance_fund.balance`. Default at init is 0
+// (disabled); admin enables via UpdateConfig. These tests verify:
+//   1. Default init leaves the cap disabled (value = 0).
+//   2. Enabling via UpdateConfig persists the value.
+//   3. An enabled cap rejects deposits that would exceed the ceiling.
+//   4. An enabled cap accepts deposits that stay within the ceiling.
+//   5. Disabled cap (k=0) accepts arbitrarily large deposits.
+//   6. Enabled cap with zero insurance rejects any deposit (bootstrap case).
+
+fn encode_update_config_with_cap_tag(k: u16) -> Vec<u8> {
+    // Same wire format as encode_update_config, plus a trailing u16.
+    let mut data = vec![14u8]; // Tag 14 = UpdateConfig
+    data.extend_from_slice(&3600u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&100i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&10i64.to_le_bytes());  // funding_max_e9_per_slot
+    data.extend_from_slice(&k.to_le_bytes());      // tvl_insurance_cap_mult
+    data
+}
+
+fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), String> {
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(admin.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(env.slab, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_update_config_with_cap_tag(k),
+    };
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+}
+
+/// Fresh markets default to cap disabled (k=0).
+#[test]
+fn test_deposit_cap_default_disabled() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let cfg = percolator_prog::state::read_config(&slab.data);
+    assert_eq!(
+        cfg.tvl_insurance_cap_mult, 0,
+        "tvl_insurance_cap_mult must default to 0 (disabled)"
+    );
+}
+
+/// Admin can enable the cap via UpdateConfig and the value persists.
+#[test]
+fn test_deposit_cap_enable_via_update_config() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let cfg = percolator_prog::state::read_config(&slab.data);
+    assert_eq!(cfg.tvl_insurance_cap_mult, 20, "cap must persist");
+}
+
+/// Cap enabled with k=20 and insurance=1_000 must reject a deposit of
+/// 20_001 (exceeds 20 * 1_000 = 20_000) and accept a deposit of 20_000.
+#[test]
+fn test_deposit_cap_enforced() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+
+    // Seed insurance so the cap denominator is nonzero.
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+    assert_eq!(env.read_insurance_balance(), 1_000);
+
+    // Enable the cap at k=20 → ceiling = 20_000 units of c_tot.
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+
+    // init_user itself deposits a 100-unit account-open fee, so c_tot = 100
+    // immediately after onboarding. Cap ceiling is 20_000 units.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    // Exact-at-ceiling deposit: 100 (already there) + 19_900 = 20_000 = cap.
+    env.try_deposit(&user, user_idx, 19_900)
+        .expect("deposit at ceiling must succeed");
+
+    // Next deposit of 1 would push c_tot to 20_001 > 20_000 → reject.
+    let over = env.try_deposit(&user, user_idx, 1);
+    assert!(
+        over.is_err(),
+        "deposit that would exceed k * insurance must be rejected"
+    );
+}
+
+/// Cap disabled (k=0) accepts arbitrary deposits even with zero insurance.
+#[test]
+fn test_deposit_cap_disabled_allows_any_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+    // Do NOT call UpdateConfig — cap stays at default 0.
+    assert_eq!(env.read_insurance_balance(), 0, "fresh market has zero insurance");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.try_deposit(&user, user_idx, 1_000_000)
+        .expect("deposit with cap disabled must succeed even with zero insurance");
+}
+
+/// Cap enabled with zero insurance rejects any deposit (bootstrap case).
+/// Operator is expected to seed insurance before enabling the cap.
+#[test]
+fn test_deposit_cap_zero_insurance_rejects() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+
+    // Enable cap WITHOUT seeding insurance.
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+    assert_eq!(env.read_insurance_balance(), 0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    let result = env.try_deposit(&user, user_idx, 1);
+    assert!(
+        result.is_err(),
+        "deposit with enabled cap and zero insurance must be rejected"
+    );
+}
