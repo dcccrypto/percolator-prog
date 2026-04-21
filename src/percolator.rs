@@ -1220,6 +1220,14 @@ pub mod error {
         /// `tvl_insurance_cap_mult * insurance_fund.balance`.
         /// Only triggered when the admin has enabled the cap via UpdateConfig.
         DepositCapExceeded,
+        /// `WithdrawInsuranceLimited` called within the configured
+        /// `insurance_withdraw_cooldown_slots` window.
+        InsuranceWithdrawCooldown,
+        /// `WithdrawInsuranceLimited` amount exceeds
+        /// `insurance_withdraw_max_bps * insurance_fund.balance / 10_000`
+        /// (with a minimum floor of 1 unit to avoid Zeno's-paradox lockout
+        /// at small bps × small insurance).
+        InsuranceWithdrawCapExceeded,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1356,20 +1364,28 @@ pub mod ix {
         /// Resolve market: force-close all positions at admin oracle price, enter withdraw-only mode.
         /// Admin only. Uses authority_price_e6 as settlement price.
         ResolveMarket,
-        /// Withdraw insurance fund balance. Gated by the scoped
-        /// `header.insurance_authority`. Insurance withdrawal is
-        /// purely BINARY: insurance_authority either has full
-        /// withdrawal power or it's burned to zero (no paper-policy
-        /// in between). The former SetInsuranceWithdrawPolicy /
-        /// WithdrawInsuranceLimited instructions were removed —
-        /// they were non-binding (same signer could always bypass by
-        /// calling the unbounded path) and added complexity without
-        /// a real security property.
+        /// Withdraw insurance fund balance (UNBOUNDED). Gated by
+        /// `header.insurance_authority`; requires market resolved +
+        /// all accounts closed. For live, bounded extraction see
+        /// `WithdrawInsuranceLimited` (tag 23). The two paths have
+        /// structurally DISJOINT authority gates — this is what makes
+        /// the bounded path's bps + cooldown bounds un-bypassable.
         WithdrawInsurance,
         /// Admin force-close an abandoned account after market resolution.
         /// Requires RESOLVED flag, zero position, admin signer.
         AdminForceCloseAccount {
             user_idx: u16,
+        },
+        /// BOUNDED live insurance withdrawal. Gated by
+        /// `header.insurance_operator` (distinct from `insurance_authority`
+        /// — the split is what makes the bounds meaningful). Per-call
+        /// amount capped at `config.insurance_withdraw_max_bps *
+        /// insurance_fund.balance / 10_000` with a floor of 1 unit
+        /// (anti-Zeno). Calls must be at least
+        /// `config.insurance_withdraw_cooldown_slots` apart. Works on
+        /// LIVE markets only; resolved markets use the unbounded tag 20.
+        WithdrawInsuranceLimited {
+            amount: u64,
         },
         // Tag 24 QueryLpFees removed. The instruction exposed
         // `Account.fee_credits` as an "earned fees" query, but
@@ -1711,11 +1727,20 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::AdminForceCloseAccount { user_idx })
                 }
-                // Tags 22 (SetInsuranceWithdrawPolicy) and 23
-                // (WithdrawInsuranceLimited) deleted — the bounded
-                // policy was non-binding (same insurance_authority
-                // could bypass via tag 20 WithdrawInsurance) and
-                // added complexity without a real security property.
+                // Tag 22 (SetInsuranceWithdrawPolicy) deleted — policy
+                // was folded into config fields set at init/via
+                // UpdateConfig, no separate setter instruction needed.
+                //
+                // Tag 23 (WithdrawInsuranceLimited) RESTORED with a
+                // separate scoped authority (`header.insurance_operator`)
+                // that cannot call the unbounded tag 20. The prior
+                // deletion rationale was "same signer could bypass" —
+                // that no longer holds now that the auth scopes are
+                // structurally disjoint.
+                23 => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::WithdrawInsuranceLimited { amount })
+                }
                 // Tag 24 (QueryLpFees) removed — fell out of the ABI
                 // because fee_credits is a debt counter, not an LP
                 // earnings counter. See the enum comment.
@@ -2003,6 +2028,17 @@ pub mod state {
         /// or burned via UpdateAuthority { kind=CLOSE }. Burning
         /// traps rent forever (the traders-are-rug-proof setting).
         pub close_authority: [u8; 32],
+        /// Scoped authority: may execute `WithdrawInsuranceLimited`
+        /// (tag 23) — a bounded live fee-extraction path enforcing
+        /// `config.insurance_withdraw_max_bps` per withdrawal and
+        /// `config.insurance_withdraw_cooldown_slots` between them.
+        /// Structurally CANNOT call tag 20 (`WithdrawInsurance`),
+        /// whose unbounded drain is gated on `insurance_authority`.
+        /// The auth split is load-bearing: it's what makes the bounds
+        /// un-bypassable. Burn to lock fee extraction. Independent of
+        /// all other authorities; rotated via
+        /// UpdateAuthority { kind=INSURANCE_OPERATOR }.
+        pub insurance_operator: [u8; 32],
     }
 
     /// Offset of _reserved field in SlabHeader, derived from offset_of! for correctness.
@@ -4028,6 +4064,9 @@ pub mod processor {
     pub const AUTHORITY_ORACLE: u8 = 1;
     pub const AUTHORITY_INSURANCE: u8 = 2;
     pub const AUTHORITY_CLOSE: u8 = 3;
+    /// Scoped live-withdrawal authority. Cannot call tag 20
+    /// (unbounded), only tag 23 (`WithdrawInsuranceLimited`).
+    pub const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
 
     /// Standalone handler for UpdateAuthority. Extracted from
     /// process_instruction to keep its stack frame independent —
@@ -4087,6 +4126,7 @@ pub mod processor {
             AUTHORITY_ORACLE => config.oracle_authority,
             AUTHORITY_INSURANCE => header.insurance_authority,
             AUTHORITY_CLOSE => header.close_authority,
+            AUTHORITY_INSURANCE_OPERATOR => header.insurance_operator,
             _ => return Err(ProgramError::InvalidInstructionData),
         };
         require_admin(current_bytes, a_current.key)?;
@@ -4155,10 +4195,14 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
             }
-            AUTHORITY_INSURANCE | AUTHORITY_CLOSE => {
+            AUTHORITY_INSURANCE | AUTHORITY_CLOSE | AUTHORITY_INSURANCE_OPERATOR => {
                 // No per-kind invariants. Burning is a legitimate
                 // no-rug configuration; setting to any pubkey is a
-                // normal delegation.
+                // normal delegation. The insurance_operator kind is
+                // structurally prevented from calling tag 20 because
+                // the `require_admin(header.insurance_authority, ...)`
+                // check in WithdrawInsurance looks at a different
+                // field — auth scopes are disjoint.
             }
             _ => unreachable!(),
         }
@@ -4189,6 +4233,10 @@ pub mod processor {
             }
             AUTHORITY_CLOSE => {
                 header.close_authority = new_bytes;
+                state::write_header(&mut data, &header);
+            }
+            AUTHORITY_INSURANCE_OPERATOR => {
+                header.insurance_operator = new_bytes;
                 state::write_header(&mut data, &header);
             }
             _ => unreachable!(),
@@ -4738,6 +4786,7 @@ pub mod processor {
                     // call UpdateAuthority with the specific kind.
                     insurance_authority: a_admin.key.to_bytes(),
                     close_authority: a_admin.key.to_bytes(),
+                    insurance_operator: a_admin.key.to_bytes(),
                 };
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
@@ -7733,6 +7782,151 @@ pub mod processor {
                 )?;
             }
 
+            Instruction::WithdrawInsuranceLimited { amount } => {
+                // BOUNDED live insurance withdrawal.
+                //
+                // Auth: `header.insurance_operator` (distinct from
+                // `insurance_authority` which gates the unbounded tag 20).
+                // This auth split is structural — an operator with only
+                // `insurance_operator` CANNOT bypass the bounds by
+                // calling tag 20.
+                //
+                // Bounds:
+                //   per-call amount ≤ max(10, bps_cap), clamped to insurance
+                //     where bps_cap = insurance × max_bps / 10_000
+                //   cooldown: clock.slot - last_withdraw_slot ≥ cooldown_slots
+                //
+                // The 10-unit floor (anti-Zeno) lets the fund drain to zero
+                // even when max_bps × insurance < 10.
+                //
+                // Live markets only. For resolved markets use tag 20
+                // (whose terminal-surplus sweep also folds residue into
+                // the payout — not replicated here).
+                const MIN_WITHDRAW_FLOOR_UNITS: u128 = 10;
+
+                accounts::expect_len(accounts, 7)?;
+                let a_operator = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_operator_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_vault_pda = &accounts[5];
+                let a_clock = &accounts[6];
+
+                accounts::expect_signer(a_operator)?;
+                accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                // Live markets only. Resolved markets go through tag 20.
+                if zc::engine_ref(&data)?.is_resolved() {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                let header = state::read_header(&data);
+                require_admin(header.insurance_operator, a_operator.key)?;
+
+                let mut config = state::read_config(&data);
+                let clock = Clock::from_account_info(a_clock)?;
+
+                // Hard-timeout gate: don't mutate a matured market.
+                if oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+
+                // Feature-disabled gate: max_bps == 0 means "bounded path
+                // turned off." Operator must opt in at init or via
+                // UpdateConfig (field is admin-set, not operator-set).
+                if config.insurance_withdraw_max_bps == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
+                // Cooldown: first call (last_slot == 0) bypasses. Subsequent
+                // calls require clock.slot - last ≥ cooldown_slots.
+                let last = config.last_insurance_withdraw_slot;
+                if last != 0
+                    && clock.slot.saturating_sub(last) < config.insurance_withdraw_cooldown_slots
+                {
+                    return Err(PercolatorError::InsuranceWithdrawCooldown.into());
+                }
+
+                let (amount_units, dust) =
+                    crate::units::base_to_units(amount, config.unit_scale);
+                if dust != 0 || amount_units == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Compute per-call cap: bps × insurance / 10_000, floor
+                // lifted to MIN_WITHDRAW_FLOOR_UNITS, clamped to insurance.
+                let ins = zc::engine_ref(&data)?.insurance_fund.balance.get();
+                if ins == 0 {
+                    return Err(PercolatorError::EngineInsufficientBalance.into());
+                }
+                let bps_cap = ins
+                    .saturating_mul(config.insurance_withdraw_max_bps as u128)
+                    / 10_000;
+                let cap = core::cmp::max(bps_cap, MIN_WITHDRAW_FLOOR_UNITS);
+                let cap = core::cmp::min(cap, ins);
+                if (amount_units as u128) > cap {
+                    return Err(PercolatorError::InsuranceWithdrawCapExceeded.into());
+                }
+
+                // Vault + ATA checks (reuse the pattern from tag 20).
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id,
+                    a_slab.key,
+                    config.vault_authority_bump,
+                )?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
+                verify_token_account(a_operator_ata, a_operator.key, &mint)?;
+                accounts::expect_key(a_vault_pda, &auth)?;
+
+                // Commit state changes BEFORE the CPI. The CPI is SPL
+                // Token, which cannot re-enter this program, so ordering
+                // is safe; doing state-then-CPI means a CPI failure
+                // reverts the whole tx atomically.
+                {
+                    let engine = zc::engine_mut(&mut data)?;
+                    let new_ins = ins - (amount_units as u128);
+                    engine.insurance_fund.balance = percolator::U128::new(new_ins);
+                    let v = engine.vault.get();
+                    engine.vault = percolator::U128::new(
+                        v.checked_sub(amount_units as u128)
+                            .ok_or(PercolatorError::EngineInsufficientBalance)?,
+                    );
+                }
+                config.last_insurance_withdraw_slot = clock.slot;
+                state::write_config(&mut data, &config);
+                drop(data);
+
+                // PDA-signed SPL Token transfer.
+                let vault_tag: &[u8] = b"vault";
+                let slab_bytes = a_slab.key.to_bytes();
+                let seed1: &[u8] = vault_tag;
+                let seed2: &[u8] = &slab_bytes;
+                let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_operator_ata,
+                    a_vault_pda,
+                    amount,
+                    &signer_seeds,
+                )?;
+            }
 
             Instruction::AdminForceCloseAccount { user_idx } => {
                 // Admin force-close an abandoned account after market resolution.

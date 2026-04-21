@@ -1193,8 +1193,8 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
 
     // Snapshot fields.
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + authority_price_e6(176)
-    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + authority_timestamp(184)
+    const AUTH_PRICE_OFF: usize = 344; // HEADER_LEN(168) + authority_price_e6(176)
+    const AUTH_TS_OFF: usize = 352;    // HEADER_LEN(168) + authority_timestamp(184)
     let (price_before, ts_before) = {
         let slab = env.svm.get_account(&env.slab).unwrap().data;
         (
@@ -1382,5 +1382,117 @@ fn test_deposit_cap_zero_insurance_rejects() {
     assert!(
         result.is_err(),
         "deposit with enabled cap and zero insurance must be rejected"
+    );
+}
+
+/// Positive: a deposit blocked by the cap becomes allowed once the admin
+/// widens k. The operator pattern is "start tight, loosen as insurance
+/// grows" — this test verifies a deposit attempt that was over-cap
+/// succeeds after the cap is raised, without any other state change.
+#[test]
+fn test_deposit_cap_widened_unblocks_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    // Tight cap: k=20 → ceiling = 20_000.
+    send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // c_tot = 100
+
+    // c_tot = 100; try to deposit 19_901 → c_tot_new = 20_001 > 20_000 → reject.
+    let blocked = env.try_deposit(&user, user_idx, 19_901);
+    assert!(blocked.is_err(), "deposit must be blocked at k=20");
+
+    // Admin widens: k=40 → ceiling = 40_000.
+    send_update_config(&mut env, &admin, 40).expect("widen cap to k=40");
+
+    // Previously-blocked deposit of 19_901 now fits within the 40_000 cap.
+    env.try_deposit(&user, user_idx, 19_901)
+        .expect("widened cap must unblock the previously-rejected deposit");
+}
+
+/// Positive: the alternative widening path — top up insurance rather than
+/// raising k. If insurance grows from 1_000 to 2_000 with k=20, the cap
+/// doubles from 20_000 to 40_000 without any config change.
+#[test]
+fn test_deposit_cap_topping_up_insurance_unblocks_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // c_tot = 100
+
+    let blocked = env.try_deposit(&user, user_idx, 19_901);
+    assert!(blocked.is_err(), "deposit must be blocked at insurance=1000");
+
+    // Grow insurance: 1_000 → 2_000. Cap rises 20_000 → 40_000.
+    env.top_up_insurance(&insurance_payer, 1_000);
+    assert_eq!(env.read_insurance_balance(), 2_000);
+
+    env.try_deposit(&user, user_idx, 19_901)
+        .expect("topped-up insurance must unblock the deposit");
+}
+
+/// Negative: tightening the cap via UpdateConfig stops new deposits even
+/// when prior deposits were allowed. Equivalent economic effect to
+/// "insurance was higher, now it's lower" — we tighten via k because
+/// live insurance withdrawals (WithdrawInsuranceLimited) were removed
+/// and WithdrawInsurance requires a resolved market.
+#[test]
+fn test_deposit_cap_tightened_blocks_further_deposits() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("push price");
+
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    // Loose cap: k=40 → ceiling = 40_000.
+    send_update_config(&mut env, &admin, 40).expect("enable cap k=40");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // c_tot = 100
+
+    // Deposit 19_900 → c_tot = 20_000. Fits under 40_000 cap.
+    env.try_deposit(&user, user_idx, 19_900)
+        .expect("initial deposit must succeed under loose cap");
+
+    // Admin tightens: k=20 → new ceiling = 20_000. c_tot already there.
+    send_update_config(&mut env, &admin, 20).expect("tighten to k=20");
+
+    // Any further deposit now over-cap → rejected.
+    let blocked = env.try_deposit(&user, user_idx, 1);
+    assert!(
+        blocked.is_err(),
+        "tightened cap must reject deposits that exceed the new ceiling"
     );
 }

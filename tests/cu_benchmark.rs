@@ -32,11 +32,11 @@ use std::path::PathBuf;
 // tests) has been removed; integration tests go through the BPF binary.
 // BPF-target SLAB_LEN, cfg-gated by deployment-size feature.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-const SLAB_LEN: usize = 96696;
+const SLAB_LEN: usize = 96728;
 #[cfg(all(feature = "medium", not(feature = "small")))]
-const SLAB_LEN: usize = 382488;
+const SLAB_LEN: usize = 382520;
 #[cfg(not(any(feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1525656;
+const SLAB_LEN: usize = 1525688;
 const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -144,7 +144,7 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&risk_reduction_threshold.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&1000u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -781,6 +781,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
 
 #[cfg(not(feature = "test"))]
 #[test]
+#[cfg(not(any(feature = "small", feature = "medium")))]
 fn benchmark_worst_case_scenarios() {
     println!("\n=== WORST-CASE CRANK CU BENCHMARK ===");
     println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
@@ -1678,6 +1679,7 @@ fn benchmark_worst_case_scenarios() {
 /// Measures CU consumed for each instruction under typical conditions.
 #[cfg(not(feature = "test"))]
 #[test]
+#[cfg(not(any(feature = "small", feature = "medium")))]
 fn benchmark_all_instructions() {
     println!("\n=== PER-INSTRUCTION CU BENCHMARK ===\n");
 

@@ -486,7 +486,7 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .expect("set authority must succeed");
 
-    const AUTHORITY_OFF: usize = 136 + 128;
+    const AUTHORITY_OFF: usize = 168 + 128;
     let authority_bytes = {
         let slab = env.svm.get_account(&env.slab).unwrap();
         let mut b = [0u8; 32];
@@ -978,9 +978,9 @@ fn test_admin_limits_lifecycle() {
     // maintenance_fee_per_slot: u128 @ config offset 352
     // max_insurance_floor: u128 @ config offset 208
     // min_oracle_price_cap_e2bps: u64 @ config offset 224
-    const MAINT_FEE_OFF: usize = 136 + 352;
-    const MAX_INS_FLOOR_OFF: usize = 136 + 208;
-    const MIN_OPC_OFF: usize = 136 + 224;
+    const MAINT_FEE_OFF: usize = 168 + 352;
+    const MAX_INS_FLOOR_OFF: usize = 168 + 208;
+    const MIN_OPC_OFF: usize = 168 + 224;
 
     let maint_fee = u128::from_le_bytes(
         slab.data[MAINT_FEE_OFF..MAINT_FEE_OFF + 16].try_into().unwrap(),

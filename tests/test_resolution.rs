@@ -820,7 +820,7 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
 
     // Read index right after push (should still be initial since the push's
     // internal index flush used the OLD mark = initial = 100M, so no movement)
-    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 368; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     let index_after_push =
         u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
@@ -996,7 +996,7 @@ fn test_resolve_permissionless_after_staleness() {
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         // max_staleness_secs: at slab offset 72+96=168
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes()); // 30 seconds
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes()); // 30 seconds
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1081,7 +1081,7 @@ fn test_resolve_permissionless_settlement_price() {
     // Override max_staleness_secs to 30 for faster staleness detection
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1107,7 +1107,7 @@ fn test_resolve_permissionless_rejects_wrong_oracle() {
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
         let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
         slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1198,7 +1198,7 @@ fn test_governance_free_full_lifecycle() {
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         // max_staleness_secs at offset 72+96=168
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1271,7 +1271,7 @@ fn test_governance_free_full_lifecycle_inverted() {
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1325,7 +1325,7 @@ fn test_resolve_permissionless_inverted_market() {
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         // max_staleness_secs at offset 72+96=168
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1359,7 +1359,7 @@ fn test_resolve_permissionless_inverted_settlement_price() {
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1413,7 +1413,7 @@ fn test_resolve_permissionless_inverted_with_positions() {
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1469,7 +1469,7 @@ fn test_resolve_permissionless_empty_market_at_sentinel() {
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1561,7 +1561,7 @@ fn test_force_close_resolved_basic() {
     // Set bounded staleness for permissionless resolution
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1617,7 +1617,7 @@ fn test_force_close_resolved_rejects_before_delay() {
     env.try_init_market_raw(data).expect("init failed");
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1761,7 +1761,7 @@ fn test_init_sentinel_permissionless_resolve_deposits_only_preserves_capital() {
     // advance without us having to actually stop the mocked Pyth feed.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1806,7 +1806,7 @@ fn test_sentinel_replaced_after_first_crank() {
     env.init_market_with_cap(0, 10_000, 50);
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1867,7 +1867,7 @@ fn test_sentinel_invariant_nonzero_oi_implies_oracle_initialized() {
     // oracle, settlement uses the real price (not the sentinel).
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
     env.svm.set_sysvar(&Clock { slot: 500, unix_timestamp: 500, ..Clock::default() });
@@ -1898,7 +1898,7 @@ fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() 
     // Tighten oracle staleness so clock advance → oracle death.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1949,7 +1949,7 @@ fn test_resolve_permissionless_stamp_cleared_by_live_observation() {
     // Tighten oracle staleness window.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -1987,7 +1987,7 @@ fn test_resolve_permissionless_stamp_cleared_by_live_observation() {
     // be in place — and `!is_market_resolved` would still pass if the
     // duration check happened to not yet elapse, giving a false
     // negative on the recovery-clearing property.
-    const FIRST_OBS_STALE_OFF: usize = 136 + 296;
+    const FIRST_OBS_STALE_OFF: usize = 168 + 296;
     let stamp_after_recovery = {
         let slab = env.svm.get_account(&env.slab).unwrap();
         u64::from_le_bytes(
@@ -2075,7 +2075,7 @@ fn test_resolve_permissionless_treats_conf_too_wide_as_stampable() {
     // Set a tight conf_filter_bps and rewrite the oracle fixture with a
     // very wide confidence band so every read rejects with
     // OracleConfTooWide (publish_time stays current → NOT OracleStale).
-    const CONF_FILTER_OFF: usize = 136 + 104; // HEADER_LEN + offset_of!(MarketConfig, conf_filter_bps)
+    const CONF_FILTER_OFF: usize = 168 + 104; // HEADER_LEN + offset_of!(MarketConfig, conf_filter_bps)
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         slab.data[CONF_FILTER_OFF..CONF_FILTER_OFF + 2]
@@ -2124,7 +2124,7 @@ fn test_resolve_permissionless_treats_conf_too_wide_as_stampable() {
     // test could pass vacuously if the code path didn't stamp at all —
     // the `!is_market_resolved` check is consistent with both
     // "stamped but delay not elapsed" and "never stamped".
-    const FIRST_OBS_STALE_OFF: usize = 136 + 296;
+    const FIRST_OBS_STALE_OFF: usize = 168 + 296;
     let stamp_after_first = {
         let slab = env.svm.get_account(&env.slab).unwrap();
         u64::from_le_bytes(
@@ -2249,7 +2249,7 @@ fn test_resolve_permissionless_fresh_authority_does_not_stamp() {
     // external feed appears stale) while the authority remains fresh.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -2269,7 +2269,7 @@ fn test_resolve_permissionless_fresh_authority_does_not_stamp() {
     assert!(!env.is_market_resolved(), "market stays live (authority fresh)");
 
     // Read first_observed_stale_slot from the slab — must still be 0.
-    const FIRST_OBS_STALE_OFF: usize = 136 + 296; // HEADER_LEN + offset_of!(MarketConfig, first_observed_stale_slot)
+    const FIRST_OBS_STALE_OFF: usize = 168 + 296; // HEADER_LEN + offset_of!(MarketConfig, first_observed_stale_slot)
     let stamp = {
         let slab = env.svm.get_account(&env.slab).unwrap();
         u64::from_le_bytes(

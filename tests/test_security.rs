@@ -628,7 +628,7 @@ fn test_attack_trade_risk_increase_when_gated() {
     // SBF uses 8-byte u128 alignment (unlike x86-64 which uses 16-byte).
     // ENGINE_OFF = 440.  Within RiskEngine (SBF layout):
     //   oi_eff_long_q:  U256 (32 bytes) at engine offset 472, ends at 504
-    //   oi_eff_short_q: U256 (32 bytes) at engine offset 504, ends at 536
+    //   oi_eff_short_q: U256 (32 bytes) at engine offset 504, ends at 568
     //   side_mode_long: u8 at engine offset 424 (BPF, native 128-bit)
     // => slab absolute offset = 520 + 488 = 864
     // BPF layout: ENGINE_OFF=472, side_mode_long at engine offset
@@ -641,9 +641,9 @@ fn test_attack_trade_risk_increase_when_gated() {
     // But the diff is not uniform. Use the read_num_used helper's ENGINE offset (472)
     // and compute empirically. The oi_eff_long/short pair (32 bytes) precedes side_mode.
     // From code analysis: BPF side_mode_long at engine offset ~488.
-    // Slab absolute = 536 + 960 = 960.
+    // Slab absolute = 568 + 960 = 960.
     // Fallback: try the value and if the trade still works, try adjacent offsets.
-    const SIDE_MODE_LONG_OFF: usize = 536 + 552; // v12.18.x layout
+    const SIDE_MODE_LONG_OFF: usize = 568 + 552; // v12.18.x layout
     {
         let original_slab = env
             .svm
@@ -3643,7 +3643,7 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
     // Read last_effective_price_e6 (the index) before same-slot crank
     // last_effective_price_e6 is at config offset 312: slab bytes [384..392]
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 368; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_before =
         u64::from_le_bytes(slab_before[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert!(index_before > 0, "Index should be non-zero before crank");
@@ -3720,7 +3720,7 @@ fn test_attack_hyperp_push_extreme_price() {
     // Read stored last_effective_price_e6 - must be clamped, not u64::MAX/2
     // last_effective_price_e6 is at slab offset 384 (last u64 in config before engine)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 368; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let stored_price = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     // With 5% cap and base price 1_000_000, max clamped = 1_050_000
     assert!(
@@ -7162,7 +7162,7 @@ fn test_attack_funding_accrue_huge_dt_capped() {
     let user_pos_before = env.read_account_position(user_idx);
 
     // Jump 1 year worth of slots (~31.5M slots)
-    // accrue_funding should cap dt at 31,536,000 (~1 year)
+    // accrue_funding should cap dt at 31,568,000 (~1 year)
     env.set_slot(50_000); // within max_accrual_dt_slots=100_000
     let crank_result = env.try_crank();
     assert!(
