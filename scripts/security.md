@@ -211,3 +211,109 @@ then test passes, one commit per finding.
    maintenance_fee_per_slot == 0`. Test: init with both zero →
    rejection.
 4. **F4**: update the `ForceCloseResolved` doc to match reality.
+
+---
+
+## Additional surfaces traced in this sweep (no new findings)
+
+To justify stopping the sweep at F1–F4, these high-value surfaces
+were also traced and confirmed safe at `1795eba`:
+
+### TradeCpi adversarial matcher
+
+The matcher program is an arbitrary caller-chosen CPI target. In
+principle it could try to mutate state mid-instruction.
+Defense-in-depth is solid:
+
+- **Solana ownership rule**: the slab is owned by percolator; a
+  matcher (different program) cannot write to the slab's data
+  buffer directly, regardless of whether the slab is passed as
+  writable in the outer tx.
+- **Reentrancy guard**: `set_cpi_in_progress` is set before the
+  CPI at `src/percolator.rs:5952-5955`; every instruction handler
+  calls `slab_guard` which rejects if the flag is set
+  (`src/percolator.rs:3746-3748`). A matcher trying to re-enter
+  percolator from inside the CPI fails immediately.
+- **LP PDA validation**: `find_program_address` against
+  `["lp", slab_key, lp_idx]` — PDA key match implies only
+  percolator can sign for it, so it's always system-owned with
+  zero data. Can't be spoofed.
+- **Matcher identity binding**: `matcher_program` and
+  `matcher_context` are stored at InitLP and checked against the
+  CPI args. Can't swap matcher mid-flight.
+- **ABI echo**: the matcher must echo `req_id`, `lp_account_id`,
+  and `oracle_price_e6` back — forgery requires the matcher to
+  guess the caller's pre-CPI-computed values, which are fresh
+  per-call (`req_nonce`).
+
+### Funding rate boundary arithmetic
+
+`compute_current_funding_rate_e9` at `src/percolator.rs:3628-3652`
+was traced numerically. All intermediate products fit i128 easily
+given the configured bounds:
+
+- `diff.saturating_mul(1e9)` at worst `1.8e19 * 1e9 = 1.8e28` (fits
+  i128 = ~1.7e38).
+- `premium_e9 * funding_k_bps` post-clamp bounded at ~9.2e28.
+- Final `.clamp(-max_rate_e9, max_rate_e9)` — `max_rate_e9 ≥ 0`
+  enforced at InitMarket (`src/percolator.rs:4325-4338`) and
+  UpdateConfig (`src/percolator.rs:6797-6803`), so the clamp
+  invariant `min ≤ max` holds and `.clamp()` never panics.
+- Engine envelope (`max_abs_funding_e9_per_slot *
+  max_accrual_dt_slots`) is validated at InitMarket per
+  `validate_params` in the engine crate.
+
+### `is_resolved()` coverage across instructions
+
+Every instruction handler was checked for post-resolution gating.
+Coverage map:
+
+- **Blocks post-resolution**: `InitUser`, `InitLP`,
+  `DepositCollateral`, `WithdrawCollateral`, `KeeperCrank`,
+  `TradeNoCpi`, `TradeCpi`, `LiquidateAtOracle`, `TopUpInsurance`,
+  `UpdateConfig`, `PushHyperpMark`, `SetOraclePriceCap`,
+  `ResolveMarket` (re-resolve), `WithdrawInsuranceLimited`,
+  `ReclaimEmptyAccount`, `SettleAccount`, `DepositFeeCredits`,
+  `ConvertReleasedPnl`, `ResolvePermissionless` (re-resolve),
+  `CatchupAccrue` (confirmed at `src/percolator.rs:8314`).
+- **Requires resolved**: `WithdrawInsurance`,
+  `AdminForceCloseAccount`, `ForceCloseResolved`.
+- **Mode-aware**: `CloseAccount` (both modes, different paths).
+- **No explicit check (correct)**: `UpdateAuthority` — rotating
+  insurance_authority post-resolution is a legitimate operational
+  pattern; admin-burn has its own kind-specific invariant check.
+- **No explicit check (correct)**: `CloseSlab` — requires all
+  accounts freed + vault zero, which is only achievable in
+  Resolved mode anyway.
+
+### Vault / token account hygiene
+
+- `verify_vault_empty` at `src/percolator.rs:3816-3849` enforces
+  mint + owner + initialized + no delegate + no close_authority +
+  zero balance. Can't smuggle pre-loaded vault at init.
+- `verify_vault` at `src/percolator.rs:3777+` mirrors the checks
+  for live-market validation.
+- `verify_token_account` checks owner + mint only (doesn't derive
+  ATA) — documented as F4.
+
+### Crank reward economics
+
+`CRANK_REWARD_BPS = 5000` (50% of swept fees). Traced possible
+farming attacks:
+
+- Self-cranker receives up to 50% of all swept fees in a single
+  crank. Comes from insurance (zero-sum: insurance pays out what
+  it just collected).
+- Attacker filling dust accounts to farm rewards: nets a LOSS
+  because they paid 100% of the dust capital (which becomes the
+  fee source) but only recoup 50%. Economically unfavorable.
+- Reward is capped at post-crank insurance balance, so drain is
+  bounded. Conservation invariant (vault ≥ c_tot + insurance +
+  net_pnl) is explicitly preserved with `checked_add`.
+
+### Generation counter wrap
+
+`next_mat_counter` at `src/percolator.rs:2246-2251` uses
+`checked_add` — u64 overflow returns None → error propagates. At
+~226 billion years to overflow at 1 init/slot, not a real concern
+even ignoring the overflow check.
