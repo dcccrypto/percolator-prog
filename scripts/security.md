@@ -170,6 +170,83 @@ De-prioritize targets already listed under *Verified Secure Areas* in
 `memory/MEMORY.md`. Re-audit only if the code has changed since the
 verification date.
 
+## Perp DEX failure-modes checklist (49 categories)
+
+Curated from historical perp DEX incidents. Iterate through these
+when nothing else jumps out. Each entry names the failure and the
+observable symptom.
+
+### Liquidation failures
+1. **Under-liquidation** — position deserves liq but doesn't trigger (oracle lag, MM check off-by-one).
+2. **Over-liquidation** — liq fires on healthy position (bad clamp, stale oracle).
+3. **Liquidation fee leak** — fee > user's remaining capital, uncovered debt.
+4. **Liquidation at wrong price** — oracle vs mark divergence exploited.
+5. **Partial-liq dust cascade** — tiny residual position re-liquidates every slot.
+6. **Keeper grief / non-crank** — keeper withholds crank for profit timing.
+7. **Self-liquidation profit** — same owner profits from liquidating themselves.
+8. **Liquidation arbitrage via ADL** — liquidator pre-positions opposite side.
+
+### Funding failures
+9. **Funding rate manipulation via mark** — pay fees to push mark.
+10. **Funding snapshot race** — rate captured at wrong time window.
+11. **Funding retroactivity** — admin change applies to past slots.
+12. **Zero-OI funding boundary** — one side has no OI, funding undefined.
+13. **Funding overflow** — rate × dt exceeds math bounds.
+
+### Oracle failures
+14. **Oracle lag / stale read** — clamp breaker bypassed.
+15. **Oracle jump / cap bypass** — extreme move not clamped.
+16. **Confidence interval abuse** — wide-conf reads accepted.
+17. **Feed spoofing** — wrong feed_id in Pyth account.
+18. **Stale-matured race** — resolution-eligible vs fresh observation.
+
+### Margin failures
+19. **IM bypass on position flip** — flip uses MM instead of IM.
+20. **MM boundary off-by-one** — `>` vs `>=`.
+21. **Equity during fee accrual** — margin check on pre-fee capital.
+22. **Reserved PnL in margin** — warmup buckets counted as equity.
+
+### Ordering / MEV failures
+23. **Sandwich on trades** — front-run known orders.
+24. **Liquidation front-running** — push price, liquidate, revert.
+25. **Fee-sync timing** — trigger sync at specific slot for gain.
+26. **Cross-tx race in same block** — state mutation between txs.
+27. **Crank reward farming** — keeper selective-crank for rewards.
+
+### Admin / auth failures
+28. **Authority rotation race** — burn mid-operation.
+29. **Admin path leaked to non-admin** — missing require_admin.
+30. **Resolved-market writes** — post-resolve mutation paths.
+31. **Premarket force-close bypass** — improper force-close auth.
+
+### Accounting failures
+32. **c_tot drift from sum(capitals)** — aggregate mismatch.
+33. **pnl_pos_tot drift** — same for positive PnL.
+34. **OI imbalance** — oi_long ≠ oi_short.
+35. **Vault / capital mismatch** — tokens appear/disappear.
+36. **Fee debt → positive** — fee_credits > 0 corruption.
+
+### Numerical failures
+37. **i128::MIN negation** — abs() panics.
+38. **Wide math overflow** — u256/u512 mul exceeds.
+39. **Division by zero** — ratio denominator zero.
+40. **Rounding asymmetry** — floor/ceil on credit vs debit.
+
+### Warmup / ADL failures
+41. **Warmup bucket timing** — sched→pending→released transitions.
+42. **ADL epoch mismatch state** — stale account position count.
+43. **Full-drain reset race** — reset during inflight trade.
+44. **Haircut precision** — rounding gain/loss asymmetry.
+
+### Init / lifecycle failures
+45. **Double init** — re-init corrupts state.
+46. **Init with extreme params** — config breaks invariants.
+47. **Close with residual** — sched/pending not cleared.
+48. **Reclaim on non-flat** — reclaim fires when shouldn't.
+49. **LP identity reuse** — same lp_account_id for different instances.
+
+---
+
 ## Attack pattern library (seed for hypothesis generation)
 
 Use these as prompts when nothing obvious jumps out. Each is worth at
