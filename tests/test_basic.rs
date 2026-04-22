@@ -5333,3 +5333,146 @@ fn test_init_market_accepts_any_new_account_fee_when_unit_scale_zero() {
     env.try_init_market_raw(data)
         .expect("unit_scale=0 makes alignment trivial");
 }
+
+/// Slot-exhaustion DoS defense: maintenance fees + permissionless
+/// crank GC must drain dust accounts and free their slots WITHOUT
+/// any other user action. This is the core anti-spam mechanism — if
+/// `maintenance_fee_per_slot > 0`, an attacker who fills account
+/// slots with dust will see those slots reclaimed over time purely
+/// from cranking.
+///
+/// CURRENTLY EXPECTED TO FAIL: the engine's `garbage_collect_dust`
+/// is implemented and bounded but is NOT wired into
+/// `keeper_crank_not_atomic` (engine §9.7 comment defers GC to the
+/// explicit `ReclaimEmptyAccount` instruction). Until either the
+/// engine wires GC into the crank or the wrapper calls
+/// `garbage_collect_dust` after `keeper_crank_not_atomic`, slot
+/// reclamation requires per-account `ReclaimEmptyAccount` calls.
+#[test]
+#[ignore = "dust GC not wired into KeeperCrank — see test doc"]
+fn test_dust_account_drained_and_gc_by_crank_alone() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Maintenance fee = 1 unit per slot. Tight enough to drain a
+    // 100-unit dust account in ~100 slots without a long-running test.
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1000, // max_maintenance_fee_per_slot (vestigial arg, ignored)
+        1,    // maintenance_fee_per_slot
+        0,    // min_oracle_price_cap (helper auto-promotes to MAX)
+    );
+    env.try_init_market_raw(data).expect("init");
+
+    // Create the dust account with 100 base units (= 100 units at unit_scale=0).
+    let attacker = Keypair::new();
+    let attacker_idx = env.init_user_with_fee(&attacker, 100);
+    assert_eq!(
+        env.read_num_used_accounts(), 1,
+        "precondition: attacker account materialized",
+    );
+    let cap_after_init = env.read_account_capital(attacker_idx);
+    assert_eq!(cap_after_init, 100, "attacker holds 100 dust units");
+
+    // Run cranks at advancing slots. The wrapper's
+    // sweep_maintenance_fees charges (now_slot - last_fee_slot) ×
+    // fee_per_slot on every visit. A single account in the bitmap is
+    // visited every crank, so we just need enough cumulative dt.
+    //
+    // Strategy: 12 cranks with +10 slots each = +120 slots total.
+    // Capital 100 - 120 = saturating to 0; debt forgiven by GC.
+    for i in 1..=12 {
+        env.set_slot_and_price(100 + i * 10, 138_000_000);
+        env.crank();
+    }
+
+    let cap_after_drain = env.read_account_capital(attacker_idx);
+    assert_eq!(
+        cap_after_drain, 0,
+        "maintenance fees should drain capital to 0, got {}",
+        cap_after_drain,
+    );
+
+    // One more crank to let `garbage_collect_dust` visit the now-zero
+    // -capital flat account and free the slot.
+    env.set_slot_and_price(100 + 13 * 10, 138_000_000);
+    env.crank();
+
+    assert_eq!(
+        env.read_num_used_accounts(), 0,
+        "GC must free the dust account slot — slot exhaustion is \
+         impossible when maintenance_fee_per_slot > 0",
+    );
+}
+
+/// Stronger variant: an account holds a position and is otherwise
+/// healthy at init (capital meets the maintenance margin). As fees
+/// drain capital, the account becomes liquidatable. Crank's
+/// risk-buffer scan + liquidation pass must close the position
+/// permissionlessly, then continue draining the remaining capital
+/// to zero, then GC the slot. End-to-end: just keep cranking.
+///
+/// CURRENTLY EXPECTED TO FAIL: same root cause as
+/// `test_dust_account_drained_and_gc_by_crank_alone` — the engine's
+/// dust-GC is not wired into KeeperCrank.
+#[test]
+#[ignore = "dust GC not wired into KeeperCrank — see test doc"]
+fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1000,
+        1,    // maintenance_fee_per_slot
+        0,
+    );
+    env.try_init_market_raw(data).expect("init");
+
+    // LP with healthy capital so trades can match.
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // User with modest capital. Open a small position.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000); // 1 SOL worth
+
+    // Open a long position. Size deliberately larger than what the
+    // user's capital comfortably backs at maintenance margin (5%) so
+    // any fee-driven capital decay trips the liquidation threshold.
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    let pos_after_open = env.read_account_position(user_idx);
+    assert!(pos_after_open != 0, "precondition: user has open position, got {}", pos_after_open);
+
+    let used_after_open = env.read_num_used_accounts();
+    assert_eq!(used_after_open, 2, "LP + user materialized");
+
+    // Crank repeatedly with advancing slots. Maintenance fees drain
+    // user capital each crank; risk-buffer scan flags the unhealthy
+    // user; subsequent crank liquidates the position; further cranks
+    // continue draining residual capital to 0; GC frees the slot.
+    //
+    // Use generous iteration count and slot stride to give the full
+    // pipeline (drain → flag → liquidate → drain → GC) time to
+    // complete. Each iteration also advances the wall clock so
+    // permissionless_stale_matured doesn't trip.
+    let mut user_freed = false;
+    for i in 1..=200 {
+        env.set_slot_and_price(100 + i * 5, 138_000_000);
+        env.crank();
+        // Stop once the user slot is reclaimed.
+        if env.read_num_used_accounts() < used_after_open {
+            user_freed = true;
+            break;
+        }
+    }
+
+    assert!(
+        user_freed,
+        "user account must be liquidated and GC'd within 200 cranks \
+         purely from maintenance-fee accrual; saw num_used = {}",
+        env.read_num_used_accounts(),
+    );
+}
