@@ -263,7 +263,10 @@ pub fn encode_init_market_hyperp_with_stale(
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
     data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
-    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    // mark_min_fee must be > 0 when Hyperp + perm_resolve > 0 (F2
+    // defense against liveness spoofing via cheap self-trades).
+    let mark_min_fee = if permissionless_resolve_stale_slots > 0 { 1u64 } else { 0u64 };
+    data.extend_from_slice(&mark_min_fee.to_le_bytes());
     // force_close_delay must be > 0 when perm_resolve > 0
     let force_close = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 };
     data.extend_from_slice(&force_close.to_le_bytes());

@@ -5559,3 +5559,117 @@ fn test_dust_trade_must_not_advance_mark_ewma_last_slot() {
         clock_after_dust, clock_after_full,
     );
 }
+
+/// F2: Hyperp markets with permissionless_resolve_stale_slots > 0
+/// MUST set mark_min_fee > 0 at init. Otherwise an attacker with
+/// their own LP + matcher can self-trade every slot and refresh
+/// `last_mark_push_slot` (the ONLY Hyperp hard-timeout liveness
+/// signal), permanently blocking `ResolvePermissionless`.
+#[test]
+fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
+    let mut env = TestEnv::new();
+    // Hyperp + perm_resolve > 0 + mark_min_fee = 0 → must reject.
+    let data = common::encode_init_market_hyperp_with_fees(
+        &env.payer.pubkey(),
+        &env.mint,
+        1_000_000, // initial_mark_price
+        86_400,    // max_staleness_secs
+        0,         // trading_fee_bps
+        0,         // mark_min_fee (THE HOLE)
+    );
+    // The helper's perm_resolve = 0 in its default tail — need a
+    // variant with perm_resolve > 0. For this test, craft inline.
+    let mut data = data;
+    // Find and patch perm_resolve_stale_slots (u64). In the helper,
+    // perm_resolve sits at the start of the extended tail after
+    // insurance_withdraw_max_bps(u16) + insurance_withdraw_cooldown_slots(u64).
+    // Simpler: rebuild inline.
+    let _ = data;
+
+    // Inline construction with perm_resolve = 1000, mark_min_fee = 0.
+    let mut payload = vec![0u8];
+    payload.extend_from_slice(env.payer.pubkey().as_ref());
+    payload.extend_from_slice(env.mint.as_ref());
+    payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
+    payload.extend_from_slice(&86_400u64.to_le_bytes());
+    payload.extend_from_slice(&500u16.to_le_bytes());
+    payload.push(0u8); // invert
+    payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    payload.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark
+    payload.extend_from_slice(&0u128.to_le_bytes()); // maint_fee
+    payload.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap
+    payload.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    payload.extend_from_slice(&999u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=1000)
+    payload.extend_from_slice(&50u64.to_le_bytes());
+    payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes());
+    payload.extend_from_slice(&1u128.to_le_bytes());
+    payload.extend_from_slice(&2u128.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes()); // perm_resolve = 1000 (ENABLED)
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&500i64.to_le_bytes());
+    payload.extend_from_slice(&1_000i64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee = 0 (THE HOLE)
+    payload.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay
+
+    let err = env
+        .try_init_market_raw(payload)
+        .expect_err("Hyperp+perm_resolve+mark_min_fee=0 must reject");
+    assert!(
+        err.contains("InvalidInstructionData") || err.contains("0x0"),
+        "expected InvalidInstructionData, got: {}",
+        err,
+    );
+}
+
+/// Counterpart: Hyperp + perm_resolve + nonzero mark_min_fee is accepted.
+#[test]
+fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
+    let mut env = TestEnv::new();
+    let mut payload = vec![0u8];
+    payload.extend_from_slice(env.payer.pubkey().as_ref());
+    payload.extend_from_slice(env.mint.as_ref());
+    payload.extend_from_slice(&[0u8; 32]);
+    payload.extend_from_slice(&86_400u64.to_le_bytes());
+    payload.extend_from_slice(&500u16.to_le_bytes());
+    payload.push(0u8);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&1_000_000u64.to_le_bytes());
+    payload.extend_from_slice(&1u128.to_le_bytes()); // maintenance_fee_per_slot=1 (F3 gate)
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes());
+    payload.extend_from_slice(&1u64.to_le_bytes());
+    payload.extend_from_slice(&999u64.to_le_bytes());
+    payload.extend_from_slice(&50u64.to_le_bytes());
+    payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes());
+    payload.extend_from_slice(&1u128.to_le_bytes());
+    payload.extend_from_slice(&2u128.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes());
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&500i64.to_le_bytes());
+    payload.extend_from_slice(&1_000i64.to_le_bytes());
+    payload.extend_from_slice(&1u64.to_le_bytes()); // mark_min_fee = 1 (nonzero)
+    payload.extend_from_slice(&50u64.to_le_bytes());
+    env.try_init_market_raw(payload)
+        .expect("Hyperp+perm_resolve+nonzero mark_min_fee must succeed");
+}

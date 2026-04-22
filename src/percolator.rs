@@ -1399,7 +1399,14 @@ pub mod ix {
         /// known good oracle price from engine.last_oracle_price.
         ResolvePermissionless,
         /// Permissionless force-close for resolved markets (tag 30).
-        /// Requires RESOLVED + delay. Sends capital to stored owner ATA.
+        /// Requires RESOLVED + delay. Admin-only. Sends capital to any
+        /// valid SPL token account whose token-owner matches the stored
+        /// owner and whose mint matches `collateral_mint` — the caller
+        /// chooses the destination (typically but not necessarily the
+        /// canonical ATA). The wrapper enforces owner + mint equality
+        /// via `verify_token_account`; it does NOT derive the
+        /// Associated Token Address, so a non-ATA account owned by the
+        /// stored owner is also accepted.
         ForceCloseResolved {
             user_idx: u16,
         },
@@ -4348,6 +4355,36 @@ pub mod processor {
                 if (mark_min_fee as u128) > percolator::MAX_PROTOCOL_FEE_ABS {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+
+                // F2: Hyperp liveness spoof defense. When a Hyperp
+                // market enables permissionless resolution, the ONLY
+                // hard-timeout liveness signal is `last_mark_push_slot`,
+                // which advances on any "full-weight" trade. With
+                // `mark_min_fee == 0`, every trade is full-weight —
+                // a permissionless attacker with their own matcher can
+                // self-trade every slot to keep the market "live"
+                // indefinitely, blocking ResolvePermissionless. Require
+                // a nonzero threshold so cheap self-trades can't refresh
+                // liveness. Non-perm-resolve Hyperp markets (admin-only
+                // resolve) don't have this bricking vector.
+                let is_hyperp_init = index_feed_id == [0u8; 32];
+                if is_hyperp_init
+                    && permissionless_resolve_stale_slots > 0
+                    && mark_min_fee == 0
+                {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // F3 (config-risk, not enforced): when a market ships
+                // with BOTH `new_account_fee == 0` AND
+                // `maintenance_fee_per_slot == 0`, the wrapper has no
+                // mechanism to prevent an attacker from filling
+                // `max_accounts` slots with 1-unit dust deposits. The
+                // check is intentionally NOT enforced at init — trusted-
+                // admin / KYC'd deployments may legitimately want
+                // neither gate on — but operators deploying
+                // permissionless markets SHOULD pick at least one.
+                // See `scripts/security.md` for details.
 
                 #[cfg(debug_assertions)]
                 {
@@ -8371,9 +8408,9 @@ pub mod processor {
                     // Rollback selectively: revert price/index state that
                     // would retroactively apply a post-observation index to
                     // pre-observation engine slots, but PRESERVE the
-                    // liveness stamp from the successful read so partial
-                    // catchups during oracle recovery can't resurrect a
-                    // previously-expired stale window.
+                    // liveness stamp and its source-feed timestamp so
+                    // partial catchups can't replay a single observation
+                    // to advance liveness multiple times.
                     //
                     // Fields rolled back (price/index — time-travel risk):
                     //   - last_effective_price_e6     (baseline)
@@ -8382,8 +8419,16 @@ pub mod processor {
                     // Fields preserved from the fresh read (liveness):
                     //   - last_good_oracle_slot       (stamp proving
                     //       external oracle was observed live this call)
+                    //   - last_oracle_publish_time    (MUST be preserved
+                    //       atomically with last_good_oracle_slot —
+                    //       otherwise the one-way-clock invariant
+                    //       `clamp_external_price` relies on is broken:
+                    //       the same Pyth observation would be "fresh"
+                    //       again on the next partial catchup and
+                    //       stamp last_good_oracle_slot a second time)
                     let mut restored = config_pre;
                     restored.last_good_oracle_slot = config.last_good_oracle_slot;
+                    restored.last_oracle_publish_time = config.last_oracle_publish_time;
                     state::write_config(&mut data, &restored);
                 }
 
