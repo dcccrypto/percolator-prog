@@ -65,7 +65,56 @@ For each iteration:
    errors, panics in CI-only paths, CU anomalies) are findings even
    when the test "passes."
 
-5. **Disposition.** Exactly one of:
+   **Weirdness signals that matter even on a green test:**
+   - Transaction succeeded but the error message path was reachable
+     (e.g. `Custom(19)` where you expected `Custom(0x12)`) — the
+     code rejected for the wrong reason, meaning the intended check
+     is not the one that actually fired.
+   - CU consumption outside the usual envelope (±30%) on a path
+     you thought was small. Implies unexpected work or a loop you
+     didn't model.
+   - State moved in a field you didn't assert. Always re-read
+     `num_used_accounts`, `c_tot`, `insurance`, `vault`, and the
+     touched account's `pnl` + `fee_credits` + `reserved_pnl` — not
+     just the one field you were probing. Partial movement
+     elsewhere is a finding even if the probed field matches.
+   - Success where failure was expected. Write the negative case
+     (`expect_err`) just as carefully as the positive case —
+     otherwise an accidentally-removed guard silently passes.
+   - Off-by-one vs clean rounding. If you expect exactly `X` and
+     get `X-1`, ask WHY the rounding went that direction. Floor
+     vs ceil chosen differently on credit vs debit paths is an
+     attack pattern (see library: `rounding asymmetry`).
+
+5. **Probe fired? Investigate BEFORE writing up.** When a test
+   assertion fails or observable state looks weird:
+
+   a. **Understanding check first.** Ask: is my invariant too
+      narrow? The spec frequently distinguishes which fields move
+      on which paths (e.g. this protocol's §6.1 losses realize
+      immediately to `capital`, §6.2 profits park in `pnl` for
+      warmup). A capital-only conservation check on a trade will
+      fire even when the code is correct. **Widen the invariant
+      to include every field the spec says moves, then re-run.**
+      Only claim a finding after the widened invariant still breaks.
+
+   b. **Reproduce with a minimal setup.** Strip the scenario to
+      the smallest that still surfaces the weirdness. Fewer moving
+      pieces = clearer attribution.
+
+   c. **Diff against the stated invariant.** Quote the spec line
+      or code comment that the weirdness contradicts. If no such
+      line exists, the weirdness may be undocumented-but-intended
+      behavior — ask the user rather than assume.
+
+   d. **Only then decide disposition.** If after (a)-(c) the
+      weirdness persists AND contradicts a stated invariant, go to
+      PASS_WEIRD or EXPLOIT. If it resolves to "my model was
+      wrong," keep the widened test as regression (it's now a
+      guard against anyone re-breaking the real invariant) and
+      move on. Do NOT file a finding based on an unwidened probe.
+
+6. **Disposition.** After step 5's investigate-first pass, exactly one of:
 
    - **PASS_SAFE** — protocol behaved correctly under attack. If the
      test exercises a genuinely under-tested path, keep it as
@@ -95,7 +144,7 @@ For each iteration:
      Keep the test. Do not loop further until the exploit is
      closed and the test is passing (i.e., attack rejected).
 
-6. **If fixed:** verify the fixed test now asserts the SAFE outcome
+7. **If fixed:** verify the fixed test now asserts the SAFE outcome
    (failure of the attack), re-run ALL tiers (default, small,
    medium), commit, push. Only then resume the loop.
 
