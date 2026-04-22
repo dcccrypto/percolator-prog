@@ -102,22 +102,24 @@ const PYTH_RECEIVER_BYTES: [u8; 32] = [
 ];
 
 /// Create PriceUpdateV2 mock data (Pyth Pull format)
-/// Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) +
-///         price(8) + conf(8) + expo(4) + publish_time(8) + ...
+/// Layout: discriminator(8) + write_authority(32) + verification_level(1 for Full)
+///         + feed_id(32) + price(8) + conf(8) + expo(4) + publish_time(8) + ...
+/// Borsh enum variants are variable-size; Full has no payload, so
+/// PriceFeedMessage begins at byte 41.
 fn make_pyth(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
     let mut data = vec![0u8; 134];
-    // verification_level = 1 (Full) at offset 40
-    data[40..42].copy_from_slice(&1u16.to_le_bytes());
-    // feed_id at offset 42
-    data[42..74].copy_from_slice(feed_id);
-    // price at offset 74
-    data[74..82].copy_from_slice(&price.to_le_bytes());
-    // conf at offset 82
-    data[82..90].copy_from_slice(&conf.to_le_bytes());
-    // expo at offset 90
-    data[90..94].copy_from_slice(&expo.to_le_bytes());
-    // publish_time at offset 94
-    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
+    // verification_level = Full (discriminant 0x01) at offset 40
+    data[40] = 1;
+    // feed_id at offset 41
+    data[41..73].copy_from_slice(feed_id);
+    // price at offset 73
+    data[73..81].copy_from_slice(&price.to_le_bytes());
+    // conf at offset 81
+    data[81..89].copy_from_slice(&conf.to_le_bytes());
+    // expo at offset 89
+    data[89..93].copy_from_slice(&expo.to_le_bytes());
+    // publish_time at offset 93
+    data[93..101].copy_from_slice(&publish_time.to_le_bytes());
     data
 }
 
@@ -243,7 +245,6 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
-    encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
     encode_u64(1_000_000, &mut data); // min_oracle_price_cap_e2bps (resolvability invariant: cap>0 satisfies guard)
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);   // warmup_period_slots
@@ -252,14 +253,12 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u64(0, &mut data);   // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(0, &mut data);  // new_account_fee
-    encode_u128(0, &mut data);  // insurance_floor (risk_reduction_threshold)
     encode_u64(1, &mut data);   // h_max (v12.18.1: must be >= 1)
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data);   // liquidation_fee_bps
     encode_u128(0, &mut data);  // liquidation_fee_cap
     encode_u64(100, &mut data);   // resolve_price_deviation_bps
     encode_u128(0, &mut data);  // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
@@ -292,7 +291,6 @@ fn encode_init_market_invert(
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
-    encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
     encode_u64(1_000_000, &mut data); // min_oracle_price_cap_e2bps (resolvability invariant: cap>0 satisfies guard)
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);    // warmup_period_slots
@@ -301,14 +299,12 @@ fn encode_init_market_invert(
     encode_u64(0, &mut data);    // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(0, &mut data);   // new_account_fee
-    encode_u128(0, &mut data);   // insurance_floor (risk_reduction_threshold)
     encode_u64(0, &mut data);    // h_max
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data);    // liquidation_fee_bps
     encode_u128(0, &mut data);   // liquidation_fee_cap
     encode_u64(0, &mut data);    // resolve_price_deviation_bps
     encode_u128(0, &mut data);   // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
@@ -490,8 +486,6 @@ fn test_struct_sizes() {
     // MarketConfig field offsets for admin limits test
     println!("Offset of maintenance_fee_per_slot: {}", offset_of!(state::MarketConfig, maintenance_fee_per_slot));
     println!("Slab offset of maintenance_fee_per_slot: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, maintenance_fee_per_slot));
-    println!("Offset of max_insurance_floor: {}", offset_of!(state::MarketConfig, max_insurance_floor));
-    println!("Slab offset of max_insurance_floor: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, max_insurance_floor));
     println!("Offset of min_oracle_price_cap_e2bps: {}", offset_of!(state::MarketConfig, min_oracle_price_cap_e2bps));
     println!("Slab offset of min_oracle_price_cap_e2bps: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, min_oracle_price_cap_e2bps));
     println!("Offset of mark_ewma_e6: {}", offset_of!(state::MarketConfig, mark_ewma_e6));
@@ -500,8 +494,6 @@ fn test_struct_sizes() {
     println!("Slab offset of last_oracle_price: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_oracle_price));
     println!("Offset of last_market_slot: {}", offset_of!(RiskEngine, last_market_slot));
     println!("Slab offset of last_market_slot: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_market_slot));
-    println!("Offset of first_observed_stale_slot: {}", offset_of!(state::MarketConfig, first_observed_stale_slot));
-    println!("Slab offset of first_observed_stale_slot: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, first_observed_stale_slot));
 }
 
 /// Runtime tripwire for the unsafe zero-copy cast in `zc::engine_ref`
@@ -813,11 +805,7 @@ fn test_set_risk_threshold_non_admin_fails() {
         assert_eq!(res, Err(ProgramError::InvalidInstructionData));
     }
 
-    // Verify insurance_floor was NOT updated (still 0)
-    {
-        let engine = zc::engine_ref(&f.slab.data).unwrap();
-        assert_eq!(engine.params.insurance_floor.get(), 0);
-    }
+    // insurance_floor field deleted from RiskParams — nothing to assert.
 }
 
 #[test]

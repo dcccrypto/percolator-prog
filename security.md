@@ -1103,3 +1103,237 @@ each InitUser/InitLP bumps a `mat_counter` and writes the new
 generation number to idx's slot. `lp_account_id` in TradeCpi
 matcher ABI uses this generation. An old matcher return with A's
 generation won't match B's generation; abi_ok validation rejects.
+
+## Session 2026-04-21 — adversarial audit of landed changes
+
+Focused probe against the 5 surfaces introduced this session:
+1. `LastRestartSlot` sysvar integration (cluster-restart stale gate)
+2. `DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS = 90_000` minimal-payload default
+3. Funding ABI: e9 wire format, engine ceiling 10_000, dt ceiling 10_000_000
+4. `MarketConfig.tvl_insurance_cap_mult` deposit cap (admin opt-in)
+5. `Instruction::WithdrawInsuranceLimited` (tag 23) + `SlabHeader.insurance_operator` + `AUTHORITY_INSURANCE_OPERATOR = 4`
+
+All candidates below **discarded** — either blocked by existing runtime check, out of stated trust model, or exploit test passed (i.e., attack did not work).
+
+### D61. Operator bypasses bps/cooldown bounds via tag 20
+
+**Hypothesis**: An operator holding only `insurance_operator` calls
+`WithdrawInsurance` (tag 20) for an unbounded drain.
+
+**Why discarded**:
+- tag 20 handler at src/percolator.rs:7673 gates on
+  `require_admin(header.insurance_authority, a_admin.key)` — a
+  disjoint field from `header.insurance_operator`.
+- Proof test: `test_withdraw_limited_operator_cannot_call_tag_20`
+  resolves market, closes all accounts (both tag-20 gates now
+  passable for `insurance_authority`), rotates `insurance_operator`
+  to a fresh key, then attempts tag 20 → rejected. Positive
+  control confirms `insurance_authority` still succeeds in the
+  same state.
+
+### D62. `max_bps = 10_000 + cooldown = 0` neutralizes bounded-drain limits
+
+**Hypothesis**: Admin misconfigures the policy so operator can drain
+100% per tx with no inter-call delay, rendering the "bounded" claim
+cosmetic.
+
+**Why discarded**:
+- Init-time validation at src/percolator.rs:4348 rejects
+  `max_bps > 10_000`.
+- Init-time validation at src/percolator.rs:4353 rejects
+  `max_bps > 0 && cooldown == 0`.
+- Both blocks at `InitMarket`; the combination is unreachable in
+  production markets.
+
+### D63. Multi-ix tx cooldown bypass
+
+**Hypothesis**: Operator packs N tag-23 instructions in a single tx.
+`clock.slot` is constant within a tx, so all N calls see the same
+slot and the cooldown check always returns 0 slot-gap.
+
+**Why discarded**: First call in the tx updates `config.
+last_insurance_withdraw_slot = clock.slot`. Call 2 sees
+`last = clock.slot`, so `slot_gap = 0`. Since init enforces
+`cooldown > 0`, the check `slot_gap < cooldown` (0 < N) trips and
+call 2 is rejected. Only call 1 succeeds per tx.
+
+### D64. `config.init_restart_slot` tampering after InitMarket
+
+**Hypothesis**: A post-init mutation resets `init_restart_slot` to a
+value ≥ current `LastRestartSlot`, defeating restart detection.
+
+**Why discarded**: `grep` for writes to `init_restart_slot` shows
+exactly one site — the `InitMarket` handler at src/percolator.rs:4752.
+No `UpdateConfig`, `UpdateAuthority`, or other handler touches it.
+The field is immutable post-init.
+
+### D65. Cluster restart race during InitMarket
+
+**Hypothesis**: `LastRestartSlot::get()` captures N. A restart bumps
+it to N+1 mid-tx. Admin's init commits with stale `init_restart_slot = N`
+but never sees the bump because it happened atomically.
+
+**Why discarded**: Solana's execution model — a single transaction
+does not span a restart event. Restarts halt all in-flight state;
+the blockchain replays from the last confirmed slot with txs
+re-applied or dropped. The syscall and the commit both happen
+inside one atomic tx; there's no race window.
+
+### D66. Deposit-cap bypass via insurance decrement within the same tx
+
+**Hypothesis**: Some other instruction decrements insurance
+mid-tx; the cap check in `DepositCollateral` uses a snapshot that
+doesn't reflect the new value.
+
+**Why discarded**: Handler loads `engine_ref(&data)?.insurance_fund.
+balance.get()` immediately before the comparison. Single-threaded
+per-tx semantics mean no concurrent mutation. If a prior
+instruction in the same tx decremented insurance, the handler sees
+the post-decrement value.
+
+### D67. Tag 23 breaks conservation invariant `V ≥ C_tot + I`
+
+**Hypothesis**: Tag 23 decrements insurance and vault by different
+amounts, creating a `V < C_tot + I` state.
+
+**Why discarded** (manual trace):
+- Before: vault = V, insurance = I, c_tot = C. Conservation:
+  `V ≥ C + I + net_pnl`.
+- Commit: `engine.insurance_fund.balance = I - A`,
+  `engine.vault = V.checked_sub(A)`. Both decremented by the
+  same `A = amount_units`.
+- After: `(V - A) ≥ C + (I - A) + net_pnl` ⟺ `V ≥ C + I + net_pnl`.
+  Same invariant, preserved.
+- SPL transfer moves `amount` base units (= `amount_units ×
+  unit_scale` if scale > 0, else equal). Engine tracks units;
+  SPL vault tracks base. Both sides of the equation stay
+  consistent with `unit_scale` scaling.
+
+### D68. Zeno-paradox lockout traps last residual
+
+**Hypothesis**: Operator drains insurance until `insurance = 9`.
+Cap formula: `cap = max(bps_cap, 10) = 10`. Clamp:
+`cap = min(10, 9) = 9`. Operator requests 10 → rejected
+(`10 > 9`). Request for 9 → ??
+
+**Why discarded**: Handler logic
+`if (amount_units as i128) > cap` uses strict greater-than. At
+`cap = 9`, `amount_units = 9` passes (`9 > 9` is false). Operator
+drains the exact remaining balance. Insurance reaches zero.
+
+### D69. Tag 23 amount = 0 or dust-misaligned amount
+
+**Why discarded**: Handler has
+`if dust != 0 || amount_units == 0 { return InvalidArgument }`.
+Both zero-unit withdrawals and unit-scale-misaligned amounts
+are rejected before any state change.
+
+### D70. Tag 23 spoofed accounts (vault, ATA, clock)
+
+**Why discarded**:
+- `verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(
+  config.vault_pubkey))` — cross-checks vault PDA, mint, and
+  stored pubkey.
+- `verify_token_account(a_operator_ata, a_operator.key, &mint)` —
+  cross-checks ATA owner and mint.
+- `accounts::expect_key(a_vault_pda, &auth)` — verifies the
+  signing PDA account matches the derived authority.
+- `Clock::from_account_info(a_clock)` — runtime verifies the
+  sysvar key matches `sysvar::clock::ID`.
+
+All four spoof vectors blocked.
+
+### D71. Burned `insurance_authority` + bounded drain leaves residue that traps CloseSlab
+
+**Hypothesis**: Operator drains via tag 23 but can't reach 0 (Zeno).
+Residue > 0 means tag 20 is needed to zero insurance. But
+`insurance_authority` is burned, so tag 20 is unreachable. Slab
+rent is trapped forever.
+
+**Why discarded**: D68 already shows tag 23's final-call clamp
+lets the operator drain to exactly zero. No residue. CloseSlab
+proceeds normally.
+
+### D72. Stale `last_insurance_withdraw_slot` post-restart
+
+**Hypothesis**: Pre-restart, operator's last call set
+`last = 1000`. Post-restart, `clock.slot` resumes at 800. The
+cooldown check does `800.saturating_sub(1000) = 0`, which is
+`< cooldown`. The first post-restart tag-23 call would be
+rejected — but if the operator passes `amount = 0` or exploits
+some other path, maybe they bypass.
+
+**Why discarded**: Tag 23 handler calls
+`permissionless_stale_matured(&config, clock.slot)` before the
+cooldown check. Post-restart, `LastRestartSlot::get() >
+init_restart_slot`, so `permissionless_stale_matured` returns
+true, and the handler returns `OracleStale` immediately. The
+cooldown / stale-last-slot path is never reached post-restart —
+no tag-23 call can succeed after a cluster restart. The market
+is frozen; resolution goes through `ResolvePermissionless`.
+
+### D73. Deposit-cap and SPL-transfer ordering race
+
+**Hypothesis**: The cap check succeeds, but the SPL transfer
+fails, and engine state is left inconsistent.
+
+**Why discarded**: Handler ordering is
+`cap check → collateral::deposit (SPL CPI) → engine.deposit_not_atomic`.
+The cap check runs BEFORE any state mutation. If the SPL transfer
+fails, the handler returns `Err`, Solana's runtime reverts the
+entire tx atomically (including any vault balance change attempted
+by the SPL program). Engine state is never mutated.
+
+### D74. Operator drains below `insurance_floor`
+
+**Hypothesis**: Admin sets `insurance_floor = 1_000` as a "minimum
+insurance reserved against losses." Operator drains insurance to 0
+via tag 23, undermining the floor contract.
+
+**Why discarded** (with caveat):
+- `insurance_floor` is a policy parameter used by
+  `use_insurance_buffer(loss)` at percolator/src/percolator.rs:2318
+  to compute `available = ins_bal.saturating_sub(floor)`. It
+  controls loss-consumption, not an enforced minimum balance.
+- The prior `WithdrawInsurance` (tag 20) also ignores
+  `insurance_floor` — it zeros the balance entirely at teardown.
+  Tag 23's behavior is consistent.
+- If operators want a hard minimum balance, they must either
+  (a) configure `max_bps` such that the steady-state drain rate
+  stays above the floor, or (b) rely on the deposit-cap
+  interaction (`tvl_insurance_cap_mult > 0`) to throttle TVL
+  growth as insurance shrinks.
+- **Caveat**: if `insurance_floor` is ever promoted to an
+  invariant (spec change), tag 23 would need to grow a
+  `cap = min(cap, ins - floor)` gate. For now the two paths are
+  consistent in ignoring it.
+
+### D75. CloseAccount bypass of deposit cap
+
+**Hypothesis**: A closed account reduces `c_tot`. If cap was blocking
+deposits, closing should unblock them. Attacker closes-and-reopens
+repeatedly to churn capital past the cap.
+
+**Why discarded**: CloseAccount correctly decrements `c_tot` via
+`engine.close_account → set_capital(0)`. A closed account frees cap
+room for new deposits. This is the **correct** behavior — closing
+reduces TVL, shrinking `c_tot`; cap denominator (insurance) is
+unchanged; new room appears. Churn is bounded by account-init
+costs and the cap itself. Not an exploit.
+
+### Summary — Session 2026-04-21
+
+No ship-blocking findings. Authority split on
+`insurance_operator` vs `insurance_authority` is structurally
+enforced (confirmed by tightened bypass test). Cluster-restart
+detection correctly gates all price-taking / state-mutating paths.
+Deposit cap is fail-closed on enable-without-insurance (bootstrap
+caveat documented; not a protocol hole). The tag-23 rate limits
+are ultimately as strong as admin's `max_bps` + `cooldown`
+configuration at `InitMarket`; init-time bounds prevent the
+pathological combinations.
+
+Tests: 674 pass across `default`, `small`, `medium` tiers.
+Kani: 83/83 pass. Proof harnesses cover the pure restart-detected
+comparison and all pre-existing authorization/matcher/oracle
+surfaces.

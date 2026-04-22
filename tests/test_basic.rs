@@ -1137,9 +1137,9 @@ fn test_comprehensive_funding_accrual() {
     env.top_up_insurance(&ins_payer, 1_000_000_000);
     let vault_before = env.vault_balance();
 
-    // Run many cranks to accrue funding
+    // Run many cranks to accrue funding (keep Pyth fresh at each slot).
     for i in 0..10 {
-        env.set_slot(200 + i * 100);
+        env.set_slot_and_price(200 + i * 100, 138_000_000);
         env.crank();
     }
 
@@ -2191,16 +2191,14 @@ fn test_settle_account_blocked_on_resolved() {
     env.set_slot(200);
     env.crank();
 
-    // Resolve the market.
+    // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
-    env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
-    env.set_slot(300);
+    env.set_slot_and_price(300, 138_000_000);
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved(), "Market must be resolved");
 
     // SettleAccount on a resolved market should fail.
-    env.set_slot(400);
+    env.set_slot_and_price(400, 138_000_000);
     let result = env.try_settle_account(user_idx);
     assert!(
         result.is_err(),
@@ -2490,18 +2488,14 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     env.set_slot(200);
     env.crank();
 
-    // Resolve the market.
+    // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    // try_set_oracle_authority auto-enables the circuit-breaker cap
-    // before setting authority (Model-1 weaker-authority invariant).
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
-    env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
-    env.set_slot(300);
+    env.set_slot_and_price(300, 138_000_000);
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved(), "Market must be resolved");
 
     // ConvertReleasedPnl should fail on resolved market.
-    env.set_slot(400);
+    env.set_slot_and_price(400, 138_000_000);
     let result = env.try_convert_released_pnl(&user, user_idx, 1_000_000);
     assert!(
         result.is_err(),
@@ -2557,32 +2551,6 @@ fn test_init_user_blocked_on_resolved() {
     assert!(
         result.is_err(),
         "InitUser must be rejected on a resolved market"
-    );
-}
-
-/// Spec: InitUser fee_payment below min_initial_deposit is rejected.
-#[test]
-fn test_init_user_requires_min_deposit() {
-    program_path();
-    let mut env = TestEnv::new();
-    // min_initial_deposit = 100 (set in encode_init_market_full_v2)
-    env.init_market_with_invert(0);
-
-    let num_used_before = env.read_num_used_accounts();
-
-    let user = Keypair::new();
-    // Provide only 50 tokens -- below min_initial_deposit of 100
-    let result = env.try_init_user_with_fee(&user, 50);
-    assert!(
-        result.is_err(),
-        "InitUser must reject fee_payment below min_initial_deposit"
-    );
-
-    // State preservation: num_used_accounts must not change on rejection
-    let num_used_after = env.read_num_used_accounts();
-    assert_eq!(
-        num_used_after, num_used_before,
-        "num_used_accounts must not change on rejection"
     );
 }
 
@@ -2751,10 +2719,9 @@ fn test_reclaim_blocked_on_resolved() {
     env.crank();
     env.try_withdraw(&user, user_idx, 100).unwrap();
 
-    // Resolve the market
+    // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
-    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
+    env.set_slot_and_price(200, 138_000_000);
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved());
 
@@ -4495,7 +4462,6 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_ins_floor
         data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap = 1%
         // RiskParams with 10 bps trading fee
         data.extend_from_slice(&0u64.to_le_bytes()); // warmup
@@ -4504,7 +4470,6 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&10u64.to_le_bytes()); // trading_fee_bps = 10 (0.1%)
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
-        data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
         data.extend_from_slice(&1u64.to_le_bytes()); // h_max
         let max_crank = 99u64; // permissionless > max_crank
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
@@ -4512,7 +4477,6 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
-        data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
         data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
@@ -4560,7 +4524,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     // Slab offset = HEADER_LEN(168) + config.max_staleness_secs(96) = 264.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[264..272].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -5039,10 +5003,9 @@ fn test_fee_sync_does_not_erase_market_accrual_interval() {
     env.set_slot(0);
     env.crank();
 
-    // BPF layout offset for engine.last_market_slot (v12.18.x).
-    // 568 (ENGINE_OFF, after SlabHeader +64 for 4-way auth) + 656
-    // (field offset) = 1192.
-    const LAST_MARKET_SLOT_OFF: usize = 1224;
+    // BPF layout offset for engine.last_market_slot.
+    // 536 (ENGINE_OFF) + 624 (field offset after min_initial_deposit delete) = 1160.
+    const LAST_MARKET_SLOT_OFF: usize = 1160;
     let read_last_market_slot = |e: &TestEnv| -> u64 {
         let d = e.svm.get_account(&e.slab).unwrap().data;
         u64::from_le_bytes(d[LAST_MARKET_SLOT_OFF..LAST_MARKET_SLOT_OFF + 8]

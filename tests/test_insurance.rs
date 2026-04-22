@@ -182,11 +182,6 @@ fn test_attack_withdraw_insurance_with_open_positions() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Set oracle authority and push price
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_push_oracle_price(&admin, 138_000_000, 100)
-        .expect("oracle price push must succeed");
-
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 100_000_000_000);
@@ -303,10 +298,6 @@ fn test_attack_topup_insurance_after_resolution() {
     env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_push_oracle_price(&admin, 138_000_000, 100)
-        .expect("oracle price push must succeed");
     env.set_slot(100);
     env.crank();
     env.try_resolve_market(&admin)
@@ -922,11 +913,6 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     env.trade(&user, &lp, lp_idx, user_idx, size);
 
     // Setup oracle authority and push price (required for ResolveMarket)
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_push_oracle_price(&admin, 138_000_000, 100)
-        .expect("oracle price push must succeed");
-
     // Resolve market (premarket resolution)
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "Resolve should succeed: {:?}", result);
@@ -1006,7 +992,6 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup
@@ -1022,7 +1007,6 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liq_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&10001u16.to_le_bytes()); // insurance_withdraw_max_bps > 10000
@@ -1120,108 +1104,9 @@ fn test_top_up_insurance_increases_balance() {
     );
 }
 
-/// Audit gap 3: Insurance floor is immutable after market initialization.
-///
-/// Spec behavior (ss2.2.1): insurance_floor is set at InitMarket and cannot
-/// be changed afterwards.  SetRiskThreshold (tag 11) was removed and must
-/// return InvalidInstructionData.  The stored insurance_floor must not change.
-#[test]
-fn test_insurance_floor_immutable_after_init() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    let floor_value: u128 = 1_000_000_000; // 1 SOL floor
-    env.init_market_with_insurance_floor(0, floor_value);
-
-    // Verify insurance_floor was stored correctly at init
-    let floor_after_init = env.read_insurance_floor();
-    assert_eq!(
-        floor_after_init, floor_value,
-        "insurance_floor should be set to the init value"
-    );
-
-    // Attempt to change insurance_floor via SetRiskThreshold (tag 11)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let new_threshold: u128 = 5_000_000_000; // attempt to change to 5 SOL
-    let result = env.try_set_risk_threshold(&admin, new_threshold);
-    assert!(
-        result.is_err(),
-        "SetRiskThreshold must be rejected (insurance_floor is immutable per spec ss2.2.1)"
-    );
-
-    // Verify the floor has not changed
-    let floor_after_attempt = env.read_insurance_floor();
-    assert_eq!(
-        floor_after_attempt, floor_value,
-        "insurance_floor must remain unchanged after rejected SetRiskThreshold"
-    );
-}
-
-/// SOLVENCY: WithdrawInsuranceLimited on live market must require a recent
-/// crank so that latent losses are reflected before withdrawal.
-///
-/// Without this, the insurance balance could be overstated (unsettled losses
-/// haven't absorbed insurance yet), letting the authority withdraw funds that
-/// should be reserved for loss coverage.
-#[test]
-
-
-/// Regression for audit #3: UpdateAuthority(kind=ORACLE) must NOT
-/// corrupt the limited-insurance policy state when is_policy_configured
-/// is set. The policy packs (max_bps, last_withdraw_slot) into
-/// config.authority_timestamp and min_withdraw_base into
-/// config.last_effective_price_e6 — these are repurposed-resolved-mode
-/// oracle fields. An earlier version of the ORACLE handler zeroed
-/// authority_timestamp/price unconditionally on non-Hyperp, which
-/// would break subsequent WithdrawInsuranceLimited calls.
-#[test]
-
-/// Negative-path companion: when NO policy is configured, the ORACLE
-/// authority change still clears stored price/timestamp (matches the
-/// pre-policy-configured intended behavior). Verifies the
-/// is_policy_configured gate does NOT over-extend.
-#[test]
-fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // init with cap > 0 so oracle_authority defaults to admin (under
-    // the init-time invariant; cap=0 would zero oracle_authority).
-    env.init_market_with_cap(0, 10_000, 0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
-
-    // Snapshot fields.
-    const AUTH_PRICE_OFF: usize = 344; // HEADER_LEN(168) + authority_price_e6(176)
-    const AUTH_TS_OFF: usize = 352;    // HEADER_LEN(168) + authority_timestamp(184)
-    let (price_before, ts_before) = {
-        let slab = env.svm.get_account(&env.slab).unwrap().data;
-        (
-            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
-            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
-        )
-    };
-    assert!(price_before > 0, "authority price populated by push");
-    assert!(ts_before > 0, "authority timestamp populated by push");
-
-    // Rotate oracle authority.
-    let new_oracle = Keypair::new();
-    env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle))
-        .expect("oracle rotation must succeed");
-
-    // Under the no-policy branch, the clear fires as before.
-    let (price_after, ts_after) = {
-        let slab = env.svm.get_account(&env.slab).unwrap().data;
-        (
-            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
-            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
-        )
-    };
-    assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
-    assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
-}
+// test_insurance_floor_immutable_after_init removed: insurance_floor
+// field was deleted from RiskParams. The bounded `insurance_operator`
+// path (tag 23) supersedes it.
 
 // ============================================================================
 // TVL:insurance deposit cap (admin opt-in)
@@ -1289,11 +1174,6 @@ fn test_deposit_cap_enable_via_update_config() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
-
     send_update_config(&mut env, &admin, 20).expect("enable cap");
     let slab = env.svm.get_account(&env.slab).unwrap();
     let cfg = percolator_prog::state::read_config(&slab.data);
@@ -1308,11 +1188,6 @@ fn test_deposit_cap_enforced() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
-
     // Seed insurance so the cap denominator is nonzero.
     let insurance_payer = Keypair::new();
     env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
@@ -1346,10 +1221,6 @@ fn test_deposit_cap_disabled_allows_any_deposit() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
     // Do NOT call UpdateConfig — cap stays at default 0.
     assert_eq!(env.read_insurance_balance(), 0, "fresh market has zero insurance");
 
@@ -1367,21 +1238,40 @@ fn test_deposit_cap_zero_insurance_rejects() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
-
-    // Enable cap WITHOUT seeding insurance.
+    // Enable cap WITHOUT seeding insurance. All deposit paths must be
+    // rejected — including InitUser's fee_payment, which had been a
+    // bypass before the fix.
     send_update_config(&mut env, &admin, 20).expect("enable cap");
     assert_eq!(env.read_insurance_balance(), 0);
 
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    let result = env.try_deposit(&user, user_idx, 1);
+    // InitUser with any positive fee_payment must now be rejected
+    // (c_tot = 0, cap = 20 * 0 = 0, any deposit breaches). Use a raw
+    // instruction because the `init_user` helper panics on failure.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let attacker_ata = env.create_ata(&attacker.pubkey(), 1_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_init_user(100),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
     assert!(
         result.is_err(),
-        "deposit with enabled cap and zero insurance must be rejected"
+        "InitUser with enabled cap and zero insurance must be rejected"
     );
 }
 
@@ -1395,11 +1285,6 @@ fn test_deposit_cap_widened_unblocks_deposit() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
-
     let insurance_payer = Keypair::new();
     env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
     env.top_up_insurance(&insurance_payer, 1_000);
@@ -1431,11 +1316,6 @@ fn test_deposit_cap_topping_up_insurance_unblocks_deposit() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
-
     let insurance_payer = Keypair::new();
     env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
     env.top_up_insurance(&insurance_payer, 1_000);
@@ -1467,11 +1347,6 @@ fn test_deposit_cap_tightened_blocks_further_deposits() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
-
     let insurance_payer = Keypair::new();
     env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
     env.top_up_insurance(&insurance_payer, 1_000);
@@ -1562,11 +1437,6 @@ fn setup_bounded_withdrawal(
     cooldown_slots: u64,
 ) {
     env.init_market_with_invert(0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority");
-    env.try_push_oracle_price(&admin, 1_000_000, 100)
-        .expect("push price");
     let insurance_payer = Keypair::new();
     env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
     env.top_up_insurance(&insurance_payer, insurance);
@@ -1574,10 +1444,11 @@ fn setup_bounded_withdrawal(
     // Direct slab edits for config fields that don't yet have UpdateConfig
     // wiring. Safe in tests: we own the slab account.
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    // insurance_withdraw_max_bps (u16): HEADER_LEN(168) + config offset 232 = 400
-    slab.data[400..402].copy_from_slice(&max_bps.to_le_bytes());
-    // insurance_withdraw_cooldown_slots (u64): HEADER_LEN(168) + 240 = 408
-    slab.data[408..416].copy_from_slice(&cooldown_slots.to_le_bytes());
+    // insurance_withdraw_max_bps (u16): HEADER_LEN(136) + config offset 216 = 352
+    // (config offsets shifted -16 after max_insurance_floor deletion).
+    slab.data[352..354].copy_from_slice(&max_bps.to_le_bytes());
+    // insurance_withdraw_cooldown_slots (u64): HEADER_LEN(136) + 224 = 360
+    slab.data[360..368].copy_from_slice(&cooldown_slots.to_le_bytes());
     env.svm.set_account(env.slab, slab).unwrap();
 }
 
@@ -1706,17 +1577,29 @@ fn test_withdraw_limited_operator_cannot_call_tag_20() {
     send_withdraw_limited(&mut env, &operator, 100)
         .expect("new operator must be able to use bounded path");
 
-    // CORE SECURITY CHECK: operator calling tag 20 must fail. Tag 20
-    // requires market resolved + all accounts closed (and gates on
-    // insurance_authority, not insurance_operator). Attempting to call
-    // it here hits the resolved-required gate first, but even on a
-    // correctly-resolved market the operator's signer would fail the
-    // insurance_authority check.
+    // CORE SECURITY CHECK: operator must fail tag 20 even in a state
+    // where tag 20 would otherwise succeed (resolved market, no accounts).
+    // The ONLY remaining gate is the authority check — this isolates the
+    // authority-split property from the resolved/empty gates.
+    //
+    // Resolve the market (admin, via ResolveMarket with authority price
+    // set). No accounts have been created → num_used == 0. In this state,
+    // tag 20 would succeed for insurance_authority, but not for operator.
+    env.set_slot_and_price(200, 1_000_000);
+    env.crank();
+    env.try_resolve_market(&admin).expect("admin resolves");
+
+    // Operator attempts tag 20: must fail (auth mismatch).
     let bypass = env.try_withdraw_insurance(&operator);
     assert!(
         bypass.is_err(),
-        "operator must not be able to bypass bounds via tag 20"
+        "operator must not be able to call tag 20 even on resolved+empty market"
     );
+
+    // Positive control: insurance_authority (still == admin after init
+    // since we didn't rotate it) CAN call tag 20 in this state.
+    env.try_withdraw_insurance(&admin)
+        .expect("insurance_authority must still be able to call tag 20");
 }
 
 /// 9. Anti-Zeno floor: even when `bps × insurance / 10_000 < 10`, the
@@ -1843,5 +1726,65 @@ fn test_bounded_withdrawal_tightens_deposit_cap() {
     assert!(
         blocked.is_err(),
         "insurance withdrawal must tighten the deposit cap and block further deposits"
+    );
+}
+
+/// REGRESSION / SECURITY: InitUser's `fee_payment` path bypasses the
+/// deposit cap. The cap check lives only in DepositCollateral, but
+/// InitUser also increments c_tot via engine.deposit_not_atomic with
+/// an arbitrary u64 amount. An attacker who hits the cap via the
+/// normal path can still grow c_tot unboundedly by creating new
+/// accounts with large `fee_payment` values.
+#[test]
+fn test_deposit_cap_bypassed_via_init_user() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Seed insurance, enable the cap with k=20 → ceiling = 20_000 units.
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+    send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
+
+    // First user fills to ceiling via init_user (100) + deposit (19_800)
+    // → c_tot = 19_900. One more unit via normal deposit would exceed
+    // 20_000 — so the deposit path is blocked.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.try_deposit(&user, user_idx, 19_800)
+        .expect("fill close to ceiling");
+    let blocked = env.try_deposit(&user, user_idx, 101);
+    assert!(blocked.is_err(), "DepositCollateral correctly enforces cap");
+
+    // SECURITY CHECK: a FRESH account created via init_user with a large
+    // fee_payment should ALSO be blocked — c_tot_new = 19_900 + 10_000 =
+    // 29_900, which exceeds the 20_000 cap. The cap must apply to every
+    // capital-adding path, not just DepositCollateral.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let attacker_ata = env.create_ata(&attacker.pubkey(), 20_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_init_user(10_000), // fee_payment = 10_000 units
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "InitUser with fee_payment that breaches the cap must be rejected"
     );
 }

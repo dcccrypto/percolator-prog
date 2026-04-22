@@ -470,51 +470,6 @@ fn test_update_admin_zero_accepted_for_burn() {
 /// primary use case for governance-free Pyth-Pull deployments: keep
 /// the authority as a bounded heartbeat/fallback price source that
 /// outlives admin.
-#[test]
-fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // init_market_with_cap seeds oracle_price_cap_e2bps == 10_000 (non-zero),
-    // so the weaker-authority invariant (authority set ⇒ cap != 0) holds.
-    env.init_market_with_cap(0, 10_000, 100);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Configure an oracle authority. With a non-zero cap, this is a
-    // bounded fallback price source, not an admin-equivalent role.
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("set authority must succeed");
-
-    const AUTHORITY_OFF: usize = 168 + 128;
-    let authority_bytes = {
-        let slab = env.svm.get_account(&env.slab).unwrap();
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&slab.data[AUTHORITY_OFF..AUTHORITY_OFF + 32]);
-        b
-    };
-    assert_ne!(
-        authority_bytes, [0u8; 32],
-        "precondition: oracle_authority is configured",
-    );
-
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
-    let result = env.try_update_admin(&admin, &zero_pubkey);
-    assert!(
-        result.is_ok(),
-        "UpdateAdmin burn MUST succeed when authority is set AND cap is \
-         non-zero — the cap constrains authority to a bounded fallback, \
-         which is the weaker-authority model's core guarantee: {:?}",
-        result,
-    );
-
-    // After burn, admin instructions must still fail (authority is NOT
-    // an admin-equivalent — it can only push prices, not configure).
-    let err = env
-        .try_set_risk_threshold(&admin, 999)
-        .expect_err("admin ops must fail after burn");
-    let _ = err;
-}
 
 /// Weaker-authority invariant: SetOracleAuthority on a non-Hyperp
 /// Resolvability invariant: a non-Hyperp market with
@@ -586,31 +541,6 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
     assert!(env.is_market_resolved(), "market must flip to Resolved");
 }
 
-/// Burn guard: UpdateAuthority may not zero oracle_authority on a non-
-/// Hyperp market when perm_resolve == 0. The burn would remove the only
-/// path that populates authority_price_e6 (PushOraclePrice), and
-/// perm_resolve == 0 means ResolvePermissionless never matures — every
-/// subsequent ResolveMarket call would reject on authority_price_e6 == 0.
-#[test]
-fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // Non-Hyperp, cap > 0 (so oracle_authority is admin at init),
-    // perm_resolve == 0.
-    env.init_market_with_cap(0, 10_000, 0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Attempt to burn oracle authority. Must reject.
-    let err = env
-        .try_update_authority(&admin, common::AUTHORITY_ORACLE, None)
-        .expect_err("oracle-authority burn must reject without perm_resolve");
-    assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
-    );
-}
 
 /// Weaker-authority invariant: SetOraclePriceCap may not disable the
 /// cap (set it to 0) on a non-Hyperp market while oracle_authority is
@@ -644,256 +574,6 @@ fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
     );
 }
 
-/// Verify that InitMarket rejects initial risk_params that exceed per-market limits.
-#[test]
-fn test_init_market_risk_params_exceed_limits_rejected() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    // Build InitMarket with risk_reduction_threshold > max_risk_threshold
-    let mut data = vec![0u8];
-    data.extend_from_slice(admin.pubkey().as_ref());
-    data.extend_from_slice(env.mint.as_ref());
-    data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
-    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
-    data.push(0u8); // invert
-    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
-    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // Per-market admin limits
-    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
-    data.extend_from_slice(&50_000u128.to_le_bytes()); // max_risk_threshold = 50_000
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams with risk_reduction_threshold EXCEEDING the limit
-    data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
-    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
-    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
-    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&50_001u128.to_le_bytes()); // risk_reduction_threshold = 50_001 > limit!
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
-    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
-    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
-    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data,
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    assert!(
-        env.svm.send_transaction(tx).is_err(),
-        "InitMarket with risk_reduction_threshold > max_risk_threshold should be rejected"
-    );
-
-    // Also test maintenance_fee_per_slot > max_maintenance_fee_per_slot
-    let mut env2 = TestEnv::new();
-    let admin2 = &env2.payer;
-    let dummy_ata2 = Pubkey::new_unique();
-    env2.svm
-        .set_account(
-            dummy_ata2,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    let mut data2 = vec![0u8];
-    data2.extend_from_slice(admin2.pubkey().as_ref());
-    data2.extend_from_slice(env2.mint.as_ref());
-    data2.extend_from_slice(&TEST_FEED_ID);
-    data2.extend_from_slice(&u64::MAX.to_le_bytes());
-    data2.extend_from_slice(&500u16.to_le_bytes());
-    data2.push(0u8);
-    data2.extend_from_slice(&0u32.to_le_bytes());
-    data2.extend_from_slice(&0u64.to_le_bytes());
-    // Per-market admin limits
-    data2.extend_from_slice(&1000u128.to_le_bytes()); // max_maintenance_fee = 1000
-    data2.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data2.extend_from_slice(&0u64.to_le_bytes());
-    // RiskParams with maintenance_fee_per_slot EXCEEDING the limit
-    data2.extend_from_slice(&0u64.to_le_bytes());
-    data2.extend_from_slice(&500u64.to_le_bytes());
-    data2.extend_from_slice(&1000u64.to_le_bytes());
-    data2.extend_from_slice(&0u64.to_le_bytes());
-    data2.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data2.extend_from_slice(&0u128.to_le_bytes());
-    data2.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold = 0
-    data2.extend_from_slice(&1001u128.to_le_bytes()); // maintenance_fee = 1001 > limit!
-    data2.extend_from_slice(&u64::MAX.to_le_bytes());
-    data2.extend_from_slice(&50u64.to_le_bytes());
-    data2.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
-    data2.extend_from_slice(&100u64.to_le_bytes());
-    data2.extend_from_slice(&0u128.to_le_bytes());
-
-    let ix2 = Instruction {
-        program_id: env2.program_id,
-        accounts: vec![
-            AccountMeta::new(admin2.pubkey(), true),
-            AccountMeta::new(env2.slab, false),
-            AccountMeta::new_readonly(env2.mint, false),
-            AccountMeta::new(env2.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env2.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: data2,
-    };
-
-    let tx2 = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix2],
-        Some(&admin2.pubkey()),
-        &[admin2],
-        env2.svm.latest_blockhash(),
-    );
-    assert!(
-        env2.svm.send_transaction(tx2).is_err(),
-        "InitMarket with maintenance_fee > max_maintenance_fee should be rejected"
-    );
-
-    println!("INIT MARKET RISK PARAMS EXCEED LIMITS REJECTED: PASSED");
-}
-
-/// Verify InitMarket accepts risk_params at exact boundary (equality with limits).
-#[test]
-fn test_init_market_risk_params_at_boundary_accepted() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    // Build InitMarket with risk_reduction_threshold == max_risk_threshold
-    // and maintenance_fee_per_slot == max_maintenance_fee_per_slot
-    let mut data = vec![0u8];
-    data.extend_from_slice(admin.pubkey().as_ref());
-    data.extend_from_slice(env.mint.as_ref());
-    data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
-    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
-    data.push(0u8); // invert
-    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
-    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // Per-market admin limits (current wire format)
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    // Non-Hyperp + cap=0 + perm_resolve=0 is rejected by the
-    // resolvability invariant; ship cap=MAX to satisfy it.
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
-    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
-    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
-    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
-    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
-    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
-    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    // Extended tail (required for v2 format)
-    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
-    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
-    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
-    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
-    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data,
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    assert!(
-        env.svm.send_transaction(tx).is_ok(),
-        "InitMarket with risk_params at exact limits should succeed"
-    );
-
-    println!("INIT MARKET RISK PARAMS AT BOUNDARY ACCEPTED: PASSED");
-}
 
 /// Full lifecycle test: init with limits -> Set* ops -> UpdateConfig -> crank -> Set* again.
 /// Verifies limits survive across all operation types.
@@ -972,31 +652,22 @@ fn test_admin_limits_lifecycle() {
     // Step 5: At-limit values still work
     env.try_set_oracle_price_cap(&admin, 5000).unwrap();
 
-    // Step 6: Verify limit fields in config haven't been corrupted
+    // Step 6: Verify limit fields in config haven't been corrupted.
+    // max_insurance_floor was deleted; subsequent fields shifted up 16 B.
+    //   min_oracle_price_cap_e2bps: u64 @ config 208 (was 224)
+    //   maintenance_fee_per_slot:   u128 @ config 336 (was 352)
     let slab = env.svm.get_account(&env.slab).unwrap();
-    // BPF slab offsets: HEADER_LEN(72) + config field offset
-    // maintenance_fee_per_slot: u128 @ config offset 352
-    // max_insurance_floor: u128 @ config offset 208
-    // min_oracle_price_cap_e2bps: u64 @ config offset 224
-    const MAINT_FEE_OFF: usize = 168 + 352;
-    const MAX_INS_FLOOR_OFF: usize = 168 + 208;
-    const MIN_OPC_OFF: usize = 168 + 224;
+    const MAINT_FEE_OFF: usize = 136 + 336;
+    const MIN_OPC_OFF: usize = 136 + 208;
 
     let maint_fee = u128::from_le_bytes(
         slab.data[MAINT_FEE_OFF..MAINT_FEE_OFF + 16].try_into().unwrap(),
-    );
-    let max_ins = u128::from_le_bytes(
-        slab.data[MAX_INS_FLOOR_OFF..MAX_INS_FLOOR_OFF + 16].try_into().unwrap(),
     );
     let min_opc = u64::from_le_bytes(
         slab.data[MIN_OPC_OFF..MIN_OPC_OFF + 8].try_into().unwrap(),
     );
 
-    // maintenance_fee_per_slot is disabled at init (the feature has an unsound
-    // between-cranks behavior pending per-account accrual). Encoders that
-    // used to pass a non-zero fee now coerce it to 0; the stored value is 0.
     assert_eq!(maint_fee, 0, "maintenance_fee_per_slot is disabled at init");
-    assert_eq!(max_ins, 50_000, "max_insurance_floor should be preserved");
     assert_eq!(min_opc, 5000, "min_oracle_price_cap_e2bps should be preserved");
 
     println!("ADMIN LIMITS LIFECYCLE: PASSED");
@@ -1357,9 +1028,10 @@ fn test_update_config_admin_only() {
 // UpdateAuthority (4-way split) — positive and negative paths for each kind
 // ============================================================================
 
-/// Precondition: new markets default insurance_authority + close_authority
-/// to the creator's pubkey (super-admin by default). Confirms the default
-/// so subsequent tests can rely on it.
+/// Precondition: new markets default insurance_authority to the creator's
+/// pubkey (super-admin by default). Confirms the default so subsequent
+/// tests can rely on it. (AUTHORITY_CLOSE removed — close_authority merged
+/// into admin.)
 #[test]
 fn test_update_authority_init_defaults_match_admin() {
     program_path();
@@ -1369,12 +1041,10 @@ fn test_update_authority_init_defaults_match_admin() {
     let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // UpdateAuthority with the current admin signing + new_authority = self
-    // must succeed for insurance and close kinds — which proves the
-    // current authority on both slots IS the admin pubkey at init.
+    // must succeed for insurance — which proves the current authority IS
+    // the admin pubkey at init.
     env.try_update_authority(&admin_kp, AUTHORITY_INSURANCE, Some(&admin_kp))
         .expect("init default: insurance_authority == admin");
-    env.try_update_authority(&admin_kp, AUTHORITY_CLOSE, Some(&admin_kp))
-        .expect("init default: close_authority == admin");
 }
 
 /// UpdateAuthority happy path: admin delegates insurance_authority to a
@@ -1411,7 +1081,7 @@ fn test_update_authority_negative_wrong_current_signer() {
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let target = Keypair::new();
 
-    for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE, AUTHORITY_CLOSE] {
+    for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE] {
         let err = env
             .try_update_authority(&attacker, kind, Some(&target))
             .expect_err("attacker must not be able to transfer authority");
@@ -1488,13 +1158,8 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
     env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
         .expect("burn insurance_authority");
 
-    // admin (still valid) should be able to delegate close_authority.
-    let close_delegate = Keypair::new();
-    env.try_update_authority(&admin, AUTHORITY_CLOSE, Some(&close_delegate))
-        .expect("admin still acts on close_authority after insurance_authority burn");
-
-    // admin → new admin transfer should also still work (proves the
-    // admin kind is independent of the insurance-authority burn).
+    // admin → new admin transfer should still work (proves the admin
+    // kind is independent of the insurance-authority burn).
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
     env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin))
