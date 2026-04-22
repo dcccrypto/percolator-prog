@@ -5621,10 +5621,20 @@ pub mod processor {
                         fee_paid_nocpi,
                         config.mark_min_fee,
                     );
-                    // Only update the EWMA clock when the mark actually moved.
-                    // Zero-weight trades must not refresh the clock — that would
-                    // shrink future dt and damp legitimate updates.
-                    if config.mark_ewma_e6 != old_ewma {
+                    // Only full-weight observations advance the EWMA clock
+                    // (Finding 7). Sub-threshold trades can still nudge the
+                    // EWMA value via partial alpha, but their clock bump
+                    // would make the clock a liveness signal attackers can
+                    // cheaply refresh — and on Hyperp markets the soft-
+                    // staleness check reads `max(mark_ewma_last_slot,
+                    // last_mark_push_slot)`, so any clock bump on dust
+                    // trades keeps an otherwise-dead Hyperp market live.
+                    // Gating on full-weight collapses the two-clock
+                    // dichotomy: both clocks now only refresh on
+                    // observation-eligible fills.
+                    let full_weight_observation_nocpi = config.mark_min_fee == 0
+                        || fee_paid_nocpi >= config.mark_min_fee;
+                    if full_weight_observation_nocpi {
                         config.mark_ewma_last_slot = clock.slot;
                     }
                     // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
@@ -6155,23 +6165,21 @@ pub mod processor {
                             fee_paid_cpi,
                             config.mark_min_fee,
                         );
-                        // EWMA math clock refreshes when:
-                        //   (a) the EWMA VALUE changed (any partial-
-                        //       fee sub-threshold trade that moves
-                        //       mark_ewma_e6 must advance the clock,
-                        //       otherwise the next ewma_update sees
-                        //       a stale dt and over-weights), OR
-                        //   (b) the trade was a full-weight
-                        //       observation (same-price trades don't
-                        //       move the value but do reset the dt
-                        //       anchor to "we just saw this price").
-                        // This is distinct from Hyperp liveness
-                        // (below), which only counts full-weight
-                        // observations.
+                        // Only full-weight observations advance the EWMA
+                        // clock (Finding 7). Partial-alpha nudges from
+                        // sub-threshold trades still mutate the EWMA
+                        // value, but the clock is treated strictly as a
+                        // liveness signal — otherwise dust trades on
+                        // Hyperp markets refresh the soft-staleness check
+                        // `max(mark_ewma_last_slot, last_mark_push_slot)`,
+                        // keeping an otherwise-dead market alive. The
+                        // minor EWMA-dt drift (next full-weight trade
+                        // sees `dt = time_since_last_full_weight`, not
+                        // `time_since_last_partial`) is an acceptable
+                        // tradeoff.
                         let full_weight_observation = config.mark_min_fee == 0
                             || fee_paid_cpi >= config.mark_min_fee;
-                        let ewma_moved = config.mark_ewma_e6 != old_ewma_cpi;
-                        if ewma_moved || full_weight_observation {
+                        if full_weight_observation {
                             config.mark_ewma_last_slot = clock.slot;
                         }
                         // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic

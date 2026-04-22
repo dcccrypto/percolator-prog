@@ -5469,3 +5469,93 @@ fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
         env.read_num_used_accounts(),
     );
 }
+
+/// Finding 7 (TDD regression): a sub-threshold (dust) trade must NOT
+/// advance `mark_ewma_last_slot` even when its partial-alpha
+/// contribution nudges the EWMA value by a tiny amount.
+///
+/// Why the clock bump matters for security: on Hyperp markets, soft-
+/// staleness reads `max(mark_ewma_last_slot, last_mark_push_slot)`.
+/// `last_mark_push_slot` is already full-weight-gated (correct), but
+/// if `mark_ewma_last_slot` advances on dust trades, an attacker can
+/// keep a Hyperp market indefinitely "live" by spamming dust fills
+/// even though no genuine observation has been made.
+///
+/// Even on non-Hyperp (where this clock isn't load-bearing for
+/// staleness) the invariant still holds: dust should not refresh
+/// either clock.
+#[test]
+fn test_dust_trade_must_not_advance_mark_ewma_last_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Large fee rate + high mark_min_fee so the seed trade is
+    // full-weight AND a sub-threshold partial has a NON-ZERO
+    // effective_alpha (otherwise u128 integer division rounds the
+    // partial-alpha contribution to 0 and `ewma_moved` never fires).
+    //   - trading_fee_bps = 1000 (10%): fees are large enough.
+    //   - mark_min_fee   = 100_000_000: partial fills are clearly sub.
+    //   - seed (size 10M at $138): fee ≈ 276M, full-weight.
+    //   - dust (size 1M  at $139): fee ≈ 27.8M, sub-threshold but
+    //     partial-alpha contribution ≈ 222k EWMA units — nonzero,
+    //     so `ewma_moved` is true and the buggy clock bump fires.
+    env.init_market_fee_weighted(0, 10_000, 1000, 100_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Seed EWMA with a full-weight trade.
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+    let ewma_seed = env.read_mark_ewma();
+    assert!(ewma_seed > 0, "EWMA must be seeded");
+
+    // Read mark_ewma_last_slot after seed.
+    let read_ewma_clock = |env: &TestEnv| -> u64 {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        percolator_prog::state::read_config(&d).mark_ewma_last_slot
+    };
+    let clock_after_seed = read_ewma_clock(&env);
+
+    // Advance oracle price and do a sub-threshold trade.
+    env.set_slot_and_price(500, 139_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    // Sanity: the dust trade's partial-alpha MUST have produced a
+    // nonzero EWMA move — otherwise `ewma_moved` never fires and
+    // the test can't distinguish the bug from correct behavior.
+    let ewma_after_dust = env.read_mark_ewma();
+    assert_ne!(
+        ewma_after_dust, ewma_seed,
+        "test misconfigured: partial-alpha rounded to 0, so the \
+         bug surface (ewma_moved=true while full_weight=false) \
+         wasn't exercised",
+    );
+
+    // The dust trade's fee is sub-threshold. Partial-alpha EWMA
+    // update may nudge `mark_ewma_e6` by a tiny amount, but the
+    // clock MUST NOT advance — otherwise the partial-fee fill
+    // refreshes the liveness/staleness signal attackers can spam.
+    let clock_after_dust = read_ewma_clock(&env);
+    assert_eq!(
+        clock_after_dust, clock_after_seed,
+        "dust trade (fee < mark_min_fee) must not advance \
+         mark_ewma_last_slot: seed_clock={} post_dust_clock={}",
+        clock_after_seed, clock_after_dust,
+    );
+
+    // Sanity: a full-weight trade DOES advance the clock.
+    // Use a different size so the tx signature differs from the seed
+    // (LiteSVM doesn't auto-advance blockhash between txs).
+    env.set_slot_and_price(1000, 140_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 15_000_000);
+    let clock_after_full = read_ewma_clock(&env);
+    assert!(
+        clock_after_full > clock_after_dust,
+        "full-weight trade must advance mark_ewma_last_slot: \
+         before={} after={}",
+        clock_after_dust, clock_after_full,
+    );
+}
