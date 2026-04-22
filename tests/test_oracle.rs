@@ -1128,43 +1128,51 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
 }
 
 
-/// Oracle observation monotonicity: a Pyth update with a `publish_time`
-/// strictly older than the last accepted observation must be rejected,
-/// even if its age is within `max_staleness_secs`. Without this guard
-/// a caller could submit a valid-but-older Pyth account after a newer
-/// one has been processed and price their op against the older
-/// reading (within the circuit-breaker cap).
+/// Oracle observation monotonicity (graceful policy): a Pyth update
+/// with a `publish_time` older than the last accepted observation
+/// must NOT advance the stored baseline or timestamp, but it also
+/// must not fail the caller's tx. The wrapper substitutes the stored
+/// `last_effective_price_e6` so callers who signed before a newer
+/// update landed (offline signers, hardware wallets, multi-sigs) can
+/// still execute against the freshest known price. Baseline-rewind
+/// is impossible regardless of what older observation is submitted.
 #[test]
-fn test_oracle_publish_time_monotonicity_rejects_older_observation() {
+fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    // First crank: fresh Pyth at publish_time = 200, advances baseline.
+    // First crank: fresh Pyth advances baseline.
     env.set_slot_and_price(100, 138_000_000);
     env.crank();
 
-    // Read last_oracle_publish_time from the slab to confirm advance.
-    const LAST_ORACLE_PUB_TS_OFF: usize = 320; // HEADER_LEN(136) + last_oracle_publish_time(184)
-    let pub_ts_after_first = {
+    const LAST_ORACLE_PUB_TS_OFF: usize = 320;     // HEADER_LEN(136) + last_oracle_publish_time(184)
+    const LAST_EFFECTIVE_PRICE_OFF: usize = 336;   // HEADER_LEN(136) + last_effective_price_e6(200)
+    let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         i64::from_le_bytes(
-            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
-                .try_into()
-                .unwrap(),
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8].try_into().unwrap(),
         )
     };
+    let read_baseline = |env: &TestEnv| -> u64 {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        u64::from_le_bytes(
+            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8].try_into().unwrap(),
+        )
+    };
+    let pub_ts_before = read_pub_ts(&env);
+    let baseline_before = read_baseline(&env);
     assert!(
-        pub_ts_after_first > 0,
+        pub_ts_before > 0,
         "first crank must advance last_oracle_publish_time, got {}",
-        pub_ts_after_first,
+        pub_ts_before,
     );
 
-    // Replace the on-chain Pyth account with an OLDER (but still
-    // within max_staleness_secs) update at publish_time = pub_ts - 30.
-    // The clock stays at the post-first-crank slot, so the update is
-    // not staleness-rejected — it must be MONOTONICITY-rejected.
-    let older_publish_time = pub_ts_after_first - 30;
-    let older_pyth = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, older_publish_time);
+    // Replace the on-chain Pyth account with an OLDER (still within
+    // max_staleness_secs) update at a wildly different price. The
+    // older `publish_time` must trigger the graceful fallback — the
+    // submitted price must NOT be processed against the baseline.
+    let older_publish_time = pub_ts_before - 30;
+    let older_pyth = make_pyth_data(&TEST_FEED_ID, 999_999_999, -6, 1, older_publish_time);
     env.svm
         .set_account(
             env.pyth_index,
@@ -1178,32 +1186,27 @@ fn test_oracle_publish_time_monotonicity_rejects_older_observation() {
         )
         .unwrap();
 
-    let result = env.try_crank();
-    assert!(
-        result.is_err(),
-        "crank with older Pyth observation must reject (monotonicity violation), got: {:?}",
-        result,
-    );
+    // Crank must SUCCEED (graceful) — the wrapper substitutes the stored baseline.
+    env.crank();
 
-    // Sanity: the stored publish_time must NOT have moved backward.
-    let pub_ts_after_attack = {
-        let d = env.svm.get_account(&env.slab).unwrap().data;
-        i64::from_le_bytes(
-            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
-                .try_into()
-                .unwrap(),
-        )
-    };
+    // Neither the timestamp nor the baseline moved.
     assert_eq!(
-        pub_ts_after_attack, pub_ts_after_first,
-        "rejected older observation must not rewind last_oracle_publish_time",
+        read_pub_ts(&env),
+        pub_ts_before,
+        "older observation must not advance last_oracle_publish_time",
+    );
+    assert_eq!(
+        read_baseline(&env),
+        baseline_before,
+        "older observation must not pull last_effective_price_e6 backward \
+         even when the submitted price is wildly different",
     );
 }
 
-/// Equal `publish_time` must be accepted — two transactions in the same
+/// Equal `publish_time` must be accepted: two transactions in the same
 /// slot reading the same on-chain Pyth update is not "out of order".
 #[test]
-fn test_oracle_publish_time_monotonicity_allows_equal_observation() {
+fn test_oracle_publish_time_equal_observation_succeeds() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 

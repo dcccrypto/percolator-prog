@@ -2057,12 +2057,14 @@ pub mod state {
         pub hyperp_mark_e6: u64,
         /// Most recently accepted external oracle observation timestamp
         /// (Pyth `publish_time` or Chainlink `timestamp`, in seconds).
-        /// `clamp_external_price` rejects any incoming Pyth/Chainlink
-        /// reading with `publish_time < last_oracle_publish_time` so
-        /// observations are monotonic — a caller cannot replay an older
-        /// (still-fresh-window) price after a newer one has been
-        /// accepted. Initialized to 0 at InitMarket so the first read
-        /// always passes.
+        /// Used as a one-way clock on observations: incoming reads with
+        /// `publish_time < last_oracle_publish_time` are served from
+        /// `last_effective_price_e6` and do NOT advance baseline or
+        /// timestamp. This both preserves caller liveness (offline
+        /// signers can't be deadlocked by a newer update landing
+        /// between sign and submit) and prevents baseline-rewind via
+        /// replay. See `oracle::clamp_external_price` for the full
+        /// policy. Initialized at InitMarket from the genesis Pyth read.
         pub last_oracle_publish_time: i64,
 
         // ========================================
@@ -2784,29 +2786,38 @@ pub mod oracle {
         clamp_external_price(config, external)
     }
 
-    /// Circuit-breaker clamp applied to an already-parsed external price,
-    /// plus monotonicity enforcement on the source-feed timestamp.
+    /// Circuit-breaker clamp applied to an already-parsed external
+    /// observation, with non-regressing source-feed timestamp tracking.
     ///
     /// Pyth's `publish_time` and Chainlink's `timestamp` are signed by
-    /// the off-chain network — they can't be forged by a caller — so we
-    /// can use them as a strict ordering on observations. Any reading
-    /// with `publish_time < config.last_oracle_publish_time` is
-    /// rejected as `OracleStale`. This closes the cherry-pick attack
-    /// where a caller submits a still-fresh-window-but-older Pyth
-    /// account after a newer one has been accepted, choosing the more
-    /// favorable price within the circuit-breaker cap.
+    /// the off-chain network and can't be forged by the caller, so we
+    /// use them as a one-way clock on observations:
     ///
-    /// Equal timestamps are accepted (allows two transactions in the
-    /// same slot to read the same Pyth update). The first observation
-    /// after init always passes because `last_oracle_publish_time`
-    /// initializes to 0 and any real Pyth `publish_time` is > 0.
+    ///   publish_time >= last_oracle_publish_time
+    ///       → accept the submitted observation, clamp it against the
+    ///         baseline, advance both the baseline and the timestamp.
+    ///
+    ///   publish_time <  last_oracle_publish_time
+    ///       → an even-newer observation has already been accepted.
+    ///         Don't error — the caller may have signed before the
+    ///         newer update was posted (offline signers, hardware
+    ///         wallets, multi-sigs) and forcing a retry would just
+    ///         deadlock them as the on-chain state moves forward.
+    ///         Return the stored `last_effective_price_e6` and leave
+    ///         baseline + timestamp unchanged. The caller's op runs
+    ///         against the freshest price the wrapper has on file
+    ///         and cannot pull state backward.
+    ///
+    /// This preserves caller liveness while preventing baseline-rewind
+    /// (the only way to lower the effective price is via a fresh
+    /// downward-clamped observation, not via a replay of an old one).
     pub fn clamp_external_price(
         config: &mut super::state::MarketConfig,
         external: Result<(u64, i64), ProgramError>,
     ) -> Result<u64, ProgramError> {
         let (ext_price, publish_time) = external?;
         if publish_time < config.last_oracle_publish_time {
-            return Err(PercolatorError::OracleStale.into());
+            return Ok(config.last_effective_price_e6);
         }
         let clamped = clamp_oracle_price(
             config.last_effective_price_e6,
@@ -7101,21 +7112,28 @@ pub mod processor {
                     );
                     match oracle_result {
                         Ok((fresh_oracle, publish_time)) => {
-                            // Monotonicity guard: an older Pyth/Chainlink
-                            // observation can't be used as the settlement
-                            // anchor after a newer one has been accepted.
                             if publish_time < config.last_oracle_publish_time {
-                                return Err(PercolatorError::OracleStale.into());
+                                // Older observation: substitute the stored
+                                // last-known-good price. Mirrors the live
+                                // graceful-fallback policy in
+                                // `clamp_external_price` so admin resolve
+                                // doesn't error when a newer update has
+                                // already advanced state past the
+                                // admin's signed reading. Baseline and
+                                // timestamp remain unchanged.
+                                fresh_live_oracle = Some(config.last_effective_price_e6);
+                            } else {
+                                fresh_live_oracle = Some(fresh_oracle);
+                                // Advance the circuit-breaker baseline so
+                                // compute_current_funding_rate_e9 uses the
+                                // freshest index.
+                                config.last_effective_price_e6 = oracle::clamp_oracle_price(
+                                    config.last_effective_price_e6,
+                                    fresh_oracle,
+                                    config.oracle_price_cap_e2bps,
+                                );
+                                config.last_oracle_publish_time = publish_time;
                             }
-                            fresh_live_oracle = Some(fresh_oracle);
-                            // Update the circuit-breaker baseline from this fresh read
-                            // so compute_current_funding_rate_e9 uses the freshest index.
-                            config.last_effective_price_e6 = oracle::clamp_oracle_price(
-                                config.last_effective_price_e6,
-                                fresh_oracle,
-                                config.oracle_price_cap_e2bps,
-                            );
-                            config.last_oracle_publish_time = publish_time;
                             // NOTE on design: pass the RAW fresh oracle (not the
                             // clamped value) as the engine's live_oracle_price.
                             // The resolve deviation band
