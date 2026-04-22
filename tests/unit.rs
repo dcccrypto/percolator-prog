@@ -959,14 +959,14 @@ fn test_oracle_inversion() {
 
     // Without inversion (invert=0, unit_scale=0)
     // read_engine_price_e6(ai, feed_id, unix_ts, max_staleness_secs, conf_bps, invert, unit_scale)
-    let price_raw = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 0, 0).unwrap();
+    let (price_raw, _) = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 0, 0).unwrap();
     assert_eq!(
         price_raw, 100_000_000,
         "Raw price should be $100 (100_000_000 e6)"
     );
 
     // With inversion (invert=1, unit_scale=0)
-    let price_inv = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 1, 0).unwrap();
+    let (price_inv, _) = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 1, 0).unwrap();
     assert_eq!(
         price_inv, 10_000,
         "Inverted price should be 10_000 e6 (= 1e12 / 100_000_000)"
@@ -974,7 +974,7 @@ fn test_oracle_inversion() {
 
     // Test unit_scale transformation (oracle price scaling)
     // With unit_scale=1000: price_scaled = 100_000_000 / 1000 = 100_000
-    let price_scaled =
+    let (price_scaled, _) =
         read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 0, 1000).unwrap();
     assert_eq!(
         price_scaled, 100_000,
@@ -984,7 +984,7 @@ fn test_oracle_inversion() {
     // Test combined inversion + unit_scale
     // Inverted: 1e12 / 100_000_000 = 10_000
     // Then scaled: 10_000 / 1000 = 10
-    let price_inv_scaled =
+    let (price_inv_scaled, _) =
         read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 1, 1000).unwrap();
     assert_eq!(
         price_inv_scaled, 10,

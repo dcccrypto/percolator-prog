@@ -1040,17 +1040,17 @@ fn test_attack_push_oracle_without_authority_set() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + hyperp_mark_e6(176)
-    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + _reserved_auth_ts(184)
+    const HYPERP_MARK_OFF: usize = 312;            // HEADER_LEN(136) + hyperp_mark_e6(176)
+    const LAST_ORACLE_PUB_TS_OFF: usize = 320;     // HEADER_LEN(136) + last_oracle_publish_time(184)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    let auth_price_before =
-        u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
-    let auth_ts_before =
-        i64::from_le_bytes(slab_before[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap());
+    let mark_before =
+        u64::from_le_bytes(slab_before[HYPERP_MARK_OFF..HYPERP_MARK_OFF + 8].try_into().unwrap());
+    let pub_ts_before =
+        i64::from_le_bytes(slab_before[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8].try_into().unwrap());
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
 
-    // Don't set oracle authority - default is [0;32]
+    // Non-Hyperp market has no hyperp_authority — push must reject.
     let random = Keypair::new();
     env.svm.airdrop(&random.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_push_oracle_price(&random, 138_000_000, 100);
@@ -1059,22 +1059,21 @@ fn test_attack_push_oracle_without_authority_set() {
         "ATTACK: Push price without authority set should fail"
     );
     let slab_after = env.svm.get_account(&env.slab).unwrap().data;
-    let auth_price_after =
-        u64::from_le_bytes(slab_after[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
-    let auth_ts_after =
-        i64::from_le_bytes(slab_after[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap());
+    let mark_after =
+        u64::from_le_bytes(slab_after[HYPERP_MARK_OFF..HYPERP_MARK_OFF + 8].try_into().unwrap());
+    let pub_ts_after =
+        i64::from_le_bytes(slab_after[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8].try_into().unwrap());
     let used_after = env.read_num_used_accounts();
     let vault_after = env.vault_balance();
 
-    assert_eq!(auth_price_before, 0, "Precondition: authority price should be unset");
-    assert_eq!(auth_ts_before, 0, "Precondition: authority timestamp should be unset");
+    assert_eq!(mark_before, 0, "Precondition: non-Hyperp markets have hyperp_mark_e6 == 0");
     assert_eq!(
-        auth_price_after, auth_price_before,
-        "Rejected unauthorized push must not change authority price"
+        mark_after, mark_before,
+        "Rejected unauthorized push must not write hyperp_mark_e6"
     );
     assert_eq!(
-        auth_ts_after, auth_ts_before,
-        "Rejected unauthorized push must not change authority timestamp"
+        pub_ts_after, pub_ts_before,
+        "Rejected unauthorized push must not advance last_oracle_publish_time"
     );
     assert_eq!(used_after, used_before, "Rejected unauthorized push must not change num_used_accounts");
     assert_eq!(vault_after, vault_before, "Rejected unauthorized push must not move vault funds");

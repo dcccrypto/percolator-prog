@@ -2055,11 +2055,15 @@ pub mod state {
         /// Last price pushed by the Hyperp mark authority (e6, already
         /// invert+scale normalized to engine space).
         pub hyperp_mark_e6: u64,
-        /// Reserved 8 bytes (formerly `authority_timestamp`, used by the
-        /// non-Hyperp authority fallback that's been removed). Kept to
-        /// preserve 16-byte alignment of the `last_mark_push_slot: u128`
-        /// downstream on x86_64 so `bytemuck::Pod` stays padding-free.
-        pub _reserved_auth_ts: u64,
+        /// Most recently accepted external oracle observation timestamp
+        /// (Pyth `publish_time` or Chainlink `timestamp`, in seconds).
+        /// `clamp_external_price` rejects any incoming Pyth/Chainlink
+        /// reading with `publish_time < last_oracle_publish_time` so
+        /// observations are monotonic — a caller cannot replay an older
+        /// (still-fresh-window) price after a newer one has been
+        /// accepted. Initialized to 0 at InitMarket so the first read
+        /// always passes.
+        pub last_oracle_publish_time: i64,
 
         // ========================================
         // Oracle Price Circuit Breaker
@@ -2489,14 +2493,17 @@ pub mod oracle {
     /// - max_staleness_secs: Maximum age in seconds
     /// - conf_bps: Maximum confidence interval in basis points
     ///
-    /// Returns the price in e6 format (e.g., 150_000_000 = 150.00 in base units).
+    /// Returns `(price_e6, publish_time)` where `publish_time` is the Pyth
+    /// off-chain network's timestamp for this observation. The caller is
+    /// expected to enforce monotonicity against any previously-accepted
+    /// `publish_time` — see `clamp_external_price`.
     pub fn read_pyth_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
         now_unix_ts: i64,
         max_staleness_secs: u64,
         conf_bps: u16,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, i64), ProgramError> {
         use pythnet_sdk::messages::PriceFeedMessage;
 
         // Validate oracle owner.
@@ -2585,7 +2592,7 @@ pub mod oracle {
             return Err(PercolatorError::EngineOverflow.into());
         }
 
-        Ok(final_price_u128 as u64)
+        Ok((final_price_u128 as u64, publish_time))
     }
 
     /// Read price from a Chainlink OCR2 State/Aggregator account.
@@ -2596,14 +2603,17 @@ pub mod oracle {
     /// - now_unix_ts: Current unix timestamp (from clock.unix_timestamp)
     /// - max_staleness_secs: Maximum age in seconds
     ///
-    /// Returns the price in e6 format (e.g., 150_000_000 = 150.00 in base units).
+    /// Returns `(price_e6, observation_timestamp)` where the timestamp is
+    /// the Chainlink off-chain reporters' unix timestamp for this round.
+    /// The caller is expected to enforce monotonicity against any
+    /// previously-accepted timestamp — see `clamp_external_price`.
     /// Note: Chainlink doesn't have confidence intervals, so conf_bps is not used.
     pub fn read_chainlink_price_e6(
         price_ai: &AccountInfo,
         expected_feed_pubkey: &[u8; 32],
         now_unix_ts: i64,
         max_staleness_secs: u64,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, i64), ProgramError> {
         // Validate oracle owner.
         if *price_ai.owner != CHAINLINK_OCR2_PROGRAM_ID {
             return Err(ProgramError::IllegalOwner);
@@ -2675,7 +2685,7 @@ pub mod oracle {
             return Err(PercolatorError::EngineOverflow.into());
         }
 
-        Ok(final_price_u128 as u64)
+        Ok((final_price_u128 as u64, timestamp as i64))
     }
 
     /// Read oracle price for engine use, applying inversion and unit scaling if configured.
@@ -2701,9 +2711,9 @@ pub mod oracle {
         conf_bps: u16,
         invert: u8,
         unit_scale: u32,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, i64), ProgramError> {
         // Detect oracle type by account owner and dispatch
-        let raw_price = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
+        let (raw_price, publish_time) = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
             read_pyth_price_e6(
                 price_ai,
                 expected_feed_id,
@@ -2712,7 +2722,7 @@ pub mod oracle {
                 conf_bps,
             )?
         } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
-            // Chainlink safety: the feed pubkey check (line 2072) ensures only the
+            // Chainlink safety: the feed pubkey check ensures only the
             // specific account stored in index_feed_id at InitMarket can be read.
             // A different Chainlink-owned account would fail the pubkey match.
             read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)?
@@ -2733,7 +2743,7 @@ pub mod oracle {
         if engine_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        Ok(engine_price)
+        Ok((engine_price, publish_time))
     }
 
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
@@ -2774,20 +2784,37 @@ pub mod oracle {
         clamp_external_price(config, external)
     }
 
-    /// Circuit-breaker clamp applied to an already-parsed external price.
-    /// Shared by callers that need both the Ok/Err signal and the clamped
-    /// value from a single Pyth parse (saves ~2K CU on hot paths).
+    /// Circuit-breaker clamp applied to an already-parsed external price,
+    /// plus monotonicity enforcement on the source-feed timestamp.
+    ///
+    /// Pyth's `publish_time` and Chainlink's `timestamp` are signed by
+    /// the off-chain network — they can't be forged by a caller — so we
+    /// can use them as a strict ordering on observations. Any reading
+    /// with `publish_time < config.last_oracle_publish_time` is
+    /// rejected as `OracleStale`. This closes the cherry-pick attack
+    /// where a caller submits a still-fresh-window-but-older Pyth
+    /// account after a newer one has been accepted, choosing the more
+    /// favorable price within the circuit-breaker cap.
+    ///
+    /// Equal timestamps are accepted (allows two transactions in the
+    /// same slot to read the same Pyth update). The first observation
+    /// after init always passes because `last_oracle_publish_time`
+    /// initializes to 0 and any real Pyth `publish_time` is > 0.
     pub fn clamp_external_price(
         config: &mut super::state::MarketConfig,
-        external: Result<u64, ProgramError>,
+        external: Result<(u64, i64), ProgramError>,
     ) -> Result<u64, ProgramError> {
-        let ext_price = external?;
+        let (ext_price, publish_time) = external?;
+        if publish_time < config.last_oracle_publish_time {
+            return Err(PercolatorError::OracleStale.into());
+        }
         let clamped = clamp_oracle_price(
             config.last_effective_price_e6,
             ext_price,
             config.oracle_price_cap_e2bps,
         );
         config.last_effective_price_e6 = clamped;
+        config.last_oracle_publish_time = publish_time;
         Ok(clamped)
     }
 
@@ -4300,15 +4327,17 @@ pub mod processor {
                 //   (no valid positive price may encode "no price yet"). If the
                 //   oracle is unavailable at init time the admin must retry when
                 //   the feed is live; there is no sentinel path.
-                let init_price = if is_hyperp {
-                    initial_mark_price_e6
+                let (init_price, init_publish_time) = if is_hyperp {
+                    (initial_mark_price_e6, 0i64)
                 } else {
                     // Read the external oracle NOW; propagate any error (stale,
                     // wrong feed, malformed). Success seeds engine.last_oracle_price
                     // with a real price and lets us mark the oracle-initialized
                     // flag unconditionally — no FLAG_ORACLE_INITIALIZED gating
-                    // needed for engine reads after this point.
-                    let fresh = oracle::read_engine_price_e6(
+                    // needed for engine reads after this point. Capture the
+                    // observation's `publish_time` as the monotonicity baseline
+                    // so subsequent reads can't rewind below the genesis point.
+                    let (fresh, publish_time) = oracle::read_engine_price_e6(
                         a_oracle,
                         &index_feed_id,
                         clock.unix_timestamp,
@@ -4320,7 +4349,7 @@ pub mod processor {
                     if fresh == 0 || fresh > percolator::MAX_ORACLE_PRICE {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
-                    fresh
+                    (fresh, publish_time)
                 };
 
                 // Prevalidate all engine RiskParams invariants to return
@@ -4395,7 +4424,7 @@ pub mod processor {
                     // Set to zero for non-Hyperp.
                     hyperp_authority: if is_hyperp { a_admin.key.to_bytes() } else { [0u8; 32] },
                     hyperp_mark_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-                    _reserved_auth_ts: 0,
+                    last_oracle_publish_time: init_publish_time,
                     // Oracle price circuit breaker
                     // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
                     // Default: disabled for non-Hyperp, 1% per slot for Hyperp
@@ -7071,7 +7100,13 @@ pub mod processor {
                         config.unit_scale,
                     );
                     match oracle_result {
-                        Ok(fresh_oracle) => {
+                        Ok((fresh_oracle, publish_time)) => {
+                            // Monotonicity guard: an older Pyth/Chainlink
+                            // observation can't be used as the settlement
+                            // anchor after a newer one has been accepted.
+                            if publish_time < config.last_oracle_publish_time {
+                                return Err(PercolatorError::OracleStale.into());
+                            }
                             fresh_live_oracle = Some(fresh_oracle);
                             // Update the circuit-breaker baseline from this fresh read
                             // so compute_current_funding_rate_e9 uses the freshest index.
@@ -7080,6 +7115,7 @@ pub mod processor {
                                 fresh_oracle,
                                 config.oracle_price_cap_e2bps,
                             );
+                            config.last_oracle_publish_time = publish_time;
                             // NOTE on design: pass the RAW fresh oracle (not the
                             // clamped value) as the engine's live_oracle_price.
                             // The resolve deviation band

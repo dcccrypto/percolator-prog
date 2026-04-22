@@ -1127,3 +1127,91 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     println!("FUNDING ANTI-RETROACTIVITY UpdateConfig: PASSED");
 }
 
+
+/// Oracle observation monotonicity: a Pyth update with a `publish_time`
+/// strictly older than the last accepted observation must be rejected,
+/// even if its age is within `max_staleness_secs`. Without this guard
+/// a caller could submit a valid-but-older Pyth account after a newer
+/// one has been processed and price their op against the older
+/// reading (within the circuit-breaker cap).
+#[test]
+fn test_oracle_publish_time_monotonicity_rejects_older_observation() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // First crank: fresh Pyth at publish_time = 200, advances baseline.
+    env.set_slot_and_price(100, 138_000_000);
+    env.crank();
+
+    // Read last_oracle_publish_time from the slab to confirm advance.
+    const LAST_ORACLE_PUB_TS_OFF: usize = 320; // HEADER_LEN(136) + last_oracle_publish_time(184)
+    let pub_ts_after_first = {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        i64::from_le_bytes(
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert!(
+        pub_ts_after_first > 0,
+        "first crank must advance last_oracle_publish_time, got {}",
+        pub_ts_after_first,
+    );
+
+    // Replace the on-chain Pyth account with an OLDER (but still
+    // within max_staleness_secs) update at publish_time = pub_ts - 30.
+    // The clock stays at the post-first-crank slot, so the update is
+    // not staleness-rejected — it must be MONOTONICITY-rejected.
+    let older_publish_time = pub_ts_after_first - 30;
+    let older_pyth = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, older_publish_time);
+    env.svm
+        .set_account(
+            env.pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: older_pyth,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let result = env.try_crank();
+    assert!(
+        result.is_err(),
+        "crank with older Pyth observation must reject (monotonicity violation), got: {:?}",
+        result,
+    );
+
+    // Sanity: the stored publish_time must NOT have moved backward.
+    let pub_ts_after_attack = {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        i64::from_le_bytes(
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        pub_ts_after_attack, pub_ts_after_first,
+        "rejected older observation must not rewind last_oracle_publish_time",
+    );
+}
+
+/// Equal `publish_time` must be accepted — two transactions in the same
+/// slot reading the same on-chain Pyth update is not "out of order".
+#[test]
+fn test_oracle_publish_time_monotonicity_allows_equal_observation() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // First crank stamps publish_time.
+    env.set_slot_and_price(100, 138_000_000);
+    env.crank();
+
+    // Second crank without advancing the Pyth account: same publish_time.
+    // This must succeed (equal is not "older").
+    env.crank();
+}
