@@ -6282,6 +6282,15 @@ pub mod processor {
         if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
             return Err(ProgramError::InvalidInstructionData);
         }
+        // Gap A (hardening): non-Hyperp markets must set a non-zero oracle
+        // price cap at genesis. Cap == 0 disables read_price_clamped's
+        // per-read delta bound, letting any attacker-posted Pyth VAA feed
+        // through raw. Hyperp markets fall through to the later
+        // `is_hyperp && oracle_price_cap_e2bps == 0` guard; non-Hyperp has
+        // no equivalent downstream rejection.
+        if !is_hyperp && min_oracle_price_cap_e2bps == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         // maintenance_fee_per_slot removed from engine in v12.15
 
         // Permissionless resolve: if enabled, must exceed max_crank_staleness
