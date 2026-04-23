@@ -390,6 +390,37 @@ pub mod verify {
         exec_size // Must use exec_size, never requested_size
     }
 
+    /// Gap C (hardening): pure band-bound check for matcher exec_price.
+    ///
+    /// Returns `true` iff `|exec_price − oracle_price|` is within
+    /// `max(2 × trading_fee_bps, 100) × oracle_price / 10_000`.
+    /// Zero oracle price is rejected (caller must validate non-zero
+    /// upstream; band is undefined against zero).
+    ///
+    /// This duplicates the inline check in `handle_trade_cpi` so it can
+    /// be unit- and Kani-proven without a full program build.
+    #[inline]
+    pub fn exec_price_within_band(
+        oracle_price_e6: u64,
+        exec_price_e6: u64,
+        trading_fee_bps: u64,
+    ) -> bool {
+        if oracle_price_e6 == 0 {
+            return false;
+        }
+        let band_bps = core::cmp::max(2u64.saturating_mul(trading_fee_bps), 100u64);
+        let max_delta_u128 = (oracle_price_e6 as u128)
+            .saturating_mul(band_bps as u128)
+            / 10_000u128;
+        let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
+        let delta = if exec_price_e6 > oracle_price_e6 {
+            exec_price_e6 - oracle_price_e6
+        } else {
+            oracle_price_e6 - exec_price_e6
+        };
+        delta <= max_delta
+    }
+
     // =========================================================================
     // Account validation helpers
     // =========================================================================
@@ -2378,6 +2409,19 @@ pub mod state {
         ///   requires permissionless_resolve_stale_slots > 0).
         /// - All-zeros: no transfer pending.
         pub pending_admin: [u8; 32],
+
+        // ========================================
+        // Gap B (hardening): oracle account pubkey pin
+        // ========================================
+
+        /// Expected oracle account pubkey, pinned at InitMarket.
+        /// When non-zero, `read_engine_price_e6` rejects any oracle
+        /// account whose pubkey differs from this value.
+        /// All-zeros = legacy (owner + feed_id checks only, no pubkey pin).
+        ///
+        /// Hyperp markets: all-zeros (the oracle account is the DEX pool,
+        /// validated separately via `config.dex_pool`).
+        pub expected_oracle_pubkey: [u8; 32],
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -3164,6 +3208,31 @@ pub mod oracle {
         invert: u8,
         unit_scale: u32,
     ) -> Result<u64, ProgramError> {
+        read_engine_price_e6_with_pin(
+            price_ai, expected_feed_id, &[0u8; 32],
+            now_unix_ts, max_staleness_secs, conf_bps, invert, unit_scale,
+        )
+    }
+
+    /// Gap B (hardening): pubkey-pinned variant. When `expected_pubkey`
+    /// is non-zero, reject any oracle account whose pubkey differs.
+    /// Zero pubkey = legacy behavior (feed_id + owner only).
+    pub fn read_engine_price_e6_with_pin(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+        expected_pubkey: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+        conf_bps: u16,
+        invert: u8,
+        unit_scale: u32,
+    ) -> Result<u64, ProgramError> {
+        // Gap B: if pin is set, require exact match on the oracle account pubkey.
+        if expected_pubkey != &[0u8; 32] {
+            if &price_ai.key.to_bytes() != expected_pubkey {
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+        }
         // Detect oracle type by account owner and dispatch
         let raw_price = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
             read_pyth_price_e6(
@@ -3236,10 +3305,14 @@ pub mod oracle {
         price_ai: &AccountInfo,
         now_unix_ts: i64,
     ) -> Result<u64, ProgramError> {
-        // Read from external oracle (Pyth/Chainlink)
-        let external = read_engine_price_e6(
+        // Read from external oracle (Pyth/Chainlink). Gap B (hardening):
+        // pass `config.expected_oracle_pubkey` so the pinned variant
+        // rejects caller-substituted oracle accounts on new markets.
+        // Zero pubkey = legacy (no pin enforced).
+        let external = read_engine_price_e6_with_pin(
             price_ai,
             &config.index_feed_id,
+            &config.expected_oracle_pubkey,
             now_unix_ts,
             config.max_staleness_secs,
             config.conf_filter_bps,
@@ -5342,9 +5415,13 @@ pub mod processor {
         clock_slot: u64,
         slab_data: Option<&mut [u8]>,
     ) -> Result<u64, ProgramError> {
-        let external_ok = oracle::read_engine_price_e6(
+        // Gap B (hardening): route the liveness probe through the pinned
+        // variant too — a caller-substituted oracle with matching feed_id
+        // must not count as "oracle alive" toward last_good_oracle_slot.
+        let external_ok = oracle::read_engine_price_e6_with_pin(
             a_oracle,
             &config.index_feed_id,
+            &config.expected_oracle_pubkey,
             clock_unix_ts,
             config.max_staleness_secs,
             config.conf_filter_bps,
@@ -6282,6 +6359,15 @@ pub mod processor {
         if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
             return Err(ProgramError::InvalidInstructionData);
         }
+        // Gap A (hardening): non-Hyperp markets must set a non-zero oracle
+        // price cap at genesis. Cap == 0 disables read_price_clamped's
+        // per-read delta bound, letting any attacker-posted Pyth VAA feed
+        // through raw. Hyperp markets fall through to the later
+        // `is_hyperp && oracle_price_cap_e2bps == 0` guard; non-Hyperp has
+        // no equivalent downstream rejection.
+        if !is_hyperp && min_oracle_price_cap_e2bps == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         // maintenance_fee_per_slot removed from engine in v12.15
 
         // Permissionless resolve: if enabled, must exceed max_crank_staleness
@@ -6488,6 +6574,16 @@ pub mod processor {
             // Two-step admin transfer (Phase E, 2026-04-17).
             // No transfer pending at market creation.
             pending_admin: [0u8; 32],
+            // Gap B (hardening): pin the oracle account pubkey at genesis
+            // for non-Hyperp markets. Without this, read_engine_price_e6
+            // validates only owner + feed_id, so an attacker can post any
+            // recent SOL/USD VAA to their own ephemeral PriceUpdateV2 and
+            // pass it in. Hyperp markets pin via `config.dex_pool` instead.
+            expected_oracle_pubkey: if is_hyperp {
+                [0u8; 32]
+            } else {
+                a_oracle.key.to_bytes()
+            },
         };
         // Hyperp markets must have non-zero cap for index smoothing
         if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -7548,6 +7644,19 @@ pub mod processor {
         if exec_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::OracleInvalid.into());
         }
+        // Gap C (hardening): explicit band bound on matcher-returned
+        // exec_price. See `verify::exec_price_within_band` for the pure
+        // logic and the Kani-style unit tests in `tests/hardening.rs`.
+        {
+            let fee_bps: u64 = {
+                let data = a_slab.try_borrow_data()?;
+                let engine = zc::engine_ref(&data)?;
+                engine.params.trading_fee_bps
+            };
+            if !crate::verify::exec_price_within_band(price, exec_price, fee_bps) {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+        }
         {
             let mut data = state::slab_data_mut(a_slab)?;
             let engine = zc::engine_mut(&mut data)?;
@@ -8396,9 +8505,11 @@ pub mod processor {
             mark
         } else {
             // Non-Hyperp: read live oracle; fall back to last_effective_price_e6 on stale.
-            let oracle_result = oracle::read_engine_price_e6(
+            // Gap B (hardening): use the pubkey-pinned variant.
+            let oracle_result = oracle::read_engine_price_e6_with_pin(
                 a_oracle,
                 &config.index_feed_id,
+                &config.expected_oracle_pubkey,
                 clock.unix_timestamp,
                 config.max_staleness_secs,
                 config.conf_filter_bps,
@@ -9315,8 +9426,14 @@ pub mod processor {
         // be an attacker passing garbage to fake oracle death.
         let is_hyperp = oracle::is_hyperp_mode(&config);
         if !is_hyperp {
-            let oracle_result = oracle::read_engine_price_e6(
+            // Gap B (hardening): use pubkey-pinned variant so an attacker
+            // cannot fake oracle-death by passing a garbage-pubkey account
+            // with valid feed_id — the pin rejects with InvalidOracleKey,
+            // not OracleStale, and the ResolvePermissionless pre-gate
+            // propagates non-stale errors.
+            let oracle_result = oracle::read_engine_price_e6_with_pin(
                 a_oracle, &config.index_feed_id,
+                &config.expected_oracle_pubkey,
                 clock.unix_timestamp, config.max_staleness_secs,
                 config.conf_filter_bps, config.invert, config.unit_scale,
             );
