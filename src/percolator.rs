@@ -4323,9 +4323,18 @@ pub mod processor {
                 // authority burns. Hyperp is exempt — mark is trade-
                 // sourced and the Hyperp dead-zone guard above handles
                 // its own resolvability.
-                if !is_hyperp
+                // Gap T: the `min_oracle_price_cap_e2bps == 0` clause of this
+                // guard is subsumed by the leverage-tied derivation below,
+                // which rejects the cap-disabled case for every non-Hyperp
+                // market regardless of `permissionless_resolve_stale_slots`.
+                // Keep the dead-means-resolvable shape of the original guard
+                // by retaining its structure but scoping the no-breaker
+                // branch to Hyperp markets that were allowed to keep an
+                // admin-supplied 0 floor.
+                if is_hyperp
                     && permissionless_resolve_stale_slots == 0
                     && min_oracle_price_cap_e2bps == 0
+                    && DEFAULT_HYPERP_PRICE_CAP_E2BPS == 0
                 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
@@ -4508,6 +4517,58 @@ pub mod processor {
                 // so first crank doesn't see a huge staleness gap.
                 engine.last_crank_slot = clock.slot;
 
+                // Gap T (hardening, Toly's design): derive the oracle-price
+                // circuit-breaker cap from (IM - MM) and the keeper-sweep
+                // interval. The invariant is: cumulative oracle drift between
+                // two keeper sweeps cannot exceed the MM buffer, so a position
+                // cannot skip from above-IM to bankrupt in one sweep without
+                // crossing MM first. Liquidations therefore always fire on
+                // time, at the cost of protocol-price distortion during fast
+                // real-market moves.
+                //
+                // Formula: cap_e2bps = (IM_bps - MM_bps) * 100 / max_sweep_slots
+                // For 20/10 mainnet params at 20_000 slot staleness: 5 e2bps
+                // per read.
+                //
+                // TODO (design call): `max_sweep_slots` is currently wired to
+                // `risk_params.max_crank_staleness_slots` as a placeholder.
+                // If "full crank sweep" and "keeper-staleness window" need to
+                // be independent bindings, introduce a dedicated
+                // `max_sweep_slots` field on RiskParams and switch this
+                // derivation to use it.
+                let derived_oracle_price_cap_e2bps: u64 = if is_hyperp {
+                    // Hyperp keeps its own branch in the struct literal below.
+                    0
+                } else {
+                    let diff_bps = risk_params
+                        .initial_margin_bps
+                        .checked_sub(risk_params.maintenance_margin_bps)
+                        .ok_or(PercolatorError::InvalidConfigParam)?;
+                    if diff_bps == 0 {
+                        // No MM buffer means no room for oracle drift before
+                        // liquidation is already due; the derivation is
+                        // undefined.
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                    if risk_params.max_crank_staleness_slots == 0 {
+                        // engine's validate_params should already reject this,
+                        // but keep the defensive check local to the derivation.
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                    let numerator = diff_bps
+                        .checked_mul(100)
+                        .ok_or(PercolatorError::InvalidConfigParam)?;
+                    let cap = numerator / risk_params.max_crank_staleness_slots;
+                    if cap == 0 {
+                        // Pathological: MM buffer too narrow relative to the
+                        // staleness window, so the derivation rounds to 0
+                        // and would silently disable the clamp. Reject at
+                        // init rather than ship a disabled breaker.
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                    cap
+                };
+
                 let config = MarketConfig {
                     collateral_mint: a_mint.key.to_bytes(),
                     vault_pubkey: a_vault.key.to_bytes(),
@@ -4533,15 +4594,19 @@ pub mod processor {
                     hyperp_authority: if is_hyperp { a_admin.key.to_bytes() } else { [0u8; 32] },
                     hyperp_mark_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     last_oracle_publish_time: init_publish_time,
-                    // Oracle price circuit breaker
-                    // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
-                    // Default: disabled for non-Hyperp, 1% per slot for Hyperp
+                    // Oracle price circuit breaker.
+                    // Hyperp mode: rate-limited index smoothing plus mark
+                    // price clamping, keeps the existing
+                    // `DEFAULT_HYPERP_PRICE_CAP_E2BPS` / floor behaviour.
+                    // Non-Hyperp: Gap T (hardening) derives the cap from
+                    // (IM - MM) / max_crank_staleness_slots above, so the
+                    // breaker is active at a leverage-tied rate from genesis
+                    // and cannot be disabled by admin.
                     oracle_price_cap_e2bps: if is_hyperp {
                         DEFAULT_HYPERP_PRICE_CAP_E2BPS.max(min_oracle_price_cap_e2bps)
                     } else {
-                        // Non-Hyperp: start at the immutable floor so the circuit
-                        // breaker is active from genesis. 0 floor = no breaker.
-                        min_oracle_price_cap_e2bps
+                        // Derived above; non-zero by construction.
+                        derived_oracle_price_cap_e2bps
                     },
                     // Seed last_effective_price_e6 with the genesis reading so the
                     // circuit-breaker baseline is real from genesis too (not 0, which

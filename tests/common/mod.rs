@@ -247,7 +247,7 @@ pub fn encode_init_market_hyperp_with_stale(
     let max_crank = if permissionless_resolve_stale_slots > 0 {
         permissionless_resolve_stale_slots.saturating_sub(1).max(1)
     } else {
-        u64::MAX
+        50_000u64
     };
     data.extend_from_slice(&max_crank.to_le_bytes());
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -305,7 +305,7 @@ pub fn encode_init_market_hyperp_with_fees(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&50_000u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -454,7 +454,7 @@ pub fn encode_init_market_with_cap(
     let max_crank = if permissionless_resolve_stale_slots > 0 {
         permissionless_resolve_stale_slots.saturating_sub(1).max(1)
     } else {
-        u64::MAX
+        50_000u64
     };
     data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps

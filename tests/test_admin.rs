@@ -369,35 +369,15 @@ fn test_update_admin_zero_accepted_for_burn() {
     println!("UPDATE ADMIN ZERO BURN: PASSED");
 }
 
-/// Resolvability invariant: a non-Hyperp market with
-///   min_oracle_price_cap_e2bps == 0   AND
-///   permissionless_resolve_stale_slots == 0
-/// has no resolve path: non-Hyperp markets resolve via a fresh Pyth
-/// read (or the Degenerate arm once the permissionless-stale window
-/// matures), and perm_resolve == 0 disables the window entirely.
-/// The init must reject this combo outright rather than create a
-/// permanently-bricked market.
-#[test]
-fn test_init_rejects_non_hyperp_with_no_resolve_path() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    let data = common::encode_init_market_with_cap(
-        &env.payer.pubkey(),
-        &env.mint,
-        &common::TEST_FEED_ID,
-        0, // invert=0 (non-Hyperp)
-        0, // min_oracle_price_cap_e2bps
-        0, // permissionless_resolve_stale_slots
-    );
-    let err = env
-        .try_init_market_raw(data)
-        .expect_err("init must reject non-Hyperp + cap=0 + perm_resolve=0");
-    assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
-    );
-}
+// Gap T (hardening, Toly's design): test removed. The rejection this
+// test asserted — non-Hyperp + cap=0 + perm_resolve=0 — was the
+// old-contract guard. Under the leverage-tied derivation, every
+// non-Hyperp market carries a non-zero cap derived from
+// (IM - MM) / max_crank_staleness_slots, so the cap=0 configuration
+// the guard protected against is unreachable at init regardless of
+// perm_resolve. The underlying resolvability invariant is still
+// protected, just via the derivation rather than this specific combo
+// check.
 
 /// Positive complement: same (cap=0) market with perm_resolve > 0 is
 /// allowed. The perm-stale branch of ResolveMarket settles at
