@@ -716,12 +716,6 @@ fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
     data
 }
 
-fn encode_set_oracle_price_cap(max_change_e2bps: u64) -> Vec<u8> {
-    let mut data = vec![18u8];
-    data.extend_from_slice(&max_change_e2bps.to_le_bytes());
-    data
-}
-
 fn encode_resolve_market() -> Vec<u8> {
     vec![19u8]
 }

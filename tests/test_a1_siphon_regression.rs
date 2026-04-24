@@ -276,40 +276,98 @@ fn test_a1_hyperp_mark_siphon_defended() {
     outcome.assert_defended("A1b Hyperp mark-push (authority-only)");
 }
 
-/// A1c: TradeCpi (matcher-routed) — placeholder.
+/// A1c: TradeCpi (matcher-routed) — dual-keypair self-dealing attack.
 ///
-/// The original attack vector on the TradeCpi path requires a matching-
-/// engine program loaded alongside percolator, an LP registered with the
-/// matcher, and an ABI-echoing match result. That fixture lives in
-/// `tests/test_tradecpi.rs` via `TradeCpiTestEnv` — the integration
-/// matcher binary is required. We deliberately scope this regression
-/// file to the two fixtures that can be built with the default TestEnv
-/// alone (A1a external Pyth, A1b Hyperp mark).
+/// Exercises the same self-dealing matched-pair setup as A1a but routes
+/// the trade through `TradeCpi` with the registered default matcher.
+/// This is the path where the pre-v12.19 attack had its fullest
+/// expression (the attacker could, in principle, pair any LP they own
+/// with any user they own against a tame matcher). v12.19's defenses
+/// (max_price_move_bps_per_slot, §1.4 envelope, admission threshold)
+/// apply identically across TradeCpi and TradeNoCpi — the crank pipeline
+/// is the same once a trade is admitted.
 ///
 /// The TradeCpi-specific defenses (ABI echo check, matcher identity
-/// binding, LP PDA shape check, nonce discipline, oracle-price echo)
-/// are already exercised by the per-vector `test_tradecpi_*` battery
-/// and the 243-proof Kani suite. An A1c rerun against the same
-/// self-dealing matched-pair setup but through TradeCpi would duplicate
-/// that coverage; defer until the TradeCpiTestEnv gets a dual-keypair
-/// helper (TODO).
+/// binding, LP PDA shape, nonce discipline, oracle-price echo) are
+/// exhaustively exercised by `tests/test_tradecpi.rs`. What remains
+/// specific to A1 is the `attacker_delta <= ROUNDING_TOLERANCE` +
+/// `insurance_drop <= ROUNDING_TOLERANCE` pair, which we assert here
+/// after an adverse oracle drop against a matched-pair position opened
+/// via TradeCpi.
 #[test]
-fn test_a1_tradecpi_siphon_scoped_to_test_tradecpi() {
-    // Smoke: confirm the matcher program binary is visible; if it's
-    // absent in this tree, explicitly flag A1c as out-of-scope here.
-    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/deploy/matcher_program.so");
-    if !p.exists() {
-        println!(
-            "A1c deferred: matcher_program.so not present at {:?}. \
-             TradeCpi A1 coverage lives in tests/test_tradecpi.rs.",
-            p
-        );
-        return;
+fn test_a1_tradecpi_siphon_defended() {
+    let mut env = TradeCpiTestEnv::new();
+    // Use Hyperp mode so the test can drive the oracle adversarially
+    // via PushHyperpMark — TradeCpi is legal on Hyperp, so this covers
+    // the same attack surface as A1c (attacker controlling both sides
+    // of a matched pair through the registered matcher).
+    env.init_market_hyperp(1_000_000);
+    let matcher_prog = env.matcher_program_id;
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set hyperp mark authority");
+    env.try_push_oracle_price(&admin, 1_000_000, 100)
+        .expect("seed mark");
+
+    // Attacker controls both the LP and the taker.
+    let attacker_lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&attacker_lp, &matcher_prog);
+    let deposit_lp: u64 = 20_000_000_000;
+    env.deposit(&attacker_lp, lp_idx, deposit_lp);
+
+    let attacker_user = Keypair::new();
+    let user_idx = env.init_user(&attacker_user);
+    let deposit_user: u64 = 20_000_000_000;
+    env.deposit(&attacker_user, user_idx, deposit_user);
+
+    env.top_up_insurance(&admin, 5_000_000_000);
+    let insurance_before = env.read_insurance_balance();
+
+    env.set_slot(100);
+    env.crank();
+    // Open the matched pair via TradeCpi (user long, LP short).
+    let size: i128 = 1_000_000;
+    env.try_trade_cpi(
+        &attacker_user,
+        &attacker_lp.pubkey(),
+        lp_idx,
+        user_idx,
+        size,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("TradeCpi matched pair must admit under v12.19 envelope");
+
+    // Adverse mark push ~25% down over many small steps. Each push is
+    // clamped by the engine's mark-smoothing cap; cranks between pushes
+    // walk funding/accrual without tripping §1.4.
+    let steps = 50;
+    let start_px: i64 = 1_000_000;
+    let end_px: i64 = 750_000;
+    for i in 1..=steps {
+        let slot = 200 + (i * 20) as u64;
+        let px = start_px + (end_px - start_px) * i / steps;
+        env.set_slot(slot);
+        let _ = env.try_push_oracle_price(&admin, px as u64, slot as i64);
+        env.crank();
     }
-    println!(
-        "A1c scope: matcher_program.so is present but the dual-keypair A1 setup \
-         is not yet wired for TradeCpiTestEnv. Extend that env with an \
-         attacker_a/attacker_b helper pair to port this test."
-    );
+    for _ in 0..5 {
+        env.crank();
+    }
+
+    let cap_lp = env.read_account_capital(lp_idx);
+    let cap_user = env.read_account_capital(user_idx);
+    let pnl_lp = env.read_account_pnl(lp_idx);
+    let pnl_user = env.read_account_pnl(user_idx);
+    let insurance_after = env.read_insurance_balance();
+
+    let outcome = AttackOutcome {
+        attacker_a_deposit: deposit_user as u128,
+        attacker_b_deposit: deposit_lp as u128,
+        attacker_a_equity: cap_user as i128 + pnl_user,
+        attacker_b_equity: cap_lp as i128 + pnl_lp,
+        insurance_before,
+        insurance_after,
+    };
+    outcome.assert_defended("A1c TradeCpi matched-pair (Hyperp)");
 }

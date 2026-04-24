@@ -462,7 +462,6 @@ pub fn encode_init_market_with_cap(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     invert: u8,
-    _min_oracle_price_cap_e2bps: u64,
     permissionless_resolve_stale_slots: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
@@ -523,7 +522,6 @@ pub fn encode_init_market_with_funding(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     invert: u8,
-    _min_oracle_price_cap_e2bps: u64,
     permissionless_resolve_stale_slots: u64,
     funding_horizon_slots: u64,
     funding_k_bps: u64,
@@ -535,7 +533,6 @@ pub fn encode_init_market_with_funding(
         mint,
         feed_id,
         invert,
-        0, // legacy min_oracle_price_cap_e2bps (ignored)
         permissionless_resolve_stale_slots,
     );
     // Truncate default funding + mark_min_fee + force_close_delay (48 bytes)
@@ -558,7 +555,6 @@ pub fn encode_init_market_with_min_fee(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     invert: u8,
-    _min_oracle_price_cap_e2bps: u64,
     permissionless_resolve_stale_slots: u64,
     funding_horizon_slots: u64,
     funding_k_bps: u64,
@@ -568,7 +564,6 @@ pub fn encode_init_market_with_min_fee(
 ) -> Vec<u8> {
     let mut data = encode_init_market_with_funding(
         admin, mint, feed_id, invert,
-        0, // legacy min_oracle_price_cap_e2bps (ignored)
         permissionless_resolve_stale_slots,
         funding_horizon_slots, funding_k_bps,
         funding_max_premium_bps, funding_max_e9_per_slot,
@@ -588,7 +583,6 @@ pub fn encode_init_market_with_trading_fee(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     invert: u8,
-    _min_oracle_price_cap_e2bps: u64,
     trading_fee_bps: u64,
     mark_min_fee: u64,
 ) -> Vec<u8> {
@@ -700,7 +694,7 @@ pub fn encode_init_market_with_force_close(
     // live window. The 100-slot default that was fine under the old
     // challenge-window model trips the hard gate mid-sequence.
     let mut data = encode_init_market_with_cap(
-        admin, mint, feed_id, 0, 10_000, 1000,
+        admin, mint, feed_id, 0, 1000,
     );
     // Truncate default force_close_delay_slots (last 8 bytes), replace with custom
     data.truncate(data.len() - 8);
@@ -933,28 +927,21 @@ impl TestEnv {
         // `permissionless_resolve_stale_slots == 0` (a market with no
         // resolve path is un-resolvable once admin is burned). perm_resolve
         // must also exceed `max_crank_staleness_slots = 1800`. Pick 10_000.
-        self.init_market_with_cap(invert, 10_000, 10_000);
+        self.init_market_with_cap(invert, 10_000);
     }
 
     /// Initialize a market with oracle price cap (enables EWMA) and optional permissionless resolution.
     ///
-    /// v12.19: the wrapper now rejects non-Hyperp markets with
-    /// `permissionless_resolve_stale_slots == 0`. To avoid having to
-    /// individually patch every test call site, this helper auto-promotes
-    /// `0` → `10_000` (well above the 1800-slot `max_crank_staleness`
-    /// default the encoder ships with). Tests that need the literal 0
-    /// should call `encode_init_market_with_cap` directly.
+    /// v12.19: non-Hyperp markets must set `permissionless_resolve_stale_slots`
+    /// above the default `max_crank_staleness_slots` (= 1_800) so the wrapper's
+    /// resolvability invariant admits the market. Callers that pass `0` will
+    /// be rejected by the engine; use `encode_init_market_with_cap` directly
+    /// if a test genuinely requires `perm_resolve == 0`.
     pub fn init_market_with_cap(
         &mut self,
         invert: u8,
-        _min_oracle_price_cap_e2bps: u64,
         permissionless_resolve_stale_slots: u64,
     ) {
-        let permissionless_resolve_stale_slots = if permissionless_resolve_stale_slots == 0 {
-            10_000
-        } else {
-            permissionless_resolve_stale_slots
-        };
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
         self.svm
@@ -988,7 +975,6 @@ impl TestEnv {
                 &self.mint,
                 &TEST_FEED_ID,
                 invert,
-                0, // legacy min_oracle_price_cap_e2bps (ignored)
                 permissionless_resolve_stale_slots,
             ),
         };
@@ -1004,25 +990,20 @@ impl TestEnv {
             .expect("init_market_with_cap failed");
     }
 
-    /// Initialize a market with cap, permissionless resolution, AND custom funding params.
+    /// Initialize a market with permissionless resolution AND custom funding params.
+    ///
+    /// Non-Hyperp markets must set `permissionless_resolve_stale_slots` above
+    /// the wrapper's default `max_crank_staleness_slots` (1_800); passing `0`
+    /// will be rejected by the engine.
     pub fn init_market_with_funding(
         &mut self,
         invert: u8,
-        _min_oracle_price_cap_e2bps: u64,
         permissionless_resolve_stale_slots: u64,
         funding_horizon_slots: u64,
         funding_k_bps: u64,
         funding_max_premium_bps: i64,
         funding_max_e9_per_slot: i64,
     ) {
-        // v12.19: auto-promote perm_resolve=0 → 10_000 so tests that passed
-        // 0 under the pre-v12.19 "non-Hyperp + cap>0 is resolvable" rule
-        // still succeed against the new resolvability invariant.
-        let permissionless_resolve_stale_slots = if permissionless_resolve_stale_slots == 0 {
-            10_000
-        } else {
-            permissionless_resolve_stale_slots
-        };
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
         self.svm
@@ -1056,7 +1037,6 @@ impl TestEnv {
                 &self.mint,
                 &TEST_FEED_ID,
                 invert,
-                0, // legacy min_oracle_price_cap_e2bps (ignored)
                 permissionless_resolve_stale_slots,
                 funding_horizon_slots,
                 funding_k_bps,
@@ -1117,7 +1097,6 @@ impl TestEnv {
                 &self.mint,
                 &TEST_FEED_ID,
                 invert,
-                0, // legacy min_oracle_price_cap_e2bps (ignored)
                 trading_fee_bps,
                 mark_min_fee,
             ),
@@ -1138,7 +1117,6 @@ impl TestEnv {
     pub fn init_market_with_min_fee(
         &mut self,
         invert: u8,
-        _min_oracle_price_cap_e2bps: u64,
         mark_min_fee: u64,
     ) {
         let admin = &self.payer;
@@ -1174,7 +1152,6 @@ impl TestEnv {
                 &self.mint,
                 &TEST_FEED_ID,
                 invert,
-                0, // legacy min_oracle_price_cap_e2bps (ignored)
                 10_000, // v12.19: non-Hyperp needs perm_resolve > max_crank (1800)
                 500, 100, 500, 5, // default funding params
                 mark_min_fee,
@@ -1562,51 +1539,6 @@ impl TestEnv {
         self.set_slot_and_price(slot, px);
     }
 
-    /// Advance the clock to `target_slot` in chunks that respect the
-    /// wrapper's §1.4 envelope (`MAX_ACCRUAL_DT_SLOTS = 100`), cranking
-    /// between each chunk so the engine's `accrue_market_to` never sees a
-    /// dt larger than the envelope. Equivalent to `set_slot(target_slot);
-    /// crank()` on pre-v12.19 markets.
-    pub fn warp_with_cranks(&mut self, target_slot: u64) {
-        const CHUNK: u64 = 50; // below MAX_ACCRUAL_DT_SLOTS to leave headroom
-        // set_slot()/set_slot_and_price() internally offset by +100; reverse
-        // that so we can track the "logical" slot we've reached.
-        // We track the caller-facing slot; the Clock value is always
-        // logical + 100.
-        let current_logical = self.svm.get_sysvar::<Clock>().slot.saturating_sub(100);
-        if target_slot <= current_logical {
-            // Monotonic only.
-            return;
-        }
-        let mut s = current_logical;
-        while s + CHUNK < target_slot {
-            s += CHUNK;
-            self.set_slot(s);
-            self.crank();
-        }
-        // Final jump to the target.
-        self.set_slot(target_slot);
-        self.crank();
-    }
-
-    /// Same as `warp_with_cranks`, but updates the oracle price on every
-    /// step (holding the price constant across the walk).
-    pub fn warp_with_cranks_at_price(&mut self, target_slot: u64, price_e6: i64) {
-        const CHUNK: u64 = 50;
-        let current_logical = self.svm.get_sysvar::<Clock>().slot.saturating_sub(100);
-        if target_slot <= current_logical {
-            return;
-        }
-        let mut s = current_logical;
-        while s + CHUNK < target_slot {
-            s += CHUNK;
-            self.set_slot_and_price(s, price_e6);
-            self.crank();
-        }
-        self.set_slot_and_price(target_slot, price_e6);
-        self.crank();
-    }
-
     /// Set slot and update oracle to a specific price.
     ///
     /// v12.19: tests are bound by the solvency envelope —
@@ -1924,7 +1856,24 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot
-    append_default_extended_tail_for(&mut data, feed_id == &[0u8; 32]);
+    // Extended tail: scale perm_resolve so h_max <= perm_resolve (§14.1).
+    let is_hyperp = feed_id == &[0u8; 32];
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    // §14.1: perm_resolve > h_max. Also perm_resolve > max_crank_staleness(1800).
+    let perm_resolve: u64 = if is_hyperp {
+        0
+    } else {
+        warmup_period_slots.saturating_add(10_000)
+    };
+    data.extend_from_slice(&perm_resolve.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    let force_close: u64 = if is_hyperp { 0 } else { 50 };
+    data.extend_from_slice(&force_close.to_le_bytes()); // force_close_delay_slots
     data
 }
 
@@ -2097,6 +2046,14 @@ impl TestEnv {
     pub fn read_oracle_price_cap(&self) -> u64 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
         percolator_prog::zc::engine_ref(&d).unwrap().params.max_price_move_bps_per_slot
+    }
+
+    /// Read `engine.last_market_slot` — the slot stamped at the last
+    /// `accrue_market_to` call. Used by fee-sync + accrual tests that
+    /// need to verify forward-progress without hand-rolling offsets.
+    pub fn read_last_market_slot(&self) -> u64 {
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        percolator_prog::zc::engine_ref(&d).unwrap().last_market_slot
     }
 
     /// Read funding_rate_bps_per_slot_last from engine
@@ -3019,19 +2976,6 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Stub: SetOraclePriceCap was removed in v12.19 — the per-slot
-    /// price-move cap is init-immutable via RiskParams. Kept so legacy
-    /// tests compile; always returns an error indicating the instruction
-    /// is gone. Tests that asserted specific admin-cap semantics should
-    /// be rewritten against the init-time RiskParams value.
-    pub fn try_set_oracle_price_cap(
-        &mut self,
-        _signer: &Keypair,
-        _max_change_e2bps: u64,
-    ) -> Result<(), String> {
-        Err("SetOraclePriceCap removed in v12.19".to_string())
-    }
-
     /// Try SetMaintenanceFee instruction
     pub fn try_set_maintenance_fee(&mut self, signer: &Keypair, new_fee: u128) -> Result<(), String> {
         let ix = Instruction {
@@ -3353,16 +3297,6 @@ pub struct TradeCpiTestEnv {
 }
 
 impl TradeCpiTestEnv {
-    /// Stub: SetOraclePriceCap was removed in v12.19. See the matching
-    /// stub on `TestEnv`.
-    pub fn try_set_oracle_price_cap(
-        &mut self,
-        _signer: &Keypair,
-        _max_change_e2bps: u64,
-    ) -> Result<(), String> {
-        Err("SetOraclePriceCap removed in v12.19".to_string())
-    }
-
     pub fn new() -> Self {
         let percolator_path = program_path();
         let matcher_path = matcher_program_path();
