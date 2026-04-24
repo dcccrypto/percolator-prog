@@ -541,7 +541,24 @@ impl TestEnv {
     }
 
     fn set_price(&mut self, price_e6: i64, slot: u64) {
-        // Set both slot and unix_timestamp (using slot value as unix_timestamp for simplicity)
+        // v12.19.6 envelope: perm_resolve=80 at init, so gaps > 80 slots
+        // since the last good oracle read fail with OracleStale. Chunk any
+        // jump from current slot into ≤50-slot steps with a best-effort
+        // crank between each to advance `last_good_oracle_slot` before
+        // the next jump.
+        let current = self.svm.get_sysvar::<Clock>().slot;
+        if slot > current.saturating_add(50) {
+            let mut s = current;
+            while s.saturating_add(50) < slot {
+                s = s.saturating_add(50);
+                self.write_price_and_clock(price_e6, s);
+                let _ = self.try_crank();
+            }
+        }
+        self.write_price_and_clock(price_e6, slot);
+    }
+
+    fn write_price_and_clock(&mut self, price_e6: i64, slot: u64) {
         self.svm.set_sysvar(&Clock {
             slot,
             unix_timestamp: slot as i64,
@@ -1100,7 +1117,9 @@ fn benchmark_worst_case_scenarios() {
             // Use normal threshold - insurance starts at 0 which is <= 0 threshold
             // This should trigger force_realize_losses path when there are unpaid losses
             // warmup_period > 0 so winners' PnL stays unwrapped
-            env.init_market_with_params(0, 100); // threshold=0, warmup=100 slots
+            // warmup≤perm_resolve(80) per §14.1: h_max must fit inside the
+            // permissionless-resolve window.
+            env.init_market_with_params(0, 50); // threshold=0, warmup=50 slots
 
             let lp = Keypair::new();
             env.init_lp(&lp);
@@ -1214,7 +1233,7 @@ fn benchmark_worst_case_scenarios() {
             }
 
             let mut env = TestEnv::new();
-            env.init_market_with_params(0, 100); // warmup=100 slots
+            env.init_market_with_params(0, 50); // warmup<=perm_resolve(80) per §14.1
 
             let lp = Keypair::new();
             env.init_lp(&lp);
@@ -1319,7 +1338,7 @@ fn benchmark_worst_case_scenarios() {
             }
 
             let mut env = TestEnv::new();
-            env.init_market_with_params(0, 100);
+            env.init_market_with_params(0, 50); // warmup<=perm_resolve(80) per §14.1
 
             let lp = Keypair::new();
             env.init_lp(&lp);

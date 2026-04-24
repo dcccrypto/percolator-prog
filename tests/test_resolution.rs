@@ -422,7 +422,8 @@ fn test_honest_user_standard_market_warmup_close() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 1000); // warmup_period_slots = 1000
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    env.init_market_with_warmup(0, 50);
 
     let ins_payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.top_up_insurance(&ins_payer, 1);

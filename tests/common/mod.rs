@@ -1592,6 +1592,14 @@ impl TestEnv {
         }
         // Final: caller-intended slot + price.
         self.set_slot_and_price_raw(target_effective_slot, price_e6);
+        // Best-effort crank at the final step so `last_good_oracle_slot`
+        // stays within the perm_resolve envelope for the caller's next
+        // invocation. Without this, a sequence of set_slot_and_price
+        // calls drifts last_good behind clock by CHUNK per call and
+        // trips OracleStale once the cumulative lag exceeds perm_resolve.
+        if should_walk {
+            let _ = self.try_crank_once();
+        }
     }
 
     /// Like `crank_once` but returns `Err(String)` on failure instead of

@@ -5777,32 +5777,33 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     let mut payload = vec![0u8];
     payload.extend_from_slice(env.payer.pubkey().as_ref());
     payload.extend_from_slice(env.mint.as_ref());
-    payload.extend_from_slice(&[0u8; 32]);
-    payload.extend_from_slice(&86_400u64.to_le_bytes());
-    payload.extend_from_slice(&500u16.to_le_bytes());
-    payload.push(0u8);
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    payload.extend_from_slice(&1_000_000u64.to_le_bytes());
+    payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
+    payload.extend_from_slice(&86_400u64.to_le_bytes()); // max_staleness_secs
+    payload.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    payload.push(0u8); // invert
+    payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    payload.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark
     payload.extend_from_slice(&1u128.to_le_bytes()); // maintenance_fee_per_slot=1 (F3 gate)
-    payload.extend_from_slice(&0u64.to_le_bytes());
-    payload.extend_from_slice(&0u64.to_le_bytes());
-    payload.extend_from_slice(&500u64.to_le_bytes());
-    payload.extend_from_slice(&1000u64.to_le_bytes());
-    payload.extend_from_slice(&0u64.to_le_bytes());
-    payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
-    payload.extend_from_slice(&0u128.to_le_bytes());
-    payload.extend_from_slice(&1u64.to_le_bytes());
+    // RiskParams
+    payload.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    payload.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    payload.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
+    payload.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes()); // max_accounts
+    payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
     payload.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=80 <= 100)
-    payload.extend_from_slice(&50u64.to_le_bytes());
-    payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
-    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+    payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    payload.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     payload.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     payload.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     payload.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    payload.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
+    payload.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot
+    // Extended tail
     payload.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     payload.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    payload.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots (v12.19.6: <= 100)
+    payload.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots (<= MAX_ACCRUAL_DT_SLOTS=100)
     payload.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     payload.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     payload.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps

@@ -1664,7 +1664,9 @@ fn test_attack_warmup_long_period_withdraw_attempt() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 1_000_000); // warmup = 1M slots
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100. Use the
+    // max legal envelope; the test still verifies no early withdraw.
+    env.init_market_with_warmup(0, 50);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3301,8 +3303,8 @@ fn test_attack_warmup_prevents_immediate_profit_withdrawal() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Init market with 1000-slot warmup period
-    env.init_market_with_warmup(0, 1000);
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    env.init_market_with_warmup(0, 50);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -11233,7 +11235,8 @@ fn test_attack_warmup_partial_close_vesting() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 1000); // warmup = 1000 slots
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    env.init_market_with_warmup(0, 50);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
