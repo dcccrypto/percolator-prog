@@ -3427,57 +3427,115 @@ pub mod processor {
             return Ok(());
         }
         // Mirror the engine's own envelope predicate (§5.5 clause 6, v12.19):
-        // accrue_market_to only enforces `total_dt > max_dt` Overflow when
-        // funding would actually accumulate — i.e., rate != 0 AND both
-        // sides have OI AND fund_px_last > 0. When funding is INACTIVE,
-        // the engine will happily jump any dt in one call. If the wrapper
-        // chunks anyway, it can raise CatchupRequired on paths where the
-        // engine would legally advance directly — e.g.:
-        //   - Dead-oracle UpdateConfig degenerate arm (rate = 0)
-        //   - InitUser / InitLP / no-OI markets
-        //   - ResolveMarket Degenerate (rate = 0)
-        // Skip the chunking loop entirely when funding is inactive; the
-        // caller's final accrue_market_to handles any dt in one shot.
+        // accrue_market_to rejects `total_dt > max_dt` when EITHER funding
+        // or price movement would drain equity:
+        //
+        //   funding_active    = rate != 0 AND both OI sides live AND fund_px_last > 0
+        //   price_move_active = P_last > 0 AND oracle_price != P_last AND any OI live
+        //
+        // Prior versions chunked only on `funding_active`. A zero-funding
+        // market with live OI and a fresh oracle price different from
+        // P_last would then skip catchup, and the caller's final
+        // `accrue_market_to(now, fresh, rate)` would itself trip the
+        // envelope (and/or the §5.5 step-9 per-slot price-move cap) and
+        // make the market unrecoverable in-line.
+        //
+        // Fix: also gate on price_move_active, and in that case walk the
+        // chunk price from stored P_last toward `price` in steps each
+        // bounded by the §5.5 step-9 cap.
+        let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
         let funding_active = funding_rate_e9 != 0
             && engine.oi_eff_long_q != 0
             && engine.oi_eff_short_q != 0
             && engine.fund_px_last > 0;
-        if !funding_active {
+        let price_move_active =
+            engine.last_oracle_price > 0 && price != engine.last_oracle_price && oi_any;
+        if !funding_active && !price_move_active {
+            // Neither accrual driver is active — the engine's envelope
+            // predicate will permit a single-call jump. Caller's final
+            // accrue_market_to handles it in one shot.
             return Ok(());
         }
-        // Catchup chunks use the engine's STORED last_oracle_price, not the
-        // caller's fresh `price`. Rationale: accrue_market_to's funding math
-        // (engine §5.5) uses `fund_px_last` (the price at call entry) for
-        // the fund_num_total = fund_px * rate * dt transfer, then sets
-        // fund_px_last to the caller's `oracle_price`. If we used the fresh
-        // price for every chunk:
-        //   chunk 1: fund_px_0 = stored_P, total = stored_P * rate * max_dt,
-        //            fund_px_last := fresh
-        //   chunk 2: fund_px_0 = fresh,    total = fresh     * rate * max_dt
-        //   ...
-        // yielding a mathematically different transfer than a single-call
-        // accrue (which would use stored_P throughout). Using stored_P for
-        // every chunk keeps fund_px_last pinned at stored_P across the
-        // chunked path, so the chunked sum equals the single-call transfer:
-        //   stored_P * rate * total_dt (up to the caller's final boundary).
-        // The caller's final accrue_market_to(now_slot, fresh, rate) then
-        // applies fresh only to the residual, as a single-call accrue would.
-        let chunk_price = engine.last_oracle_price;
-        let _ = price; // caller's price used only by their final accrue_market_to
+        // Per-chunk max price step (§5.5 step 9): for any chunk with
+        // dt = max_dt and previous price `prev`,
+        //   |chunk_price - prev| * 10_000 <= cap_bps * max_dt * prev
+        // i.e. max_delta_per_chunk = cap_bps * max_dt * prev / 10_000
+        // (floor). validate_params guarantees `cap_bps * max_dt <=
+        // MAX_MARGIN_BPS (1e4)`, so the per-chunk geometric ratio is
+        // bounded by 2x. A pathological 1-to-MAX_ORACLE_PRICE walk needs
+        // ~40 doublings; typical moves converge in 1-2 chunks.
+        //
+        // Loop termination: exit when the caller's final
+        // `accrue_market_to(now_slot, price, rate)` will satisfy BOTH
+        // §5.5 clause 6 (residual dt ≤ max_dt) AND §5.5 step 9 (price
+        // jump within the cap for that residual dt).
+        let cap_bps = engine.params.max_price_move_bps_per_slot;
+        let residual_admissible = |engine: &RiskEngine| -> bool {
+            let remaining = now_slot.saturating_sub(engine.last_market_slot);
+            if remaining > max_dt {
+                return false;
+            }
+            if !price_move_active {
+                return true;
+            }
+            let prev = engine.last_oracle_price;
+            let abs_delta = if price >= prev { price - prev } else { prev - price };
+            // Validated bounds: cap_bps*max_dt ≤ MAX_MARGIN_BPS (1e4),
+            // prev ≤ MAX_ORACLE_PRICE (1e12), abs_delta ≤ 2*MAX_ORACLE_PRICE.
+            // All products fit u128.
+            let lhs = (abs_delta as u128).saturating_mul(10_000u128);
+            let rhs = (cap_bps as u128)
+                .saturating_mul(remaining as u128)
+                .saturating_mul(prev as u128);
+            lhs <= rhs
+        };
         let mut chunks: u32 = 0;
-        while now_slot.saturating_sub(engine.last_market_slot) > max_dt {
+        while !residual_admissible(engine) {
             if chunks >= CATCHUP_CHUNKS_MAX {
-                // Refuse to proceed — silently returning Ok here would let
-                // the caller's main accrue hit Overflow on the residual
-                // gap, rolling back ALL catchup work (no net progress).
-                // Surfacing CatchupRequired instead tells callers/keepers
-                // to use the dedicated CatchupAccrue instruction which
-                // commits progress without attempting the main op.
+                // Silently returning Ok here would let the caller's
+                // main accrue hit Overflow on the residual, rolling
+                // back ALL catchup progress. Surface CatchupRequired
+                // so the caller routes to the dedicated CatchupAccrue
+                // instruction which commits progress without attempting
+                // the main op.
                 return Err(PercolatorError::CatchupRequired.into());
             }
-            let step = engine.last_market_slot.saturating_add(max_dt);
+            let remaining = now_slot.saturating_sub(engine.last_market_slot);
+            // Pick chunk dt: full max_dt when the time gap is large;
+            // otherwise the whole residual (we're chunking in that case
+            // only because price isn't admissible yet at the residual).
+            let chunk_dt = core::cmp::min(remaining, max_dt);
+            // chunk_dt == 0 would mean remaining == 0 but price not
+            // admissible (i.e. price != prev). Can't do a same-slot
+            // price jump via accrue_market_to — surface CatchupRequired.
+            if chunk_dt == 0 {
+                return Err(PercolatorError::CatchupRequired.into());
+            }
+            let step_slot = engine.last_market_slot.saturating_add(chunk_dt);
+            let prev_price = engine.last_oracle_price;
+            let chunk_price = if price_move_active {
+                // Walk `prev_price` toward `price` by at most
+                //   max_delta = cap_bps * chunk_dt * prev / 10_000
+                let max_delta = (cap_bps as u128)
+                    .saturating_mul(chunk_dt as u128)
+                    .saturating_mul(prev_price as u128)
+                    / 10_000u128;
+                let max_delta_u64 = core::cmp::min(max_delta, u64::MAX as u128) as u64;
+                if price >= prev_price {
+                    let remaining_px = price - prev_price;
+                    prev_price.saturating_add(core::cmp::min(remaining_px, max_delta_u64))
+                } else {
+                    let remaining_px = prev_price - price;
+                    prev_price.saturating_sub(core::cmp::min(remaining_px, max_delta_u64))
+                }
+            } else {
+                // funding-only path: keep chunk_price pinned at stored
+                // P_last so the chunked funding sum matches the single-
+                // call transfer (see extended rationale above).
+                prev_price
+            };
             engine
-                .accrue_market_to(step, chunk_price, funding_rate_e9)
+                .accrue_market_to(step_slot, chunk_price, funding_rate_e9)
                 .map_err(map_risk_error)?;
             chunks = chunks.saturating_add(1);
         }
@@ -8242,23 +8300,33 @@ pub mod processor {
                 }
 
                 // Decide COMPLETE vs PARTIAL based on whether one call can
-                // close the full gap. If funding is inactive (rate == 0
-                // OR one side has no OI OR fund_px_last == 0), the engine
-                // doesn't enforce the dt envelope — accrue_market_to can
-                // jump the full gap in one call. Treat as can_finish
-                // regardless of gap size. This matches the engine's own
-                // §5.5 clause-6 predicate and prevents CatchupAccrue from
-                // gratuitously stepping partial targets on empty/inactive
-                // markets.
+                // close the full gap. The engine's §5.5 clause-6 predicate
+                // rejects `total_dt > max_dt` whenever EITHER funding OR
+                // price-movement would drain equity:
+                //
+                //   funding_active    = rate != 0, both OI sides, fund_px_last > 0
+                //   price_move_active = P_last > 0, fresh_price != P_last, any OI
+                //
+                // If neither is active we can jump the full gap in one
+                // call. Missing the price_move leg (prior versions) meant
+                // a zero-funding live-OI market with a new oracle price
+                // could be claimed "can_finish" but then fail in the
+                // single-shot accrue after `catchup_accrue` returned
+                // early.
                 let max_dt = engine.params.max_accrual_dt_slots;
                 let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64)
                     .saturating_mul(max_dt);
                 let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
                 let funding_active = funding_rate_e9_pre != 0
                     && engine.oi_eff_long_q != 0
                     && engine.oi_eff_short_q != 0
                     && engine.fund_px_last > 0;
-                let can_finish = !funding_active || gap <= max_step_per_call;
+                let price_move_active = engine.last_oracle_price > 0
+                    && fresh_price != engine.last_oracle_price
+                    && oi_any;
+                let accrual_active = funding_active || price_move_active;
+                let can_finish = !accrual_active || gap <= max_step_per_call;
 
                 if can_finish {
                     // COMPLETE: chunk to clock.slot using stored P_last
