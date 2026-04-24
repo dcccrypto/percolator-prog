@@ -5,8 +5,12 @@
 
 use percolator::{I128, MAX_ACCOUNTS, U128};
 use percolator_prog::{
-    constants::MAGIC, error::PercolatorError, oracle, processor::process_instruction, state, units,
-    zc,
+    constants::MAGIC,
+    error::PercolatorError,
+    matcher_abi::{validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID},
+    oracle,
+    processor::process_instruction,
+    state, units, zc,
 };
 use solana_program::{
     account_info::AccountInfo, clock::Clock, program_error::ProgramError, program_pack::Pack,
@@ -422,6 +426,44 @@ fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
 }
 
 // --- Tests ---
+
+#[test]
+fn test_matcher_nonzero_partial_requires_partial_ok() {
+    let ret = MatcherReturn {
+        abi_version: percolator_prog::constants::MATCHER_ABI_VERSION,
+        flags: FLAG_VALID,
+        exec_price_e6: 100_000_000,
+        exec_size: 50,
+        req_id: 7,
+        lp_account_id: 11,
+        oracle_price_e6: 100_000_000,
+        reserved: 0,
+    };
+
+    assert_eq!(
+        validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            100,
+            ret.req_id,
+        ),
+        Err(ProgramError::InvalidAccountData)
+    );
+
+    let ret_with_partial = MatcherReturn {
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
+        ..ret
+    };
+    assert!(validate_matcher_return(
+        &ret_with_partial,
+        ret_with_partial.lp_account_id,
+        ret_with_partial.oracle_price_e6,
+        100,
+        ret_with_partial.req_id,
+    )
+    .is_ok());
+}
 
 #[test]
 fn test_struct_sizes() {

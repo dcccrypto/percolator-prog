@@ -1064,7 +1064,7 @@ pub mod matcher_abi {
 
     /// Matcher return flags
     pub const FLAG_VALID: u32 = 1; // bit0: response is valid
-    pub const FLAG_PARTIAL_OK: u32 = 2; // bit1: partial fill including zero allowed
+    pub const FLAG_PARTIAL_OK: u32 = 2; // bit1: partial fill, including zero, allowed
     pub const FLAG_REJECTED: u32 = 4; // bit2: trade rejected by matcher
 
     /// Matcher return structure.
@@ -1174,6 +1174,11 @@ pub mod matcher_abi {
             if ret.exec_size.signum() != req_size.signum() {
                 return Err(ProgramError::InvalidAccountData);
             }
+        }
+        if ret.exec_size.unsigned_abs() < req_size.unsigned_abs()
+            && (ret.flags & FLAG_PARTIAL_OK) == 0
+        {
+            return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
     }
@@ -1385,7 +1390,7 @@ pub mod ix {
         /// `header.insurance_operator` (distinct from `insurance_authority`
         /// — the split is what makes the bounds meaningful). Per-call
         /// amount capped at `config.insurance_withdraw_max_bps *
-        /// insurance_fund.balance / 10_000` with a floor of 1 unit
+        /// insurance_fund.balance / 10_000` with a floor of 10 units
         /// (anti-Zeno). Calls must be at least
         /// `config.insurance_withdraw_cooldown_slots` apart. Works on
         /// LIVE markets only; resolved markets use the unbounded tag 20.
@@ -1887,232 +1892,6 @@ pub mod ix {
         Ok(bytes.try_into().unwrap())
     }
 
-    fn ceil_div_u256_to_u128(
-        n: percolator::wide_math::U256,
-        d: percolator::wide_math::U256,
-    ) -> Option<u128> {
-        percolator::wide_math::ceil_div_positive_checked(n, d).try_into_u128()
-    }
-
-    fn ceil_mul_div_u128(a: u128, b: u128, d: u128) -> Option<u128> {
-        if d == 0 {
-            return None;
-        }
-        a.checked_mul(b)?
-            .checked_add(d.checked_sub(1)?)?
-            .checked_div(d)
-    }
-
-    fn solvency_envelope_holds_for_notional(
-        params: &RiskParams,
-        n: u128,
-        loss_budget_num: u128,
-        loss_budget_den: u128,
-        price_budget_bps: u128,
-    ) -> bool {
-        let loss = match ceil_mul_div_u128(n, loss_budget_num, loss_budget_den) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let worst_liq_multiplier = match 10_000u128.checked_add(price_budget_bps) {
-            Some(v) => v,
-            None => return false,
-        };
-        let worst_liq_notional = match ceil_mul_div_u128(n, worst_liq_multiplier, 10_000u128) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let liq_fee_raw = match ceil_mul_div_u128(
-            worst_liq_notional,
-            params.liquidation_fee_bps as u128,
-            10_000u128,
-        ) {
-            Some(v) => v,
-            None => return false,
-        };
-        let liq_fee = core::cmp::min(
-            core::cmp::max(liq_fee_raw, params.min_liquidation_abs.get()),
-            params.liquidation_fee_cap.get(),
-        );
-
-        let mm_prop = match n
-            .checked_mul(params.maintenance_margin_bps as u128)
-            .and_then(|v| v.checked_div(10_000u128))
-        {
-            Some(v) => v,
-            None => return false,
-        };
-        let mm_req = core::cmp::max(mm_prop, params.min_nonzero_mm_req);
-
-        match loss.checked_add(liq_fee) {
-            Some(total) => total <= mm_req,
-            None => false,
-        }
-    }
-
-    fn maintenance_req_for_notional(params: &RiskParams, n: u128) -> Option<u128> {
-        let mm_prop = n
-            .checked_mul(params.maintenance_margin_bps as u128)?
-            .checked_div(10_000u128)?;
-        Some(core::cmp::max(mm_prop, params.min_nonzero_mm_req))
-    }
-
-    fn maintenance_interval_end(params: &RiskParams, n: u128, limit: u128) -> Option<u128> {
-        let current_req = maintenance_req_for_notional(params, n)?;
-        let next_req = current_req.checked_add(1)?;
-        let numerator = next_req.checked_mul(10_000u128)?.checked_sub(1)?;
-        let bps = params.maintenance_margin_bps as u128;
-        if bps == 0 {
-            return Some(limit);
-        }
-        let end = numerator.checked_div(bps)?;
-        Some(core::cmp::min(core::cmp::max(end, n), limit))
-    }
-
-    fn exact_solvency_envelope_ok(params: &RiskParams) -> bool {
-        let move_cap =
-            percolator::wide_math::U256::from_u128(params.max_price_move_bps_per_slot as u128);
-        let dt = percolator::wide_math::U256::from_u128(params.max_accrual_dt_slots as u128);
-        let rate =
-            percolator::wide_math::U256::from_u128(params.max_abs_funding_e9_per_slot as u128);
-        let ten_thousand = percolator::wide_math::U256::from_u128(10_000u128);
-        let funding_den = percolator::wide_math::U256::from_u128(percolator::FUNDING_DEN);
-
-        let price_budget_bps = match move_cap.checked_mul(dt).and_then(|v| v.try_into_u128()) {
-            Some(v) => v,
-            None => return false,
-        };
-        let funding_budget_num = match rate
-            .checked_mul(dt)
-            .and_then(|v| v.checked_mul(ten_thousand))
-        {
-            Some(v) => v,
-            None => return false,
-        };
-        let loss_budget_num = match percolator::wide_math::U256::from_u128(price_budget_bps)
-            .checked_mul(funding_den)
-            .and_then(|v| v.checked_add(funding_budget_num))
-        {
-            Some(v) => v,
-            None => return false,
-        };
-        let loss_budget_den = match ten_thousand.checked_mul(funding_den) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let funding_budget_bps_ceil = match ceil_div_u256_to_u128(funding_budget_num, funding_den) {
-            Some(v) => v,
-            None => return false,
-        };
-        let loss_budget_bps_ceil = match price_budget_bps.checked_add(funding_budget_bps_ceil) {
-            Some(v) => v,
-            None => return false,
-        };
-        let worst_liq_budget_bps_ceil = match ceil_div_u256_to_u128(
-            percolator::wide_math::U256::from_u128(10_000u128.saturating_add(price_budget_bps))
-                .checked_mul(percolator::wide_math::U256::from_u128(
-                    params.liquidation_fee_bps as u128,
-                ))
-                .unwrap_or(percolator::wide_math::U256::MAX),
-            ten_thousand,
-        ) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let linear_budget_bps = match loss_budget_bps_ceil.checked_add(worst_liq_budget_bps_ceil) {
-            Some(v) => v,
-            None => return false,
-        };
-        let exact_full_margin_loss_only = params.maintenance_margin_bps == 10_000
-            && loss_budget_bps_ceil == 10_000
-            && worst_liq_budget_bps_ceil == 0
-            && params.min_liquidation_abs.get() == 0;
-        if exact_full_margin_loss_only {
-            return true;
-        }
-        if linear_budget_bps >= params.maintenance_margin_bps as u128 {
-            return false;
-        }
-
-        let slope_gap = (params.maintenance_margin_bps as u128) - linear_budget_bps;
-        let tail_for_linear = match percolator::wide_math::ceil_div_positive_checked(
-            percolator::wide_math::U256::from_u128(3u128 * 10_000),
-            percolator::wide_math::U256::from_u128(slope_gap),
-        )
-        .try_into_u128()
-        {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let loss_gap =
-            match (params.maintenance_margin_bps as u128).checked_sub(loss_budget_bps_ceil) {
-                Some(v) if v > 0 => v,
-                _ => return false,
-            };
-        let floor_fee_slack = match params.min_liquidation_abs.get().checked_add(2) {
-            Some(v) => v,
-            None => return false,
-        };
-        let floor_tail_num = match percolator::wide_math::U256::from_u128(floor_fee_slack)
-            .checked_mul(ten_thousand)
-        {
-            Some(v) => v,
-            None => return false,
-        };
-        let tail_for_fee_floor = match percolator::wide_math::ceil_div_positive_checked(
-            floor_tail_num,
-            percolator::wide_math::U256::from_u128(loss_gap),
-        )
-        .try_into_u128()
-        {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let exact_tail = core::cmp::max(tail_for_linear, tail_for_fee_floor);
-        if exact_tail > 100_000 {
-            return false;
-        }
-        let loss_budget_num = match loss_budget_num.try_into_u128() {
-            Some(v) => v,
-            None => return false,
-        };
-        let loss_budget_den = match loss_budget_den.try_into_u128() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        // LHS is monotone nondecreasing. RHS is constant on maintenance
-        // requirement intervals. Checking each interval's last notional is
-        // therefore exact while avoiding an every-notional BPF init loop.
-        let mut n = 1u128;
-        while n <= exact_tail {
-            let check_n = match maintenance_interval_end(params, n, exact_tail) {
-                Some(v) => v,
-                None => return false,
-            };
-            if !solvency_envelope_holds_for_notional(
-                params,
-                check_n,
-                loss_budget_num,
-                loss_budget_den,
-                price_budget_bps,
-            ) {
-                return false;
-            }
-            n = match check_n.checked_add(1) {
-                Some(v) => v,
-                None => return false,
-            };
-        }
-        true
-    }
-
     fn read_risk_params(input: &mut &[u8]) -> Result<(RiskParams, u128), ProgramError> {
         let h_min = read_u64(input)?;
         let maintenance_margin_bps = read_u64(input)?;
@@ -2175,7 +1954,7 @@ pub mod ix {
             min_funding_lifetime_slots: crate::constants::MIN_FUNDING_LIFETIME_SLOTS,
             max_price_move_bps_per_slot,
         };
-        if !exact_solvency_envelope_ok(&params) {
+        if percolator::RiskEngine::try_validate_params(&params).is_err() {
             return Err(crate::error::PercolatorError::InvalidConfigParam.into());
         }
         Ok((params, new_account_fee))
@@ -3690,6 +3469,15 @@ pub mod processor {
         Ok(())
     }
 
+    fn target_lag_after_read(config: &MarketConfig, effective_price: u64) -> bool {
+        if oracle::is_hyperp_mode(config) {
+            let target = hyperp_target_price(config);
+            target != 0 && target != effective_price
+        } else {
+            config.oracle_target_price_e6 != 0 && config.oracle_target_price_e6 != effective_price
+        }
+    }
+
     fn effective_pos_q_checked(engine: &RiskEngine, idx: usize) -> Result<i128, ProgramError> {
         engine
             .try_effective_pos_q(idx)
@@ -3721,150 +3509,6 @@ pub mod processor {
         {
             return Err(PercolatorError::CatchupRequired.into());
         }
-        Ok(())
-    }
-
-    fn validate_engine_params_for_wrapper(
-        params: &percolator::RiskParams,
-    ) -> Result<(), ProgramError> {
-        if (params.max_accounts as usize) > percolator::MAX_ACCOUNTS || params.max_accounts == 0 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.max_active_positions_per_side == 0
-            || params.max_active_positions_per_side > params.max_accounts
-        {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.maintenance_margin_bps > params.initial_margin_bps
-            || params.initial_margin_bps > 10_000
-        {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.trading_fee_bps > 10_000 || params.liquidation_fee_bps > 10_000 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.min_nonzero_mm_req == 0
-            || params.min_nonzero_mm_req >= params.min_nonzero_im_req
-            || params.min_nonzero_im_req > percolator::MAX_VAULT_TVL
-        {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.min_liquidation_abs.get() > params.liquidation_fee_cap.get()
-            || params.liquidation_fee_cap.get() > percolator::MAX_PROTOCOL_FEE_ABS
-        {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.h_min == 0 || params.h_max < params.h_min {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.resolve_price_deviation_bps > percolator::MAX_RESOLVE_PRICE_DEVIATION_BPS {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if params.max_accrual_dt_slots == 0 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if (params.max_abs_funding_e9_per_slot as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        let funding_envelope_ok = {
-            let adl = percolator::wide_math::U256::from_u128(percolator::ADL_ONE);
-            let px = percolator::wide_math::U256::from_u128(percolator::MAX_ORACLE_PRICE as u128);
-            let rate =
-                percolator::wide_math::U256::from_u128(params.max_abs_funding_e9_per_slot as u128);
-            let dt = percolator::wide_math::U256::from_u128(params.max_accrual_dt_slots as u128);
-            let i128_max = percolator::wide_math::U256::from_u128(i128::MAX as u128);
-            adl.checked_mul(px)
-                .and_then(|v| v.checked_mul(rate))
-                .and_then(|v| v.checked_mul(dt))
-                .map(|v| v <= i128_max)
-                .unwrap_or(false)
-        };
-        if !funding_envelope_ok {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        if params.min_funding_lifetime_slots < params.max_accrual_dt_slots {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let funding_lifetime_ok = {
-            let adl = percolator::wide_math::U256::from_u128(percolator::ADL_ONE);
-            let px = percolator::wide_math::U256::from_u128(percolator::MAX_ORACLE_PRICE as u128);
-            let rate =
-                percolator::wide_math::U256::from_u128(params.max_abs_funding_e9_per_slot as u128);
-            let life =
-                percolator::wide_math::U256::from_u128(params.min_funding_lifetime_slots as u128);
-            let i128_max = percolator::wide_math::U256::from_u128(i128::MAX as u128);
-            adl.checked_mul(px)
-                .and_then(|v| v.checked_mul(rate))
-                .and_then(|v| v.checked_mul(life))
-                .map(|v| v <= i128_max)
-                .unwrap_or(false)
-        };
-        if !funding_lifetime_ok {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        if params.max_price_move_bps_per_slot == 0
-            || params.max_price_move_bps_per_slot > percolator::MAX_MARGIN_BPS
-        {
-            return Err(crate::error::PercolatorError::InvalidConfigParam.into());
-        }
-
-        let solvency_ok = {
-            let move_cap =
-                percolator::wide_math::U256::from_u128(params.max_price_move_bps_per_slot as u128);
-            let dt = percolator::wide_math::U256::from_u128(params.max_accrual_dt_slots as u128);
-            let rate =
-                percolator::wide_math::U256::from_u128(params.max_abs_funding_e9_per_slot as u128);
-            let ten_thousand = percolator::wide_math::U256::from_u128(10_000u128);
-            let funding_den = percolator::wide_math::U256::from_u128(percolator::FUNDING_DEN);
-            let price_budget = move_cap.checked_mul(dt);
-            let funding_budget = rate
-                .checked_mul(dt)
-                .and_then(|v| v.checked_mul(ten_thousand))
-                .and_then(|v| v.checked_div(funding_den));
-            let liq = percolator::wide_math::U256::from_u128(params.liquidation_fee_bps as u128);
-            let maint =
-                percolator::wide_math::U256::from_u128(params.maintenance_margin_bps as u128);
-            match (price_budget, funding_budget) {
-                (Some(p), Some(f)) => p
-                    .checked_add(f)
-                    .and_then(|v| v.checked_add(liq))
-                    .map(|v| v <= maint)
-                    .unwrap_or(false),
-                _ => false,
-            }
-        };
-        if !solvency_ok {
-            return Err(crate::error::PercolatorError::InvalidConfigParam.into());
-        }
-
-        Ok(())
-    }
-
-    fn init_engine_in_place_prevalidated(
-        engine: &mut RiskEngine,
-        params: percolator::RiskParams,
-        init_slot: u64,
-        init_oracle_price: u64,
-    ) -> Result<(), ProgramError> {
-        validate_engine_params_for_wrapper(&params)?;
-        if init_oracle_price == 0 || init_oracle_price > percolator::MAX_ORACLE_PRICE {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-
-        // InitMarket runs on a freshly-created, zero-filled slab. Do not
-        // sweep MAX_ACCOUNTS account slots here; zero memory is the canonical
-        // unused-account state and materialization initializes a slot when it
-        // becomes live.
-        engine.params = params;
-        engine.current_slot = init_slot;
-        engine.adl_mult_long = percolator::ADL_ONE;
-        engine.adl_mult_short = percolator::ADL_ONE;
-        engine.last_oracle_price = init_oracle_price;
-        engine.fund_px_last = init_oracle_price;
-        engine.last_market_slot = init_slot;
         Ok(())
     }
 
@@ -4929,6 +4573,13 @@ pub mod processor {
                 if header.magic == MAGIC {
                     return Err(PercolatorError::AlreadyInitialized.into());
                 }
+                // Canonicalize the entire slab before the first RiskEngine
+                // reference. An uninitialized System account is normally
+                // zero-filled, but `magic != MAGIC` does not prove stale bytes
+                // in the engine/config/cache regions are valid or canonical.
+                for b in data.iter_mut() {
+                    *b = 0;
+                }
 
                 let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault_empty(a_vault, &auth, a_mint.key, a_vault.key)?;
@@ -5008,7 +4659,9 @@ pub mod processor {
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
-                init_engine_in_place_prevalidated(engine, risk_params, clock.slot, init_price)?;
+                engine
+                    .init_in_place(risk_params, clock.slot, init_price)
+                    .map_err(map_risk_error)?;
 
                 let config = MarketConfig {
                     collateral_mint: a_mint.key.to_bytes(),
@@ -6129,7 +5782,7 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_signer(a_lp)?;
                 accounts::expect_writable(a_slab)?;
-                if size == 0 {
+                if size == 0 || size == i128::MIN {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
@@ -6402,7 +6055,9 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 // Reject zero-size requests at entry — zero-fill path should only
                 // be reached via matcher returning exec_size == 0 on a nonzero request.
-                if size == 0 {
+                // Also reject i128::MIN before oracle/CPI work; it has no positive
+                // counterpart and the engine would reject it later.
+                if size == 0 || size == i128::MIN {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
@@ -6571,9 +6226,8 @@ pub mod processor {
                     price
                 };
 
-                {
-                    let data_ref = a_slab.try_borrow_data()?;
-                    reject_any_target_lag(&config, zc::engine_ref(&data_ref)?)?;
+                if target_lag_after_read(&config, price) {
+                    return Err(PercolatorError::CatchupRequired.into());
                 }
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -7055,7 +6709,7 @@ pub mod processor {
                     let acc = &engine.accounts[target_idx as usize];
                     sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1);
                     let eff = effective_pos_q_checked(engine, target_idx as usize)?;
-                    let notional = engine.notional(target_idx as usize, price);
+                    let notional = risk_notional_ceil(eff, price);
                     sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2);
                 }
 
@@ -7720,6 +7374,11 @@ pub mod processor {
                 if !oracle::is_hyperp_mode(&config) {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
+                if config.hyperp_authority == [0u8; 32]
+                    || config.hyperp_authority != a_authority.key.to_bytes()
+                {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
                 // `timestamp` is legacy wire data — non-Hyperp consumed
                 // it as a staleness reference, Hyperp ignores it.
                 let _ = timestamp;
@@ -7756,11 +7415,6 @@ pub mod processor {
                     }
                     state::write_config(&mut data, &config);
                     config = state::read_config(&data);
-                }
-                if config.hyperp_authority == [0u8; 32]
-                    || config.hyperp_authority != a_authority.key.to_bytes()
-                {
-                    return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
                 if price_e6 == 0 {

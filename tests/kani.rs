@@ -1206,7 +1206,7 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
 
     let ret = MatcherReturnFields {
         abi_version: MATCHER_ABI_VERSION,
-        flags: FLAG_VALID,
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
         exec_price_e6: kani::any::<u64>().max(1), // Non-zero price
         exec_size,
         req_id: expected_req_id, // Must match nonce_on_success(old_nonce)
@@ -1314,10 +1314,8 @@ fn kani_matcher_accepts_minimal_valid_nonzero_exec() {
     let oracle_price: u64 = ret.oracle_price_e6;
     let req_id: u64 = ret.req_id;
 
-    // req_size must be >= exec_size in magnitude, same sign
-    let req_size: i128 = kani::any();
-    kani::assume(req_size.signum() == ret.exec_size.signum());
-    kani::assume(req_size.unsigned_abs() >= ret.exec_size.unsigned_abs());
+    // Minimal nonzero fill: exact full fill, so PARTIAL_OK is not required.
+    let req_size: i128 = ret.exec_size;
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
     assert!(result.is_ok(), "valid inputs must be accepted");
