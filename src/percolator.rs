@@ -4720,24 +4720,6 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
-                // TVL:insurance cap (admin opt-in). Must apply to InitUser
-                // too, not just DepositCollateral — otherwise `fee_payment`
-                // here is an unbounded bypass that lets an attacker create
-                // fresh accounts with arbitrary capital while the normal
-                // deposit path is capped.
-                if config.tvl_insurance_cap_mult > 0 {
-                    let (units_for_cap, _) =
-                        crate::units::base_to_units(fee_payment, config.unit_scale);
-                    let engine_r = zc::engine_ref(&data)?;
-                    let ins = engine_r.insurance_fund.balance.get();
-                    let c_tot_now = engine_r.c_tot.get();
-                    let cap = ins.saturating_mul(config.tvl_insurance_cap_mult as u128);
-                    let c_tot_new = c_tot_now.saturating_add(units_for_cap as u128);
-                    if c_tot_new > cap {
-                        return Err(PercolatorError::DepositCapExceeded.into());
-                    }
-                }
-
                 // InitUser splits `fee_payment` into:
                 //   - `new_account_fee` → insurance (wrapper-charged)
                 //   - remainder → capital
@@ -4755,6 +4737,34 @@ pub mod processor {
                     return Err(PercolatorError::EngineInsufficientBalance.into());
                 }
                 let capital_base = fee_payment - fee_base;
+
+                // TVL:insurance cap (admin opt-in). Must apply to InitUser
+                // too, not just DepositCollateral — otherwise `fee_payment`
+                // here is an unbounded bypass that lets an attacker create
+                // fresh accounts with arbitrary capital while the normal
+                // deposit path is capped. Simulate the post-fee state: the
+                // `new_account_fee` share raises the insurance ceiling, and
+                // only the capital remainder counts against c_tot.
+                if config.tvl_insurance_cap_mult > 0 {
+                    let (capital_units_sim, _) =
+                        crate::units::base_to_units(capital_base, config.unit_scale);
+                    let (fee_units_sim, _) =
+                        crate::units::base_to_units(fee_base, config.unit_scale);
+                    let engine_r = zc::engine_ref(&data)?;
+                    let ins_new = engine_r
+                        .insurance_fund
+                        .balance
+                        .get()
+                        .saturating_add(fee_units_sim as u128);
+                    let c_tot_new = engine_r
+                        .c_tot
+                        .get()
+                        .saturating_add(capital_units_sim as u128);
+                    let cap = ins_new.saturating_mul(config.tvl_insurance_cap_mult as u128);
+                    if c_tot_new > cap {
+                        return Err(PercolatorError::DepositCapExceeded.into());
+                    }
+                }
 
                 // Transfer the full fee_payment to vault; split downstream.
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
@@ -4842,22 +4852,6 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
-                // TVL:insurance cap (admin opt-in). Same bypass concern as
-                // InitUser — InitLP also deposits capital via fee_payment,
-                // so the cap must apply here too.
-                if config.tvl_insurance_cap_mult > 0 {
-                    let (units_for_cap, _) =
-                        crate::units::base_to_units(fee_payment, config.unit_scale);
-                    let engine_r = zc::engine_ref(&data)?;
-                    let ins = engine_r.insurance_fund.balance.get();
-                    let c_tot_now = engine_r.c_tot.get();
-                    let cap = ins.saturating_mul(config.tvl_insurance_cap_mult as u128);
-                    let c_tot_new = c_tot_now.saturating_add(units_for_cap as u128);
-                    if c_tot_new > cap {
-                        return Err(PercolatorError::DepositCapExceeded.into());
-                    }
-                }
-
                 // Same split semantics as InitUser: fee → insurance, rest
                 // → capital. Engine requires capital_units > 0 on
                 // materialization; higher floors are wrapper policy.
@@ -4869,6 +4863,30 @@ pub mod processor {
                     return Err(PercolatorError::EngineInsufficientBalance.into());
                 }
                 let capital_base = fee_payment - fee_base;
+
+                // TVL:insurance cap (admin opt-in). Same bypass concern as
+                // InitUser — simulate post-fee state (fee → insurance,
+                // capital → c_tot) before checking the cap.
+                if config.tvl_insurance_cap_mult > 0 {
+                    let (capital_units_sim, _) =
+                        crate::units::base_to_units(capital_base, config.unit_scale);
+                    let (fee_units_sim, _) =
+                        crate::units::base_to_units(fee_base, config.unit_scale);
+                    let engine_r = zc::engine_ref(&data)?;
+                    let ins_new = engine_r
+                        .insurance_fund
+                        .balance
+                        .get()
+                        .saturating_add(fee_units_sim as u128);
+                    let c_tot_new = engine_r
+                        .c_tot
+                        .get()
+                        .saturating_add(capital_units_sim as u128);
+                    let cap = ins_new.saturating_mul(config.tvl_insurance_cap_mult as u128);
+                    if c_tot_new > cap {
+                        return Err(PercolatorError::DepositCapExceeded.into());
+                    }
+                }
 
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
@@ -4963,15 +4981,19 @@ pub mod processor {
                 // k=0 disables the check; nonzero k with zero insurance
                 // means no deposits accepted — operator is expected to
                 // seed insurance (via TopUpInsurance or fee accumulation)
-                // before enabling or raising k.
+                // before enabling or raising k. No fee split here: the
+                // full amount credits capital against the current
+                // insurance balance.
                 if config.tvl_insurance_cap_mult > 0 {
-                    let (units_for_cap, _) =
+                    let (capital_units_sim, _) =
                         crate::units::base_to_units(amount, config.unit_scale);
                     let engine_r = zc::engine_ref(&data)?;
                     let ins = engine_r.insurance_fund.balance.get();
-                    let c_tot_now = engine_r.c_tot.get();
+                    let c_tot_new = engine_r
+                        .c_tot
+                        .get()
+                        .saturating_add(capital_units_sim as u128);
                     let cap = ins.saturating_mul(config.tvl_insurance_cap_mult as u128);
-                    let c_tot_new = c_tot_now.saturating_add(units_for_cap as u128);
                     if c_tot_new > cap {
                         return Err(PercolatorError::DepositCapExceeded.into());
                     }
