@@ -1436,6 +1436,14 @@ impl TestEnv {
     }
 
     /// Like `set_slot_and_price` but takes the effective slot directly (no
+    /// +100 offset) AND does NOT walk/crank intermediate steps. Use when a
+    /// test must create a genuine engine-vs-clock gap (e.g. envelope
+    /// catchup regression tests).
+    pub fn set_slot_and_price_raw_no_walk(&mut self, effective_slot: u64, price_e6: i64) {
+        self.set_slot_and_price_raw(effective_slot, price_e6);
+    }
+
+    /// Like `set_slot_and_price` but takes the effective slot directly (no
     /// +100 offset). Internal helper.
     fn set_slot_and_price_raw(&mut self, effective_slot: u64, price_e6: i64) {
         self.svm.set_sysvar(&Clock {
