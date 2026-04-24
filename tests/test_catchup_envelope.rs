@@ -26,7 +26,7 @@ fn test_catchup_accrue_covers_price_move_with_zero_funding() {
     // perm_resolve=10_000 is large enough that our 1500-slot idle does
     // not trip the stale gate. horizon=500, k=100, premium=500 all
     // unused because funding_max_e9=0 pins the rate at 0.
-    env.init_market_with_funding(0, 10_000, 500, 100, 500, 0);
+    env.init_market_with_funding(0, 80, 500, 100, 500, 0);
 
     // Seed engine state and establish live OI. init_lp/init_user
     // airdrop internally.
@@ -78,7 +78,7 @@ fn test_catchup_accrue_covers_price_move_with_zero_funding() {
 fn test_catchup_accrue_skips_when_no_driver() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 100_000, 500, 100, 500, 0);
+    env.init_market_with_funding(0, 100, 500, 100, 500, 0);
     env.crank(); // seed engine
 
     // No OI. Idle and change price — but stay within perm_resolve to

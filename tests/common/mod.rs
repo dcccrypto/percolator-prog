@@ -615,10 +615,9 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
 
-    // v12.19: non-Hyperp markets require perm_resolve > max_crank_staleness
-    // (1800 above) for resolvability.
+    // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
     let is_hyperp = feed_id == &[0u8; 32];
-    let perm_resolve: u64 = if is_hyperp { 0 } else { 10_000 };
+    let perm_resolve: u64 = if is_hyperp { 0 } else { 80 };
     data.extend_from_slice(&perm_resolve.to_le_bytes());
     // Custom funding params (required before mark_min_fee)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
@@ -687,13 +686,9 @@ pub fn encode_init_market_with_force_close(
     force_close_delay_slots: u64,
 ) -> Vec<u8> {
     // Build base with cap + permissionless resolve (full 82-byte tail).
-    // Strict hard-timeout model: use a wide permissionless_resolve
-    // _stale_slots (1000) so tests that advance the clock for their
-    // OWN purposes (trade → crank → resolve sequences) stay within the
-    // live window. The 100-slot default that was fine under the old
-    // challenge-window model trips the hard gate mid-sequence.
+    // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Use 80.
     let mut data = encode_init_market_with_cap(
-        admin, mint, feed_id, 0, 1000,
+        admin, mint, feed_id, 0, 80,
     );
     // Truncate default force_close_delay_slots (last 8 bytes), replace with custom
     data.truncate(data.len() - 8);
@@ -1152,7 +1147,7 @@ impl TestEnv {
                 &self.mint,
                 &TEST_FEED_ID,
                 invert,
-                10_000, // v12.19: non-Hyperp needs perm_resolve > max_crank (1800)
+                80, // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100)
                 500, 100, 500, 5, // default funding params
                 mark_min_fee,
             ),
@@ -1868,11 +1863,14 @@ pub fn encode_init_market_with_warmup(
     let is_hyperp = feed_id == &[0u8; 32];
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    // §14.1: perm_resolve > h_max. Also perm_resolve > max_crank_staleness(1800).
+    // v12.19.6: perm_resolve must satisfy `perm_resolve > h_max` AND
+    // `perm_resolve > max_crank_staleness(50)` AND `perm_resolve <= 100`.
+    // For tests that pass warmup >= 100 there's no valid value — the
+    // caller should use a shorter warmup.
     let perm_resolve: u64 = if is_hyperp {
         0
     } else {
-        warmup_period_slots.saturating_add(10_000)
+        100.min(warmup_period_slots.saturating_add(10).max(80))
     };
     data.extend_from_slice(&perm_resolve.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
@@ -5227,6 +5225,17 @@ impl TestEnv {
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot
+        // v12.19.6 extended tail: non-Hyperp needs perm_resolve > 0, and
+        // perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
+        data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+        data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+        data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots
+        data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+        data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+        data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+        data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+        data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+        data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots
 
         let ix = Instruction {
             program_id: self.program_id,

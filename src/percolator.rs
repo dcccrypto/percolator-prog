@@ -1899,6 +1899,36 @@ pub mod ix {
         // v12.19: per-slot price-move cap (standard bps, 100 = 1%).
         // Init-immutable per spec §1.4 solvency invariant.
         let max_price_move_bps_per_slot = read_u64(input)?;
+
+        // v12.19.6 §1.4 solvency envelope prevalidation. Engine's
+        // `validate_params` asserts this at init_in_place; wrapper surfaces
+        // as a clean `InvalidConfigParam` before the engine gets the chance
+        // to panic. Exact arithmetic using u128 for the sum — worst-case
+        // terms: price_budget <= 10_000*1_000_000 < 2^44, funding_budget
+        // has the same order; liquidation_fee_bps < 2^32; total fits u128.
+        //
+        //   price_budget = max_price_move_bps_per_slot * max_accrual_dt_slots
+        //   funding_budget = (max_abs_funding_e9_per_slot * max_accrual_dt_slots
+        //                     * 10_000) / FUNDING_DEN
+        //   require price_budget + funding_budget + liquidation_fee_bps
+        //            <= maintenance_margin_bps
+        {
+            let max_dt = crate::constants::MAX_ACCRUAL_DT_SLOTS as u128;
+            let max_mv = max_price_move_bps_per_slot as u128;
+            let max_fn = crate::constants::MAX_ABS_FUNDING_E9_PER_SLOT as u128;
+            let price_budget: u128 = max_mv.saturating_mul(max_dt);
+            let funding_budget: u128 = max_fn
+                .saturating_mul(max_dt)
+                .saturating_mul(10_000u128)
+                / percolator::FUNDING_DEN;
+            let total: u128 = price_budget
+                .saturating_add(funding_budget)
+                .saturating_add(liquidation_fee_bps as u128);
+            if total > maintenance_margin_bps as u128 {
+                return Err(crate::error::PercolatorError::InvalidConfigParam.into());
+            }
+        }
+
         let params = RiskParams {
             maintenance_margin_bps,
             initial_margin_bps,

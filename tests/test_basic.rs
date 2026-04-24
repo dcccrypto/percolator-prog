@@ -3882,7 +3882,7 @@ fn test_init_market_custom_funding_horizon() {
     program_path();
     let mut env = TestEnv::new();
     // Custom horizon=1000, k=100 (default), max_premium=500 (default), max_per_slot=5 (default)
-    env.init_market_with_funding(0, 10_000, 1000, 100, 500, 5);
+    env.init_market_with_funding(0, 80, 1000, 100, 500, 5);
     assert_eq!(env.read_funding_horizon(), 1000, "Custom horizon must be stored");
 }
 
@@ -3891,7 +3891,7 @@ fn test_init_market_custom_funding_horizon() {
 fn test_init_market_custom_funding_k() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 500, 200, 500, 5);
+    env.init_market_with_funding(0, 80, 500, 200, 500, 5);
     assert_eq!(env.read_funding_k_bps(), 200, "Custom k_bps must be stored");
 }
 
@@ -3900,7 +3900,7 @@ fn test_init_market_custom_funding_k() {
 fn test_init_market_custom_funding_max_premium() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 500, 100, 1000, 5);
+    env.init_market_with_funding(0, 80, 500, 100, 1000, 5);
     assert_eq!(
         env.read_funding_max_premium_bps(),
         1000,
@@ -3913,7 +3913,7 @@ fn test_init_market_custom_funding_max_premium() {
 fn test_init_market_custom_funding_max_per_slot() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 500, 100, 500, 10);
+    env.init_market_with_funding(0, 80, 500, 100, 500, 10);
     assert_eq!(
         env.read_funding_max_e9_per_slot(),
         10,
@@ -3928,7 +3928,7 @@ fn test_init_market_custom_all_funding_params() {
     let mut env = TestEnv::new();
     // funding_max_e9_per_slot must fit the engine's per-market envelope
     // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
-    env.init_market_with_funding(0, 10_000, 2000, 300, 800, 10);
+    env.init_market_with_funding(0, 80, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);
@@ -3960,7 +3960,7 @@ fn test_init_market_rejects_zero_funding_horizon() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000,
+        0, 80,
         0, // funding_horizon_slots = 0 (invalid)
         100, 500, 5,
     );
@@ -3975,7 +3975,7 @@ fn test_init_market_rejects_excessive_funding_k() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000,
+        0, 80,
         500,
         100_001, // k > 100_000 (invalid)
         500, 5,
@@ -3991,7 +3991,7 @@ fn test_init_market_rejects_negative_max_premium() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000,
+        0, 80,
         500, 100,
         -1, // negative (invalid)
         5,
@@ -4007,7 +4007,7 @@ fn test_init_market_rejects_negative_max_per_slot() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000,
+        0, 80,
         500, 100, 500,
         -1, // negative (invalid)
     );
@@ -4028,7 +4028,7 @@ fn test_init_market_mark_min_fee_sanity_cap_admits_full_u64() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_min_fee(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000,
+        0, 80,
         500, 100, 500, 5,
         u64::MAX, // below MAX_PROTOCOL_FEE_ABS (10^36) — accepted
     );
@@ -4468,12 +4468,11 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-        // Strict hard-timeout model: permissionless_resolve_stale_slots is the
-        // hard upper bound on "slots since last accepted oracle read before
-        // market is dead". 100 was tight for this test's 60+ slot dust-wash
-        // sequence + the preceding trade gap; bump to 500 so the test stays
-        // within the live window.
-        data.extend_from_slice(&500u64.to_le_bytes()); // permissionless_resolve = 500
+        // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 100 —
+        // the upper bound. The test's 60+ slot dust-wash sequence must
+        // now fit within this window (the test may need to tighten its
+        // own cadence).
+        data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
         // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_k_bps (2x)
