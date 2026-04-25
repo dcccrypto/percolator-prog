@@ -322,84 +322,6 @@ fn test_critical_invalid_account_indices_rejected() {
     println!("CRITICAL TEST PASSED: Invalid account indices rejection verified");
 }
 
-/// Verify per-market admin limits are enforced for Set* operations.
-#[test]
-fn test_init_market_admin_limits_enforced() {
-    program_path();
-
-    let mut env = TestEnv::new();
-
-    // Init market with specific limits
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: encode_init_market_with_limits(
-            &admin.pubkey(),
-            &env.mint,
-            &TEST_FEED_ID,
-            5000,
-        ),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("init_market failed");
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // SetOraclePriceCap: above floor should succeed
-    let result = env.try_set_oracle_price_cap(&admin, 5000);
-    assert!(
-        result.is_ok(),
-        "Cap at floor should succeed: {:?}",
-        result
-    );
-
-    // SetOraclePriceCap: below floor (non-zero) should fail
-    let result = env.try_set_oracle_price_cap(&admin, 4999);
-    assert!(result.is_err(), "Cap below floor should fail");
-
-    // SetOraclePriceCap: zero is rejected when min floor is set
-    // (prevents settlement guard bypass via baseline poisoning)
-    let result = env.try_set_oracle_price_cap(&admin, 0);
-    assert!(
-        result.is_err(),
-        "Cap=0 must be rejected when min_oracle_price_cap > 0 (settlement guard)"
-    );
-
-    println!("INIT MARKET ADMIN LIMITS ENFORCED: PASSED");
-}
-
-
 /// Verify admin burn (rotate to zero) lifecycle rules.
 #[test]
 fn test_update_admin_zero_accepted_for_burn() {
@@ -408,7 +330,7 @@ fn test_update_admin_zero_accepted_for_burn() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 10_000, 100);
+    env.init_market_with_cap(0, 100);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
@@ -420,8 +342,9 @@ fn test_update_admin_zero_accepted_for_burn() {
         "admin burn should succeed under the lifecycle guard"
     );
 
-    // After burn, admin instructions must fail
-    let result = env.try_set_oracle_price_cap(&admin, 999);
+    // After burn, admin instructions must fail. SetMaintenanceFee is also
+    // admin-gated; use it as the probe now that SetOraclePriceCap is gone.
+    let result = env.try_set_maintenance_fee(&admin, 0);
     assert!(
         result.is_err(),
         "Admin operations must fail after admin burn"
@@ -448,12 +371,11 @@ fn test_init_rejects_non_hyperp_with_no_resolve_path() {
         &env.mint,
         &common::TEST_FEED_ID,
         0, // invert=0 (non-Hyperp)
-        0, // min_oracle_price_cap_e2bps
         0, // permissionless_resolve_stale_slots
     );
     let err = env
         .try_init_market_raw(data)
-        .expect_err("init must reject non-Hyperp + cap=0 + perm_resolve=0");
+        .expect_err("init must reject non-Hyperp + perm_resolve=0");
     assert!(
         err.contains("0x1a"),
         "expected InvalidConfigParam, got: {}", err,
@@ -478,11 +400,10 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
         &env.mint,
         &common::TEST_FEED_ID,
         0,      // invert (non-Hyperp)
-        0,      // min_oracle_price_cap_e2bps
         perm_resolve,
     );
     env.try_init_market_raw(data)
-        .expect("non-Hyperp + cap=0 + perm_resolve>0 must init OK");
+        .expect("non-Hyperp + perm_resolve>0 must init OK");
 
     // End-to-end check: the whole point of the positive invariant is
     // that ResolvePermissionless actually works on this configuration.
@@ -499,13 +420,10 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
 }
 
 
-/// SetOraclePriceCap may not disable the circuit breaker (cap = 0) on a
-/// non-Hyperp market that was initialized with a non-zero floor. Silent
-/// runtime disable would defeat the flash-crash protection the floor
-/// promised.
-#[test]
-fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
-    program_path();
+// test_set_oracle_price_cap_rejects_zero_when_floor_nonzero deleted:
+// SetOraclePriceCap (tag 18) was removed in v12.19. The per-slot price-move
+// cap is now the immutable init-time `max_price_move_bps_per_slot` field,
+// so there is no runtime admin path to disable/change it.
 
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 10_000, 0);
@@ -1214,7 +1132,7 @@ fn test_update_config_admin_only() {
 fn test_update_authority_init_defaults_match_admin() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
 
     let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1233,7 +1151,7 @@ fn test_update_authority_init_defaults_match_admin() {
 fn test_update_authority_insurance_positive_delegation() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let delegate = Keypair::new();
     env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
@@ -1254,7 +1172,7 @@ fn test_update_authority_insurance_positive_delegation() {
 fn test_update_authority_negative_wrong_current_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let target = Keypair::new();
@@ -1274,7 +1192,7 @@ fn test_update_authority_negative_wrong_current_signer() {
 fn test_update_authority_negative_new_pubkey_not_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let target_pubkey = Pubkey::new_unique();
 
@@ -1309,7 +1227,7 @@ fn test_update_authority_negative_new_pubkey_not_signer() {
 fn test_update_authority_burn_single_sig_and_then_dead() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Burn insurance_authority (single-sig: only current signs).
@@ -1330,7 +1248,7 @@ fn test_update_authority_burn_single_sig_and_then_dead() {
 fn test_update_authority_burning_one_kind_leaves_others_intact() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
@@ -1344,28 +1262,18 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
         .expect("admin transfer still works after insurance_authority burn");
 }
 
-/// Admin-burn liveness guard still applies via UpdateAuthority(kind=ADMIN):
-/// cannot burn admin on a live market without permissionless paths wired.
-#[test]
-fn test_update_authority_admin_burn_requires_permissionless_paths() {
-    program_path();
-    let mut env = TestEnv::new();
-    // permissionless_resolve = 0 → admin burn must reject.
-    env.init_market_with_cap(0, 10_000, 0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let err = env
-        .try_update_authority(&admin, AUTHORITY_ADMIN, None)
-        .expect_err("admin burn on live market without perm-resolve must reject");
-    let _ = err;
-}
+// test_update_authority_admin_burn_requires_permissionless_paths deleted:
+// v12.19 enforces the resolvability invariant at InitMarket — a non-Hyperp
+// market can no longer be created with permissionless_resolve_stale_slots = 0,
+// so the "live market without perm-resolve" configuration this test required
+// is unreachable via the public init surface.
 
 /// Bad kind byte rejects.
 #[test]
 fn test_update_authority_negative_invalid_kind() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env
@@ -1382,7 +1290,7 @@ fn test_update_authority_negative_invalid_kind() {
 fn test_update_authority_insurance_survives_admin_burn() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Before admin burn: delegate insurance_authority to a dedicated key.
@@ -1659,4 +1567,112 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
 
     // Config must be unchanged after rejection
     assert_eq!(env.read_update_config_snapshot(), config_before, "config must be preserved after rejected UpdateConfig");
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_init_market_admin_limits_enforced() {
+    program_path();
+
+    let mut env = TestEnv::new();
+
+    // Init market with specific limits
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            5000,
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init_market failed");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // SetOraclePriceCap: above floor should succeed
+    let result = env.try_set_oracle_price_cap(&admin, 5000);
+    assert!(
+        result.is_ok(),
+        "Cap at floor should succeed: {:?}",
+        result
+    );
+
+    // SetOraclePriceCap: below floor (non-zero) should fail
+    let result = env.try_set_oracle_price_cap(&admin, 4999);
+    assert!(result.is_err(), "Cap below floor should fail");
+
+    // SetOraclePriceCap: zero is rejected when min floor is set
+    // (prevents settlement guard bypass via baseline poisoning)
+    let result = env.try_set_oracle_price_cap(&admin, 0);
+    assert!(
+        result.is_err(),
+        "Cap=0 must be rejected when min_oracle_price_cap > 0 (settlement guard)"
+    );
+
+    println!("INIT MARKET ADMIN LIMITS ENFORCED: PASSED");
+}
+
+#[test]
+fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let err = env
+        .try_set_oracle_price_cap(&admin, 0)
+        .expect_err("SetOraclePriceCap(0) must reject when floor != 0");
+    assert!(
+        err.contains("0x1a"),
+        "expected InvalidConfigParam, got: {}", err,
+    );
+}
+
+#[test]
+fn test_update_authority_admin_burn_requires_permissionless_paths() {
+    program_path();
+    let mut env = TestEnv::new();
+    // permissionless_resolve = 0 → admin burn must reject.
+    env.init_market_with_cap(0, 10_000, 0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let err = env
+        .try_update_authority(&admin, AUTHORITY_ADMIN, None)
+        .expect_err("admin burn on live market without perm-resolve must reject");
+    let _ = err;
 }

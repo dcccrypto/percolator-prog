@@ -121,13 +121,16 @@ pub mod constants {
     /// it pays for its full elapsed interval in one charge.
     pub const FEE_SWEEP_BUDGET: usize = 128;
 
+    // ML10: upstream re-introduced LIQ_BUDGET_PER_CRANK = 64; fork keeps the
+    // tighter 24 cap (defined above) per the MTM-density CU-budget analysis.
+
     // Compile-time invariant: the crank's total fee-sync budget
-    // (FEE_SWEEP_BUDGET) must accommodate the engine's per-crank
+    // (FEE_SWEEP_BUDGET) must accommodate the wrapper's per-crank
     // liquidation/candidate-sync allowance. The candidate-sync path
     // caps itself at min(LIQ_BUDGET_PER_CRANK, FEE_SWEEP_BUDGET); if
-    // the engine constant were raised above the wrapper constant the
-    // belt-and-braces min() would silently under-apply the engine
-    // budget. Assert the relation so a mismatch is a build error.
+    // this constant were raised above FEE_SWEEP_BUDGET the belt-and-
+    // braces min() would silently under-apply the budget. Assert so
+    // a mismatch is a build error.
     const _: () = assert!(
         (LIQ_BUDGET_PER_CRANK as usize) <= FEE_SWEEP_BUDGET,
         "LIQ_BUDGET_PER_CRANK must not exceed FEE_SWEEP_BUDGET"
@@ -152,9 +155,24 @@ pub mod constants {
     // exactly what values ship, rather than having them buried inside the
     // RiskParams literal in read_risk_params.
     /// Max dt allowed in a single `accrue_market_to` call (spec §1.4).
-    /// 10_000_000 slots at 400 ms/slot ≈ 46 days — the permissionless-
-    /// resolve / outage-tolerance window. Must be ≤ min_funding_lifetime_slots.
-    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 10_000_000;
+    ///
+    /// Tightened from the legacy 10_000_000 to satisfy the v12.19 engine
+    /// solvency envelope (§1.4):
+    ///
+    ///   max_price_move_bps_per_slot * max_accrual_dt_slots
+    ///     + floor(max_abs_funding_e9_per_slot * max_accrual_dt_slots
+    ///             * 10_000 / FUNDING_DEN)
+    ///     + liquidation_fee_bps
+    ///     <= maintenance_margin_bps
+    ///
+    /// For a deployment with maintenance=500, liq=50, max_price_move=2
+    /// bps/slot, max_abs_funding_e9_per_slot=10_000 the envelope
+    /// collapses to max_accrual_dt_slots <= ~216 (= (500 - 50) / 2.09
+    /// ignoring floor). The wrapper picks 100 so both idle and price-
+    /// moving / funding-active markets have an ~40 sec per-crank window
+    /// at 400 ms slots. Catchup loops up to `CATCHUP_CHUNKS_MAX × 100`
+    /// = 2000 slots in one instruction before `CatchupRequired`.
+    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 100;
     /// Max |funding_rate_e9_per_slot| the engine will accrue (spec §1.4).
     /// Matches the engine-crate GLOBAL ceiling. Realistic perp funding is
     /// 3-5 orders of magnitude below this (see compute_current_funding_rate_e9
@@ -243,8 +261,12 @@ pub mod constants {
     /// ceiling MAX_ABS_FUNDING_E9_PER_SLOT = 10_000. Clients compute this from
     /// operator-friendly units (e.g. bps/day) at market-setup time.
     pub const DEFAULT_FUNDING_MAX_E9_PER_SLOT: i64 = 1_000;
-    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000; // 1% per slot max price change for Hyperp
-    pub const MAX_ORACLE_PRICE_CAP_E2BPS: u64 = 1_000_000; // 100% — hard ceiling for circuit breaker
+    /// Fork-retained: max admin-settable oracle-price cap in 0.01 bps (e2bps).
+    /// 1_000_000 e2bps = 100% per slot (effectively a no-op cap). ML10:
+    /// upstream removed this constant; fork keeps it for SetOraclePriceCap.
+    pub const MAX_ORACLE_PRICE_CAP_E2BPS: u64 = 1_000_000;
+    /// Fork-retained: default Hyperp index-vs-mark cap (1% per slot).
+    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000;
     pub const DEFAULT_INSURANCE_WITHDRAW_MIN_BASE: u64 = 1;
     pub const DEFAULT_INSURANCE_WITHDRAW_MAX_BPS: u16 = 100; // 1%
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
@@ -1444,8 +1466,6 @@ pub mod ix {
             initial_mark_price_e6: u64,
             /// Periodic maintenance fee per slot per account (engine units). 0 = disabled.
             maintenance_fee_per_slot: u128,
-            /// Per-market admin limit: min oracle price cap (e2bps floor for non-zero values)
-            min_oracle_price_cap_e2bps: u64,
             /// Insurance withdrawal: max bps per withdrawal (0 = no live withdrawals)
             insurance_withdraw_max_bps: u16,
             /// Insurance withdrawal: cooldown slots between withdrawals
@@ -1772,7 +1792,6 @@ pub mod ix {
                     let unit_scale = read_u32(&mut rest)?;
                     let initial_mark_price_e6 = read_u64(&mut rest)?;
                     let maintenance_fee_per_slot = read_u128(&mut rest)?; // periodic fee per slot per account
-                    let min_oracle_price_cap_e2bps = read_u64(&mut rest)?;
                     // Insurance withdrawal limits (immutable after init)
                     let (risk_params, new_account_fee) = read_risk_params(&mut rest)?;
                     // Extended fields: either ALL present (66 bytes) or NONE.
@@ -1841,7 +1860,6 @@ pub mod ix {
                         unit_scale,
                         initial_mark_price_e6,
                         maintenance_fee_per_slot,
-                        min_oracle_price_cap_e2bps,
                         insurance_withdraw_max_bps,
                         insurance_withdraw_cooldown_slots,
                         risk_params,
@@ -2600,22 +2618,9 @@ pub mod state {
         /// policy. Initialized at InitMarket from the genesis Pyth read.
         pub last_oracle_publish_time: i64,
 
-        // ========================================
-        // Oracle Price Circuit Breaker
-        // ========================================
-        /// Max oracle price change per update in 0.01 bps (e2bps).
-        /// 0 = disabled (no cap). 1_000_000 = 100%.
-        pub oracle_price_cap_e2bps: u64,
         /// Last effective oracle price (after clamping), in e6 format.
         /// 0 = no history (first price accepted as-is).
         pub last_effective_price_e6: u64,
-
-        // ========================================
-        // Per-Market Admin Limits (set at InitMarket, immutable)
-        // ========================================
-        /// Minimum oracle price cap (e2bps) admin can set (floor for non-zero values).
-        /// 0 = no floor (admin can set any value).
-        pub min_oracle_price_cap_e2bps: u64,
 
         // ========================================
         // Insurance Withdrawal Limits (set at InitMarket, immutable)
@@ -2634,7 +2639,15 @@ pub mod state {
         pub _iw_padding: [u8; 4],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
-        pub _iw_padding2: [u64; 2],
+        /// Fork-retained: max oracle-price change per update in 0.01 bps (e2bps).
+        /// 0 = disabled (no cap). 1_000_000 = 100%. ML10: re-allocated from the
+        /// former `_iw_padding2[0]` (was upstream-removed, fork keeps the cap
+        /// for SetOraclePriceCap admin gating and for Hyperp-mark clamping).
+        pub oracle_price_cap_e2bps: u64,
+        /// Fork-retained: minimum oracle price cap admin can set (immutable
+        /// at InitMarket). 0 = no floor. ML10: re-allocated from
+        /// `_iw_padding2[1]` (paired with oracle_price_cap_e2bps above).
+        pub min_oracle_price_cap_e2bps: u64,
         pub last_hyperp_index_slot: u64,
         pub last_mark_push_slot: u128,
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
@@ -3619,11 +3632,11 @@ pub mod oracle {
 
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
     /// Units: 1_000_000 e2bps = 100%. 0 = disabled (no cap). last_price == 0 = first-time.
-    pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_e2bps: u64) -> u64 {
-        if max_change_e2bps == 0 || last_price == 0 {
+    pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_bps: u64) -> u64 {
+        if max_change_bps == 0 || last_price == 0 {
             return raw_price;
         }
-        let max_delta_128 = (last_price as u128) * (max_change_e2bps as u128) / 1_000_000;
+        let max_delta_128 = (last_price as u128) * (max_change_bps as u128) / 10_000;
         let max_delta = core::cmp::min(max_delta_128, u64::MAX as u128) as u64;
         let lower = last_price.saturating_sub(max_delta);
         let upper = last_price.saturating_add(max_delta);
@@ -3640,6 +3653,7 @@ pub mod oracle {
         config: &mut super::state::MarketConfig,
         price_ai: &AccountInfo,
         now_unix_ts: i64,
+        max_change_bps: u64,
     ) -> Result<u64, ProgramError> {
         // Read from external oracle (Pyth/Chainlink)
         let external = read_engine_price_e6(
@@ -3761,22 +3775,22 @@ pub mod oracle {
         false
     }
 
-    /// Move `index` toward `mark`, but clamp movement by cap_e2bps * dt_slots.
-    /// cap_e2bps units: 1_000_000 = 100.00%
+    /// Move `index` toward `mark`, but clamp movement by cap_bps * dt_slots.
+    /// cap_bps units: standard bps (10_000 = 100%).
     /// Returns the new index value.
     ///
-    /// Security: When dt_slots == 0 (same slot) or cap_e2bps == 0 (cap disabled),
+    /// Security: When dt_slots == 0 (same slot) or cap_bps == 0 (cap disabled),
     /// returns index unchanged to prevent bypassing rate limits.
     /// Maximum effective dt for rate-limiting. Caps accumulated movement to
     /// prevent a crank pause from allowing a full-magnitude index jump.
     /// ~1 hour at 2.5 slots/sec = 9000 slots.
     const MAX_CLAMP_DT_SLOTS: u64 = 9_000;
 
-    pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
+    pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_bps: u64, dt_slots: u64) -> u64 {
         if index == 0 {
             return mark;
         }
-        if cap_e2bps == 0 || dt_slots == 0 {
+        if cap_bps == 0 || dt_slots == 0 {
             return index;
         }
 
@@ -3784,9 +3798,9 @@ pub mod oracle {
         let capped_dt = dt_slots.min(MAX_CLAMP_DT_SLOTS);
 
         let max_delta_u128 = (index as u128)
-            .saturating_mul(cap_e2bps as u128)
+            .saturating_mul(cap_bps as u128)
             .saturating_mul(capped_dt as u128)
-            / 1_000_000u128;
+            / 10_000u128;
 
         let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
         let lo = index.saturating_sub(max_delta);
@@ -3804,6 +3818,7 @@ pub mod oracle {
         now_unix_ts: i64,
         config: &mut super::state::MarketConfig,
         a_oracle: &AccountInfo,
+        max_change_bps: u64,
     ) -> Result<u64, ProgramError> {
         // Strict hard-timeout gate (applies to both Hyperp and non-Hyperp):
         // once the oracle has been stale for >=
@@ -3842,7 +3857,7 @@ pub mod oracle {
             let last_idx_slot = config.last_hyperp_index_slot;
             let dt = now_slot.saturating_sub(last_idx_slot);
             let new_index =
-                clamp_toward_with_dt(prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt);
+                clamp_toward_with_dt(prev_index.max(1), mark, max_change_bps, dt);
 
             config.last_effective_price_e6 = new_index;
             config.last_hyperp_index_slot = now_slot;
@@ -3850,7 +3865,7 @@ pub mod oracle {
         }
 
         // Non-Hyperp: existing behavior (authority -> Pyth/Chainlink) + circuit breaker
-        read_price_clamped(config, a_oracle, now_unix_ts)
+        read_price_clamped(config, a_oracle, now_unix_ts, max_change_bps)
     }
 
     /// Compute premium-based funding rate (Hyperp funding model).
@@ -5747,7 +5762,8 @@ pub mod processor {
         constants::{
             CONFIG_LEN, DEFAULT_FUNDING_HORIZON_SLOTS,
             DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_E9_PER_SLOT,
-            DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_HYPERP_PRICE_CAP_E2BPS, MAX_ORACLE_PRICE_CAP_E2BPS,
+            DEFAULT_FUNDING_MAX_PREMIUM_BPS,
+            DEFAULT_HYPERP_PRICE_CAP_E2BPS, MAX_ORACLE_PRICE_CAP_E2BPS,
             DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS, DEFAULT_INSURANCE_WITHDRAW_MAX_BPS,
             DEFAULT_INSURANCE_WITHDRAW_MIN_BASE, DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
             MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG,
@@ -5798,7 +5814,7 @@ pub mod processor {
             config.unit_scale,
         ).is_ok();
 
-        let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts)?;
+        let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts, config.oracle_price_cap_e2bps)?;
 
         if external_ok {
             config.last_good_oracle_slot = clock_slot;
@@ -6323,6 +6339,7 @@ pub mod processor {
                 b, now_slot, maintenance_fee_per_slot,
             )?;
         }
+        let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -6731,7 +6748,6 @@ pub mod processor {
                 unit_scale,
                 initial_mark_price_e6,
                 maintenance_fee_per_slot,
-                min_oracle_price_cap_e2bps,
                 insurance_withdraw_max_bps,
                 insurance_withdraw_cooldown_slots,
                 risk_params,
@@ -6750,6 +6766,10 @@ pub mod processor {
                 // policy is now enforced via insurance_authority capability.
                 let max_insurance_floor: u128 = percolator::MAX_VAULT_TVL;
                 let insurance_floor: u128 = 0;
+                // min_oracle_price_cap_e2bps removed from wire format in ML10
+                // (SetOraclePriceCap retired upstream; fork keeps the field
+                // but seeds it to 0 = no admin floor).
+                let min_oracle_price_cap_e2bps: u64 = 0;
                 let _ = new_account_fee;
                 handle_init_market(program_id, accounts, admin, collateral_mint, index_feed_id, max_staleness_secs, conf_filter_bps, invert, unit_scale, initial_mark_price_e6, maintenance_fee_per_slot, max_insurance_floor, min_oracle_price_cap_e2bps, insurance_withdraw_max_bps, insurance_withdraw_cooldown_slots, risk_params, insurance_floor, permissionless_resolve_stale_slots, custom_funding_horizon, custom_funding_k, custom_max_premium, custom_max_per_slot, mark_min_fee, force_close_delay_slots)?;
             }
@@ -7433,7 +7453,6 @@ pub mod processor {
             tvl_insurance_cap_mult: 0,
             _iw_padding: [0u8; 4],
             insurance_withdraw_cooldown_slots,
-            _iw_padding2: [0u64; 2],
             last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
             // Hyperp: stamp init slot so stale check works from genesis.
             // Non-Hyperp: 0 (no mark push concept).
@@ -7807,10 +7826,14 @@ pub mod processor {
             let px = if is_hyperp {
                 let eng = zc::engine_ref(&data)?;
                 let last_slot = eng.current_slot;
+                {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
                 oracle::get_engine_oracle_price_e6(
                     last_slot, clock.slot, clock.unix_timestamp,
                     &mut config, a_oracle_idx,
-                )?
+                    _oracle_cap,
+                )
+            }?
             } else {
                 read_price_and_stamp(&mut config, a_oracle_idx, clock.unix_timestamp, clock.slot, Some(&mut *data))?
             };
@@ -7997,13 +8020,17 @@ pub mod processor {
 
         let price = if is_hyperp {
             // Hyperp mode: update index toward mark with rate limiting
-            oracle::get_engine_oracle_price_e6(
+            {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
+                oracle::get_engine_oracle_price_e6(
                 engine_last_slot,
                 clock.slot,
                 clock.unix_timestamp,
                 &mut config,
                 a_oracle,
-            )?
+                    _oracle_cap,
+                )
+            }?
         } else {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?
         };
@@ -8394,10 +8421,14 @@ pub mod processor {
         // Non-Hyperp: standard circuit-breaker clamping.
         let is_hyperp = oracle::is_hyperp_mode(&config);
         let price = if is_hyperp {
-            oracle::get_engine_oracle_price_e6(
+            {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
+                oracle::get_engine_oracle_price_e6(
                 engine_current_slot, clock.slot, clock.unix_timestamp,
                 &mut config, a_oracle,
-            )?
+                    _oracle_cap,
+                )
+            }?
         } else {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, None)?
         };
@@ -8674,10 +8705,14 @@ pub mod processor {
             // Read engine.current_slot before mutable borrow
             let eng = zc::engine_ref(&data)?;
             let last_slot = eng.current_slot;
-            oracle::get_engine_oracle_price_e6(
+            {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
+                oracle::get_engine_oracle_price_e6(
                 last_slot, clock.slot, clock.unix_timestamp,
                 &mut config, a_oracle,
-            )?
+                    _oracle_cap,
+                )
+            }?
         } else {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?
         };
@@ -8771,10 +8806,14 @@ pub mod processor {
             let px = if is_hyperp {
                 let eng = zc::engine_ref(&data)?;
                 let last_slot = eng.current_slot;
+                {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
                 oracle::get_engine_oracle_price_e6(
                     last_slot, clock.slot, clock.unix_timestamp,
                     &mut config, a_oracle,
-                )?
+                    _oracle_cap,
+                )
+            }?
             } else {
                 read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?
             };
@@ -9795,10 +9834,14 @@ pub mod processor {
                 let accrual_price = if is_hyperp {
                     let last_slot = engine.current_slot;
                     drop(engine);
-                    let px = oracle::get_engine_oracle_price_e6(
+                    let px = {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
+                oracle::get_engine_oracle_price_e6(
                         last_slot, clock.slot, clock.unix_timestamp,
                         &mut config, a_oracle,
-                    )?;
+                    _oracle_cap,
+                )
+            }?;
                     state::write_config(&mut data, &config);
                     px
                 } else {
@@ -10103,10 +10146,14 @@ pub mod processor {
         let price = if is_hyperp {
             let eng = zc::engine_ref(&data)?;
             let last_slot = eng.current_slot;
-            oracle::get_engine_oracle_price_e6(
+            {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
+                oracle::get_engine_oracle_price_e6(
                 last_slot, clock.slot, clock.unix_timestamp,
                 &mut config, a_oracle,
-            )?
+                    _oracle_cap,
+                )
+            }?
         } else {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?
         };
@@ -10235,10 +10282,14 @@ pub mod processor {
         let price = if is_hyperp {
             let eng = zc::engine_ref(&data)?;
             let last_slot = eng.current_slot;
-            oracle::get_engine_oracle_price_e6(
+            {
+                let _oracle_cap = config.oracle_price_cap_e2bps;
+                oracle::get_engine_oracle_price_e6(
                 last_slot, clock.slot, clock.unix_timestamp,
                 &mut config, a_oracle,
-            )?
+                    _oracle_cap,
+                )
+            }?
         } else {
             read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?
         };
@@ -12105,11 +12156,15 @@ pub mod processor {
             }
             idx
         } else {
-            oracle::read_price_clamped(
-                &mut config,
-                a_oracle,
-                clock.unix_timestamp,
-            )?
+            {
+                let cap = config.oracle_price_cap_e2bps;
+                oracle::read_price_clamped(
+                    &mut config,
+                    a_oracle,
+                    clock.unix_timestamp,
+                    cap,
+                )?
+            }
         };
         state::write_config(&mut data, &config);
 

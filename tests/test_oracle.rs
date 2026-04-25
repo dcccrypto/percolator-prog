@@ -120,7 +120,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
     const HEADER_CONFIG_LEN: usize = 584;
-    let NUM_USED_OFF: usize = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let NUM_USED_OFF: usize = 520 + common::ENGINE_NUM_USED_OFFSET;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {
         let vault_data = svm.get_account(&vault).unwrap().data;
@@ -288,10 +288,10 @@ fn test_hyperp_init_market_with_valid_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap = config.oracle_price_cap_e2bps;
+    let cap_off = 520 + 200; let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used_off = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let used_off = 520 + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -309,7 +309,8 @@ fn test_hyperp_init_market_with_valid_price() {
         index, initial_price_e6,
         "Hyperp index must equal initial_mark_price_e6 at init"
     );
-    assert_eq!(cap, 10_000, "Hyperp default oracle cap should be 1% per slot");
+    assert_eq!(cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "Cap should match engine's max_price_move_bps_per_slot");
     assert_eq!(used, 0, "No user/LP accounts should exist immediately after market init");
 
     println!("HYPERP INIT VERIFIED: Market initialized with $100 initial mark/index price");
@@ -447,10 +448,10 @@ fn test_hyperp_init_market_with_inverted_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap = config.oracle_price_cap_e2bps;
+    let cap_off = 520 + 200; let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used_off = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let used_off = 520 + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -468,7 +469,8 @@ fn test_hyperp_init_market_with_inverted_price() {
         index, expected_inverted,
         "Hyperp index must be stored as inverted initial price"
     );
-    assert_eq!(cap, 10_000, "Hyperp default oracle cap should be 1% per slot");
+    assert_eq!(cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "Cap should match engine's max_price_move_bps_per_slot");
     assert_eq!(used, 0, "No user/LP accounts should exist immediately after market init");
 
     println!("HYPERP INVERTED MARKET VERIFIED:");
@@ -555,41 +557,15 @@ fn test_comprehensive_oracle_price_impact_on_pnl() {
 }
 
 /// CRITICAL: SetOraclePriceCap admin-only
-#[test]
-fn test_critical_set_oracle_price_cap_authorization() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
-
-    // Attacker tries to set price cap - should fail
-    let result = env.try_set_oracle_price_cap(&attacker, 10000);
-    assert!(
-        result.is_err(),
-        "SECURITY: Non-admin should not set oracle price cap"
-    );
-    println!("SetOraclePriceCap by non-admin: REJECTED (correct)");
-
-    // Admin sets price cap - should succeed
-    let result = env.try_set_oracle_price_cap(&admin, 10000);
-    assert!(
-        result.is_ok(),
-        "Admin should set oracle price cap: {:?}",
-        result
-    );
-    println!("SetOraclePriceCap by admin: ACCEPTED (correct)");
-
-    println!("CRITICAL TEST PASSED: SetOraclePriceCap authorization enforced");
-}
+// test_critical_set_oracle_price_cap_authorization deleted:
+// SetOraclePriceCap (tag 18) was removed in v12.19. The cap is now the
+// immutable init-time `max_price_move_bps_per_slot` RiskParam, so there
+// is no runtime admin authorization surface left to test.
 
 /// Test: Hyperp mode index smoothing bypass via multiple cranks in same slot
 ///
 /// SECURITY RESEARCH: In Hyperp mode, the index should smoothly move toward the mark
-/// price, rate-limited by oracle_price_cap_e2bps (default 1% per slot).
+/// price, rate-limited by oracle_price_cap (default 1% per slot).
 ///
 /// Potential issue: If crank is called twice in the same slot:
 /// 1. First crank: dt > 0, index rate-limited toward mark
@@ -770,7 +746,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     // Before Bug #9 fix, dt=0 caused clamp_toward_with_dt to return mark
     // instead of index, allowing the index to jump to mark in a single slot.
     let slab_data = svm.get_account(&slab).unwrap().data;
-    const INDEX_OFF: usize = 336; // HEADER_LEN(136) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
     let index_after = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert_eq!(
         index_after, initial_price_e6,
@@ -780,10 +756,10 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     );
 }
 
-/// Audit gap 1: Hyperp index smoothing is rate-limited by cap_e2bps * dt.
+/// Audit gap 1: Hyperp index smoothing is rate-limited by cap * dt.
 ///
 /// Spec behavior: In Hyperp mode, the index (last_effective_price_e6) moves
-/// toward the mark price by at most `index * cap_e2bps * dt / 1_000_000` per
+/// toward the mark price by at most `index * cap * dt / 1_000_000` per
 /// crank.  A second crank in the same slot (dt=0) must leave the index unchanged.
 ///
 /// This test:
@@ -803,12 +779,16 @@ fn test_hyperp_index_smoothing_rate_limited() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Read default oracle_price_cap_e2bps (1% per slot = 10_000 e2bps)
+    // Read the engine-level `max_price_move_bps_per_slot` — v12.19
+    // replacement for `oracle_price_cap`.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = 136 + 192; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
-    let cap_e2bps =
+    const CAP_OFF: usize = 720; // ENGINE(520) + RiskParams(32) + 168
+    let cap =
         u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
-    assert_eq!(cap_e2bps, 10_000, "default cap should be 10_000 e2bps (1% per slot)");
+    assert_eq!(
+        cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "default cap must match test fixture",
+    );
 
     // Push $200 after enough time for EWMA to blend significantly.
     // With default halflife=100 and ~100 slots dt, alpha ≈ 50%.
@@ -819,7 +799,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
     env.set_oracle_price_e6(200_000_000);
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 136 + 200; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
 
     // Advance 10 slots and crank. Index should move toward mark.
     let dt: u64 = 10;
@@ -830,8 +810,8 @@ fn test_hyperp_index_smoothing_rate_limited() {
     let index_after_crank =
         u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
 
-    // Max allowed movement: index * cap_e2bps * dt / 1_000_000
-    let max_delta = initial_price as u128 * cap_e2bps as u128 * dt as u128 / 1_000_000;
+    // Max allowed movement: index * cap * dt / 1_000_000
+    let max_delta = initial_price as u128 * cap as u128 * dt as u128 / 1_000_000;
     let actual_delta = if index_after_crank > initial_price {
         (index_after_crank - initial_price) as u128
     } else {
@@ -840,8 +820,8 @@ fn test_hyperp_index_smoothing_rate_limited() {
 
     assert!(
         actual_delta <= max_delta,
-        "index movement {} exceeds rate limit {} (cap_e2bps={}, dt={})",
-        actual_delta, max_delta, cap_e2bps, dt
+        "index movement {} exceeds rate limit {} (cap={}, dt={})",
+        actual_delta, max_delta, cap, dt
     );
     // Index should have moved toward mark (if mark > initial and dt > 0)
     // With EWMA, the mark may be only slightly above initial after pushes.
@@ -1142,7 +1122,7 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     env.crank();
 
     const LAST_ORACLE_PUB_TS_OFF: usize = 320;     // HEADER_LEN(136) + last_oracle_publish_time(184)
-    const LAST_EFFECTIVE_PRICE_OFF: usize = 336;   // HEADER_LEN(136) + last_effective_price_e6(200)
+    const LAST_EFFECTIVE_PRICE_OFF: usize = 328;   // HEADER_LEN(136) + last_effective_price_e6(192)
     let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         i64::from_le_bytes(
@@ -1208,7 +1188,7 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
 fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
     let mut env = TestEnv::new();
     // Set a tight 1% cap so each cap-step would be visible.
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     const LAST_ORACLE_PUB_TS_OFF: usize = 320;
     const LAST_EFFECTIVE_PRICE_OFF: usize = 336;
@@ -1273,7 +1253,7 @@ fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
 #[test]
 fn test_oracle_replay_does_not_advance_liveness_cursor() {
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     const LAST_GOOD_SLOT_OFF: usize = 136 + 328; // HEADER_LEN(136) + last_good_oracle_slot offset
     let read_last_good = |env: &TestEnv| -> u64 {
@@ -1360,4 +1340,36 @@ fn test_push_oracle_price_rejects_stale_timestamp() {
          first_observed_stale_slot while read_authority_price still \
          ignores the stored price, creating a liveness freeze"
     );
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_critical_set_oracle_price_cap_authorization() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // Attacker tries to set price cap - should fail
+    let result = env.try_set_oracle_price_cap(&attacker, 10000);
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not set oracle price cap"
+    );
+    println!("SetOraclePriceCap by non-admin: REJECTED (correct)");
+
+    // Admin sets price cap - should succeed
+    let result = env.try_set_oracle_price_cap(&admin, 10000);
+    assert!(
+        result.is_ok(),
+        "Admin should set oracle price cap: {:?}",
+        result
+    );
+    println!("SetOraclePriceCap by admin: ACCEPTED (correct)");
+
+    println!("CRITICAL TEST PASSED: SetOraclePriceCap authorization enforced");
 }

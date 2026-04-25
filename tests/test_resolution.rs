@@ -807,9 +807,8 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
     env.svm.send_transaction(tx).expect("UpdateConfig");
     println!("5. UpdateConfig succeeded (k=200, horizon=7200)");
 
-    // 6. SetOraclePriceCap
-    env.try_set_oracle_price_cap(&admin, 50_000).expect("SetOraclePriceCap");
-    println!("6. SetOraclePriceCap set to 50_000 (5%/slot)");
+    // 6. v12.19: price-move cap is immutable init-time, no runtime call.
+    println!("6. price cap is init-time (v12.19)");
 
     // 7. Create user + deposit
     let user = Keypair::new();
@@ -919,7 +918,7 @@ fn test_resolve_permissionless_after_staleness() {
     program_path();
     let mut env = TestEnv::new();
     // Init with permissionless resolve enabled (stale_slots=100, cap=10000)
-    env.init_market_with_cap(0, 10_000, 100);
+    env.init_market_with_cap(0, 100);
 
     // Override max_staleness_secs to 30 for faster staleness detection
     {
@@ -955,18 +954,11 @@ fn test_resolve_permissionless_after_staleness() {
     assert!(env.is_market_resolved());
 }
 
-/// Permissionless resolution rejected when disabled (stale_slots=0).
-#[test]
-fn test_resolve_permissionless_disabled_by_default() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-    env.crank();
-    env.set_slot(1_000_000);
-    let result = env.try_resolve_permissionless();
-    assert!(result.is_err(), "Should fail when feature disabled");
-    assert!(!env.is_market_resolved(), "Market must NOT be resolved after rejected call");
-}
+// test_resolve_permissionless_disabled_by_default deleted:
+// v12.19 requires non-Hyperp markets to set permissionless_resolve_stale_slots > 0
+// (resolvability invariant). The "disabled" configuration this test exercised
+// no longer exists at the non-Hyperp init surface. Hyperp markets may still
+// set it to 0, but that case is covered by the Hyperp-specific resolve tests.
 
 /// Can't double-resolve — admin resolves first, permissionless rejected.
 #[test]
@@ -1004,7 +996,7 @@ fn test_resolve_permissionless_settlement_price() {
     program_path();
     let mut env = TestEnv::new();
     // Init with permissionless resolve enabled (stale_slots=50, cap=10000)
-    env.init_market_with_cap(0, 10_000, 50);
+    env.init_market_with_cap(0, 50);
 
     // Override max_staleness_secs to 30 for faster staleness detection
     {
@@ -1103,12 +1095,9 @@ fn test_governance_free_full_lifecycle() {
     // horizon=200 (shorter for faster funding), k=200 (2x multiplier), max_premium=1000, max_per_slot=10
     env.init_market_with_funding(
         0,      // invert=0 (direct, e.g., BTC/USD)
-        10_000, // min_oracle_price_cap_e2bps = 1% per slot
-        // permissionless_resolve_stale_slots: bumped to 1000 under the
-        // strict hard-timeout model so the test's natural slot
-        // advances (init → 200 → 300 → 600) stay within the live
-        // window. The original 100 tripped the gate mid-sequence
-        // under strict policy.
+        // permissionless_resolve_stale_slots: 1000 slots so the test's
+        // natural slot advances (init → 200 → 300 → 600) stay within
+        // the live window.
         1000,
         200,    // funding_horizon_slots (custom, not default 500)
         200,    // funding_k_bps (2x, not default 1x)
@@ -1189,8 +1178,7 @@ fn test_governance_free_full_lifecycle_inverted() {
 
     env.init_market_with_funding(
         1,      // invert=1
-        10_000, // 1% cap
-        1000,   // permissionless resolve (strict model: wider window)
+        1000,   // permissionless_resolve_stale_slots (wider than max_crank_staleness)
         300,    // custom horizon
         150,    // 1.5x k
         800,    // 8% max premium
@@ -1247,7 +1235,7 @@ fn test_resolve_permissionless_inverted_market() {
     program_path();
     let mut env = TestEnv::new();
     // Inverted market with cap + permissionless resolve enabled (stale > 50 slots)
-    env.init_market_with_cap(1, 10_000, 50);
+    env.init_market_with_cap(1, 50);
 
     // Bounded staleness so oracle can go stale
     {
@@ -1283,7 +1271,7 @@ fn test_resolve_permissionless_inverted_market() {
 fn test_resolve_permissionless_inverted_settlement_price() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(1, 10_000, 50);
+    env.init_market_with_cap(1, 50);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -1337,7 +1325,7 @@ fn test_resolve_permissionless_inverted_settlement_price() {
 fn test_resolve_permissionless_inverted_with_positions() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(1, 10_000, 1000);
+    env.init_market_with_cap(1, 1000);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -1393,7 +1381,7 @@ fn test_resolve_permissionless_inverted_with_positions() {
 fn test_resolve_permissionless_empty_market_at_sentinel() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 100);
+    env.init_market_with_cap(0, 100);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -1688,7 +1676,7 @@ fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
     // account created by TestEnv::new). min_cap=10_000 to satisfy other
     // invariants; permissionless_resolve_stale_slots=50 so the test
     // doesn't need to warp far.
-    env.init_market_with_cap(0, 10_000, 50);
+    env.init_market_with_cap(0, 50);
 
     // Non-Hyperp markets have hyperp_authority == 0 at init (no
     // authority role), so no burn is needed — the "no authority
@@ -1742,7 +1730,7 @@ fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
     program_path();
     let mut env = TestEnv::new();
     // Small delay so the test doesn't need to warp far.
-    env.init_market_with_cap(0, 10_000, 50);
+    env.init_market_with_cap(0, 50);
     env.crank(); // advances last_good_oracle_slot to ~init slot
 
     // Configure a FRESH oracle authority.
@@ -1786,7 +1774,7 @@ fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
     program_path();
     let mut env = TestEnv::new();
     // Small perm window so we can warp past it quickly.
-    env.init_market_with_cap(0, 10_000, 50);
+    env.init_market_with_cap(0, 50);
     env.crank(); // seed engine.last_oracle_price via successful read
 
     // Record engine.last_oracle_price as the expected settlement anchor.
@@ -1829,7 +1817,7 @@ fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
 fn test_deposit_rejected_after_hard_timeout_matures() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 50);
+    env.init_market_with_cap(0, 50);
     env.crank();
 
     let user = Keypair::new();
@@ -1874,4 +1862,17 @@ fn test_resolve_permissionless_inverted_rejects_live_oracle() {
         "Inverted market must not resolve permissionlessly when oracle is live"
     );
     assert!(!env.is_market_resolved());
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_resolve_permissionless_disabled_by_default() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    env.crank();
+    env.set_slot(1_000_000);
+    let result = env.try_resolve_permissionless();
+    assert!(result.is_err(), "Should fail when feature disabled");
+    assert!(!env.is_market_resolved(), "Market must NOT be resolved after rejected call");
 }
