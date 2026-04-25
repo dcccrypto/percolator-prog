@@ -138,6 +138,38 @@ pub mod constants {
     pub const MAX_ACCRUAL_DT_SLOTS: u64 = 100_000;
     /// Max |funding_rate_e9_per_slot| the engine will accrue (spec §1.4).
     pub const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 1_000_000;
+    /// Cumulative-funding lifetime (engine §1.4 v12.18.x). Distinct from
+    /// the per-call `MAX_ACCRUAL_DT_SLOTS` envelope: this bounds the
+    /// lifetime sum of funding contributions, not any single call.
+    ///
+    /// Engine init asserts the safety envelope:
+    ///
+    ///     ADL_ONE · MAX_ORACLE_PRICE · max_abs_funding_e9_per_slot ·
+    ///       min_funding_lifetime_slots  ≤  i128::MAX
+    ///
+    /// With the engine-crate constants
+    ///     ADL_ONE            = 10^15
+    ///     MAX_ORACLE_PRICE   = 10^12
+    /// and this crate's
+    ///     MAX_ABS_FUNDING_E9_PER_SLOT = 10^6
+    /// the lifetime ceiling is
+    ///     i128::MAX / (10^15 · 10^12 · 10^6)  ≈ 170_141
+    ///
+    /// 170_000 is the largest value that passes the engine assert while
+    /// keeping the current funding cap. That gives a THEORETICAL safety
+    /// horizon of 170 000 slots (≈ 19 hours at 400 ms slots) when the
+    /// market sits at max funding rate continuously. Real markets
+    /// rarely hit the cap; at a typical 1 bps/day average rate the
+    /// effective horizon is many orders of magnitude longer.
+    ///
+    /// Deployments with a longer target lifetime should lower
+    /// `MAX_ABS_FUNDING_E9_PER_SLOT` proportionally, or (out of scope
+    /// for the wrapper) the engine should expose an F-index rebase.
+    /// The prior setting of `MAX_ACCRUAL_DT_SLOTS` (100_000) was a
+    /// strict under-provisioning — made the engine only guarantee one
+    /// call's worth of funding safety — and is raised here to the
+    /// engine's mathematical ceiling.
+    pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 170_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
@@ -1032,15 +1064,11 @@ pub mod zc {
         program::invoke_signed,
     };
 
-    /// Invoke the matcher program via CPI with proper lifetime coercion.
-    ///
-    /// This is the ONLY place where unsafe lifetime transmute is allowed.
-    /// The transmute is sound because:
-    /// - We are shortening lifetime from 'a (caller) to local scope
-    /// - The AccountInfo is only used for the duration of invoke_signed
-    /// - We don't hold references past the function call
+    /// Invoke the matcher program via CPI. The AccountInfo clones satisfy
+    /// solana_program::program::invoke_signed's ownership requirement
+    /// without relying on lifetime transmutes (the earlier transmute-
+    /// based version has been removed).
     #[inline]
-    #[allow(unsafe_code)]
     pub fn invoke_signed_trade<'a>(
         ix: &SolInstruction,
         a_lp_pda: &AccountInfo<'a>,
@@ -1675,9 +1703,24 @@ pub mod ix {
                     // format_version 1: u16 idx + u8 policy_tag per candidate
                     //   policy tag 0 = FullClose, 1 = ExactPartial(u128), 0xFF = touch-only
                     let mut candidates = alloc::vec::Vec::new();
+                    // Cap candidate count to prevent CU exhaustion via
+                    // padding: the engine's keeper_crank_not_atomic scans
+                    // every candidate in the slice, but only counts
+                    // VALID existing entries against its per-crank
+                    // budget. A keeper could otherwise submit thousands
+                    // of invalid indices to burn CU before any useful
+                    // work. We accept up to 2 × LIQ_BUDGET_PER_CRANK
+                    // candidates — enough room for over-specification
+                    // of deduplication / expired entries while keeping
+                    // the total scan bounded.
+                    const MAX_CANDIDATES: usize =
+                        (crate::constants::LIQ_BUDGET_PER_CRANK as usize) * 2;
                     if format_version == 1 {
                         // Extended: u16 idx + u8 policy tag per candidate
                         while rest.len() >= 3 {
+                            if candidates.len() >= MAX_CANDIDATES {
+                                return Err(ProgramError::InvalidInstructionData);
+                            }
                             let idx = read_u16(&mut rest)?;
                             let tag = read_u8(&mut rest)?;
                             let policy = match tag {
@@ -3375,12 +3418,8 @@ pub mod oracle {
                 config.oracle_price_cap_e2bps,
             );
             config.last_effective_price_e6 = clamped_ext;
-            // Any successful external read proves the oracle is currently live,
-            // so reset the permissionless-resolve staleness observation. This
-            // prevents a premature resolve after a long idle period + a short
-            // oracle hiccup — the continuous-death window only starts from the
-            // first in-window stale observation, not the last successful read.
             config.first_observed_stale_slot = 0;
+            return Ok(clamped_ext);
         }
 
         match external {
@@ -5694,6 +5733,25 @@ pub mod processor {
         // Market never had a real oracle observation — nothing to catch up.
         // The caller's own _not_atomic call will seed last_oracle_price.
         if engine.last_oracle_price == 0 {
+            return Ok(());
+        }
+        // Mirror the engine's own envelope predicate (§5.5 clause 6, v12.19):
+        // accrue_market_to only enforces `total_dt > max_dt` Overflow when
+        // funding would actually accumulate — i.e., rate != 0 AND both
+        // sides have OI AND fund_px_last > 0. When funding is INACTIVE,
+        // the engine will happily jump any dt in one call. If the wrapper
+        // chunks anyway, it can raise CatchupRequired on paths where the
+        // engine would legally advance directly — e.g.:
+        //   - Dead-oracle UpdateConfig degenerate arm (rate = 0)
+        //   - InitUser / InitLP / no-OI markets
+        //   - ResolveMarket Degenerate (rate = 0)
+        // Skip the chunking loop entirely when funding is inactive; the
+        // caller's final accrue_market_to handles any dt in one shot.
+        let funding_active = funding_rate_e9 != 0
+            && engine.oi_eff_long_q != 0
+            && engine.oi_eff_short_q != 0
+            && engine.fund_px_last > 0;
+        if !funding_active {
             return Ok(());
         }
         // Catchup chunks use the engine's STORED last_oracle_price, not the

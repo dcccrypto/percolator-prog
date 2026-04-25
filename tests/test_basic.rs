@@ -3943,19 +3943,29 @@ fn test_init_market_rejects_negative_max_per_slot() {
     assert!(result.is_err(), "negative funding_max_bps_per_slot must be rejected");
 }
 
-/// InitMarket with mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected.
+/// InitMarket cap check for mark_min_fee is against MAX_PROTOCOL_FEE_ABS
+/// (10^36, spec §1.4). Since mark_min_fee is u64 (max ≈ 1.8 × 10^19), the
+/// u128 comparison always passes for any u64 input — the ceiling is a
+/// sanity guard, not an economic bound. Regression: the earlier
+/// `MAX_PROTOCOL_FEE_ABS as u64` cast wrapped (Finding P3) and rejected
+/// values at essentially random u64 thresholds. After the fix, u64::MAX
+/// is accepted, which is the correct spec-level behavior.
 #[test]
-fn test_init_market_rejects_excessive_mark_min_fee() {
+fn test_init_market_mark_min_fee_sanity_cap_admits_full_u64() {
     program_path();
     let mut env = TestEnv::new();
     let data = encode_init_market_with_min_fee(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
         0, 10_000, 0,
         500, 100, 500, 5,
-        u64::MAX, // way too large
+        u64::MAX, // below MAX_PROTOCOL_FEE_ABS (10^36) — accepted
     );
     let result = env.try_init_market_raw(data);
-    assert!(result.is_err(), "mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected");
+    assert!(
+        result.is_ok(),
+        "u64::MAX < MAX_PROTOCOL_FEE_ABS must be accepted by the u128 sanity cap: {:?}",
+        result
+    );
 }
 
 // ============================================================================
@@ -4472,7 +4482,8 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     env.crank();
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000); // large trade
 
-    // Oracle dies → permissionless resolution
+    // Oracle dies → permissionless resolution (unified stale-oracle
+    // policy: any stale oracle + no clear within delay → resolve).
     env.svm.set_sysvar(&Clock {
         slot: 700,
         unix_timestamp: 700,
@@ -4803,3 +4814,18 @@ fn test_f7_oracle_initialized_flag_set_after_crank() {
     }
 }
 
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_init_market_rejects_excessive_mark_min_fee() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_min_fee(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        0, 10_000, 0,
+        500, 100, 500, 5,
+        u64::MAX, // way too large
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected");
+}
