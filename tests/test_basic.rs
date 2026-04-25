@@ -1567,7 +1567,7 @@ fn test_position_flip_minimal_equity() {
 fn test_liquidation_reduces_position_and_charges_fee() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // liquidation test: max cap (100%/read), unrestricted for these moves
+    env.init_market_with_cap(0, 10_000); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1594,11 +1594,12 @@ fn test_liquidation_reduces_position_and_charges_fee() {
 
     let _insurance_before = env.read_insurance_balance();
 
-    // Price drop to $120. PnL = 100M * (120 - 138) / 1e6 = -1.8 SOL.
-    // Equity = 1.5 - 1.8 = -0.3 SOL -> max(0, -0.3) = 0.
-    // Notional at $120: 100M * 120M / 1e6 = 12 SOL. MM = 0.6 SOL.
-    // 0 > 0.6? No -> liquidatable.
-    env.set_slot_and_price(200, 120_000_000); // $138 -> $120
+    // Drive the oracle adversarially over enough slots for the per-slot
+    // price-move cap (TEST_MAX_PRICE_MOVE_BPS_PER_SLOT = 4 bps / slot) to
+    // compound to ~15-20% drift. At 500 slots with ~9 walk chunks of 2%
+    // each, the engine's effective price lands well below the liquidation
+    // threshold (~$129.5M for this position size + capital).
+    env.set_slot_and_price(500, 110_000_000); // walk target: $138 → ~$115
 
     // Call LiquidateAtOracle directly (no crank first).
     let result = env.try_liquidate(user_idx);
@@ -1769,7 +1770,7 @@ fn test_partial_withdrawal_with_position_succeeds() {
 fn test_keeper_crank_format_v1_full_close() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // max cap; unrestricted for $138→$120 move
+    env.init_market_with_cap(0, 10_000); // max cap; unrestricted for $138→$120 move
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -1790,8 +1791,10 @@ fn test_keeper_crank_format_v1_full_close() {
     env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
     assert_ne!(env.read_account_position(user_idx), 0, "precondition: user has position");
 
-    // Price drop to $120 -> user deeply underwater (see liquidation test above)
-    env.set_slot_and_price(200, 120_000_000); // $138 -> $120
+    // Drive oracle adversarially over enough slots for the per-slot
+    // price-move cap to compound to a price-deep-enough for liquidation
+    // (~$130 threshold given 1.5 SOL capital, 100M-unit position).
+    env.set_slot_and_price(500, 110_000_000);
 
     // Build format_version=1 crank instruction with FullClose policy (tag=0)
     let caller = Keypair::new();
@@ -2010,8 +2013,7 @@ fn test_funding_rate_transfers_pnl_on_premium() {
     let mp = env.matcher_program_id;
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
-    // Widen cap so mark can diverge from index significantly
-    env.try_set_oracle_price_cap(&admin, 500_000).unwrap(); // 50% per slot
+    // Per-slot price-move cap is init-immutable in v12.19; no runtime widening.
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
@@ -2175,7 +2177,7 @@ fn test_settle_account_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so hyperp_authority defaults to admin
+    env.init_market_with_cap(0, 10_000); // cap > 0 so hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2472,7 +2474,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so hyperp_authority defaults to admin (for later push)
+    env.init_market_with_cap(0, 10_000); // cap > 0 so hyperp_authority defaults to admin (for later push)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2704,7 +2706,7 @@ fn test_reclaim_rejects_account_with_position() {
 fn test_reclaim_blocked_on_resolved() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → hyperp_authority defaults to admin
+    env.init_market_with_cap(0, 10_000); // cap > 0 → hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2744,14 +2746,15 @@ fn test_init_user_survives_stale_oracle() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    // Advance clock well past max_staleness_secs (86400s = 86400 slots
-    // in the test harness where 1 slot = 1 second) WITHOUT updating the
-    // pyth publish_time. Under the prior oracle-dependent InitUser, any
-    // oracle read would fail OracleStale. We bypass the test harness's
-    // set_slot helper because it refreshes pyth publish_time to match.
+    // Advance clock past max_crank_staleness_slots (1_800) so that any
+    // oracle read from InitUser would fail, but stay inside
+    // permissionless_resolve_stale_slots (= 10_000 in the default
+    // TestEnv fixture) so the terminal hard-timeout gate hasn't fired.
+    // Under the correct InitUser (no oracle read), the account must
+    // still materialize.
     env.svm.set_sysvar(&solana_sdk::clock::Clock {
-        slot: 100_000,
-        unix_timestamp: 100_000,
+        slot: 9_000,
+        unix_timestamp: 9_000,
         ..Default::default()
     });
 
@@ -2783,9 +2786,11 @@ fn test_init_lp_survives_stale_oracle() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
+    // Stay inside permissionless_resolve_stale_slots (= 10_000) — see
+    // test_init_user_survives_stale_oracle for the reasoning.
     env.svm.set_sysvar(&solana_sdk::clock::Clock {
-        slot: 100_000,
-        unix_timestamp: 100_000,
+        slot: 9_000,
+        unix_timestamp: 9_000,
         ..Default::default()
     });
 
@@ -3287,7 +3292,7 @@ use percolator_prog::oracle::clamp_oracle_price;
 #[test]
 fn test_ewma_single_slot_max_movement() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 10_000; // 1%
+    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
     let halflife: u64 = 100;
 
     // Attacker exec price: as far from index as circuit breaker allows
@@ -3311,7 +3316,7 @@ fn test_ewma_single_slot_max_movement() {
 #[test]
 fn test_ewma_walkup_clamp_against_mark_vulnerable() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 10_000; // 1%
+    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
     let halflife: u64 = 100;
     let mut mark = index;
 
@@ -3334,7 +3339,7 @@ fn test_ewma_walkup_clamp_against_mark_vulnerable() {
 #[test]
 fn test_ewma_walkup_clamp_against_index_bounded() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 10_000; // 1%
+    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
     let halflife: u64 = 100;
     let mut mark = index;
 
@@ -3345,7 +3350,8 @@ fn test_ewma_walkup_clamp_against_index_bounded() {
         mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
     // Mark must be within cap of index (1% = 1_000_000)
-    let max_gap = index as u128 * cap as u128 / 1_000_000;
+    // v12.19: clamp uses bps (denominator 10_000), not e2bps (1_000_000).
+    let max_gap = index as u128 * cap as u128 / 10_000;
     assert!(
         (mark as u128) <= index as u128 + max_gap,
         "Index-clamped walk must be bounded: mark={} index={} max_gap={}",
@@ -3356,7 +3362,7 @@ fn test_ewma_walkup_clamp_against_index_bounded() {
 /// Test 1.4: Legitimate price discovery — mark tracks moving index.
 #[test]
 fn test_ewma_tracks_moving_index() {
-    let cap: u64 = 10_000; // 1%
+    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
     let halflife: u64 = 100;
     let mut index: u64 = 100_000_000;
     let mut mark = index;
@@ -3397,7 +3403,8 @@ fn test_ewma_walkdown_clamp_against_index_bounded() {
         let clamped = clamp_oracle_price(clamp_base, 1, cap); // attack downward
         mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
-    let max_gap = index as u128 * cap as u128 / 1_000_000;
+    // v12.19: clamp uses bps (denominator 10_000), not e2bps (1_000_000).
+    let max_gap = index as u128 * cap as u128 / 10_000;
     assert!(
         mark as u128 >= index as u128 - max_gap,
         "Downward walk must be bounded: mark={} index={} max_gap={}",
@@ -3712,7 +3719,7 @@ fn test_funding_bootstrap_ewma_seeded_on_first_trade() {
     program_path();
     let mut env = TestEnv::new();
     // cap = 10_000 e2bps = 1% per slot, no permissionless resolve
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     // Before any trade, EWMA should be 0
     assert_eq!(env.read_mark_ewma(), 0, "EWMA must be zero before any trade");
@@ -3738,7 +3745,7 @@ fn test_funding_bootstrap_ewma_seeded_on_first_trade() {
 fn test_funding_bootstrap_rate_stamped_after_trade() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3782,7 +3789,7 @@ fn test_funding_bootstrap_inverted_market() {
     program_path();
     let mut env = TestEnv::new();
     // Inverted market with cap enabled
-    env.init_market_with_cap(1, 10_000, 0);
+    env.init_market_with_cap(1, 10_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3802,30 +3809,11 @@ fn test_funding_bootstrap_inverted_market() {
     assert!(ewma < 100_000, "Inverted price should be small (not raw), got {}", ewma);
 }
 
-/// Without oracle price cap (cap=0), EWMA never updates and funding stays 0.
-/// This is the control case: markets without cap cannot bootstrap funding.
-#[test]
-fn test_funding_no_cap_means_no_ewma() {
-    program_path();
-    let mut env = TestEnv::new();
-    // cap = 0 means EWMA is disabled. Pair with perm_resolve > 0 so the
-    // market still has a resolve path (non-Hyperp + cap=0 + perm=0 is
-    // now rejected at init as unresolvable).
-    env.init_market_with_cap(0, 0, 50_000);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000_000);
-
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-
-    assert_eq!(env.read_mark_ewma(), 0, "No cap → no EWMA update");
-    assert_eq!(env.read_funding_rate(), 0, "No cap → no funding rate");
-}
+// test_funding_no_cap_means_no_ewma deleted:
+// v12.19 removed `oracle_price_cap_e2bps` entirely — the per-slot
+// price-move cap is now the immutable `max_price_move_bps_per_slot`
+// RiskParam (always non-zero in test fixtures). There is no longer
+// a "no cap" configuration to test; the control case doesn't exist.
 
 /// Non-Hyperp market with cap: multiple trades across slots converge EWMA toward index.
 /// After crank accrual, the engine should have applied funding.
@@ -3833,7 +3821,7 @@ fn test_funding_no_cap_means_no_ewma() {
 fn test_funding_bootstrap_multiple_trades_and_crank() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3874,13 +3862,14 @@ fn test_funding_bootstrap_multiple_trades_and_crank() {
 fn test_funding_bootstrap_default_params() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     let horizon = env.read_funding_horizon();
     let cap = env.read_oracle_price_cap();
 
     assert_eq!(horizon, 500, "Default funding_horizon_slots should be 500");
-    assert_eq!(cap, 10_000, "Cap should match min_oracle_price_cap_e2bps");
+    assert_eq!(cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "Cap should match engine's max_price_move_bps_per_slot");
 }
 
 // ============================================================================
@@ -3893,7 +3882,7 @@ fn test_init_market_custom_funding_horizon() {
     program_path();
     let mut env = TestEnv::new();
     // Custom horizon=1000, k=100 (default), max_premium=500 (default), max_per_slot=5 (default)
-    env.init_market_with_funding(0, 10_000, 0, 1000, 100, 500, 5);
+    env.init_market_with_funding(0, 10_000, 1000, 100, 500, 5);
     assert_eq!(env.read_funding_horizon(), 1000, "Custom horizon must be stored");
 }
 
@@ -3902,7 +3891,7 @@ fn test_init_market_custom_funding_horizon() {
 fn test_init_market_custom_funding_k() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 500, 200, 500, 5);
+    env.init_market_with_funding(0, 10_000, 500, 200, 500, 5);
     assert_eq!(env.read_funding_k_bps(), 200, "Custom k_bps must be stored");
 }
 
@@ -3911,7 +3900,7 @@ fn test_init_market_custom_funding_k() {
 fn test_init_market_custom_funding_max_premium() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 500, 100, 1000, 5);
+    env.init_market_with_funding(0, 10_000, 500, 100, 1000, 5);
     assert_eq!(
         env.read_funding_max_premium_bps(),
         1000,
@@ -3924,7 +3913,7 @@ fn test_init_market_custom_funding_max_premium() {
 fn test_init_market_custom_funding_max_per_slot() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 500, 100, 500, 10);
+    env.init_market_with_funding(0, 10_000, 500, 100, 500, 10);
     assert_eq!(
         env.read_funding_max_e9_per_slot(),
         10,
@@ -3939,7 +3928,7 @@ fn test_init_market_custom_all_funding_params() {
     let mut env = TestEnv::new();
     // funding_max_e9_per_slot must fit the engine's per-market envelope
     // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
-    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 10);
+    env.init_market_with_funding(0, 10_000, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);
@@ -3953,7 +3942,7 @@ fn test_init_market_no_funding_params_uses_defaults() {
     program_path();
     let mut env = TestEnv::new();
     // init_market_with_cap doesn't append funding params
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
     assert_eq!(env.read_funding_horizon(), 500, "Default horizon");
     assert_eq!(env.read_funding_k_bps(), 100, "Default k_bps");
     assert_eq!(env.read_funding_max_premium_bps(), 500, "Default max_premium");
@@ -3971,7 +3960,7 @@ fn test_init_market_rejects_zero_funding_horizon() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000, 0,
+        0, 10_000,
         0, // funding_horizon_slots = 0 (invalid)
         100, 500, 5,
     );
@@ -3986,7 +3975,7 @@ fn test_init_market_rejects_excessive_funding_k() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000, 0,
+        0, 10_000,
         500,
         100_001, // k > 100_000 (invalid)
         500, 5,
@@ -4002,7 +3991,7 @@ fn test_init_market_rejects_negative_max_premium() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000, 0,
+        0, 10_000,
         500, 100,
         -1, // negative (invalid)
         5,
@@ -4018,7 +4007,7 @@ fn test_init_market_rejects_negative_max_per_slot() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_funding(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000, 0,
+        0, 10_000,
         500, 100, 500,
         -1, // negative (invalid)
     );
@@ -4039,7 +4028,7 @@ fn test_init_market_mark_min_fee_sanity_cap_admits_full_u64() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_min_fee(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000, 0,
+        0, 10_000,
         500, 100, 500, 5,
         u64::MAX, // below MAX_PROTOCOL_FEE_ABS (10^36) — accepted
     );
@@ -4156,7 +4145,7 @@ fn test_trading_fee_exact_amounts() {
 fn test_liquidation_fee_goes_to_insurance() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // liquidation test: max cap (100%/read), unrestricted for these moves
+    env.init_market_with_cap(0, 10_000); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4177,8 +4166,9 @@ fn test_liquidation_fee_goes_to_insurance() {
 
     let ins_before = env.read_insurance_balance();
 
-    // Price drop to $120 makes user undercollateralized
-    env.set_slot_and_price(200, 120_000_000);
+    // Drive oracle over enough slots for per-slot cap to compound below
+    // the liquidation threshold.
+    env.set_slot_and_price(500, 110_000_000);
 
     // Direct liquidation (not crank — crank may skip per hint logic)
     let result = env.try_liquidate(user_idx);
@@ -4274,7 +4264,7 @@ fn test_insurance_absorbs_bankruptcy_loss() {
 fn test_init_market_with_mark_min_fee() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_min_fee(0, 10_000, 5_000_000_000);
+    env.init_market_with_min_fee(0, 5_000_000_000);
     assert_eq!(
         env.read_mark_min_fee(),
         5_000_000_000,
@@ -4288,7 +4278,7 @@ fn test_init_market_default_mark_min_fee_backward_compat() {
     program_path();
     let mut env = TestEnv::new();
     // init_market_with_cap omits funding params and mark_min_fee
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
     assert_eq!(
         env.read_mark_min_fee(),
         0,
@@ -4301,7 +4291,7 @@ fn test_init_market_default_mark_min_fee_backward_compat() {
 fn test_init_market_mark_min_fee_immutable() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_min_fee(0, 10_000, 1_000_000);
+    env.init_market_with_min_fee(0, 1_000_000);
     let before = env.read_mark_min_fee();
     assert_eq!(before, 1_000_000);
 
@@ -4459,11 +4449,10 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-        data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap = 1%
         // RiskParams with 10 bps trading fee
-        data.extend_from_slice(&0u64.to_le_bytes()); // warmup
-        data.extend_from_slice(&500u64.to_le_bytes()); // mm_bps
-        data.extend_from_slice(&1000u64.to_le_bytes()); // im_bps
+        data.extend_from_slice(&0u64.to_le_bytes()); // h_min (warmup floor)
+        data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+        data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
         data.extend_from_slice(&10u64.to_le_bytes()); // trading_fee_bps = 10 (0.1%)
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
@@ -4476,6 +4465,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
         data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+        data.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
         // Strict hard-timeout model: permissionless_resolve_stale_slots is the
@@ -4892,8 +4882,7 @@ fn test_init_market_rejects_huge_funding_max_e9_per_slot_without_wrap() {
         // i64::MAX would overflow the envelope by ~17 orders of magnitude.
         env.init_market_with_funding(
             0,     // invert
-            10_000, // min_oracle_price_cap_e2bps
-            0,     // permissionless_resolve_stale_slots
+            10_000, // permissionless_resolve_stale_slots
             200,   // funding_horizon_slots
             200,   // funding_k_bps
             1_000, // funding_max_premium_bps
@@ -5000,13 +4989,11 @@ fn test_fee_sync_does_not_erase_market_accrual_interval() {
     env.set_slot(0);
     env.crank();
 
-    // BPF layout offset for engine.last_market_slot.
-    // 536 (ENGINE_OFF) + 624 (field offset after min_initial_deposit delete) = 1160.
-    const LAST_MARKET_SLOT_OFF: usize = 1160;
+    // Use TestEnv accessor rather than a hand-rolled offset — the
+    // engine layout shifts with v12.19 schema updates and hand-rolled
+    // offsets drift silently.
     let read_last_market_slot = |e: &TestEnv| -> u64 {
-        let d = e.svm.get_account(&e.slab).unwrap().data;
-        u64::from_le_bytes(d[LAST_MARKET_SLOT_OFF..LAST_MARKET_SLOT_OFF + 8]
-            .try_into().unwrap())
+        e.read_last_market_slot()
     };
     let before = read_last_market_slot(&env);
     assert_eq!(before, 100, "seeded last_market_slot at 100");
@@ -5825,18 +5812,19 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     payload.extend_from_slice(&50u64.to_le_bytes());
     payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
     payload.extend_from_slice(&100u64.to_le_bytes());
-    payload.extend_from_slice(&0u128.to_le_bytes());
-    payload.extend_from_slice(&1u128.to_le_bytes());
-    payload.extend_from_slice(&2u128.to_le_bytes());
-    payload.extend_from_slice(&0u16.to_le_bytes());
-    payload.extend_from_slice(&0u64.to_le_bytes());
-    payload.extend_from_slice(&1000u64.to_le_bytes());
-    payload.extend_from_slice(&500u64.to_le_bytes());
-    payload.extend_from_slice(&100u64.to_le_bytes());
-    payload.extend_from_slice(&500i64.to_le_bytes());
-    payload.extend_from_slice(&1_000i64.to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    payload.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
+    payload.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    payload.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
+    payload.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    payload.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    payload.extend_from_slice(&1000u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    payload.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    payload.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    payload.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    payload.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     payload.extend_from_slice(&1u64.to_le_bytes()); // mark_min_fee = 1 (nonzero)
-    payload.extend_from_slice(&50u64.to_le_bytes());
+    payload.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots
     env.try_init_market_raw(payload)
         .expect("Hyperp+perm_resolve+nonzero mark_min_fee must succeed");
 }

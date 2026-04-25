@@ -177,7 +177,7 @@ fn test_attack_withdraw_insurance_with_open_positions() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -295,7 +295,7 @@ fn test_attack_topup_insurance_after_resolution() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_slot(100);
@@ -890,7 +890,7 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
     let admin = env.payer.insecure_clone();
 
     // Create LP and user
@@ -1443,12 +1443,24 @@ fn setup_bounded_withdrawal(
 
     // Direct slab edits for config fields that don't yet have UpdateConfig
     // wiring. Safe in tests: we own the slab account.
+    //
+    // v12.19 MarketConfig layout (up to the insurance withdrawal fields):
+    //   offset 0..192  : collateral_mint + vault_pubkey + index_feed_id +
+    //                    max_staleness_secs + conf_filter_bps + bump + invert +
+    //                    unit_scale + funding (4×u64/i64) + hyperp_authority +
+    //                    hyperp_mark_e6 + last_oracle_publish_time
+    //   offset 192..200: last_effective_price_e6 (u64)
+    //   offset 200..202: insurance_withdraw_max_bps (u16)
+    //   offset 202..204: tvl_insurance_cap_mult (u16)
+    //   offset 204..208: _iw_padding
+    //   offset 208..216: insurance_withdraw_cooldown_slots (u64)
+    //
+    // With HEADER_LEN = 136:
+    //   slab[336..338] = insurance_withdraw_max_bps
+    //   slab[344..352] = insurance_withdraw_cooldown_slots
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    // insurance_withdraw_max_bps (u16): HEADER_LEN(136) + config offset 216 = 352
-    // (config offsets shifted -16 after max_insurance_floor deletion).
-    slab.data[352..354].copy_from_slice(&max_bps.to_le_bytes());
-    // insurance_withdraw_cooldown_slots (u64): HEADER_LEN(136) + 224 = 360
-    slab.data[360..368].copy_from_slice(&cooldown_slots.to_le_bytes());
+    slab.data[336..338].copy_from_slice(&max_bps.to_le_bytes());
+    slab.data[344..352].copy_from_slice(&cooldown_slots.to_le_bytes());
     env.svm.set_account(env.slab, slab).unwrap();
 }
 
