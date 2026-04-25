@@ -2606,7 +2606,13 @@ impl TestEnv {
     }
 
     /// Try SetOracleAuthority instruction
-    pub fn try_set_oracle_authority(
+    /// Raw SetOracleAuthority helper — invokes the instruction directly
+    /// with no pre-setup. Used by regression tests that verify the
+    /// Model-1 weaker-authority invariant (non-Hyperp + cap == 0 +
+    /// non-zero authority must reject). Most integration tests should
+    /// use `try_set_oracle_authority`, which auto-enables a default cap
+    /// so the invariant is satisfied.
+    pub fn try_set_oracle_authority_raw(
         &mut self,
         signer: &Keypair,
         new_authority: &Pubkey,
@@ -2629,6 +2635,33 @@ impl TestEnv {
             .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
+    }
+
+    /// SetOracleAuthority with automatic weaker-authority bootstrapping.
+    /// If the target market is non-Hyperp, has cap == 0, and the new
+    /// authority is non-zero, enables a 1% default cap first to satisfy
+    /// the Model-1 invariant. This matches the production policy where
+    /// admins always configure a cap before enabling an authority.
+    pub fn try_set_oracle_authority(
+        &mut self,
+        signer: &Keypair,
+        new_authority: &Pubkey,
+    ) -> Result<(), String> {
+        let is_hyperp;
+        let cap_is_zero;
+        {
+            let slab = self.svm.get_account(&self.slab).unwrap();
+            let config = percolator_prog::state::read_config(&slab.data);
+            is_hyperp = config.index_feed_id == [0u8; 32];
+            cap_is_zero = config.oracle_price_cap_e2bps == 0;
+        }
+        if !is_hyperp
+            && cap_is_zero
+            && new_authority != &Pubkey::default()
+        {
+            let _ = self.try_set_oracle_price_cap(signer, 10_000);
+        }
+        self.try_set_oracle_authority_raw(signer, new_authority)
     }
 
     /// Try PushOraclePrice instruction

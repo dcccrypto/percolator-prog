@@ -2492,6 +2492,8 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 
     // Resolve the market.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // try_set_oracle_authority auto-enables the circuit-breaker cap
+    // before setting authority (Model-1 weaker-authority invariant).
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
     env.set_slot(300);
@@ -3943,19 +3945,29 @@ fn test_init_market_rejects_negative_max_per_slot() {
     assert!(result.is_err(), "negative funding_max_bps_per_slot must be rejected");
 }
 
-/// InitMarket with mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected.
+/// InitMarket cap check for mark_min_fee is against MAX_PROTOCOL_FEE_ABS
+/// (10^36, spec §1.4). Since mark_min_fee is u64 (max ≈ 1.8 × 10^19), the
+/// u128 comparison always passes for any u64 input — the ceiling is a
+/// sanity guard, not an economic bound. Regression: the earlier
+/// `MAX_PROTOCOL_FEE_ABS as u64` cast wrapped (Finding P3) and rejected
+/// values at essentially random u64 thresholds. After the fix, u64::MAX
+/// is accepted, which is the correct spec-level behavior.
 #[test]
-fn test_init_market_rejects_excessive_mark_min_fee() {
+fn test_init_market_mark_min_fee_sanity_cap_admits_full_u64() {
     program_path();
     let mut env = TestEnv::new();
     let data = encode_init_market_with_min_fee(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
         0, 10_000, 0,
         500, 100, 500, 5,
-        u64::MAX, // way too large
+        u64::MAX, // below MAX_PROTOCOL_FEE_ABS (10^36) — accepted
     );
     let result = env.try_init_market_raw(data);
-    assert!(result.is_err(), "mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected");
+    assert!(
+        result.is_ok(),
+        "u64::MAX < MAX_PROTOCOL_FEE_ABS must be accepted by the u128 sanity cap: {:?}",
+        result
+    );
 }
 
 // ============================================================================
@@ -4472,7 +4484,8 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     env.crank();
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000); // large trade
 
-    // Oracle dies → permissionless resolution
+    // Oracle dies → permissionless resolution (unified stale-oracle
+    // policy: any stale oracle + no clear within delay → resolve).
     env.svm.set_sysvar(&Clock {
         slot: 700,
         unix_timestamp: 700,
@@ -5031,21 +5044,33 @@ fn test_fee_markets_survive_one_slot_gap_on_every_accrue_path() {
     env.try_deposit(&user, user_idx, 500)
         .expect("DepositCollateral must succeed after 1-slot gap with fees ON");
 
-    // DepositFeeCredits is also exercised — it reaches the debt-cap check
-    // only AFTER sync_account_fee succeeds, so a failure here must be
-    // InvalidArgument (units > debt), not Overflow / "fee anchor > current".
-    // That's the signature of a passing sync with no outstanding debt.
+    // DepositFeeCredits: our user has no fee debt (they have plenty of
+    // capital), so the wrapper's Phase 2 debt-cap check MUST reject with
+    // InvalidArgument AFTER successfully syncing fees. Accepting Ok
+    // would be a vacuous assertion (we didn't engineer a debt scenario);
+    // accepting a generic Err would hide a potential sync-anchor bug
+    // (Custom(Overflow) = 0x12). Assert the EXACT expected outcome:
+    // InvalidArgument (Phase 2 rejection), not Overflow (Phase 1 sync
+    // failure) nor success (unexpected debt).
     env.set_slot(4);
     let r = env.try_deposit_fee_credits(&user, user_idx, 50);
-    match r {
-        Ok(_) => {} // had debt, repaid
-        Err(e) => assert!(
-            e.contains("InvalidArgument"),
-            "DepositFeeCredits must either succeed or reject via the \
-             debt-cap guard (InvalidArgument). A fee-sync-anchor failure \
-             would appear as Custom(Overflow). Got: {e}",
-        ),
-    }
+    let err_msg = r.expect_err(
+        "DepositFeeCredits MUST reject — user has no fee debt so the \
+         Phase 2 debt-cap check fires. If this succeeds, the test setup \
+         no longer matches its stated precondition.",
+    );
+    assert!(
+        err_msg.contains("InvalidArgument"),
+        "DepositFeeCredits must reject via the Phase 2 debt-cap guard \
+         (InvalidArgument, proving Phase 1 sync ran first). A sync-anchor \
+         failure would appear as Custom(Overflow)=0x12. Got: {err_msg}",
+    );
+    // Also assert it's NOT a sync-anchor failure specifically.
+    assert!(
+        !err_msg.contains("0x12"),
+        "DepositFeeCredits rejection must be from debt-cap, not fee-sync \
+         anchor. Got Overflow: {err_msg}",
+    );
 }
 
 /// KeeperCrank reward: a non-permissionless cranker earns 50% of the

@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 mod common;
 #[allow(unused_imports)]
 use common::*;
@@ -24,7 +23,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 fn test_hyperp_rejects_zero_initial_mark_price() {
     let path = program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -173,7 +172,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
 fn test_hyperp_init_market_with_valid_price() {
     let path = program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -328,7 +327,7 @@ fn test_hyperp_init_market_with_valid_price() {
 fn test_hyperp_init_market_with_inverted_price() {
     let path = program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -552,6 +551,67 @@ fn test_comprehensive_oracle_price_impact_on_pnl() {
     assert_ne!(env.read_account_position(user_idx), 0, "Position must persist through price changes");
 }
 
+/// CRITICAL: Admin oracle mechanism for Hyperp mode
+#[test]
+fn test_critical_admin_oracle_authority() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let oracle_authority = Keypair::new();
+    let attacker = Keypair::new();
+    env.svm
+        .airdrop(&oracle_authority.pubkey(), 1_000_000_000)
+        .unwrap();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // Attacker tries to set oracle authority - should fail
+    let result = env.try_set_oracle_authority(&attacker, &attacker.pubkey());
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-admin should not set oracle authority"
+    );
+    println!("SetOracleAuthority by non-admin: REJECTED (correct)");
+
+    // Weaker-authority invariant (Model 1): non-Hyperp markets with a
+    // configured oracle authority must also have a non-zero circuit
+    // breaker cap. init_market_with_invert(0) ships cap=0 (permissive
+    // test default), so enable the cap first before configuring
+    // authority.
+    env.try_set_oracle_price_cap(&admin, 10_000)
+        .expect("admin must enable cap before setting authority");
+
+    // Admin sets oracle authority - should succeed now that cap is set
+    let result = env.try_set_oracle_authority(&admin, &oracle_authority.pubkey());
+    assert!(
+        result.is_ok(),
+        "Admin should set oracle authority: {:?}",
+        result
+    );
+    println!("SetOracleAuthority by admin: ACCEPTED (correct)");
+
+    // Attacker tries to push price - should fail
+    let result = env.try_push_oracle_price(&attacker, 150_000_000, 200);
+    assert!(
+        result.is_err(),
+        "SECURITY: Non-authority should not push oracle price"
+    );
+    println!("PushOraclePrice by non-authority: REJECTED (correct)");
+
+    // Oracle authority pushes price - should succeed
+    let result = env.try_push_oracle_price(&oracle_authority, 150_000_000, 200);
+    assert!(
+        result.is_ok(),
+        "Oracle authority should push price: {:?}",
+        result
+    );
+    println!("PushOraclePrice by authority: ACCEPTED (correct)");
+
+    println!("CRITICAL TEST PASSED: Admin oracle mechanism verified");
+}
+
 /// CRITICAL: SetOraclePriceCap admin-only
 #[test]
 fn test_critical_set_oracle_price_cap_authorization() {
@@ -599,7 +659,7 @@ fn test_critical_set_oracle_price_cap_authorization() {
 fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     let path = program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
@@ -799,7 +859,10 @@ fn test_hyperp_index_smoothing_rate_limited() {
     // Init Hyperp market (feed_id = [0;32], no external oracle)
     env.init_market_hyperp(initial_price);
 
+    // Set oracle authority so we can push prices
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set oracle authority");
 
     // Read default oracle_price_cap_e2bps (1% per slot = 10_000 e2bps)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
@@ -814,7 +877,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
     // EWMA: $100 * 0.5 + $101 * 0.5 = $100.5M
     // The mark moves enough that the index will follow.
     env.set_slot(1);
-    env.set_oracle_price_e6(200_000_000);
+    env.try_push_oracle_price(&admin, 200_000_000, 200).expect("push");
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     const INDEX_OFF: usize = 72 + 200; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
@@ -995,7 +1058,8 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
 
-    // High cap so mark can diverge from index
+    // Oracle authority + high cap so mark can diverge from index
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_set_oracle_price_cap(&admin, 100_000).unwrap(); // 10%/slot
 
     // Helper: send UpdateConfig with a specific funding_k_bps.
@@ -1030,8 +1094,8 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     admin_send_config(&mut env, 1000);
     println!("1. Funding config: k=1000, horizon=100");
 
-    // Set price and crank to initialize
-    env.set_oracle_price_e6(1_000_000);
+    // Push price and crank to initialize
+    env.try_push_oracle_price(&admin, 1_000_000, 100).unwrap();
     env.set_slot(5);
     env.crank();
 
@@ -1060,7 +1124,7 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     // The trade updated mark to exec_price (which may differ from index).
     // Push mark above current index to widen the premium, then let it persist.
     env.set_slot(11);
-    env.set_oracle_price_e6(2_000_000);
+    env.try_push_oracle_price(&admin, 2_000_000, 111).unwrap();
     // Do NOT crank -- we want mark != index so the stored rate is non-zero.
     // The push already recomputes and stores the funding rate.
 
@@ -1110,7 +1174,7 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
 
     // Post-UpdateConfig crank should use new rate (k=2000)
     env.set_slot(11 + idle_dt + 10);
-    env.set_oracle_price_e6(2_000_000);
+    env.try_push_oracle_price(&admin, 2_000_000, 190).unwrap();
     env.crank();
     let config_post = {
         let d = env.svm.get_account(&env.slab).unwrap().data;
@@ -1121,5 +1185,66 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
 
     println!();
     println!("FUNDING ANTI-RETROACTIVITY UpdateConfig: PASSED");
+}
+
+/// Regression: PushOraclePrice on a non-Hyperp market must reject a push
+/// whose timestamp is already stale relative to max_staleness_secs.
+/// Without this guard, a monotonic-but-ancient timestamp can pass the
+/// monotonicity + non-future checks, clear first_observed_stale_slot,
+/// yet be ignored by read_authority_price (age > max_staleness_secs) —
+/// yielding a freeze state where the stale-resolve window never matures
+/// even though the market cannot actually be priced.
+#[test]
+fn test_push_oracle_price_rejects_stale_timestamp() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Non-Hyperp market with non-zero cap so authority can be enabled.
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority_raw(&admin, &admin.pubkey())
+        .expect("authority setup with cap != 0 must succeed");
+
+    // Advance clock by a large amount so the push timestamp we construct
+    // below is monotonic (> 0) AND non-future (<= current unix_timestamp)
+    // AND stale (age > max_staleness_secs). encode_init_market_full_v2
+    // ships max_staleness_secs = 86_400, so we need age > 86_400 seconds.
+    let clock: Clock = env.svm.get_sysvar();
+    let now = clock.unix_timestamp;
+    let far_future = now + 200_000; // advance clock 200k seconds forward
+    env.svm.set_sysvar(&Clock {
+        unix_timestamp: far_future,
+        ..clock
+    });
+
+    // Build a push with a timestamp that is:
+    //   - Positive and monotonic (> authority_timestamp == 0)
+    //   - Non-future (equals `now` from before the clock warp,
+    //     so <= `far_future`)
+    //   - Stale (age = 200_000 > max_staleness_secs = 86_400)
+    let stale_ts = now;
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+        ],
+        data: encode_push_oracle_price(150_000_000, stale_ts),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "PushOraclePrice must reject a timestamp older than \
+         max_staleness_secs — otherwise a stale push would clear \
+         first_observed_stale_slot while read_authority_price still \
+         ignores the stored price, creating a liveness freeze"
+    );
 }
 

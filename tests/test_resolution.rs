@@ -2097,6 +2097,27 @@ fn test_resolve_permissionless_stamp_cleared_by_live_observation() {
     // the old stamp (from slot 200) plus the 50_000-slot delay would allow
     // resolve immediately at slot 50_250 despite the oracle having been
     // healthy for most of that window.
+    // Read the stamp AFTER live recovery to verify it was cleared.
+    // Without this, a stale (un-cleared) stamp from step 1 would still
+    // be in place — and `!is_market_resolved` would still pass if the
+    // duration check happened to not yet elapse, giving a false
+    // negative on the recovery-clearing property.
+    const FIRST_OBS_STALE_OFF: usize = 72 + 296;
+    let stamp_after_recovery = {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        u64::from_le_bytes(
+            slab.data[FIRST_OBS_STALE_OFF..FIRST_OBS_STALE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        stamp_after_recovery, 0,
+        "first_observed_stale_slot MUST be cleared after the live \
+         oracle observation in step 2 — this is the actual safety \
+         property being tested, not just the downstream effect",
+    );
+
     env.svm.set_sysvar(&Clock {
         slot: 50_250, // 50_050 slots past the step-1 stamp — would have triggered under old code
         unix_timestamp: 50_250,
@@ -2104,6 +2125,21 @@ fn test_resolve_permissionless_stamp_cleared_by_live_observation() {
     });
     env.try_resolve_permissionless_once()
         .expect("fresh stale observation after recovery");
+    // The fresh call stamps at 50_250 (not at the old 200). The
+    // duration since 50_250 is 0, well under the 50k delay.
+    let stamp_after_fresh = {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        u64::from_le_bytes(
+            slab.data[FIRST_OBS_STALE_OFF..FIRST_OBS_STALE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        stamp_after_fresh, 50_250,
+        "fresh stale observation must stamp the CURRENT slot (50_250), \
+         not carry over the ancient step-1 stamp of 200",
+    );
     assert!(
         !env.is_market_resolved(),
         "MUST NOT resolve — stamp from first hiccup was cleared by live \
@@ -2190,11 +2226,33 @@ fn test_resolve_permissionless_treats_conf_too_wide_as_stampable() {
     };
 
     wide_conf_at_slot(&mut env, 100_000);
+    let effective_slot_1 = 100_000u64 + 100; // set_slot adds +100
 
     // First observation: OracleConfTooWide must stamp first_observed_stale_slot.
     env.try_resolve_permissionless_once()
         .expect("OracleConfTooWide must be a stampable observation");
     assert!(!env.is_market_resolved(), "not yet resolved after stamp");
+
+    // Verify the stamp was actually set to the current slot on the
+    // first OracleConfTooWide observation. Without this check, the
+    // test could pass vacuously if the code path didn't stamp at all —
+    // the `!is_market_resolved` check is consistent with both
+    // "stamped but delay not elapsed" and "never stamped".
+    const FIRST_OBS_STALE_OFF: usize = 72 + 296;
+    let stamp_after_first = {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        u64::from_le_bytes(
+            slab.data[FIRST_OBS_STALE_OFF..FIRST_OBS_STALE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        stamp_after_first, effective_slot_1,
+        "first OracleConfTooWide observation must stamp \
+         first_observed_stale_slot at the current slot — asserting the \
+         stamping code path actually ran, not just its downstream effect",
+    );
 
     // Advance past the delay and retry — stamp stays set, duration check
     // passes, resolve succeeds even though the feed's failure mode is
@@ -2270,12 +2328,12 @@ fn test_catchup_accrue_commits_progress_past_in_line_cap() {
     env.crank();
 }
 
-/// Regression for Finding 5: ResolvePermissionless must check oracle
-/// authority freshness BEFORE stamping first_observed_stale_slot. Otherwise
-/// an attacker could observe external-oracle staleness once while the
-/// authority is fresh (stamping an old slot), then exploit a brief
-/// authority pause much later to resolve immediately — the stamp would
-/// carry over a long authority-healthy window.
+/// Unified-policy regression: when the EXTERNAL oracle is live at the
+/// time of the ResolvePermissionless call, the instruction clears any
+/// pending stale stamp and returns Ok without resolving — regardless
+/// of authority state. (This replaces the earlier "fresh authority
+/// prevents stamping" behavior, which was removed along with the
+/// authority-blocks-resolve carve-out.)
 #[test]
 fn test_resolve_permissionless_fresh_authority_does_not_stamp() {
     program_path();
@@ -2331,6 +2389,130 @@ fn test_resolve_permissionless_fresh_authority_does_not_stamp() {
         "first_observed_stale_slot MUST NOT be stamped while authority is \
          fresh — otherwise a later brief authority pause would short-circuit \
          the continuous-death window (Finding 5)",
+    );
+}
+
+/// Unified stale-oracle policy regression: a Pyth-Pull market with NO
+/// oracle authority configured can still be resolved permissionlessly
+/// once the Pyth feed goes stale past the configured delay. The prior
+/// policy rejected this path (Pyth-Pull needed an authority heartbeat
+/// to prove feed death); the unified policy says any stale oracle +
+/// no clear within delay = everyone exits at the last price. This test
+/// documents the simplified behavior: if the oracle you configured is
+/// stale, the market freezes and resolves. Full stop, no oracle-kind-
+/// specific carve-outs.
+#[test]
+fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Pyth-Pull market (TEST_FEED_ID resolves to the Pyth-owned fixture
+    // account created by TestEnv::new). min_cap=10_000 to satisfy other
+    // invariants; permissionless_resolve_stale_slots=50 so the test
+    // doesn't need to warp far.
+    env.init_market_with_cap(0, 10_000, 50);
+
+    // No SetOracleAuthority call — the market has oracle_authority==0.
+    // Under the old policy this would make ResolvePermissionless reject
+    // on Pyth-Pull; under the unified policy it's irrelevant. Read via
+    // the config helper so we don't depend on hard-coded field offsets.
+    {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let config = percolator_prog::state::read_config(&slab.data);
+        assert_eq!(
+            config.oracle_authority, [0u8; 32],
+            "precondition: market has no oracle authority configured",
+        );
+    }
+
+    // Kill the Pyth feed by advancing the clock far beyond the
+    // fixture's published_time (TestEnv's fixture uses clock slot 0;
+    // max_staleness_secs default is 86_400). Moving unix_timestamp by
+    // 200_000 seconds guarantees a stale observation.
+    env.svm.set_sysvar(&Clock {
+        slot: 500,
+        unix_timestamp: 200_000,
+        ..Clock::default()
+    });
+
+    // Unified policy: stale feed + no authority + delay elapsed →
+    // resolution succeeds.
+    env.try_resolve_permissionless().expect(
+        "Unified stale-oracle policy: a stale Pyth-Pull market with no \
+         oracle authority MUST resolve permissionlessly once the stale \
+         window has matured. Under the previous policy this rejected \
+         because Pyth-Pull required an authority heartbeat; the unified \
+         policy removes that carve-out.",
+    );
+    assert!(
+        env.is_market_resolved(),
+        "market must be resolved after stale window matures",
+    );
+}
+
+/// Carve-out removal regression: under the unified stale-oracle policy,
+/// a FRESH oracle authority MUST NOT block ResolvePermissionless when
+/// the configured external oracle is stale. The previous model treated
+/// fresh authority as "market is priceable" and short-circuited the
+/// resolve flow; in practice that pinned the effective price within one
+/// cap-width of a stale baseline (because authority is clamped against
+/// last_effective_price_e6, which only advances on external Ok). The
+/// new rule: defined oracle stale → market resolves, regardless of
+/// authority state. Authority is a short-outage fallback for individual
+/// price reads, not a lifeline that extends the oracle's useful life.
+#[test]
+fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Use a small delay so the test doesn't need to warp far.
+    env.init_market_with_cap(0, 10_000, 50);
+    env.crank();
+
+    // Configure a FRESH oracle authority. Under the old carve-out, this
+    // would short-circuit ResolvePermissionless and leave the market
+    // unresolvable even as the external feed went dark.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+
+    // Kill the external Pyth feed by warping the clock far past the
+    // fixture's published_time (default max_staleness_secs = 86_400).
+    // Stop short of invalidating the authority push by also advancing
+    // authority_timestamp along with the clock:
+    //  - Keep the authority FRESH via a second push at a later ts.
+    //  - Meanwhile, the Pyth fixture's publish_time stays put, so the
+    //    external read returns OracleStale.
+    env.svm.set_sysvar(&Clock {
+        slot: 200_000,
+        unix_timestamp: 200_000,
+        ..Clock::default()
+    });
+    // Second push at the new ts refreshes authority_timestamp.
+    env.try_push_oracle_price(&admin, 138_100_000, 199_999).unwrap();
+
+    // First call — stamps first_observed_stale_slot (regardless of
+    // authority freshness, since the carve-out is gone).
+    env.try_resolve_permissionless_once()
+        .expect("first call stamps observation, returns Ok");
+
+    // Advance past permissionless_resolve_stale_slots (50) and refresh
+    // authority again to keep it fresh across the window. The resolve
+    // must still proceed; authority does not extend oracle life.
+    env.svm.set_sysvar(&Clock {
+        slot: 200_100,
+        unix_timestamp: 200_100,
+        ..Clock::default()
+    });
+    env.try_push_oracle_price(&admin, 138_200_000, 200_099).unwrap();
+
+    env.try_resolve_permissionless_once()
+        .expect("second call after delay resolves the market");
+    assert!(
+        env.is_market_resolved(),
+        "fresh authority MUST NOT block permissionless resolve once \
+         the configured external oracle has been stale past the \
+         delay — the weaker-authority model treats authority as a \
+         short-outage fallback, not an independent oracle that can \
+         keep the market alive indefinitely",
     );
 }
 
