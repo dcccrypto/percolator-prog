@@ -585,9 +585,359 @@ exhausting the u64 space and bricking trading via
 exhausting takes ~234 billion years. Each nonce burn is a full tx
 with Solana-level fees. Economic impossibility, not a protocol flaw.
 
+### D43. Resolved-payout snapshot premature lock
+
+**Hypothesis**: `resolved_payout_h_num/h_den` snapshot locks based on
+`is_terminal_ready() == (neg_pnl_account_count == 0)`. If the
+counter is ever desynced from reality, the snapshot could lock
+prematurely, paying out winners at a favorable ratio that doesn't
+account for not-yet-reconciled losers.
+
+**Why discarded**: `neg_pnl_account_count` is maintained via
+`checked_add/checked_sub` at every PnL/capital transition point
+(set_pnl line 1466-1469, set_capital line 1527-1532). Any
+inconsistency surfaces as CorruptState immediately. There is no
+silent-drift path: the counter is only updated inside the state
+mutation functions that also control the sign transitions, so it
+reflects the actual count at all times.
+
+### D44. c_tot desync on close
+
+**Hypothesis**: CloseAccount removes user's capital from vault but
+could miss updating `c_tot`, leaving c_tot elevated post-close.
+Conservation `V >= C_tot + I` would then be violated (V decreased
+more than C_tot).
+
+**Why discarded**: All capital mutations route through `set_capital`
+(engine line 1588) which applies the signed delta to c_tot using
+checked arithmetic. CloseAccount's `set_capital(idx, 0)` decrements
+c_tot by exactly the account's prior capital. `assert_public_post
+conditions` then verifies conservation; a drift would surface as
+CorruptState.
+
+### D45. Haircut ratio with senior sum overflow
+
+**Hypothesis**: `c_tot + insurance_fund.balance` overflows u128,
+engine treats this as residual=0 (maximum haircut). Could this be
+exploited to force-haircut winners unfairly?
+
+**Why discarded**: c_tot ≤ MAX_VAULT_TVL (10^16), insurance ≤
+MAX_VAULT_TVL (10^16). Sum ≤ 2×10^16 ≪ u128::MAX (~3.4×10^38).
+Overflow is not reachable in practice. The conservative "treat as
+zero residual" on hypothetical overflow is a SAFE failure mode:
+winners get MORE haircut (smaller payout) which preserves
+conservation V ≥ C_tot + I. Cannot cause over-payout to winners.
+
+### D46. Zero-margin configuration
+
+**Hypothesis**: Admin sets initial_margin_bps = 0 at init. User
+opens huge positions with only min_nonzero_im_req capital,
+creating risk the protocol can't cover.
+
+**Why discarded**: Wrapper rejects `initial_margin_bps == 0` at
+init (src/percolator.rs:4190-4194). Both initial and maintenance
+must be nonzero. Admin cannot configure a zero-margin market.
+
+### D47. Insurance-floor drain via inflated losses
+
+**Hypothesis**: Attacker triggers loss cascades to drain insurance
+to the floor, leaving legitimate later losses to hit junior haircut
+early. Winners get haircut that wouldn't have fired without the
+attacker's actions.
+
+**Why discarded**: Losses require the ATTACKER's position to move
+against them. To cause large losses that drain insurance, attacker
+must themselves lose money. Net economic flow: attacker pays loss
+out of their capital → drains insurance → haircut on winners.
+Attacker doesn't benefit from the haircut (they're not the winner).
+Attacker cost > any gain; not rational.
+
+### D48. Junior haircut preservation (record_uninsured_protocol_loss)
+
+**Hypothesis**: After insurance is drained, the remaining uninsured
+loss gets "double-counted" — once via haircut on matured pos, once
+via vault reduction — unfairly penalizing winners.
+
+**Why discarded**: `record_uninsured_protocol_loss` (engine line
+2326) is explicitly a no-op per spec §4.17. Code comment documents
+the exact reason: double-draining would penalize winners twice. The
+current implementation is correct — losses are absorbed purely via
+the haircut mechanism after insurance is drained, without additional
+vault reduction.
+
+### D49. Cross-close reconcile ordering
+
+**Hypothesis**: In a resolved market with many winners and losers,
+the order in which users call CloseAccount matters. Closing losers
+first vs. winners first might produce different total payouts due
+to haircut snapshot timing.
+
+**Why discarded**: The haircut snapshot (`resolved_payout_h_num/
+h_den`) is LOCKED AT THE MOMENT `is_terminal_ready()` becomes true
+— which is exactly when `neg_pnl_account_count` reaches 0 (all
+losers reconciled). Winners calling Phase 2 before this point
+receive `ProgressOnly` (no payout, just persistence). After the
+snapshot locks, every winner's payout uses the SAME (h_num, h_den).
+Order-invariant by design.
+
+### D50. Epoch wrap in stale-reconcile check
+
+**Hypothesis**: `adl_epoch_snap` is u64; after 2^64 epochs, wrap
+could make `epoch_snap + 1 == epoch_side` spuriously match a
+non-stale account in a corrupted way.
+
+**Why discarded**: Epoch increments only on reset_pending → reset
+lifecycle, which happens at most a few times per market. Reaching
+2^64 epochs would take >10^10 years of continuous reset activity.
+Not a practical attack surface; the engine uses `checked_add(1)` at
+line 5155 which would fail with `None` on wrap, producing
+CorruptState rejection rather than a silent wrap-induced match.
+
+### D51. Mat_counter overflow
+
+**Hypothesis**: u64 mat_counter wraps after 2^64 materializations,
+allowing gen collision → stale lp_account_id matches new account.
+
+**Why discarded**: `next_mat_counter` uses checked_add (line 2165),
+returns None on overflow. Callers map None to EngineOverflow error
+rejection. 2^64 materializations is not practically reachable.
+
+### D52. Empty-market keeper crank
+
+**Hypothesis**: Keeper cranks on a market with num_used_accounts=0.
+Some state mutation or reward payment could happen on the empty
+state that shouldn't.
+
+**Why discarded**: Crank with no accounts: scan finds no bits set,
+no candidates processed, no fees swept (no accounts to sweep).
+`sweep_delta = 0` → reward gate at line 5327 (`sweep_delta > 0`)
+blocks reward payment. Crank returns cleanly; no state mutation
+beyond the accrue-to-clock-slot (which is the correct ongoing
+market-clock advancement, not a bug).
+
+### D53. Funding f_snap desync
+
+**Hypothesis**: When an account changes position, `f_snap` is
+updated to the current side's `f_{side}_num`. If this update is
+missed on some code path, subsequent funding PnL computation would
+use stale snapshot, producing wrong PnL.
+
+**Why discarded**: `set_position_basis_q` (engine line 1700-1717) is
+the single entry point for position changes; it atomically updates
+`adl_a_basis`, `adl_k_snap`, `f_snap`, `adl_epoch_snap` together.
+No mutation path sets position without going through this function.
+The engine's 243 Kani proofs include invariants verifying this
+snapshot synchronicity.
+
+### D54. ADL coefficient reset during epoch transition
+
+**Hypothesis**: When epoch resets (side becomes ResetPending →
+reopen), `f_{side}_num` and `adl_coeff_{side}` are zeroed. If this
+happens while an account still holds epoch_snap of the OLD epoch,
+reconcile can't reconstruct old PnL.
+
+**Why discarded**: The engine reconciles stale-epoch accounts
+(spec §5.4) by using `F_epoch_start_{side}` (the F value snapshotted
+at epoch start, NOT current F). Reconcile line 5166:
+`f_end_wide = I256::from_i128(self.get_f_epoch_start(side))`. So the
+reset doesn't lose the information needed for prior-epoch
+reconciliation.
+
+### D55. clamp_oracle_price saturating underflow
+
+**Hypothesis**: `clamp_oracle_price` computes `lower = last_price -
+max_delta`. If `max_delta > last_price`, the subtraction saturates
+to 0, allowing `raw_price = 0` to be accepted as a valid clamped
+price — but `OracleInvalid` check rejects price=0 elsewhere. Does
+any path accept a 0 price?
+
+**Why discarded**: Every oracle consumer (`read_pyth_price_e6`,
+`read_chainlink_price_e6`, `read_authority_price`) checks for
+price=0 and rejects with `OracleInvalid`. The clamp's saturating
+behavior is only applied AFTER validation ensures the raw input is
+nonzero; even if the clamped value were 0, the downstream
+`if mark == 0 → OracleInvalid` (e.g., line 2951 in
+`get_engine_oracle_price_e6`) rejects it.
+
+### D56. Fee sweep cursor infinite loop
+
+**Hypothesis**: If only word 0 of the bitmap has set bits (e.g., 64
+accounts in a 4096-slot market), the cursor could loop endlessly
+between word 0 and wrap-around.
+
+**Why discarded**: Outer loop (line 3603) is bounded by
+`words_scanned < BITMAP_WORDS`, terminating after exactly
+BITMAP_WORDS=64 iterations regardless of bit distribution. Each
+word is visited at most once per crank.
+
+### D57. Admin-controlled funding rate extraction
+
+**Threat model**: Compromised/malicious admin extracts user capital
+via adversarial funding rate + mark manipulation. Classic
+centralized-protocol rug vector.
+
+**Exploit path**:
+1. Attacker is admin AND oracle_authority on a live market with
+   open user positions.
+2. Attacker opens a large LP on the opposite side of users'
+   aggregate exposure (e.g., SHORT if users are net LONG).
+3. Attacker calls PushOraclePrice to push the mark significantly
+   away from the index, creating a large premium.
+4. Attacker calls UpdateConfig to raise `funding_max_bps_per_slot`
+   to the engine-enforced max of 10 bps/slot (21,600% per day at
+   max rate).
+5. Funding accrues against users' positions; their capital shrinks
+   each slot, transferring to attacker's LP.
+6. Users who don't close positions fast enough lose up to 100%
+   of their capital over hours.
+7. Attacker closes LP, withdraws profit.
+
+**Why this is not a protocol vulnerability**:
+- User can ALWAYS CloseAccount to exit and reclaim remaining
+  capital. No permanent lock.
+- Conservation V ≥ C_tot + I is preserved — funding is a transfer
+  between users' accounts, not a mint/burn.
+- The cap `MAX_ABS_FUNDING_E9_PER_SLOT = 10^6` is protocol-enforced;
+  any higher would violate the engine's i128 envelope. This is the
+  MAXIMUM admin can set.
+- The protocol explicitly supports "burn admin after init" as a
+  user-protection feature. Markets with burned admin cannot have
+  their funding params adversarially updated.
+- Spec §5 documents funding as admin-configurable within the
+  envelope. Users must trust admin (or use burned-admin markets).
+
+**Why this is classified as "operational risk, not protocol bug"**:
+The protocol's trust model explicitly includes admin configuration.
+Users entering a market with a live admin accept that admin can
+update params. The protocol provides THREE mitigations:
+1. Admin can be burned (rug-proof markets)
+2. Per-market cap (operators can lower the effective cap below
+   engine max when they deploy)
+3. User's close-position escape hatch
+
+**Lazarus-style attacker would look at**: the engine's envelope max
+(10 bps/slot) as the WORST CASE and ask "does any honest market
+deployment need higher than 1 bps/slot? If not, the envelope
+max should match real-world funding caps to limit admin abuse
+surface." This is an operational recommendation, not a ship-blocker:
+deployers choose their own per-market caps.
+
+**Attack surface for a sophisticated attacker**:
+- Compromise admin's private key (social engineering, key theft)
+- Then follow the exploit path above
+- Mitigation: burn admin, or use multisig/timelock for admin
+
+## Sophisticated-attacker analysis (Lazarus-style)
+
+Thinking like a professional DeFi hacker, the high-value attacks
+typically target one of these surfaces:
+
+1. **Admin-key compromise + config abuse** — D57 analyzed this. The
+   protocol's design bounds admin abuse to funding-rate manipulation
+   within the envelope max. Users can always close; protocol
+   conservation preserved. Operational risk, not a protocol flaw.
+
+2. **Oracle manipulation** — circuit-breaker caps per-push movement
+   (cap_e2bps). Admin/oracle_authority can drive moves within cap.
+   User's close-escape limits per-block exposure. Hard-timeout
+   `permissionless_stale_matured` forces resolution after sustained
+   staleness. Bounded attack surface.
+
+3. **Cross-protocol composition (matcher CPI tail)** — D1/D11/D14
+   covered. The matcher is LP-delegated; anything the matcher does
+   is within the LP's trust model. Wrapper enforces account shape
+   + signer propagation + ABI validation. No privilege elevation
+   possible through the tail.
+
+4. **Reentrancy** — `FLAG_CPI_IN_PROGRESS` blocks reentry on the
+   same slab. Cross-slab reentry (D21) can't elevate privileges
+   beyond what attacker already has.
+
+5. **Token transfer / mint tricks** — verify_token_program checks
+   legacy `spl_token::ID` (rejects Token-2022 fee extensions).
+   `verify_vault_empty` at init rejects pre-loaded vaults.
+   `verify_token_account` checks mint + owner on every transfer.
+
+6. **State initialization / layout** — D56/D45/D55 covered.
+   `slab_guard` checks owner + length + reentrancy. Instruction
+   decoder uses checked reads. No uninitialized-data exploits.
+
+7. **Arithmetic precision** — D30/D45/D55 covered. Fee
+   computation uses ceil (protocol wins rounding). Wide
+   arithmetic (U256/I256) for haircut + K-diff paths. Envelope
+   invariant ensures products stay within i128::MAX.
+
+8. **Flash-loan-style attacks** — Solana doesn't have native flash
+   loans. Multi-ix tx is atomic (D17). No repeated-borrow
+   primitives. The circuit breaker bounds same-slot price
+   manipulation.
+
+9. **MEV / sandwich** — limit_price_e6 on TradeCpi bounds slippage.
+   User can refuse to execute outside their limit. Standard perp
+   protection.
+
+10. **Governance / upgrade attacks** — percolator has NO governance
+    mechanism. The program owner controls upgrades; that's a
+    Solana-level trust assumption.
+
+**Conclusion**: Every standard DeFi attack pattern I considered
+either (a) doesn't apply to this architecture, (b) is blocked by
+existing defenses, or (c) requires admin-key compromise (which the
+burn-admin feature mitigates). No ship-blocking protocol-level
+vulnerability identified.
+
+### D58. Dust-window griefing via rapid reclaim
+
+**Threat**: User deposits exactly min_initial_deposit. Attacker
+waits a few slots for maintenance fees to accumulate, then calls
+ReclaimEmptyAccount. Sync drains fees; capital drops below min;
+reclaim eligibility passes; user's dust goes to insurance.
+
+**Why classified as known behavior (D12 variant)**:
+- This is spec §2.6 dormant-account cleanup — the user deposited
+  the MINIMUM, so any fee accrual pushes them to reclaimable dust.
+- User's mitigation: deposit more than min_initial_deposit so
+  fee-window eats less than the buffer.
+- Maintenance fee is admin-configurable. Markets with fee=0 are
+  immune (no dust drain).
+- My sync-before-reclaim fix made this attack faster, but the end
+  state (user loses dust to insurance) is unchanged from the pre-
+  fix behavior once crank eventually syncs their fees.
+- Discussed in D12. Same analysis applies.
+
+### D59. All-losers-never-close post-resolve trap
+
+**Threat**: Post-resolve, winners can only Phase-2-close after ALL
+losers have Phase-1-reconciled (terminal_ready). If some losers
+never get force-closed, winners' funds are locked forever.
+
+**Why discarded**:
+- ForceCloseResolved is PERMISSIONLESS past force_close_delay_slots.
+  Any keeper can close any account.
+- MAX_FORCE_CLOSE_DELAY_SLOTS = 10_000_000 (≈46 days at 0.4s/slot)
+  caps the admin's choice.
+- Phase 1 reconcile (which decrements neg_pnl_account_count) works
+  on any account regardless of capital state — it only zeros the
+  position and settles losses.
+- Worst case: winners wait up to MAX_FORCE_CLOSE_DELAY_SLOTS (46
+  days) before they can force-close losers. Not permanent.
+
+### D60. PDA collision to all-zero pubkey
+
+**Threat**: A PDA derivation accidentally produces all-zero pubkey.
+`admin_ok` rejects zero admin, but other checks might treat zero
+as "unset" differently.
+
+**Why discarded**: find_program_address uses sha256-based hashing
+with off-curve requirement. The probability of hitting all-zero
+(2^-256) is astronomically low. Additionally, `admin_ok` (line
+339-341) and owner checks consistently treat zero as "unset/burned",
+not as a valid active signer. Even if collision occurred, no path
+grants privileges to it.
+
 ## Audit completion status
 
-**16 concrete attack hypotheses probed across two rounds.** Every
+**54 concrete attack hypotheses probed across three rounds.** Every
 candidate discarded under inspection. No ship-blocking findings.
 
 ### Coverage
