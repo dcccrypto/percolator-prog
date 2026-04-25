@@ -32,7 +32,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 19640; // MAX_ACCOUNTS=64 - native 128-bit fields
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1484632; // MAX_ACCOUNTS=4096, Account=352 bytes (SBF target) + gen table
+const SLAB_LEN: usize = 1525584; // MAX_ACCOUNTS=4096, Account=352 bytes (SBF target) + gen table
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -345,7 +345,9 @@ impl TestEnv {
             )
             .unwrap();
 
-        // InitMarket now expects 9 accounts (removed pyth_index and pyth_col)
+        // InitMarket expects 9 accounts. Slot 7 is the oracle account —
+        // InitMarket now requires a successful oracle read at init (no sentinel).
+        let _ = dummy_ata;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -356,7 +358,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_params(
@@ -686,28 +688,15 @@ fn encode_update_config(
     funding_k_bps: u64,
     funding_max_premium_bps: i64,
     funding_max_bps_per_slot: i64,
-    thresh_floor: u128,
-    thresh_risk_bps: u64,
-    thresh_update_interval_slots: u64,
-    thresh_step_bps: u64,
-    thresh_alpha_bps: u64,
-    thresh_min: u128,
-    thresh_max: u128,
-    thresh_min_step: u128,
 ) -> Vec<u8> {
+    // UpdateConfig wire format in v12.18.1: tag (1) + 4 u64/i64 funding params.
+    // Earlier revisions had trailing threshold fields; the decoder now rejects
+    // them explicitly so the benchmark must not append them either.
     let mut data = vec![14u8];
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
-    data.extend_from_slice(&thresh_floor.to_le_bytes());
-    data.extend_from_slice(&thresh_risk_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_update_interval_slots.to_le_bytes());
-    data.extend_from_slice(&thresh_step_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_alpha_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_min.to_le_bytes());
-    data.extend_from_slice(&thresh_max.to_le_bytes());
-    data.extend_from_slice(&thresh_min_step.to_le_bytes());
     data
 }
 
@@ -1849,20 +1838,15 @@ fn benchmark_all_instructions() {
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // Oracle is REQUIRED on non-Hyperp UpdateConfig — admin cannot
+                // select the degenerate zero-funding arm by omission.
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_update_config(
                 3600,   // funding_horizon_slots
                 100,    // funding_k_bps
                 500,    // funding_max_premium_bps
                 5,      // funding_max_bps_per_slot
-                0,      // thresh_floor
-                100,    // thresh_risk_bps
-                100,    // thresh_update_interval_slots
-                100,    // thresh_step_bps
-                5000,   // thresh_alpha_bps
-                0,      // thresh_min
-                1_000_000_000_000_000, // thresh_max (must be <= max_insurance_floor)
-                1,      // thresh_min_step
             ),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();

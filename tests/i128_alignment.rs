@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1484632;
+const SLAB_LEN: usize = 1525584;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -264,6 +264,7 @@ fn test_account_struct_alignment() {
         pending_remaining_q: 0,
         pending_horizon: 0,
         pending_created_slot: 0,
+        last_fee_slot: 0,
     };
 
     // Verify all fields round-trip correctly
@@ -577,13 +578,19 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market(&payer.pubkey(), &mint, &TEST_FEED_ID),
     };
+    // InitMarket now reads the oracle at genesis (§2.7, no sentinel), which
+    // pushes it past the default 200K CU budget. Request 1.4M like the rest
+    // of the test suite.
+    let cu_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+        1_400_000,
+    );
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[cu_ix, ix],
         Some(&payer.pubkey()),
         &[&payer],
         svm.latest_blockhash(),

@@ -1633,7 +1633,11 @@ fn test_attack_four_users_one_lp_conservation() {
 
 /// ATTACK: InitUser with new_account_fee.
 /// Verify fee goes to insurance fund and conservation holds.
+///
+/// Obsolete under engine v12.18.1: new_account_fee is gone; deposits
+/// credit entirely to capital (spec §10.2).
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_attack_init_user_fee_conservation() {
     program_path();
 

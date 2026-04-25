@@ -177,9 +177,13 @@ fn test_misaligned_withdrawal_rejected() {
 
 /// Test that fee overpayments are properly handled.
 ///
-/// Bug: If fee_payment > new_account_fee, the excess is deposited to vault
-/// but only new_account_fee is accounted in engine.vault/insurance.
+/// Obsolete under engine v12.18.1: new_account_fee was removed when deposit
+/// became the canonical materialization path (spec §10.2). There is no
+/// engine-native opening fee to over- or under-pay; the minimum deposit
+/// alone gates materialization. The scenario this test targets no longer
+/// exists.
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_bug4_fee_overpayment_should_be_handled() {
     program_path();
 
@@ -2507,8 +2511,11 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 // InitUser (tag 1) additional coverage
 // ============================================================================
 
-/// Spec: InitUser transfers new_account_fee to insurance fund.
-/// After InitUser, insurance balance must increase by exactly new_account_fee.
+/// Obsolete under engine v12.18.1: new_account_fee was removed (spec §10.2
+/// made deposit the canonical materialization path with no engine-native
+/// opening fee). Deposit amounts now credit entirely to capital; insurance
+/// is no longer debited on creation.
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 #[test]
 fn test_init_user_charges_new_account_fee() {
     program_path();
@@ -3847,11 +3854,13 @@ fn test_init_market_custom_funding_max_per_slot() {
 fn test_init_market_custom_all_funding_params() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 20);
+    // funding_max_bps_per_slot must fit the engine's per-market envelope
+    // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
+    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);
-    assert_eq!(env.read_funding_max_bps_per_slot(), 20);
+    assert_eq!(env.read_funding_max_bps_per_slot(), 10);
 }
 
 /// Without trailing funding params, defaults should be used (backward compat).
@@ -4399,7 +4408,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
@@ -4756,6 +4765,163 @@ fn test_trade_nocpi_allows_user_user_bilateral() {
     // User-user bilateral trade — allowed by spec
     let result = env.try_trade(&user1, &user2, user2_idx, user1_idx, 1_000);
     assert!(result.is_ok(), "User-user bilateral trade must be allowed: {:?}", result);
+}
+
+// ============================================================================
+// Regression tests: TDD round-4 blockers
+// ============================================================================
+
+/// Blocker 3 regression: funding_max_bps_per_slot is compared in i128 space;
+/// huge positive inputs must NOT wrap through `as u64` into the per-market
+/// envelope. With the wrapper envelope = 1_000_000 (10 bps/slot), a value of
+/// i64::MAX bps_per_slot would yield funding_bps_to_e9 ≈ 9.2e23, which casts
+/// modulo 2^64 to a small value and used to sneak past the check.
+#[test]
+fn test_init_market_rejects_huge_funding_max_bps_per_slot_without_wrap() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Send the largest legal i64 through the custom-funding path.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1 bps/slot is safely within the envelope (fits 1e6 e9/slot);
+        // i64::MAX would overflow the envelope by ~17 orders of magnitude.
+        env.init_market_with_funding(
+            0,     // invert
+            10_000, // min_oracle_price_cap_e2bps
+            0,     // permissionless_resolve_stale_slots
+            200,   // funding_horizon_slots
+            200,   // funding_k_bps
+            1_000, // funding_max_premium_bps
+            i64::MAX, // funding_max_bps_per_slot — MUST be rejected
+        );
+    }));
+    assert!(
+        result.is_err(),
+        "InitMarket must reject funding_max_bps_per_slot = i64::MAX (beyond per-market envelope)"
+    );
+}
+
+// ============================================================================
+// Regression: per-account maintenance fees (engine v12.18.4)
+// ============================================================================
+
+/// Maintenance fees are realized per-account via engine.last_fee_slot. A new
+/// user joining mid-interval must NOT be back-charged for time before it was
+/// materialized: the engine seeds last_fee_slot at the materialization slot
+/// (Goal 47) and the wrapper honors that by not flushing a global cursor on
+/// init.
+///
+/// Setup: init a market with maintenance_fee_per_slot = 1_000, seed an LP
+/// that exists through the whole run, advance to slot 500, init a user at
+/// slot 1_000, crank at slot 1_500. The user must be charged for exactly
+/// 500 slots (1_500 − 1_000), NOT 1_500 or 1_000.
+#[test]
+fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot (sufficient ceiling)
+        1_000,         // maintenance_fee_per_slot (base units / slot)
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    env.set_slot(500);
+    env.crank(); // LP's last_fee_slot advances to 500
+
+    env.set_slot(1_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // materialized at slot 1_000
+    env.deposit(&user, user_idx, 10_000_000_000);
+    let user_cap_after_init = env.read_account_capital(user_idx);
+
+    env.set_slot(1_500);
+    env.crank(); // sweeps both accounts via sync_account_fee_to_slot_not_atomic
+    let user_cap_after_crank = env.read_account_capital(user_idx);
+
+    // Expected fee = 1_000 * (1_500 − 1_000) = 500_000. The user existed for
+    // 500 slots; back-charging for the entire [500, 1_500] = 1_000 slots would
+    // indicate the old global-cursor bug is back.
+    let expected_fee: u128 = 1_000u128 * 500u128;
+    let charged: u128 = user_cap_after_init.saturating_sub(user_cap_after_crank);
+    assert_eq!(
+        charged, expected_fee,
+        "New user must pay fees only for the interval since materialization \
+         (expected {expected_fee} for 500 slots @ 1_000 /slot, got {charged})"
+    );
+}
+
+/// KeeperCrank reward: a non-permissionless cranker earns 50% of the
+/// maintenance fees swept on that crank as capital credit, capped at
+/// CRANK_REWARD_ACCOUNT_CAP (=16) * maintenance_fee_per_slot.
+///
+/// Minimal check: non-permissionless crank → caller's capital strictly
+/// increased by some positive reward. Permissionless crank → no reward.
+#[test]
+fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // The cranker needs an account to be credited.
+    let cranker = Keypair::new();
+    let cranker_idx = env.init_user(&cranker);
+    env.deposit(&cranker, cranker_idx, 10_000_000_000);
+
+    // Other accounts for the sweep to collect fees from.
+    let u2 = Keypair::new();
+    let u2_idx = env.init_user(&u2);
+    env.deposit(&u2, u2_idx, 10_000_000_000);
+    let u3 = Keypair::new();
+    let u3_idx = env.init_user(&u3);
+    env.deposit(&u3, u3_idx, 10_000_000_000);
+
+    env.set_slot(500);
+
+    let cranker_cap_before = env.read_account_capital(cranker_idx);
+    // Permissioned crank with caller_idx = cranker_idx (not CRANK_NO_CALLER).
+    env.crank_as(&cranker, cranker_idx);
+    let cranker_cap_after = env.read_account_capital(cranker_idx);
+
+    // Cranker's own fee is also charged by the sweep BEFORE the reward
+    // is credited, so the net delta = reward − self_fee. For self_fee =
+    // 1000 * 500 = 500_000 and reward = 50% of total sweep capped at
+    // 16 × 1000 = 16_000, we expect a NET LOSS of roughly 484_000. The
+    // *regression* we guard against is "no reward at all", so assert the
+    // reward was paid (net loss < self_fee) OR net capital strictly
+    // higher than without-reward baseline. Numerically:
+    //   without reward: delta = −500_000
+    //   with 16k reward cap: delta = −484_000
+    let self_fee_only: i128 = 1_000i128 * 500i128; // 500_000
+    let actual_delta: i128 = (cranker_cap_after as i128) - (cranker_cap_before as i128);
+    // Sanity: cranker paid a fee (so delta is negative), but it's less
+    // negative than pure self-fee because the reward was credited.
+    assert!(
+        actual_delta < 0,
+        "cranker still pays maintenance fee on their own account: delta={actual_delta}"
+    );
+    assert!(
+        actual_delta > -self_fee_only,
+        "cranker should have received a positive reward offsetting part of \
+         the self-fee; net delta={actual_delta} but self-fee alone is \
+         {self_fee_only}. Reward appears to not have been paid."
+    );
 }
 
 

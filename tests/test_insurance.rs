@@ -1315,7 +1315,10 @@ fn test_attack_multiple_liquidations_insurance_drain() {
 
 /// ATTACK: Insurance grows correctly from new account fees.
 /// InitUser/InitLP pays a new_account_fee that goes to insurance.
+///
+/// Obsolete under engine v12.18.1: new_account_fee is gone (spec §10.2).
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_attack_new_account_fee_goes_to_insurance() {
     program_path();
 
@@ -2070,7 +2073,7 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,

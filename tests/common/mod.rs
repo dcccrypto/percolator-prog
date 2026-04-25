@@ -19,7 +19,7 @@ pub use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-pub const SLAB_LEN: usize = 1484632; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
+pub const SLAB_LEN: usize = 1525584; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
 pub const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -438,7 +438,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     _max_maintenance_fee_per_slot: u128,
-    _maintenance_fee_per_slot: u128,
+    maintenance_fee_per_slot: u128,
     min_oracle_price_cap_e2bps: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
@@ -450,7 +450,9 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
+    // maintenance_fee_per_slot now passed through (engine v12.18.4 supports
+    // per-account fee accrual via sync_account_fee_to_slot_not_atomic).
+    data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
@@ -689,7 +691,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_conf_bps(
@@ -738,7 +740,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_invert(
@@ -790,7 +792,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_cap(
@@ -850,7 +852,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_funding(
@@ -911,7 +913,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_trading_fee(
@@ -968,7 +970,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_min_fee(
@@ -1021,7 +1023,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_hyperp(&admin.pubkey(), &self.mint, initial_mark_price_e6),
@@ -1246,6 +1248,33 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("crank failed");
+    }
+
+    /// Permissioned crank: caller is a real account on the market (`caller_idx`
+    /// must be their slot). Required for the crank-reward path, which pays
+    /// the reward only when `caller_idx != CRANK_NO_CALLER`.
+    pub fn crank_as(&mut self, caller: &Keypair, caller_idx: u16) {
+        let mut data = vec![5u8]; // Tag 5: KeeperCrank
+        data.extend_from_slice(&caller_idx.to_le_bytes());
+        data.push(1u8); // format_version = 1
+        // No candidates — sweep visits every used account via the bitmap.
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data,
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("crank_as failed");
     }
 
     pub fn try_crank(&mut self) -> Result<(), String> {
@@ -1631,7 +1660,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_full(
@@ -1680,7 +1709,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_warmup(
@@ -1739,7 +1768,7 @@ impl TestEnv {
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 472, num_used_accounts at engine offset 1224
-        pub const NUM_USED_OFFSET: usize = 472 + 1240;
+        pub const NUM_USED_OFFSET: usize = 472 + 1232;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -1816,7 +1845,7 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 440, offset of RiskEngine.used = 576 (after insurance_floor)
         // Bitmap is [u64; 64] at offset 520 + 608 = 1016
-        pub const BITMAP_OFFSET: usize = 472 + 728;
+        pub const BITMAP_OFFSET: usize = 472 + 720;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -1836,8 +1865,8 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 472, accounts array at offset 9376 within RiskEngine
         // Account size = 280 bytes, capital at offset 8 within Account (after account_id u64)
-        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        pub const ACCOUNT_SIZE: usize = 352;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        pub const ACCOUNT_SIZE: usize = 360;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0; // After account_id (u64)
         let account_offset =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -1859,15 +1888,15 @@ impl TestEnv {
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
         pub const ENGINE: usize = 472;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 9440;
-        pub const ACCOUNT_SIZE: usize = 352;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + 17624;
+        pub const ACCOUNT_SIZE: usize = 360;
         pub const PBQ: usize = 56;       // position_basis_q: i128 (16 bytes)
         pub const A_BASIS: usize = 72;   // adl_a_basis: u128 (16 bytes)
         pub const EPOCH_SNAP: usize = 120; // adl_epoch_snap: u64 (8 bytes)
-        pub const ADL_MULT_LONG: usize = ENGINE + 408;
-        pub const ADL_MULT_SHORT: usize = ENGINE + 424;
-        pub const ADL_EPOCH_LONG: usize = ENGINE + 480;
-        pub const ADL_EPOCH_SHORT: usize = ENGINE + 480;
+        pub const ADL_MULT_LONG: usize = ENGINE + 400;
+        pub const ADL_MULT_SHORT: usize = ENGINE + 416;
+        pub const ADL_EPOCH_LONG: usize = ENGINE + 472;
+        pub const ADL_EPOCH_SHORT: usize = ENGINE + 472;
 
         let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
         if d.len() < acc_off + ACCOUNT_SIZE { return 0; }
@@ -2502,28 +2531,24 @@ pub fn encode_update_config(
     funding_k_bps: u64,
     funding_max_premium_bps: i64,        // i64!
     funding_max_bps_per_slot: i64,       // i64!
-    thresh_floor: u128,
-    thresh_risk_bps: u64,
-    thresh_update_interval_slots: u64,
-    thresh_step_bps: u64,
-    thresh_alpha_bps: u64,
-    thresh_min: u128,
-    thresh_max: u128,
-    thresh_min_step: u128,
+    // Legacy trailing threshold fields kept in the signature so test call
+    // sites compile unchanged. The wrapper's UpdateConfig ABI no longer
+    // accepts them — the decoder rejects trailing bytes — so we swallow
+    // them here instead of writing them.
+    _thresh_floor: u128,
+    _thresh_risk_bps: u64,
+    _thresh_update_interval_slots: u64,
+    _thresh_step_bps: u64,
+    _thresh_alpha_bps: u64,
+    _thresh_min: u128,
+    _thresh_max: u128,
+    _thresh_min_step: u128,
 ) -> Vec<u8> {
     let mut data = vec![14u8]; // Tag 14: UpdateConfig
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes()); // i64
     data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes()); // i64
-    data.extend_from_slice(&thresh_floor.to_le_bytes());
-    data.extend_from_slice(&thresh_risk_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_update_interval_slots.to_le_bytes());
-    data.extend_from_slice(&thresh_step_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_alpha_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_min.to_le_bytes());
-    data.extend_from_slice(&thresh_max.to_le_bytes());
-    data.extend_from_slice(&thresh_min_step.to_le_bytes());
     data
 }
 
@@ -2939,6 +2964,10 @@ impl TestEnv {
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // Non-Hyperp UpdateConfig REQUIRES the oracle account. Admin
+                // can no longer select the degenerate zero-funding arm by
+                // omission; only a confirmed-stale oracle triggers it.
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 3600,                      // funding_horizon_slots
@@ -3212,7 +3241,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_invert(&admin.pubkey(), &self.mint, &TEST_FEED_ID, 0),
@@ -3578,7 +3607,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_hyperp(&admin.pubkey(), &self.mint, initial_mark_price_e6),
@@ -3799,15 +3828,15 @@ impl TradeCpiTestEnv {
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
         pub const ENGINE: usize = 472;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 9440;
-        pub const ACCOUNT_SIZE: usize = 352;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + 17624;
+        pub const ACCOUNT_SIZE: usize = 360;
         pub const PBQ: usize = 56;
         pub const A_BASIS: usize = 72;
         pub const EPOCH_SNAP: usize = 120;
-        pub const ADL_MULT_LONG: usize = ENGINE + 408;
-        pub const ADL_MULT_SHORT: usize = ENGINE + 424;
-        pub const ADL_EPOCH_LONG: usize = ENGINE + 480;
-        pub const ADL_EPOCH_SHORT: usize = ENGINE + 480;
+        pub const ADL_MULT_LONG: usize = ENGINE + 400;
+        pub const ADL_MULT_SHORT: usize = ENGINE + 416;
+        pub const ADL_EPOCH_LONG: usize = ENGINE + 472;
+        pub const ADL_EPOCH_SHORT: usize = ENGINE + 472;
 
         let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
         if d.len() < acc_off + ACCOUNT_SIZE { return 0; }
@@ -3870,7 +3899,7 @@ impl TradeCpiTestEnv {
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // ENGINE_OFF (472) + num_used_accounts offset (1240) = 1712 (v12.18.1)
-        u16::from_le_bytes(slab_data[1712..1714].try_into().unwrap())
+        u16::from_le_bytes(slab_data[1704..1706].try_into().unwrap())
     }
 
     /// Read pnl_pos_tot aggregate from slab
@@ -3878,7 +3907,7 @@ impl TradeCpiTestEnv {
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // ENGINE_OFF = 472, pnl_pos_tot at engine offset 368 (after c_tot at 352)
-        pub const PNL_POS_TOT_OFFSET: usize = 472 + 368;
+        pub const PNL_POS_TOT_OFFSET: usize = 472 + 360;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -3890,7 +3919,7 @@ impl TradeCpiTestEnv {
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // c_tot is at offset 264 within RiskEngine (16 bytes before pnl_pos_tot)
-        pub const C_TOT_OFFSET: usize = 472 + 352;
+        pub const C_TOT_OFFSET: usize = 472 + 344;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -3920,8 +3949,8 @@ impl TradeCpiTestEnv {
         //   pnl: i128 (16), offset 24
         //   reserved_pnl: u128 (16), offset 40
         //   position_basis_q: i128 (16), offset 56
-        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        pub const ACCOUNT_SIZE: usize = 352;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        pub const ACCOUNT_SIZE: usize = 360;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -4075,7 +4104,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_full_v2(
@@ -4101,8 +4130,8 @@ impl TradeCpiTestEnv {
 
     pub fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        pub const ACCOUNT_SIZE: usize = 352;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        pub const ACCOUNT_SIZE: usize = 360;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0;
         let account_off =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -4365,7 +4394,7 @@ impl TestEnv {
     /// Read c_tot aggregate from slab
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const C_TOT_OFFSET: usize = 472 + 352;
+        pub const C_TOT_OFFSET: usize = 472 + 344;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -4387,7 +4416,7 @@ impl TestEnv {
     /// Read pnl_pos_tot aggregate from slab
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const PNL_POS_TOT_OFFSET: usize = 472 + 368;
+        pub const PNL_POS_TOT_OFFSET: usize = 472 + 360;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -4398,8 +4427,8 @@ impl TestEnv {
     /// Read account PnL for a slot
     pub fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        pub const ACCOUNT_SIZE: usize = 352;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        pub const ACCOUNT_SIZE: usize = 360;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24; // BPF: i128 has 8-byte alignment
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -4827,7 +4856,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
@@ -4908,7 +4937,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
@@ -5098,8 +5127,8 @@ impl TestEnv {
     /// Fee credits is at offset 240 within Account.
     pub fn read_account_fee_credits(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const FEE_CREDITS_OFFSET: usize = 224;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
         if slab_data.len() < off + 16 {
@@ -5112,8 +5141,8 @@ impl TestEnv {
     /// fees_earned_total is at offset 264 within Account.
     pub fn read_account_fees_earned_total(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const FEES_EARNED_OFFSET: usize = 264;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEES_EARNED_OFFSET;
         if slab_data.len() < off + 16 {
@@ -5126,8 +5155,8 @@ impl TestEnv {
     /// warmup_started_at_slot is at offset 64 within Account.
     pub fn read_account_warmup_started_at_slot(&self, idx: u16) -> u64 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const WARMUP_SLOT_OFFSET: usize = 64;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + WARMUP_SLOT_OFFSET;
         if slab_data.len() < off + 8 {
@@ -5140,8 +5169,8 @@ impl TestEnv {
     /// reserved_pnl is at offset 48 within Account.
     pub fn read_account_reserved_pnl(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const RESERVED_PNL_OFFSET: usize = 40; // BPF: u128 has 8-byte alignment
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + RESERVED_PNL_OFFSET;
         if slab_data.len() < off + 16 {
@@ -5156,8 +5185,8 @@ impl TestEnv {
     ///   kind: u8 at offset 16
     pub fn read_account_kind(&self, idx: u16) -> u8 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const KIND_OFFSET: usize = 16;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
         if slab_data.len() < off + 1 {
@@ -5170,8 +5199,8 @@ impl TestEnv {
     /// matcher_program is at offset 144 within Account (BPF layout).
     pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const MATCHER_PROG_OFFSET: usize = 128;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
         let mut buf = [0u8; 32];
@@ -5183,8 +5212,8 @@ impl TestEnv {
     /// matcher_context is at offset 176 within Account (BPF layout).
     pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 9440;
-        const ACCOUNT_SIZE: usize = 352;
+        const ACCOUNTS_OFFSET: usize = 472 + 17624;
+        const ACCOUNT_SIZE: usize = 360;
         const MATCHER_CTX_OFFSET: usize = 160;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
         let mut buf = [0u8; 32];
@@ -5477,6 +5506,10 @@ impl TestEnv {
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // Non-Hyperp UpdateConfig REQUIRES the oracle account. Admin
+                // can no longer select the degenerate zero-funding arm by
+                // omission; only a confirmed-stale oracle triggers it.
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 funding_horizon_slots,
@@ -7429,8 +7462,13 @@ pub fn encode_init_market_with_limits(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // Per-market admin limits
-    data.extend_from_slice(&max_maintenance_fee.to_le_bytes());
+    // Per-market admin limits.
+    // maintenance_fee_per_slot is gated to 0 at init — the feature is disabled
+    // pending per-account accrual. Ignore the `max_maintenance_fee` arg and
+    // always write 0 so these test helpers keep compiling without touching
+    // every call site.
+    let _ = max_maintenance_fee;
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (disabled)
     data.extend_from_slice(&max_risk_threshold.to_le_bytes());
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
@@ -7570,7 +7608,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_insurance_floor(
@@ -7596,9 +7634,10 @@ impl TestEnv {
     /// Read insurance_floor from RiskEngine (standalone field, not in RiskParams)
     pub fn read_insurance_floor(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // insurance_floor is now in params.insurance_floor (no separate engine field).
-        // params at engine offset 32, insurance_floor at params offset 168.
-        pub const INSURANCE_FLOOR_OFFSET: usize = 472 + 32 + 144;
+        // params.insurance_floor. Engine v12.18.1 removed new_account_fee (U128=16B),
+        // so fields after it shifted by -16. Within RiskParams:
+        //   6×u64 (48) + 3×U128 (48) + 2×u128 (32) = 128 for insurance_floor.
+        pub const INSURANCE_FLOOR_OFFSET: usize = 472 + 32 + 128;
         u128::from_le_bytes(
             slab_data[INSURANCE_FLOOR_OFFSET..INSURANCE_FLOOR_OFFSET + 16]
                 .try_into()
@@ -7649,7 +7688,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,

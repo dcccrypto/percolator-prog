@@ -575,7 +575,7 @@ fn test_init_market() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -604,7 +604,7 @@ fn test_init_user() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
@@ -658,7 +658,7 @@ fn test_deposit_withdraw() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
@@ -747,7 +747,7 @@ fn test_vault_validation() {
         f.token_prog.to_info(),
         f.clock.to_info(),
         f.rent.to_info(),
-        dummy_ata.to_info(),
+        f.pyth_index.to_info(),
         f.system.to_info(),
     ];
     let res = process_instruction(&f.program_id, &init_accounts, &init_data);
@@ -768,7 +768,7 @@ fn test_trade() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
@@ -1470,7 +1470,6 @@ fn test_set_risk_threshold() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
     {
-        let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let accs = vec![
             f.admin.to_info(),
             f.slab.to_info(),
@@ -1479,7 +1478,7 @@ fn test_set_risk_threshold() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &init_data).unwrap();
@@ -1511,7 +1510,6 @@ fn test_set_risk_threshold_non_admin_fails() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
     {
-        let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let accs = vec![
             f.admin.to_info(),
             f.slab.to_info(),
@@ -1520,7 +1518,7 @@ fn test_set_risk_threshold_non_admin_fails() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &init_data).unwrap();
@@ -1803,7 +1801,7 @@ fn test_permissionless_crank() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -1854,7 +1852,7 @@ fn test_permissionless_crank_gc() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -1985,7 +1983,7 @@ fn test_permissionless_funding_not_controllable() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -2145,7 +2143,7 @@ fn test_admin_rotate() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -2224,7 +2222,7 @@ fn test_non_admin_cannot_rotate() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -2266,7 +2264,7 @@ fn test_burn_admin_to_zero() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -2305,7 +2303,7 @@ fn test_after_burn_admin_ops_disabled() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -2425,7 +2423,7 @@ fn test_init_market_with_invert_and_unit_scale() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -2453,7 +2451,7 @@ fn test_unit_scale_validation_at_init() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         let res = process_instruction(&f.program_id, &accounts, &data);
@@ -2483,7 +2481,7 @@ fn test_withdraw_misalignment_rejected() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -2605,7 +2603,7 @@ fn test_vault_amount_matches_engine_vault_plus_dust() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -2729,7 +2727,7 @@ fn test_engine_vault_equals_insurance_plus_capital_when_no_fees() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -2860,7 +2858,7 @@ fn test_withdraw_preserves_vault_accounting_invariant() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -3002,7 +3000,7 @@ fn test_dust_sweep_preserves_real_to_accounted_equality() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -3126,7 +3124,7 @@ fn test_invariants_with_unit_scale_zero() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
@@ -3222,7 +3220,7 @@ fn test_close_slab() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
@@ -3299,7 +3297,7 @@ fn test_close_slab_non_admin_rejected() {
             f.token_prog.to_info(),
             f.clock.to_info(),
             f.rent.to_info(),
-            dummy_ata.to_info(),
+            f.pyth_index.to_info(),
             f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
