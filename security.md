@@ -1337,3 +1337,124 @@ Tests: 674 pass across `default`, `small`, `medium` tiers.
 Kani: 83/83 pass. Proof harnesses cover the pure restart-detected
 comparison and all pre-existing authorization/matcher/oracle
 surfaces.
+
+## Session 2026-04-22 — oracle observation monotonicity
+
+### Threat model
+
+`clamp_external_price` previously had no ordering guarantee on Pyth /
+Chainlink readings. Once the authority-fallback path was removed
+(commit `86ea41f`), the wrapper's only price source for non-Hyperp
+markets is the caller-supplied Pyth/Chainlink account. Pyth Pull is
+permissionless: anyone can post a fresher `PriceUpdateV2` for any
+feed at any time. That created a per-call cherry-pick:
+
+1. State: `last_effective_price_e6 = 100`, latest on-chain Pyth
+   shows `price = 102` clamped to `101` (cap = 1%/slot).
+2. A second, valid-but-older Pyth account exists on-chain showing
+   `price = 99`. Both readings are within `max_staleness_secs` of
+   the current clock.
+3. A caller chooses to submit the older account. `clamp_external_
+   _price` clamps `99` against baseline `101` → returns `100`,
+   advances baseline to `100`.
+4. Subsequent ops now price against `100` instead of `101`. The
+   caller has effectively pulled the baseline backward by a full
+   cap-step.
+
+Repeated systematically, this is a bounded but real price-direction
+attack — the caller can keep the baseline pinned to whichever older
+observation they prefer, within `oracle_price_cap_e2bps` per step.
+
+### Fix
+
+`MarketConfig.last_oracle_publish_time: i64` is added (stored in the
+8-byte slot formerly reserved for `authority_timestamp`, no layout
+change). On every accepted external observation, the wrapper writes
+`config.last_oracle_publish_time = publish_time`.
+
+`clamp_external_price` now applies a one-way clock to the source-feed
+timestamp:
+
+```text
+publish_time >= last_oracle_publish_time
+    → clamp the submitted observation against the baseline,
+      advance baseline + timestamp.
+
+publish_time <  last_oracle_publish_time
+    → return last_effective_price_e6 unchanged.
+      Do NOT advance baseline or timestamp.
+      Do NOT error — the caller's tx still succeeds.
+```
+
+Pyth's `publish_time` and Chainlink's `timestamp` are signed by the
+respective off-chain networks and cannot be forged client-side, so
+they're a sound ordering signal.
+
+### Why graceful (return stored), not strict (return error)
+
+The strict variant — reject any older observation outright — was
+considered and rejected. It deadlocks legitimate callers whose
+signing path is asynchronous from the Solana tip:
+
+- Hardware wallets that take seconds to confirm.
+- Multi-sig flows that batch signatures across minutes.
+- Offline signers that ship pre-signed txs.
+- Any tx that lands a few seconds after a competing keeper
+  submitted a fresher Pyth update.
+
+These callers' txs would need an embedded oracle-account-version
+parameter to retry safely against tip movement. Forcing them to
+retry with a fresh Pyth account each round is a permanent loop
+under any contention.
+
+The graceful variant gives the caller's tx the freshest known price
+the wrapper has on file. It cannot move state backward (the
+older-observation branch is purely read-only on baseline). The cap-
+step cherry-pick is closed because the caller can no longer pick
+"older observation processed against current baseline" — they only
+get "current baseline as-is."
+
+### What's preserved vs. surrendered
+
+Preserved:
+- `last_effective_price_e6` is monotonic with respect to the
+  one-way clock: it only moves on observations newer than the
+  last accepted one.
+- Caller cannot rewind baseline by replaying an old observation.
+- Circuit-breaker clamp still applies to all forward observations.
+- All pre-existing terminal-stale guarantees
+  (`permissionless_stale_matured`) hold unchanged.
+
+Surrendered:
+- Observation freshness is not enforced at the per-tx level. A
+  caller submitting an older Pyth account is priced against the
+  stored baseline, which may differ from the most recent on-chain
+  Pyth reading by up to one cap-step. This is the same surface
+  area as the wrapper had before the monotonicity field existed,
+  with the explicit constraint that the baseline cannot rewind.
+
+### InitMarket bootstrap
+
+InitMarket now seeds `last_oracle_publish_time` from the genesis
+Pyth read (non-Hyperp markets only; Hyperp leaves it at 0). This
+prevents an immediate post-init replay of an even-older observation
+from poisoning the baseline before any normal-path crank has run.
+
+### ResolveMarket
+
+The non-Hyperp admin `ResolveMarket` path also performs a direct
+external read (it bypasses `clamp_external_price` because §9.8
+deviation band wants the raw, un-clamped oracle). The same graceful
+fallback applies there: an older observation substitutes the stored
+`last_effective_price_e6` as `live_oracle_price`, mirroring the
+live policy.
+
+### Tests
+
+- `test_oracle_older_observation_uses_stored_price_and_does_not_rewind`:
+  asserts the graceful behavior — older observation succeeds, but
+  baseline + timestamp don't move, even when the submitted price is
+  wildly different.
+- `test_oracle_publish_time_equal_observation_succeeds`: regression
+  guard that equal-timestamp re-reads (e.g., two txs in the same
+  slot reading the same on-chain Pyth account) keep working.

@@ -1606,7 +1606,14 @@ pub mod ix {
         /// known good oracle price from engine.last_oracle_price.
         ResolvePermissionless,
         /// Permissionless force-close for resolved markets (tag 30).
-        /// Requires RESOLVED + delay. Sends capital to stored owner ATA.
+        /// Requires RESOLVED + delay. Admin-only. Sends capital to any
+        /// valid SPL token account whose token-owner matches the stored
+        /// owner and whose mint matches `collateral_mint` — the caller
+        /// chooses the destination (typically but not necessarily the
+        /// canonical ATA). The wrapper enforces owner + mint equality
+        /// via `verify_token_account`; it does NOT derive the
+        /// Associated Token Address, so a non-ATA account owned by the
+        /// stored owner is also accepted.
         ForceCloseResolved {
             user_idx: u16,
         },
@@ -2583,12 +2590,14 @@ pub mod state {
         pub hyperp_mark_e6: u64,
         /// Most recently accepted external oracle observation timestamp
         /// (Pyth `publish_time` or Chainlink `timestamp`, in seconds).
-        /// `clamp_external_price` rejects any incoming Pyth/Chainlink
-        /// reading with `publish_time < last_oracle_publish_time` so
-        /// observations are monotonic — a caller cannot replay an older
-        /// (still-fresh-window) price after a newer one has been
-        /// accepted. Initialized to 0 at InitMarket so the first read
-        /// always passes.
+        /// Used as a one-way clock on observations: incoming reads with
+        /// `publish_time < last_oracle_publish_time` are served from
+        /// `last_effective_price_e6` and do NOT advance baseline or
+        /// timestamp. This both preserves caller liveness (offline
+        /// signers can't be deadlocked by a newer update landing
+        /// between sign and submit) and prevents baseline-rewind via
+        /// replay. See `oracle::clamp_external_price` for the full
+        /// policy. Initialized at InitMarket from the genesis Pyth read.
         pub last_oracle_publish_time: i64,
 
         // ========================================
@@ -6188,6 +6197,43 @@ pub mod processor {
                     )
                     .map_err(map_risk_error)?;
                 syncs_done += 1;
+
+                // Permissionless dust reclaim: fee accrual just charged
+                // this account; if that drained capital to zero on a
+                // flat account (no position, no PnL, no reserve, no
+                // pending, no positive fee_credits), free the slot now.
+                // Without this, an attacker could fill `max_accounts`
+                // with dust and brick onboarding even when fees drain
+                // capital, because slot reclamation would still require
+                // an explicit per-account `ReclaimEmptyAccount` call.
+                //
+                // All six flat-clean predicates the engine's reclaim
+                // checks are mirrored here so the call CANNOT hit an
+                // `Undercollateralized` / `CorruptState` early return.
+                // That lets us propagate any remaining error with `?`
+                // rather than silently swallowing a `_not_atomic`
+                // failure — per the engine contract, a failing
+                // `_not_atomic` may have already mutated state and the
+                // caller must abort the transaction. Envelope /
+                // market-mode guards upstream (KeeperCrank's oracle
+                // read + is_resolved gate + accrue_market_to) ensure
+                // the remaining engine preconditions hold, so in
+                // practice the `?` is unreachable — but if a future
+                // engine change introduces a new precondition, we get
+                // a transaction rollback instead of silent corruption.
+                let acc = &engine.accounts[idx];
+                if acc.capital.is_zero()
+                    && acc.position_basis_q == 0
+                    && acc.pnl == 0
+                    && acc.reserved_pnl == 0
+                    && acc.sched_present == 0
+                    && acc.pending_present == 0
+                    && acc.fee_credits.get() <= 0
+                {
+                    engine
+                        .reclaim_empty_account_not_atomic(idx as u16, now_slot)
+                        .map_err(map_risk_error)?;
+                }
             }
             // Word fully drained — advance to next word, reset bit cursor.
             word_cursor = (word_cursor + 1) % BITMAP_WORDS;
