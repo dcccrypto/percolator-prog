@@ -424,7 +424,8 @@ fn test_honest_user_standard_market_warmup_close() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 1000); // warmup_period_slots = 1000
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    env.init_market_with_warmup(0, 50);
 
     let ins_payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.top_up_insurance(&ins_payer, 1);
@@ -1095,10 +1096,11 @@ fn test_governance_free_full_lifecycle() {
     // horizon=200 (shorter for faster funding), k=200 (2x multiplier), max_premium=1000, max_per_slot=10
     env.init_market_with_funding(
         0,      // invert=0 (direct, e.g., BTC/USD)
-        // permissionless_resolve_stale_slots: 1000 slots so the test's
-        // natural slot advances (init → 200 → 300 → 600) stay within
-        // the live window.
-        1000,
+        // permissionless_resolve_stale_slots: 80 slots (v12.19.6: must be
+        // <= MAX_ACCRUAL_DT_SLOTS=100). The natural slot advances in this
+        // test (init → 200 → 300 → 600) go well past the live window, so
+        // the final Resolve branch exercises the permissionless path.
+        80,
         200,    // funding_horizon_slots (custom, not default 500)
         200,    // funding_k_bps (2x, not default 1x)
         1000,   // funding_max_premium_bps (10%, not default 5%)
@@ -1178,7 +1180,7 @@ fn test_governance_free_full_lifecycle_inverted() {
 
     env.init_market_with_funding(
         1,      // invert=1
-        1000,   // permissionless_resolve_stale_slots (wider than max_crank_staleness)
+        80,     // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
         300,    // custom horizon
         150,    // 1.5x k
         800,    // 8% max premium
@@ -1325,7 +1327,7 @@ fn test_resolve_permissionless_inverted_settlement_price() {
 fn test_resolve_permissionless_inverted_with_positions() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(1, 1000);
+    env.init_market_with_cap(1, 80);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();

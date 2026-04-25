@@ -1600,7 +1600,9 @@ fn test_attack_warmup_long_period_withdraw_attempt() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 1_000_000); // warmup = 1M slots
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100. Use the
+    // max legal envelope; the test still verifies no early withdraw.
+    env.init_market_with_warmup(0, 50);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3109,7 +3111,7 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
     // Read last_effective_price_e6 (the index) before same-slot crank
     // last_effective_price_e6 is at config offset 312: slab bytes [384..392]
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192) (v12.19)
     let index_before =
         u64::from_le_bytes(slab_before[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert!(index_before > 0, "Index should be non-zero before crank");
@@ -3174,8 +3176,8 @@ fn test_attack_warmup_prevents_immediate_profit_withdrawal() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Init market with 1000-slot warmup period
-    env.init_market_with_warmup(0, 1000);
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    env.init_market_with_warmup(0, 50);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3420,7 +3422,7 @@ fn test_attack_liquidate_healthy_account() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000); // max cap (100%/read)
+    env.init_market_with_cap(0, 80); // max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -5460,7 +5462,7 @@ fn test_attack_liquidation_after_price_crash() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000); // max cap (100%/read)
+    env.init_market_with_cap(0, 80); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -5491,7 +5493,9 @@ fn test_attack_liquidation_after_price_crash() {
     // With 5B tokens capital, this should make the account deeply insolvent
     // maintenance_margin_bps=200 -> 2%, required margin = 100M*50/1e6*0.02 = 100 tokens
     // equity = 5000 - 8800 = -3800 -> deeply negative -> liquidated
-    env.set_slot_and_price(100, 50_000_000);
+    // Drive the oracle down far enough (compounded per-slot cap) for
+    // the account to be deeply insolvent.
+    env.set_slot_and_price(2000, 80_000_000);
     env.crank(); // Settle mark-to-oracle (crank does not liquidate with None hint)
 
     // Use explicit liquidation instruction to liquidate the insolvent account
@@ -5685,7 +5689,7 @@ fn test_attack_same_slot_triple_crank_convergence() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000); // max cap (100%/read)
+    env.init_market_with_cap(0, 80); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -10938,7 +10942,8 @@ fn test_attack_warmup_partial_close_vesting() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_warmup(0, 1000); // warmup = 1000 slots
+    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    env.init_market_with_warmup(0, 50);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 

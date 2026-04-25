@@ -4845,7 +4845,7 @@ fn test_zero_fill_must_not_advance_circuit_breaker_baseline() {
     env.crank();
 
     // Read the circuit-breaker baseline (last_effective_price_e6) from slab
-    const LAST_EFF_PRICE_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200) // last_effective_price_e6 in slab (config offset)
+    const LAST_EFF_PRICE_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192) (v12.19)
     let baseline_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8].try_into().unwrap())
@@ -5292,7 +5292,7 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
     env.crank();
 
     // Read last_effective_price_e6 before the zero-fill trade
-    const LAST_EFF_PRICE_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const LAST_EFF_PRICE_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192) (v12.19)
     let index_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(
@@ -5504,8 +5504,11 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     // source before trades can produce exec prices at the mark).
     env.try_push_oracle_price(&admin, 1_000_000, 1).unwrap();
 
-    const MARK_EWMA_LAST_OFF: usize = 136 + 296; // HEADER_LEN + offset_of(mark_ewma_last_slot)
-    const LAST_MARK_PUSH_OFF: usize = 136 + 256; // HEADER_LEN + offset_of(last_mark_push_slot) (u128, low 8 bytes = slot)
+    // v12.19 MarketConfig layout (u128 alignment pulls fields forward):
+    //   last_mark_push_slot (u128) starts at config offset 240.
+    //   mark_ewma_last_slot (u64) is at config offset 280.
+    const MARK_EWMA_LAST_OFF: usize = 136 + 280;
+    const LAST_MARK_PUSH_OFF: usize = 136 + 240; // low 8 bytes of u128 = slot
     let read_slots = |env: &TradeCpiTestEnv| -> (u64, u64) {
         let slab = env.svm.get_account(&env.slab).unwrap().data;
         let e = u64::from_le_bytes(
@@ -5576,7 +5579,7 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
     env.try_init_market_hyperp_with_stale(
         1_000_000,
         100,  // max_staleness_secs
-        300,  // permissionless_resolve_stale_slots
+        80,  // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
     ).expect("init Hyperp with explicit stale/perm-resolve");
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -5599,8 +5602,8 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
         10_000_000, &matcher_prog, &matcher_ctx,
     ).expect("opening trade succeeds while fresh");
 
-    // Advance past permissionless_resolve_stale_slots (= 300).
-    env.set_slot(10 + 301);
+    // Advance past permissionless_resolve_stale_slots (= 80).
+    env.set_slot(10 + 81);
 
     // Admin push must NOT revive the market.
     let err = env.try_push_oracle_price(&admin, 1_020_000, 10 + 301)
@@ -5648,7 +5651,7 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     env.try_init_market_hyperp_with_stale(
         1_000_000,
         100,  // max_staleness_secs
-        300,  // permissionless_resolve_stale_slots
+        80,  // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
     ).expect("init Hyperp with explicit stale/perm-resolve");
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -5668,12 +5671,12 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
         10_000_000, &matcher_prog, &matcher_ctx,
     ).unwrap();
 
-    // Advance to JUST BEFORE perm_resolve maturity.
-    env.set_slot(10 + 299);
+    // Advance to JUST BEFORE perm_resolve maturity (= 80).
+    env.set_slot(10 + 79);
 
     // Admin push still works — perm_resolve hasn't matured, market is
     // recoverable.
-    env.try_push_oracle_price(&admin, 1_020_000, 10 + 299)
+    env.try_push_oracle_price(&admin, 1_020_000, 10 + 79)
         .expect("PushHyperpMark must succeed before perm_resolve maturity");
     assert!(
         !env.is_market_resolved(),

@@ -392,9 +392,9 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
 
     let mut env = TestEnv::new();
     // encode_init_market_with_cap auto-sets max_crank_staleness and
-    // force_close_delay when perm_resolve > 0. perm_resolve must be
-    // <= MAX_ACCRUAL_DT_SLOTS = 100_000.
-    let perm_resolve: u64 = 50_000;
+    // force_close_delay when perm_resolve > 0. v12.19.6: perm_resolve
+    // must be <= MAX_ACCRUAL_DT_SLOTS = 100.
+    let perm_resolve: u64 = 80;
     let data = common::encode_init_market_with_cap(
         &env.payer.pubkey(),
         &env.mint,
@@ -1132,7 +1132,7 @@ fn test_update_config_admin_only() {
 fn test_update_authority_init_defaults_match_admin() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
 
     let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1151,7 +1151,7 @@ fn test_update_authority_init_defaults_match_admin() {
 fn test_update_authority_insurance_positive_delegation() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let delegate = Keypair::new();
     env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
@@ -1172,7 +1172,7 @@ fn test_update_authority_insurance_positive_delegation() {
 fn test_update_authority_negative_wrong_current_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let target = Keypair::new();
@@ -1192,7 +1192,7 @@ fn test_update_authority_negative_wrong_current_signer() {
 fn test_update_authority_negative_new_pubkey_not_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let target_pubkey = Pubkey::new_unique();
 
@@ -1227,7 +1227,7 @@ fn test_update_authority_negative_new_pubkey_not_signer() {
 fn test_update_authority_burn_single_sig_and_then_dead() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Burn insurance_authority (single-sig: only current signs).
@@ -1248,7 +1248,7 @@ fn test_update_authority_burn_single_sig_and_then_dead() {
 fn test_update_authority_burning_one_kind_leaves_others_intact() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
@@ -1273,7 +1273,7 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
 fn test_update_authority_negative_invalid_kind() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env
@@ -1290,7 +1290,7 @@ fn test_update_authority_negative_invalid_kind() {
 fn test_update_authority_insurance_survives_admin_burn() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1000);
+    env.init_market_with_cap(0, 80);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Before admin burn: delegate insurance_authority to a dedicated key.
