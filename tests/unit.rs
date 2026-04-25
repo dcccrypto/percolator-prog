@@ -254,7 +254,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(0, &mut data);  // new_account_fee
     encode_u128(0, &mut data);  // insurance_floor (risk_reduction_threshold)
-    encode_u64(0, &mut data);   // h_max
+    encode_u64(1, &mut data);   // h_max (v12.18.1: must be >= 1)
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data);   // liquidation_fee_bps
     encode_u128(0, &mut data);  // liquidation_fee_cap

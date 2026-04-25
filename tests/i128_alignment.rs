@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 //! BPF i128 Alignment Test
 //!
 //! Tests that I128/U128 wrapper types work correctly:
@@ -21,12 +20,11 @@ use solana_sdk::{
     sysvar,
     transaction::Transaction,
 };
-use solana_program_runtime::compute_budget::ComputeBudget;
 use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1484728; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
+const SLAB_LEN: usize = 1484632;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -379,7 +377,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -396,7 +394,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -475,11 +473,6 @@ fn test_bpf_i128_alignment() {
     let program_id = Pubkey::new_unique();
     let program_bytes = std::fs::read(&path).expect("Failed to read program");
     svm.add_program(program_id, &program_bytes);
-    svm.set_compute_budget(ComputeBudget {
-        compute_unit_limit: 50_000_000, // 50M CUs — unoptimized test build needs more
-        heap_size: 256 * 1024,
-        ..ComputeBudget::default()
-    });
 
     let payer = Keypair::new();
     let slab = Pubkey::new_unique();

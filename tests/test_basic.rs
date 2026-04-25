@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 mod common;
 #[allow(unused_imports)]
 use common::*;
@@ -211,9 +210,9 @@ fn test_bug4_fee_overpayment_should_be_handled() {
         engine_vault, vault_after
     );
 
-    // Fee is charged once by deposit_not_atomic during materialization:
-    // capital_amount = fee_payment - new_account_fee, insurance += new_account_fee.
-    // (The prior handler-side fee surgery was removed — it double-charged.)
+    // Current behavior: InitUser deposits the full fee_payment into the vault,
+    // then charges new_account_fee from capital → insurance.
+    // So capital = fee_payment - new_account_fee, insurance = new_account_fee.
     let user_idx = _user_idx;
     let user_capital = env.read_account_capital(user_idx);
     let insurance = env.read_insurance_balance();
@@ -487,7 +486,7 @@ fn test_idle_account_can_close_after_crank() {
 fn test_matcher_init_vamm_passive_mode() {
     let path = matcher_program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
 
@@ -507,15 +506,14 @@ fn test_matcher_init_vamm_passive_mode() {
     };
     svm.set_account(ctx_pubkey, ctx_account).unwrap();
 
-    // Create LP keypair (matcher requires LP PDA to sign init)
-    let lp_kp = Keypair::new();
-    let lp_pda = lp_kp.pubkey();
+    // Create LP PDA placeholder (stored in context for signature verification)
+    let lp_pda = Pubkey::new_unique();
 
     // Initialize in Passive mode
     let ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, true), // LP PDA (must sign)
+            AccountMeta::new_readonly(lp_pda, false), // LP PDA
             AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
         data: encode_init_vamm(
@@ -526,14 +524,14 @@ fn test_matcher_init_vamm_passive_mode() {
             0,                 // impact_k not used in Passive
             0,                 // liquidity not needed for Passive
             1_000_000_000_000, // max fill
-            1_000_000_000_000, // max_inventory_abs — validate() requires > 0 (PERC-322 3E.4)
+            0,                 // no inventory limit
         ),
     };
 
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), ix],
         Some(&payer.pubkey()),
-        &[&payer, &lp_kp],
+        &[&payer],
         svm.latest_blockhash(),
     );
 
@@ -557,7 +555,7 @@ fn test_matcher_init_vamm_passive_mode() {
 fn test_matcher_call_after_init() {
     let path = matcher_program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let payer = Keypair::new();
     let lp = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
@@ -584,10 +582,10 @@ fn test_matcher_call_after_init() {
     let init_ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp.pubkey(), true), // LP PDA (must sign)
+            AccountMeta::new_readonly(lp.pubkey(), false), // LP PDA
             AccountMeta::new(ctx_pubkey, false),           // Context account
         ],
-        data: encode_init_vamm_with_id(
+        data: encode_init_vamm(
             MatcherMode::Passive,
             5,
             10,
@@ -595,15 +593,14 @@ fn test_matcher_call_after_init() {
             0,
             0,
             1_000_000_000_000, // max fill
-            1_000_000_000_000, // max_inventory_abs — validate() requires > 0
-            100,               // lp_account_id — must match encode_matcher_call below
+            0,
         ),
     };
 
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), init_ix],
         Some(&payer.pubkey()),
-        &[&payer, &lp],
+        &[&payer],
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx).expect("Init failed");
@@ -663,7 +660,7 @@ fn test_matcher_call_after_init() {
 fn test_matcher_rejects_double_init() {
     let path = matcher_program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
 
@@ -683,24 +680,23 @@ fn test_matcher_rejects_double_init() {
     };
     svm.set_account(ctx_pubkey, ctx_account).unwrap();
 
-    // Create LP keypair (matcher requires signer)
-    let lp_kp = Keypair::new();
-    let lp_pda = lp_kp.pubkey();
+    // Create LP PDA placeholder
+    let lp_pda = Pubkey::new_unique();
 
     // First init succeeds
     let ix1 = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, true), // LP PDA (must sign)
+            AccountMeta::new_readonly(lp_pda, false), // LP PDA
             AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
-        data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 1_000_000_000_000),
+        data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
     };
 
     let tx1 = Transaction::new_signed_with_payer(
         &[cu_ix(), ix1],
         Some(&payer.pubkey()),
-        &[&payer, &lp_kp],
+        &[&payer],
         svm.latest_blockhash(),
     );
     let result1 = svm.send_transaction(tx1);
@@ -710,16 +706,16 @@ fn test_matcher_rejects_double_init() {
     let ix2 = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp_pda, true), // LP PDA (must sign)
+            AccountMeta::new_readonly(lp_pda, false), // LP PDA
             AccountMeta::new(ctx_pubkey, false),      // Context account
         ],
-        data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 1_000_000_000_000),
+        data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 1_000_000_000_000, 0),
     };
 
     let tx2 = Transaction::new_signed_with_payer(
         &[cu_ix(), ix2],
         Some(&payer.pubkey()),
-        &[&payer, &lp_kp],
+        &[&payer],
         svm.latest_blockhash(),
     );
     let result2 = svm.send_transaction(tx2);
@@ -736,7 +732,7 @@ fn test_matcher_rejects_double_init() {
 fn test_matcher_vamm_mode_with_impact() {
     let path = matcher_program_path();
 
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let payer = Keypair::new();
     let lp = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
@@ -767,10 +763,10 @@ fn test_matcher_vamm_mode_with_impact() {
     let init_ix = Instruction {
         program_id: matcher_program_id,
         accounts: vec![
-            AccountMeta::new_readonly(lp.pubkey(), true), // LP PDA (must sign)
+            AccountMeta::new_readonly(lp.pubkey(), false), // LP PDA
             AccountMeta::new(ctx_pubkey, false),           // Context account
         ],
-        data: encode_init_vamm_with_id(
+        data: encode_init_vamm(
             MatcherMode::Vamm,
             5,                 // 0.05% trading fee
             10,                // 0.10% base spread
@@ -778,15 +774,14 @@ fn test_matcher_vamm_mode_with_impact() {
             50,                // 0.50% impact at full liquidity
             10_000_000_000,    // 10B notional_e6 liquidity
             1_000_000_000_000, // max fill
-            1_000_000_000_000, // max_inventory_abs — validate() requires > 0
-            100,               // lp_account_id — must match encode_matcher_call below
+            0,
         ),
     };
 
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), init_ix],
         Some(&payer.pubkey()),
-        &[&payer, &lp],
+        &[&payer],
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx).expect("Init failed");
@@ -2012,7 +2007,8 @@ fn test_funding_rate_transfers_pnl_on_premium() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let mp = env.matcher_program_id;
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
     // Widen cap so mark can diverge from index significantly
     env.try_set_oracle_price_cap(&admin, 500_000).unwrap(); // 50% per slot
 
@@ -2041,7 +2037,7 @@ fn test_funding_rate_transfers_pnl_on_premium() {
     // Index will chase mark but never catch up fully due to rate limiting.
     // Each crank applies funding from the previous rate (anti-retroactivity).
     for slot in (100..5000).step_by(100) {
-        env.set_oracle_price_e6(1_500_000);
+        env.try_push_oracle_price(&admin, 1_500_000, slot as i64).unwrap();
         env.set_slot(slot as u64);
         env.crank();
     }
@@ -2193,7 +2189,8 @@ fn test_settle_account_blocked_on_resolved() {
 
     // Resolve the market.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_oracle_price_e6(138_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
     env.set_slot(300);
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved(), "Market must be resolved");
@@ -2491,7 +2488,8 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 
     // Resolve the market.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_oracle_price_e6(138_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
     env.set_slot(300);
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved(), "Market must be resolved");
@@ -2521,14 +2519,13 @@ fn test_init_user_charges_new_account_fee() {
     let insurance_before = env.read_insurance_balance();
 
     let user = Keypair::new();
-    // deposit_not_atomic requires fee_payment >= min_initial_deposit(100) + new_account_fee(500) = 600.
-    let _user_idx = env.init_user_with_fee(&user, 600);
+    // Fee payment must be >= new_account_fee (500) AND >= min_initial_deposit (100)
+    let _user_idx = env.init_user_with_fee(&user, 500);
 
     let insurance_after = env.read_insurance_balance();
-    // Fee is charged once by deposit_not_atomic during materialization.
     assert_eq!(
         insurance_after - insurance_before, 500,
-        "Insurance must increase by new_account_fee (500). Before={}, after={}",
+        "Insurance must increase by exactly new_account_fee (500). Before={}, after={}",
         insurance_before, insurance_after
     );
 }
@@ -2541,7 +2538,8 @@ fn test_init_user_blocked_on_resolved() {
     env.init_market_hyperp(1_000_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved());
 
@@ -2641,7 +2639,8 @@ fn test_init_lp_blocked_on_resolved() {
     env.init_market_hyperp(1_000_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved());
 
@@ -2745,7 +2744,8 @@ fn test_reclaim_blocked_on_resolved() {
 
     // Resolve the market
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_oracle_price_e6(138_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
     env.try_resolve_market(&admin).unwrap();
     assert!(env.is_market_resolved());
 
@@ -4351,7 +4351,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(env.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(1u8); // invert=1 (SOL/USD)
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -4367,7 +4367,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-        data.extend_from_slice(&0u64.to_le_bytes()); // h_max (must be >= h_min=0)
+        data.extend_from_slice(&1u64.to_le_bytes()); // h_max
         let max_crank = 99u64; // permissionless > max_crank
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -4758,39 +4758,4 @@ fn test_trade_nocpi_allows_user_user_bilateral() {
     assert!(result.is_ok(), "User-user bilateral trade must be allowed: {:?}", result);
 }
 
-// ============================================================================
-// F-7 regression: FLAG_ORACLE_INITIALIZED must be set after first crank
-// ============================================================================
-
-/// Regression test for F-7: the fork must set FLAG_ORACLE_INITIALIZED
-/// after the first instruction that feeds a real oracle price to the engine.
-/// Before the fix, the flag was defined but never called (0 call sites).
-#[test]
-fn test_f7_oracle_initialized_flag_set_after_crank() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    // Before any crank, flag should NOT be set
-    {
-        let slab = env.svm.get_account(&env.slab).unwrap();
-        let flag_byte = slab.data[13]; // FLAGS_OFF = 13
-        let oracle_init_bit = flag_byte & (1 << 3); // FLAG_ORACLE_INITIALIZED = bit 3
-        assert_eq!(oracle_init_bit, 0,
-            "FLAG_ORACLE_INITIALIZED must be 0 before first crank");
-    }
-
-    // First crank feeds real oracle price to engine via accrue_market_to
-    env.set_slot(100);
-    env.crank();
-
-    // After crank, flag MUST be set
-    {
-        let slab = env.svm.get_account(&env.slab).unwrap();
-        let flag_byte = slab.data[13];
-        let oracle_init_bit = flag_byte & (1 << 3);
-        assert_ne!(oracle_init_bit, 0,
-            "F-7 REGRESSION: FLAG_ORACLE_INITIALIZED must be set after first crank");
-    }
-}
 

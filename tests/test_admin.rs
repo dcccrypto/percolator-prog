@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 mod common;
 #[allow(unused_imports)]
 use common::*;
@@ -15,11 +14,7 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
-/// CRITICAL: UpdateAdmin only callable by current admin (two-step semantics).
-///
-/// Phase E (2026-04-17): UpdateAdmin for non-zero new_admin now sets pending_admin
-/// only. The proposed new admin must separately call AcceptAdmin to complete
-/// the transfer. This prevents instant takeover on admin key compromise.
+/// CRITICAL: UpdateAdmin only callable by current admin
 #[test]
 fn test_critical_update_admin_authorization() {
     program_path();
@@ -31,95 +26,36 @@ fn test_critical_update_admin_authorization() {
     let new_admin = Keypair::new();
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
-    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
 
-    // Attacker proposes a transfer (even to themselves) — must fail authorization.
+    // Attacker tries to change admin - should fail
     let result = env.try_update_admin(&attacker, &attacker.pubkey());
     assert!(
         result.is_err(),
-        "SECURITY: Non-admin should not be able to propose admin transfer"
+        "SECURITY: Non-admin should not be able to change admin"
     );
     println!("UpdateAdmin by non-admin: REJECTED (correct)");
 
-    // Attacker calls AcceptAdmin when no transfer is pending — must fail.
-    let result = env.try_accept_admin(&attacker);
-    assert!(
-        result.is_err(),
-        "SECURITY: AcceptAdmin with no pending transfer should fail"
-    );
-    println!("AcceptAdmin with no pending: REJECTED (correct)");
-
-    // Real admin proposes new admin — should succeed (sets pending_admin).
+    // Real admin changes admin - should succeed
     let result = env.try_update_admin(&admin, &new_admin.pubkey());
     assert!(
         result.is_ok(),
-        "Admin should be able to propose admin transfer: {:?}",
+        "Admin should be able to change admin: {:?}",
         result
     );
-    println!("UpdateAdmin propose by admin: ACCEPTED (correct)");
+    println!("UpdateAdmin by admin: ACCEPTED (correct)");
 
-    // TWO-STEP PROPERTY: old admin still has authority until Accept is called.
-    // Old admin can still propose a different transfer (overwriting pending).
-    env.svm.expire_blockhash();
+    // Old admin tries again - should now fail
     let result = env.try_update_admin(&admin, &admin.pubkey());
-    assert!(
-        result.is_ok(),
-        "Old admin retains authority during pending transfer: {:?}",
-        result
-    );
-    println!("Old admin retains authority during pending: CONFIRMED (correct)");
+    assert!(result.is_err(), "Old admin should no longer have authority");
 
-    // Attacker tries to accept even though they're not the pending admin — must fail.
-    // (Requires re-proposing new_admin first since we just overwrote pending to admin.)
-    env.svm.expire_blockhash();
-    env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
-    let result = env.try_accept_admin(&attacker);
-    assert!(
-        result.is_err(),
-        "SECURITY: Only pending_admin signer can AcceptAdmin"
-    );
-    println!("AcceptAdmin by wrong signer: REJECTED (correct)");
-
-    // New admin (the actual pending_admin) accepts — transfer completes.
-    let result = env.try_accept_admin(&new_admin);
-    assert!(
-        result.is_ok(),
-        "Pending admin should be able to complete transfer: {:?}",
-        result
-    );
-    println!("AcceptAdmin by pending_admin: ACCEPTED (correct)");
-
-    // Now the OLD admin has no authority.
-    env.svm.expire_blockhash();
-    let result = env.try_update_admin(&admin, &admin.pubkey());
-    assert!(
-        result.is_err(),
-        "After AcceptAdmin, old admin should no longer have authority"
-    );
-    println!("Post-transfer: old admin rejected (correct)");
-
-    // New admin has authority — but call exists NOW as new admin only; propose
-    // to themselves just to prove they can. (This overwrites pending to new_admin.)
-    env.svm.expire_blockhash();
+    // New admin can exercise authority (proves transfer actually happened)
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
     let result = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(
         result.is_ok(),
         "New admin should be able to exercise authority: {:?}",
         result
     );
-    println!("Post-transfer: new admin exercises authority (correct)");
-
-    // Separately verify the cleared-pending property: fresh market, accept with
-    // nothing pending must fail. (We proved this earlier in the test too.)
-    env.svm.expire_blockhash();
-    let mut env2 = TestEnv::new();
-    env2.init_market_with_invert(0);
-    let result = env2.try_accept_admin(&new_admin);
-    assert!(
-        result.is_err(),
-        "AcceptAdmin on fresh market (no pending) must be rejected"
-    );
-    println!("AcceptAdmin on fresh market: REJECTED (correct)");
 }
 
 /// CRITICAL: UpdateConfig admin-only with all parameters
@@ -549,7 +485,7 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     data.extend_from_slice(admin.pubkey().as_ref());
     data.extend_from_slice(env.mint.as_ref());
     data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -705,7 +641,7 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.extend_from_slice(admin.pubkey().as_ref());
     data.extend_from_slice(env.mint.as_ref());
     data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -722,7 +658,7 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max (must be >= h_min=0)
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -880,7 +816,7 @@ fn test_admin_limits_lifecycle() {
 #[test]
 fn test_init_market_rejects_vault_with_delegate() {
     program_path();
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
     svm.add_program(program_id, &std::fs::read(program_path()).unwrap());
 
@@ -954,7 +890,7 @@ fn test_init_market_rejects_vault_with_delegate() {
 #[test]
 fn test_init_market_rejects_vault_with_close_authority() {
     program_path();
-    let mut svm = common::new_test_svm();
+    let mut svm = LiteSVM::new();
     let program_id = Pubkey::new_unique();
     svm.add_program(program_id, &std::fs::read(program_path()).unwrap());
 

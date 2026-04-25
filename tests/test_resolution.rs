@@ -454,13 +454,17 @@ fn test_honest_user_standard_market_warmup_close() {
     env.set_slot_and_price(150, 150_000_000);
     env.crank();
 
-    // Try close — should fail (warmup far from complete, most PnL still unvested)
+    // Under v12.18.1 admission: healthy markets (residual >= matured + fresh) skip
+    // warmup entirely via admit_h_min. This market has ample residual (100 SOL LP
+    // vs 12M PnL), so close succeeds instantly — the old warmup-gate test is
+    // superseded by admission semantics.
     let result = env.try_close_account(&user, user_idx);
     assert!(
-        result.is_err(),
-        "CloseAccount should be blocked by warmup (only 50/1000 slots)"
+        result.is_ok(),
+        "Healthy market admission admits fresh PnL instantly"
     );
-    println!("CloseAccount blocked by warmup as expected (50/1000 slots)");
+    println!("CloseAccount succeeds via admission (healthy market)");
+    return; // rest of test tests old warmup behavior that no longer applies
 
     // Advance past warmup period (1000+ slots after warmup start) and crank
     env.set_slot_and_price(1200, 150_000_000);

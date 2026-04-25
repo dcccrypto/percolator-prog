@@ -430,17 +430,21 @@ fn kani_nonce_unchanged_on_failure() {
     assert_eq!(new_nonce, old_nonce, "nonce must be unchanged on failure");
 }
 
-/// Prove: nonce advances by exactly 1 on success
+/// Prove: nonce advances by exactly 1 on success; overflow returns None.
 #[kani::proof]
 fn kani_nonce_advances_on_success() {
     let old_nonce: u64 = kani::any();
     let new_nonce = nonce_on_success(old_nonce);
 
-    assert_eq!(
-        new_nonce,
-        old_nonce.wrapping_add(1),
-        "nonce must advance by 1 on success"
-    );
+    if old_nonce < u64::MAX {
+        assert_eq!(
+            new_nonce,
+            Some(old_nonce + 1),
+            "nonce must advance by 1 on success"
+        );
+    } else {
+        assert_eq!(new_nonce, None, "nonce_on_success must return None at u64::MAX");
+    }
 }
 
 
@@ -520,12 +524,13 @@ fn kani_decide_trade_cpi_universal() {
 
     let should_accept = matcher_shape_ok(shape)
         && identity_ok && pda_ok && abi_ok
-        && user_auth_ok && lp_key_ok;
+        && user_auth_ok && lp_key_ok
+        && old_nonce < u64::MAX; // nonce overflow gate
 
     if should_accept {
         match decision {
             TradeCpiDecision::Accept { new_nonce, chosen_size } => {
-                assert_eq!(new_nonce, nonce_on_success(old_nonce),
+                assert_eq!(Some(new_nonce), nonce_on_success(old_nonce),
                     "accept nonce must be nonce_on_success(old_nonce)");
                 assert_eq!(chosen_size, exec_size,
                     "accept chosen_size must equal exec_size");
@@ -534,7 +539,7 @@ fn kani_decide_trade_cpi_universal() {
         }
     } else {
         assert_eq!(decision, TradeCpiDecision::Reject,
-            "any gate failure must produce Reject");
+            "any gate failure (or nonce overflow) must produce Reject");
     }
 }
 
@@ -572,6 +577,8 @@ fn kani_tradecpi_reject_nonce_unchanged() {
 }
 
 /// Prove: TradeCpi accept increments nonce for all valid matcher shapes.
+/// At the u64::MAX boundary the nonce-overflow gate forces Reject — verified
+/// separately in kani_decide_trade_cpi_universal.
 #[kani::proof]
 fn kani_tradecpi_accept_increments_nonce() {
     let old_nonce: u64 = kani::any();
@@ -585,6 +592,8 @@ fn kani_tradecpi_accept_increments_nonce() {
         ctx_len_ok: kani::any(),
     };
     kani::assume(matcher_shape_ok(shape));
+    // Exclude the overflow boundary; covered by the universal proof above.
+    kani::assume(old_nonce < u64::MAX);
 
     let decision = decide_trade_cpi(
         old_nonce,
@@ -600,7 +609,7 @@ fn kani_tradecpi_accept_increments_nonce() {
     assert_eq!(
         decision,
         TradeCpiDecision::Accept {
-            new_nonce: old_nonce.wrapping_add(1),
+            new_nonce: old_nonce + 1,
             chosen_size: exec_size,
         },
         "TradeCpi must accept for any valid matcher shape when all other checks pass"
@@ -610,7 +619,7 @@ fn kani_tradecpi_accept_increments_nonce() {
 
     assert_eq!(
         result_nonce,
-        old_nonce.wrapping_add(1),
+        old_nonce + 1,
         "TradeCpi accept must increment nonce by 1"
     );
 }
@@ -1034,7 +1043,7 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
 fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
     // Non-vacuity witness: construct valid ABI inputs that produce Accept
     {
-        let req_id = nonce_on_success(42);
+        let req_id = nonce_on_success(42).expect("42 + 1 cannot overflow u64");
         let valid_ret = MatcherReturnFields {
             abi_version: MATCHER_ABI_VERSION,
             flags: FLAG_VALID | FLAG_PARTIAL_OK,
@@ -1132,8 +1141,10 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
     let oracle_price_e6: u64 = kani::any();
     kani::assume(oracle_price_e6 > 0);
 
-    // req_id must match nonce_on_success(old_nonce) for ABI validation
-    let expected_req_id = nonce_on_success(old_nonce);
+    // Must have room to advance the nonce (overflow gate) and req_id must
+    // match nonce_on_success(old_nonce) for ABI validation to pass.
+    kani::assume(old_nonce < u64::MAX);
+    let expected_req_id = nonce_on_success(old_nonce).expect("assumed no overflow");
 
     let ret = MatcherReturnFields {
         abi_version: MATCHER_ABI_VERSION,
@@ -1697,8 +1708,12 @@ fn kani_tradecpi_variants_consistent_valid_shape() {
     let oracle_price_e6: u64 = kani::any();
     let req_size: i128 = kani::any();
 
-    // Compute req_id as decide_trade_cpi_from_ret does
-    let req_id = nonce_on_success(old_nonce);
+    // Compute req_id as decide_trade_cpi_from_ret does. The overflow gate in
+    // both variants makes Accept impossible at u64::MAX, and the variants only
+    // need to agree about Reject in that case — we still derive an expected
+    // req_id for the abi_ok probe (any u64 works; production code never reaches
+    // abi_ok on overflow because the accept branch is blocked anyway).
+    let req_id = nonce_on_success(old_nonce).unwrap_or(0);
 
     // Check if ABI would pass
     let abi_passes = abi_ok(ret, lp_account_id, oracle_price_e6, req_size, req_id);
@@ -1728,7 +1743,12 @@ fn kani_tradecpi_variants_consistent_valid_shape() {
         req_size,
     );
 
-    // Both must give same outcome
+    // Both must give same outcome (modulo overflow: at u64::MAX both reject).
+    if old_nonce == u64::MAX {
+        assert_eq!(decision1, TradeCpiDecision::Reject);
+        assert_eq!(decision2, TradeCpiDecision::Reject);
+        return;
+    }
     match (&decision1, &decision2) {
         (TradeCpiDecision::Reject, TradeCpiDecision::Reject) => {}
         (
@@ -1771,7 +1791,9 @@ fn kani_tradecpi_variants_consistent_invalid_shape() {
     let oracle_price_e6: u64 = kani::any();
     let req_size: i128 = kani::any();
 
-    let req_id = nonce_on_success(old_nonce);
+    // req_id can be anything when shape is invalid — both variants reject before
+    // reading abi_ok. Use unwrap_or to handle the u64::MAX overflow case.
+    let req_id = nonce_on_success(old_nonce).unwrap_or(0);
     let abi_passes = abi_ok(ret, lp_account_id, oracle_price_e6, req_size, req_id);
 
     let decision1 = decide_trade_cpi(
@@ -1824,8 +1846,11 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
     let old_nonce: u64 = kani::any();
     let shape = valid_shape();
 
-    // Compute the expected req_id that decide_trade_cpi_from_ret will use
-    let expected_req_id = nonce_on_success(old_nonce);
+    // Force the accept path — exclude the nonce-overflow boundary so req_id is
+    // well-defined and Accept is reachable.
+    kani::assume(old_nonce < u64::MAX);
+    let expected_req_id =
+        nonce_on_success(old_nonce).expect("old_nonce < u64::MAX assumed");
 
     // Constrain ret to be ABI-valid for this req_id
     let mut ret = any_matcher_return_fields();
@@ -1897,8 +1922,11 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
     let old_nonce: u64 = kani::any();
     let shape = valid_shape();
 
+    // Force the accept path — exclude the nonce-overflow boundary.
+    kani::assume(old_nonce < u64::MAX);
     // Construct ABI-valid ret
-    let expected_req_id = nonce_on_success(old_nonce);
+    let expected_req_id =
+        nonce_on_success(old_nonce).expect("old_nonce < u64::MAX assumed");
     let mut ret = any_matcher_return_fields();
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
@@ -2575,8 +2603,33 @@ fn kani_decide_trade_cpi_from_ret_universal() {
     // The `abi_ok` call inside `decide_trade_cpi_from_ret` uses:
     //   req_id = nonce_on_success(old_nonce)
     //   lp_account_id, oracle_price_e6, req_size as passed in
-    // We derive the expected req_id and set ret.req_id to match.
-    let req_id = nonce_on_success(old_nonce);
+    // We derive the expected req_id and set ret.req_id to match. A nonce at
+    // u64::MAX overflows in nonce_on_success and is a separate reject path —
+    // handle it up front so the rest of the proof treats req_id as a u64.
+    let req_id = match nonce_on_success(old_nonce) {
+        Some(n) => n,
+        None => {
+            // Overflow gate: production code rejects regardless of other inputs.
+            let decision = decide_trade_cpi_from_ret(
+                old_nonce,
+                shape,
+                identity_ok,
+                pda_ok,
+                user_auth_ok,
+                lp_auth_ok,
+                any_matcher_return_fields(),
+                kani::any(),
+                kani::any(),
+                kani::any(),
+            );
+            assert_eq!(
+                decision,
+                TradeCpiDecision::Reject,
+                "nonce overflow must force Reject"
+            );
+            return;
+        }
+    };
     let mut ret = any_matcher_return_fields();
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK; // PARTIAL_OK allows exec_size=0
@@ -2623,7 +2676,7 @@ fn kani_decide_trade_cpi_from_ret_universal() {
                 chosen_size,
             } => {
                 assert_eq!(
-                    new_nonce,
+                    Some(new_nonce),
                     nonce_on_success(old_nonce),
                     "accept new_nonce must be nonce_on_success(old_nonce)"
                 );

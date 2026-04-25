@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::doc_markdown, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
+#![allow(dead_code, unused_imports)]
 //! Shared test infrastructure for integration tests.
 
 pub use litesvm::LiteSVM;
@@ -12,7 +12,6 @@ pub use solana_sdk::{
     sysvar,
     transaction::Transaction,
 };
-pub use solana_program_runtime::compute_budget::ComputeBudget;
 pub use spl_token::state::{Account as TokenAccount, AccountState};
 pub use std::path::PathBuf;
 
@@ -20,11 +19,7 @@ pub use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-// 2026-04-17: CONFIG_LEN extended 432 → 480 (Phase A, +48) → 512 (Phase E,
-// +32 for pending_admin). SLAB_LEN tracks via percolator_prog::constants::SLAB_LEN
-// but is hardcoded here because the tests' BPF layout is a 32-bit SBF target
-// that doesn't match the host constant.
-pub const SLAB_LEN: usize = 1484728; // v12.17 + Phase A (+48) + Phase E (+32) = 1484648+80
+pub const SLAB_LEN: usize = 1484632; // MAX_ACCOUNTS=2048 (v12.15 Account with reserve cohort queues, fits 10MB Solana limit)
 pub const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -37,19 +32,6 @@ pub const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
 
 pub fn cu_ix() -> Instruction {
     solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)
-}
-
-/// Create a LiteSVM instance with an uncapped compute budget for test builds.
-/// Unoptimized debug BPF binaries consume far more CUs than mainnet release builds,
-/// so we raise the limit to 50M to avoid false CU-exhaustion failures.
-pub fn new_test_svm() -> LiteSVM {
-    let mut svm = LiteSVM::new();
-    svm.set_compute_budget(ComputeBudget {
-        compute_unit_limit: 50_000_000,
-        heap_size: 256 * 1024,
-        ..ComputeBudget::default()
-    });
-    svm
 }
 
 pub fn program_path() -> PathBuf {
@@ -143,7 +125,7 @@ pub fn make_pyth_data(
     data
 }
 
-/// Append default extended tail (66 bytes) to an InitMarket payload.
+/// Append default extended tail (82 bytes) to an InitMarket payload.
 /// All extended fields get default/disabled values.
 fn append_default_extended_tail(data: &mut Vec<u8>) {
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
@@ -188,7 +170,7 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&conf_filter_bps.to_le_bytes()); // conf_filter_bps
     data.push(invert); // invert flag
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -205,7 +187,7 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -231,7 +213,7 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert); // invert flag
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -248,7 +230,7 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -277,7 +259,7 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -294,7 +276,7 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     // max_crank_staleness_slots: use bounded value when permissionless resolve is enabled
     // (permissionless_resolve_stale_slots must exceed max_crank_staleness_slots)
@@ -406,7 +388,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -422,7 +404,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -463,7 +445,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -479,7 +461,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -585,7 +567,7 @@ impl TestEnv {
     pub fn new() -> Self {
         let path = program_path();
 
-        let mut svm = new_test_svm();
+        let mut svm = LiteSVM::new();
         let program_id = Pubkey::new_unique();
         let program_bytes = std::fs::read(&path).expect("Failed to read program");
         svm.add_program(program_id, &program_bytes);
@@ -1547,7 +1529,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&unit_scale.to_le_bytes());
@@ -1564,7 +1546,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&new_account_fee.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -1590,7 +1572,7 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale = 0 (no scaling)
@@ -1607,7 +1589,7 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -1756,8 +1738,8 @@ impl TestEnv {
     /// Read num_used_accounts from engine state
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = 584, num_used_accounts at engine offset 1224
-        pub const NUM_USED_OFFSET: usize = 584 + 1224;
+        // ENGINE_OFF = 472, num_used_accounts at engine offset 1224
+        pub const NUM_USED_OFFSET: usize = 472 + 1240;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -1832,9 +1814,9 @@ impl TestEnv {
     /// Check if a slot is marked as used in the bitmap
     pub fn is_slot_used(&self, idx: u16) -> bool {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = 584, offset of RiskEngine.used = 712
-        // Bitmap is [u64; 64] at offset 584 + 712 = 1216
-        pub const BITMAP_OFFSET: usize = 584 + 712;
+        // ENGINE_OFF = 440, offset of RiskEngine.used = 576 (after insurance_floor)
+        // Bitmap is [u64; 64] at offset 520 + 608 = 1016
+        pub const BITMAP_OFFSET: usize = 472 + 728;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -1852,9 +1834,9 @@ impl TestEnv {
     /// Read account capital for a slot (to verify it's zeroed after GC)
     pub fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = 584, accounts array at offset 9424 within RiskEngine
-        // Account size = 368 bytes, capital at offset 0 within Account
-        pub const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        // ENGINE_OFF = 472, accounts array at offset 9376 within RiskEngine
+        // Account size = 280 bytes, capital at offset 8 within Account (after account_id u64)
+        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0; // After account_id (u64)
         let account_offset =
@@ -1876,16 +1858,16 @@ impl TestEnv {
     /// v12.15: position_basis_q is i128 (not I256), at offset 64 in Account.
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ENGINE: usize = 584;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 9424;
+        pub const ENGINE: usize = 472;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + 9440;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const PBQ: usize = 56;       // position_basis_q: i128 (16 bytes)
         pub const A_BASIS: usize = 72;   // adl_a_basis: u128 (16 bytes)
         pub const EPOCH_SNAP: usize = 120; // adl_epoch_snap: u64 (8 bytes)
-        pub const ADL_MULT_LONG: usize = ENGINE + 392;
-        pub const ADL_MULT_SHORT: usize = ENGINE + 408;
-        pub const ADL_EPOCH_LONG: usize = ENGINE + 456;
-        pub const ADL_EPOCH_SHORT: usize = ENGINE + 464;
+        pub const ADL_MULT_LONG: usize = ENGINE + 408;
+        pub const ADL_MULT_SHORT: usize = ENGINE + 424;
+        pub const ADL_EPOCH_LONG: usize = ENGINE + 480;
+        pub const ADL_EPOCH_SHORT: usize = ENGINE + 480;
 
         let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
         if d.len() < acc_off + ACCOUNT_SIZE { return 0; }
@@ -2215,34 +2197,7 @@ pub fn encode_init_vamm(
     max_fill_abs: u128,
     max_inventory_abs: u128,
 ) -> Vec<u8> {
-    encode_init_vamm_with_id(
-        mode,
-        trading_fee_bps,
-        base_spread_bps,
-        max_total_bps,
-        impact_k_bps,
-        liquidity_notional_e6,
-        max_fill_abs,
-        max_inventory_abs,
-        1, // default synthetic lp_account_id for direct-to-matcher tests
-    )
-}
-
-/// Encode InitVamm instruction (Tag 2) — explicit `lp_account_id` variant.
-/// Matcher's `InitParams::parse` requires the full 78-byte layout; the trailing
-/// 8 bytes are the per-LP generation counter used for cross-market spoof protection.
-pub fn encode_init_vamm_with_id(
-    mode: MatcherMode,
-    trading_fee_bps: u32,
-    base_spread_bps: u32,
-    max_total_bps: u32,
-    impact_k_bps: u32,
-    liquidity_notional_e6: u128,
-    max_fill_abs: u128,
-    max_inventory_abs: u128,
-    lp_account_id: u64,
-) -> Vec<u8> {
-    let mut data = vec![0u8; 78]; // 70 + 8 (lp_account_id)
+    let mut data = vec![0u8; 66];
     data[0] = MATCHER_INIT_VAMM_TAG;
     data[1] = mode as u8;
     data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
@@ -2252,40 +2207,7 @@ pub fn encode_init_vamm_with_id(
     data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
     data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
     data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
-    // fee_to_insurance_bps at [66..68] = 0, skew_spread_mult_bps at [68..70] = 0
-    data[70..78].copy_from_slice(&lp_account_id.to_le_bytes());
     data
-}
-
-/// Encode percolator's InitMatcherCtx instruction (Tag 75)
-/// This goes to the *percolator* program, which CPIs into the matcher with
-/// the LP PDA as a PDA signer.
-pub fn encode_init_matcher_ctx(
-    lp_idx: u16,
-    kind: u8,
-    trading_fee_bps: u32,
-    base_spread_bps: u32,
-    max_total_bps: u32,
-    impact_k_bps: u32,
-    liquidity_notional_e6: u128,
-    max_fill_abs: u128,
-    max_inventory_abs: u128,
-    fee_to_insurance_bps: u16,
-    skew_spread_mult_bps: u16,
-) -> Vec<u8> {
-    let mut d = vec![75u8]; // tag 75
-    d.extend_from_slice(&lp_idx.to_le_bytes());
-    d.push(kind);
-    d.extend_from_slice(&trading_fee_bps.to_le_bytes());
-    d.extend_from_slice(&base_spread_bps.to_le_bytes());
-    d.extend_from_slice(&max_total_bps.to_le_bytes());
-    d.extend_from_slice(&impact_k_bps.to_le_bytes());
-    d.extend_from_slice(&liquidity_notional_e6.to_le_bytes());
-    d.extend_from_slice(&max_fill_abs.to_le_bytes());
-    d.extend_from_slice(&max_inventory_abs.to_le_bytes());
-    d.extend_from_slice(&fee_to_insurance_bps.to_le_bytes());
-    d.extend_from_slice(&skew_spread_mult_bps.to_le_bytes());
-    d
 }
 
 /// Encode a matcher call instruction (Tag 0)
@@ -2538,13 +2460,22 @@ pub fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
     data
 }
 
-pub fn encode_accept_admin() -> Vec<u8> {
-    vec![82u8] // Tag 82: AcceptAdmin
-}
-
 pub fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
     let mut data = vec![11u8]; // Tag 11: SetRiskThreshold
     data.extend_from_slice(&new_threshold.to_le_bytes());
+    data
+}
+
+pub fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
+    let mut data = vec![16u8]; // Tag 16: SetOracleAuthority
+    data.extend_from_slice(new_authority.as_ref());
+    data
+}
+
+pub fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
+    let mut data = vec![17u8]; // Tag 17: PushOraclePrice
+    data.extend_from_slice(&price_e6.to_le_bytes());
+    data.extend_from_slice(&timestamp.to_le_bytes());
     data
 }
 
@@ -2597,10 +2528,7 @@ pub fn encode_update_config(
 }
 
 impl TestEnv {
-    /// Try UpdateAdmin instruction.
-    /// Phase E (2026-04-17): two-step semantics. new_admin != default() sets
-    /// pending_admin only; caller must also call try_accept_admin(&new_admin_kp)
-    /// to complete the transfer. new_admin == default() still burns immediately.
+    /// Try UpdateAdmin instruction
     pub fn try_update_admin(&mut self, signer: &Keypair, new_admin: &Pubkey) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
@@ -2620,41 +2548,6 @@ impl TestEnv {
             .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
-    }
-
-    /// Try AcceptAdmin (tag 82) — second half of two-step UpdateAdmin.
-    /// Signer must match config.pending_admin (the pubkey proposed via UpdateAdmin).
-    pub fn try_accept_admin(&mut self, signer: &Keypair) -> Result<(), String> {
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new(self.slab, false),
-            ],
-            data: encode_accept_admin(),
-        };
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), ix],
-            Some(&signer.pubkey()),
-            &[signer],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
-
-    /// Helper: perform a full two-step admin rotation (UpdateAdmin + AcceptAdmin).
-    /// Returns Ok if both steps succeed. Used by tests that care about the
-    /// end state (admin actually rotated), not the intermediate pending state.
-    pub fn try_rotate_admin(
-        &mut self,
-        current_admin: &Keypair,
-        new_admin: &Keypair,
-    ) -> Result<(), String> {
-        self.try_update_admin(current_admin, &new_admin.pubkey())?;
-        self.try_accept_admin(new_admin)
     }
 
     /// Try SetRiskThreshold instruction
@@ -2684,38 +2577,69 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Phase G migration helper: replace `try_push_oracle_price`. Writes the Pyth
-    /// mock account directly (no on-chain transaction). Bumps clock unix_timestamp
-    /// by 1 to preserve the strict-monotonicity behavior the old push helper had.
-    pub fn set_oracle_price_e6(&mut self, price_e6: u64) {
+    /// Try SetOracleAuthority instruction
+    pub fn try_set_oracle_authority(
+        &mut self,
+        signer: &Keypair,
+        new_authority: &Pubkey,
+    ) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_set_oracle_authority(new_authority),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Try PushOraclePrice instruction
+    pub fn try_push_oracle_price(
+        &mut self,
+        signer: &Keypair,
+        price_e6: u64,
+        _timestamp: i64,
+    ) -> Result<(), String> {
+        // Use current clock unix_timestamp + 1 to guarantee strict monotonicity
+        // and clock anchoring. The explicit timestamp parameter is ignored —
+        // kept for API compatibility.
         let clock: Clock = self.svm.get_sysvar();
-        let ts = clock.unix_timestamp + 1;
+        let ts = clock.unix_timestamp;
+        // Bump the clock by 1 second so subsequent pushes in the same test
+        // get strictly increasing timestamps.
         self.svm.set_sysvar(&Clock {
             slot: clock.slot,
-            unix_timestamp: ts,
+            unix_timestamp: ts + 1,
             ..clock
         });
-        let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6 as i64, -6, 1, ts);
-        self.svm.set_account(
-            self.pyth_index,
-            Account {
-                lamports: 1_000_000,
-                data: pyth_data.clone(),
-                owner: PYTH_RECEIVER_PROGRAM_ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        ).unwrap();
-        self.svm.set_account(
-            self.pyth_col,
-            Account {
-                lamports: 1_000_000,
-                data: pyth_data,
-                owner: PYTH_RECEIVER_PROGRAM_ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        ).unwrap();
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_push_oracle_price(price_e6, ts),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
     }
 
     /// Try SetOraclePriceCap instruction
@@ -2916,12 +2840,12 @@ impl TestEnv {
     }
 
     /// Limited insurance withdraw by configured authority.
-    /// Live markets require oracle (8th account). Pass pyth_index for accrual.
     pub fn try_withdraw_insurance_limited(
         &mut self,
         authority: &Keypair,
         amount: u64,
     ) -> Result<(), String> {
+        // Live markets require oracle (8th account). Pass pyth_index for accrual.
         let authority_ata = self.create_ata(&authority.pubkey(), 0);
         let (vault_pda, _) =
             Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
@@ -2955,19 +2879,24 @@ impl TestEnv {
     /// which differs from BPF, we check resolved_price > 0 as a proxy.
     /// resolved_price is only set by engine.resolve_market().
     pub fn is_market_resolved(&self) -> bool {
-        // Check FLAG_RESOLVED (bit 0) in header flags byte at offset 13.
-        // This is stable across engine layout changes.
+        // resolved_price is a u64 in the engine. Its offset relative to ENGINE_OFF
+        // can be inferred: it's 8 bytes before resolved_slot, which is 8 bytes before
+        // resolved_payout_h_num. We know c_tot is at ENGINE+184.
+        // Working back: c_tot(184) - last_crank(8) - ready_pad(8) - h_den(16) - h_num(16) - resolved_slot(8) - resolved_price(8)
+        // = 184 - 64 = 120. resolved_price at ENGINE+120.
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        (d[13] & 0x01) != 0
+        let off = 472 + 240; // ENGINE_OFF + resolved_price offset
+        let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
+        rp > 0
     }
 
     /// Read insurance fund balance from engine
     pub fn read_insurance_balance(&self) -> u128 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = 584, InsuranceFund.balance is at offset 16 within engine
+        // ENGINE_OFF = 440, InsuranceFund.balance is at offset 16 within engine
         // (vault is 16 bytes at 0, insurance_fund starts at 16)
         // InsuranceFund { balance: U128, ... } - balance is first field
-        pub const INSURANCE_OFFSET: usize = 584 + 16;
+        pub const INSURANCE_OFFSET: usize = 472 + 16;
         u128::from_le_bytes(
             slab_account.data[INSURANCE_OFFSET..INSURANCE_OFFSET + 16]
                 .try_into()
@@ -3157,7 +3086,7 @@ impl TradeCpiTestEnv {
         let percolator_path = program_path();
         let matcher_path = matcher_program_path();
 
-        let mut svm = new_test_svm();
+        let mut svm = LiteSVM::new();
         let program_id = Pubkey::new_unique();
         let matcher_program_id = Pubkey::new_unique();
 
@@ -3342,8 +3271,36 @@ impl TradeCpiTestEnv {
             )
             .unwrap();
 
-        // Step 1: Init LP in percolator (registers matcher_program + matcher_context
-        // in the slab LP account).
+        // Initialize the matcher context with LP PDA
+        let init_ix = Instruction {
+            program_id: *matcher_prog,
+            accounts: vec![
+                AccountMeta::new_readonly(lp_pda, false), // LP PDA (stored for signature verification)
+                AccountMeta::new(ctx, false),             // Context account
+            ],
+            data: encode_init_vamm(
+                MatcherMode::Passive,
+                5,
+                10,
+                200,
+                0,
+                0,
+                1_000_000_000_000, // max fill
+                0,
+            ),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), init_ix],
+            Some(&owner.pubkey()),
+            &[owner],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("init matcher context failed");
+
+        // Now init LP in percolator with this matcher
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3367,45 +3324,6 @@ impl TradeCpiTestEnv {
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
         self.account_count += 1;
-
-        // Step 2: Use percolator's InitMatcherCtx (tag 75) to CPI-init the matcher
-        // context.  The LP PDA is passed as a PDA signer by the percolator
-        // program, satisfying the matcher's signer requirement.
-        let admin = &self.payer;
-        let init_ctx_ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),       // admin (signer)
-                AccountMeta::new_readonly(self.slab, false),  // slab
-                AccountMeta::new(ctx, false),                 // matcher_ctx (writable)
-                AccountMeta::new_readonly(*matcher_prog, false), // matcher_prog
-                AccountMeta::new_readonly(lp_pda, false),     // lp_pda
-            ],
-            data: encode_init_matcher_ctx(
-                idx,                    // lp_idx
-                MatcherMode::Passive as u8, // kind
-                5,                      // trading_fee_bps
-                10,                     // base_spread_bps
-                200,                    // max_total_bps
-                0,                      // impact_k_bps
-                0,                      // liquidity_notional_e6
-                1_000_000_000_000,      // max_fill_abs
-                1_000_000_000_000,      // max_inventory_abs (matcher validate() requires > 0)
-                0,                      // fee_to_insurance_bps
-                0,                      // skew_spread_mult_bps
-            ),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), init_ctx_ix],
-            Some(&admin.pubkey()),
-            &[admin],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .expect("init matcher context failed");
-
         (idx, ctx)
     }
 
@@ -3711,63 +3629,65 @@ impl TradeCpiTestEnv {
         self.svm.send_transaction(tx).expect("crank failed");
     }
 
-    /// Phase G migration helper: replace `try_push_oracle_price`. Writes the Pyth
-    /// mock account directly (no on-chain transaction). Bumps clock unix_timestamp
-    /// by 1 to preserve the strict-monotonicity behavior the old push helper had.
-    pub fn set_oracle_price_e6(&mut self, price_e6: u64) {
-        let clock: Clock = self.svm.get_sysvar();
-        let ts = clock.unix_timestamp + 1;
-        self.svm.set_sysvar(&Clock {
-            slot: clock.slot,
-            unix_timestamp: ts,
-            ..clock
-        });
-        let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6 as i64, -6, 1, ts);
-        self.svm.set_account(
-            self.pyth_index,
-            Account {
-                lamports: 1_000_000,
-                data: pyth_data.clone(),
-                owner: PYTH_RECEIVER_PROGRAM_ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        ).unwrap();
-        self.svm.set_account(
-            self.pyth_col,
-            Account {
-                lamports: 1_000_000,
-                data: pyth_data,
-                owner: PYTH_RECEIVER_PROGRAM_ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        ).unwrap();
+    pub fn try_set_oracle_authority(
+        &mut self,
+        admin: &Keypair,
+        new_authority: &Pubkey,
+    ) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_set_oracle_authority(new_authority),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
     }
 
-    /// v12.17: flatten positions via an opposing TradeCpi before resolution.
-    /// After resolution, AdminForceCloseAccount requires position == 0.
-    pub fn flatten_positions_via_trade(
+    pub fn try_push_oracle_price(
         &mut self,
-        user: &Keypair,
-        lp_owner: &Pubkey,
-        lp_idx: u16,
-        user_idx: u16,
-        matcher_prog: &Pubkey,
-        matcher_ctx: &Pubkey,
-    ) {
-        let user_pos = self.read_account_position(user_idx);
-        if user_pos != 0 {
-            let _ = self.try_trade_cpi(
-                user,
-                lp_owner,
-                lp_idx,
-                user_idx,
-                -user_pos,
-                matcher_prog,
-                matcher_ctx,
-            );
-        }
+        authority: &Keypair,
+        price_e6: u64,
+        _timestamp: i64,
+    ) -> Result<(), String> {
+        let clock: Clock = self.svm.get_sysvar();
+        let ts = clock.unix_timestamp;
+        self.svm.set_sysvar(&Clock {
+            slot: clock.slot,
+            unix_timestamp: ts + 1,
+            ..clock
+        });
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_push_oracle_price(price_e6, ts),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&authority.pubkey()),
+            &[authority],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
     }
 
     pub fn try_resolve_market(&mut self, admin: &Keypair) -> Result<(), String> {
@@ -3856,18 +3776,18 @@ impl TradeCpiTestEnv {
     }
 
     pub fn is_market_resolved(&self) -> bool {
-        // Check FLAG_RESOLVED (bit 0) in header flags byte at offset 13.
-        // This is stable across engine layout changes.
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        (d[13] & 0x01) != 0
+        let off = 472 + 240; // ENGINE_OFF + resolved_price offset (BPF)
+        let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
+        rp > 0
     }
 
     pub fn read_insurance_balance(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF = 584, InsuranceFund.balance is at offset 16 within engine
-        // (vault is 16 bytes at 0, insurance_fund starts at 16)
-        // InsuranceFund { balance: U128, ... } - balance is first field
-        pub const INSURANCE_BALANCE_OFFSET: usize = 584 + 16;
+        // ENGINE_OFF = 440
+        // RiskEngine layout: vault(U128=16) + insurance_fund(balance(U128=16) + fee_revenue(16))
+        // So insurance_fund.balance is at ENGINE_OFF + 16 = 408
+        pub const INSURANCE_BALANCE_OFFSET: usize = 472 + 16;
         u128::from_le_bytes(
             slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET + 16]
                 .try_into()
@@ -3878,16 +3798,16 @@ impl TradeCpiTestEnv {
     /// Read effective position (v12.15: position_basis_q is i128, not I256)
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ENGINE: usize = 584;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 9424;
+        pub const ENGINE: usize = 472;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + 9440;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const PBQ: usize = 56;
         pub const A_BASIS: usize = 72;
         pub const EPOCH_SNAP: usize = 120;
-        pub const ADL_MULT_LONG: usize = ENGINE + 392;
-        pub const ADL_MULT_SHORT: usize = ENGINE + 408;
-        pub const ADL_EPOCH_LONG: usize = ENGINE + 456;
-        pub const ADL_EPOCH_SHORT: usize = ENGINE + 464;
+        pub const ADL_MULT_LONG: usize = ENGINE + 408;
+        pub const ADL_MULT_SHORT: usize = ENGINE + 424;
+        pub const ADL_EPOCH_LONG: usize = ENGINE + 480;
+        pub const ADL_EPOCH_SHORT: usize = ENGINE + 480;
 
         let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
         if d.len() < acc_off + ACCOUNT_SIZE { return 0; }
@@ -3949,17 +3869,16 @@ impl TradeCpiTestEnv {
 
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF (584) + num_used_accounts offset (1224) = 1808
-        u16::from_le_bytes(slab_data[1808..1810].try_into().unwrap())
+        // ENGINE_OFF (472) + num_used_accounts offset (1240) = 1712 (v12.18.1)
+        u16::from_le_bytes(slab_data[1712..1714].try_into().unwrap())
     }
 
     /// Read pnl_pos_tot aggregate from slab
     /// This is the sum of all positive PnL values, used for haircut calculations
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF = 584
-        // pnl_pos_tot at engine offset 352
-        pub const PNL_POS_TOT_OFFSET: usize = 584 + 352;
+        // ENGINE_OFF = 472, pnl_pos_tot at engine offset 368 (after c_tot at 352)
+        pub const PNL_POS_TOT_OFFSET: usize = 472 + 368;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -3970,8 +3889,8 @@ impl TradeCpiTestEnv {
     /// Read c_tot aggregate from slab
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // c_tot is at offset 336 within RiskEngine (16 bytes before pnl_pos_tot)
-        pub const C_TOT_OFFSET: usize = 584 + 336;
+        // c_tot is at offset 264 within RiskEngine (16 bytes before pnl_pos_tot)
+        pub const C_TOT_OFFSET: usize = 472 + 352;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -3983,7 +3902,7 @@ impl TradeCpiTestEnv {
     pub fn read_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // vault is at offset 0 within RiskEngine
-        pub const VAULT_OFFSET: usize = 584;
+        pub const VAULT_OFFSET: usize = 472;
         u128::from_le_bytes(
             slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
                 .try_into()
@@ -3995,13 +3914,13 @@ impl TradeCpiTestEnv {
     pub fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // Account layout:
-        // BPF Account layout (v12.17, SBF 8-byte i128 alignment):
+        // BPF Account layout (i128 align=8):
         //   capital: U128 (16), offset 0
         //   kind: u8 (1+7pad), offset 16
         //   pnl: i128 (16), offset 24
         //   reserved_pnl: u128 (16), offset 40
         //   position_basis_q: i128 (16), offset 56
-        pub const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
@@ -4182,7 +4101,7 @@ impl TradeCpiTestEnv {
 
     pub fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0;
         let account_off =
@@ -4446,7 +4365,7 @@ impl TestEnv {
     /// Read c_tot aggregate from slab
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const C_TOT_OFFSET: usize = 584 + 336;
+        pub const C_TOT_OFFSET: usize = 472 + 352;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -4457,7 +4376,7 @@ impl TestEnv {
     /// Read vault balance from engine state
     pub fn read_engine_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const VAULT_OFFSET: usize = 584;
+        pub const VAULT_OFFSET: usize = 472;
         u128::from_le_bytes(
             slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
                 .try_into()
@@ -4468,7 +4387,7 @@ impl TestEnv {
     /// Read pnl_pos_tot aggregate from slab
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const PNL_POS_TOT_OFFSET: usize = 584 + 352;
+        pub const PNL_POS_TOT_OFFSET: usize = 472 + 368;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -4479,7 +4398,7 @@ impl TestEnv {
     /// Read account PnL for a slot
     pub fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        pub const ACCOUNTS_OFFSET: usize = 472 + 9440;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24; // BPF: i128 has 8-byte alignment
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
@@ -4870,7 +4789,7 @@ impl TestEnv {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(0u8); // invert
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -4887,7 +4806,7 @@ impl TestEnv {
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-        data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+        data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -4952,7 +4871,7 @@ impl TestEnv {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(0u8); // invert
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -4967,7 +4886,7 @@ impl TestEnv {
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-        data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+        data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -5176,10 +5095,10 @@ impl TestEnv {
     // ------------------------------------------------------------------
 
     /// Read fee_credits (i128) for an account slot.
-    /// Fee credits is at offset 224 within Account.
+    /// Fee credits is at offset 240 within Account.
     pub fn read_account_fee_credits(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
         const ACCOUNT_SIZE: usize = 352;
         const FEE_CREDITS_OFFSET: usize = 224;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
@@ -5189,12 +5108,25 @@ impl TestEnv {
         i128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
     }
 
+    /// Read fees_earned_total (u128) for an account slot.
+    /// fees_earned_total is at offset 264 within Account.
+    pub fn read_account_fees_earned_total(&self, idx: u16) -> u128 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
+        const ACCOUNT_SIZE: usize = 352;
+        const FEES_EARNED_OFFSET: usize = 264;
+        let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEES_EARNED_OFFSET;
+        if slab_data.len() < off + 16 {
+            return 0;
+        }
+        u128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
+    }
 
     /// Read warmup_started_at_slot (u64) for an account slot.
     /// warmup_started_at_slot is at offset 64 within Account.
     pub fn read_account_warmup_started_at_slot(&self, idx: u16) -> u64 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
         const ACCOUNT_SIZE: usize = 352;
         const WARMUP_SLOT_OFFSET: usize = 64;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + WARMUP_SLOT_OFFSET;
@@ -5208,9 +5140,9 @@ impl TestEnv {
     /// reserved_pnl is at offset 48 within Account.
     pub fn read_account_reserved_pnl(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
         const ACCOUNT_SIZE: usize = 352;
-        const RESERVED_PNL_OFFSET: usize = 40;
+        const RESERVED_PNL_OFFSET: usize = 40; // BPF: u128 has 8-byte alignment
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + RESERVED_PNL_OFFSET;
         if slab_data.len() < off + 16 {
             return 0;
@@ -5224,7 +5156,7 @@ impl TestEnv {
     ///   kind: u8 at offset 16
     pub fn read_account_kind(&self, idx: u16) -> u8 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
         const ACCOUNT_SIZE: usize = 352;
         const KIND_OFFSET: usize = 16;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
@@ -5235,10 +5167,10 @@ impl TestEnv {
     }
 
     /// Read matcher_program ([u8; 32]) for an account slot.
-    /// matcher_program is at offset 128 within Account (BPF layout).
+    /// matcher_program is at offset 144 within Account (BPF layout).
     pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
         const ACCOUNT_SIZE: usize = 352;
         const MATCHER_PROG_OFFSET: usize = 128;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
@@ -5248,10 +5180,10 @@ impl TestEnv {
     }
 
     /// Read matcher_context ([u8; 32]) for an account slot.
-    /// matcher_context is at offset 160 within Account (BPF layout).
+    /// matcher_context is at offset 176 within Account (BPF layout).
     pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 9424;
+        const ACCOUNTS_OFFSET: usize = 472 + 9440;
         const ACCOUNT_SIZE: usize = 352;
         const MATCHER_CTX_OFFSET: usize = 160;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
@@ -7492,7 +7424,7 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -7509,7 +7441,7 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -7539,7 +7471,7 @@ pub fn encode_init_market_with_maintenance_fee(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -7555,7 +7487,7 @@ pub fn encode_init_market_with_maintenance_fee(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -7580,7 +7512,7 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -7596,7 +7528,7 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&insurance_floor.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -7665,8 +7597,8 @@ impl TestEnv {
     pub fn read_insurance_floor(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // insurance_floor is now in params.insurance_floor (no separate engine field).
-        // params at engine offset 32, insurance_floor at params offset 144.
-        pub const INSURANCE_FLOOR_OFFSET: usize = 584 + 32 + 144;
+        // params at engine offset 32, insurance_floor at params offset 168.
+        pub const INSURANCE_FLOOR_OFFSET: usize = 472 + 32 + 144;
         u128::from_le_bytes(
             slab_data[INSURANCE_FLOOR_OFFSET..INSURANCE_FLOOR_OFFSET + 16]
                 .try_into()
