@@ -104,7 +104,11 @@ fn test_insurance_fund_traps_funds_preventing_closeslab() {
 
     // Users close their accounts
     let user_close = env.try_close_account(&user, user_idx);
-    assert!(user_close.is_ok(), "User close should succeed: {:?}", user_close);
+    assert!(
+        user_close.is_ok(),
+        "User close should succeed: {:?}",
+        user_close
+    );
 
     let lp_close = env.try_close_account(&lp, lp_idx);
     assert!(lp_close.is_ok(), "LP close should succeed: {:?}", lp_close);
@@ -929,7 +933,7 @@ fn test_attack_withdraw_insurance_with_open_positions() {
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
 
     // Resolve market
-    let result = env.try_resolve_market(&admin);
+    let result = env.try_resolve_market(&admin, 0);
     assert!(result.is_ok(), "Should resolve: {:?}", result);
 
     let user_pos_before = env.read_account_position(user_idx);
@@ -1036,7 +1040,7 @@ fn test_attack_topup_insurance_after_resolution() {
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("market resolution setup must succeed");
 
     let insurance_before = env.read_insurance_balance();
@@ -1056,7 +1060,10 @@ fn test_attack_topup_insurance_after_resolution() {
     let vault_after = env.vault_balance();
     let used_after = env.read_num_used_accounts();
     let resolved_after = env.is_market_resolved();
-    assert!(resolved_before, "Precondition: market should already be resolved");
+    assert!(
+        resolved_before,
+        "Precondition: market should already be resolved"
+    );
     assert_eq!(
         resolved_after, resolved_before,
         "Rejected top-up on resolved market must not change resolved flag"
@@ -1107,7 +1114,7 @@ fn test_attack_topup_insurance_insufficient_balance() {
             AccountMeta::new(ata, false),
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data,
     };
@@ -1485,7 +1492,7 @@ fn test_attack_topup_insurance_wrong_vault() {
             AccountMeta::new(ata, false),
             AccountMeta::new(fake_vault, false), // Wrong vault
             AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data,
     };
@@ -1540,8 +1547,8 @@ fn test_attack_topup_insurance_unit_scale_dust() {
 
     // Top up insurance with amount not aligned to unit_scale
     let result = env.try_top_up_insurance(&admin, 999); // Not aligned to 1000
-    // Insurance topup may succeed but 999 / 1000 = 0 units (dust lost to protocol).
-    // If rejected, insurance should still remain unchanged at 0.
+                                                        // Insurance topup may succeed but 999 / 1000 = 0 units (dust lost to protocol).
+                                                        // If rejected, insurance should still remain unchanged at 0.
     let insurance_after_dust = env.read_insurance_balance();
     assert_eq!(
         insurance_after_dust, 0,
@@ -1598,7 +1605,11 @@ fn test_attack_insurance_topup_from_non_admin() {
 
     // Non-admin tops up insurance — TopUpInsurance does not require admin
     let result = env.try_top_up_insurance(&random_user, 1_000_000_000);
-    assert!(result.is_ok(), "Anyone should be able to top up insurance: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Anyone should be able to top up insurance: {:?}",
+        result
+    );
 
     let vault = env.vault_balance();
     let engine_vault = env.read_engine_vault();
@@ -1662,7 +1673,7 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     env.set_oracle_price_e6(138_000_000);
 
     // Resolve market (premarket resolution)
-    let result = env.try_resolve_market(&admin);
+    let result = env.try_resolve_market(&admin, 0);
     assert!(result.is_ok(), "Resolve should succeed: {:?}", result);
     assert!(env.is_market_resolved(), "Market should be resolved");
 
@@ -1672,26 +1683,56 @@ fn test_withdraw_insurance_decrements_engine_vault() {
 
     // Admin force-close both accounts (zeros positions, handles PnL settlement, fee forgiveness)
     let result = env.try_admin_force_close_account(&admin, user_idx, &user.pubkey());
-    assert!(result.is_ok(), "Admin force close user should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin force close user should succeed: {:?}",
+        result
+    );
 
     let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
-    assert!(result.is_ok(), "Admin force close LP should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin force close LP should succeed: {:?}",
+        result
+    );
 
     // Verify positions are zeroed after AdminForceCloseAccount
-    assert_eq!(env.read_account_position(user_idx), 0, "User position should be 0 after AdminForceCloseAccount");
-    assert_eq!(env.read_account_position(lp_idx), 0, "LP position should be 0 after AdminForceCloseAccount");
+    assert_eq!(
+        env.read_account_position(user_idx),
+        0,
+        "User position should be 0 after AdminForceCloseAccount"
+    );
+    assert_eq!(
+        env.read_account_position(lp_idx),
+        0,
+        "LP position should be 0 after AdminForceCloseAccount"
+    );
 
-    assert_eq!(env.read_num_used_accounts(), 0, "All accounts should be closed");
+    assert_eq!(
+        env.read_num_used_accounts(),
+        0,
+        "All accounts should be closed"
+    );
 
     // Record vault before WithdrawInsurance
     let vault_before = env.read_engine_vault();
     let insurance = env.read_insurance_balance();
-    assert!(insurance > 0, "Insurance should still have balance before withdrawal");
-    assert!(vault_before > 0, "Vault should be non-zero before withdrawal");
+    assert!(
+        insurance > 0,
+        "Insurance should still have balance before withdrawal"
+    );
+    assert!(
+        vault_before > 0,
+        "Vault should be non-zero before withdrawal"
+    );
 
     // Withdraw insurance
     let result = env.try_withdraw_insurance(&admin);
-    assert!(result.is_ok(), "WithdrawInsurance should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "WithdrawInsurance should succeed: {:?}",
+        result
+    );
 
     // CRITICAL ASSERTION: engine.vault must be decremented by the insurance amount
     let vault_after = env.read_engine_vault();
@@ -1700,12 +1741,19 @@ fn test_withdraw_insurance_decrements_engine_vault() {
         vault_before - insurance,
         "engine.vault must be decremented by insurance amount. \
          Before: {}, Insurance: {}, After: {} (expected {})",
-        vault_before, insurance, vault_after, vault_before - insurance
+        vault_before,
+        insurance,
+        vault_after,
+        vault_before - insurance
     );
 
     // CloseSlab requires engine.vault == 0
     let result = env.try_close_slab();
-    assert!(result.is_ok(), "CloseSlab should succeed after WithdrawInsurance: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "CloseSlab should succeed after WithdrawInsurance: {:?}",
+        result
+    );
 
     println!("WITHDRAW INSURANCE DECREMENTS ENGINE VAULT: PASSED");
 }
@@ -1808,7 +1856,7 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams
+                                                 // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup
     data.extend_from_slice(&500u64.to_le_bytes()); // mm_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // im_bps
@@ -1822,8 +1870,8 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liq_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&10001u16.to_le_bytes()); // insurance_withdraw_max_bps > 10000
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
     data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_floor_change_per_day
@@ -1835,7 +1883,8 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
     data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
 
-    let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
     let ix = Instruction {
         program_id: env.program_id,
         accounts: vec![
@@ -1843,19 +1892,22 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
             AccountMeta::new(env.slab, false),
             AccountMeta::new_readonly(env.mint, false),
             AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(Pubkey::new_unique(), false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
     };
     let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix], Some(&admin.pubkey()), &[&admin], env.svm.latest_blockhash(),
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "insurance_withdraw_max_bps > 10000 must be rejected");
+    assert!(
+        result.is_err(),
+        "insurance_withdraw_max_bps > 10000 must be rejected"
+    );
 
     // Slab header must remain all-zeros (uninitialized) after rejected InitMarket
     let slab_after = env.svm.get_account(&env.slab).unwrap();
@@ -1909,11 +1961,13 @@ fn test_top_up_insurance_increases_balance() {
     let vault_after = env.vault_balance();
 
     assert_eq!(
-        insurance_after - insurance_before, amount as u128,
+        insurance_after - insurance_before,
+        amount as u128,
         "Insurance balance must increase by the top-up amount"
     );
     assert_eq!(
-        vault_after - vault_before, amount,
+        vault_after - vault_before,
+        amount,
         "Vault SPL balance must increase by the top-up amount"
     );
 }
@@ -1942,8 +1996,8 @@ fn encode_update_config_with_cap_tag(k: u16) -> Vec<u8> {
     data.extend_from_slice(&3600u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&100i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&10i64.to_le_bytes());  // funding_max_e9_per_slot
-    data.extend_from_slice(&k.to_le_bytes());      // tvl_insurance_cap_mult
+    data.extend_from_slice(&10i64.to_le_bytes()); // funding_max_e9_per_slot
+    data.extend_from_slice(&k.to_le_bytes()); // tvl_insurance_cap_mult
     data
 }
 
@@ -1953,7 +2007,10 @@ fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), 
         accounts: vec![
             solana_sdk::instruction::AccountMeta::new(admin.pubkey(), true),
             solana_sdk::instruction::AccountMeta::new(env.slab, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                solana_sdk::sysvar::clock::ID,
+                false,
+            ),
             solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
         ],
         data: encode_update_config_with_cap_tag(k),
@@ -1964,7 +2021,10 @@ fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), 
         &[admin],
         env.svm.latest_blockhash(),
     );
-    env.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
 }
 
 /// Fresh markets default to cap disabled (k=0).
@@ -1994,8 +2054,9 @@ fn test_deposit_cap_enable_via_update_config() {
     assert_eq!(cfg.tvl_insurance_cap_mult, 20, "cap must persist");
 }
 
-/// Cap enabled with k=20 and insurance=1_000 must reject a deposit of
-/// 20_001 (exceeds 20 * 1_000 = 20_000) and accept a deposit of 20_000.
+/// Cap enabled with k=20 and insurance=1_000 must include the mandatory
+/// account-open fee in post-init insurance. InitUser adds 1 insurance unit
+/// and 99 capital units, so the post-init ceiling is 20 * 1_001 = 20_020.
 #[test]
 fn test_deposit_cap_enforced() {
     program_path();
@@ -2004,23 +2065,26 @@ fn test_deposit_cap_enforced() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Seed insurance so the cap denominator is nonzero.
     let insurance_payer = Keypair::new();
-    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
     env.top_up_insurance(&insurance_payer, 1_000);
     assert_eq!(env.read_insurance_balance(), 1_000);
 
-    // Enable the cap at k=20 → ceiling = 20_000 units of c_tot.
+    // Enable the cap at k=20. After InitUser's anti-spam split, the
+    // ceiling is 20_020 units of c_tot.
     send_update_config(&mut env, &admin, 20).expect("enable cap");
 
-    // init_user itself deposits a 100-unit account-open fee, so c_tot = 100
-    // immediately after onboarding. Cap ceiling is 20_000 units.
+    // init_user splits 100 into 1 insurance + 99 capital, so c_tot = 99
+    // immediately after onboarding and insurance = 1_001.
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
 
-    // Exact-at-ceiling deposit: 100 (already there) + 19_900 = 20_000 = cap.
-    env.try_deposit(&user, user_idx, 19_900)
+    // Exact-at-ceiling deposit: 99 (already there) + 19_921 = 20_020 = cap.
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("deposit at ceiling must succeed");
 
-    // Next deposit of 1 would push c_tot to 20_001 > 20_000 → reject.
+    // Next deposit of 1 would push c_tot to 20_021 > 20_020 → reject.
     let over = env.try_deposit(&user, user_idx, 1);
     assert!(
         over.is_err(),
@@ -2036,7 +2100,11 @@ fn test_deposit_cap_disabled_allows_any_deposit() {
     env.init_market_with_invert(0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Do NOT call UpdateConfig — cap stays at default 0.
-    assert_eq!(env.read_insurance_balance(), 0, "fresh market has zero insurance");
+    assert_eq!(
+        env.read_insurance_balance(),
+        0,
+        "fresh market has zero insurance"
+    );
 
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
@@ -2177,8 +2245,7 @@ fn test_deposit_cap_widened_unblocks_deposit() {
     assert_eq!(insurance_before, 10_000);
 
     // Withdraw 500 units (5% of 10_000 = 500, exactly at cap).
-    send_withdraw_limited(&mut env, &admin, 500)
-        .expect("operator withdrawal at cap must succeed");
+    send_withdraw_limited(&mut env, &admin, 500).expect("operator withdrawal at cap must succeed");
 
     assert_eq!(env.read_insurance_balance(), 10_000 - 500);
     assert_eq!(env.vault_balance(), vault_before - 500);
@@ -2197,7 +2264,10 @@ fn test_withdraw_limited_cooldown_enforced() {
     // Advance only a few slots (still inside cooldown=1000).
     env.set_slot(1);
     let blocked = send_withdraw_limited(&mut env, &admin, 50);
-    assert!(blocked.is_err(), "second call within cooldown must be rejected");
+    assert!(
+        blocked.is_err(),
+        "second call within cooldown must be rejected"
+    );
 }
 
 /// 3. After cooldown: second call succeeds.
@@ -2210,8 +2280,7 @@ fn test_withdraw_limited_after_cooldown_accepted() {
 
     send_withdraw_limited(&mut env, &admin, 100).expect("first call");
     env.set_slot(200); // past cooldown of 100
-    send_withdraw_limited(&mut env, &admin, 100)
-        .expect("post-cooldown call must succeed");
+    send_withdraw_limited(&mut env, &admin, 100).expect("post-cooldown call must succeed");
 }
 
 /// 4. Amount exceeding per-call cap is rejected.
@@ -2244,8 +2313,8 @@ fn test_withdraw_limited_zero_insurance_rejects() {
     program_path();
     let mut env = TestEnv::new();
     setup_bounded_withdrawal(&mut env, 0, 500, 100); // no insurance seeded in call
-    // setup_bounded_withdrawal tops up `insurance`; pass 0 to skip.
-    // But top_up_insurance(0) is a noop that still packs data — just assert 0.
+                                                     // setup_bounded_withdrawal tops up `insurance`; pass 0 to skip.
+                                                     // But top_up_insurance(0) is a noop that still packs data — just assert 0.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Force insurance to zero: init already does so, and our call passed 0
@@ -2298,7 +2367,7 @@ fn test_withdraw_limited_operator_cannot_call_tag_20() {
     // tag 20 would succeed for insurance_authority, but not for operator.
     env.set_slot_and_price(200, 1_000_000);
     env.crank();
-    env.try_resolve_market(&admin).expect("admin resolves");
+    env.try_resolve_market(&admin, 0).expect("admin resolves");
 
     // Operator attempts tag 20: must fail (auth mismatch).
     let bypass = env.try_withdraw_insurance(&operator);
@@ -2383,7 +2452,7 @@ fn test_withdraw_limited_resolved_market_rejects() {
 
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("admin can resolve live market");
 
     let result = send_withdraw_limited(&mut env, &admin, 100);
@@ -2417,22 +2486,21 @@ fn test_bounded_withdrawal_tightens_deposit_cap() {
     // Enable deposit cap at k=20. UpdateConfig also sets funding params.
     send_update_config(&mut env, &admin, 20).expect("enable deposit cap k=20");
 
-    // Fill up to the cap: c_tot = init_user_fee(100) + user_deposit(19_900)
-    // = 20_000 = k × insurance (1000 × 20).
+    // Fill up to the cap: c_tot = init capital(99) + user_deposit(19_921)
+    // = 20_020 = k × insurance (1001 × 20).
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.try_deposit(&user, user_idx, 19_900)
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("initial deposit at ceiling must succeed");
     let ins_before = env.read_insurance_balance();
-    assert_eq!(ins_before, 1_000);
+    assert_eq!(ins_before, 1_001);
 
     // Operator withdraws 500 insurance (exactly at the 50% bps cap).
-    send_withdraw_limited(&mut env, &admin, 500)
-        .expect("operator withdraws 500");
+    send_withdraw_limited(&mut env, &admin, 500).expect("operator withdraws 500");
     let ins_after = env.read_insurance_balance();
-    assert_eq!(ins_after, 500, "insurance must drop by withdrawal amount");
+    assert_eq!(ins_after, 501, "insurance must drop by withdrawal amount");
 
-    // Cap shrank: 500 × 20 = 10_000 < c_tot (20_000). Further deposit blocked.
+    // Cap shrank: 501 × 20 = 10_020 < c_tot (20_020). Further deposit blocked.
     let blocked = env.try_deposit(&user, user_idx, 1);
     assert!(
         blocked.is_err(),
@@ -2454,23 +2522,24 @@ fn test_deposit_cap_bypassed_via_init_user() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Seed insurance, enable the cap with k=20 → ceiling = 20_000 units.
     let insurance_payer = Keypair::new();
-    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
     env.top_up_insurance(&insurance_payer, 1_000);
     send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
 
-    // First user fills to ceiling via init_user (100) + deposit (19_800)
-    // → c_tot = 19_900. One more unit via normal deposit would exceed
-    // 20_000 — so the deposit path is blocked.
+    // First user fills to ceiling via init_user (99 capital, 1 insurance)
+    // + deposit (19_921) → c_tot = 20_020. One more unit via normal
+    // deposit would exceed the post-init cap.
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.try_deposit(&user, user_idx, 19_800)
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("fill close to ceiling");
-    let blocked = env.try_deposit(&user, user_idx, 101);
+    let blocked = env.try_deposit(&user, user_idx, 1);
     assert!(blocked.is_err(), "DepositCollateral correctly enforces cap");
 
     // SECURITY CHECK: a FRESH account created via init_user with a large
-    // fee_payment should ALSO be blocked — c_tot_new = 19_900 + 10_000 =
-    // 29_900, which exceeds the 20_000 cap. The cap must apply to every
+    // fee_payment should ALSO be blocked. The cap must apply to every
     // capital-adding path, not just DepositCollateral.
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();

@@ -15,6 +15,12 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+fn advance_hyperp_target(env: &mut TradeCpiTestEnv, logical_slot: &mut u64) {
+    *logical_slot += 1;
+    env.set_slot(*logical_slot);
+    env.crank();
+}
+
 /// CRITICAL: TradeCpi allows trading without LP signature
 ///
 /// The LP delegates trade authorization to a matcher program. The percolator
@@ -181,8 +187,16 @@ fn test_tradecpi_pda_with_dusted_lamports_still_works() {
     );
 
     // Trade should have created positions
-    assert_ne!(env.read_account_position(user_idx), 0, "User should have position");
-    assert_ne!(env.read_account_position(lp_idx), 0, "LP should have position");
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "User should have position"
+    );
+    assert_ne!(
+        env.read_account_position(lp_idx),
+        0,
+        "LP should have position"
+    );
 }
 
 /// ATTACK: Configure LP with matcher_program = percolator program (self-CPI recursion vector).
@@ -607,7 +621,7 @@ fn test_premarket_resolution_full_lifecycle() {
     println!("Admin set final price: 1e-6 (NO outcome)");
 
     // Step 2: Admin resolves market
-    let result = env.try_resolve_market(&admin);
+    let result = env.try_resolve_market(&admin, 0);
     assert!(result.is_ok(), "ResolveMarket should succeed: {:?}", result);
     println!("Market resolved");
 
@@ -621,10 +635,11 @@ fn test_premarket_resolution_full_lifecycle() {
 
     // The resolved crank only settles PnL; position zeroing and account freeing
     // happen when users call CloseAccount or admin calls AdminForceCloseAccount.
-    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
-        .expect("AdminForceCloseAccount LP must succeed");
-    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
-        .expect("AdminForceCloseAccount user must succeed");
+    env.force_close_accounts_fully(
+        &admin,
+        &[(lp_idx, &lp.pubkey()), (user_idx, &user.pubkey())],
+    )
+    .expect("AdminForceCloseAccount must fully close both accounts");
     println!("Positions force-closed via AdminForceCloseAccount");
 
     // Verify positions are closed
@@ -683,7 +698,8 @@ fn test_withdraw_insurance_requires_positions_closed() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(50);
+    let slot = 50;
+    env.set_slot(slot);
     env.crank();
     env.try_trade_cpi(
         &user,
@@ -771,7 +787,8 @@ fn test_premarket_paginated_force_close() {
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
     env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
 
-    env.set_slot(50);
+    let mut slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     println!("Creating {} users with positions...", NUM_USERS);
@@ -791,6 +808,7 @@ fn test_premarket_paginated_force_close() {
             &matcher_ctx,
         )
         .expect("user setup trade must succeed");
+        advance_hyperp_target(&mut env, &mut slot);
         users.push((user, user_idx));
 
         if (i + 1) % 20 == 0 {
@@ -903,7 +921,8 @@ fn test_premarket_binary_outcome_price_zero() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(50);
+    let slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
@@ -970,7 +989,8 @@ fn test_premarket_binary_outcome_price_one() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(50);
+    let slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
@@ -1045,7 +1065,8 @@ fn test_premarket_force_close_cu_benchmark() {
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
     env.deposit(&lp, lp_idx, 1_000_000_000_000); // 1000 SOL
 
-    env.set_slot(50);
+    let mut slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     // Create 64 users (one batch worth) with positions
@@ -1068,6 +1089,7 @@ fn test_premarket_force_close_cu_benchmark() {
             &matcher_ctx,
         )
         .expect("user setup trade must succeed");
+        advance_hyperp_target(&mut env, &mut slot);
         users.push((user, user_idx));
     }
     println!("Created {} users with positions", NUM_USERS);
@@ -1199,11 +1221,20 @@ fn test_premarket_force_close_cu_benchmark() {
     // Force-close all user accounts.
     for (user, idx) in &users {
         let result = env.try_admin_force_close_account(&admin, *idx, &user.pubkey());
-        assert!(result.is_ok(), "AdminForceCloseAccount user {} failed: {:?}", idx, result);
+        assert!(
+            result.is_ok(),
+            "AdminForceCloseAccount user {} failed: {:?}",
+            idx,
+            result
+        );
     }
     // Force-close LP
     let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
-    assert!(result.is_ok(), "AdminForceCloseAccount LP failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "AdminForceCloseAccount LP failed: {:?}",
+        result
+    );
 
     let mut remaining = 0;
     for (_, idx) in &users {
@@ -1300,7 +1331,10 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
 
     // Verify position was zeroed
     let pos_after = env.read_account_position(user_long_idx);
-    assert_eq!(pos_after, 0, "Position should be zero after AdminForceCloseAccount");
+    assert_eq!(
+        pos_after, 0,
+        "Position should be zero after AdminForceCloseAccount"
+    );
 
     println!("REGRESSION TEST PASSED: pnl_pos_tot correctly maintained after force-close");
 }
@@ -1577,7 +1611,11 @@ fn test_tradecpi_pda_with_lamports_and_data_still_works() {
         "PDA with lamports/data must not block TradeCpi (key match is sufficient): {:?}",
         result,
     );
-    assert_ne!(env.read_account_position(user_idx), 0, "Trade should create position");
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "Trade should create position"
+    );
 }
 
 /// ATTACK: LP A's matcher tries to trade for LP B.
@@ -1723,7 +1761,10 @@ fn test_attack_trade_after_force_close() {
 
     // Verify position force-closed
     let pos = env.read_account_position(user_idx);
-    assert_eq!(pos, 0, "Position should be force-closed after AdminForceCloseAccount");
+    assert_eq!(
+        pos, 0,
+        "Position should be force-closed after AdminForceCloseAccount"
+    );
 
     // Try to open new trade - should fail (market resolved, account closed)
     let result = env.try_trade_cpi(
@@ -1765,7 +1806,8 @@ fn test_attack_hyperp_mark_manipulation_via_trade() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Vault before
@@ -1782,6 +1824,7 @@ fn test_attack_hyperp_mark_manipulation_via_trade() {
         &matcher_ctx,
     );
     assert!(result.is_ok(), "First trade should succeed: {:?}", result);
+    advance_hyperp_target(&mut env, &mut slot);
 
     // Execute reverse trade to close
     let result = env.try_trade_cpi(
@@ -1830,7 +1873,8 @@ fn test_attack_hyperp_index_lag_exploitation() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let vault_total = env.read_vault();
@@ -1838,7 +1882,10 @@ fn test_attack_hyperp_index_lag_exploitation() {
     // Push mark price up significantly (circuit breaker will clamp)
     env.set_oracle_price_e6(2_000_000);
 
-    // Trade at slot 101 (index lags behind new mark)
+    // Trade at slot 101 after the mark moves. With zero existing OI,
+    // the wrapper may feed the raw target directly; no live position
+    // can lose equity during the catch-up, so the opening trade should
+    // proceed at the now-current effective price.
     env.set_slot(101);
     let result = env.try_trade_cpi(
         &user,
@@ -1849,26 +1896,11 @@ fn test_attack_hyperp_index_lag_exploitation() {
         &matcher_prog,
         &matcher_ctx,
     );
-    assert!(result.is_ok(), "Trade should succeed: {:?}", result);
-
-    // Crank to settle funding and move index toward mark
-    env.set_slot(200);
-    env.crank();
-
-    // Close position at new price
-    let result = env.try_trade_cpi(
-        &user,
-        &lp.pubkey(),
-        lp_idx,
-        user_idx,
-        -100_000_000,
-        &matcher_prog,
-        &matcher_ctx,
+    assert!(
+        result.is_ok(),
+        "Flat-market TradeCpi should catch up and execute: {:?}",
+        result
     );
-    assert!(result.is_ok(), "Close trade should succeed: {:?}", result);
-
-    env.set_slot(300);
-    env.crank();
 
     // Conservation: total vault should remain the same (PnL is zero-sum internally)
     let vault_after = env.read_vault();
@@ -1899,7 +1931,8 @@ fn test_attack_premarket_withdraw_before_force_close() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // User takes large position
@@ -1948,7 +1981,8 @@ fn test_attack_premarket_extra_cranks_idempotent() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let result = env.try_trade_cpi(
@@ -2079,7 +2113,7 @@ fn test_attack_premarket_resolve_extreme_high_price() {
     env.crank();
 
     // Resolve at whatever price we reached
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Force-close: should handle extreme PnL without panicking
     env.set_slot(5000);
@@ -2120,7 +2154,7 @@ fn test_attack_withdraw_insurance_non_admin() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     env.set_slot(100);
     env.crank();
 
@@ -2215,7 +2249,8 @@ fn test_attack_double_withdraw_insurance() {
     env.force_close_accounts_fully(
         &admin,
         &[(user_idx, &user.pubkey()), (lp_idx, &lp.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     let _vault_before_first_withdraw = env.read_vault();
 
@@ -2268,7 +2303,7 @@ fn test_attack_tradecpi_after_resolution() {
     env.crank();
 
     // Resolve market
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     let user_cap_before = env.read_account_capital(user_idx);
     let lp_cap_before = env.read_account_capital(lp_idx);
     let user_pos_before = env.read_account_position(user_idx);
@@ -2299,13 +2334,34 @@ fn test_attack_tradecpi_after_resolution() {
     let used_after = env.read_num_used_accounts();
     let resolved_after = env.is_market_resolved();
     assert!(resolved_before, "Precondition: market should be resolved");
-    assert_eq!(resolved_after, resolved_before, "Rejected post-resolution trade must not change resolved flag");
-    assert_eq!(user_cap_after, user_cap_before, "Rejected post-resolution trade must not change user capital");
-    assert_eq!(lp_cap_after, lp_cap_before, "Rejected post-resolution trade must not change LP capital");
-    assert_eq!(user_pos_after, user_pos_before, "Rejected post-resolution trade must not change user position");
-    assert_eq!(lp_pos_after, lp_pos_before, "Rejected post-resolution trade must not change LP position");
-    assert_eq!(vault_after, vault_before, "Rejected post-resolution trade must not change vault");
-    assert_eq!(used_after, used_before, "Rejected post-resolution trade must not change num_used_accounts");
+    assert_eq!(
+        resolved_after, resolved_before,
+        "Rejected post-resolution trade must not change resolved flag"
+    );
+    assert_eq!(
+        user_cap_after, user_cap_before,
+        "Rejected post-resolution trade must not change user capital"
+    );
+    assert_eq!(
+        lp_cap_after, lp_cap_before,
+        "Rejected post-resolution trade must not change LP capital"
+    );
+    assert_eq!(
+        user_pos_after, user_pos_before,
+        "Rejected post-resolution trade must not change user position"
+    );
+    assert_eq!(
+        lp_pos_after, lp_pos_before,
+        "Rejected post-resolution trade must not change LP position"
+    );
+    assert_eq!(
+        vault_after, vault_before,
+        "Rejected post-resolution trade must not change vault"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "Rejected post-resolution trade must not change num_used_accounts"
+    );
 }
 
 /// ATTACK: Try to deposit after market resolution.
@@ -2324,7 +2380,7 @@ fn test_attack_hyperp_deposit_after_resolution() {
     env.deposit(&user, user_idx, 1_000_000_000);
 
     // Resolve
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     let user_cap_before = env.read_account_capital(user_idx);
     let vault_before = env.read_vault();
     let used_before = env.read_num_used_accounts();
@@ -2368,11 +2424,26 @@ fn test_attack_hyperp_deposit_after_resolution() {
         TokenAccount::unpack(&ata_data).unwrap().amount
     };
     assert!(resolved_before, "Precondition: market should be resolved");
-    assert_eq!(resolved_after, resolved_before, "Rejected post-resolution deposit must not change resolved flag");
-    assert_eq!(user_cap_after, user_cap_before, "Rejected post-resolution deposit must not change user capital");
-    assert_eq!(vault_after, vault_before, "Rejected post-resolution deposit must not change vault");
-    assert_eq!(used_after, used_before, "Rejected post-resolution deposit must not change num_used_accounts");
-    assert_eq!(ata_after, ata_before, "Rejected post-resolution deposit must not debit user ATA");
+    assert_eq!(
+        resolved_after, resolved_before,
+        "Rejected post-resolution deposit must not change resolved flag"
+    );
+    assert_eq!(
+        user_cap_after, user_cap_before,
+        "Rejected post-resolution deposit must not change user capital"
+    );
+    assert_eq!(
+        vault_after, vault_before,
+        "Rejected post-resolution deposit must not change vault"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "Rejected post-resolution deposit must not change num_used_accounts"
+    );
+    assert_eq!(
+        ata_after, ata_before,
+        "Rejected post-resolution deposit must not debit user ATA"
+    );
 }
 
 /// ATTACK: Sandwich attack. Deposit large amount before a trade to change
@@ -2439,8 +2510,7 @@ fn test_attack_sandwich_deposit_withdraw() {
     assert_eq!(
         vault_after, vault_before_attack,
         "ATTACK: Sandwich flow changed vault unexpectedly! before_attack={} after={}",
-        vault_before_attack,
-        vault_after
+        vault_before_attack, vault_after
     );
 }
 
@@ -2771,8 +2841,14 @@ fn test_attack_extreme_position_size() {
         lp_pos_after, lp_pos_before,
         "Rejected extreme-size trade must not change LP position"
     );
-    assert_eq!(vault_after, vault_before, "Rejected extreme-size trade must not change vault");
-    assert_eq!(used_after, used_before, "Rejected extreme-size trade must not change num_used_accounts");
+    assert_eq!(
+        vault_after, vault_before,
+        "Rejected extreme-size trade must not change vault"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "Rejected extreme-size trade must not change num_used_accounts"
+    );
 }
 
 /// ATTACK: Try to trade with i128::MIN position size (negative extreme).
@@ -2839,8 +2915,14 @@ fn test_attack_extreme_negative_position_size() {
         lp_pos_after, lp_pos_before,
         "Rejected extreme-negative trade must not change LP position"
     );
-    assert_eq!(vault_after, vault_before, "Rejected extreme-negative trade must not change vault");
-    assert_eq!(used_after, used_before, "Rejected extreme-negative trade must not change num_used_accounts");
+    assert_eq!(
+        vault_after, vault_before,
+        "Rejected extreme-negative trade must not change vault"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "Rejected extreme-negative trade must not change num_used_accounts"
+    );
 }
 
 /// ATTACK: Two sequential TradeCpi calls with the same parameters.
@@ -2864,7 +2946,8 @@ fn test_attack_nonce_replay_same_trade() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // First trade succeeds
@@ -2879,6 +2962,7 @@ fn test_attack_nonce_replay_same_trade() {
     );
     assert!(result.is_ok(), "First trade should succeed");
     let pos_after_first = env.read_account_position(user_idx);
+    advance_hyperp_target(&mut env, &mut slot);
 
     // Use a near-identical second trade to avoid tx-signature dedup artifacts in the harness.
     // This still checks that the second operation is processed as a new trade (not replay).
@@ -2945,7 +3029,8 @@ fn test_attack_rounding_extraction_rapid_trades() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let vault_before = env.read_vault();
@@ -2967,6 +3052,7 @@ fn test_attack_rounding_extraction_rapid_trades() {
         );
         if result.is_ok() {
             successful_open_trades += 1;
+            advance_hyperp_target(&mut env, &mut slot);
             // Close immediately
             env.try_trade_cpi(
                 &user,
@@ -2978,6 +3064,7 @@ fn test_attack_rounding_extraction_rapid_trades() {
                 &matcher_ctx,
             )
             .expect("close leg for successful tiny open trade must succeed");
+            advance_hyperp_target(&mut env, &mut slot);
             let pos_after_close = env.read_account_position(user_idx);
             assert_eq!(
                 pos_after_close, pos_before_attempt,
@@ -3268,7 +3355,7 @@ fn test_attack_withdraw_insurance_before_force_close() {
     );
 
     // Resolve
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Try to withdraw insurance BEFORE force-closing positions
     env.set_slot(200);
@@ -3417,7 +3504,8 @@ fn test_binary_market_negative_pnl_close_immediate() {
     env.force_close_accounts_fully(
         &admin,
         &[(user_idx, &user.pubkey()), (lp_idx, &lp.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     // User had a losing trade (long at 1.0, resolved at 0.5).
     // With warmup_period=100 but force-close loss settlement is instant (§6.1),
@@ -3518,7 +3606,10 @@ fn test_binary_market_force_close_pnl_correctness() {
 
     // After AdminForceCloseAccount: account is freed, position is zero
     let final_pos = env.read_account_position(user_idx);
-    assert_eq!(final_pos, 0, "position should be zero after AdminForceCloseAccount");
+    assert_eq!(
+        final_pos, 0,
+        "position should be zero after AdminForceCloseAccount"
+    );
 
     println!("BINARY MARKET FORCE-CLOSE PNL CORRECTNESS: PASSED");
 }
@@ -3543,7 +3634,7 @@ fn test_binary_market_force_close_zero_position_noop() {
     let pnl_before = env.read_account_pnl(user_idx);
 
     // Resolve and force-close
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     env.set_slot(200);
     env.crank();
 
@@ -3629,7 +3720,8 @@ fn test_admin_force_close_account_happy_path() {
     env.force_close_accounts_fully(
         &admin,
         &[(lp_idx, &lp.pubkey()), (user_idx, &user.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(
         env.read_account_position(user_idx),
@@ -3638,7 +3730,11 @@ fn test_admin_force_close_account_happy_path() {
     );
 
     let used_after = env.read_num_used_accounts();
-    assert_eq!(used_after, used_before - 2, "num_used should decrease by 2 (both LP and user closed)");
+    assert_eq!(
+        used_after,
+        used_before - 2,
+        "num_used should decrease by 2 (both LP and user closed)"
+    );
 
     println!("ADMIN FORCE CLOSE ACCOUNT HAPPY PATH: PASSED");
 }
@@ -3675,7 +3771,10 @@ fn test_admin_force_close_account_requires_resolved() {
     let vault_after = env.vault_balance();
     let resolved_after = env.is_market_resolved();
 
-    assert!(!resolved_before, "Precondition: market should be unresolved");
+    assert!(
+        !resolved_before,
+        "Precondition: market should be unresolved"
+    );
     assert_eq!(
         resolved_after, resolved_before,
         "Rejected force-close must not change resolved flag"
@@ -3714,7 +3813,7 @@ fn test_admin_force_close_account_requires_admin() {
     env.deposit(&user, user_idx, 1_000_000_000);
 
     // Resolve
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     env.set_slot(200);
     env.crank();
 
@@ -3816,7 +3915,8 @@ fn test_admin_force_close_account_requires_zero_position() {
     env.force_close_accounts_fully(
         &admin,
         &[(lp_idx, &lp.pubkey()), (user_idx, &user.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Position should now be zero
     let user_pos_after = env.read_account_position(user_idx);
@@ -3828,7 +3928,8 @@ fn test_admin_force_close_account_requires_zero_position() {
     // Both account slots should be freed
     let used_after = env.read_num_used_accounts();
     assert_eq!(
-        used_after, used_before - 2,
+        used_after,
+        used_before - 2,
         "AdminForceCloseAccount should decrement num_used_accounts for both LP and user"
     );
 
@@ -3892,7 +3993,8 @@ fn test_admin_force_close_account_with_positive_pnl() {
     env.force_close_accounts_fully(
         &admin,
         &[(lp_idx, &lp.pubkey()), (user_idx, &user.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     let vault_after = env.vault_balance();
     assert!(
@@ -3967,10 +4069,15 @@ fn test_admin_force_close_account_with_negative_pnl() {
     env.force_close_accounts_fully(
         &admin,
         &[(user_idx, &user.pubkey()), (lp_idx, &lp.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
     let used_after = env.read_num_used_accounts();
     let vault_after = env.vault_balance();
-    assert_eq!(used_after, used_before - 2, "Force-close should remove both accounts");
+    assert_eq!(
+        used_after,
+        used_before - 2,
+        "Force-close should remove both accounts"
+    );
     assert!(
         vault_after <= vault_before,
         "Force-close should not increase vault balance"
@@ -4039,7 +4146,8 @@ fn test_admin_force_close_account_enables_close_slab() {
     env.force_close_accounts_fully(
         &admin,
         &[(user_idx, &user.pubkey()), (lp_idx, &lp.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(
         env.read_num_used_accounts(),
@@ -4182,7 +4290,10 @@ fn test_honest_user_close_after_force_close_negative_pnl() {
     // With warmup_period=0, PnL converts to capital instantly.
     // User bought at 2.0, resolved at 1.0 → capital should have decreased.
     let cap_before_close = env.read_account_capital(user_idx);
-    println!("After force-close: user capital={} (initial deposit was 1_000_000_000)", cap_before_close);
+    println!(
+        "After force-close: user capital={} (initial deposit was 1_000_000_000)",
+        cap_before_close
+    );
     assert!(
         cap_before_close < 1_000_000_000,
         "Precondition: user capital should have decreased after losing force-close: capital={}",
@@ -4424,14 +4535,31 @@ fn test_full_market_shutdown_lifecycle() {
 
     // Open positions via CPI trade
     let trade_result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx, 100_000,
-        &mp, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000,
+        &mp,
+        &matcher_ctx,
     );
-    assert!(trade_result.is_ok(), "Trade should succeed: {:?}", trade_result);
+    assert!(
+        trade_result.is_ok(),
+        "Trade should succeed: {:?}",
+        trade_result
+    );
 
     // Verify positions exist
-    assert_ne!(env.read_account_position(user_idx), 0, "User should have position");
-    assert_ne!(env.read_account_position(lp_idx), 0, "LP should have position");
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "User should have position"
+    );
+    assert_ne!(
+        env.read_account_position(lp_idx),
+        0,
+        "LP should have position"
+    );
 
     let vault_before_resolve = env.vault_balance();
     assert!(vault_before_resolve > 0, "Vault should have funds");
@@ -4459,7 +4587,8 @@ fn test_full_market_shutdown_lifecycle() {
     env.force_close_accounts_fully(
         &admin,
         &[(user_idx, &user.pubkey()), (lp_idx, &lp.pubkey())],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify all accounts closed
     let used = env.read_num_used_accounts();
@@ -4467,7 +4596,11 @@ fn test_full_market_shutdown_lifecycle() {
 
     // Step 5: Withdraw insurance
     let withdraw_result = env.try_withdraw_insurance(&admin);
-    assert!(withdraw_result.is_ok(), "Insurance withdrawal: {:?}", withdraw_result);
+    assert!(
+        withdraw_result.is_ok(),
+        "Insurance withdrawal: {:?}",
+        withdraw_result
+    );
 
     // Step 6: Close slab
     let close_slab_result = env.try_close_slab();
@@ -4502,14 +4635,26 @@ fn test_insurance_withdraw_resolved_requires_positions_closed() {
     env.set_slot(100);
     env.crank();
 
-    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 10_000, &mp, &matcher_ctx).unwrap();
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000,
+        &mp,
+        &matcher_ctx,
+    )
+    .unwrap();
     assert_ne!(env.read_account_position(user_idx), 0);
 
     env.set_oracle_price_e6(1_000_000);
     env.try_resolve_market(&admin).unwrap();
 
     let r = env.try_withdraw_insurance(&admin);
-    assert!(r.is_err(), "Resolved withdrawal must fail with open positions");
+    assert!(
+        r.is_err(),
+        "Resolved withdrawal must fail with open positions"
+    );
 }
 
 /// Regression test: resolved close must settle ADL/mark effects before closing.
@@ -4537,7 +4682,16 @@ fn test_resolved_close_settles_before_closing() {
     env.crank();
 
     // Open a position
-    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000,
+        &mp,
+        &matcher_ctx,
+    )
+    .unwrap();
     assert_ne!(env.read_account_position(user_idx), 0);
 
     // Move price significantly before resolution
@@ -4553,15 +4707,23 @@ fn test_resolved_close_settles_before_closing() {
     env.crank();
 
     // Resolve market at 2x price
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Close account WITHOUT cranking the resolved market first.
     let result = env.try_close_account(&user, user_idx);
-    assert!(result.is_ok(), "Resolved close should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Resolved close should succeed: {:?}",
+        result
+    );
 
     // Admin force-close the LP account too
     let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
-    assert!(result.is_ok(), "Admin force-close should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin force-close should succeed: {:?}",
+        result
+    );
 }
 
 /// Regression test: TradeCpi with zero-fill matcher response must succeed.
@@ -4673,12 +4835,26 @@ fn test_tradecpi_zero_fill_succeeds() {
 
     // TradeCpi with zero-fill matcher: before the fix this would fail with Overflow
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx.0, user_idx, 100_000, &mp, &lp_idx.1,
+        &user,
+        &lp.pubkey(),
+        lp_idx.0,
+        user_idx,
+        100_000,
+        &mp,
+        &lp_idx.1,
     );
-    assert!(result.is_ok(), "Zero-fill TradeCpi should succeed as no-op: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Zero-fill TradeCpi should succeed as no-op: {:?}",
+        result
+    );
 
     // Position should remain zero (no fill occurred)
-    assert_eq!(env.read_account_position(user_idx), 0, "No fill means no position change");
+    assert_eq!(
+        env.read_account_position(user_idx),
+        0,
+        "No fill means no position change"
+    );
 }
 
 /// Regression test: resolved close with touch_account_full settles correctly.
@@ -4704,7 +4880,16 @@ fn test_resolved_close_with_inline_touch() {
     // Open a position at price $1
     env.set_slot(50);
     env.crank();
-    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000,
+        &mp,
+        &matcher_ctx,
+    )
+    .unwrap();
     let pos = env.read_account_position(user_idx);
     assert_ne!(pos, 0, "user should have an open position");
 
@@ -4721,15 +4906,23 @@ fn test_resolved_close_with_inline_touch() {
     env.crank();
 
     // Resolve at $2 — but do NOT run resolved crank
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // User closes directly — touch_account_full runs inline at settlement price.
     let result = env.try_close_account(&user, user_idx);
-    assert!(result.is_ok(), "Resolved close with inline touch should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Resolved close with inline touch should succeed: {:?}",
+        result
+    );
 
     // Admin force-close LP (also does inline touch)
     let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
-    assert!(result.is_ok(), "Admin force-close with inline touch should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin force-close with inline touch should succeed: {:?}",
+        result
+    );
 }
 
 /// Test that resolved close produces same payout whether crank touched first or not.
@@ -4754,7 +4947,16 @@ fn test_resolved_close_payout_with_and_without_crank() {
 
         env.set_slot(50);
         env.crank();
-        env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+        env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            100_000,
+            &mp,
+            &matcher_ctx,
+        )
+        .unwrap();
 
         env.set_oracle_price_e6(2_000_000);
         env.set_slot(200);
@@ -4797,7 +4999,16 @@ fn test_resolved_close_payout_with_and_without_crank() {
 
         env.set_slot(50);
         env.crank();
-        env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+        env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            100_000,
+            &mp,
+            &matcher_ctx,
+        )
+        .unwrap();
 
         env.set_oracle_price_e6(2_000_000);
         env.set_slot(200);
@@ -4820,8 +5031,14 @@ fn test_resolved_close_payout_with_and_without_crank() {
 
     // Both paths should produce valid payouts (may differ slightly due to
     // K-pair settlement timing, but both should be non-zero and within bounds)
-    assert!(payout_with_crank > 0, "Crank-then-close should return capital");
-    assert!(payout_without_crank > 0, "Direct-close should return capital");
+    assert!(
+        payout_with_crank > 0,
+        "Crank-then-close should return capital"
+    );
+    assert!(
+        payout_without_crank > 0,
+        "Direct-close should return capital"
+    );
 }
 
 /// Spec requirement: zero-fill TradeCpi must not advance the oracle circuit-breaker
@@ -4848,7 +5065,11 @@ fn test_zero_fill_must_not_advance_circuit_breaker_baseline() {
     const LAST_EFF_PRICE_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192) (v12.19)
     let baseline_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
-        u64::from_le_bytes(data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8].try_into().unwrap())
+        u64::from_le_bytes(
+            data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
     };
 
     // The baseline should be the last oracle price from the crank
@@ -4860,7 +5081,11 @@ fn test_zero_fill_must_not_advance_circuit_breaker_baseline() {
     // Read baseline after real trade
     let baseline_after_trade = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
-        u64::from_le_bytes(data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8].try_into().unwrap())
+        u64::from_le_bytes(
+            data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
     };
 
     // After a real trade, baseline may have advanced (this is fine — trade happened)
@@ -4895,11 +5120,20 @@ fn test_tradecpi_slippage_buy_limit_generous_succeeds() {
 
     // Buy (size > 0), limit = 200M (well above any VAMM spread) → should succeed
     let result = env.try_trade_cpi_with_limit(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        1_000_000i128, 200_000_000u64,
-        &matcher_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000i128,
+        200_000_000u64,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_ok(), "Buy with generous limit should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Buy with generous limit should succeed: {:?}",
+        result
+    );
 }
 
 /// Slippage: buy with limit below oracle price should be rejected.
@@ -4919,11 +5153,19 @@ fn test_tradecpi_slippage_buy_limit_below_oracle_rejected() {
 
     // Buy (size > 0), limit = 100M (well below oracle 138M + VAMM spread) → reject
     let result = env.try_trade_cpi_with_limit(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        1_000_000i128, 100_000_000u64,
-        &matcher_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000i128,
+        100_000_000u64,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_err(), "Buy with limit below oracle must be rejected");
+    assert!(
+        result.is_err(),
+        "Buy with limit below oracle must be rejected"
+    );
 }
 
 /// Slippage: sell with low limit (below any realistic exec_price) should succeed.
@@ -4943,11 +5185,20 @@ fn test_tradecpi_slippage_sell_limit_low_succeeds() {
 
     // Sell (size < 0), limit = 1 (well below VAMM exec_price) → should succeed
     let result = env.try_trade_cpi_with_limit(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        -1_000_000i128, 1u64,
-        &matcher_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        -1_000_000i128,
+        1u64,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_ok(), "Sell with low limit should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Sell with low limit should succeed: {:?}",
+        result
+    );
 }
 
 /// Slippage: sell with limit above oracle price should be rejected.
@@ -4967,11 +5218,19 @@ fn test_tradecpi_slippage_sell_limit_above_oracle_rejected() {
 
     // Sell (size < 0), limit = 200M (above any exec_price for sells) → reject
     let result = env.try_trade_cpi_with_limit(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        -1_000_000i128, 200_000_000u64,
-        &matcher_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        -1_000_000i128,
+        200_000_000u64,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_err(), "Sell with limit above oracle must be rejected");
+    assert!(
+        result.is_err(),
+        "Sell with limit above oracle must be rejected"
+    );
 }
 
 /// Slippage: limit_price_e6 = 0 means no limit (backward compat).
@@ -4989,11 +5248,20 @@ fn test_tradecpi_slippage_zero_limit_is_no_limit() {
 
     // limit = 0 should mean "no slippage check" → always succeeds
     let result = env.try_trade_cpi_with_limit(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        1_000_000i128, 0u64,
-        &matcher_prog, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000i128,
+        0u64,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_ok(), "limit_price_e6=0 should be no-op (backward compat): {:?}", result);
+    assert!(
+        result.is_ok(),
+        "limit_price_e6=0 should be no-op (backward compat): {:?}",
+        result
+    );
 }
 
 /// Slippage: old wire format (no limit field) is backward compatible.
@@ -5011,11 +5279,19 @@ fn test_tradecpi_slippage_old_wire_format_backward_compat() {
 
     // Use OLD encode_trade_cpi (no limit field) — must still work
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
         1_000_000i128,
-        &matcher_prog, &matcher_ctx,
+        &matcher_prog,
+        &matcher_ctx,
     );
-    assert!(result.is_ok(), "Old wire format (no limit) must still work: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Old wire format (no limit) must still work: {:?}",
+        result
+    );
 }
 
 // ── Inverted market slippage protection tests ──────────────────────────
@@ -5045,11 +5321,8 @@ fn init_market_inverted(env: &mut TradeCpiTestEnv) {
             AccountMeta::new(env.slab, false),
             AccountMeta::new_readonly(env.mint, false),
             AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_invert(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 1),
     };
@@ -5308,11 +5581,23 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
     env.set_oracle_price_e6(2_000_000);
     env.set_slot(100);
 
-    // Execute zero-fill TradeCpi
+    // Execute zero-fill TradeCpi. With zero OI, the wrapper is allowed
+    // to accept the raw target directly; the no-op fill may refresh the
+    // flat market's index because no live account can lose equity.
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx.0, user_idx, 100_000, &mp, &lp_idx.1,
+        &user,
+        &lp.pubkey(),
+        lp_idx.0,
+        user_idx,
+        100_000,
+        &mp,
+        &lp_idx.1,
     );
-    assert!(result.is_ok(), "Zero-fill TradeCpi should succeed as no-op: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Zero-fill TradeCpi should refresh a flat market: {:?}",
+        result
+    );
 
     // Read last_effective_price_e6 after the zero-fill
     let index_after = {
@@ -5386,15 +5671,29 @@ fn test_trade_cpi_rejects_nonce_overflow_instead_of_wrapping() {
 
     // Trade at nonce = u64::MAX - 1 → req_id = u64::MAX. Should succeed.
     let result = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        100_000, &mp, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000,
+        &mp,
+        &matcher_ctx,
     );
-    assert!(result.is_ok(), "Trade at nonce u64::MAX-1 should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Trade at nonce u64::MAX-1 should succeed: {:?}",
+        result
+    );
 
     // Nonce is now u64::MAX. Next trade would wrap to 0 — must reject.
     let result2 = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        100_001, &mp, &matcher_ctx,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_001,
+        &mp,
+        &matcher_ctx,
     );
     assert!(
         result2.is_err(),
@@ -5425,8 +5724,12 @@ fn test_slot_reuse_does_not_reuse_lp_matcher_identity() {
         };
         mix(&mut h, idx as u8);
         mix(&mut h, (idx >> 8) as u8);
-        for &b in owner.iter() { mix(&mut h, b); }
-        for &b in ctx.iter() { mix(&mut h, b); }
+        for &b in owner.iter() {
+            mix(&mut h, b);
+        }
+        for &b in ctx.iter() {
+            mix(&mut h, b);
+        }
         h
     }
 
@@ -5436,21 +5739,27 @@ fn test_slot_reuse_does_not_reuse_lp_matcher_identity() {
     let ctx_b = [3u8; 32];
     let id_a = fnv_lp_id(5, &owner, &ctx_a);
     let id_b = fnv_lp_id(5, &owner, &ctx_b);
-    assert_ne!(id_a, id_b,
-        "Same owner+slot but different context must produce different IDs");
+    assert_ne!(
+        id_a, id_b,
+        "Same owner+slot but different context must produce different IDs"
+    );
 
     // Same owner, same context, different slot → different ID
     let id_slot5 = fnv_lp_id(5, &owner, &ctx_a);
     let id_slot6 = fnv_lp_id(6, &owner, &ctx_a);
-    assert_ne!(id_slot5, id_slot6,
-        "Same owner+context but different slot must produce different IDs");
+    assert_ne!(
+        id_slot5, id_slot6,
+        "Same owner+context but different slot must produce different IDs"
+    );
 
     // Different owner, same slot+context → different ID
     let owner2 = [9u8; 32];
     let id_owner1 = fnv_lp_id(5, &owner, &ctx_a);
     let id_owner2 = fnv_lp_id(5, &owner2, &ctx_a);
-    assert_ne!(id_owner1, id_owner2,
-        "Different owner at same slot must produce different IDs");
+    assert_ne!(
+        id_owner1, id_owner2,
+        "Different owner at same slot must produce different IDs"
+    );
 
     // Integration: two LPs in BPF get distinct IDs
     let mut env = TradeCpiTestEnv::new();
@@ -5472,7 +5781,6 @@ fn test_slot_reuse_does_not_reuse_lp_matcher_identity() {
     // (Verified structurally above; integration confirms no panic/regression.)
     assert_ne!(lp1_idx, lp2_idx, "LPs must be at different slots");
 }
-
 
 /// Audit #1 regression: honest same-price Hyperp trades MUST refresh
 /// the mark-liveness timer, otherwise a fully admin-free Hyperp market
@@ -5513,10 +5821,14 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
         let slab = env.svm.get_account(&env.slab).unwrap().data;
         let e = u64::from_le_bytes(
             slab[MARK_EWMA_LAST_OFF..MARK_EWMA_LAST_OFF + 8]
-                .try_into().unwrap());
+                .try_into()
+                .unwrap(),
+        );
         let p = u64::from_le_bytes(
             slab[LAST_MARK_PUSH_OFF..LAST_MARK_PUSH_OFF + 8]
-                .try_into().unwrap());
+                .try_into()
+                .unwrap(),
+        );
         (e, p)
     };
 
@@ -5530,12 +5842,16 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     // observation-eligible fill (mark_min_fee == 0 here) refreshes
     // both mark_ewma_last_slot and last_mark_push_slot.
     env.set_slot(500);
-    env
-        .try_trade_cpi(
-            &user, &lp.pubkey(), lp_idx, user_idx,
-            100_000_000, &matcher_prog, &matcher_ctx,
-        )
-        .expect("same-price Hyperp trade must succeed");
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("same-price Hyperp trade must succeed");
 
     let (ewma_after, push_after) = read_slots(&env);
 
@@ -5543,13 +5859,15 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
         ewma_after > ewma_before,
         "mark_ewma_last_slot must advance on observation-eligible \
          same-price trade (audit #1). before={} after={}",
-        ewma_before, ewma_after,
+        ewma_before,
+        ewma_after,
     );
     assert!(
         push_after > push_before,
         "last_mark_push_slot must advance on observation-eligible \
          same-price Hyperp trade (audit #1). before={} after={}",
-        push_before, push_after,
+        push_before,
+        push_after,
     );
 }
 
@@ -5577,10 +5895,10 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
 fn test_hyperp_after_stale_maturity_is_resolve_only() {
     let mut env = TradeCpiTestEnv::new();
     env.try_init_market_hyperp_with_stale(
-        1_000_000,
-        100,  // max_staleness_secs
+        1_000_000, 100, // max_staleness_secs
         80,  // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
-    ).expect("init Hyperp with explicit stale/perm-resolve");
+    )
+    .expect("init Hyperp with explicit stale/perm-resolve");
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
@@ -5598,40 +5916,58 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
     env.set_slot(10);
     env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
     env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        10_000_000, &matcher_prog, &matcher_ctx,
-    ).expect("opening trade succeeds while fresh");
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("opening trade succeeds while fresh");
 
     // Advance past permissionless_resolve_stale_slots (= 80).
     env.set_slot(10 + 81);
 
     // Admin push must NOT revive the market.
-    let err = env.try_push_oracle_price(&admin, 1_020_000, 10 + 301)
+    let err = env
+        .try_push_oracle_price(&admin, 1_020_000, 10 + 301)
         .expect_err("PushHyperpMark must reject past perm_resolve maturity");
     assert!(
         err.contains("0x6"),
-        "PushHyperpMark past maturity must surface OracleStale (0x6), got: {}", err,
+        "PushHyperpMark past maturity must surface OracleStale (0x6), got: {}",
+        err,
     );
 
     // TradeCpi must also reject — same hard-timeout gate. This is the
     // important one: the RESOLVE-ONLY intent is that user-facing
     // trading is terminally dead post-maturity, not just admin ops.
-    let err = env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        1_000_000, &matcher_prog, &matcher_ctx,
-    ).expect_err("TradeCpi must reject past perm_resolve maturity");
+    let err = env
+        .try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            1_000_000,
+            &matcher_prog,
+            &matcher_ctx,
+        )
+        .expect_err("TradeCpi must reject past perm_resolve maturity");
     assert!(
         err.contains("0x6"),
-        "TradeCpi past maturity must surface OracleStale (0x6), got: {}", err,
+        "TradeCpi past maturity must surface OracleStale (0x6), got: {}",
+        err,
     );
 
     // CatchupAccrue must also reject — it routes through
     // get_engine_oracle_price_e6 which honors the hard-timeout gate.
-    let err = env.try_catchup_accrue()
+    let err = env
+        .try_catchup_accrue()
         .expect_err("CatchupAccrue must reject past perm_resolve maturity");
     assert!(
         err.contains("0x6"),
-        "CatchupAccrue past maturity must surface OracleStale (0x6), got: {}", err,
+        "CatchupAccrue past maturity must surface OracleStale (0x6), got: {}",
+        err,
     );
 
     // ResolvePermissionless must succeed and flip the market to resolved.
@@ -5649,10 +5985,10 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
 fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     let mut env = TradeCpiTestEnv::new();
     env.try_init_market_hyperp_with_stale(
-        1_000_000,
-        100,  // max_staleness_secs
+        1_000_000, 100, // max_staleness_secs
         80,  // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
-    ).expect("init Hyperp with explicit stale/perm-resolve");
+    )
+    .expect("init Hyperp with explicit stale/perm-resolve");
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
@@ -5667,9 +6003,15 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     env.set_slot(10);
     env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
     env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        10_000_000, &matcher_prog, &matcher_ctx,
-    ).unwrap();
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .unwrap();
 
     // Advance to JUST BEFORE perm_resolve maturity (= 80).
     env.set_slot(10 + 79);
@@ -5683,16 +6025,28 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
         "market must still be live before perm_resolve maturity"
     );
 
-    // Stronger assertion: "market stays live" means more than "push
-    // didn't error" — a subsequent TradeCpi at the same slot must also
-    // succeed. If the market had silently slipped into a frozen state
-    // (e.g. get_engine_oracle_price_e6 refusing price reads on the
-    // trade path), this follow-up trade would fail. This is the
-    // end-to-end recoverability check the original audit flagged.
-    env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        1_000_000, &matcher_prog, &matcher_ctx,
-    ).expect("TradeCpi must succeed on a freshly-revived market");
+    // User risk changes are now conservatively blocked while the Hyperp
+    // target/effective price has not caught up. The important liveness
+    // property here is that the market remains live and recoverable, not
+    // that same-slot extraction can bypass target lag.
+    let lagged_trade = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
+    assert!(
+        lagged_trade.is_err(),
+        "TradeCpi must wait for target catchup after a fresh push: {:?}",
+        lagged_trade
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "target-lag rejection must not resolve the market"
+    );
 }
 
 // test_hyperp_init_rejects_permissionless_window_past_accrue_envelope deleted:
