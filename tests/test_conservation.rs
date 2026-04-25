@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::manual_saturating_arithmetic, clippy::useless_conversion, for_loops_over_fallibles, clippy::unnecessary_cast, clippy::absurd_extreme_comparisons, clippy::manual_abs_diff, clippy::empty_line_after_doc_comments, clippy::doc_lazy_continuation, clippy::needless_range_loop, clippy::implicit_saturating_sub, clippy::wrong_self_convention)]
 mod common;
 #[allow(unused_imports)]
 use common::*;
@@ -238,7 +237,9 @@ fn test_attack_premarket_force_close_pnl_conservation() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
     // Create LP and 3 users with positions
     let lp = Keypair::new();
@@ -282,23 +283,8 @@ fn test_attack_premarket_force_close_pnl_conservation() {
     }
     let total_pnl_before = lp_pnl_before + user_pnl_before_sum;
 
-    // Flatten positions before resolution (v12.17 requirement)
-    env.set_slot(200);
-    env.crank();
-    for (user, user_idx) in &users {
-        let pos = env.read_account_position(*user_idx);
-        if pos != 0 {
-            let _ = env.try_trade_cpi(
-                user, &lp.pubkey(), lp_idx, *user_idx,
-                -pos, &matcher_prog, &matcher_ctx,
-            );
-        }
-    }
-    env.set_slot(210);
-    env.crank();
-
     // Resolve at different price to create PnL
-    env.set_oracle_price_e6(1_500_000); // 50% up
+    env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap(); // 50% up
     env.try_resolve_market(&admin).unwrap();
 
     // Force-close via crank (settles PnL only; positions require AdminForceCloseAccount)
@@ -363,7 +349,9 @@ fn test_attack_multi_lp_conservation() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
     // Create 2 LPs
     let lp1 = Keypair::new();
@@ -408,7 +396,7 @@ fn test_attack_multi_lp_conservation() {
     assert!(result.is_ok(), "Trade vs LP2 should succeed: {:?}", result);
 
     // Price moves
-    env.set_oracle_price_e6(1_200_000);
+    env.try_push_oracle_price(&admin, 1_200_000, 2000).unwrap();
     env.set_slot(200);
     env.crank();
 
@@ -456,7 +444,9 @@ fn test_attack_conservation_through_price_movement() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -492,7 +482,7 @@ fn test_attack_conservation_through_price_movement() {
     );
 
     // Price moves up
-    env.set_oracle_price_e6(1_500_000);
+    env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap();
     env.set_slot(200);
     env.crank();
 
@@ -505,7 +495,7 @@ fn test_attack_conservation_through_price_movement() {
     );
 
     // Price moves down
-    env.set_oracle_price_e6(500_000);
+    env.try_push_oracle_price(&admin, 500_000, 3000).unwrap();
     env.set_slot(300);
     env.crank();
 
@@ -546,7 +536,9 @@ fn test_attack_premarket_partial_force_close_conservation() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
     // Create LP and many users
     let lp = Keypair::new();
@@ -581,7 +573,7 @@ fn test_attack_premarket_partial_force_close_conservation() {
     let vault_before = env.read_vault();
 
     // Resolve market
-    env.set_oracle_price_e6(1_200_000);
+    env.try_push_oracle_price(&admin, 1_200_000, 2000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
     // Single crank: may only force-close a batch (64 accounts max)
@@ -752,7 +744,7 @@ fn test_attack_multi_crank_funding_conservation() {
     // Engine vault should still be total deposited amount
     let engine_vault = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
+        u128::from_le_bytes(slab.data[536..552].try_into().unwrap()) // BPF ENGINE_OFF=472, vault at engine offset 0
     };
     assert_eq!(
         engine_vault, 20_000_000_200,
@@ -794,7 +786,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_before = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
+        u128::from_le_bytes(slab.data[536..552].try_into().unwrap()) // BPF ENGINE_OFF=472, vault at engine offset 0
     };
 
     // UpdateConfig with different parameters
@@ -818,7 +810,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_after = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
+        u128::from_le_bytes(slab.data[536..552].try_into().unwrap()) // BPF ENGINE_OFF=472, vault at engine offset 0
     };
 
     // Conservation: UpdateConfig must not change vault balances
@@ -1648,12 +1640,10 @@ fn test_attack_init_user_fee_conservation() {
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 5_000_000_000).unwrap();
 
-    // deposit_not_atomic gate: fee_payment >= min_initial_deposit + new_account_fee.
-    // Use fee + margin for excess capital beyond the gate.
-    let fee_payment: u64 = (new_account_fee as u64) + 100;
-    let ata = env.create_ata(&user.pubkey(), fee_payment);
+    // Create ATA with enough tokens to cover the fee
+    let ata = env.create_ata(&user.pubkey(), 2_000_000_000);
 
-    // Manually construct InitUser with fee covering new_account_fee + min_initial_deposit
+    // Manually construct InitUser with fee matching new_account_fee
     let ix = Instruction {
         program_id: env.program_id,
         accounts: vec![
@@ -1665,7 +1655,7 @@ fn test_attack_init_user_fee_conservation() {
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(env.pyth_col, false),
         ],
-        data: encode_init_user(fee_payment),
+        data: encode_init_user(new_account_fee as u64),
     };
 
     let tx = Transaction::new_signed_with_payer(
@@ -1678,7 +1668,8 @@ fn test_attack_init_user_fee_conservation() {
         .send_transaction(tx)
         .expect("init_user with fee failed");
 
-    // Fee is charged once by deposit_not_atomic during materialization.
+    // Current behavior: InitUser deposits fee_payment as capital via
+    // engine.deposit(), then charges new_account_fee from capital → insurance.
     let insurance = env.read_insurance_balance();
     assert_eq!(
         insurance, new_account_fee,
@@ -2157,20 +2148,19 @@ fn test_property_authorization_exhaustive() {
         vault_before, vault_after
     );
 
-    // --- Admin chain: verify old admin locked out after two-step transfer (Phase E) ---
+    // --- Admin chain: verify old admin locked out ---
+    // Cross-Keypair transfer requires the two-sig handover — both
+    // current and new keys sign. Use try_update_authority directly.
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
-    // Phase E: UpdateAdmin only proposes; AcceptAdmin completes the transfer.
-    env.try_rotate_admin(&admin, &new_admin).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin)).unwrap();
 
-    env.svm.expire_blockhash();
     let r = env.try_update_admin(&admin, &admin.pubkey());
     assert!(
         r.is_err(),
         "A5: Old admin should be locked out after transfer"
     );
 
-    env.svm.expire_blockhash();
     let r = env.try_update_admin(&new_admin, &new_admin.pubkey());
     assert!(r.is_ok(), "A6: New admin should work after transfer");
 
@@ -2326,7 +2316,10 @@ fn test_binary_market_complete_lifecycle_conservation() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    env.set_oracle_price_e6(1_000_000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Setup: LP + 2 users with opposing positions
     let lp = Keypair::new();
@@ -2369,7 +2362,8 @@ fn test_binary_market_complete_lifecycle_conservation() {
     let vault_before = env.vault_balance();
 
     // Resolve at $1.50 (user_a profits, user_b loses)
-    env.set_oracle_price_e6(1_500_000);
+    env.try_push_oracle_price(&admin, 1_500_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
     // Settle PnL via crank (positions require explicit AdminForceCloseAccount)

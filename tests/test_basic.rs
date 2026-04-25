@@ -1569,7 +1569,7 @@ fn test_position_flip_minimal_equity() {
 fn test_liquidation_reduces_position_and_charges_fee() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1772,7 +1772,7 @@ fn test_partial_withdrawal_with_position_succeeds() {
 fn test_keeper_crank_format_v1_full_close() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap; unrestricted for $138→$120 move
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -2178,7 +2178,7 @@ fn test_settle_account_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2477,7 +2477,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin (for later push)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2739,7 +2739,7 @@ fn test_reclaim_rejects_account_with_position() {
 fn test_reclaim_blocked_on_resolved() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → oracle_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2764,6 +2764,64 @@ fn test_reclaim_blocked_on_resolved() {
         "ReclaimEmptyAccount must be rejected on a resolved market"
     );
 }
+
+/// Spec §10.2: account creation via deposit is a pure capital transfer
+/// that MUST NOT require a fresh oracle read. Before the fix, InitUser/
+/// InitLP read the oracle and fully accrued the market, which meant a
+/// stale feed (oracle publish_time older than max_staleness_secs) could
+/// block new-user and new-LP onboarding even while the market itself
+/// was within the permissionless-resolve horizon. Under the fix, the
+/// path is gated only by `permissionless_stale_matured` (the terminal
+/// hard-timeout) and the engine's live-accrual envelope — both of which
+/// stay satisfied through typical oracle outages.
+#[test]
+fn test_init_user_survives_stale_oracle() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Advance clock well past max_staleness_secs (86400s = 86400 slots
+    // in the test harness where 1 slot = 1 second) WITHOUT updating the
+    // pyth publish_time. Under the prior oracle-dependent InitUser, any
+    // oracle read would fail OracleStale. We bypass the test harness's
+    // set_slot helper because it refreshes pyth publish_time to match.
+    env.svm.set_sysvar(&solana_sdk::clock::Clock {
+        slot: 100_000,
+        unix_timestamp: 100_000,
+        ..Default::default()
+    });
+
+    // InitUser must succeed despite the stale pyth account.
+    let user = solana_sdk::signature::Keypair::new();
+    let _user_idx = env.init_user(&user);
+}
+
+/// Companion: InitLP also stays live through an oracle outage under the
+/// pure-deposit materialization path.
+#[test]
+fn test_init_lp_survives_stale_oracle() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    env.svm.set_sysvar(&solana_sdk::clock::Clock {
+        slot: 100_000,
+        unix_timestamp: 100_000,
+        ..Default::default()
+    });
+
+    let lp = solana_sdk::signature::Keypair::new();
+    let _lp_idx = env.init_lp(&lp);
+}
+
+// Note: ReclaimEmptyAccount now syncs maintenance fees before the
+// reclaim-eligibility check (spec §10.7 wrapper rule). Existing
+// reclaim tests (test_reclaim_rejects_account_with_capital,
+// test_reclaim_rejects_account_with_position,
+// test_reclaim_blocked_on_resolved, test_reclaim_empty_account)
+// exercise the pre-reclaim path and continue to pass — any regression
+// in the sync insertion (monotonicity, envelope, etc.) would surface
+// as an Overflow/Undercollateralized on those tests.
 
 // ============================================================================
 // QueryLpFees (tag 24) additional coverage
@@ -3729,8 +3787,10 @@ fn test_funding_bootstrap_inverted_market() {
 fn test_funding_no_cap_means_no_ewma() {
     program_path();
     let mut env = TestEnv::new();
-    // cap = 0 means EWMA is disabled
-    env.init_market_with_cap(0, 0, 0);
+    // cap = 0 means EWMA is disabled. Pair with perm_resolve > 0 so the
+    // market still has a resolve path (non-Hyperp + cap=0 + perm=0 is
+    // now rejected at init as unresolvable).
+    env.init_market_with_cap(0, 0, 50_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4075,7 +4135,7 @@ fn test_trading_fee_exact_amounts() {
 fn test_liquidation_fee_goes_to_insurance() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4400,7 +4460,12 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-        data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
+        // Strict hard-timeout model: permissionless_resolve_stale_slots is the
+        // hard upper bound on "slots since last accepted oracle read before
+        // market is dead". 100 was tight for this test's 60+ slot dust-wash
+        // sequence + the preceding trade gap; bump to 500 so the test stays
+        // within the live window.
+        data.extend_from_slice(&500u64.to_le_bytes()); // permissionless_resolve = 500
         // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_k_bps (2x)
@@ -4437,7 +4502,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     // Set bounded staleness for permissionless resolution
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -4470,6 +4535,13 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         // Alternate trade direction to avoid position limits
         let size = if i % 2 == 0 { 1i128 } else { -1i128 };
         let _ = env.try_trade(&user, &lp, lp_idx, user_idx, size);
+        // Strict hard-timeout: keep last_good_oracle_slot fresh by
+        // cranking every iteration. Without this, if dust trades fail
+        // (size-1 trades may reject on position limits etc.), no
+        // successful read advances last_good_oracle_slot and the market
+        // matures into the stale state mid-loop. The crank's oracle
+        // read advances the field regardless of trade success.
+        env.crank();
     }
     let ewma_after_dust_attack = env.read_mark_ewma();
     let dust_drift_bps = ((ewma_after_dust_attack as i128 - ewma_seed as i128).unsigned_abs() * 10_000) / ewma_seed as u128;
@@ -4479,13 +4551,16 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         dust_drift_bps
     );
 
-    // Organic trade restores mark
-    env.set_slot(300);
+    // Organic trade restores the mark. Use a small slot advance so the
+    // crank stays within the hard-timeout window
+    // (permissionless_resolve_stale_slots = 100 slots). Last trade/
+    // crank was at effective slot ~260; stay under +99 from there.
+    env.set_slot(230); // effective 330 → age from 260 ≈ 70 < 100
     env.crank();
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000); // large trade
 
-    // Oracle dies → permissionless resolution (unified stale-oracle
-    // policy: any stale oracle + no clear within delay → resolve).
+    // Oracle dies → permissionless resolution (strict hard-timeout
+    // policy: last_good_oracle_slot + N ≤ clock.slot → resolve).
     env.svm.set_sysvar(&Clock {
         slot: 700,
         unix_timestamp: 700,
@@ -4908,8 +4983,9 @@ fn test_fee_sync_does_not_erase_market_accrual_interval() {
     env.crank();
 
     // BPF layout offset for engine.last_market_slot (v12.18.x).
-    // 472 (ENGINE_OFF) + 656 (field offset after params grew by 8) = 1128.
-    const LAST_MARKET_SLOT_OFF: usize = 1128;
+    // 536 (ENGINE_OFF, after SlabHeader +64 for 4-way auth) + 656
+    // (field offset) = 1192.
+    const LAST_MARKET_SLOT_OFF: usize = 1192;
     let read_last_market_slot = |e: &TestEnv| -> u64 {
         let d = e.svm.get_account(&e.slab).unwrap().data;
         u64::from_le_bytes(d[LAST_MARKET_SLOT_OFF..LAST_MARKET_SLOT_OFF + 8]

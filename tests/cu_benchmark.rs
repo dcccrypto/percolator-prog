@@ -30,7 +30,7 @@ use std::path::PathBuf;
 // SLAB_LEN / MAX_ACCOUNTS: production BPF values. The wrapper's `"test"`
 // feature (which compiled the engine with MAX_ACCOUNTS=64 for native unit
 // tests) has been removed; integration tests go through the BPF binary.
-const SLAB_LEN: usize = 1525592; // v12.18.x: +8 bytes for RiskParams::min_funding_lifetime_slots
+const SLAB_LEN: usize = 1525656; // +64 bytes for insurance_authority + close_authority in SlabHeader
 const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -128,7 +128,7 @@ fn encode_init_market_with_params(
     // Per-market admin limits (within engine bounds)
     data.extend_from_slice(&0u128.to_le_bytes()); // max_maintenance_fee_per_slot (legacy, ignored)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps (resolvability invariant)
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
@@ -416,7 +416,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -444,7 +443,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -666,7 +664,9 @@ fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
 }
 
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8];
+    // UpdateAuthority { kind: AUTHORITY_ADMIN = 0, new_pubkey }
+    let mut data = vec![32u8];
+    data.push(0u8);
     data.extend_from_slice(new_admin.as_ref());
     data
 }
@@ -699,7 +699,9 @@ fn encode_set_maintenance_fee(new_fee: u128) -> Vec<u8> {
 }
 
 fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    let mut data = vec![16u8];
+    // UpdateAuthority { kind: AUTHORITY_ORACLE = 1, new_pubkey }
+    let mut data = vec![32u8];
+    data.push(1u8);
     data.extend_from_slice(new_authority.as_ref());
     data
 }
@@ -753,7 +755,6 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -849,7 +850,6 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_index, false),
                 ],
                 data: encode_init_user(100),
             };
@@ -916,7 +916,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1139,7 +1138,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1253,7 +1251,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1358,7 +1355,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1511,7 +1507,6 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_index, false),
                 ],
                 data: encode_init_user(100),
             };
@@ -1847,18 +1842,21 @@ fn benchmark_all_instructions() {
 
     // SetMaintenanceFee (Tag 15) — removed per spec §8.2. Decoder rejects.
 
-    // --- SetOracleAuthority (Tag 16) ---
+    // --- UpdateAuthority(ORACLE) (Tag 32) — replaces legacy Tag 16 ---
+    // Self-transfer (admin → admin). Requires [current, new, slab] and
+    // new signer consents (same key, same signer vector).
     {
         let ix = Instruction {
             program_id: env.program_id,
             accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
             ],
             data: encode_set_oracle_authority(&admin.pubkey()),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("SetOracleAuthority:    {:>8} CU", cu);
+        println!("UpdateAuthority(ORACLE): {:>8} CU", cu);
     }
 
     // --- PushOraclePrice (Tag 17) ---
@@ -1890,7 +1888,7 @@ fn benchmark_all_instructions() {
                 AccountMeta::new(env.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
-            data: encode_set_oracle_price_cap(10_000),
+            data: encode_set_oracle_price_cap(1_000_000), // min_cap=1M at init; cap must be >= min
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
         println!("SetOraclePriceCap:     {:>8} CU", cu);
@@ -1965,18 +1963,19 @@ fn benchmark_all_instructions() {
         }
     }
 
-    // --- UpdateAdmin (Tag 12) ---
+    // --- UpdateAuthority(ADMIN) (Tag 32) — replaces legacy Tag 12 ---
     {
         let ix = Instruction {
             program_id: env.program_id,
             accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
             ],
             data: encode_update_admin(&admin.pubkey()),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("UpdateAdmin:           {:>8} CU", cu);
+        println!("UpdateAuthority(ADMIN): {:>8} CU", cu);
     }
 
     // --- ResolveMarket + resolved-path instructions ---

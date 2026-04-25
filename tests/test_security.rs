@@ -504,11 +504,13 @@ fn test_attack_oracle_authority_wrong_signer() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
-    // Admin sets oracle authority
+    // Admin sets oracle authority (cross-Keypair: two-sig handover).
+    // Enable cap first for the weaker-authority invariant.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     let authority = Keypair::new();
     env.svm.airdrop(&authority.pubkey(), 1_000_000_000).unwrap();
-    let result = env.try_set_oracle_authority(&admin, &authority.pubkey());
+    let result = env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&authority));
     assert!(result.is_ok(), "Admin should set oracle authority");
 
     // Wrong signer tries to push price
@@ -639,9 +641,9 @@ fn test_attack_trade_risk_increase_when_gated() {
     // But the diff is not uniform. Use the read_num_used helper's ENGINE offset (472)
     // and compute empirically. The oi_eff_long/short pair (32 bytes) precedes side_mode.
     // From code analysis: BPF side_mode_long at engine offset ~488.
-    // Slab absolute = 472 + 960 = 960.
+    // Slab absolute = 536 + 960 = 960.
     // Fallback: try the value and if the trade still works, try adjacent offsets.
-    const SIDE_MODE_LONG_OFF: usize = 472 + 552; // v12.18.x layout
+    const SIDE_MODE_LONG_OFF: usize = 536 + 552; // v12.18.x layout
     {
         let original_slab = env
             .svm
@@ -1073,18 +1075,14 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // min_cap=100: non-zero floor → oracle_authority=admin at init,
+    // and SetOraclePriceCap(100) stays at/above the floor.
+    env.init_market_with_cap(0, 100, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Crank first to establish external oracle baseline
     env.crank();
-
-    // Set oracle authority and cap
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_set_oracle_price_cap(&admin, 100)
-        .expect("oracle price cap setup must succeed"); // 0.01% per slot
 
     // Push initial price (clamped against external baseline $138)
     env.try_push_oracle_price(&admin, 138_000_000, 100)
@@ -1092,7 +1090,7 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
     env.set_slot(101);
 
     // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -1236,8 +1234,8 @@ fn test_attack_push_oracle_zero_price() {
     // Push valid price first
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -1280,8 +1278,8 @@ fn test_attack_push_oracle_without_authority_set() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -2439,24 +2437,31 @@ fn test_attack_oracle_authority_disable_clears_price() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // Non-Hyperp oracle-authority burns are only allowed when
+    // perm_resolve > 0 (resolvability invariant). Init with cap>0 +
+    // perm_resolve>0 so the burn is permitted and the market retains
+    // a resolve path after authority disappears.
+    env.init_market_with_cap(0, 10_000, 50_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Set oracle authority and push a price
+    // Set oracle authority and push a price (cross-Keypair: two-sig handover).
+    // Enable the circuit-breaker cap first — weaker-authority invariant
+    // requires non-Hyperp markets with a configured authority to have cap > 0.
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     let authority = Keypair::new();
     env.svm.airdrop(&authority.pubkey(), 1_000_000_000).unwrap();
-    env.try_set_oracle_authority(&admin, &authority.pubkey())
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&authority))
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&authority, 200_000_000, 100)
         .expect("oracle price push must succeed");
 
-    // Now disable oracle authority by setting to [0;32]
-    let zero = Pubkey::new_from_array([0u8; 32]);
-    let result = env.try_set_oracle_authority(&admin, &zero);
+    // Now disable oracle authority — the CURRENT authority (which was
+    // transferred to `authority` above) must sign the burn.
+    let result = env.try_update_authority(&authority, AUTHORITY_ORACLE, None);
     assert!(
         result.is_ok(),
-        "Admin should disable oracle authority: {:?}",
+        "Oracle authority should be able to burn itself: {:?}",
         result
     );
 
@@ -2502,19 +2507,21 @@ fn test_attack_oracle_authority_change_with_positions() {
     // Open position
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
 
-    // Set authority and push price
+    // Set authority and push price (cross-Keypair: two-sig handover).
+    // Enable cap first to satisfy the weaker-authority invariant.
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     let auth1 = Keypair::new();
     env.svm.airdrop(&auth1.pubkey(), 1_000_000_000).unwrap();
-    env.try_set_oracle_authority(&admin, &auth1.pubkey())
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&auth1))
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&auth1, 200_000_000, 100)
         .expect("oracle price push must succeed");
 
-    // Change to new authority
+    // Change to new authority — transfer from auth1 (current) to auth2 (new)
     let auth2 = Keypair::new();
     env.svm.airdrop(&auth2.pubkey(), 1_000_000_000).unwrap();
-    env.try_set_oracle_authority(&admin, &auth2.pubkey())
-        .expect("oracle authority setup must succeed");
+    env.try_update_authority(&auth1, AUTHORITY_ORACLE, Some(&auth2))
+        .expect("oracle authority rotation must succeed");
 
     // Old authority can't push anymore
     let result = env.try_push_oracle_price(&auth1, 250_000_000, 200);
@@ -2534,48 +2541,28 @@ fn test_attack_oracle_authority_change_with_positions() {
     );
 }
 
-/// ATTACK: Set oracle price cap to 0 (disables capping), verify uncapped price accepted.
-/// Expected: With cap=0, any price jump is accepted.
+/// ATTACK: Attempt to deploy a non-Hyperp market with no resolve path.
+/// The legacy attack was: init with cap=0 + perm_resolve=0, then use the
+/// now-uncapped oracle authority to walk the effective price. The
+/// resolvability invariant closes the attack by rejecting the combo at
+/// init outright — an operator cannot deploy a market that has no
+/// resolve path to begin with.
 #[test]
 fn test_attack_oracle_cap_zero_disables_clamping() {
     program_path();
 
-    // Model-1 regression: the "cap=0 + authority set" state used to let
-    // an oracle authority walk the effective price arbitrarily (the
-    // "attack" this test originally documented). The weaker-authority
-    // model closes that hole by making authority+cap=0 an unreachable
-    // configuration: SetOraclePriceCap(0) is rejected whenever authority
-    // is non-zero, and SetOracleAuthority(non-zero) is rejected on a
-    // non-Hyperp market with cap=0. Verify both guards fire.
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0); // non-Hyperp, cap=0 at genesis
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Guard 1: raw SetOracleAuthority with cap=0 is rejected. (The
-    // common helper's auto-cap bootstrap would mask this — use the
-    // raw primitive to prove the engine-side rejection.)
-    let err = env
-        .try_set_oracle_authority_raw(&admin, &admin.pubkey())
-        .expect_err("SetOracleAuthority(non-zero) with cap=0 must reject");
-    assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
+    let data = common::encode_init_market_with_cap(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0, // invert=0 (non-Hyperp)
+        0, // min_oracle_price_cap_e2bps
+        0, // permissionless_resolve_stale_slots
     );
-
-    // Guard 2: the reverse ordering is also rejected. First enable cap
-    // so authority can be set; then attempt to disable the cap while
-    // authority is live. Use a distinct authority pubkey so the second
-    // SetOracleAuthority tx bytes differ from the first (LiteSVM dedups
-    // identical signatures under the same blockhash).
-    env.try_set_oracle_price_cap(&admin, 10_000)
-        .expect("enabling cap must succeed");
-    let alt_authority = Keypair::new();
-    env.try_set_oracle_authority_raw(&admin, &alt_authority.pubkey())
-        .expect("authority with cap>0 must succeed");
     let err = env
-        .try_set_oracle_price_cap(&admin, 0)
-        .expect_err("SetOraclePriceCap(0) while authority set must reject");
+        .try_init_market_raw(data)
+        .expect_err("init must reject non-Hyperp + cap=0 + perm_resolve=0");
     assert!(
         err.contains("0x1a"),
         "expected InvalidConfigParam, got: {}", err,
@@ -2589,18 +2576,14 @@ fn test_attack_oracle_cap_ultra_restrictive() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // min_cap=1 at init: oracle_authority defaults to admin (non-zero
+    // init floor passes the init-time invariant), and cap can be held
+    // at or above 1 per the immutable floor check in SetOraclePriceCap.
+    env.init_market_with_cap(0, 1, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Crank first to establish external oracle baseline
     env.crank();
-
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-
-    // Set ultra-restrictive cap
-    env.try_set_oracle_price_cap(&admin, 1)
-        .expect("oracle price cap setup must succeed");
 
     // Push initial price (clamped against external baseline $138)
     env.try_push_oracle_price(&admin, 138_000_000, 100)
@@ -2608,7 +2591,7 @@ fn test_attack_oracle_cap_ultra_restrictive() {
     env.set_slot(200);
 
     // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -3660,7 +3643,7 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
     // Read last_effective_price_e6 (the index) before same-slot crank
     // last_effective_price_e6 is at config offset 312: slab bytes [384..392]
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_before =
         u64::from_le_bytes(slab_before[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert!(index_before > 0, "Index should be non-zero before crank");
@@ -3737,7 +3720,7 @@ fn test_attack_hyperp_push_extreme_price() {
     // Read stored last_effective_price_e6 - must be clamped, not u64::MAX/2
     // last_effective_price_e6 is at slab offset 384 (last u64 in config before engine)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let stored_price = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     // With 5% cap and base price 1_000_000, max clamped = 1_050_000
     assert!(
@@ -4008,7 +3991,7 @@ fn test_attack_liquidate_healthy_account() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4079,30 +4062,13 @@ fn test_attack_update_admin_to_zero_locks_out() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Set admin to zero - now allowed for admin burn (spec §7)
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-        ],
-        data: {
-            let mut d = vec![12u8]; // UpdateAdmin tag
-            d.extend_from_slice(zero_pubkey.as_ref());
-            d
-        },
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[&admin],
-        env.svm.latest_blockhash(),
-    );
-    let result = env.svm.send_transaction(tx);
+    // Burn admin via UpdateAuthority (tag 32, kind=ADMIN, new=zero,
+    // single-sig). Legacy UpdateAdmin tag 12 was deleted.
+    let result = env.try_update_authority(&admin, AUTHORITY_ADMIN, None);
     assert!(
         result.is_ok(),
-        "UpdateAdmin to zero should succeed (admin burn)"
+        "Admin burn via UpdateAuthority must succeed: {:?}",
+        result
     );
 
     // Admin is now burned - all admin instructions must fail
@@ -5629,8 +5595,8 @@ fn test_attack_old_admin_blocked_after_transfer() {
 
     env.crank();
 
-    // Transfer admin
-    env.try_update_admin(&old_admin, &new_admin.pubkey())
+    // Transfer admin (cross-Keypair: two-sig handover)
+    env.try_update_authority(&old_admin, AUTHORITY_ADMIN, Some(&new_admin))
         .unwrap();
 
     // Old admin should fail
@@ -6075,7 +6041,7 @@ fn test_attack_liquidation_after_price_crash() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -6300,7 +6266,7 @@ fn test_attack_same_slot_triple_crank_convergence() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -7829,8 +7795,8 @@ fn test_attack_update_admin_old_admin_rejected() {
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 5_000_000_000).unwrap();
 
-    // Transfer admin to new_admin
-    env.try_update_admin(&admin, &new_admin.pubkey()).unwrap();
+    // Transfer admin to new_admin (cross-Keypair: two-sig handover)
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin)).unwrap();
 
     // Old admin tries admin operation - should fail
     let slab_before_old_admin_attempt = env.svm.get_account(&env.slab).unwrap().data;
@@ -7881,11 +7847,20 @@ fn test_attack_set_oracle_authority_to_zero_disables_push() {
         "Hyperp with bootstrapped EWMA should accept zero authority: {:?}",
         zero_result);
 
-    // Set to a different non-zero authority instead
+    // Under the 4-way split, burning oracle_authority is a
+    // one-way operation — the zero slot has no current authority
+    // so no one can re-set it. Admin's attempt to set a new
+    // authority here must fail.
     let new_auth = Keypair::new();
-    env.try_set_oracle_authority(&admin, &new_auth.pubkey()).unwrap();
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
-    const AUTH_TS_OFF: usize = 368;
+    env.svm.airdrop(&new_auth.pubkey(), 1_000_000_000).unwrap();
+    let reset_result = env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_auth));
+    assert!(
+        reset_result.is_err(),
+        "Burned oracle_authority must not be resettable by admin: {:?}",
+        reset_result,
+    );
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -11406,7 +11381,7 @@ fn test_attack_push_oracle_after_resolution_rejected() {
     env.try_resolve_market(&admin).unwrap();
 
     // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let settle_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -11447,7 +11422,7 @@ fn test_attack_set_oracle_authority_after_resolution_rejected() {
     env.try_push_oracle_price(&admin, 140_000_000, 100).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    const AUTHORITY_OFF: usize = 328;
+    const AUTHORITY_OFF: usize = 392;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let authority_before: [u8; 32] = slab_before[AUTHORITY_OFF..AUTHORITY_OFF + 32]
         .try_into()
@@ -11485,7 +11460,7 @@ fn test_attack_set_oracle_price_cap_after_resolution_rejected() {
     env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    const CAP_OFF: usize = 264; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
+    const CAP_OFF: usize = 392; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let cap_before = u64::from_le_bytes(slab_before[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
 
@@ -12964,7 +12939,7 @@ fn test_attack_oracle_timestamp_zero_then_crank() {
 
     // In Hyperp mode authority_timestamp is funding-rate state, not publish time.
     // PushOraclePrice must not overwrite it with user-supplied timestamps.
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_TS_OFF: usize = 432;
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     let funding_state =
         i64::from_le_bytes(slab_data[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap());
@@ -13008,7 +12983,7 @@ fn test_attack_oracle_timestamp_i64_max_no_overflow() {
     );
 
     // In Hyperp mode, external timestamp input must not clobber funding-rate state.
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_TS_OFF: usize = 432;
     let slab_after_max = env.svm.get_account(&env.slab).unwrap().data;
     let funding_state_after_max = i64::from_le_bytes(
         slab_after_max[AUTH_TS_OFF..AUTH_TS_OFF + 8]
@@ -13060,9 +13035,9 @@ fn test_attack_rapid_admin_transfers() {
     env.svm.airdrop(&admin2.pubkey(), 5_000_000_000).unwrap();
     env.svm.airdrop(&admin3.pubkey(), 5_000_000_000).unwrap();
 
-    // Chain: admin1 -> admin2 -> admin3
-    env.try_update_admin(&admin1, &admin2.pubkey()).unwrap();
-    env.try_update_admin(&admin2, &admin3.pubkey()).unwrap();
+    // Chain: admin1 -> admin2 -> admin3 (cross-Keypair: two-sig handover)
+    env.try_update_authority(&admin1, AUTHORITY_ADMIN, Some(&admin2)).unwrap();
+    env.try_update_authority(&admin2, AUTHORITY_ADMIN, Some(&admin3)).unwrap();
 
     // Only admin3 should work now
     let r1 = env.try_update_admin(&admin1, &admin1.pubkey());
@@ -13513,7 +13488,7 @@ fn test_attack_resolve_rejects_stale_settlement_push() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap = 0 (no cap)
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap > 0 so oracle_authority defaults to admin
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -13587,7 +13562,9 @@ fn test_attack_authority_push_crank_does_not_ratchet_baseline() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // cap > 0 so oracle_authority defaults to admin; perm_resolve > 0
+    // so the later oracle-authority burn passes the resolvability guard.
+    env.init_market_with_cap(0, 10_000, 50_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 

@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1525592; // v12.18.x: +8 bytes for RiskParams::min_funding_lifetime_slots
+const SLAB_LEN: usize = 1525656; // +64 bytes for insurance_authority + close_authority in SlabHeader
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -386,7 +386,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     // Per-market admin limits (within engine bounds)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps (resolvability invariant)
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min (warmup_period_slots)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -638,7 +638,6 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
-            AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_init_lp(&matcher, &ctx, 100),
     };
@@ -677,7 +676,6 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_init_user(100),
     };

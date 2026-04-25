@@ -2426,8 +2426,8 @@ fn test_attack_hyperp_push_zero_mark_price() {
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
-    const AUTH_PRICE_OFF: usize = 360;
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 424;
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -2621,7 +2621,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     env.svm
         .airdrop(&old_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_set_oracle_authority(&admin, &old_authority.pubkey())
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&old_authority))
         .unwrap();
     env.try_push_oracle_price(&old_authority, 1_000_000, 1000)
         .unwrap();
@@ -2649,12 +2649,13 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     );
     assert!(result.is_ok(), "Trade should succeed");
 
-    // Change oracle authority
+    // Change oracle authority — current authority (old_authority)
+    // must sign, along with new_authority (two-sig handover).
     let new_authority = Keypair::new();
     env.svm
         .airdrop(&new_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_set_oracle_authority(&admin, &new_authority.pubkey())
+    env.try_update_authority(&old_authority, AUTHORITY_ORACLE, Some(&new_authority))
         .unwrap();
 
     // Old authority should no longer be able to push prices
@@ -4734,7 +4735,6 @@ fn test_tradecpi_zero_fill_succeeds() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -4916,7 +4916,7 @@ fn test_zero_fill_must_not_advance_circuit_breaker_baseline() {
     env.crank();
 
     // Read the circuit-breaker baseline (last_effective_price_e6) from slab
-    const LAST_EFF_PRICE_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200) // last_effective_price_e6 in slab (config offset)
+    const LAST_EFF_PRICE_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200) // last_effective_price_e6 in slab (config offset)
     let baseline_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8].try_into().unwrap())
@@ -5331,7 +5331,6 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -5357,7 +5356,7 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
     env.crank();
 
     // Read last_effective_price_e6 before the zero-fill trade
-    const LAST_EFF_PRICE_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const LAST_EFF_PRICE_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(
@@ -5423,11 +5422,11 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
 /// offset_of!(RiskEngine, last_market_slot)=672, so 480+672=1152).
 #[test]
 fn test_tradecpi_zero_fill_advances_engine_time() {
-    // BPF layout offset for engine.last_market_slot. BPF ENGINE_OFF=472 with
-    // u128 align=8 (tighter than native align=16). last_market_slot sits at
-    // engine offset 656 after v12.18.x added RiskParams::min_funding_lifetime_slots
-    // (+8 vs the prior 648), giving absolute slab offset 472+656=1128.
-    const LAST_MARKET_SLOT_OFF: usize = 1128;
+    // BPF layout offset for engine.last_market_slot. 4-way-auth header
+    // grew from 72→136 (+64 for insurance_authority + close_authority),
+    // so ENGINE_OFF is now 536. last_market_slot at engine offset 656,
+    // absolute slab offset 536+656=1192.
+    const LAST_MARKET_SLOT_OFF: usize = 1192;
 
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;
@@ -5482,7 +5481,6 @@ fn test_tradecpi_zero_fill_advances_engine_time() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -5736,3 +5734,79 @@ fn test_slot_reuse_does_not_reuse_lp_matcher_identity() {
     assert_ne!(lp1_idx, lp2_idx, "LPs must be at different slots");
 }
 
+
+/// Audit #1 regression: honest same-price Hyperp trades MUST refresh
+/// the mark-liveness timer, otherwise a fully admin-free Hyperp market
+/// with steady-price real trading would expire into
+/// ResolvePermissionless.
+///
+/// Under the prior rule, liveness refreshed only when
+/// `config.mark_ewma_e6 != old_ewma_cpi` — same-price trades with a
+/// flat EWMA didn't count. The fix checks observation eligibility
+/// (fee_paid >= mark_min_fee) instead, so honest full-fee same-price
+/// trades DO refresh the liveness slots.
+#[test]
+fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+
+    // Set up trading parties.
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Seed the mark via an initial admin push (Hyperp needs a mark
+    // source before trades can produce exec prices at the mark).
+    env.try_push_oracle_price(&admin, 1_000_000, 1).unwrap();
+
+    const MARK_EWMA_LAST_OFF: usize = 136 + 312; // HEADER_LEN + offset_of(mark_ewma_last_slot)
+    const LAST_MARK_PUSH_OFF: usize = 136 + 272; // HEADER_LEN + offset_of(last_mark_push_slot) (u128, low 8 bytes = slot)
+    let read_slots = |env: &TradeCpiTestEnv| -> (u64, u64) {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        let e = u64::from_le_bytes(
+            slab[MARK_EWMA_LAST_OFF..MARK_EWMA_LAST_OFF + 8]
+                .try_into().unwrap());
+        let p = u64::from_le_bytes(
+            slab[LAST_MARK_PUSH_OFF..LAST_MARK_PUSH_OFF + 8]
+                .try_into().unwrap());
+        (e, p)
+    };
+
+    // Snapshot liveness slots BEFORE the test trade.
+    env.set_slot(100);
+    let (ewma_before, push_before) = read_slots(&env);
+
+    // Execute a same-price TradeCpi fill at a later slot. Under the
+    // old rule (EWMA-value-change refresh), same-price trades with a
+    // flat EWMA wouldn't move the liveness slots. Under the fix, an
+    // observation-eligible fill (mark_min_fee == 0 here) refreshes
+    // both mark_ewma_last_slot and last_mark_push_slot.
+    env.set_slot(500);
+    env
+        .try_trade_cpi(
+            &user, &lp.pubkey(), lp_idx, user_idx,
+            100_000_000, &matcher_prog, &matcher_ctx,
+        )
+        .expect("same-price Hyperp trade must succeed");
+
+    let (ewma_after, push_after) = read_slots(&env);
+
+    assert!(
+        ewma_after > ewma_before,
+        "mark_ewma_last_slot must advance on observation-eligible \
+         same-price trade (audit #1). before={} after={}",
+        ewma_before, ewma_after,
+    );
+    assert!(
+        push_after > push_before,
+        "last_mark_push_slot must advance on observation-eligible \
+         same-price Hyperp trade (audit #1). before={} after={}",
+        push_before, push_after,
+    );
+}
