@@ -209,11 +209,15 @@ pub mod constants {
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
     /// Default slot-based oracle staleness window before anyone may resolve.
-    /// ~10 hours at 400 ms/slot. Chosen to tolerate multi-hour Pyth or keeper
-    /// outages while staying well under the engine's `MAX_ACCRUAL_DT_SLOTS`
-    /// envelope. A cluster hard-fork restart bypasses this threshold
-    /// entirely via the `LastRestartSlot` sysvar check on `init_restart_slot`.
-    pub const DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 90_000;
+    /// Disabled by default (0 == opt-out): v12.19.6 restores the invariant
+    /// `permissionless_resolve_stale_slots <= max_accrual_dt_slots`, and the
+    /// engine's `MAX_ACCRUAL_DT_SLOTS = 100` is far too tight for any
+    /// meaningful public staleness window. Markets that need permissionless
+    /// resolution MUST set this explicitly on the extended InitMarket tail
+    /// to a value in `1..=max_accrual_dt_slots`. The non-Hyperp resolvability
+    /// guard (see InitMarket) still requires a non-zero value OR Hyperp mode,
+    /// so an admin-free non-Hyperp market can't be shipped with this at 0.
+    pub const DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 0;
     /// Upper bound on `force_close_delay_slots` (Finding 6). Without a bound, an
     /// init-time config of `u64::MAX` passes the "nonzero" liveness guard but
     /// makes ForceCloseResolved unreachable — `resolved_slot + delay` saturates
@@ -1713,10 +1717,6 @@ pub mod ix {
                         timestamp,
                     })
                 }
-                // Tag 18 (SetOraclePriceCap) removed in v12.19: the
-                // per-slot price-move cap is now init-immutable via
-                // RiskParams.max_price_move_bps_per_slot (spec §1.4
-                // solvency envelope).
                 19 => Ok(Instruction::ResolveMarket),
                 20 => Ok(Instruction::WithdrawInsurance),
                 21 => {
@@ -1895,6 +1895,36 @@ pub mod ix {
         // v12.19: per-slot price-move cap (standard bps, 100 = 1%).
         // Init-immutable per spec §1.4 solvency invariant.
         let max_price_move_bps_per_slot = read_u64(input)?;
+
+        // v12.19.6 §1.4 solvency envelope prevalidation. Engine's
+        // `validate_params` asserts this at init_in_place; wrapper surfaces
+        // as a clean `InvalidConfigParam` before the engine gets the chance
+        // to panic. Exact arithmetic using u128 for the sum — worst-case
+        // terms: price_budget <= 10_000*1_000_000 < 2^44, funding_budget
+        // has the same order; liquidation_fee_bps < 2^32; total fits u128.
+        //
+        //   price_budget = max_price_move_bps_per_slot * max_accrual_dt_slots
+        //   funding_budget = (max_abs_funding_e9_per_slot * max_accrual_dt_slots
+        //                     * 10_000) / FUNDING_DEN
+        //   require price_budget + funding_budget + liquidation_fee_bps
+        //            <= maintenance_margin_bps
+        {
+            let max_dt = crate::constants::MAX_ACCRUAL_DT_SLOTS as u128;
+            let max_mv = max_price_move_bps_per_slot as u128;
+            let max_fn = crate::constants::MAX_ABS_FUNDING_E9_PER_SLOT as u128;
+            let price_budget: u128 = max_mv.saturating_mul(max_dt);
+            let funding_budget: u128 = max_fn
+                .saturating_mul(max_dt)
+                .saturating_mul(10_000u128)
+                / percolator::FUNDING_DEN;
+            let total: u128 = price_budget
+                .saturating_add(funding_budget)
+                .saturating_add(liquidation_fee_bps as u128);
+            if total > maintenance_margin_bps as u128 {
+                return Err(crate::error::PercolatorError::InvalidConfigParam.into());
+            }
+        }
+
         let params = RiskParams {
             maintenance_margin_bps,
             initial_margin_bps,
@@ -3369,8 +3399,9 @@ pub mod processor {
     /// `CatchupAccrue` instruction which commits progress atomically
     /// without attempting a main operation afterwards.
     ///
-    /// 20 × max_dt ≈ 2M slots ≈ 11 days at 100k-slot envelope — well above
-    /// the auditor's pathological 1.3M-slot example.
+    /// 20 × max_dt = 20 × 100 = 2_000 slots per single instruction. Larger
+    /// gaps require multiple CatchupAccrue calls — that's the design
+    /// contract, not a misconfig.
     const CATCHUP_CHUNKS_MAX: u32 = 20;
 
     /// Pre-chunk market-clock advancement when the gap since the last
@@ -3427,57 +3458,115 @@ pub mod processor {
             return Ok(());
         }
         // Mirror the engine's own envelope predicate (§5.5 clause 6, v12.19):
-        // accrue_market_to only enforces `total_dt > max_dt` Overflow when
-        // funding would actually accumulate — i.e., rate != 0 AND both
-        // sides have OI AND fund_px_last > 0. When funding is INACTIVE,
-        // the engine will happily jump any dt in one call. If the wrapper
-        // chunks anyway, it can raise CatchupRequired on paths where the
-        // engine would legally advance directly — e.g.:
-        //   - Dead-oracle UpdateConfig degenerate arm (rate = 0)
-        //   - InitUser / InitLP / no-OI markets
-        //   - ResolveMarket Degenerate (rate = 0)
-        // Skip the chunking loop entirely when funding is inactive; the
-        // caller's final accrue_market_to handles any dt in one shot.
+        // accrue_market_to rejects `total_dt > max_dt` when EITHER funding
+        // or price movement would drain equity:
+        //
+        //   funding_active    = rate != 0 AND both OI sides live AND fund_px_last > 0
+        //   price_move_active = P_last > 0 AND oracle_price != P_last AND any OI live
+        //
+        // Prior versions chunked only on `funding_active`. A zero-funding
+        // market with live OI and a fresh oracle price different from
+        // P_last would then skip catchup, and the caller's final
+        // `accrue_market_to(now, fresh, rate)` would itself trip the
+        // envelope (and/or the §5.5 step-9 per-slot price-move cap) and
+        // make the market unrecoverable in-line.
+        //
+        // Fix: also gate on price_move_active, and in that case walk the
+        // chunk price from stored P_last toward `price` in steps each
+        // bounded by the §5.5 step-9 cap.
+        let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
         let funding_active = funding_rate_e9 != 0
             && engine.oi_eff_long_q != 0
             && engine.oi_eff_short_q != 0
             && engine.fund_px_last > 0;
-        if !funding_active {
+        let price_move_active =
+            engine.last_oracle_price > 0 && price != engine.last_oracle_price && oi_any;
+        if !funding_active && !price_move_active {
+            // Neither accrual driver is active — the engine's envelope
+            // predicate will permit a single-call jump. Caller's final
+            // accrue_market_to handles it in one shot.
             return Ok(());
         }
-        // Catchup chunks use the engine's STORED last_oracle_price, not the
-        // caller's fresh `price`. Rationale: accrue_market_to's funding math
-        // (engine §5.5) uses `fund_px_last` (the price at call entry) for
-        // the fund_num_total = fund_px * rate * dt transfer, then sets
-        // fund_px_last to the caller's `oracle_price`. If we used the fresh
-        // price for every chunk:
-        //   chunk 1: fund_px_0 = stored_P, total = stored_P * rate * max_dt,
-        //            fund_px_last := fresh
-        //   chunk 2: fund_px_0 = fresh,    total = fresh     * rate * max_dt
-        //   ...
-        // yielding a mathematically different transfer than a single-call
-        // accrue (which would use stored_P throughout). Using stored_P for
-        // every chunk keeps fund_px_last pinned at stored_P across the
-        // chunked path, so the chunked sum equals the single-call transfer:
-        //   stored_P * rate * total_dt (up to the caller's final boundary).
-        // The caller's final accrue_market_to(now_slot, fresh, rate) then
-        // applies fresh only to the residual, as a single-call accrue would.
-        let chunk_price = engine.last_oracle_price;
-        let _ = price; // caller's price used only by their final accrue_market_to
+        // Per-chunk max price step (§5.5 step 9): for any chunk with
+        // dt = max_dt and previous price `prev`,
+        //   |chunk_price - prev| * 10_000 <= cap_bps * max_dt * prev
+        // i.e. max_delta_per_chunk = cap_bps * max_dt * prev / 10_000
+        // (floor). validate_params guarantees `cap_bps * max_dt <=
+        // MAX_MARGIN_BPS (1e4)`, so the per-chunk geometric ratio is
+        // bounded by 2x. A pathological 1-to-MAX_ORACLE_PRICE walk needs
+        // ~40 doublings; typical moves converge in 1-2 chunks.
+        //
+        // Loop termination: exit when the caller's final
+        // `accrue_market_to(now_slot, price, rate)` will satisfy BOTH
+        // §5.5 clause 6 (residual dt ≤ max_dt) AND §5.5 step 9 (price
+        // jump within the cap for that residual dt).
+        let cap_bps = engine.params.max_price_move_bps_per_slot;
+        let residual_admissible = |engine: &RiskEngine| -> bool {
+            let remaining = now_slot.saturating_sub(engine.last_market_slot);
+            if remaining > max_dt {
+                return false;
+            }
+            if !price_move_active {
+                return true;
+            }
+            let prev = engine.last_oracle_price;
+            let abs_delta = if price >= prev { price - prev } else { prev - price };
+            // Validated bounds: cap_bps*max_dt ≤ MAX_MARGIN_BPS (1e4),
+            // prev ≤ MAX_ORACLE_PRICE (1e12), abs_delta ≤ 2*MAX_ORACLE_PRICE.
+            // All products fit u128.
+            let lhs = (abs_delta as u128).saturating_mul(10_000u128);
+            let rhs = (cap_bps as u128)
+                .saturating_mul(remaining as u128)
+                .saturating_mul(prev as u128);
+            lhs <= rhs
+        };
         let mut chunks: u32 = 0;
-        while now_slot.saturating_sub(engine.last_market_slot) > max_dt {
+        while !residual_admissible(engine) {
             if chunks >= CATCHUP_CHUNKS_MAX {
-                // Refuse to proceed — silently returning Ok here would let
-                // the caller's main accrue hit Overflow on the residual
-                // gap, rolling back ALL catchup work (no net progress).
-                // Surfacing CatchupRequired instead tells callers/keepers
-                // to use the dedicated CatchupAccrue instruction which
-                // commits progress without attempting the main op.
+                // Silently returning Ok here would let the caller's
+                // main accrue hit Overflow on the residual, rolling
+                // back ALL catchup progress. Surface CatchupRequired
+                // so the caller routes to the dedicated CatchupAccrue
+                // instruction which commits progress without attempting
+                // the main op.
                 return Err(PercolatorError::CatchupRequired.into());
             }
-            let step = engine.last_market_slot.saturating_add(max_dt);
+            let remaining = now_slot.saturating_sub(engine.last_market_slot);
+            // Pick chunk dt: full max_dt when the time gap is large;
+            // otherwise the whole residual (we're chunking in that case
+            // only because price isn't admissible yet at the residual).
+            let chunk_dt = core::cmp::min(remaining, max_dt);
+            // chunk_dt == 0 would mean remaining == 0 but price not
+            // admissible (i.e. price != prev). Can't do a same-slot
+            // price jump via accrue_market_to — surface CatchupRequired.
+            if chunk_dt == 0 {
+                return Err(PercolatorError::CatchupRequired.into());
+            }
+            let step_slot = engine.last_market_slot.saturating_add(chunk_dt);
+            let prev_price = engine.last_oracle_price;
+            let chunk_price = if price_move_active {
+                // Walk `prev_price` toward `price` by at most
+                //   max_delta = cap_bps * chunk_dt * prev / 10_000
+                let max_delta = (cap_bps as u128)
+                    .saturating_mul(chunk_dt as u128)
+                    .saturating_mul(prev_price as u128)
+                    / 10_000u128;
+                let max_delta_u64 = core::cmp::min(max_delta, u64::MAX as u128) as u64;
+                if price >= prev_price {
+                    let remaining_px = price - prev_price;
+                    prev_price.saturating_add(core::cmp::min(remaining_px, max_delta_u64))
+                } else {
+                    let remaining_px = prev_price - price;
+                    prev_price.saturating_sub(core::cmp::min(remaining_px, max_delta_u64))
+                }
+            } else {
+                // funding-only path: keep chunk_price pinned at stored
+                // P_last so the chunked funding sum matches the single-
+                // call transfer (see extended rationale above).
+                prev_price
+            };
             engine
-                .accrue_market_to(step, chunk_price, funding_rate_e9)
+                .accrue_market_to(step_slot, chunk_price, funding_rate_e9)
                 .map_err(map_risk_error)?;
             chunks = chunks.saturating_add(1);
         }
@@ -4162,6 +4251,22 @@ pub mod processor {
                 if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // Spec §12.21: public wrappers MUST NOT admit the combination
+                //   (admit_h_min == 0 && admit_h_max_consumption_threshold_bps == None)
+                // at any admission call site. The wrapper's runtime default
+                // passes `Some(maintenance_margin_bps)` as the threshold
+                // (see `admit_threshold = Some(engine.params
+                // .maintenance_margin_bps as u128)` in every execute_trade /
+                // withdraw / convert / settle call site). maintenance_margin_bps
+                // is validated > 0 immediately above, so the forbidden
+                // combination cannot arise at runtime. This assert makes the
+                // invariant explicit at init so a future change that relaxes
+                // the `maintenance_margin_bps == 0` reject (or swaps the
+                // runtime threshold to `None`) trips here, not silently via
+                // a §12.21-violating admission.
+                if risk_params.h_min == 0 && risk_params.maintenance_margin_bps == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
                 // insurance_withdraw_max_bps is a percentage (0..=10_000)
                 if insurance_withdraw_max_bps > 10_000 {
                     return Err(ProgramError::InvalidInstructionData);
@@ -4259,18 +4364,18 @@ pub mod processor {
                 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // v12.19: the old "perm_resolve <= max_accrual_dt_slots"
-                // check is dropped. MAX_ACCRUAL_DT_SLOTS was tightened to
-                // 100 slots (solvency envelope), while perm_resolve is a
-                // cluster-timeout in the 10_000-slot range; they are
-                // independent parameters. Admin ResolveMarket's Ordinary
-                // arm can still hit CatchupRequired on a market with
-                // large dt — callers run the dedicated CatchupAccrue
-                // instruction, which is why it exists. The Hyperp
-                // `CATCHUP_CHUNKS_MAX * MAX_ACCRUAL_DT_SLOTS` bound is
-                // also dropped: Hyperp stale recovery uses the same
-                // CatchupAccrue loop, so a multi-call recovery is an
-                // explicit contract, not a misconfiguration.
+                // §12.19.6: permissionless resolution must fire within a
+                // single accrue envelope, else the last accrue on the
+                // market would exceed `max_accrual_dt_slots` and starve
+                // permissionless resolve (callers would have to run
+                // CatchupAccrue first, which is an admin/keeper path).
+                // This invariant is the opt-in gate: markets that don't
+                // enable permissionless resolve pass trivially (perm==0).
+                if permissionless_resolve_stale_slots > 0
+                    && permissionless_resolve_stale_slots > risk_params.max_accrual_dt_slots
+                {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 // Non-Hyperp resolvability invariant: a non-Hyperp market
                 // with `permissionless_resolve_stale_slots == 0` has only
@@ -4449,10 +4554,10 @@ pub mod processor {
                     if p.h_max == 0 || p.h_min > p.h_max {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    // Settlement deviation band: 0 < bps <= MAX (engine asserts)
-                    if p.resolve_price_deviation_bps == 0
-                        || p.resolve_price_deviation_bps > percolator::MAX_RESOLVE_PRICE_DEVIATION_BPS
-                    {
+                    // Settlement deviation band: 0 <= bps <= MAX per spec
+                    // v12.19.6. Zero means "no deviation tolerance" — the
+                    // authority settlement path admits only exact P_last.
+                    if p.resolve_price_deviation_bps > percolator::MAX_RESOLVE_PRICE_DEVIATION_BPS {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                 }
@@ -6571,22 +6676,17 @@ pub mod processor {
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
-                // No-oracle path. bounded_now:
-                //   - upper-bounded by last_market_slot so we don't
-                //     advance current_slot past the accrue envelope,
-                //   - floored at current_slot so the engine's
-                //     monotonicity guard (`now_slot >= current_slot`)
-                //     still holds after a prior no-oracle op (InitUser,
-                //     DepositCollateral, ReclaimEmptyAccount) has
-                //     advanced current_slot past last_market_slot.
-                // Full accrue for the tail `(last_market_slot,
-                // clock.slot]` happens on the next oracle-backed op.
-                let bounded_now = core::cmp::max(
-                    core::cmp::min(clock.slot, engine.last_market_slot),
-                    engine.current_slot,
-                );
+                // §9.2 envelope gate on no-oracle paths: if the market's
+                // `last_market_slot` lags clock beyond the single-accrue
+                // envelope, this op would silently advance `current_slot`
+                // into a region whose funding/mark has never been accrued.
+                // Require the caller to run `CatchupAccrue` first.
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                if gap > engine.params.max_accrual_dt_slots {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
                 engine
-                    .top_up_insurance_fund(units as u128, bounded_now)
+                    .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
 
@@ -6834,26 +6934,17 @@ pub mod processor {
                                     (price, funding_rate_e9)
                                 }
                                 Err(e) => {
-                                    // Only OracleStale / OracleConfTooWide
-                                    // prove the feed is unusable; other
-                                    // errors (wrong account, bad data,
-                                    // wrong feed) propagate as-is.
-                                    // OracleConfTooWide added to match
-                                    // ResolvePermissionless (Finding 7 of
-                                    // an earlier round) — without it,
-                                    // non-Hyperp markets with a live-but-
-                                    // wide feed would be unable to update
-                                    // config under the degenerate arm.
-                                    let stale_err: ProgramError =
-                                        PercolatorError::OracleStale.into();
-                                    let conf_err: ProgramError =
-                                        PercolatorError::OracleConfTooWide.into();
-                                    if e != stale_err && e != conf_err {
-                                        return Err(e);
-                                    }
-                                    // Oracle is confirmed unusable → degenerate arm.
-                                    let engine = zc::engine_ref(&data)?;
-                                    (engine.last_oracle_price, 0i128)
+                                    // v12.19.6: propagate the oracle error.
+                                    // UpdateConfig must NOT enter a
+                                    // degenerate-price + rate=0 arm on
+                                    // OracleStale / OracleConfTooWide — that
+                                    // would erase elapsed funding on a live
+                                    // market (current-slot advances but no
+                                    // accrual lands). Admin MUST route stale
+                                    // markets through Resolve{Market,
+                                    // Permissionless}; the hard-timeout gate
+                                    // above is the "market is dead" signal.
+                                    return Err(e);
                                 }
                             }
                         };
@@ -7732,18 +7823,12 @@ pub mod processor {
                 sync_account_fee_bounded_to_market(
                     engine, &config, user_idx, clock.slot,
                 )?;
-                // No-oracle path: cap anchor at last_market_slot but
-                // floor at current_slot so the engine's monotonicity
-                // guard (now_slot >= current_slot) holds even in the
-                // transient state where a previous no-oracle op (e.g.
-                // InitUser / DepositCollateral) has advanced current
-                // _slot past last_market_slot. Full accrue still
-                // happens on the next oracle-backed op.
-                let bounded_now = core::cmp::max(
-                    core::cmp::min(clock.slot, engine.last_market_slot),
-                    engine.current_slot,
-                );
-                engine.reclaim_empty_account_not_atomic(user_idx, bounded_now)
+                // §9.2 envelope gate on no-oracle paths.
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                if gap > engine.params.max_accrual_dt_slots {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
+                engine.reclaim_empty_account_not_atomic(user_idx, clock.slot)
                     .map_err(map_risk_error)?;
                 // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
             }
@@ -7877,25 +7962,19 @@ pub mod processor {
                 // Phase 3: SPL transfer (only after validation)
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Phase 4: book the repayment in the engine. The engine's
-                // deposit_fee_credits self-advances current_slot; bound its
-                // now_slot at last_market_slot BUT floor at current_slot
-                // so the engine monotonicity guard (`now_slot >= current
-                // _slot`) holds after any prior no-oracle self-advance
-                // (InitUser, DepositCollateral, ReclaimEmptyAccount,
-                // TopUpInsurance). Full accrue for the residual tail
-                // happens on the next oracle-backed op.
+                // Phase 4: book the repayment in the engine.
                 let mut data = state::slab_data_mut(a_slab)?;
                 let config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
                 let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
                 let _ = &config; // Phase 1 synced; no second sync needed.
-                let bounded_now = core::cmp::max(
-                    core::cmp::min(clock.slot, engine.last_market_slot),
-                    engine.current_slot,
-                );
-                engine.deposit_fee_credits(user_idx, units2 as u128, bounded_now)
+                // §9.2 envelope gate on no-oracle paths.
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                if gap > engine.params.max_accrual_dt_slots {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
+                engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
 
@@ -8242,23 +8321,33 @@ pub mod processor {
                 }
 
                 // Decide COMPLETE vs PARTIAL based on whether one call can
-                // close the full gap. If funding is inactive (rate == 0
-                // OR one side has no OI OR fund_px_last == 0), the engine
-                // doesn't enforce the dt envelope — accrue_market_to can
-                // jump the full gap in one call. Treat as can_finish
-                // regardless of gap size. This matches the engine's own
-                // §5.5 clause-6 predicate and prevents CatchupAccrue from
-                // gratuitously stepping partial targets on empty/inactive
-                // markets.
+                // close the full gap. The engine's §5.5 clause-6 predicate
+                // rejects `total_dt > max_dt` whenever EITHER funding OR
+                // price-movement would drain equity:
+                //
+                //   funding_active    = rate != 0, both OI sides, fund_px_last > 0
+                //   price_move_active = P_last > 0, fresh_price != P_last, any OI
+                //
+                // If neither is active we can jump the full gap in one
+                // call. Missing the price_move leg (prior versions) meant
+                // a zero-funding live-OI market with a new oracle price
+                // could be claimed "can_finish" but then fail in the
+                // single-shot accrue after `catchup_accrue` returned
+                // early.
                 let max_dt = engine.params.max_accrual_dt_slots;
                 let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64)
                     .saturating_mul(max_dt);
                 let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
                 let funding_active = funding_rate_e9_pre != 0
                     && engine.oi_eff_long_q != 0
                     && engine.oi_eff_short_q != 0
                     && engine.fund_px_last > 0;
-                let can_finish = !funding_active || gap <= max_step_per_call;
+                let price_move_active = engine.last_oracle_price > 0
+                    && fresh_price != engine.last_oracle_price
+                    && oi_any;
+                let accrual_active = funding_active || price_move_active;
+                let can_finish = !accrual_active || gap <= max_step_per_call;
 
                 if can_finish {
                     // COMPLETE: chunk to clock.slot using stored P_last
