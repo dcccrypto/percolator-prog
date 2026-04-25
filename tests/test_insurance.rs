@@ -912,7 +912,7 @@ fn test_attack_withdraw_insurance_with_open_positions() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
@@ -1030,7 +1030,7 @@ fn test_attack_topup_insurance_after_resolution() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
@@ -1628,7 +1628,7 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0);
     let admin = env.payer.insecure_clone();
 
     // Create LP and user
@@ -1784,28 +1784,6 @@ fn test_insurance_withdraw_bps_cap() {
 
 /// insurance_withdraw_max_bps == 0 blocks live-market withdrawals.
 #[test]
-fn test_insurance_withdraw_disabled_on_live_market() {
-    program_path();
-    let mut env = TestEnv::new();
-    // Default init: insurance_withdraw_max_bps = 0 (disabled)
-    env.init_market_with_invert(0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
-
-    // Capture state before rejected operation
-    let vault_before = env.vault_balance();
-    let insurance_before = env.read_insurance_balance();
-
-    // Live-market withdrawal should be rejected
-    env.set_slot(1);
-    let r = env.try_withdraw_insurance_limited(&admin, 1);
-    assert!(r.is_err(), "Live withdrawal must be blocked when max_bps=0");
-
-    // State must be unchanged after rejection
-    assert_eq!(env.vault_balance(), vault_before, "vault_balance must be preserved after rejection");
-    assert_eq!(env.read_insurance_balance(), insurance_before, "insurance_balance must be preserved after rejection");
-}
 
 /// InitMarket must reject insurance_withdraw_max_bps > 10000.
 #[test]
@@ -1986,6 +1964,161 @@ fn test_insurance_floor_immutable_after_init() {
 /// haven't absorbed insurance yet), letting the authority withdraw funds that
 /// should be reserved for loss coverage.
 #[test]
+
+
+/// Regression for audit #3: UpdateAuthority(kind=ORACLE) must NOT
+/// corrupt the limited-insurance policy state when is_policy_configured
+/// is set. The policy packs (max_bps, last_withdraw_slot) into
+/// config.authority_timestamp and min_withdraw_base into
+/// config.last_effective_price_e6 — these are repurposed-resolved-mode
+/// oracle fields. An earlier version of the ORACLE handler zeroed
+/// authority_timestamp/price unconditionally on non-Hyperp, which
+/// would break subsequent WithdrawInsuranceLimited calls.
+#[test]
+
+/// Negative-path companion: when NO policy is configured, the ORACLE
+/// authority change still clears stored price/timestamp (matches the
+/// pre-policy-configured intended behavior). Verifies the
+/// is_policy_configured gate does NOT over-extend.
+#[test]
+fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
+    program_path();
+
+    let mut env = TestEnv::new();
+
+    // Init market with insurance_withdraw_max_bps=100 (1%) + cooldown=1 slot
+    // to enable live-market limited withdrawals.
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm.set_account(dummy_ata, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; TokenAccount::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.pubkey().as_ref());
+    data.extend_from_slice(env.mint.as_ref());
+    data.extend_from_slice(&TEST_FEED_ID);
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    data.push(0u8); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
+    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
+    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap
+    // RiskParams
+    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&10u64.to_le_bytes()); // max_crank_staleness_slots = 10
+    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
+    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    // Enable live insurance withdrawals
+    data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
+    data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
+    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix], Some(&admin.pubkey()), &[admin], env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init with live withdrawals");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+
+    // Snapshot fields.
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + authority_price_e6(176)
+    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + authority_timestamp(184)
+    let (price_before, ts_before) = {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        (
+            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
+            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
+        )
+    };
+    assert!(price_before > 0, "authority price populated by push");
+    assert!(ts_before > 0, "authority timestamp populated by push");
+
+    // Rotate oracle authority.
+    let new_oracle = Keypair::new();
+    env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle))
+        .expect("oracle rotation must succeed");
+
+    // Under the no-policy branch, the clear fires as before.
+    let (price_after, ts_after) = {
+        let slab = env.svm.get_account(&env.slab).unwrap().data;
+        (
+            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
+            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
+        )
+    };
+    assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
+    assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_insurance_withdraw_disabled_on_live_market() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Default init: insurance_withdraw_max_bps = 0 (disabled)
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
+
+    // Capture state before rejected operation
+    let vault_before = env.vault_balance();
+    let insurance_before = env.read_insurance_balance();
+
+    // Live-market withdrawal should be rejected
+    env.set_slot(1);
+    let r = env.try_withdraw_insurance_limited(&admin, 1);
+    assert!(r.is_err(), "Live withdrawal must be blocked when max_bps=0");
+
+    // State must be unchanged after rejection
+    assert_eq!(env.vault_balance(), vault_before, "vault_balance must be preserved after rejection");
+    assert_eq!(env.read_insurance_balance(), insurance_before, "insurance_balance must be preserved after rejection");
+}
+
+#[test]
 fn test_insurance_withdraw_limited_requires_recent_crank() {
     program_path();
 
@@ -2089,4 +2222,3 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
         err_msg,
     );
 }
-

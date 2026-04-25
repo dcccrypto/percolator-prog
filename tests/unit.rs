@@ -245,7 +245,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
     encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
-    encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
+    encode_u64(1_000_000, &mut data); // min_oracle_price_cap_e2bps (resolvability invariant: cap>0 satisfies guard)
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);   // warmup_period_slots
     encode_u64(500, &mut data); // maintenance_margin_bps (must be < initial_margin_bps)
@@ -294,7 +294,7 @@ fn encode_init_market_invert(
     // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
     encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
-    encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
+    encode_u64(1_000_000, &mut data); // min_oracle_price_cap_e2bps (resolvability invariant: cap>0 satisfies guard)
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);    // warmup_period_slots
     encode_u64(500, &mut data);  // maintenance_margin_bps (must be < initial_margin_bps)
@@ -440,7 +440,9 @@ fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
 }
 
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8];
+    // UpdateAuthority { kind: AUTHORITY_ADMIN = 0, new_pubkey }
+    let mut data = vec![32u8];
+    data.push(0u8); // AUTHORITY_ADMIN
     encode_pubkey(new_admin, &mut data);
     data
 }

@@ -120,7 +120,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
     const HEADER_CONFIG_LEN: usize = 584;
-    const NUM_USED_OFF: usize = 1680;
+    const NUM_USED_OFF: usize = 1776;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {
         let vault_data = svm.get_account(&vault).unwrap().data;
@@ -289,8 +289,8 @@ fn test_hyperp_init_market_with_valid_price() {
     let mark = config.authority_price_e6;
     let index = config.last_effective_price_e6;
     let cap = config.oracle_price_cap_e2bps;
-    const FEED_ID_OFF: usize = 72 + 64;
-    const INVERT_OFF: usize = 72 + 107;
+    const FEED_ID_OFF: usize = 136 + 64;
+    const INVERT_OFF: usize = 136 + 107;
     let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -447,8 +447,8 @@ fn test_hyperp_init_market_with_inverted_price() {
     let mark = config.authority_price_e6;
     let index = config.last_effective_price_e6;
     let cap = config.oracle_price_cap_e2bps;
-    const FEED_ID_OFF: usize = 72 + 64;
-    const INVERT_OFF: usize = 72 + 107;
+    const FEED_ID_OFF: usize = 136 + 64;
+    const INVERT_OFF: usize = 136 + 107;
     let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -768,7 +768,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     // Before Bug #9 fix, dt=0 caused clamp_toward_with_dt to return mark
     // instead of index, allowing the index to jump to mark in a single slot.
     let slab_data = svm.get_account(&slab).unwrap().data;
-    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 336; // HEADER_LEN(136) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_after = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert_eq!(
         index_after, initial_price_e6,
@@ -803,7 +803,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
 
     // Read default oracle_price_cap_e2bps (1% per slot = 10_000 e2bps)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = 72 + 192; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
+    const CAP_OFF: usize = 136 + 192; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
     let cap_e2bps =
         u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
     assert_eq!(cap_e2bps, 10_000, "default cap should be 10_000 e2bps (1% per slot)");
@@ -817,7 +817,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
     env.set_oracle_price_e6(200_000_000);
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 72 + 200; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 136 + 200; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
 
     // Advance 10 slots and crank. Index should move toward mark.
     let dt: u64 = 10;

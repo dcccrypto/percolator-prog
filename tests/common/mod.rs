@@ -196,7 +196,10 @@ pub fn encode_init_market_with_conf_bps(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: ship max cap for non-Hyperp since the
+    // default tail has perm_resolve=0.
+    let default_cap: u64 = if feed_id == &[0u8; 32] { 0 } else { 1_000_000 };
+    data.extend_from_slice(&default_cap.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -239,7 +242,14 @@ pub fn encode_init_market_full_v2(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
+    // rejected at init. Default tail uses perm_resolve=0, so non-Hyperp
+    // feeds need cap > 0. Hyperp (feed_id all-zero) is exempt and can
+    // carry cap=0 — the wrapper promotes to DEFAULT_HYPERP_PRICE_CAP
+    // at init.
+    let is_hyperp = feed_id == &[0u8; 32];
+    let default_cap: u64 = if is_hyperp { 0 } else { 1_000_000 };
+    data.extend_from_slice(&default_cap.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -472,7 +482,17 @@ pub fn encode_init_market_with_maint_fee_bounded(
     // per-account fee accrual via sync_account_fee_to_slot_not_atomic).
     data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
+    // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
+    // rejected at init. This helper's tail uses perm_resolve=0, so
+    // promote cap=0 callers to the max cap (100%/read — essentially
+    // unrestricted) instead of failing init. Callers that want to
+    // exercise cap semantics should use a different encoder.
+    let cap = if min_oracle_price_cap_e2bps == 0 {
+        1_000_000
+    } else {
+        min_oracle_price_cap_e2bps
+    };
+    data.extend_from_slice(&cap.to_le_bytes());
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -502,9 +522,14 @@ pub fn encode_init_market_with_force_close(
     feed_id: &[u8; 32],
     force_close_delay_slots: u64,
 ) -> Vec<u8> {
-    // Build base with cap + permissionless resolve (full 82-byte tail)
+    // Build base with cap + permissionless resolve (full 82-byte tail).
+    // Strict hard-timeout model: use a wide permissionless_resolve
+    // _stale_slots (1000) so tests that advance the clock for their
+    // OWN purposes (trade → crank → resolve sequences) stay within the
+    // live window. The 100-slot default that was fine under the old
+    // challenge-window model trips the hard gate mid-sequence.
     let mut data = encode_init_market_with_cap(
-        admin, mint, feed_id, 0, 10_000, 100,
+        admin, mint, feed_id, 0, 10_000, 1000,
     );
     // Truncate default force_close_delay_slots (last 8 bytes), replace with custom
     data.truncate(data.len() - 8);
@@ -733,49 +758,12 @@ impl TestEnv {
     }
 
     pub fn init_market_with_invert(&mut self, invert: u8) {
-        let admin = &self.payer;
-        let dummy_ata = Pubkey::new_unique();
-        self.svm
-            .set_account(
-                dummy_ata,
-                Account {
-                    lamports: 1_000_000,
-                    data: vec![0u8; TokenAccount::LEN],
-                    owner: spl_token::ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(self.mint, false),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            ],
-            data: encode_init_market_with_invert(
-                &admin.pubkey(),
-                &self.mint,
-                &TEST_FEED_ID,
-                invert,
-            ),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), ix],
-            Some(&admin.pubkey()),
-            &[admin],
-            self.svm.latest_blockhash(),
-        );
-        self.svm.send_transaction(tx).expect("init_market failed");
+        // Delegate to init_market_with_cap with min_cap=10_000 so the
+        // init-time invariant (non-Hyperp + cap=0 → oracle_authority=0)
+        // doesn't zero oracle_authority for tests that later expect to
+        // use it. Tests that want the cap=0 behavior use
+        // init_market_with_cap directly with 0.
+        self.init_market_with_cap(invert, 10_000, 0);
     }
 
     /// Initialize a market with oracle price cap (enables EWMA) and optional permissionless resolution.
@@ -1103,7 +1091,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -1147,7 +1134,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, fee),
         };
@@ -1177,7 +1163,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -1527,25 +1512,7 @@ pub fn encode_withdraw_insurance() -> Vec<u8> {
     vec![20u8] // Instruction tag for WithdrawInsurance
 }
 
-pub fn encode_set_insurance_withdraw_policy(
-    authority: &Pubkey,
-    min_withdraw_base: u64,
-    max_withdraw_bps: u16,
-    cooldown_slots: u64,
-) -> Vec<u8> {
-    let mut data = vec![22u8];
-    data.extend_from_slice(authority.as_ref());
-    data.extend_from_slice(&min_withdraw_base.to_le_bytes());
-    data.extend_from_slice(&max_withdraw_bps.to_le_bytes());
-    data.extend_from_slice(&cooldown_slots.to_le_bytes());
-    data
-}
 
-pub fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
-    let mut data = vec![23u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    data
-}
 
 pub fn encode_withdraw(user_idx: u16, amount: u64) -> Vec<u8> {
     let mut data = vec![4u8]; // Instruction tag for WithdrawCollateral
@@ -1587,7 +1554,10 @@ pub fn encode_init_market_full(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // min_oracle_price_cap_e2bps = 10_000 so oracle_authority defaults
+    // to admin under the init-time invariant. Tests that specifically
+    // want cap=0 should use init_market_with_cap(..., 0, ...) directly.
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -1630,7 +1600,11 @@ pub fn encode_init_market_with_warmup(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
+    // rejected at init. Default tail has perm_resolve=0, so ship max
+    // cap to satisfy the invariant without restricting test oracle
+    // moves.
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
@@ -1769,7 +1743,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(fee),
         };
@@ -2563,11 +2536,11 @@ impl TestEnv {
 // CRITICAL SECURITY TESTS - L7 DEEP DIVE
 // ============================================================================
 
-// Instruction encoders for admin operations
+// Legacy encoders — the on-chain UpdateAdmin (tag 12) and
+// SetOracleAuthority (tag 16) instructions were deleted. These
+// helpers now route through UpdateAuthority (tag 32).
 pub fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8]; // Tag 12: UpdateAdmin
-    data.extend_from_slice(new_admin.as_ref());
-    data
+    encode_update_authority(AUTHORITY_ADMIN, new_admin)
 }
 
 pub fn encode_accept_admin() -> Vec<u8> {
@@ -2630,10 +2603,20 @@ impl TestEnv {
     /// pending_admin only; caller must also call try_accept_admin(&new_admin_kp)
     /// to complete the transfer. new_admin == default() still burns immediately.
     pub fn try_update_admin(&mut self, signer: &Keypair, new_admin: &Pubkey) -> Result<(), String> {
+        let is_burn = *new_admin == Pubkey::default();
+        let is_self = *new_admin == signer.pubkey();
+        // Mark new as signer only on self-transfer (one tx sig covers
+        // both slots). Cross-Keypair transfers are marked non-signer
+        // and the program rejects at expect_signer — this matches
+        // the "negative test expects rejection" pattern used by
+        // legacy call-sites. Positive cross-Keypair transfers should
+        // use try_update_authority directly with Some(&new_kp).
+        let new_is_signer = !is_burn && is_self;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(*new_admin, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_admin(new_admin),
@@ -2824,6 +2807,11 @@ impl TestEnv {
     /// OracleStale; a second call after `permissionless_resolve_stale_slots`
     /// have elapsed succeeds. Tests asserting specific single-call behavior
     /// (e.g., rejecting a premature resolve after idle) should use this.
+    /// ResolvePermissionless in the strict hard-timeout model takes just
+    /// the slab and clock sysvar — no oracle account. The timer anchor
+    /// is config.last_good_oracle_slot (non-Hyperp) or the mark slot
+    /// (Hyperp). Single-call: the instruction either succeeds
+    /// (window matured) or returns OracleStale (not yet).
     pub fn try_resolve_permissionless_once(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
@@ -2832,7 +2820,6 @@ impl TestEnv {
             accounts: vec![
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_resolve_permissionless(),
         };
@@ -2845,20 +2832,11 @@ impl TestEnv {
         self.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
     }
 
-    /// Permissionless resolution convenience helper simulating a real keeper:
-    /// observe stale → wait permissionless_resolve_stale_slots → resolve.
-    /// The wrapper now requires two observations of a stale oracle separated
-    /// by the configured delay to prevent premature resolution after a long
-    /// idle period followed by a short oracle hiccup. This helper performs
-    /// both observations with an artificial clock advance between them so
-    /// existing tests don't have to manually orchestrate the two-phase flow.
+    /// Convenience helper: advance the clock past
+    /// permissionless_resolve_stale_slots (measured from the current
+    /// last-live slot), then call ResolvePermissionless. Matches a real
+    /// keeper waiting out the hard timeout.
     pub fn try_resolve_permissionless(&mut self) -> Result<(), String> {
-        // First observation — stamps first_observed_stale_slot, returns stale.
-        // Idempotent on repeated calls within the same stale window.
-        let _ = self.try_resolve_permissionless_once();
-        // Advance clock past permissionless_resolve_stale_slots so the second
-        // call passes the duration check. Reads the configured delay from the
-        // slab via the program's own state layout.
         let delay = {
             let slab = self.svm.get_account(&self.slab).unwrap();
             percolator_prog::state::read_config(&slab.data).permissionless_resolve_stale_slots
@@ -2867,7 +2845,6 @@ impl TestEnv {
         clk.slot = clk.slot.saturating_add(delay).saturating_add(1);
         clk.unix_timestamp = clk.unix_timestamp.saturating_add(delay as i64 + 1);
         self.svm.set_sysvar(&clk);
-        // Second observation — duration check passes, market resolves.
         self.try_resolve_permissionless_once()
     }
 
@@ -2965,38 +2942,6 @@ impl TestEnv {
     }
 
     /// Configure limited insurance-withdraw policy (admin only, resolved market only).
-    pub fn try_set_insurance_withdraw_policy(
-        &mut self,
-        admin: &Keypair,
-        authority: &Pubkey,
-        min_withdraw_base: u64,
-        max_withdraw_bps: u16,
-        cooldown_slots: u64,
-    ) -> Result<(), String> {
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(self.slab, false),
-            ],
-            data: encode_set_insurance_withdraw_policy(
-                authority,
-                min_withdraw_base,
-                max_withdraw_bps,
-                cooldown_slots,
-            ),
-        };
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), ix],
-            Some(&admin.pubkey()),
-            &[admin],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
 
     /// Limited insurance withdraw by configured authority.
     /// Live markets require oracle (8th account). Pass pyth_index for accrual.
@@ -3441,7 +3386,6 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher_prog, &ctx, 100),
         };
@@ -3517,7 +3461,6 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher_prog, matcher_ctx, 100),
         };
@@ -3549,7 +3492,6 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -4590,7 +4532,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -4964,7 +4905,8 @@ impl TestEnv {
         // Per-market admin limits (uncapped defaults for tests)
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
         data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-        data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+        // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
+        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
         // RiskParams
         data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -5361,7 +5303,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(fee),
         };
@@ -5396,7 +5337,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher, ctx, fee),
         };
@@ -5813,7 +5753,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&Pubkey::new_unique(), &Pubkey::new_unique(), 100),
         };
@@ -7681,7 +7620,8 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps

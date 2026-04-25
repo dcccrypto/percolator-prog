@@ -3124,7 +3124,7 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
     // Read last_effective_price_e6 (the index) before same-slot crank
     // last_effective_price_e6 is at config offset 312: slab bytes [384..392]
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_before =
         u64::from_le_bytes(slab_before[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert!(index_before > 0, "Index should be non-zero before crank");
@@ -3435,7 +3435,7 @@ fn test_attack_liquidate_healthy_account() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3504,30 +3504,13 @@ fn test_attack_update_admin_to_zero_locks_out() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Set admin to zero - now allowed for admin burn (spec §7)
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-        ],
-        data: {
-            let mut d = vec![12u8]; // UpdateAdmin tag
-            d.extend_from_slice(zero_pubkey.as_ref());
-            d
-        },
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[&admin],
-        env.svm.latest_blockhash(),
-    );
-    let result = env.svm.send_transaction(tx);
+    // Burn admin via UpdateAuthority (tag 32, kind=ADMIN, new=zero,
+    // single-sig). Legacy UpdateAdmin tag 12 was deleted.
+    let result = env.try_update_authority(&admin, AUTHORITY_ADMIN, None);
     assert!(
         result.is_ok(),
-        "UpdateAdmin to zero should succeed (admin burn)"
+        "Admin burn via UpdateAuthority must succeed: {:?}",
+        result
     );
 
     // Admin is now burned - all admin instructions must fail
@@ -5498,7 +5481,7 @@ fn test_attack_liquidation_after_price_crash() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -5723,7 +5706,7 @@ fn test_attack_same_slot_triple_crank_convergence() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 1_000_000, 0); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -10681,7 +10664,7 @@ fn test_attack_set_oracle_price_cap_after_resolution_rejected() {
     env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    const CAP_OFF: usize = 264; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
+    const CAP_OFF: usize = 392; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let cap_before = u64::from_le_bytes(slab_before[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
 
