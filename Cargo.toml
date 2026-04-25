@@ -16,9 +16,14 @@ path = "src/percolator.rs"
 no-entrypoint = []
 test-sbf = []
 cu-audit = []  # Enable compute unit checkpoints for CU auditing
-small = ["percolator/small"]    # MAX_ACCOUNTS=256 (~0.68 SOL)
-medium = ["percolator/medium"]  # MAX_ACCOUNTS=1024 (~2.7 SOL)
-mainnet = []                    # Mainnet build — enables compile-time guards
+# Deployment-size tiers — forward to the engine crate. Only one of
+# `small` / `medium` should be set; leaving both off uses the engine's
+# default (MAX_ACCOUNTS=4096). Both the BPF binary and the test
+# harness honor these flags so tests run against the same size tier
+# as the deployed program.
+small = ["percolator/small"]
+medium = ["percolator/medium"]
+mainnet = []                    # Mainnet build — enables compile-time guards (fork-only)
 
 [dependencies]
 solana-program = "1.18"

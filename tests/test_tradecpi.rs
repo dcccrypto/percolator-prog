@@ -1252,7 +1252,7 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
     // Resolve market at 2.0 (2_000_000 e6) - user's long position is profitable
     // This means user has positive PnL = position * (2.0 - 1.0) / 1e6
     env.set_slot(100);
-    env.crank(); // fresh crank required before PushOraclePrice on hyperp
+    env.crank(); // fresh crank required before PushHyperpMark on hyperp
     env.try_push_oracle_price(&admin, 2_000_000, 200)
         .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
@@ -1679,7 +1679,7 @@ fn test_attack_trade_after_force_close() {
 
     // Resolve + settle PnL via crank + force-close positions
     env.set_slot(200);
-    env.crank(); // fresh crank required before PushOraclePrice on hyperp
+    env.crank(); // fresh crank required before PushHyperpMark on hyperp
     env.try_push_oracle_price(&admin, 1_000_000, 200)
         .expect("oracle price push must succeed");
     env.try_resolve_market(&admin)
@@ -2621,7 +2621,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     env.svm
         .airdrop(&old_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&old_authority))
+    env.try_update_authority(&admin, AUTHORITY_HYPERP_MARK, Some(&old_authority))
         .unwrap();
     env.try_push_oracle_price(&old_authority, 1_000_000, 1000)
         .unwrap();
@@ -2655,7 +2655,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     env.svm
         .airdrop(&new_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_update_authority(&old_authority, AUTHORITY_ORACLE, Some(&new_authority))
+    env.try_update_authority(&old_authority, AUTHORITY_HYPERP_MARK, Some(&new_authority))
         .unwrap();
 
     // Old authority should no longer be able to push prices
@@ -5422,11 +5422,10 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
 /// offset_of!(RiskEngine, last_market_slot)=672, so 480+672=1152).
 #[test]
 fn test_tradecpi_zero_fill_advances_engine_time() {
-    // BPF layout offset for engine.last_market_slot. 4-way-auth header
-    // grew from 72→136 (+64 for insurance_authority + close_authority),
-    // so ENGINE_OFF is now 536. last_market_slot at engine offset 656,
-    // absolute slab offset 536+656=1192.
-    const LAST_MARKET_SLOT_OFF: usize = 1192;
+    // BPF layout offset for engine.last_market_slot.
+    // ENGINE_OFF=536; last_market_slot at engine offset 624 (after
+    // insurance_floor and min_initial_deposit deletes); slab offset 1160.
+    const LAST_MARKET_SLOT_OFF: usize = 1160;
 
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;
@@ -5591,7 +5590,7 @@ fn test_tradecpi_buffer_notional_uses_oracle_price() {
         use bytemuck::Zeroable;
         let d = env.svm.get_account(&env.slab).unwrap().data;
         let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
-        let gen_table_size = 4096 * 8;
+        let gen_table_size = common::MAX_ACCOUNTS * 8;
         let buf_off = SLAB_LEN - gen_table_size - buf_size;
         let mut buf = percolator_prog::risk_buffer::RiskBuffer::zeroed();
         bytemuck::bytes_of_mut(&mut buf).copy_from_slice(&d[buf_off..buf_off + buf_size]);
@@ -5765,8 +5764,8 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     // source before trades can produce exec prices at the mark).
     env.try_push_oracle_price(&admin, 1_000_000, 1).unwrap();
 
-    const MARK_EWMA_LAST_OFF: usize = 136 + 312; // HEADER_LEN + offset_of(mark_ewma_last_slot)
-    const LAST_MARK_PUSH_OFF: usize = 136 + 272; // HEADER_LEN + offset_of(last_mark_push_slot) (u128, low 8 bytes = slot)
+    const MARK_EWMA_LAST_OFF: usize = 136 + 296; // HEADER_LEN + offset_of(mark_ewma_last_slot)
+    const LAST_MARK_PUSH_OFF: usize = 136 + 256; // HEADER_LEN + offset_of(last_mark_push_slot) (u128, low 8 bytes = slot)
     let read_slots = |env: &TradeCpiTestEnv| -> (u64, u64) {
         let slab = env.svm.get_account(&env.slab).unwrap().data;
         let e = u64::from_le_bytes(
@@ -5818,7 +5817,7 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
 //
 //   1. POST-MATURITY TERMINAL. Once clock.slot - last_live_slot >=
 //      permissionless_resolve_stale_slots, the market is resolve-only:
-//      PushOraclePrice and CatchupAccrue reject with OracleStale;
+//      PushHyperpMark and CatchupAccrue reject with OracleStale;
 //      ResolvePermissionless succeeds.
 //
 //   2. NO PRE-MATURITY UNRECOVERABLE WINDOW. Just before maturity a
@@ -5865,10 +5864,10 @@ fn test_hyperp_after_stale_maturity_is_resolve_only() {
 
     // Admin push must NOT revive the market.
     let err = env.try_push_oracle_price(&admin, 1_020_000, 10 + 301)
-        .expect_err("PushOraclePrice must reject past perm_resolve maturity");
+        .expect_err("PushHyperpMark must reject past perm_resolve maturity");
     assert!(
         err.contains("0x6"),
-        "PushOraclePrice past maturity must surface OracleStale (0x6), got: {}", err,
+        "PushHyperpMark past maturity must surface OracleStale (0x6), got: {}", err,
     );
 
     // TradeCpi must also reject — same hard-timeout gate. This is the
@@ -5935,7 +5934,7 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     // Admin push still works — perm_resolve hasn't matured, market is
     // recoverable.
     env.try_push_oracle_price(&admin, 1_020_000, 10 + 299)
-        .expect("PushOraclePrice must succeed before perm_resolve maturity");
+        .expect("PushHyperpMark must succeed before perm_resolve maturity");
     assert!(
         !env.is_market_resolved(),
         "market must still be live before perm_resolve maturity"
@@ -5954,18 +5953,18 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
 }
 
 /// Test 3: Init rejects Hyperp perm_resolve values too large to
-/// recover within the accrue envelope. In the current code the general
-/// `perm_resolve <= risk_params.max_accrual_dt_slots` guard (100_000)
-/// is strictly tighter than the new Hyperp catchup-budget guard
-/// (CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS = 2_000_000), so the
-/// general guard always fires first. The substantive assertion this
-/// test makes is that init REJECTS any Hyperp perm_resolve past the
-/// accrue envelope — we pick a value above the general bound so the
-/// test is meaningful regardless of which guard fires.
+/// recover within the accrue envelope. The general `perm_resolve <=
+/// risk_params.max_accrual_dt_slots` guard (MAX_ACCRUAL_DT_SLOTS =
+/// 10_000_000) is strictly tighter than the Hyperp catchup-budget guard
+/// (CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS), so the general guard
+/// always fires first. The substantive assertion is that init REJECTS
+/// any Hyperp perm_resolve past the accrue envelope — pick a value
+/// above the general bound so the test is meaningful regardless of
+/// which guard fires.
 #[test]
 fn test_hyperp_init_rejects_permissionless_window_past_accrue_envelope() {
     let mut env = TradeCpiTestEnv::new();
-    let too_large: u64 = 100_001; // MAX_ACCRUAL_DT_SLOTS + 1
+    let too_large: u64 = 10_000_001; // MAX_ACCRUAL_DT_SLOTS + 1
     env.try_init_market_hyperp_with_stale(
         1_000_000,
         86_400,
@@ -6056,3 +6055,4 @@ fn test_tradecpi_empty_tail_is_canonical() {
     )
     .expect("TradeCpi with empty tail must succeed (canonical 8-account form)");
 }
+

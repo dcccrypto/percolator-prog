@@ -182,11 +182,6 @@ fn test_attack_withdraw_insurance_with_open_positions() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Set oracle authority and push price
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_push_oracle_price(&admin, 138_000_000, 100)
-        .expect("oracle price push must succeed");
-
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 100_000_000_000);
@@ -303,10 +298,6 @@ fn test_attack_topup_insurance_after_resolution() {
     env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_push_oracle_price(&admin, 138_000_000, 100)
-        .expect("oracle price push must succeed");
     env.set_slot(100);
     env.crank();
     env.try_resolve_market(&admin)
@@ -922,11 +913,6 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     env.trade(&user, &lp, lp_idx, user_idx, size);
 
     // Setup oracle authority and push price (required for ResolveMarket)
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_push_oracle_price(&admin, 138_000_000, 100)
-        .expect("oracle price push must succeed");
-
     // Resolve market (premarket resolution)
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "Resolve should succeed: {:?}", result);
@@ -1006,7 +992,6 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup
@@ -1022,7 +1007,6 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liq_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&10001u16.to_le_bytes()); // insurance_withdraw_max_bps > 10000
@@ -1032,7 +1016,7 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
     data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
 
@@ -1120,105 +1104,687 @@ fn test_top_up_insurance_increases_balance() {
     );
 }
 
-/// Audit gap 3: Insurance floor is immutable after market initialization.
-///
-/// Spec behavior (ss2.2.1): insurance_floor is set at InitMarket and cannot
-/// be changed afterwards.  SetRiskThreshold (tag 11) was removed and must
-/// return InvalidInstructionData.  The stored insurance_floor must not change.
+// test_insurance_floor_immutable_after_init removed: insurance_floor
+// field was deleted from RiskParams. The bounded `insurance_operator`
+// path (tag 23) supersedes it.
+
+// ============================================================================
+// TVL:insurance deposit cap (admin opt-in)
+// ============================================================================
+//
+// `MarketConfig.tvl_insurance_cap_mult` gates DepositCollateral such that
+// post-deposit `c_tot <= k * insurance_fund.balance`. Default at init is 0
+// (disabled); admin enables via UpdateConfig. These tests verify:
+//   1. Default init leaves the cap disabled (value = 0).
+//   2. Enabling via UpdateConfig persists the value.
+//   3. An enabled cap rejects deposits that would exceed the ceiling.
+//   4. An enabled cap accepts deposits that stay within the ceiling.
+//   5. Disabled cap (k=0) accepts arbitrarily large deposits.
+//   6. Enabled cap with zero insurance rejects any deposit (bootstrap case).
+
+fn encode_update_config_with_cap_tag(k: u16) -> Vec<u8> {
+    // Same wire format as encode_update_config, plus a trailing u16.
+    let mut data = vec![14u8]; // Tag 14 = UpdateConfig
+    data.extend_from_slice(&3600u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&100i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&10i64.to_le_bytes());  // funding_max_e9_per_slot
+    data.extend_from_slice(&k.to_le_bytes());      // tvl_insurance_cap_mult
+    data
+}
+
+fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), String> {
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(admin.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(env.slab, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_update_config_with_cap_tag(k),
+    };
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+}
+
+/// Fresh markets default to cap disabled (k=0).
 #[test]
-fn test_insurance_floor_immutable_after_init() {
+fn test_deposit_cap_default_disabled() {
     program_path();
-
     let mut env = TestEnv::new();
-    let floor_value: u128 = 1_000_000_000; // 1 SOL floor
-    env.init_market_with_insurance_floor(0, floor_value);
-
-    // Verify insurance_floor was stored correctly at init
-    let floor_after_init = env.read_insurance_floor();
+    env.init_market_with_invert(0);
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let cfg = percolator_prog::state::read_config(&slab.data);
     assert_eq!(
-        floor_after_init, floor_value,
-        "insurance_floor should be set to the init value"
-    );
-
-    // Attempt to change insurance_floor via SetRiskThreshold (tag 11)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let new_threshold: u128 = 5_000_000_000; // attempt to change to 5 SOL
-    let result = env.try_set_risk_threshold(&admin, new_threshold);
-    assert!(
-        result.is_err(),
-        "SetRiskThreshold must be rejected (insurance_floor is immutable per spec ss2.2.1)"
-    );
-
-    // Verify the floor has not changed
-    let floor_after_attempt = env.read_insurance_floor();
-    assert_eq!(
-        floor_after_attempt, floor_value,
-        "insurance_floor must remain unchanged after rejected SetRiskThreshold"
+        cfg.tvl_insurance_cap_mult, 0,
+        "tvl_insurance_cap_mult must default to 0 (disabled)"
     );
 }
 
-/// SOLVENCY: WithdrawInsuranceLimited on live market must require a recent
-/// crank so that latent losses are reflected before withdrawal.
-///
-/// Without this, the insurance balance could be overstated (unsettled losses
-/// haven't absorbed insurance yet), letting the authority withdraw funds that
-/// should be reserved for loss coverage.
+/// Admin can enable the cap via UpdateConfig and the value persists.
 #[test]
-
-
-/// Regression for audit #3: UpdateAuthority(kind=ORACLE) must NOT
-/// corrupt the limited-insurance policy state when is_policy_configured
-/// is set. The policy packs (max_bps, last_withdraw_slot) into
-/// config.authority_timestamp and min_withdraw_base into
-/// config.last_effective_price_e6 — these are repurposed-resolved-mode
-/// oracle fields. An earlier version of the ORACLE handler zeroed
-/// authority_timestamp/price unconditionally on non-Hyperp, which
-/// would break subsequent WithdrawInsuranceLimited calls.
-#[test]
-
-/// Negative-path companion: when NO policy is configured, the ORACLE
-/// authority change still clears stored price/timestamp (matches the
-/// pre-policy-configured intended behavior). Verifies the
-/// is_policy_configured gate does NOT over-extend.
-#[test]
-fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
+fn test_deposit_cap_enable_via_update_config() {
     program_path();
-
     let mut env = TestEnv::new();
-    // init with cap > 0 so oracle_authority defaults to admin (under
-    // the init-time invariant; cap=0 would zero oracle_authority).
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let cfg = percolator_prog::state::read_config(&slab.data);
+    assert_eq!(cfg.tvl_insurance_cap_mult, 20, "cap must persist");
+}
+
+/// Cap enabled with k=20 and insurance=1_000 must reject a deposit of
+/// 20_001 (exceeds 20 * 1_000 = 20_000) and accept a deposit of 20_000.
+#[test]
+fn test_deposit_cap_enforced() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Seed insurance so the cap denominator is nonzero.
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+    assert_eq!(env.read_insurance_balance(), 1_000);
+
+    // Enable the cap at k=20 → ceiling = 20_000 units of c_tot.
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+
+    // init_user itself deposits a 100-unit account-open fee, so c_tot = 100
+    // immediately after onboarding. Cap ceiling is 20_000 units.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    // Exact-at-ceiling deposit: 100 (already there) + 19_900 = 20_000 = cap.
+    env.try_deposit(&user, user_idx, 19_900)
+        .expect("deposit at ceiling must succeed");
+
+    // Next deposit of 1 would push c_tot to 20_001 > 20_000 → reject.
+    let over = env.try_deposit(&user, user_idx, 1);
+    assert!(
+        over.is_err(),
+        "deposit that would exceed k * insurance must be rejected"
+    );
+}
+
+/// Cap disabled (k=0) accepts arbitrary deposits even with zero insurance.
+#[test]
+fn test_deposit_cap_disabled_allows_any_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Do NOT call UpdateConfig — cap stays at default 0.
+    assert_eq!(env.read_insurance_balance(), 0, "fresh market has zero insurance");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.try_deposit(&user, user_idx, 1_000_000)
+        .expect("deposit with cap disabled must succeed even with zero insurance");
+}
+
+/// Cap enabled with zero insurance rejects any deposit (bootstrap case).
+/// Operator is expected to seed insurance before enabling the cap.
+#[test]
+fn test_deposit_cap_zero_insurance_rejects() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Enable cap WITHOUT seeding insurance. All deposit paths must be
+    // rejected — including InitUser's fee_payment, which had been a
+    // bypass before the fix.
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+    assert_eq!(env.read_insurance_balance(), 0);
+
+    // InitUser with any positive fee_payment must now be rejected
+    // (c_tot = 0, cap = 20 * 0 = 0, any deposit breaches). Use a raw
+    // instruction because the `init_user` helper panics on failure.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let attacker_ata = env.create_ata(&attacker.pubkey(), 1_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_init_user(100),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "InitUser with enabled cap and zero insurance must be rejected"
+    );
+}
+
+/// Positive: a deposit blocked by the cap becomes allowed once the admin
+/// widens k. The operator pattern is "start tight, loosen as insurance
+/// grows" — this test verifies a deposit attempt that was over-cap
+/// succeeds after the cap is raised, without any other state change.
+#[test]
+fn test_deposit_cap_widened_unblocks_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    // Tight cap: k=20 → ceiling = 20_000.
+    send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // c_tot = 100
+
+    // c_tot = 100; try to deposit 19_901 → c_tot_new = 20_001 > 20_000 → reject.
+    let blocked = env.try_deposit(&user, user_idx, 19_901);
+    assert!(blocked.is_err(), "deposit must be blocked at k=20");
+
+    // Admin widens: k=40 → ceiling = 40_000.
+    send_update_config(&mut env, &admin, 40).expect("widen cap to k=40");
+
+    // Previously-blocked deposit of 19_901 now fits within the 40_000 cap.
+    env.try_deposit(&user, user_idx, 19_901)
+        .expect("widened cap must unblock the previously-rejected deposit");
+}
+
+/// Positive: the alternative widening path — top up insurance rather than
+/// raising k. If insurance grows from 1_000 to 2_000 with k=20, the cap
+/// doubles from 20_000 to 40_000 without any config change.
+#[test]
+fn test_deposit_cap_topping_up_insurance_unblocks_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    send_update_config(&mut env, &admin, 20).expect("enable cap");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // c_tot = 100
+
+    let blocked = env.try_deposit(&user, user_idx, 19_901);
+    assert!(blocked.is_err(), "deposit must be blocked at insurance=1000");
+
+    // Grow insurance: 1_000 → 2_000. Cap rises 20_000 → 40_000.
+    env.top_up_insurance(&insurance_payer, 1_000);
+    assert_eq!(env.read_insurance_balance(), 2_000);
+
+    env.try_deposit(&user, user_idx, 19_901)
+        .expect("topped-up insurance must unblock the deposit");
+}
+
+/// Negative: tightening the cap via UpdateConfig stops new deposits even
+/// when prior deposits were allowed. Equivalent economic effect to
+/// "insurance was higher, now it's lower" — we tighten via k because
+/// live insurance withdrawals (WithdrawInsuranceLimited) were removed
+/// and WithdrawInsurance requires a resolved market.
+#[test]
+fn test_deposit_cap_tightened_blocks_further_deposits() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    // Loose cap: k=40 → ceiling = 40_000.
+    send_update_config(&mut env, &admin, 40).expect("enable cap k=40");
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // c_tot = 100
+
+    // Deposit 19_900 → c_tot = 20_000. Fits under 40_000 cap.
+    env.try_deposit(&user, user_idx, 19_900)
+        .expect("initial deposit must succeed under loose cap");
+
+    // Admin tightens: k=20 → new ceiling = 20_000. c_tot already there.
+    send_update_config(&mut env, &admin, 20).expect("tighten to k=20");
+
+    // Any further deposit now over-cap → rejected.
+    let blocked = env.try_deposit(&user, user_idx, 1);
+    assert!(
+        blocked.is_err(),
+        "tightened cap must reject deposits that exceed the new ceiling"
+    );
+}
+
+// ============================================================================
+// WithdrawInsuranceLimited (tag 23) — permutation coverage
+// ============================================================================
+// Bounded live fee-extraction gated on the separate `header.insurance_operator`
+// authority. Per-call cap = max(10 units, bps * insurance / 10_000), bounded by
+// current insurance balance. Calls must be ≥ insurance_withdraw_cooldown_slots
+// apart. Operator CANNOT bypass via tag 20 — that path is gated on a
+// different field (`header.insurance_authority`).
+//
+// Authority kinds: AUTHORITY_ADMIN=0, AUTHORITY_HYPERP_MARK=1, AUTHORITY_INSURANCE=2,
+// AUTHORITY_CLOSE=3, AUTHORITY_INSURANCE_OPERATOR=4.
+
+const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
+
+fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
+    let mut data = vec![23u8]; // Tag 23
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+fn send_withdraw_limited(
+    env: &mut TestEnv,
+    operator: &Keypair,
+    amount: u64,
+) -> Result<(), String> {
+    let operator_ata = env.create_ata(&operator.pubkey(), 0);
+    let (vault_pda, _) = Pubkey::find_program_address(
+        &[b"vault", env.slab.as_ref()],
+        &env.program_id,
+    );
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(operator.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(operator_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+        ],
+        data: encode_withdraw_insurance_limited(amount),
+    };
+    // Repeated airdrops of the same amount in the same blockhash window
+    // collide — swallow the AlreadyProcessed.
+    let _ = env.svm.airdrop(&operator.pubkey(), 1_000_000_000);
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&operator.pubkey()),
+        &[operator],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+}
+
+/// Configure a market with bounded-withdrawal enabled: seed insurance and
+/// set `insurance_withdraw_max_bps` + `insurance_withdraw_cooldown_slots`
+/// via direct slab edits (faster than extending UpdateConfig ABI for tests).
+fn setup_bounded_withdrawal(
+    env: &mut TestEnv,
+    insurance: u64,
+    max_bps: u16,
+    cooldown_slots: u64,
+) {
+    env.init_market_with_invert(0);
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, insurance);
+
+    // Direct slab edits for config fields that don't yet have UpdateConfig
+    // wiring. Safe in tests: we own the slab account.
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    // insurance_withdraw_max_bps (u16): HEADER_LEN(136) + config offset 216 = 352
+    // (config offsets shifted -16 after max_insurance_floor deletion).
+    slab.data[352..354].copy_from_slice(&max_bps.to_le_bytes());
+    // insurance_withdraw_cooldown_slots (u64): HEADER_LEN(136) + 224 = 360
+    slab.data[360..368].copy_from_slice(&cooldown_slots.to_le_bytes());
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
+/// 1. Positive: default insurance_operator (=admin) signs, amount within bps
+///    cap, insurance balance decrements by exactly the withdrawal amount.
+#[test]
+fn test_withdraw_limited_operator_succeeds() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100); // 5% cap, 100 slot cooldown
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+    let insurance_before = env.read_insurance_balance();
+    let vault_before = env.vault_balance();
+    assert_eq!(insurance_before, 10_000);
 
-    // Snapshot fields.
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + authority_price_e6(176)
-    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + authority_timestamp(184)
-    let (price_before, ts_before) = {
-        let slab = env.svm.get_account(&env.slab).unwrap().data;
-        (
-            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
-            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
-        )
+    // Withdraw 500 units (5% of 10_000 = 500, exactly at cap).
+    send_withdraw_limited(&mut env, &admin, 500)
+        .expect("operator withdrawal at cap must succeed");
+
+    assert_eq!(env.read_insurance_balance(), 10_000 - 500);
+    assert_eq!(env.vault_balance(), vault_before - 500);
+}
+
+/// 2. Cooldown: second call within cooldown slots is rejected.
+#[test]
+fn test_withdraw_limited_cooldown_enforced() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    send_withdraw_limited(&mut env, &admin, 100).expect("first call ok");
+
+    // Advance only a few slots (still inside cooldown=1000).
+    env.set_slot(1);
+    let blocked = send_withdraw_limited(&mut env, &admin, 50);
+    assert!(blocked.is_err(), "second call within cooldown must be rejected");
+}
+
+/// 3. After cooldown: second call succeeds.
+#[test]
+fn test_withdraw_limited_after_cooldown_accepted() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    send_withdraw_limited(&mut env, &admin, 100).expect("first call");
+    env.set_slot(200); // past cooldown of 100
+    send_withdraw_limited(&mut env, &admin, 100)
+        .expect("post-cooldown call must succeed");
+}
+
+/// 4. Amount exceeding per-call cap is rejected.
+#[test]
+fn test_withdraw_limited_over_cap_rejected() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100); // cap = 500
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let over = send_withdraw_limited(&mut env, &admin, 501);
+    assert!(over.is_err(), "amount > cap must be rejected");
+}
+
+/// 5. Feature disabled: max_bps=0 rejects all withdrawals.
+#[test]
+fn test_withdraw_limited_disabled_rejects() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 0, 100); // disabled (max_bps=0)
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let result = send_withdraw_limited(&mut env, &admin, 1);
+    assert!(result.is_err(), "max_bps=0 must disable the bounded path");
+}
+
+/// 6. Zero insurance balance rejects.
+#[test]
+fn test_withdraw_limited_zero_insurance_rejects() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 0, 500, 100); // no insurance seeded in call
+    // setup_bounded_withdrawal tops up `insurance`; pass 0 to skip.
+    // But top_up_insurance(0) is a noop that still packs data — just assert 0.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Force insurance to zero: init already does so, and our call passed 0
+    // above, but top_up_insurance may have written zero. Recheck.
+    let result = send_withdraw_limited(&mut env, &admin, 1);
+    assert!(result.is_err(), "zero insurance must reject withdrawal");
+}
+
+/// 7. Non-operator signer (random key) rejected.
+#[test]
+fn test_withdraw_limited_rejects_random_signer() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100);
+    let random = Keypair::new();
+
+    let result = send_withdraw_limited(&mut env, &random, 100);
+    assert!(result.is_err(), "random signer must be rejected");
+}
+
+/// 8. Key security property: operator CANNOT use tag 20 to bypass bounds.
+///    After rotating insurance_operator to a new key, that operator must not
+///    be accepted by the unbounded tag-20 path (which still requires the
+///    separate insurance_authority).
+#[test]
+fn test_withdraw_limited_operator_cannot_call_tag_20() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Rotate insurance_operator away from admin. Now admin is no longer
+    // the operator — and the new operator is not insurance_authority.
+    let operator = Keypair::new();
+    env.svm.airdrop(&operator.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&operator))
+        .expect("rotate insurance_operator");
+
+    // Sanity: the operator CAN use tag 23.
+    send_withdraw_limited(&mut env, &operator, 100)
+        .expect("new operator must be able to use bounded path");
+
+    // CORE SECURITY CHECK: operator must fail tag 20 even in a state
+    // where tag 20 would otherwise succeed (resolved market, no accounts).
+    // The ONLY remaining gate is the authority check — this isolates the
+    // authority-split property from the resolved/empty gates.
+    //
+    // Resolve the market (admin, via ResolveMarket with authority price
+    // set). No accounts have been created → num_used == 0. In this state,
+    // tag 20 would succeed for insurance_authority, but not for operator.
+    env.set_slot_and_price(200, 1_000_000);
+    env.crank();
+    env.try_resolve_market(&admin).expect("admin resolves");
+
+    // Operator attempts tag 20: must fail (auth mismatch).
+    let bypass = env.try_withdraw_insurance(&operator);
+    assert!(
+        bypass.is_err(),
+        "operator must not be able to call tag 20 even on resolved+empty market"
+    );
+
+    // Positive control: insurance_authority (still == admin after init
+    // since we didn't rotate it) CAN call tag 20 in this state.
+    env.try_withdraw_insurance(&admin)
+        .expect("insurance_authority must still be able to call tag 20");
+}
+
+/// 9. Anti-Zeno floor: even when `bps × insurance / 10_000 < 10`, the
+///    operator can still withdraw up to 10 units per call (or insurance,
+///    whichever is smaller). Guarantees the fund can be fully drained
+///    over repeated calls rather than asymptoting.
+#[test]
+fn test_withdraw_limited_floor_prevents_zeno_paradox() {
+    program_path();
+    let mut env = TestEnv::new();
+    // insurance = 100, max_bps = 1 → bps_cap = 100 × 1 / 10_000 = 0 units.
+    // Without the floor, no withdrawal would be possible. The MIN floor of
+    // 10 lets operator drain 10 per call.
+    setup_bounded_withdrawal(&mut env, 100, 1, 1);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    send_withdraw_limited(&mut env, &admin, 10)
+        .expect("anti-Zeno floor must permit 10-unit withdrawal even at tiny bps");
+    assert_eq!(env.read_insurance_balance(), 90);
+
+    // 11 would exceed the floor → rejected.
+    env.set_slot(10);
+    let over_floor = send_withdraw_limited(&mut env, &admin, 11);
+    assert!(
+        over_floor.is_err(),
+        "floor is 10 units; 11 must be rejected"
+    );
+}
+
+/// 10. After rotation, previous operator (admin) is rejected and new
+///     operator is accepted.
+#[test]
+fn test_withdraw_limited_rotation_swaps_authority() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Pre-rotation: admin is the default operator → accepted.
+    send_withdraw_limited(&mut env, &admin, 100).expect("admin as default operator");
+
+    // Rotate operator to a fresh key.
+    let new_op = Keypair::new();
+    env.svm.airdrop(&new_op.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&new_op))
+        .expect("rotate operator");
+
+    env.set_slot(200);
+
+    // Post-rotation: admin no longer operator → rejected.
+    let admin_rejected = send_withdraw_limited(&mut env, &admin, 100);
+    assert!(
+        admin_rejected.is_err(),
+        "admin after rotation must be rejected"
+    );
+
+    // New operator accepted.
+    send_withdraw_limited(&mut env, &new_op, 100)
+        .expect("new operator must be accepted post-rotation");
+}
+
+/// 11. Resolved markets reject bounded withdrawal (unbounded tag 20 owns
+///     that case).
+#[test]
+fn test_withdraw_limited_resolved_market_rejects() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    env.set_slot(100);
+    env.crank();
+    env.try_resolve_market(&admin)
+        .expect("admin can resolve live market");
+
+    let result = send_withdraw_limited(&mut env, &admin, 100);
+    assert!(
+        result.is_err(),
+        "bounded path must reject on resolved market"
+    );
+}
+
+/// End-to-end: bounded insurance withdrawal tightens the deposit cap.
+///
+/// Setup:
+///   - tvl_insurance_cap_mult = 20 (deposit cap enabled, k=20)
+///   - insurance_withdraw_max_bps = 5000 (50% of insurance per call)
+///   - insurance seed = 1_000 units  → deposit cap = 20_000 units
+///
+/// Flow:
+///   1. User deposits up to the ceiling (c_tot = 20_000, fills cap exactly)
+///   2. Operator withdraws 500 insurance (allowed: 5000 bps × 1_000 = 500)
+///   3. Insurance is now 500, cap shrank to 500 × 20 = 10_000 units
+///   4. c_tot (20_000) already exceeds the new cap → any further deposit is
+///      rejected. The protocol is now rate-limiting new exposure until
+///      insurance grows back via fees.
+#[test]
+fn test_bounded_withdrawal_tightens_deposit_cap() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 1_000, 5_000, 100);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Enable deposit cap at k=20. UpdateConfig also sets funding params.
+    send_update_config(&mut env, &admin, 20).expect("enable deposit cap k=20");
+
+    // Fill up to the cap: c_tot = init_user_fee(100) + user_deposit(19_900)
+    // = 20_000 = k × insurance (1000 × 20).
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.try_deposit(&user, user_idx, 19_900)
+        .expect("initial deposit at ceiling must succeed");
+    let ins_before = env.read_insurance_balance();
+    assert_eq!(ins_before, 1_000);
+
+    // Operator withdraws 500 insurance (exactly at the 50% bps cap).
+    send_withdraw_limited(&mut env, &admin, 500)
+        .expect("operator withdraws 500");
+    let ins_after = env.read_insurance_balance();
+    assert_eq!(ins_after, 500, "insurance must drop by withdrawal amount");
+
+    // Cap shrank: 500 × 20 = 10_000 < c_tot (20_000). Further deposit blocked.
+    let blocked = env.try_deposit(&user, user_idx, 1);
+    assert!(
+        blocked.is_err(),
+        "insurance withdrawal must tighten the deposit cap and block further deposits"
+    );
+}
+
+/// REGRESSION / SECURITY: InitUser's `fee_payment` path bypasses the
+/// deposit cap. The cap check lives only in DepositCollateral, but
+/// InitUser also increments c_tot via engine.deposit_not_atomic with
+/// an arbitrary u64 amount. An attacker who hits the cap via the
+/// normal path can still grow c_tot unboundedly by creating new
+/// accounts with large `fee_payment` values.
+#[test]
+fn test_deposit_cap_bypassed_via_init_user() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Seed insurance, enable the cap with k=20 → ceiling = 20_000 units.
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+    send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
+
+    // First user fills to ceiling via init_user (100) + deposit (19_800)
+    // → c_tot = 19_900. One more unit via normal deposit would exceed
+    // 20_000 — so the deposit path is blocked.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.try_deposit(&user, user_idx, 19_800)
+        .expect("fill close to ceiling");
+    let blocked = env.try_deposit(&user, user_idx, 101);
+    assert!(blocked.is_err(), "DepositCollateral correctly enforces cap");
+
+    // SECURITY CHECK: a FRESH account created via init_user with a large
+    // fee_payment should ALSO be blocked — c_tot_new = 19_900 + 10_000 =
+    // 29_900, which exceeds the 20_000 cap. The cap must apply to every
+    // capital-adding path, not just DepositCollateral.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let attacker_ata = env.create_ata(&attacker.pubkey(), 20_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_init_user(10_000), // fee_payment = 10_000 units
     };
-    assert!(price_before > 0, "authority price populated by push");
-    assert!(ts_before > 0, "authority timestamp populated by push");
-
-    // Rotate oracle authority.
-    let new_oracle = Keypair::new();
-    env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle))
-        .expect("oracle rotation must succeed");
-
-    // Under the no-policy branch, the clear fires as before.
-    let (price_after, ts_after) = {
-        let slab = env.svm.get_account(&env.slab).unwrap().data;
-        (
-            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
-            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
-        )
-    };
-    assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
-    assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "InitUser with fee_payment that breaches the cap must be rejected"
+    );
 }
