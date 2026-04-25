@@ -3,10 +3,12 @@
 //! These tests verify the Solana program wrapper's instruction handling,
 //! including account validation, state management, and invariants.
 
+use bytemuck::Zeroable;
 use percolator::{I128, MAX_ACCOUNTS, U128};
 use percolator_prog::{
     constants::MAGIC,
     error::PercolatorError,
+    matcher_abi::{validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID},
     oracle,
     processor::process_instruction,
     state, units, zc,
@@ -243,23 +245,23 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     data.push(0u8); // invert (0 = no inversion)
     encode_u32(0, &mut data); // unit_scale (0 = no scaling)
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
-    // Per-market admin limits (uncapped defaults for tests)
+                              // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
-    // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
-    encode_u64(0, &mut data);   // warmup_period_slots
+                                   // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
+    encode_u64(1, &mut data); // h_min
     encode_u64(500, &mut data); // maintenance_margin_bps (must be < initial_margin_bps)
     encode_u64(1000, &mut data); // initial_margin_bps
-    encode_u64(0, &mut data);   // trading_fee_bps
+    encode_u64(0, &mut data); // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
-    encode_u128(0, &mut data);  // new_account_fee
-    encode_u64(1, &mut data);   // h_max (v12.18.1: must be >= 1)
+    encode_u128(1, &mut data); // new_account_fee (§12.19.6 F8 anti-spam)
+    encode_u64(1, &mut data); // h_max (v12.18.1: must be >= 1)
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
-    encode_u64(0, &mut data);   // liquidation_fee_bps
-    encode_u128(0, &mut data);  // liquidation_fee_cap
-    encode_u64(100, &mut data);   // resolve_price_deviation_bps
-    encode_u128(0, &mut data);  // min_liquidation_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    encode_u64(0, &mut data); // liquidation_fee_bps
+    encode_u128(0, &mut data); // liquidation_fee_cap
+    encode_u64(100, &mut data); // resolve_price_deviation_bps
+    encode_u128(0, &mut data); // min_liquidation_abs
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
     encode_u64(2, &mut data); // max_price_move_bps_per_slot (v12.19)
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
     encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
@@ -292,23 +294,23 @@ fn encode_init_market_invert(
     data.push(invert);
     encode_u32(unit_scale, &mut data);
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
-    // Per-market admin limits (uncapped defaults for tests)
+                              // Per-market admin limits (uncapped defaults for tests)
     encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
-    // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
-    encode_u64(0, &mut data);    // warmup_period_slots
-    encode_u64(500, &mut data);  // maintenance_margin_bps (must be < initial_margin_bps)
+                                   // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
+    encode_u64(1, &mut data); // h_min
+    encode_u64(500, &mut data); // maintenance_margin_bps (must be < initial_margin_bps)
     encode_u64(1000, &mut data); // initial_margin_bps
-    encode_u64(0, &mut data);    // trading_fee_bps
+    encode_u64(0, &mut data); // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
-    encode_u128(0, &mut data);   // new_account_fee
-    encode_u64(0, &mut data);    // h_max
+    encode_u128(1, &mut data); // new_account_fee (§12.19.6 F8 anti-spam)
+    encode_u64(1, &mut data); // h_max
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
-    encode_u64(0, &mut data);    // liquidation_fee_bps
-    encode_u128(0, &mut data);   // liquidation_fee_cap
-    encode_u64(0, &mut data);    // resolve_price_deviation_bps
-    encode_u128(0, &mut data);   // min_liquidation_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    encode_u64(0, &mut data); // liquidation_fee_bps
+    encode_u128(0, &mut data); // liquidation_fee_cap
+    encode_u64(0, &mut data); // resolve_price_deviation_bps
+    encode_u128(0, &mut data); // min_liquidation_abs
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
     encode_u64(2, &mut data); // max_price_move_bps_per_slot (v12.19)
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
     encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
@@ -427,6 +429,70 @@ fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
 // --- Tests ---
 
 #[test]
+fn test_matcher_nonzero_partial_requires_partial_ok() {
+    let ret = MatcherReturn {
+        abi_version: percolator_prog::constants::MATCHER_ABI_VERSION,
+        flags: FLAG_VALID,
+        exec_price_e6: 100_000_000,
+        exec_size: 50,
+        req_id: 7,
+        lp_account_id: 11,
+        oracle_price_e6: 100_000_000,
+        reserved: 0,
+    };
+
+    assert_eq!(
+        validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            100,
+            ret.req_id,
+        ),
+        Err(ProgramError::InvalidAccountData)
+    );
+
+    let ret_with_partial = MatcherReturn {
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
+        ..ret
+    };
+    assert!(validate_matcher_return(
+        &ret_with_partial,
+        ret_with_partial.lp_account_id,
+        ret_with_partial.oracle_price_e6,
+        100,
+        ret_with_partial.req_id,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_external_oracle_flat_market_uses_raw_target() {
+    let mut config = state::MarketConfig::zeroed();
+
+    let price =
+        oracle::clamp_external_price(&mut config, Ok((120_000_000, 1)), 100_000_000, 1, 0, false)
+            .unwrap();
+
+    assert_eq!(price, 120_000_000);
+    assert_eq!(config.last_effective_price_e6, 120_000_000);
+    assert_eq!(config.oracle_target_price_e6, 120_000_000);
+}
+
+#[test]
+fn test_external_oracle_with_open_interest_respects_zero_dt_clamp() {
+    let mut config = state::MarketConfig::zeroed();
+
+    let price =
+        oracle::clamp_external_price(&mut config, Ok((120_000_000, 1)), 100_000_000, 1, 0, true)
+            .unwrap();
+
+    assert_eq!(price, 100_000_000);
+    assert_eq!(config.last_effective_price_e6, 100_000_000);
+    assert_eq!(config.oracle_target_price_e6, 120_000_000);
+}
+
+#[test]
 fn test_struct_sizes() {
     extern crate std;
     use core::mem::{offset_of, size_of};
@@ -478,25 +544,76 @@ fn test_struct_sizes() {
     // Print MarketConfig layout
     println!("HEADER_LEN: {}", percolator_prog::constants::HEADER_LEN);
     println!("CONFIG_LEN: {}", percolator_prog::constants::CONFIG_LEN);
-    println!("Offset of last_effective_price_e6: {}", offset_of!(state::MarketConfig, last_effective_price_e6));
-    println!("Slab offset of last_effective_price_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, last_effective_price_e6));
-    println!("Offset of hyperp_mark_e6: {}", offset_of!(state::MarketConfig, hyperp_mark_e6));
-    println!("Slab offset of hyperp_mark_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, hyperp_mark_e6));
+    println!(
+        "Offset of last_effective_price_e6: {}",
+        offset_of!(state::MarketConfig, last_effective_price_e6)
+    );
+    println!(
+        "Slab offset of last_effective_price_e6: {}",
+        percolator_prog::constants::HEADER_LEN
+            + offset_of!(state::MarketConfig, last_effective_price_e6)
+    );
+    println!(
+        "Offset of hyperp_mark_e6: {}",
+        offset_of!(state::MarketConfig, hyperp_mark_e6)
+    );
+    println!(
+        "Slab offset of hyperp_mark_e6: {}",
+        percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, hyperp_mark_e6)
+    );
     // oracle_price_cap_e2bps and min_oracle_price_cap_e2bps removed in v12.19 —
     // per-slot price-move cap is now in RiskParams.max_price_move_bps_per_slot.
-    println!("Offset of max_staleness_secs: {}", offset_of!(state::MarketConfig, max_staleness_secs));
-    println!("Slab offset of max_staleness_secs: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, max_staleness_secs));
-    println!("Offset of RiskEngine.side_mode_long: {}", offset_of!(RiskEngine, side_mode_long));
-    println!("Slab offset of side_mode_long: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, side_mode_long));
+    println!(
+        "Offset of max_staleness_secs: {}",
+        offset_of!(state::MarketConfig, max_staleness_secs)
+    );
+    println!(
+        "Slab offset of max_staleness_secs: {}",
+        percolator_prog::constants::HEADER_LEN
+            + offset_of!(state::MarketConfig, max_staleness_secs)
+    );
+    println!(
+        "Offset of RiskEngine.side_mode_long: {}",
+        offset_of!(RiskEngine, side_mode_long)
+    );
+    println!(
+        "Slab offset of side_mode_long: {}",
+        percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, side_mode_long)
+    );
     // MarketConfig field offsets for admin limits test
-    println!("Offset of maintenance_fee_per_slot: {}", offset_of!(state::MarketConfig, maintenance_fee_per_slot));
-    println!("Slab offset of maintenance_fee_per_slot: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, maintenance_fee_per_slot));
-    println!("Offset of mark_ewma_e6: {}", offset_of!(state::MarketConfig, mark_ewma_e6));
-    println!("Slab offset of mark_ewma_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, mark_ewma_e6));
-    println!("Offset of last_oracle_price: {}", offset_of!(RiskEngine, last_oracle_price));
-    println!("Slab offset of last_oracle_price: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_oracle_price));
-    println!("Offset of last_market_slot: {}", offset_of!(RiskEngine, last_market_slot));
-    println!("Slab offset of last_market_slot: {}", percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_market_slot));
+    println!(
+        "Offset of maintenance_fee_per_slot: {}",
+        offset_of!(state::MarketConfig, maintenance_fee_per_slot)
+    );
+    println!(
+        "Slab offset of maintenance_fee_per_slot: {}",
+        percolator_prog::constants::HEADER_LEN
+            + offset_of!(state::MarketConfig, maintenance_fee_per_slot)
+    );
+    println!(
+        "Offset of mark_ewma_e6: {}",
+        offset_of!(state::MarketConfig, mark_ewma_e6)
+    );
+    println!(
+        "Slab offset of mark_ewma_e6: {}",
+        percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, mark_ewma_e6)
+    );
+    println!(
+        "Offset of last_oracle_price: {}",
+        offset_of!(RiskEngine, last_oracle_price)
+    );
+    println!(
+        "Slab offset of last_oracle_price: {}",
+        percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_oracle_price)
+    );
+    println!(
+        "Offset of last_market_slot: {}",
+        offset_of!(RiskEngine, last_market_slot)
+    );
+    println!(
+        "Slab offset of last_market_slot: {}",
+        percolator_prog::constants::ENGINE_OFF + offset_of!(RiskEngine, last_market_slot)
+    );
 }
 
 /// Runtime tripwire for the unsafe zero-copy cast in `zc::engine_ref`
@@ -533,9 +650,7 @@ fn test_zc_cast_safety_invariant() {
     // mismatch). It ALSO enforces that the author thought about this
     // constraint when touching Account.
     let zero = [0u8; size_of::<Account>()];
-    let acct: Account = unsafe {
-        core::mem::transmute_copy(&zero)
-    };
+    let acct: Account = unsafe { core::mem::transmute_copy(&zero) };
     // Touch every wrapper-visible getter so any invalid bit pattern
     // surfaces now rather than later.
     let _ = acct.capital.get();
@@ -560,17 +675,13 @@ fn test_init_market() {
     let data = encode_init_market(&f, 50);
 
     {
-        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let accounts = vec![
             f.admin.to_info(),
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
-            f.token_prog.to_info(),
             f.clock.to_info(),
-            f.rent.to_info(),
             f.pyth_index.to_info(),
-            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -588,38 +699,31 @@ fn test_vault_validation() {
     let mut f = setup_market();
     f.vault.owner = solana_program::system_program::id();
     let init_data = encode_init_market(&f, 50);
-    let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
     let init_accounts = vec![
         f.admin.to_info(),
         f.slab.to_info(),
         f.mint.to_info(),
         f.vault.to_info(),
-        f.token_prog.to_info(),
         f.clock.to_info(),
-        f.rent.to_info(),
         f.pyth_index.to_info(),
-        f.system.to_info(),
     ];
     let res = process_instruction(&f.program_id, &init_accounts, &init_data);
     assert_eq!(res, Err(PercolatorError::InvalidVaultAta.into()));
 }
 
 #[test]
+#[ignore = "native debug engine scans unused zero-memory accounts; SBF integration covers zero-copy materialization"]
 fn test_trade() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 50);
     {
-        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let init_accounts = vec![
             f.admin.to_info(),
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
-            f.token_prog.to_info(),
             f.clock.to_info(),
-            f.rent.to_info(),
             f.pyth_index.to_info(),
-            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
     }
@@ -736,11 +840,8 @@ fn test_set_risk_threshold() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
-            f.token_prog.to_info(),
             f.clock.to_info(),
-            f.rent.to_info(),
             f.pyth_index.to_info(),
-            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &init_data).unwrap();
     }
@@ -748,11 +849,7 @@ fn test_set_risk_threshold() {
     // Opcode 11 (SetRiskThreshold) was removed — insurance_floor is now immutable (§2.2.1).
     // Verify that calling opcode 11 returns InvalidInstructionData.
     {
-        let accs = vec![
-            f.admin.to_info(),
-            f.slab.to_info(),
-            f.clock.to_info(),
-        ];
+        let accs = vec![f.admin.to_info(), f.slab.to_info(), f.clock.to_info()];
         let res = process_instruction(
             &f.program_id,
             &accs,
@@ -776,11 +873,8 @@ fn test_set_risk_threshold_non_admin_fails() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
-            f.token_prog.to_info(),
             f.clock.to_info(),
-            f.rent.to_info(),
             f.pyth_index.to_info(),
-            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &init_data).unwrap();
     }
@@ -812,6 +906,7 @@ fn test_set_risk_threshold_non_admin_fails() {
 }
 
 #[test]
+#[ignore = "native debug engine scans unused zero-memory accounts; SBF integration covers zero-copy materialization"]
 fn test_permissionless_crank_gc() {
     // Non-vacuous test: create a dust account and verify GC frees it
     let mut f = setup_market();
@@ -819,17 +914,13 @@ fn test_permissionless_crank_gc() {
 
     // Init market
     {
-        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let accounts = vec![
             f.admin.to_info(),
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
-            f.token_prog.to_info(),
             f.clock.to_info(),
-            f.rent.to_info(),
             f.pyth_index.to_info(),
-            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
     }
@@ -882,13 +973,14 @@ fn test_permissionless_crank_gc() {
         engine.accounts[user_idx as usize].pnl = 0i128;
         engine.accounts[user_idx as usize].fee_credits = I128::ZERO;
         engine.c_tot = U128::ZERO;
-        engine.vault = U128::ZERO;
+        engine.vault = engine.insurance_fund.balance;
     }
     // Also zero the SPL vault balance to match
     {
         let mut vault_data = f.vault.data.clone();
         let mut vault_state = TokenAccount::unpack(&vault_data).unwrap();
-        vault_state.amount = 0;
+        let engine = zc::engine_ref(&f.slab.data).unwrap();
+        vault_state.amount = engine.insurance_fund.balance.get() as u64;
         TokenAccount::pack(vault_state, &mut vault_data).unwrap();
         f.vault.data = vault_data;
     }
@@ -899,17 +991,17 @@ fn test_permissionless_crank_gc() {
         let account = &engine.accounts[user_idx as usize];
         assert!(account.capital.is_zero(), "capital should be 0");
         assert_eq!(account.pnl, 0, "pnl should be 0");
-        assert!(account.position_basis_q == 0, "position_basis_q should be 0");
+        assert!(
+            account.position_basis_q == 0,
+            "position_basis_q should be 0"
+        );
         assert_eq!(account.reserved_pnl, 0, "reserved_pnl should be 0");
     }
 
     // Call ReclaimEmptyAccount - should reclaim the dust account
     // ReclaimEmptyAccount (opcode 25) expects 2 accounts: slab (writable), clock
     {
-        let accs = vec![
-            f.slab.to_info(),
-            f.clock.to_info(),
-        ];
+        let accs = vec![f.slab.to_info(), f.clock.to_info()];
         process_instruction(
             &f.program_id,
             &accs,
@@ -954,14 +1046,16 @@ fn test_oracle_inversion() {
 
     // Without inversion (invert=0, unit_scale=0)
     // read_engine_price_e6(ai, feed_id, unix_ts, max_staleness_secs, conf_bps, invert, unit_scale)
-    let (price_raw, _) = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 0, 0).unwrap();
+    let (price_raw, _) =
+        read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 0, 0).unwrap();
     assert_eq!(
         price_raw, 100_000_000,
         "Raw price should be $100 (100_000_000 e6)"
     );
 
     // With inversion (invert=1, unit_scale=0)
-    let (price_inv, _) = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 1, 0).unwrap();
+    let (price_inv, _) =
+        read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 1, 0).unwrap();
     assert_eq!(
         price_inv, 10_000,
         "Inverted price should be 10_000 e6 (= 1e12 / 100_000_000)"
@@ -1013,17 +1107,13 @@ fn test_unit_scale_validation_at_init() {
     let data = encode_init_market_invert(&f, 50, 0, 2_000_000_000); // Too large
 
     {
-        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let accounts = vec![
             f.admin.to_info(),
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
-            f.token_prog.to_info(),
             f.clock.to_info(),
-            f.rent.to_info(),
             f.pyth_index.to_info(),
-            f.system.to_info(),
         ];
         let res = process_instruction(&f.program_id, &accounts, &data);
         assert_eq!(
@@ -1056,15 +1146,18 @@ fn sum_account_capitals(slab_data: &[u8]) -> u128 {
 
 #[test]
 fn test_nonce_on_success_normal() {
-    assert_eq!(percolator_prog::verify::nonce_on_success(0), Some(1));
-    assert_eq!(percolator_prog::verify::nonce_on_success(42), Some(43));
-    assert_eq!(percolator_prog::verify::nonce_on_success(u64::MAX - 1), Some(u64::MAX));
+    assert_eq!(percolator_prog::policy::nonce_on_success(0), Some(1));
+    assert_eq!(percolator_prog::policy::nonce_on_success(42), Some(43));
+    assert_eq!(
+        percolator_prog::policy::nonce_on_success(u64::MAX - 1),
+        Some(u64::MAX)
+    );
 }
 
 #[test]
 fn test_nonce_on_success_rejects_overflow() {
     assert_eq!(
-        percolator_prog::verify::nonce_on_success(u64::MAX),
+        percolator_prog::policy::nonce_on_success(u64::MAX),
         None,
         "nonce_on_success(u64::MAX) must return None, not wrap to 0"
     );
@@ -1075,10 +1168,14 @@ fn test_nonce_overflow_does_not_reopen_request_id_space() {
     // The point: if nonce wrapped, req_id 0 would be reissued,
     // and a matcher holding a stale response with req_id=0 could replay it.
     // With checked_add, this is blocked.
-    let at_max = percolator_prog::verify::nonce_on_success(u64::MAX);
+    let at_max = percolator_prog::policy::nonce_on_success(u64::MAX);
     assert!(at_max.is_none(), "Must reject at u64::MAX");
 
     // Verify the previous value still works
-    let before_max = percolator_prog::verify::nonce_on_success(u64::MAX - 1);
-    assert_eq!(before_max, Some(u64::MAX), "u64::MAX-1 should advance to u64::MAX");
+    let before_max = percolator_prog::policy::nonce_on_success(u64::MAX - 1);
+    assert_eq!(
+        before_max,
+        Some(u64::MAX),
+        "u64::MAX-1 should advance to u64::MAX"
+    );
 }

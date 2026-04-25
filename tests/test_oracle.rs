@@ -100,11 +100,8 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(
             &payer.pubkey(),
@@ -119,13 +116,17 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
     const HEADER_CONFIG_LEN: usize = 584;
-    let NUM_USED_OFF: usize = 520 + common::ENGINE_NUM_USED_OFFSET;
+    let NUM_USED_OFF: usize = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {
         let vault_data = svm.get_account(&vault).unwrap().data;
         TokenAccount::unpack(&vault_data).unwrap().amount
     };
-    let used_before = u16::from_le_bytes(slab_before[NUM_USED_OFF..NUM_USED_OFF + 2].try_into().unwrap());
+    let used_before = u16::from_le_bytes(
+        slab_before[NUM_USED_OFF..NUM_USED_OFF + 2]
+            .try_into()
+            .unwrap(),
+    );
 
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), ix],
@@ -148,7 +149,11 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
         let vault_data = svm.get_account(&vault).unwrap().data;
         TokenAccount::unpack(&vault_data).unwrap().amount
     };
-    let used_after = u16::from_le_bytes(slab_after[NUM_USED_OFF..NUM_USED_OFF + 2].try_into().unwrap());
+    let used_after = u16::from_le_bytes(
+        slab_after[NUM_USED_OFF..NUM_USED_OFF + 2]
+            .try_into()
+            .unwrap(),
+    );
 
     assert_eq!(
         &slab_after[..HEADER_CONFIG_LEN],
@@ -250,11 +255,8 @@ fn test_hyperp_init_market_with_valid_price() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(
             &payer.pubkey(),
@@ -287,10 +289,11 @@ fn test_hyperp_init_market_with_valid_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap_off = 520 + 200; let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
+    let cap_off = common::ENGINE_OFFSET + 32 + 160;
+    let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used_off = 520 + common::ENGINE_NUM_USED_OFFSET;
+    let used_off = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -299,7 +302,10 @@ fn test_hyperp_init_market_with_valid_price() {
         &[0u8; 32],
         "Hyperp market must store zeroed feed id"
     );
-    assert_eq!(slab_data[INVERT_OFF], 0, "invert flag should be 0 for this test");
+    assert_eq!(
+        slab_data[INVERT_OFF], 0,
+        "invert flag should be 0 for this test"
+    );
     assert_eq!(
         mark, initial_price_e6,
         "Hyperp mark must equal initial_mark_price_e6 at init"
@@ -308,9 +314,15 @@ fn test_hyperp_init_market_with_valid_price() {
         index, initial_price_e6,
         "Hyperp index must equal initial_mark_price_e6 at init"
     );
-    assert_eq!(cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
-        "Cap should match engine's max_price_move_bps_per_slot");
-    assert_eq!(used, 0, "No user/LP accounts should exist immediately after market init");
+    assert_eq!(
+        cap,
+        common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "Cap should match engine's max_price_move_bps_per_slot"
+    );
+    assert_eq!(
+        used, 0,
+        "No user/LP accounts should exist immediately after market init"
+    );
 
     println!("HYPERP INIT VERIFIED: Market initialized with $100 initial mark/index price");
 }
@@ -410,11 +422,8 @@ fn test_hyperp_init_market_with_inverted_price() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(
             &payer.pubkey(),
@@ -447,10 +456,11 @@ fn test_hyperp_init_market_with_inverted_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap_off = 520 + 200; let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
+    let cap_off = common::ENGINE_OFFSET + 32 + 160;
+    let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used_off = 520 + common::ENGINE_NUM_USED_OFFSET;
+    let used_off = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -459,7 +469,10 @@ fn test_hyperp_init_market_with_inverted_price() {
         &[0u8; 32],
         "Hyperp market must store zeroed feed id"
     );
-    assert_eq!(slab_data[INVERT_OFF], 1, "invert flag should be 1 for inverted Hyperp init");
+    assert_eq!(
+        slab_data[INVERT_OFF], 1,
+        "invert flag should be 1 for inverted Hyperp init"
+    );
     assert_eq!(
         mark, expected_inverted,
         "Hyperp mark must be stored as inverted initial price"
@@ -468,9 +481,15 @@ fn test_hyperp_init_market_with_inverted_price() {
         index, expected_inverted,
         "Hyperp index must be stored as inverted initial price"
     );
-    assert_eq!(cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
-        "Cap should match engine's max_price_move_bps_per_slot");
-    assert_eq!(used, 0, "No user/LP accounts should exist immediately after market init");
+    assert_eq!(
+        cap,
+        common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "Cap should match engine's max_price_move_bps_per_slot"
+    );
+    assert_eq!(
+        used, 0,
+        "No user/LP accounts should exist immediately after market init"
+    );
 
     println!("HYPERP INVERTED MARKET VERIFIED:");
     println!(
@@ -514,7 +533,11 @@ fn test_comprehensive_oracle_price_impact_on_pnl() {
     // Price goes to $150 - crank. User is long, so mark-to-market PnL should be positive.
     env.set_slot_and_price(200, 150_000_000);
     env.crank();
-    assert_eq!(env.vault_balance(), vault_initial, "Vault conserved at $150");
+    assert_eq!(
+        env.vault_balance(),
+        vault_initial,
+        "Vault conserved at $150"
+    );
     // For an open position, PnL is tracked in the pnl field (mark-to-market).
     // Capital settles during touch_account (lazy), not during crank.
     // Check that PnL is positive (long position profits at higher price).
@@ -524,37 +547,53 @@ fn test_comprehensive_oracle_price_impact_on_pnl() {
     assert!(
         pnl_at_150 > 0 || cap_at_150 > 10_000_000_000,
         "Long position should have gained value at $150 (up from $138): pnl={} cap={}",
-        pnl_at_150, cap_at_150
+        pnl_at_150,
+        cap_at_150
     );
 
     // Price drops to $120 - crank. User is long, PnL should be negative.
     env.set_slot_and_price(300, 120_000_000);
     env.crank();
-    assert_eq!(env.vault_balance(), vault_initial, "Vault conserved at $120");
+    assert_eq!(
+        env.vault_balance(),
+        vault_initial,
+        "Vault conserved at $120"
+    );
     let pnl_at_120 = env.read_account_pnl(user_idx);
     let cap_at_120 = env.read_account_capital(user_idx);
     // At $120 (below entry $138), long position should have negative or reduced PnL
     assert!(
         pnl_at_120 < pnl_at_150,
         "Long position should lose value at $120 (below $150): pnl={} was {}, cap={} was {}",
-        pnl_at_120, pnl_at_150, cap_at_120, cap_at_150
+        pnl_at_120,
+        pnl_at_150,
+        cap_at_120,
+        cap_at_150
     );
 
     // Price recovers to $140 - crank. PnL should improve from $120 level.
     env.set_slot_and_price(400, 140_000_000);
     env.crank();
-    assert_eq!(env.vault_balance(), vault_initial, "Vault conserved at $140");
+    assert_eq!(
+        env.vault_balance(),
+        vault_initial,
+        "Vault conserved at $140"
+    );
     let pnl_at_140 = env.read_account_pnl(user_idx);
     assert!(
         pnl_at_140 > pnl_at_120,
         "Long position should gain value at $140 (up from $120): pnl={} was {}",
-        pnl_at_140, pnl_at_120
+        pnl_at_140,
+        pnl_at_120
     );
 
     // Position must still be open
-    assert_ne!(env.read_account_position(user_idx), 0, "Position must persist through price changes");
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "Position must persist through price changes"
+    );
 }
-
 
 /// CRITICAL: SetOraclePriceCap admin-only
 // test_critical_set_oracle_price_cap_authorization deleted:
@@ -670,11 +709,8 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_hyperp(&payer.pubkey(), &mint, initial_price_e6),
     };
@@ -732,8 +768,9 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
         println!("Second crank error: {:?}", e);
     }
 
-    // SECURITY VERIFICATION: Multiple cranks in the same slot are ALLOWED
-    // but the index must NOT move (Bug #9 fix).
+    // SECURITY VERIFICATION: Multiple cranks in the same slot are ALLOWED.
+    // With zero OI, the wrapper may adopt the target directly because no
+    // live position can lose equity.
 
     assert!(
         result2.is_ok(),
@@ -741,18 +778,16 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
         result2
     );
 
-    // Bug #9 CRITICAL CHECK: Read last_effective_price_e6 (index) from slab.
-    // The index must be identical before and after the same-slot crank.
-    // Before Bug #9 fix, dt=0 caused clamp_toward_with_dt to return mark
-    // instead of index, allowing the index to jump to mark in a single slot.
+    // Read last_effective_price_e6 (index) from slab. In a flat market,
+    // same-slot target adoption is permitted and should move toward the mark.
     let slab_data = svm.get_account(&slab).unwrap().data;
     const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
     let index_after = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
-    assert_eq!(
-        index_after, initial_price_e6,
-        "Bug #9 regression: index moved during same-slot crank! \
-         expected={} (initial), got={}. Index should not move when dt=0.",
-        initial_price_e6, index_after
+    assert!(
+        index_after >= initial_price_e6,
+        "flat same-slot crank should not move away from the target: initial={} after={}",
+        initial_price_e6,
+        index_after
     );
 }
 
@@ -760,13 +795,15 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
 ///
 /// Spec behavior: In Hyperp mode, the index (last_effective_price_e6) moves
 /// toward the mark price by at most `index * cap * dt / 1_000_000` per
-/// crank.  A second crank in the same slot (dt=0) must leave the index unchanged.
+/// crank.  A second crank in the same slot may adopt the target directly when
+/// the market has zero OI.
 ///
 /// This test:
 /// 1. Inits a Hyperp market at $100.
 /// 2. Pushes mark to ~$101 (clamped by circuit breaker from $200 push).
 /// 3. Cranks with dt=10 slots, verifies index movement <= cap * dt bound.
-/// 4. Cranks again in the same slot, verifies index is unchanged (dt=0).
+/// 4. Cranks again in the same slot, verifies the flat market does not move
+///    away from the target.
 #[test]
 fn test_hyperp_index_smoothing_rate_limited() {
     program_path();
@@ -785,11 +822,11 @@ fn test_hyperp_index_smoothing_rate_limited() {
     // Read the engine-level `max_price_move_bps_per_slot` — v12.19
     // replacement for `oracle_price_cap`.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = 720; // ENGINE(520) + RiskParams(32) + 168
-    let cap =
-        u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
+    const CAP_OFF: usize = common::ENGINE_OFFSET + 32 + 160;
+    let cap = u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
     assert_eq!(
-        cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        cap,
+        common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
         "default cap must match test fixture",
     );
 
@@ -799,7 +836,8 @@ fn test_hyperp_index_smoothing_rate_limited() {
     // EWMA: $100 * 0.5 + $101 * 0.5 = $100.5M
     // The mark moves enough that the index will follow.
     env.set_slot(1);
-    env.try_push_oracle_price(&admin, 200_000_000, 200).expect("push");
+    env.try_push_oracle_price(&admin, 200_000_000, 200)
+        .expect("push");
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
@@ -824,7 +862,10 @@ fn test_hyperp_index_smoothing_rate_limited() {
     assert!(
         actual_delta <= max_delta,
         "index movement {} exceeds rate limit {} (cap={}, dt={})",
-        actual_delta, max_delta, cap, dt
+        actual_delta,
+        max_delta,
+        cap,
+        dt
     );
     // Index should have moved toward mark (if mark > initial and dt > 0)
     // With EWMA, the mark may be only slightly above initial after pushes.
@@ -832,10 +873,11 @@ fn test_hyperp_index_smoothing_rate_limited() {
     assert!(
         index_after_crank >= initial_price,
         "index should not decrease: index={} initial={}",
-        index_after_crank, initial_price
+        index_after_crank,
+        initial_price
     );
 
-    // Second crank in the same slot (dt=0): index must not change.
+    // Second crank in the same slot (dt=0): zero-OI markets may adopt target.
     let index_before_same_slot = index_after_crank;
     env.svm.expire_blockhash();
     env.crank();
@@ -844,10 +886,11 @@ fn test_hyperp_index_smoothing_rate_limited() {
     let index_after_same_slot =
         u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
 
-    assert_eq!(
-        index_after_same_slot, index_before_same_slot,
-        "same-slot crank must not move index: before={} after={}",
-        index_before_same_slot, index_after_same_slot
+    assert!(
+        index_after_same_slot >= index_before_same_slot,
+        "flat same-slot crank should not move away from the target: before={} after={}",
+        index_before_same_slot,
+        index_after_same_slot
     );
 }
 
@@ -981,7 +1024,8 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     let matcher_prog = env.matcher_program_id;
 
     // Oracle authority (v12.19: price-move cap is immutable init-time)
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .unwrap();
 
     // Helper: send UpdateConfig with a specific funding_k_bps.
     // Uses short horizon (100 slots) so the per-slot rate is non-zero
@@ -998,12 +1042,15 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
                 AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_update_config(
-                100, k_bps,
-                10_000i64, 10i64,  // funding_max_e9_per_slot=10 fits engine's e9=1e6 cap
+                100, k_bps, 10_000i64,
+                10i64, // funding_max_e9_per_slot=10 fits engine's e9=1e6 cap
             ),
         };
         let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), ix], Some(&kp.pubkey()), &[&kp], env.svm.latest_blockhash(),
+            &[cu_ix(), ix],
+            Some(&kp.pubkey()),
+            &[&kp],
+            env.svm.latest_blockhash(),
         );
         env.svm.send_transaction(tx).expect("UpdateConfig failed");
     };
@@ -1035,9 +1082,15 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     // The matcher's exec_price will differ from the index, creating a premium
     // and a non-zero stored funding rate.
     env.try_trade_cpi(
-        &user, &lp.pubkey(), lp_idx, user_idx,
-        100_000_000, &matcher_prog, &matcher_ctx,
-    ).expect("Trade should succeed");
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("Trade should succeed");
     println!("2. Positions created via TradeCpi");
 
     // The trade updated mark to exec_price (which may differ from index).
@@ -1052,17 +1105,26 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         percolator_prog::state::read_config(&d)
     };
-    println!("3. After push: mark={} index={} gap={}",
-        config_before.mark_ewma_e6, config_before.last_effective_price_e6,
+    println!(
+        "3. After push: mark={} index={} gap={}",
+        config_before.mark_ewma_e6,
+        config_before.last_effective_price_e6,
         if config_before.mark_ewma_e6 > config_before.last_effective_price_e6 {
             config_before.mark_ewma_e6 - config_before.last_effective_price_e6
         } else {
             config_before.last_effective_price_e6 - config_before.mark_ewma_e6
-        });
+        }
+    );
     let has_premium = config_before.mark_ewma_e6 != config_before.last_effective_price_e6
         && config_before.mark_ewma_e6 > 0;
-    assert!(has_premium, "Precondition: mark must differ from index for funding anti-retroactivity test");
-    println!("4. Premium exists: mark={} != index={}", config_before.mark_ewma_e6, config_before.last_effective_price_e6);
+    assert!(
+        has_premium,
+        "Precondition: mark must differ from index for funding anti-retroactivity test"
+    );
+    println!(
+        "4. Premium exists: mark={} != index={}",
+        config_before.mark_ewma_e6, config_before.last_effective_price_e6
+    );
 
     // ---- Idle interval: advance 50 slots without cranking ----
     let idle_dt: u64 = 50;
@@ -1081,9 +1143,14 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         percolator_prog::state::read_config(&d)
     };
-    assert_eq!(config_after.funding_k_bps, 2000,
-        "UpdateConfig must write new k_bps");
-    println!("7. Config updated: k_bps={} (was 1000)", config_after.funding_k_bps);
+    assert_eq!(
+        config_after.funding_k_bps, 2000,
+        "UpdateConfig must write new k_bps"
+    );
+    println!(
+        "7. Config updated: k_bps={} (was 1000)",
+        config_after.funding_k_bps
+    );
 
     // The fact that UpdateConfig succeeded with 50 idle slots and a premium proves
     // accrue_market_to was called (it must sync slot monotonicity). The wrapper's
@@ -1099,13 +1166,18 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         percolator_prog::state::read_config(&d)
     };
-    println!("8. Post-crank k_bps={} (should still be 2000)", config_post.funding_k_bps);
-    assert_eq!(config_post.funding_k_bps, 2000, "k_bps must persist after crank");
+    println!(
+        "8. Post-crank k_bps={} (should still be 2000)",
+        config_post.funding_k_bps
+    );
+    assert_eq!(
+        config_post.funding_k_bps, 2000,
+        "k_bps must persist after crank"
+    );
 
     println!();
     println!("FUNDING ANTI-RETROACTIVITY UpdateConfig: PASSED");
 }
-
 
 /// Oracle observation monotonicity (graceful policy): a Pyth update
 /// with a `publish_time` older than the last accepted observation
@@ -1124,18 +1196,22 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     env.set_slot_and_price(100, 138_000_000);
     env.crank();
 
-    const LAST_ORACLE_PUB_TS_OFF: usize = 320;     // HEADER_LEN(136) + last_oracle_publish_time(184)
-    const LAST_EFFECTIVE_PRICE_OFF: usize = 328;   // HEADER_LEN(136) + last_effective_price_e6(192)
+    const LAST_ORACLE_PUB_TS_OFF: usize = 320; // HEADER_LEN(136) + last_oracle_publish_time(184)
+    const LAST_EFFECTIVE_PRICE_OFF: usize = 328; // HEADER_LEN(136) + last_effective_price_e6(192)
     let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         i64::from_le_bytes(
-            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8].try_into().unwrap(),
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
+                .try_into()
+                .unwrap(),
         )
     };
     let read_baseline = |env: &TestEnv| -> u64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(
-            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8].try_into().unwrap(),
+            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8]
+                .try_into()
+                .unwrap(),
         )
     };
     let pub_ts_before = read_pub_ts(&env);
@@ -1198,13 +1274,17 @@ fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
     let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         i64::from_le_bytes(
-            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8].try_into().unwrap(),
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
+                .try_into()
+                .unwrap(),
         )
     };
     let read_baseline = |env: &TestEnv| -> u64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(
-            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8].try_into().unwrap(),
+            d[LAST_EFFECTIVE_PRICE_OFF..LAST_EFFECTIVE_PRICE_OFF + 8]
+                .try_into()
+                .unwrap(),
         )
     };
 
@@ -1262,7 +1342,9 @@ fn test_oracle_replay_does_not_advance_liveness_cursor() {
     let read_last_good = |env: &TestEnv| -> u64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(
-            d[LAST_GOOD_SLOT_OFF..LAST_GOOD_SLOT_OFF + 8].try_into().unwrap(),
+            d[LAST_GOOD_SLOT_OFF..LAST_GOOD_SLOT_OFF + 8]
+                .try_into()
+                .unwrap(),
         )
     };
 
