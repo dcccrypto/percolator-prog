@@ -621,16 +621,30 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
     // encode_init_market_with_cap auto-sets max_crank_staleness and
     // force_close_delay when perm_resolve > 0. perm_resolve must be
     // <= MAX_ACCRUAL_DT_SLOTS = 100_000.
+    let perm_resolve: u64 = 50_000;
     let data = common::encode_init_market_with_cap(
         &env.payer.pubkey(),
         &env.mint,
         &common::TEST_FEED_ID,
         0,      // invert (non-Hyperp)
         0,      // min_oracle_price_cap_e2bps
-        50_000, // permissionless_resolve_stale_slots
+        perm_resolve,
     );
     env.try_init_market_raw(data)
         .expect("non-Hyperp + cap=0 + perm_resolve>0 must init OK");
+
+    // End-to-end check: the whole point of the positive invariant is
+    // that ResolvePermissionless actually works on this configuration.
+    // Init succeeding alone doesn't prove the resolve path exists —
+    // the engine could still refuse to resolve at settlement time.
+    // Drive the clock past perm_resolve and confirm resolve succeeds.
+    let mut clk = env.svm.get_sysvar::<solana_sdk::clock::Clock>();
+    clk.slot = clk.slot.saturating_add(perm_resolve + 1);
+    clk.unix_timestamp = clk.unix_timestamp.saturating_add(perm_resolve as i64 + 1);
+    env.svm.set_sysvar(&clk);
+    env.try_resolve_permissionless_once()
+        .expect("ResolvePermissionless must succeed on cap=0+perm_resolve>0 market");
+    assert!(env.is_market_resolved(), "market must flip to Resolved");
 }
 
 /// Burn guard: UpdateAuthority may not zero oracle_authority on a non-

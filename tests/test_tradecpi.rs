@@ -5550,3 +5550,249 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
         push_before, push_after,
     );
 }
+
+// ============================================================================
+// Hyperp perm_resolve terminal-behavior invariants (audit follow-up)
+//
+// Two properties these tests pin down:
+//
+//   1. POST-MATURITY TERMINAL. Once clock.slot - last_live_slot >=
+//      permissionless_resolve_stale_slots, the market is resolve-only:
+//      PushOraclePrice and CatchupAccrue reject with OracleStale;
+//      ResolvePermissionless succeeds.
+//
+//   2. NO PRE-MATURITY UNRECOVERABLE WINDOW. Just before maturity a
+//      fresh admin push must still succeed — otherwise the market
+//      enters a "frozen but not yet resolvable" dead zone. The init-
+//      time invariant
+//          perm_resolve <= CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS
+//      guarantees catchup_accrue can close any pre-maturity gap in a
+//      single call.
+// ============================================================================
+
+/// Test 1: Post-maturity Hyperp markets are resolve-only.
+#[test]
+fn test_hyperp_after_stale_maturity_is_resolve_only() {
+    let mut env = TradeCpiTestEnv::new();
+    env.try_init_market_hyperp_with_stale(
+        1_000_000,
+        100,  // max_staleness_secs
+        300,  // permissionless_resolve_stale_slots
+    ).expect("init Hyperp with explicit stale/perm-resolve");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+
+    // Fund LP + user; open a small OI so funding is active (not required
+    // for the assertions, but reflects a realistic live market state).
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Seed mark + open position at slot 10 to activate funding.
+    env.set_slot(10);
+    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+    env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        10_000_000, &matcher_prog, &matcher_ctx,
+    ).expect("opening trade succeeds while fresh");
+
+    // Advance past permissionless_resolve_stale_slots (= 300).
+    env.set_slot(10 + 301);
+
+    // Admin push must NOT revive the market.
+    let err = env.try_push_oracle_price(&admin, 1_020_000, 10 + 301)
+        .expect_err("PushOraclePrice must reject past perm_resolve maturity");
+    assert!(
+        err.contains("0x6"),
+        "PushOraclePrice past maturity must surface OracleStale (0x6), got: {}", err,
+    );
+
+    // TradeCpi must also reject — same hard-timeout gate. This is the
+    // important one: the RESOLVE-ONLY intent is that user-facing
+    // trading is terminally dead post-maturity, not just admin ops.
+    let err = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000, &matcher_prog, &matcher_ctx,
+    ).expect_err("TradeCpi must reject past perm_resolve maturity");
+    assert!(
+        err.contains("0x6"),
+        "TradeCpi past maturity must surface OracleStale (0x6), got: {}", err,
+    );
+
+    // CatchupAccrue must also reject — it routes through
+    // get_engine_oracle_price_e6 which honors the hard-timeout gate.
+    let err = env.try_catchup_accrue()
+        .expect_err("CatchupAccrue must reject past perm_resolve maturity");
+    assert!(
+        err.contains("0x6"),
+        "CatchupAccrue past maturity must surface OracleStale (0x6), got: {}", err,
+    );
+
+    // ResolvePermissionless must succeed and flip the market to resolved.
+    env.try_resolve_permissionless()
+        .expect("ResolvePermissionless must succeed after maturity");
+    assert!(
+        env.is_market_resolved(),
+        "market must be resolved after ResolvePermissionless"
+    );
+}
+
+/// Test 2: A fresh admin push just before perm_resolve maturity must
+/// succeed — there is no pre-maturity unrecoverable window.
+#[test]
+fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
+    let mut env = TradeCpiTestEnv::new();
+    env.try_init_market_hyperp_with_stale(
+        1_000_000,
+        100,  // max_staleness_secs
+        300,  // permissionless_resolve_stale_slots
+    ).expect("init Hyperp with explicit stale/perm-resolve");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(10);
+    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+    env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        10_000_000, &matcher_prog, &matcher_ctx,
+    ).unwrap();
+
+    // Advance to JUST BEFORE perm_resolve maturity.
+    env.set_slot(10 + 299);
+
+    // Admin push still works — perm_resolve hasn't matured, market is
+    // recoverable.
+    env.try_push_oracle_price(&admin, 1_020_000, 10 + 299)
+        .expect("PushOraclePrice must succeed before perm_resolve maturity");
+    assert!(
+        !env.is_market_resolved(),
+        "market must still be live before perm_resolve maturity"
+    );
+
+    // Stronger assertion: "market stays live" means more than "push
+    // didn't error" — a subsequent TradeCpi at the same slot must also
+    // succeed. If the market had silently slipped into a frozen state
+    // (e.g. get_engine_oracle_price_e6 refusing price reads on the
+    // trade path), this follow-up trade would fail. This is the
+    // end-to-end recoverability check the original audit flagged.
+    env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000, &matcher_prog, &matcher_ctx,
+    ).expect("TradeCpi must succeed on a freshly-revived market");
+}
+
+/// Test 3: Init rejects Hyperp perm_resolve values too large to
+/// recover within the accrue envelope. In the current code the general
+/// `perm_resolve <= risk_params.max_accrual_dt_slots` guard (100_000)
+/// is strictly tighter than the new Hyperp catchup-budget guard
+/// (CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS = 2_000_000), so the
+/// general guard always fires first. The substantive assertion this
+/// test makes is that init REJECTS any Hyperp perm_resolve past the
+/// accrue envelope — we pick a value above the general bound so the
+/// test is meaningful regardless of which guard fires.
+#[test]
+fn test_hyperp_init_rejects_permissionless_window_past_accrue_envelope() {
+    let mut env = TradeCpiTestEnv::new();
+    let too_large: u64 = 100_001; // MAX_ACCRUAL_DT_SLOTS + 1
+    env.try_init_market_hyperp_with_stale(
+        1_000_000,
+        86_400,
+        too_large,
+    ).expect_err("init must reject perm_resolve past the accrue envelope");
+}
+
+/// TradeCpi ABI: variadic tail accounts past index 7 are forwarded
+/// verbatim to the matcher CPI. This test exercises the wiring — it
+/// passes two arbitrary readonly accounts after the fixed 8 and
+/// asserts that the instruction still succeeds.
+///
+/// Scope of this test: proves the wrapper does NOT reject the tail
+/// and does NOT corrupt the CPI plumbing (account-count / info-slice
+/// mismatches would surface as `NotEnoughAccountKeys`, `MissingAccount`,
+/// or `AccountBorrowFailed`). The test does NOT prove the matcher
+/// actually reads the tail accounts — that's matcher-side
+/// responsibility (the stub matcher in-tree does not inspect its
+/// tail). Integrators who rely on tail accounts should add a matcher-
+/// side assertion.
+#[test]
+fn test_tradecpi_forwards_variadic_tail_to_matcher() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Two arbitrary readonly tail accounts. Using the existing pyth
+    // index and pyth collateral accounts so the AccountInfo resolves
+    // cleanly through litesvm; the matcher ignores them but that's OK
+    // — we are testing wrapper wiring, not matcher behavior.
+    let tail = vec![
+        AccountMeta::new_readonly(env.pyth_index, false),
+        AccountMeta::new_readonly(env.pyth_col, false),
+    ];
+
+    env.set_slot(10);
+    env.try_trade_cpi_with_tail(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+        &tail,
+    )
+    .expect("TradeCpi with 2-account variadic tail must succeed");
+}
+
+/// Companion: a trade with ZERO tail (the canonical 8-account form)
+/// must behave identically — documents that the tail is optional.
+#[test]
+fn test_tradecpi_empty_tail_is_canonical() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(10);
+    env.try_trade_cpi_with_tail(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+        &[], // empty tail
+    )
+    .expect("TradeCpi with empty tail must succeed (canonical 8-account form)");
+}
