@@ -456,7 +456,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     _max_maintenance_fee_per_slot: u128,
-    _maintenance_fee_per_slot: u128,
+    maintenance_fee_per_slot: u128,
     min_oracle_price_cap_e2bps: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
@@ -468,7 +468,9 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
+    // maintenance_fee_per_slot now passed through (engine v12.18.4 supports
+    // per-account fee accrual via sync_account_fee_to_slot_not_atomic).
+    data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
@@ -707,7 +709,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_conf_bps(
@@ -756,7 +758,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_invert(
@@ -808,7 +810,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_cap(
@@ -868,7 +870,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_funding(
@@ -929,7 +931,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_trading_fee(
@@ -986,7 +988,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_min_fee(
@@ -1039,7 +1041,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_hyperp(&admin.pubkey(), &self.mint, initial_mark_price_e6),
@@ -1101,8 +1103,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -1146,8 +1147,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, fee),
         };
@@ -1177,7 +1177,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -1264,6 +1264,33 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("crank failed");
+    }
+
+    /// Permissioned crank: caller is a real account on the market (`caller_idx`
+    /// must be their slot). Required for the crank-reward path, which pays
+    /// the reward only when `caller_idx != CRANK_NO_CALLER`.
+    pub fn crank_as(&mut self, caller: &Keypair, caller_idx: u16) {
+        let mut data = vec![5u8]; // Tag 5: KeeperCrank
+        data.extend_from_slice(&caller_idx.to_le_bytes());
+        data.push(1u8); // format_version = 1
+        // No candidates — sweep visits every used account via the bitmap.
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data,
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("crank_as failed");
     }
 
     pub fn try_crank(&mut self) -> Result<(), String> {
@@ -1491,6 +1518,11 @@ pub fn encode_resolve_permissionless() -> Vec<u8> {
     vec![29u8]
 }
 
+/// Tag 31: CatchupAccrue — permissionless partial market-clock advance.
+pub fn encode_catchup_accrue() -> Vec<u8> {
+    vec![31u8]
+}
+
 pub fn encode_withdraw_insurance() -> Vec<u8> {
     vec![20u8] // Instruction tag for WithdrawInsurance
 }
@@ -1649,7 +1681,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_full(
@@ -1698,7 +1730,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_warmup(
@@ -1737,7 +1769,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(fee),
         };
@@ -2571,28 +2603,24 @@ pub fn encode_update_config(
     funding_k_bps: u64,
     funding_max_premium_bps: i64,        // i64!
     funding_max_bps_per_slot: i64,       // i64!
-    thresh_floor: u128,
-    thresh_risk_bps: u64,
-    thresh_update_interval_slots: u64,
-    thresh_step_bps: u64,
-    thresh_alpha_bps: u64,
-    thresh_min: u128,
-    thresh_max: u128,
-    thresh_min_step: u128,
+    // Legacy trailing threshold fields kept in the signature so test call
+    // sites compile unchanged. The wrapper's UpdateConfig ABI no longer
+    // accepts them — the decoder rejects trailing bytes — so we swallow
+    // them here instead of writing them.
+    _thresh_floor: u128,
+    _thresh_risk_bps: u64,
+    _thresh_update_interval_slots: u64,
+    _thresh_step_bps: u64,
+    _thresh_alpha_bps: u64,
+    _thresh_min: u128,
+    _thresh_max: u128,
+    _thresh_min_step: u128,
 ) -> Vec<u8> {
     let mut data = vec![14u8]; // Tag 14: UpdateConfig
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes()); // i64
     data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes()); // i64
-    data.extend_from_slice(&thresh_floor.to_le_bytes());
-    data.extend_from_slice(&thresh_risk_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_update_interval_slots.to_le_bytes());
-    data.extend_from_slice(&thresh_step_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_alpha_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_min.to_le_bytes());
-    data.extend_from_slice(&thresh_max.to_le_bytes());
-    data.extend_from_slice(&thresh_min_step.to_le_bytes());
     data
 }
 
@@ -2791,8 +2819,12 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Permissionless resolution (anyone can call when oracle is dead)
-    pub fn try_resolve_permissionless(&mut self) -> Result<(), String> {
+    /// Raw single-call ResolvePermissionless. Production semantics: first call
+    /// during a stale window stamps `first_observed_stale_slot` and returns
+    /// OracleStale; a second call after `permissionless_resolve_stale_slots`
+    /// have elapsed succeeds. Tests asserting specific single-call behavior
+    /// (e.g., rejecting a premature resolve after idle) should use this.
+    pub fn try_resolve_permissionless_once(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
         let ix = Instruction {
@@ -2803,6 +2835,57 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_resolve_permissionless(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+    }
+
+    /// Permissionless resolution convenience helper simulating a real keeper:
+    /// observe stale → wait permissionless_resolve_stale_slots → resolve.
+    /// The wrapper now requires two observations of a stale oracle separated
+    /// by the configured delay to prevent premature resolution after a long
+    /// idle period followed by a short oracle hiccup. This helper performs
+    /// both observations with an artificial clock advance between them so
+    /// existing tests don't have to manually orchestrate the two-phase flow.
+    pub fn try_resolve_permissionless(&mut self) -> Result<(), String> {
+        // First observation — stamps first_observed_stale_slot, returns stale.
+        // Idempotent on repeated calls within the same stale window.
+        let _ = self.try_resolve_permissionless_once();
+        // Advance clock past permissionless_resolve_stale_slots so the second
+        // call passes the duration check. Reads the configured delay from the
+        // slab via the program's own state layout.
+        let delay = {
+            let slab = self.svm.get_account(&self.slab).unwrap();
+            percolator_prog::state::read_config(&slab.data).permissionless_resolve_stale_slots
+        };
+        let mut clk = self.svm.get_sysvar::<solana_sdk::clock::Clock>();
+        clk.slot = clk.slot.saturating_add(delay).saturating_add(1);
+        clk.unix_timestamp = clk.unix_timestamp.saturating_add(delay as i64 + 1);
+        self.svm.set_sysvar(&clk);
+        // Second observation — duration check passes, market resolves.
+        self.try_resolve_permissionless_once()
+    }
+
+    /// Tag 31: permissionless CatchupAccrue. Commits up to
+    /// CATCHUP_CHUNKS_MAX chunks of market-clock advancement. Requires
+    /// a live oracle (proves market is live; dead oracles must use
+    /// ResolvePermissionless instead).
+    pub fn try_catchup_accrue(&mut self) -> Result<(), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_catchup_accrue(),
         };
         let tx = Transaction::new_signed_with_payer(
             &[cu_ix(), ix],
@@ -3011,6 +3094,10 @@ impl TestEnv {
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // Non-Hyperp UpdateConfig REQUIRES the oracle account. Admin
+                // can no longer select the degenerate zero-funding arm by
+                // omission; only a confirmed-stale oracle triggers it.
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 3600,                      // funding_horizon_slots
@@ -3284,7 +3371,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_invert(&admin.pubkey(), &self.mint, &TEST_FEED_ID, 0),
@@ -3354,8 +3441,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(*matcher_prog, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher_prog, &ctx, 100),
         };
@@ -3431,8 +3517,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(*matcher_prog, false),
-                AccountMeta::new_readonly(*matcher_ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher_prog, matcher_ctx, 100),
         };
@@ -3464,7 +3549,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -3661,7 +3746,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_hyperp(&admin.pubkey(), &self.mint, initial_mark_price_e6),
@@ -4157,7 +4242,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_full_v2(
@@ -4505,7 +4590,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -4909,7 +4994,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
@@ -4990,7 +5075,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
@@ -5276,7 +5361,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(fee),
         };
@@ -5311,8 +5396,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(*matcher, false),
-                AccountMeta::new_readonly(*ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(matcher, ctx, fee),
         };
@@ -5546,6 +5630,10 @@ impl TestEnv {
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // Non-Hyperp UpdateConfig REQUIRES the oracle account. Admin
+                // can no longer select the degenerate zero-funding arm by
+                // omission; only a confirmed-stale oracle triggers it.
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 funding_horizon_slots,
@@ -5725,7 +5813,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&Pubkey::new_unique(), &Pubkey::new_unique(), 100),
         };
@@ -7498,8 +7586,13 @@ pub fn encode_init_market_with_limits(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // Per-market admin limits
-    data.extend_from_slice(&max_maintenance_fee.to_le_bytes());
+    // Per-market admin limits.
+    // maintenance_fee_per_slot is gated to 0 at init — the feature is disabled
+    // pending per-account accrual. Ignore the `max_maintenance_fee` arg and
+    // always write 0 so these test helpers keep compiling without touching
+    // every call site.
+    let _ = max_maintenance_fee;
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (disabled)
     data.extend_from_slice(&max_risk_threshold.to_le_bytes());
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
@@ -7639,7 +7732,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_insurance_floor(
@@ -7718,7 +7811,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,

@@ -267,6 +267,7 @@ fn test_account_struct_alignment() {
         pending_remaining_q: 0,
         pending_horizon: 0,
         pending_created_slot: 0,
+        last_fee_slot: 0,
     };
 
     // Verify all fields round-trip correctly
@@ -585,13 +586,19 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market(&payer.pubkey(), &mint, &TEST_FEED_ID),
     };
+    // InitMarket now reads the oracle at genesis (§2.7, no sentinel), which
+    // pushes it past the default 200K CU budget. Request 1.4M like the rest
+    // of the test suite.
+    let cu_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+        1_400_000,
+    );
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[cu_ix, ix],
         Some(&payer.pubkey()),
         &[&payer],
         svm.latest_blockhash(),
@@ -639,8 +646,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
-            AccountMeta::new_readonly(matcher, false),
-            AccountMeta::new_readonly(ctx, false),
+            AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_init_lp(&matcher, &ctx, 100),
     };
@@ -679,7 +685,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(pyth_col, false),
+            AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_init_user(100),
     };

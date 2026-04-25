@@ -178,9 +178,13 @@ fn test_misaligned_withdrawal_rejected() {
 
 /// Test that fee overpayments are properly handled.
 ///
-/// Bug: If fee_payment > new_account_fee, the excess is deposited to vault
-/// but only new_account_fee is accounted in engine.vault/insurance.
+/// Obsolete under engine v12.18.1: new_account_fee was removed when deposit
+/// became the canonical materialization path (spec §10.2). There is no
+/// engine-native opening fee to over- or under-pay; the minimum deposit
+/// alone gates materialization. The scenario this test targets no longer
+/// exists.
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_bug4_fee_overpayment_should_be_handled() {
     program_path();
 
@@ -2509,8 +2513,11 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 // InitUser (tag 1) additional coverage
 // ============================================================================
 
-/// Spec: InitUser transfers new_account_fee to insurance fund.
-/// After InitUser, insurance balance must increase by exactly new_account_fee.
+/// Obsolete under engine v12.18.1: new_account_fee was removed (spec §10.2
+/// made deposit the canonical materialization path with no engine-native
+/// opening fee). Deposit amounts now credit entirely to capital; insurance
+/// is no longer debited on creation.
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 #[test]
 fn test_init_user_charges_new_account_fee() {
     program_path();
@@ -3847,11 +3854,13 @@ fn test_init_market_custom_funding_max_per_slot() {
 fn test_init_market_custom_all_funding_params() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 20);
+    // funding_max_bps_per_slot must fit the engine's per-market envelope
+    // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
+    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);
-    assert_eq!(env.read_funding_max_bps_per_slot(), 20);
+    assert_eq!(env.read_funding_max_bps_per_slot(), 10);
 }
 
 /// Without trailing funding params, defaults should be used (backward compat).
@@ -4399,7 +4408,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,

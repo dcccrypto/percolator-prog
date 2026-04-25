@@ -249,7 +249,7 @@ fn test_critical_init_market_rejects_double_init() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_invert(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 0),
@@ -355,7 +355,7 @@ fn test_init_market_admin_limits_enforced() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_limits(
@@ -433,7 +433,7 @@ fn test_init_market_zero_limits_rejected() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_limits(
@@ -467,7 +467,7 @@ fn test_init_market_zero_limits_rejected() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_limits(
@@ -586,7 +586,7 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
@@ -658,7 +658,7 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata2, false),
+            AccountMeta::new_readonly(env2.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: data2,
@@ -752,7 +752,7 @@ fn test_init_market_risk_params_at_boundary_accepted() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
@@ -806,7 +806,7 @@ fn test_admin_limits_lifecycle() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_limits(
@@ -869,7 +869,10 @@ fn test_admin_limits_lifecycle() {
         slab.data[MIN_OPC_OFF..MIN_OPC_OFF + 8].try_into().unwrap(),
     );
 
-    assert_eq!(maint_fee, 1000, "maintenance_fee_per_slot should be preserved");
+    // maintenance_fee_per_slot is disabled at init (the feature has an unsound
+    // between-cranks behavior pending per-account accrual). Encoders that
+    // used to pass a non-zero fee now coerce it to 0; the stored value is 0.
+    assert_eq!(maint_fee, 0, "maintenance_fee_per_slot is disabled at init");
     assert_eq!(max_ins, 50_000, "max_insurance_floor should be preserved");
     assert_eq!(min_opc, 5000, "min_oracle_price_cap_e2bps should be preserved");
 
@@ -1144,7 +1147,7 @@ fn test_init_market_rejects_nonempty_vault() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 0, 0, 0),

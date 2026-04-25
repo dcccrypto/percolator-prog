@@ -783,13 +783,16 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
     env.crank();
     println!("   set_oracle_price_e6 $120 at slot 30, cranked at slot 40");
 
-    // 5. UpdateConfig (change funding params)
+    // 5. UpdateConfig (change funding params) — oracle is now required on
+    // non-Hyperp markets. This test runs on Hyperp where the oracle account
+    // isn't consulted, but expect_len requires 4 accounts regardless.
     let ix = Instruction {
         program_id: env.program_id,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(env.slab, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
         ],
         data: encode_update_config(
             7200, 200, 200i64, 10i64,
@@ -935,8 +938,11 @@ fn test_resolve_permissionless_after_staleness() {
     // Oracle still fresh (ts=100, clock=150, age=50 > 30 but set_slot updates oracle)
     // set_slot updates pyth_data publish_time → oracle stays fresh
     env.set_slot(50);
-    let result = env.try_resolve_permissionless();
-    assert!(result.is_err(), "Should fail when oracle is live");
+    // Live oracle: single observation call returns Ok (clears any stamp) and
+    // the market MUST NOT resolve. Use the raw once-helper here so we're not
+    // secretly advancing the clock past authority staleness.
+    let _ = env.try_resolve_permissionless_once();
+    assert!(!env.is_market_resolved(), "Must not resolve while oracle is live");
 
     // Make oracle actually stale: advance clock WITHOUT updating oracle data
     env.svm.set_sysvar(&Clock {
@@ -1322,10 +1328,11 @@ fn test_resolve_permissionless_inverted_rejects_live_oracle() {
 
     // Oracle is still fresh — set_slot updates the oracle publish_time
     env.set_slot(200);
-    let result = env.try_resolve_permissionless();
+    // Two-phase design: call returns Ok but does NOT resolve while live.
+    let _ = env.try_resolve_permissionless();
     assert!(
-        result.is_err(),
-        "Inverted market must reject permissionless resolve when oracle is live"
+        !env.is_market_resolved(),
+        "Inverted market must not resolve permissionlessly when oracle is live"
     );
     assert!(!env.is_market_resolved());
 }

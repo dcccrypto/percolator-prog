@@ -105,6 +105,39 @@ pub mod constants {
     // CRANK_REWARD_MIN_DT removed — crank discount logic removed in v12.15
     /// Progressive scan window per crank.
     pub const RISK_SCAN_WINDOW: usize = 32;
+    /// Crank reward: fraction of the maintenance-fee sweep that is paid to
+    /// a non-permissionless caller. 5_000 bps = 50 %. The remaining 50 %
+    /// stays in the insurance fund. Only bounded by insurance balance post-
+    /// crank; the sweep itself is the natural cap (≤ FEE_SWEEP_BUDGET
+    /// accounts × per-account dt × fee_rate per call).
+    pub const CRANK_REWARD_BPS: u128 = 5_000;
+
+    /// Max accounts whose fees get realized in a single KeeperCrank call.
+    /// Keeps CU bounded regardless of `max_accounts` / total live-account
+    /// count: at ~5K CU per `sync_account_fee_to_slot_not_atomic` call,
+    /// 128 syncs ≈ 640K CU — room for liquidation/lifecycle in the same
+    /// transaction. Per-account `Account::last_fee_slot` keeps the sweep
+    /// correct across multiple cranks — when the cursor reaches an account,
+    /// it pays for its full elapsed interval in one charge.
+    pub const FEE_SWEEP_BUDGET: usize = 128;
+
+    // ── Engine envelope constants (wrapper-owned, immutable per deployment) ──
+    //
+    // These values populate the engine's per-market RiskParams envelope at
+    // InitMarket. They are NOT decoded from instruction data and NOT admin-
+    // configurable — every deployment uses these exact values. The envelope
+    // invariant
+    //   ADL_ONE * MAX_ORACLE_PRICE * MAX_ABS_FUNDING_E9_PER_SLOT *
+    //     MAX_ACCRUAL_DT_SLOTS <= i128::MAX
+    // must hold: 1e15 * 1e12 * 1e6 * 1e5 = 1e38 < i128::MAX (≈1.7e38). ✓
+    //
+    // Surface them here as named constants so operators and auditors can see
+    // exactly what values ship, rather than having them buried inside the
+    // RiskParams literal in read_risk_params.
+    /// Max dt allowed in a single `accrue_market_to` call (spec §1.4).
+    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 100_000;
+    /// Max |funding_rate_e9_per_slot| the engine will accrue (spec §1.4).
+    pub const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 1_000_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
@@ -130,6 +163,13 @@ pub mod constants {
     pub const DEFAULT_INSURANCE_WITHDRAW_MAX_BPS: u16 = 100; // 1%
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
+    /// Upper bound on `force_close_delay_slots` (Finding 6). Without a bound, an
+    /// init-time config of `u64::MAX` passes the "nonzero" liveness guard but
+    /// makes ForceCloseResolved unreachable — `resolved_slot + delay` saturates
+    /// to `u64::MAX`, stranding any accounts left on a resolved market whose
+    /// admin was burned. 10_000_000 slots is ~50 days at 2 slots/s, far beyond
+    /// any reasonable grace period but well short of the saturation regime.
+    pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
 
     // Hyperp EMA oracle constants
     /// EMA window in slots for UpdateHyperpMark (~8 hours at 2.5 slots/sec).
@@ -1080,6 +1120,14 @@ pub mod matcher_abi {
         if ret.abi_version != MATCHER_ABI_VERSION {
             return Err(ProgramError::InvalidAccountData);
         }
+        // Reject any flag bits outside the known set. Prevents a future
+        // matcher that uses a currently-undefined flag (e.g. a new partial
+        // fill semantics) from being silently accepted by this wrapper —
+        // upgraders must bump the ABI version to signal new flag meaning.
+        const KNOWN_FLAGS: u32 = FLAG_VALID | FLAG_PARTIAL_OK | FLAG_REJECTED;
+        if (ret.flags & !KNOWN_FLAGS) != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         // Must have VALID flag set
         if (ret.flags & FLAG_VALID) == 0 {
             return Err(ProgramError::InvalidAccountData);
@@ -1189,6 +1237,9 @@ pub mod error {
         AuditViolation,
         CrossMarginPairNotFound,
         InsufficientDexLiquidity,
+        // v12.18.1: caller's accrue path hit max_dt envelope and refuses to roll
+        // back; signals callers/keepers to use dedicated CatchupAccrue instead.
+        CatchupRequired,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1508,7 +1559,7 @@ pub mod ix {
                 .split_first()
                 .ok_or(ProgramError::InvalidInstructionData)?;
 
-            match tag {
+            let result = match tag {
                 0 => {
                     // InitMarket
                     let admin = read_pubkey(&mut rest)?;
@@ -1960,7 +2011,19 @@ pub mod ix {
                     Ok(Instruction::SetOiImbalanceHardBlock { threshold_bps })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
+            };
+            // Trailing-byte guard: every tag above fully consumes its expected
+            // payload. Anything left over is either a malformed client payload
+            // or a future-version wire format the current program cannot safely
+            // interpret. Reject rather than silently ignore — accepting stray
+            // bytes is an ABI footgun that turns into a semantic drift bug as
+            // soon as any instruction grows an optional tail field.
+            // (Tag 0 / InitMarket has its own extended-tail check before
+            //  returning; this final check is a belt-and-braces second line.)
+            if result.is_ok() && !rest.is_empty() {
+                return Err(ProgramError::InvalidInstructionData);
             }
+            result
         }
     }
 
@@ -2298,8 +2361,16 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// Padding for alignment.
-        pub _liw_padding: u64,
+        /// First slot on which ResolvePermissionless observed the external oracle
+        /// as stale (non-Hyperp only). 0 = not currently observing staleness.
+        /// Cleared on every successful external oracle read so a live-but-idle
+        /// market cannot be prematurely resolved after a short oracle hiccup.
+        /// Stamped on the first stale observation, so continuous-death duration
+        /// is measured from that observation (not from the last-good stamp,
+        /// which only advances when some instruction reads the oracle).
+        /// Repurposed from the former `_liw_padding` (same 8-byte slot, same
+        /// wire offset). Legacy zero initialization is the correct sentinel.
+        pub first_observed_stale_slot: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -2328,12 +2399,27 @@ pub mod state {
         // Fee-Weighted EWMA
         // ========================================
         /// Periodic maintenance fee per slot per account (engine units).
-        /// Wrapper charges via engine.charge_account_fee_not_atomic during KeeperCrank.
+        /// Wrapper charges via engine.sync_account_fee_to_slot_not_atomic.
         /// 0 = disabled. Set at InitMarket, immutable.
         pub maintenance_fee_per_slot: u128,
-        /// Last slot when maintenance fees were globally charged.
-        pub last_fee_charge_slot: u64,
-        pub _fee_padding: u64,
+        /// Incremental fee-sweep cursor: next bitmap word to scan on the
+        /// next KeeperCrank. Per-account `last_fee_slot` on the engine side
+        /// keeps the sweep correct across cranks — each account pays for
+        /// its full elapsed interval the first time the cursor reaches it.
+        /// Scanning is O(FEE_SWEEP_BUDGET) per crank regardless of
+        /// max_accounts, so a 4096-account market doesn't blow the CU
+        /// budget on a single crank.
+        ///
+        /// Repurposed from the former `last_fee_charge_slot` (now dead —
+        /// replaced by per-account `Account::last_fee_slot`). Same 8-byte
+        /// slot, same wire offset; only u16 is meaningful.
+        pub fee_sweep_cursor_word: u64,
+        /// Bit position within `fee_sweep_cursor_word` at which the next sweep
+        /// resumes. Stored so the sweep can stop EXACTLY at FEE_SWEEP_BUDGET
+        /// mid-word without losing remaining set bits to budget truncation.
+        /// Only values 0..=63 are meaningful; wider values are normalized.
+        /// Repurposed from the former `_fee_padding`.
+        pub fee_sweep_cursor_bit: u64,
         /// Minimum fee (in engine units, same as insurance_fund.balance) for full mark EWMA weight.
         /// Trades with fee below this get proportionally reduced alpha.
         /// 0 = disabled (all trades get full weight, backward compat).
@@ -3289,6 +3375,12 @@ pub mod oracle {
                 config.oracle_price_cap_e2bps,
             );
             config.last_effective_price_e6 = clamped_ext;
+            // Any successful external read proves the oracle is currently live,
+            // so reset the permissionless-resolve staleness observation. This
+            // prevents a premature resolve after a long idle period + a short
+            // oracle hiccup — the continuous-death window only starts from the
+            // first in-window stale observation, not the last successful read.
+            config.first_observed_stale_slot = 0;
         }
 
         match external {
@@ -5396,6 +5488,7 @@ pub mod processor {
         // only true after the engine processes it via accrue_market_to or similar.
         // Setting it on wrapper read alone would be unsound because zero-fill
         // and other early-return paths skip the engine call.
+        let _ = slab_data; // reserved for future per-read slab stamping
         Ok(price)
     }
 
@@ -5464,6 +5557,305 @@ pub mod processor {
     /// Returns 0 if no trades yet (mark_ewma == 0) or params unset.
     /// Compute funding rate in e9-per-slot (ppb) directly.
     /// Avoids bps quantization: sub-bps rates are preserved as nonzero ppb values.
+    /// Realize due maintenance fees for a single account up to `now_slot`.
+    /// Idempotent: the engine's per-account `last_fee_slot` cursor prevents
+    /// double-charging over the same interval, and a call at the same anchor
+    /// as the cursor is a no-op (engine v12.18.4 §4.6.1).
+    ///
+    /// Wrappers MUST call this before any health-sensitive engine operation
+    /// on the acting account when `maintenance_fee_per_slot > 0`, so that
+    /// the margin / withdrawal / close check sees post-fee capital. Between
+    /// cranks, each acting account self-realizes its share via this call;
+    /// KeeperCrank sweeps the rest.
+    ///
+    /// No-op when `maintenance_fee_per_slot == 0`.
+    ///
+    /// Invariant: capital-sensitive operations MUST fully accrue the
+    /// market (advance `last_market_slot` to `now_slot`) before syncing
+    /// per-account fees. Oracle-backed paths satisfy this via
+    /// `ensure_market_accrued_to_now` upstream. No-oracle paths (Deposit,
+    /// DepositFeeCredits, InitUser, InitLP, TopUpInsurance,
+    /// ReclaimEmptyAccount) cannot advance `last_market_slot` (no price /
+    /// rate available), so they MUST pass an anchor that is already
+    /// accrued — use `sync_account_fee_bounded_to_market` below rather
+    /// than calling this helper with a wall-clock slot.
+    ///
+    /// Calling this with `now_slot > engine.last_market_slot` creates a
+    /// `current_slot > last_market_slot` split that later breaks the
+    /// accrual envelope: the next oracle-backed instruction will see an
+    /// inflated `clock.slot - last_market_slot` dt and fail Overflow.
+    fn sync_account_fee(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        engine
+            .sync_account_fee_to_slot_not_atomic(
+                idx,
+                now_slot,
+                config.maintenance_fee_per_slot,
+            )
+            .map_err(map_risk_error)
+    }
+
+    /// Fee-sync variant for no-oracle instructions. Caps the fee anchor
+    /// at `engine.last_market_slot`, leaving full realization of fees
+    /// accrued over `[last_market_slot, clock.slot]` to the next
+    /// oracle-backed instruction. Prevents the `current_slot >
+    /// last_market_slot` split that would otherwise brick later
+    /// accrual.
+    ///
+    /// Acceptable trade-off: fees from the unaccrued tail are realized
+    /// slightly later (on the next trade/crank/withdraw) instead of now.
+    /// Correctness is preserved because the engine's per-account
+    /// `last_fee_slot` still advances monotonically to the
+    /// already-accrued boundary; subsequent sync calls cover the rest.
+    fn sync_account_fee_bounded_to_market(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        wallclock_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        let anchor = core::cmp::min(wallclock_slot, engine.last_market_slot);
+        engine
+            .sync_account_fee_to_slot_not_atomic(
+                idx,
+                anchor,
+                config.maintenance_fee_per_slot,
+            )
+            .map_err(map_risk_error)
+    }
+
+    /// Maximum number of max_dt chunks the in-line catchup can advance per
+    /// instruction. Bounded by CU budget — each `accrue_market_to` is cheap
+    /// but not free. For gaps beyond this, callers must use the dedicated
+    /// `CatchupAccrue` instruction which commits progress atomically
+    /// without attempting a main operation afterwards.
+    ///
+    /// 20 × max_dt ≈ 2M slots ≈ 11 days at 100k-slot envelope — well above
+    /// the auditor's pathological 1.3M-slot example.
+    const CATCHUP_CHUNKS_MAX: u32 = 20;
+
+    /// Pre-chunk market-clock advancement when the gap since the last
+    /// engine *accrue* exceeds `params.max_accrual_dt_slots`. The engine
+    /// rejects any single `accrue_market_to` whose funding-active dt
+    /// exceeds the envelope (spec §1.4 / §5.5 clause 6), so every
+    /// accrue-bearing instruction (KeeperCrank, TradeCpi, TradeNoCpi,
+    /// Withdraw, Liquidate, Close, Settle, Convert, live Insurance
+    /// withdraw, Ordinary ResolveMarket, UpdateConfig) must close that
+    /// gap before its own accrue.
+    ///
+    /// Cursor: loops on `engine.last_market_slot`, NOT `current_slot`.
+    /// `last_market_slot` is the only cursor `accrue_market_to` uses to
+    /// compute `total_dt = now_slot - last_market_slot`; `current_slot`
+    /// can be advanced by non-accruing public endpoints (fee sync on Live,
+    /// deposit/top-up without oracle) so it does not track market accrual.
+    /// Earlier versions chunked from `current_slot`, which after any
+    /// no-oracle self-advance would under-report the real gap and let the
+    /// caller's own `accrue_market_to` hit Overflow on the residual.
+    ///
+    /// Caller supplies the catchup price and funding rate. Typical usage:
+    /// the pre-oracle-read funding rate (`funding_rate_e9_pre`) and the
+    /// fresh (or about-to-be-set) `oracle_price`. Using the caller-supplied
+    /// rate (not 0) preserves anti-retroactivity — the rate reflects the
+    /// mark/index state as it was before this instruction, not what the
+    /// idle interval "should have" been (which is unknowable).
+    ///
+    /// If the gap exceeds `CATCHUP_CHUNKS_MAX × max_dt`, returns `Err`
+    /// with `CatchupRequired` so the caller can surface "call CatchupAccrue
+    /// first" instead of silently returning Ok and letting the subsequent
+    /// main engine call Overflow-and-rollback (which would discard the
+    /// catchup progress too, making the market unrecoverable in-line).
+    ///
+    /// No-op when the gap is already within the envelope, or when
+    /// `max_dt == 0` (misconfiguration guard), or when the engine has never
+    /// seen a real oracle observation (`last_oracle_price == 0`; the
+    /// caller's own `_not_atomic` call will seed it).
+    fn catchup_accrue(
+        engine: &mut RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        let max_dt = engine.params.max_accrual_dt_slots;
+        if max_dt == 0 {
+            return Ok(());
+        }
+        if now_slot <= engine.last_market_slot {
+            return Ok(());
+        }
+        // Market never had a real oracle observation — nothing to catch up.
+        // The caller's own _not_atomic call will seed last_oracle_price.
+        if engine.last_oracle_price == 0 {
+            return Ok(());
+        }
+        // Catchup chunks use the engine's STORED last_oracle_price, not the
+        // caller's fresh `price`. Rationale: accrue_market_to's funding math
+        // (engine §5.5) uses `fund_px_last` (the price at call entry) for
+        // the fund_num_total = fund_px * rate * dt transfer, then sets
+        // fund_px_last to the caller's `oracle_price`. If we used the fresh
+        // price for every chunk:
+        //   chunk 1: fund_px_0 = stored_P, total = stored_P * rate * max_dt,
+        //            fund_px_last := fresh
+        //   chunk 2: fund_px_0 = fresh,    total = fresh     * rate * max_dt
+        //   ...
+        // yielding a mathematically different transfer than a single-call
+        // accrue (which would use stored_P throughout). Using stored_P for
+        // every chunk keeps fund_px_last pinned at stored_P across the
+        // chunked path, so the chunked sum equals the single-call transfer:
+        //   stored_P * rate * total_dt (up to the caller's final boundary).
+        // The caller's final accrue_market_to(now_slot, fresh, rate) then
+        // applies fresh only to the residual, as a single-call accrue would.
+        let chunk_price = engine.last_oracle_price;
+        let _ = price; // caller's price used only by their final accrue_market_to
+        let mut chunks: u32 = 0;
+        while now_slot.saturating_sub(engine.last_market_slot) > max_dt {
+            if chunks >= CATCHUP_CHUNKS_MAX {
+                // Refuse to proceed — silently returning Ok here would let
+                // the caller's main accrue hit Overflow on the residual
+                // gap, rolling back ALL catchup work (no net progress).
+                // Surfacing CatchupRequired instead tells callers/keepers
+                // to use the dedicated CatchupAccrue instruction which
+                // commits progress without attempting the main op.
+                return Err(PercolatorError::CatchupRequired.into());
+            }
+            let step = engine.last_market_slot.saturating_add(max_dt);
+            engine
+                .accrue_market_to(step, chunk_price, funding_rate_e9)
+                .map_err(map_risk_error)?;
+            chunks = chunks.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Fully advance the engine's market clock to `now_slot` before any
+    /// per-account fee sync. This is an explicit-ordering helper:
+    /// `catchup_accrue` brings the gap within the envelope, then a final
+    /// `accrue_market_to(now_slot)` closes the residual so subsequent
+    /// `sync_account_fee_to_slot_not_atomic(..., now_slot, ...)` runs
+    /// against a fully-accrued market.
+    ///
+    /// Why explicit, when the engine already self-handles it via the main
+    /// op's internal accrue? Because even though the engine uses
+    /// `last_market_slot` (not `current_slot`) for funding dt — so the
+    /// interval is never erased (see
+    /// `test_fee_sync_does_not_erase_market_accrual_interval`) — making
+    /// the ordering explicit in the wrapper removes all ambiguity and
+    /// aligns with the auditor-requested pattern:
+    /// `ensure_market_accrued_to_now; sync_account_fee; engine.<op>_not_atomic`.
+    ///
+    /// The main op's internal `accrue_market_to(now_slot, price, rate)`
+    /// then hits the same-slot + same-price no-op branch (engine §5.4
+    /// early return) — about 150 CU of redundancy, bought for ordering
+    /// clarity.
+    ///
+    /// No-op when the engine has no oracle observation yet (price=0
+    /// catchup is unsafe) or when the gap is already zero.
+    fn ensure_market_accrued_to_now(
+        engine: &mut RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        catchup_accrue(engine, now_slot, price, funding_rate_e9)?;
+        if price > 0 && now_slot > engine.last_market_slot {
+            engine
+                .accrue_market_to(now_slot, price, funding_rate_e9)
+                .map_err(map_risk_error)?;
+        }
+        Ok(())
+    }
+
+    /// Incrementally sweep maintenance fees from the current cursor position.
+    /// Scans bitmap words starting at `(fee_sweep_cursor_word,
+    /// fee_sweep_cursor_bit)`, calling `sync_account_fee_to_slot_not_atomic`
+    /// on every set bit. Stops EXACTLY at `FEE_SWEEP_BUDGET` syncs — the bit
+    /// cursor lets us pause mid-word without losing remaining set bits to
+    /// budget truncation.
+    ///
+    /// Correctness: the engine's per-account `last_fee_slot` is the source of
+    /// truth. When the cursor reaches an account, that account's sync call
+    /// realizes fees for the *entire* elapsed interval
+    /// `[account.last_fee_slot, now_slot]` in one charge — no fees are lost
+    /// between cursor visits. Self-acting accounts realize their own fees
+    /// inline on every capital-sensitive instruction (see `sync_account_fee`);
+    /// the sweep handles everything that hasn't self-acted.
+    ///
+    /// CU bound: at most `FEE_SWEEP_BUDGET` sync calls per crank (strictly,
+    /// thanks to the bit cursor), plus O(BITMAP_WORDS) word reads. Constant
+    /// in `max_accounts`, so a 4096-slot market is handled the same as a
+    /// 64-slot market.
+    fn sweep_maintenance_fees(
+        engine: &mut RiskEngine,
+        config: &mut MarketConfig,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
+        // Normalize cursor in case of stale/corrupt values.
+        let mut word_cursor = (config.fee_sweep_cursor_word as usize) % BITMAP_WORDS;
+        let mut bit_cursor = (config.fee_sweep_cursor_bit as usize) & 63;
+        let mut syncs_done: usize = 0;
+        let mut words_scanned: usize = 0;
+        // Budget check is inside the inner loop so we can stop exactly at
+        // FEE_SWEEP_BUDGET, not after completing the current word.
+        'outer: while words_scanned < BITMAP_WORDS {
+            // Skip bits below bit_cursor on the resume word.
+            let resume_mask = if bit_cursor == 0 {
+                u64::MAX
+            } else {
+                // Clear bits 0..bit_cursor (they were already processed last call).
+                !((1u64 << bit_cursor).wrapping_sub(1))
+            };
+            let mut bits = engine.used[word_cursor] & resume_mask;
+            while bits != 0 {
+                if syncs_done >= crate::constants::FEE_SWEEP_BUDGET {
+                    // Stop EXACTLY at budget. Save the next unprocessed bit
+                    // as the resume point for the following crank.
+                    let next_bit = bits.trailing_zeros() as usize;
+                    config.fee_sweep_cursor_word = word_cursor as u64;
+                    config.fee_sweep_cursor_bit = next_bit as u64;
+                    return Ok(());
+                }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let idx = word_cursor * 64 + bit;
+                if idx >= percolator::MAX_ACCOUNTS {
+                    continue;
+                }
+                engine
+                    .sync_account_fee_to_slot_not_atomic(
+                        idx as u16,
+                        now_slot,
+                        config.maintenance_fee_per_slot,
+                    )
+                    .map_err(map_risk_error)?;
+                syncs_done += 1;
+            }
+            // Word fully drained — advance to next word, reset bit cursor.
+            word_cursor = (word_cursor + 1) % BITMAP_WORDS;
+            bit_cursor = 0;
+            words_scanned += 1;
+            // Budget may have hit right at the end of the word — avoid one
+            // wasted iteration on the next (empty in the caller's view) word.
+            if syncs_done >= crate::constants::FEE_SWEEP_BUDGET {
+                break 'outer;
+            }
+        }
+        config.fee_sweep_cursor_word = word_cursor as u64;
+        config.fee_sweep_cursor_bit = 0;
+        Ok(())
+    }
+
     fn compute_current_funding_rate_e9(config: &MarketConfig) -> i128 {
         let mark = config.mark_ewma_e6;
         let index = config.last_effective_price_e6;
@@ -5505,6 +5897,7 @@ pub mod processor {
         size: i128,
         funding_rate_e9: i128,
         lp_account_id: u64,
+        maintenance_fee_per_slot: u128,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
         let exec = matcher.execute_match(
@@ -5531,6 +5924,16 @@ pub mod processor {
         };
         let admit_h_min = engine.params.h_min;
         let admit_h_max = engine.params.h_max;
+        // Realize due maintenance fees on both counterparties BEFORE the trade
+        // so margin checks see post-fee capital. No-op when fee rate is 0.
+        if maintenance_fee_per_slot > 0 {
+            engine.sync_account_fee_to_slot_not_atomic(
+                a, now_slot, maintenance_fee_per_slot,
+            )?;
+            engine.sync_account_fee_to_slot_not_atomic(
+                b, now_slot, maintenance_fee_per_slot,
+            )?;
+        }
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -6484,7 +6887,7 @@ pub mod processor {
             // Non-Hyperp: 0 (no mark push concept).
             last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
             last_insurance_withdraw_slot: 0,
-            _liw_padding: 0,
+            first_observed_stale_slot: 0,
             // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
             mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
             mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
@@ -6496,8 +6899,8 @@ pub mod processor {
             // if the oracle happens to be down during market creation).
             last_good_oracle_slot: clock.slot,
             maintenance_fee_per_slot,
-            last_fee_charge_slot: clock.slot,
-            _fee_padding: 0,
+            fee_sweep_cursor_word: 0,
+            fee_sweep_cursor_bit: 0,
             mark_min_fee,
             force_close_delay_slots,
             // DEX pool pinning: initialized to all-zeros (not set).
@@ -7233,6 +7636,7 @@ pub mod processor {
         execute_trade_with_matcher(
             engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
             funding_rate, 0, // NoOpMatcher ignores lp_account_id
+            config.maintenance_fee_per_slot,
         ).map_err(map_risk_error)?;
 
         // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
@@ -7608,6 +8012,7 @@ pub mod processor {
             execute_trade_with_matcher(
                 engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
                 funding_rate, lp_account_id,
+                config.maintenance_fee_per_slot,
             ).map_err(map_risk_error)?;
             #[cfg(feature = "cu-audit")]
             {
@@ -12080,6 +12485,7 @@ pub mod processor {
                     ],
                 )?;
             }
+
         }
 
         {
