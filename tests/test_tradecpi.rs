@@ -4734,8 +4734,7 @@ fn test_tradecpi_zero_fill_succeeds() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(mp, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -5332,8 +5331,7 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(mp, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_lp(&mp, &ctx, 100),
         };
@@ -5404,6 +5402,138 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
         env.read_account_position(user_idx),
         0,
         "Zero-fill means no position change"
+    );
+}
+
+/// Regression for Finding 3: a zero-fill TradeCpi MUST advance engine time to
+/// match the config index/baseline that legitimately moved during the oracle
+/// read. Leaving engine.current_slot / engine.last_market_slot behind after
+/// the config index advances means the next trade or crank computes funding
+/// from the new index and applies it RETROACTIVELY over
+/// [old engine.last_market_slot, now], violating anti-retroactivity.
+///
+/// The fix: on the zero-fill path we call
+/// engine.accrue_market_to(clock.slot, price, funding_rate_e9_pre)
+/// before writing config, so the engine advances to the same boundary as
+/// the config with the pre-read funding rate.
+///
+/// This test verifies the engine boundary advanced by reading
+/// `last_market_slot` from the slab after a zero-fill. Offsets are absolute
+/// byte offsets within the slab (ENGINE_OFF=480, last_market_slot at
+/// offset_of!(RiskEngine, last_market_slot)=672, so 480+672=1152).
+#[test]
+fn test_tradecpi_zero_fill_advances_engine_time() {
+    // BPF layout offset for engine.last_market_slot. BPF ENGINE_OFF=472 with
+    // u128 align=8 (tighter than native align=16). last_market_slot sits at
+    // engine offset 656 after v12.18.x added RiskParams::min_funding_lifetime_slots
+    // (+8 vs the prior 648), giving absolute slab offset 472+656=1128.
+    const LAST_MARKET_SLOT_OFF: usize = 1128;
+
+    let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
+        let data = env.svm.get_account(&env.slab).unwrap().data;
+        u64::from_le_bytes(
+            data[LAST_MARKET_SLOT_OFF..LAST_MARKET_SLOT_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Zero-fill LP (max_fill_abs=0).
+    let lp = Keypair::new();
+    let lp_idx = {
+        let idx = env.account_count;
+        env.svm.airdrop(&lp.pubkey(), 1_000_000_000).unwrap();
+        let ata = env.create_ata(&lp.pubkey(), 100);
+        let lp_bytes = idx.to_le_bytes();
+        let (lp_pda, _) =
+            Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
+        let ctx = Pubkey::new_unique();
+        env.svm.set_account(ctx, Account {
+            lamports: 10_000_000,
+            data: vec![0u8; MATCHER_CONTEXT_LEN],
+            owner: mp, executable: false, rent_epoch: 0,
+        }).unwrap();
+        let init_ix = Instruction {
+            program_id: mp,
+            accounts: vec![
+                AccountMeta::new_readonly(lp_pda, false),
+                AccountMeta::new(ctx, false),
+            ],
+            data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, 0, 0),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), init_ix], Some(&lp.pubkey()), &[&lp], env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("init matcher");
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data: encode_init_lp(&mp, &ctx, 100),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix], Some(&lp.pubkey()), &[&lp], env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("init_lp");
+        env.account_count += 1;
+        (idx, ctx)
+    };
+
+    env.deposit(&lp, lp_idx.0, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Seed engine state via a crank at slot 50 (env.set_slot adds +100,
+    // so effective clock = 150 during the crank).
+    env.set_slot(50);
+    env.crank();
+    let slot_after_crank = read_last_market_slot(&env);
+    assert_eq!(
+        slot_after_crank, 150,
+        "engine.last_market_slot after initial crank should be 150 (effective clock)",
+    );
+
+    // Jump clock forward WITHOUT another crank. effective clock = 350.
+    env.set_slot(250);
+
+    // Zero-fill TradeCpi.
+    env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx.0, user_idx, 100_000, &mp, &lp_idx.1,
+    ).expect("zero-fill TradeCpi succeeds");
+
+    // Verify: after the zero-fill, engine.last_market_slot MUST have advanced
+    // to clock.slot (effective 350). Under the pre-fix code, it stayed behind
+    // at 150, leaving the engine time-desync'd from the advanced config index.
+    let slot_after_zero_fill = read_last_market_slot(&env);
+    assert_eq!(
+        slot_after_zero_fill, 350,
+        "zero-fill must advance engine.last_market_slot to clock.slot — \
+         anti-retroactivity requires engine time to match config index \
+         advancement (Finding 3). Got {}, expected 350.",
+        slot_after_zero_fill,
+    );
+
+    // Sanity: still zero-fill semantics.
+    assert_eq!(
+        env.read_account_position(user_idx), 0,
+        "zero-fill means no position change",
     );
 }
 

@@ -27,17 +27,10 @@ use std::path::PathBuf;
 // Note: Can't read BPF slab from native - struct layouts differ:
 // BPF SLAB_LEN: ~1.1MB, Native SLAB_LEN: ~1.2MB (even with repr(C) and same MAX_ACCOUNTS)
 
-// SLAB_LEN for SBF - differs between test and production
-#[cfg(feature = "test")]
-const SLAB_LEN: usize = 19640; // MAX_ACCOUNTS=64 - native 128-bit fields
-
-#[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1525584; // MAX_ACCOUNTS=4096, Account=352 bytes (SBF target) + gen table
-
-#[cfg(feature = "test")]
-const MAX_ACCOUNTS: usize = 64;
-
-#[cfg(not(feature = "test"))]
+// SLAB_LEN / MAX_ACCOUNTS: production BPF values. The wrapper's `"test"`
+// feature (which compiled the engine with MAX_ACCOUNTS=64 for native unit
+// tests) has been removed; integration tests go through the BPF binary.
+const SLAB_LEN: usize = 1525592; // v12.18.x: +8 bytes for RiskParams::min_funding_lifetime_slots
 const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -423,8 +416,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -452,7 +444,7 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -761,7 +753,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_col, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_init_user(100),
         };
@@ -857,7 +849,7 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_col, false),
+                    AccountMeta::new_readonly(env.pyth_index, false),
                 ],
                 data: encode_init_user(100),
             };
@@ -924,7 +916,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1147,7 +1139,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1261,7 +1253,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1366,7 +1358,7 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
+                        AccountMeta::new_readonly(env.pyth_index, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1519,7 +1511,7 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_col, false),
+                    AccountMeta::new_readonly(env.pyth_index, false),
                 ],
                 data: encode_init_user(100),
             };

@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1525584;
+const SLAB_LEN: usize = 1525592; // v12.18.x: +8 bytes for RiskParams::min_funding_lifetime_slots
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -638,8 +638,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
-            AccountMeta::new_readonly(matcher, false),
-            AccountMeta::new_readonly(ctx, false),
+            AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_init_lp(&matcher, &ctx, 100),
     };
@@ -678,7 +677,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(pyth_col, false),
+            AccountMeta::new_readonly(pyth_index, false),
         ],
         data: encode_init_user(100),
     };

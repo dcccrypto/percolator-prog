@@ -4858,12 +4858,205 @@ fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
     );
 }
 
-/// KeeperCrank reward: a non-permissionless cranker earns 50% of the
-/// maintenance fees swept on that crank as capital credit, capped at
-/// CRANK_REWARD_ACCOUNT_CAP (=16) * maintenance_fee_per_slot.
+/// Disproof of the "fee sync erases market accrual" audit claim.
 ///
-/// Minimal check: non-permissionless crank → caller's capital strictly
-/// increased by some positive reward. Permissionless crank → no reward.
+/// Hypothesis under test: when sync_account_fee self-advances
+/// engine.current_slot = clock.slot, a subsequent accrue_market_to
+/// becomes a no-op and the funding interval [prev, clock.slot] is lost.
+///
+/// Actual engine contract: accrue_market_to's dt is measured from
+/// `last_market_slot`, NOT `current_slot` (engine v12.18.x,
+/// accrue_market_to line 2143: `let total_dt = now_slot - last_market_slot`).
+/// sync_account_fee advances current_slot but NOT last_market_slot.
+/// So the next accrue_market_to still sees the full interval.
+///
+/// This test verifies empirically by reading `last_market_slot` before
+/// and after a fee-bearing operation. Under the hypothesis the field
+/// would stay behind; in practice it advances to clock.slot.
+#[test]
+fn test_fee_sync_does_not_erase_market_accrual_interval() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, 1_000, 0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Seed engine at slot 100 via crank (set_slot adds +100 → clock=100).
+    env.set_slot(0);
+    env.crank();
+
+    // BPF layout offset for engine.last_market_slot (v12.18.x).
+    // 472 (ENGINE_OFF) + 656 (field offset after params grew by 8) = 1128.
+    const LAST_MARKET_SLOT_OFF: usize = 1128;
+    let read_last_market_slot = |e: &TestEnv| -> u64 {
+        let d = e.svm.get_account(&e.slab).unwrap().data;
+        u64::from_le_bytes(d[LAST_MARKET_SLOT_OFF..LAST_MARKET_SLOT_OFF + 8]
+            .try_into().unwrap())
+    };
+    let before = read_last_market_slot(&env);
+    assert_eq!(before, 100, "seeded last_market_slot at 100");
+
+    // Advance one slot. sync_account_fee will self-advance current_slot to
+    // 101. If the audit hypothesis held, the subsequent
+    // accrue_market_to(101, ...) inside withdraw_not_atomic would become a
+    // no-op and last_market_slot would stay at 100. Under the real engine
+    // contract, accrue_market_to's dt uses last_market_slot (100), applies
+    // funding for 1 slot, and advances last_market_slot to 101.
+    env.set_slot(1);
+    env.try_withdraw(&user, user_idx, 100)
+        .expect("Withdraw must succeed");
+
+    let after = read_last_market_slot(&env);
+    assert_eq!(
+        after, 101,
+        "last_market_slot MUST advance through the fee-bearing op — the \
+         audit's claim that fee-sync self-advance erases market accrual \
+         is false; accrue_market_to uses last_market_slot (not \
+         current_slot) to compute funding dt, so the interval is \
+         preserved.",
+    );
+}
+
+/// Disproof (extended) — exactly the shape the auditor described in the
+/// final pass: market at slot 100, user exists, clock advances to 101,
+/// maintenance_fee > 0. Every fee-bearing accrue path MUST succeed.
+/// Extends the existing 1-slot-gap test with a larger-gap variant and
+/// an explicit assertion per-instruction, so a regression anywhere
+/// between "sync_account_fee_to_slot_not_atomic reject" and "wrapper
+/// envelope" surfaces as the failing path.
+#[test]
+fn test_fee_sync_anchor_accepts_future_now_slot_for_every_path() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, 1_000, 0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // One user. Seed the engine at slot 100 via a crank so
+    // engine.current_slot == 100 at the start of the test proper.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    env.set_slot(0); // clock = 100
+    env.crank();
+
+    // Exact auditor shape #1: advance clock by ONE slot. engine.current_slot
+    // still points at the last crank. sync_account_fee(..., clock.slot)
+    // MUST succeed — the engine self-advances current_slot to clock.slot.
+    env.set_slot(1); // clock = 101; engine.current_slot still 100
+    env.try_withdraw(&user, user_idx, 100)
+        .expect("WithdrawCollateral after 1-slot gap (fees ON) MUST succeed");
+
+    env.set_slot(2);
+    env.try_deposit(&user, user_idx, 500)
+        .expect("DepositCollateral after 1-slot gap (fees ON) MUST succeed");
+
+    env.set_slot(3);
+    env.crank(); // KeeperCrank after 1-slot gap
+
+    // Larger gap (within max_dt=100_000). Exercises the exact path the
+    // auditor called out as the "even after catchup" failure.
+    env.set_slot(50_000);
+    env.try_withdraw(&user, user_idx, 100)
+        .expect("WithdrawCollateral after 50k-slot gap (fees ON) MUST succeed");
+
+    // Close path — crank first to keep engine and config aligned, then
+    // withdraw fully and close.
+    env.set_slot(50_001);
+    env.crank();
+    env.set_slot(50_002);
+    // Withdraw remaining deposited amount, then close.
+    env.try_close_account(&user, user_idx)
+        .expect("CloseAccount after 50k-slot gap (fees ON) MUST succeed");
+}
+
+/// Disproof of the "fee sync ordering" audit claim: with maintenance fees
+/// enabled, a 1-slot gap before the next KeeperCrank / WithdrawCollateral /
+/// DepositCollateral MUST NOT cause the instruction to reject with
+/// "fee_slot_anchor > current_slot".
+///
+/// The engine's public entrypoint `sync_account_fee_to_slot_not_atomic`
+/// self-advances `current_slot = now_slot` BEFORE deriving the anchor, so
+/// the inner constraint `fee_slot_anchor <= current_slot` is always
+/// satisfied at call time. This test demonstrates that empirically against
+/// the exact shape described in the audit.
+#[test]
+fn test_fee_markets_survive_one_slot_gap_on_every_accrue_path() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot > 0 — fees ON
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // One user, deposited.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Advance clock by ONE slot. set_slot adds +100 so effective gap is
+    // really a single-slot delta against the seeded engine state.
+    env.set_slot(1);
+
+    // KeeperCrank must succeed — fee sync uses engine-self-advanced anchor.
+    env.crank();
+
+    // Advance another slot and exercise WithdrawCollateral.
+    env.set_slot(2);
+    env.try_withdraw(&user, user_idx, 100)
+        .expect("WithdrawCollateral must succeed after 1-slot gap with fees ON");
+
+    // Advance another slot and exercise DepositCollateral (top-up path).
+    env.set_slot(3);
+    env.try_deposit(&user, user_idx, 500)
+        .expect("DepositCollateral must succeed after 1-slot gap with fees ON");
+
+    // DepositFeeCredits is also exercised — it reaches the debt-cap check
+    // only AFTER sync_account_fee succeeds, so a failure here must be
+    // InvalidArgument (units > debt), not Overflow / "fee anchor > current".
+    // That's the signature of a passing sync with no outstanding debt.
+    env.set_slot(4);
+    let r = env.try_deposit_fee_credits(&user, user_idx, 50);
+    match r {
+        Ok(_) => {} // had debt, repaid
+        Err(e) => assert!(
+            e.contains("InvalidArgument"),
+            "DepositFeeCredits must either succeed or reject via the \
+             debt-cap guard (InvalidArgument). A fee-sync-anchor failure \
+             would appear as Custom(Overflow). Got: {e}",
+        ),
+    }
+}
+
+/// KeeperCrank reward: a non-permissionless cranker earns 50% of the
+/// maintenance fees swept on that crank as capital credit, the other
+/// 50% stays in insurance. No additional cap — the sweep itself is the
+/// bound (FEE_SWEEP_BUDGET accounts per crank).
+///
+/// Setup: 3 accounts at slot 0, advance to slot 500, permissioned crank.
+/// Per-account fee = 1_000 × 500 = 500_000. Total sweep = 3 × 500_000.
+/// Cranker's own sync charges 500_000, then reward credits 50% × 3 × 500_000
+/// = 750_000 back to cranker. Net: cranker +250_000, insurance +750_000.
 #[test]
 fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller() {
     program_path();
@@ -4879,7 +5072,7 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.top_up_insurance(&admin, 100_000_000_000);
 
-    // The cranker needs an account to be credited.
+    // Cranker needs an account to be credited.
     let cranker = Keypair::new();
     let cranker_idx = env.init_user(&cranker);
     env.deposit(&cranker, cranker_idx, 10_000_000_000);
@@ -4895,32 +5088,67 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     env.set_slot(500);
 
     let cranker_cap_before = env.read_account_capital(cranker_idx);
-    // Permissioned crank with caller_idx = cranker_idx (not CRANK_NO_CALLER).
-    env.crank_as(&cranker, cranker_idx);
-    let cranker_cap_after = env.read_account_capital(cranker_idx);
+    let ins_before = env.read_insurance_balance();
 
-    // Cranker's own fee is also charged by the sweep BEFORE the reward
-    // is credited, so the net delta = reward − self_fee. For self_fee =
-    // 1000 * 500 = 500_000 and reward = 50% of total sweep capped at
-    // 16 × 1000 = 16_000, we expect a NET LOSS of roughly 484_000. The
-    // *regression* we guard against is "no reward at all", so assert the
-    // reward was paid (net loss < self_fee) OR net capital strictly
-    // higher than without-reward baseline. Numerically:
-    //   without reward: delta = −500_000
-    //   with 16k reward cap: delta = −484_000
-    let self_fee_only: i128 = 1_000i128 * 500i128; // 500_000
-    let actual_delta: i128 = (cranker_cap_after as i128) - (cranker_cap_before as i128);
-    // Sanity: cranker paid a fee (so delta is negative), but it's less
-    // negative than pure self-fee because the reward was credited.
-    assert!(
-        actual_delta < 0,
-        "cranker still pays maintenance fee on their own account: delta={actual_delta}"
+    env.crank_as(&cranker, cranker_idx);
+
+    let cranker_cap_after = env.read_account_capital(cranker_idx);
+    let ins_after = env.read_insurance_balance();
+
+    // Each of the 3 accounts owed 1_000 × 500 = 500_000.
+    let per_account_fee: i128 = 1_000 * 500;
+    let total_sweep: i128 = per_account_fee * 3;
+    let reward: i128 = total_sweep / 2;        // 750_000 → cranker
+    let insurance_share: i128 = total_sweep / 2; // 750_000 → insurance
+
+    let cranker_delta: i128 =
+        (cranker_cap_after as i128) - (cranker_cap_before as i128);
+    let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
+
+    // Cranker's net = reward received − own fee paid = +250_000
+    let expected_cranker_delta = reward - per_account_fee;
+    assert_eq!(
+        cranker_delta, expected_cranker_delta,
+        "cranker net = reward − own self-fee; expected {expected_cranker_delta}, got {cranker_delta}"
     );
-    assert!(
-        actual_delta > -self_fee_only,
-        "cranker should have received a positive reward offsetting part of \
-         the self-fee; net delta={actual_delta} but self-fee alone is \
-         {self_fee_only}. Reward appears to not have been paid."
+    assert_eq!(
+        ins_delta, insurance_share,
+        "insurance keeps exactly 50% of the sweep; expected {insurance_share}, got {ins_delta}"
+    );
+}
+
+/// Permissionless crank must not pay a reward — the caller has no account.
+#[test]
+fn test_keeper_crank_permissionless_pays_no_reward() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let u1 = Keypair::new();
+    let u1_idx = env.init_user(&u1);
+    env.deposit(&u1, u1_idx, 10_000_000_000);
+
+    env.set_slot(500);
+
+    let ins_before = env.read_insurance_balance();
+    env.crank(); // permissionless (caller_idx = u16::MAX)
+    let ins_after = env.read_insurance_balance();
+
+    // All swept fees (1 account × 500 × 1000 = 500_000) stay with insurance.
+    let expected_ins_delta: i128 = 500_000;
+    let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
+    assert_eq!(
+        ins_delta, expected_ins_delta,
+        "permissionless crank: 100% of sweep → insurance; expected {expected_ins_delta}, got {ins_delta}"
     );
 }
 
