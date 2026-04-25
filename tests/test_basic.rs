@@ -185,6 +185,50 @@ fn test_external_oracle_stuck_target_does_not_advance_slot_last() {
 }
 
 #[test]
+fn test_catchup_accrue_flat_same_slot_syncs_engine_price() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let slot = env.read_last_market_slot();
+    let old_price = read_engine_last_oracle_price(&env);
+    let target = old_price.saturating_add(1_000_000);
+    let publish_time = slot as i64 + 1;
+    env.svm.set_sysvar(&Clock {
+        slot,
+        unix_timestamp: publish_time,
+        ..Clock::default()
+    });
+    let pyth_data = make_pyth_data(&TEST_FEED_ID, target as i64, -6, 1, publish_time);
+    for oracle in [env.pyth_index, env.pyth_col] {
+        env.svm
+            .set_account(
+                oracle,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data.clone(),
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    env.try_catchup_accrue()
+        .expect("flat same-slot CatchupAccrue should adopt the fresh target");
+
+    assert_eq!(env.read_oracle_target_price(), target);
+    assert_eq!(env.read_last_effective_price(), target);
+    assert_eq!(
+        read_engine_last_oracle_price(&env),
+        target,
+        "CatchupAccrue complete mode must install the flat same-slot target into engine P_last"
+    );
+}
+
+#[test]
 fn test_zero_oi_no_oracle_topup_can_cross_accrual_envelope() {
     program_path();
 
