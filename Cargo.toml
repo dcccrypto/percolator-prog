@@ -28,6 +28,20 @@ spl-token-metadata-interface = { version = "0.2" }
 thiserror = "1.0"
 bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
 pyth-sdk-solana = "0.10"
+# pythnet-sdk (no default features) exposes the canonical
+# PriceFeedMessage struct used inside Pyth Solana Receiver's
+# PriceUpdateV2 account. Using this official struct's BorshDeserialize
+# swaps the prior hand-rolled fixed-offset parser for a compile-time
+# typed binding: any breaking layout change on the Pyth side produces a
+# build error (missing/reordered fields) or a deserialize error at
+# runtime, rather than silent garbage reads. Pulled with
+# no-default-features to keep the transitive closure light (~52 crates,
+# no Anchor).
+pythnet-sdk = { version = "2.3", default-features = false }
+# pythnet-sdk uses borsh 0.10 internally; pin the same major so our
+# direct use of BorshDeserialize on its types reads/writes the same
+# wire format.
+borsh = { version = "0.10", default-features = false }
 pinocchio = "0.6"
 arrayref = "0.3"
 num-derive = "0.4"

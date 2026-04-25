@@ -733,11 +733,6 @@ fn encode_admin_force_close_account(user_idx: u16) -> Vec<u8> {
     data
 }
 
-fn encode_query_lp_fees(lp_idx: u16) -> Vec<u8> {
-    let mut data = vec![24u8];
-    data.extend_from_slice(&lp_idx.to_le_bytes());
-    data
-}
 
 fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Keypair> {
     let mut users = Vec::with_capacity(count);
@@ -1894,18 +1889,7 @@ fn benchmark_all_instructions() {
         println!("SetOraclePriceCap:     {:>8} CU", cu);
     }
 
-    // --- QueryLpFees (Tag 24) ---
-    {
-        let ix = Instruction {
-            program_id: env.program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(env.slab, false),
-            ],
-            data: encode_query_lp_fees(lp_idx),
-        };
-        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("QueryLpFees:           {:>8} CU", cu);
-    }
+    // Tag 24 (QueryLpFees) removed from the wire format.
 
     // --- LiquidateAtOracle (Tag 7) ---
     // Make user underwater first
