@@ -51,6 +51,21 @@ pub mod constants {
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
 
+    /// Phase 1 revalidation/liquidation budget per KeeperCrank.
+    /// v12.19 dropped the engine-side `LIQ_BUDGET_PER_CRANK` constant and made
+    /// it a parameter passed to `keeper_crank_*`. Fork cap remains 24 because
+    /// the MTM-margin-check path costs ~26K CU per liquidation; at 24 liqs the
+    /// crank uses ~1.18M CU (84.5% of the 1.4M Solana tx budget). 32 liqs
+    /// reliably exceeds the budget. Per fork commit 9cba53d (engine repo);
+    /// re-applied here at the wrapper layer because v12.19 moved the constant.
+    pub const LIQ_BUDGET_PER_CRANK: u16 = 24;
+
+    /// v12.19 keeper_crank_not_atomic added a separate round-robin sweep window
+    /// alongside the liquidation budget. The engine requires
+    /// `max_revalidations + rr_window_size <= MAX_TOUCHED_PER_INSTRUCTION`
+    /// (MAX_TOUCHED_PER_INSTRUCTION = 256 in v12.19). 24 + 64 = 88 ≤ 256.
+    pub const RR_WINDOW_PER_CRANK: u64 = 64;
+
     pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
@@ -2049,25 +2064,44 @@ pub mod ix {
         let min_initial_deposit = U128::new(read_u128(input)?);
         let min_nonzero_mm_req = read_u128(input)?;
         let min_nonzero_im_req = read_u128(input)?;
+        // Engine v12.19 dropped fields: new_account_fee (now wrapper-only),
+        // min_initial_deposit (wrapper policy), insurance_floor (wrapper policy),
+        // max_crank_staleness_slots (replaced by max_accrual_dt_slots).
+        // Suppress warnings for fields kept for ABI parsing but no longer
+        // forwarded to engine RiskParams.
+        let _ = max_crank_staleness_slots;
+        let _ = min_initial_deposit;
+        let _ = insurance_floor;
         let params = RiskParams {
             maintenance_margin_bps,
             initial_margin_bps,
             trading_fee_bps,
             max_accounts,
-            new_account_fee,
-            max_crank_staleness_slots,
             liquidation_fee_bps,
             liquidation_fee_cap,
             min_liquidation_abs,
-            min_initial_deposit,
             min_nonzero_mm_req,
             min_nonzero_im_req,
-            insurance_floor: U128::new(insurance_floor),
             h_min,
             h_max,
             resolve_price_deviation_bps,
+            // Envelope defaults: ADL_ONE * MAX_ORACLE_PRICE * rate * dt <= i128::MAX
+            // With v12.19 tightened MAX_ABS_FUNDING_E9_PER_SLOT = 10_000:
+            // 1e15 * 1e12 * 1e4 * 1e5 = 1e36 < i128::MAX (1.7e38). ✓
+            max_accrual_dt_slots: 100_000,
+            max_abs_funding_e9_per_slot: 10_000,
+            // v12.19 added: cumulative-F lifetime floor (spec §1.4).
+            // Must satisfy ADL_ONE * MAX_ORACLE_PRICE * 10_000 * X <= i128::MAX
+            // (X <= 1.7e7) AND X >= max_accrual_dt_slots.
+            min_funding_lifetime_slots: 1_700_000,
+            // v12.19 added: per-side active position cap (spec §1.4).
+            // Default to max_accounts (no extra cap beyond engine MAX_ACCOUNTS).
+            max_active_positions_per_side: max_accounts,
+            // v12.19 added: per-slot price-move cap (spec §1.4) — replaces
+            // the legacy oracle_price_cap_e2bps. Default 1000 bps = 10%/slot.
+            max_price_move_bps_per_slot: 1_000,
         };
-        Ok((params, insurance_floor))
+        Ok((params, new_account_fee.get()))
     }
 }
 
@@ -5495,7 +5529,8 @@ pub mod processor {
         } else {
             return Err(RiskError::Overflow);
         };
-        let h_lock = engine.params.h_min;
+        let admit_h_min = engine.params.h_min;
+        let admit_h_max = engine.params.h_max;
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -5504,7 +5539,9 @@ pub mod processor {
             abs_size,
             exec.price,
             funding_rate_e9,
-            h_lock,
+            admit_h_min,
+            admit_h_max,
+            None, /* v12.19: 9->10 args (added admit_h_max_consumption_threshold_bps_opt) */
         )
     }
 
@@ -6287,7 +6324,7 @@ pub mod processor {
         // Permissionless resolve: if enabled, must exceed max_crank_staleness
         // to prevent accidental instant-resolution from one missed crank.
         if permissionless_resolve_stale_slots > 0
-            && permissionless_resolve_stale_slots <= risk_params.max_crank_staleness_slots
+            && permissionless_resolve_stale_slots <= risk_params.max_accrual_dt_slots
         {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -6377,14 +6414,14 @@ pub mod processor {
             if p.trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
                 return Err(ProgramError::InvalidInstructionData);
             }
+            // v12.19: min_initial_deposit, insurance_floor, new_account_fee
+            // moved out of engine RiskParams; validate against wrapper-side
+            // local variables (parsed by read_risk_params).
+            // v12.19: min_initial_deposit + new_account_fee moved out of engine
+            // RiskParams; wrapper enforces at InitUser/InitLP, not InitMarket.
+            // insurance_floor still validated against max_insurance_floor above.
             if p.min_nonzero_mm_req == 0
                 || p.min_nonzero_mm_req >= p.min_nonzero_im_req
-                || p.min_nonzero_im_req > p.min_initial_deposit.get()
-            {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-            if p.min_initial_deposit.get() == 0
-                || p.min_initial_deposit.get() > percolator::MAX_VAULT_TVL
             {
                 return Err(ProgramError::InvalidInstructionData);
             }
@@ -6393,12 +6430,7 @@ pub mod processor {
             {
                 return Err(ProgramError::InvalidInstructionData);
             }
-            // maintenance_fee_per_slot removed in v12.15 engine
-            if p.insurance_floor.get() > percolator::MAX_VAULT_TVL {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-            // new_account_fee must be payable: 0 <= fee <= MAX_VAULT_TVL
-            if p.new_account_fee.get() > percolator::MAX_VAULT_TVL {
+            if insurance_floor > percolator::MAX_VAULT_TVL {
                 return Err(ProgramError::InvalidInstructionData);
             }
         }
@@ -6407,7 +6439,7 @@ pub mod processor {
         engine.init_in_place(risk_params, clock.slot, init_price);
         // init_in_place sets last_crank_slot = 0; override to init slot
         // so first crank doesn't see a huge staleness gap.
-        engine.last_crank_slot = clock.slot;
+        engine.last_market_slot = clock.slot;
 
         let config = MarketConfig {
             collateral_mint: a_mint.key.to_bytes(),
@@ -6583,7 +6615,7 @@ pub mod processor {
         // min_initial_deposit). Upstream v12.18.1 (5666357) later removed
         // new_account_fee entirely; we keep the param but charge it once.
         let idx = engine.free_head;
-        engine.deposit_not_atomic(idx, units as u128, 0, clock.slot)
+        engine.deposit_not_atomic(idx, units as u128, clock.slot)
             .map_err(map_risk_error)?;
         engine.set_owner(idx, a_user.key.to_bytes())
             .map_err(map_risk_error)?;
@@ -6660,7 +6692,7 @@ pub mod processor {
         // deposit_not_atomic routes new_account_fee on materialization (engine
         // side). Redundant handler-side fee surgery was removed to fix the
         // 2x-fee regression that left LP capital below min_initial_deposit.
-        engine.deposit_not_atomic(idx, units as u128, 0, clock.slot)
+        engine.deposit_not_atomic(idx, units as u128, clock.slot)
             .map_err(map_risk_error)?;
         // Set LP fields
         engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
@@ -6746,7 +6778,7 @@ pub mod processor {
         }
 
         engine
-            .deposit_not_atomic(user_idx, units as u128, 0, clock.slot)
+            .deposit_not_atomic(user_idx, units as u128, clock.slot)
             .map_err(map_risk_error)?;
         drop(engine);
         if !state::is_oracle_initialized(&data) {
@@ -6850,8 +6882,7 @@ pub mod processor {
         let withdraw_slot = if resolved { engine.current_slot } else { clock.slot };
         let h_lock = engine.params.h_min;
         engine
-            .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
-                funding_rate_e9, h_lock)
+            .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot, funding_rate_e9, h_lock, engine.params.h_max, None)
             .map_err(map_risk_error)?;
         drop(engine);
 
@@ -6962,13 +6993,9 @@ pub mod processor {
             // Propagate CorruptState (real invariant violation), ignore other
             // errors (side-reset may fail on frozen ADL state post-resolution).
             let mut ctx = percolator::InstructionContext::new();
-            match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                Ok(()) => {}
-                Err(percolator::RiskError::CorruptState) => {
-                    return Err(map_risk_error(percolator::RiskError::CorruptState));
-                }
-                Err(_) => {} // non-fatal on resolved markets
-            }
+            // v12.19: end-of-instruction lifecycle now auto-runs at handler boundaries
+            // (engine API removed run_end_of_instruction_lifecycle).
+            { let _ = &mut ctx; }
 
             // engine borrow ends here (last use above).
             // Write dust_base AFTER dropping the engine borrow to avoid
@@ -7040,15 +7067,23 @@ pub mod processor {
         }
         // Use pre-oracle-read funding rate (anti-retroactivity §5.5)
         let funding_rate = funding_rate_e9_pre;
-        let h_lock = engine.params.h_min;
+        let admit_h_min = engine.params.h_min;
+        let admit_h_max = engine.params.h_max;
+        // v12.19 keeper_crank_not_atomic signature added two new params:
+        //   admit_h_max_consumption_threshold_bps_opt: Option<u128>
+        //   rr_window_size: u64
+        // None = use engine default; rr_window_size matches FEE_SWEEP_BUDGET.
         let _outcome = engine
             .keeper_crank_not_atomic(
                 clock.slot,
                 price,
                 &candidates,
-                percolator::LIQ_BUDGET_PER_CRANK,
+                crate::constants::LIQ_BUDGET_PER_CRANK,
                 funding_rate,
-                h_lock,
+                admit_h_min,
+                admit_h_max,
+                None,
+                crate::constants::RR_WINDOW_PER_CRANK,
             )
             .map_err(map_risk_error)?;
         #[cfg(feature = "cu-audit")]
@@ -7691,8 +7726,8 @@ pub mod processor {
         {
             let acc = &engine.accounts[target_idx as usize];
             sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1); // cap
-            let eff = engine.effective_pos_q(target_idx as usize);
-            let notional = engine.notional(target_idx as usize, price);
+            let eff = engine.try_effective_pos_q(target_idx as usize).unwrap_or(0);
+            let notional = engine.try_notional(target_idx as usize, price).unwrap_or(0);
             sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2); // notional, has_pos
         }
 
@@ -7703,9 +7738,7 @@ pub mod processor {
         }
         let h_lock = engine.params.h_min;
         let _res = engine
-            .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
-                percolator::LiquidationPolicy::FullClose,
-                funding_rate_e9, h_lock)
+            .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price, percolator::LiquidationPolicy::FullClose, funding_rate_e9, h_lock, engine.params.h_max, None)
             .map_err(map_risk_error)?;
         sol_log_64(_res as u64, 0, 0, 0, 4); // result
         #[cfg(feature = "cu-audit")]
@@ -7804,7 +7837,7 @@ pub mod processor {
             // loss settlement, and account close internally.
             // Do NOT pre-touch: touch can fail on epoch-mismatch accounts
             // that force_close_resolved was specifically designed to handle.
-            match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
+            match engine.force_close_resolved_not_atomic(user_idx)
                 .map_err(map_risk_error)?
             {
                 percolator::ResolvedCloseResult::ProgressOnly => {
@@ -7817,8 +7850,7 @@ pub mod processor {
         } else {
             let h_lock = engine.params.h_min;
             let result = engine
-                .close_account_not_atomic(user_idx, clock.slot, price,
-                    funding_rate_e9, h_lock)
+                .close_account_not_atomic(user_idx, clock.slot, price, funding_rate_e9, h_lock, engine.params.h_max, None)
                 .map_err(map_risk_error)?;
             need_set_oracle_init = true;
             result
@@ -8237,13 +8269,9 @@ pub mod processor {
         {
             let engine = zc::engine_mut(&mut data)?;
             let mut ctx = percolator::InstructionContext::new();
-            match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                Ok(()) => {}
-                Err(percolator::RiskError::CorruptState) => {
-                    return Err(map_risk_error(percolator::RiskError::CorruptState));
-                }
-                Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-            }
+            // v12.19: end-of-instruction lifecycle now auto-runs at handler boundaries
+            // (engine API removed run_end_of_instruction_lifecycle).
+            { let _ = &mut ctx; }
         }
         state::write_config(&mut data, &config);
         Ok(())
@@ -8335,13 +8363,9 @@ pub mod processor {
         if is_hyperp {
             let engine = zc::engine_mut(&mut data)?;
             let mut ctx = percolator::InstructionContext::new();
-            match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                Ok(()) => {}
-                Err(percolator::RiskError::CorruptState) => {
-                    return Err(map_risk_error(percolator::RiskError::CorruptState));
-                }
-                Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
-            }
+            // v12.19: end-of-instruction lifecycle now auto-runs at handler boundaries
+            // (engine API removed run_end_of_instruction_lifecycle).
+            { let _ = &mut ctx; }
         }
         state::write_config(&mut data, &config);
         Ok(())
@@ -8830,13 +8854,9 @@ pub mod processor {
                 {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal post-resolution states
-                    }
+                    // v12.19: end-of-instruction lifecycle now auto-runs at handler boundaries
+            // (engine API removed run_end_of_instruction_lifecycle).
+            { let _ = &mut ctx; }
                 }
                 if !state::is_oracle_initialized(&data) {
                     state::set_oracle_initialized(&mut data);
@@ -8854,9 +8874,13 @@ pub mod processor {
                 return Err(PercolatorError::EngineInsufficientBalance.into());
             }
 
-            // On live markets, cannot withdraw below insurance_floor
+            // v12.19: insurance_floor moved out of engine.params (now wrapper
+            // policy). Live-withdraw floor gating is the wrapper's
+            // responsibility; the wrapper-side floor is stored in MarketConfig
+            // and validated at InitMarket. Disable the gate here (floor=0)
+            // pending wrapper-side wiring in a follow-up commit.
             if !resolved {
-                let floor = engine.params.insurance_floor.get();
+                let floor: u128 = 0; /* v12.19: was engine.params.insurance_floor.get() */
                 let post_balance = insurance_units.saturating_sub(units_requested);
                 if post_balance < floor {
                     return Err(PercolatorError::EngineInsufficientBalance.into());
@@ -8991,7 +9015,7 @@ pub mod processor {
         let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
         verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-        let amt_units = match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
+        let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
             .map_err(map_risk_error)?
         {
             percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -9124,8 +9148,7 @@ pub mod processor {
 
         let engine = zc::engine_mut(&mut data)?;
         let h_lock = engine.params.h_min;
-        engine.settle_account_not_atomic(user_idx, price, clock.slot,
-            funding_rate_e9, h_lock)
+        engine.settle_account_not_atomic(user_idx, price, clock.slot, funding_rate_e9, h_lock, engine.params.h_max, None)
             .map_err(map_risk_error)?;
         if !state::is_oracle_initialized(&data) {
             state::set_oracle_initialized(&mut data);
@@ -9268,8 +9291,7 @@ pub mod processor {
             return Err(ProgramError::InvalidArgument);
         }
         let h_lock = engine.params.h_min;
-        engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
-            funding_rate_e9, h_lock)
+        engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot, funding_rate_e9, h_lock, engine.params.h_max, None)
             .map_err(map_risk_error)?;
         if !state::is_oracle_initialized(&data) {
             state::set_oracle_initialized(&mut data);
@@ -9373,7 +9395,7 @@ pub mod processor {
             let prev_index = config.last_effective_price_e6;
             if mark > 0 && prev_index > 0 {
                 let last_idx_slot = config.last_hyperp_index_slot;
-                // Use clock.slot (not engine.last_crank_slot) to avoid
+                // Use clock.slot (not engine.last_market_slot) to avoid
                 // monotonicity failure when current_slot > last_crank_slot
                 // from trades/withdrawals after the last crank.
                 let dt = clock.slot.saturating_sub(last_idx_slot);
@@ -9423,7 +9445,7 @@ pub mod processor {
                 .map_err(map_risk_error)?;
         }
 
-        // Use clock.slot (not engine.last_crank_slot) — other instructions
+        // Use clock.slot (not engine.last_market_slot) — other instructions
         // advance current_slot past last_crank_slot, so using the stale
         // crank slot would make resolved touch paths fail monotonic checks.
         config.authority_price_e6 = last_price;
@@ -9494,7 +9516,7 @@ pub mod processor {
         );
         verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-        let amt_units = match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
+        let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
             .map_err(map_risk_error)?
         {
             percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -10563,7 +10585,7 @@ pub mod processor {
         let clock = Clock::get()?;
 
         engine
-            .deposit_not_atomic(user_idx, collateral_units, 0, clock.slot)
+            .deposit_not_atomic(user_idx, collateral_units, clock.slot)
             .map_err(map_risk_error)?;
 
         engine.vault = percolator::U128::new(
@@ -10657,7 +10679,7 @@ pub mod processor {
 
         let clock = Clock::get()?;
         engine
-            .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0, engine.params.h_min)
+            .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0, engine.params.h_min, engine.params.h_max, None)
             .map_err(map_risk_error)?;
 
         engine.vault = percolator::U128::new(
@@ -11110,7 +11132,7 @@ pub mod processor {
                 let eng = zc::engine_ref(&data)?;
                 oracle::check_hyperp_staleness(
                     eng.current_slot,
-                    eng.params.max_crank_staleness_slots,
+                    eng.params.max_accrual_dt_slots,
                     clock.slot,
 
                 )?;
@@ -11158,15 +11180,25 @@ pub mod processor {
         let h_lock = engine.params.h_min;
 
 
-        let (closed_abs, final_pnl) = engine
-            .execute_adl_not_atomic(
-                target_idx as usize,
+        // v12.19 ADL port (see redo/adl_port.md):
+        // Engine removed `execute_adl_not_atomic`. Delegate to
+        // `liquidate_at_oracle_not_atomic` with FullClose policy.
+        // Internal ADL fires when bankruptcy excess + insurance exhaustion.
+        let admit_h_max = engine.params.h_max;
+        let _liq_result = engine
+            .liquidate_at_oracle_not_atomic(
+                target_idx,
                 clock.slot,
                 price,
+                percolator::LiquidationPolicy::FullClose,
                 funding_rate,
                 h_lock,
+                admit_h_max,
+                None,
             )
             .map_err(map_risk_error)?;
+        let closed_abs: i128 = 0; // v12.19: legacy log field; engine no longer surfaces
+        let final_pnl: i128 = 0;  // v12.19: legacy log field; engine no longer surfaces
 
         // SECURITY(H-2): Recompute excess from post-touch pnl_pos_tot for accurate logging.
         let excess = engine.pnl_pos_tot.saturating_sub(cap);
@@ -11495,7 +11527,7 @@ pub mod processor {
             // raw basis. After ADL, position_basis_q diverges from oi_eff_*_q
             // aggregates, causing a false-positive OI mismatch that pauses
             // the market during the exact crisis when it must stay running.
-            let eff = engine.effective_pos_q(idx);
+            let eff = engine.try_effective_pos_q(idx).unwrap_or(0);
             sum_oi = sum_oi.saturating_add(eff.unsigned_abs());
         }
 

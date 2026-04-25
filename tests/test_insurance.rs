@@ -2020,7 +2020,7 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
     data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max (must be >= h_min=0)
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     data.extend_from_slice(&10u64.to_le_bytes()); // max_crank_staleness_slots = 10
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap

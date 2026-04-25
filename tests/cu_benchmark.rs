@@ -195,7 +195,7 @@ fn encode_init_market_with_params(
 }
 
 fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<u8> {
-    encode_init_market_with_params(admin, mint, feed_id, 0, 0)
+    encode_init_market_with_params(admin, mint, feed_id, 0, 1)
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
@@ -392,7 +392,7 @@ impl TestEnv {
     }
 
     fn init_market(&mut self) {
-        self.init_market_with_params(0, 0);
+        self.init_market_with_params(0, 1);
     }
 
     fn init_market_with_params(

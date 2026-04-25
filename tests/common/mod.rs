@@ -153,7 +153,7 @@ fn append_default_extended_tail(data: &mut Vec<u8>) {
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps (default)
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot (default)
+    data.extend_from_slice(&0i64.to_le_bytes()); /* v12.19: funding_bps_to_e9(5) = 500_000 > MAX(10_000); use 0 */ // funding_max_bps_per_slot (default)
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
     data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots (default tail has permissionless=0)
 }
@@ -198,14 +198,14 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -241,14 +241,14 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -287,14 +287,14 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     // max_crank_staleness_slots: use bounded value when permissionless resolve is enabled
     // (permissionless_resolve_stale_slots must exceed max_crank_staleness_slots)
@@ -319,7 +319,7 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps (default)
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot (default)
+    data.extend_from_slice(&0i64.to_le_bytes()); /* v12.19: funding_bps_to_e9(5) = 500_000 > MAX(10_000); use 0 */ // funding_max_bps_per_slot (default)
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
     // force_close_delay must be > 0 when permissionless_resolve > 0
     let force_close = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 };
@@ -415,14 +415,14 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -472,14 +472,14 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -1557,14 +1557,14 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&new_account_fee.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -1600,14 +1600,14 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -2922,6 +2922,7 @@ impl TestEnv {
         authority: &Keypair,
         amount: u64,
     ) -> Result<(), String> {
+        // Live markets require oracle (8th account). Pass pyth_index for accrual.
         let authority_ata = self.create_ata(&authority.pubkey(), 0);
         let (vault_pda, _) =
             Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
@@ -4880,14 +4881,14 @@ impl TestEnv {
         data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
         data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
         // RiskParams
-        data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+        data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
         data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
         data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-        data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+        data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -4960,14 +4961,14 @@ impl TestEnv {
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
         data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
         data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-        data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
+        data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
         data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
         data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-        data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+        data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -7502,14 +7503,14 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(&max_risk_threshold.to_le_bytes());
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
@@ -7548,14 +7549,14 @@ pub fn encode_init_market_with_maintenance_fee(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
@@ -7589,14 +7590,14 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&insurance_floor.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps

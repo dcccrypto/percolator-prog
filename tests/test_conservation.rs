@@ -1103,8 +1103,9 @@ fn test_attack_conservation_large_slot_jump() {
     // Open position
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
 
-    // Large slot jump (1 million slots)
-    env.set_slot(1_000_000);
+    // Large slot jump (within max_accrual_dt_slots=100_000 envelope per spec §1.4).
+    // Use 50,000 slots to test conservation under large (but bounded) gaps.
+    env.set_slot(50_000);
     env.crank();
 
     // SPL vault unchanged

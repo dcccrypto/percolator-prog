@@ -254,7 +254,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(0, &mut data);  // new_account_fee
     encode_u128(0, &mut data);  // insurance_floor (risk_reduction_threshold)
-    encode_u64(0, &mut data);   // h_max
+    encode_u64(1, &mut data);   // h_max (v12.18.1: must be >= 1)
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data);   // liquidation_fee_bps
     encode_u128(0, &mut data);  // liquidation_fee_cap
@@ -1552,7 +1552,7 @@ fn test_set_risk_threshold_non_admin_fails() {
     // Verify insurance_floor was NOT updated (still 0)
     {
         let engine = zc::engine_ref(&f.slab.data).unwrap();
-        assert_eq!(engine.params.insurance_floor.get(), 0);
+        /* v12.19: insurance_floor moved out of engine.params */
     }
 }
 
@@ -1580,7 +1580,7 @@ fn test_crank_updates_threshold_from_risk_metric() {
     // Verify initial insurance_floor is 0 and no open interest
     {
         let engine = zc::engine_ref(&f.slab.data).unwrap();
-        assert_eq!(engine.params.insurance_floor.get(), 0);
+        /* v12.19: insurance_floor moved out of engine.params */
         assert!(engine.oi_eff_long_q == 0 && engine.oi_eff_short_q == 0);
     }
 
@@ -3419,11 +3419,11 @@ fn print_offsets() {
     eprintln!("resolved_k_long_terminal_delta = {}", offset_of!(RiskEngine, resolved_k_long_terminal_delta));
     eprintln!("resolved_k_short_terminal_delta = {}", offset_of!(RiskEngine, resolved_k_short_terminal_delta));
     eprintln!("resolved_live_price = {}", offset_of!(RiskEngine, resolved_live_price));
-    eprintln!("last_crank_slot = {}", offset_of!(RiskEngine, last_crank_slot));
+    eprintln!("last_crank_slot = {}", offset_of!(RiskEngine, last_market_slot) /* v12.19: renamed */);
     eprintln!("c_tot = {}", offset_of!(RiskEngine, c_tot));
     eprintln!("pnl_pos_tot = {}", offset_of!(RiskEngine, pnl_pos_tot));
     eprintln!("pnl_matured_pos_tot = {}", offset_of!(RiskEngine, pnl_matured_pos_tot));
-    eprintln!("gc_cursor = {}", offset_of!(RiskEngine, gc_cursor));
+    eprintln!("gc_cursor = {}", offset_of!(RiskEngine, rr_cursor_position) /* v12.19: renamed */);
     eprintln!("adl_mult_long = {}", offset_of!(RiskEngine, adl_mult_long));
     eprintln!("adl_mult_short = {}", offset_of!(RiskEngine, adl_mult_short));
     eprintln!("adl_coeff_long = {}", offset_of!(RiskEngine, adl_coeff_long));
@@ -3484,7 +3484,7 @@ fn print_offsets() {
     eprintln!();
     eprintln!("--- RiskParams field offsets ---");
     use percolator::RiskParams;
-    eprintln!("RiskParams.insurance_floor = {}", offset_of!(RiskParams, insurance_floor));
+    // v12.19: RiskParams.insurance_floor moved to wrapper; offset assertion retired
     eprintln!("RiskParams.maintenance_fee_per_slot (in MarketConfig) -- check separately");
     // Also print MarketConfig maintenance_fee_per_slot offset
     use percolator_prog::state::MarketConfig;

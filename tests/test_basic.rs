@@ -4367,7 +4367,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
         data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-        data.extend_from_slice(&0u64.to_le_bytes()); // h_max (must be >= h_min=0)
+        data.extend_from_slice(&1u64.to_le_bytes()); // h_max
         let max_crank = 99u64; // permissionless > max_crank
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps

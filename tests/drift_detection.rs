@@ -173,7 +173,7 @@ mod layout_constants {
     pub const ENGINE_PNL_MATURED_POS_TOT_OFF: usize =
         core::mem::offset_of!(percolator::RiskEngine, pnl_matured_pos_tot);
     pub const ENGINE_LIQ_CURSOR_OFF: usize =
-        core::mem::offset_of!(percolator::RiskEngine, gc_cursor);
+        0; // v12.19: gc_cursor field retired (sweep cursors restructured)
     pub const ENGINE_NUM_USED_ACCOUNTS_OFF: usize =
         core::mem::offset_of!(percolator::RiskEngine, num_used_accounts);
     pub const ENGINE_ACCOUNTS_OFF: usize =
@@ -332,11 +332,7 @@ fn layout_engine_field_offsets_pinned() {
         layout_constants::ENGINE_PNL_MATURED_POS_TOT_OFF,
         "RiskEngine.pnl_matured_pos_tot offset drift"
     );
-    assert_eq!(
-        offset_of!(RiskEngine, gc_cursor),
-        layout_constants::ENGINE_LIQ_CURSOR_OFF,
-        "RiskEngine.gc_cursor offset drift"
-    );
+    // v12.19: gc_cursor field retired
     assert_eq!(
         offset_of!(RiskEngine, num_used_accounts),
         layout_constants::ENGINE_NUM_USED_ACCOUNTS_OFF,
@@ -1009,18 +1005,12 @@ fn risk_params_full_round_trip_via_init_market() {
             assert_eq!(risk_params.initial_margin_bps, im_bps, "initial_margin_bps");
             assert_eq!(risk_params.trading_fee_bps, fee_bps, "trading_fee_bps");
             assert_eq!(risk_params.max_accounts, max_accts, "max_accounts");
-            assert_eq!(
-                risk_params.new_account_fee.get(),
-                new_acct_fee,
-                "new_account_fee"
-            );
+            // v12.19: new_account_fee moved to wrapper MarketConfig
+            let _ = new_acct_fee;
             // maintenance_fee_per_slot assertion removed in v12.15
             let _ = maint_fee;
-            assert_eq!(
-                risk_params.max_crank_staleness_slots,
-                crank_staleness,
-                "max_crank_staleness_slots"
-            );
+            // v12.19: max_crank_staleness_slots replaced by max_accrual_dt_slots
+            let _ = crank_staleness;
             assert_eq!(risk_params.liquidation_fee_bps, liq_fee_bps, "liquidation_fee_bps");
             assert_eq!(
                 risk_params.liquidation_fee_cap.get(),
@@ -1033,18 +1023,12 @@ fn risk_params_full_round_trip_via_init_market() {
                 "min_liquidation_abs"
             );
             // Three mandatory trailing fields (PERC-spec: truncated payloads rejected)
-            assert_eq!(
-                risk_params.min_initial_deposit.get(),
-                min_init_deposit,
-                "min_initial_deposit"
-            );
+            // v12.19: min_initial_deposit moved to wrapper policy
+            let _ = min_init_deposit;
             assert_eq!(risk_params.min_nonzero_mm_req, min_nonzero_mm, "min_nonzero_mm_req");
             assert_eq!(risk_params.min_nonzero_im_req, min_nonzero_im, "min_nonzero_im_req");
-            assert_eq!(
-                risk_params.insurance_floor.get(),
-                insurance_floor,
-                "insurance_floor"
-            );
+            // v12.19: insurance_floor moved to wrapper policy
+            let _ = insurance_floor;
         }
         other => panic!("Expected InitMarket to decode, got {:?}", other),
     }
@@ -1228,12 +1212,13 @@ fn engine_aggregate_fields_relative_order() {
     let c_tot_off = offset_of!(RiskEngine, c_tot);
     let pnl_pos_off = offset_of!(RiskEngine, pnl_pos_tot);
     let pnl_mat_off = offset_of!(RiskEngine, pnl_matured_pos_tot);
-    let gc_cursor_off = offset_of!(RiskEngine, gc_cursor);
+    let _gc_cursor_off: usize = 0;
+    let rr_cursor_off = offset_of!(RiskEngine, rr_cursor_position); // v12.19: gc_cursor retired
 
     assert!(vault_off < c_tot_off, "vault must precede c_tot");
     assert!(c_tot_off < pnl_pos_off, "c_tot must precede pnl_pos_tot");
     assert!(pnl_pos_off < pnl_mat_off, "pnl_pos_tot must precede pnl_matured_pos_tot");
-    assert!(pnl_mat_off < gc_cursor_off, "pnl_matured_pos_tot must precede gc_cursor");
+    assert!(pnl_mat_off < rr_cursor_off, "pnl_matured_pos_tot must precede rr_cursor_position /* v12.19 rename */");
 }
 
 #[test]
