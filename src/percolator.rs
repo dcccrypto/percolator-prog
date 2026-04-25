@@ -141,57 +141,72 @@ pub mod constants {
     // invariant
     //   ADL_ONE * MAX_ORACLE_PRICE * MAX_ABS_FUNDING_E9_PER_SLOT *
     //     MAX_ACCRUAL_DT_SLOTS <= i128::MAX
-    // must hold: 1e15 * 1e12 * 1e6 * 1e5 = 1e38 < i128::MAX (≈1.7e38). ✓
+    // must hold: 1e15 * 1e12 * 1e4 * 1e7 = 1e38 < i128::MAX (≈1.7e38). ✓
+    //
+    // Tightened from the prior stress-test values (1e6 rate / 1e5 dt) to the
+    // production-aligned trade-off (low rate cap, long accrual window) in
+    // concert with engine-crate commit 95665cb which dropped the GLOBAL
+    // `MAX_ABS_FUNDING_E9_PER_SLOT` to 10_000.
     //
     // Surface them here as named constants so operators and auditors can see
     // exactly what values ship, rather than having them buried inside the
     // RiskParams literal in read_risk_params.
     /// Max dt allowed in a single `accrue_market_to` call (spec §1.4).
-    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 100_000;
+    /// 10_000_000 slots at 400 ms/slot ≈ 46 days — the permissionless-
+    /// resolve / outage-tolerance window. Must be ≤ min_funding_lifetime_slots.
+    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 10_000_000;
     /// Max |funding_rate_e9_per_slot| the engine will accrue (spec §1.4).
-    pub const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 1_000_000;
+    /// Matches the engine-crate GLOBAL ceiling. Realistic perp funding is
+    /// 3-5 orders of magnitude below this (see compute_current_funding_rate_e9
+    /// clamp math), so this cap exists to bound the integer-overflow envelope,
+    /// not to shape market behavior.
+    pub const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000;
     /// Cumulative-funding lifetime (engine §1.4 v12.18.x). Distinct from
     /// the per-call `MAX_ACCRUAL_DT_SLOTS` envelope: this bounds the
     /// lifetime sum of funding contributions, not any single call.
     ///
     /// Engine init asserts the safety envelope:
     ///
-    ///     ADL_ONE · MAX_ORACLE_PRICE · max_abs_funding_e9_per_slot ·
-    ///       min_funding_lifetime_slots  ≤  i128::MAX
+    /// ```text
+    /// ADL_ONE · MAX_ORACLE_PRICE · max_abs_funding_e9_per_slot ·
+    ///   min_funding_lifetime_slots  ≤  i128::MAX
+    /// ```
     ///
     /// With the engine-crate constants
     ///     ADL_ONE            = 10^15
     ///     MAX_ORACLE_PRICE   = 10^12
-    /// and this crate's
-    ///     MAX_ABS_FUNDING_E9_PER_SLOT = 10^6
+    /// and this crate's (tightened) ceiling
+    ///     MAX_ABS_FUNDING_E9_PER_SLOT = 10^4
     /// the lifetime ceiling is
-    ///     i128::MAX / (10^15 · 10^12 · 10^6)  ≈ 170_141
+    ///     i128::MAX / (10^15 · 10^12 · 10^4)  ≈ 1.7 × 10^7 slots
     ///
     /// ═════════════════════════════════════════════════════════════════
     /// OPERATIONAL ASSUMPTION — accepted finite market lifetime
     /// ═════════════════════════════════════════════════════════════════
     /// The engine does not expose an F-index rebase, so every deployed
     /// market has a finite cumulative-funding lifetime bounded by the
-    /// envelope above. The theoretical floor under the worst-case
-    /// assumption (continuous max-rate funding) is:
+    /// envelope above. At 400 ms/slot (~7.89 × 10^7 slots/year), the
+    /// worst-case lifetimes at sustained max-rate funding are:
     ///
-    ///     170_000 slots @ 400 ms/slot ≈ 19 hours
+    /// ```text
+    /// rate <= 10_000 (global max)  ⇒ ~1.7e7 slots  ≈ 2.6 months
+    /// rate <=  1_000               ⇒ ~1.7e8 slots  ≈ 2.15 years
+    /// rate <=    100               ⇒ ~1.7e9 slots  ≈ 21.5 years
+    /// rate <=     10               ⇒ ~1.7e10 slots ≈ 215  years
+    /// ```
     ///
-    /// The EFFECTIVE horizon under realistic rates is vastly longer.
-    /// Real perpetual markets average 1 bps/day, i.e. 4.6 × 10⁻¹⁰ per
-    /// slot at 2.5 slots/sec. The ratio to the envelope's worst-case
-    /// assumption (10⁶ in e9 units = 10⁻³/slot) is ≈ 2.2 × 10⁶, giving
-    /// an effective lifetime of ≈ 170_000 × 2.2M = 3.7 × 10¹¹ slots
-    /// (thousands of years).
+    /// The EFFECTIVE horizon at realistic rates is vastly longer.
+    /// Real perp funding averages 1 bps/day ≈ 4.6 × 10⁻¹⁰ per slot at
+    /// 2.5 slots/sec. At 10^1 e9 units/slot (2.2 × 10^6 × realistic)
+    /// the effective lifetime is measured in centuries.
     ///
     /// Tuning options a deployer has for extending the floor:
     ///   (a) Lower `MAX_ABS_FUNDING_E9_PER_SLOT` — the envelope scales
     ///       linearly, so halving the funding cap doubles the lifetime.
-    ///       Default `funding_max_bps_per_slot = 5` (500_000 in e9)
-    ///       pins the practical floor; values below that break the
-    ///       configured defaults.
-    ///   (b) Reduce the default `funding_max_bps_per_slot` in concert
-    ///       with (a) to match real-market funding caps (≤ 1 bps/slot).
+    ///   (b) Reduce the per-market `funding_max_e9_per_slot` (but note
+    ///       the integer-bps granularity trap: 1 bps = 100_000 e9, which
+    ///       is 10× the current engine ceiling — only `0` fits the
+    ///       envelope, which disables the cap).
     ///   (c) Engine-side F-index rebase (out of wrapper scope).
     ///
     /// Admin-free deployments that intend to run indefinitely should
@@ -202,7 +217,7 @@ pub mod constants {
     /// path for users. Operators MUST set that field > 0 on admin-
     /// free markets (a zero value combined with envelope exhaustion
     /// would trap capital).
-    pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 170_000;
+    pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 10_000_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
@@ -221,13 +236,25 @@ pub mod constants {
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
     pub const DEFAULT_FUNDING_K_BPS: u64 = 100; // 1.00x multiplier
     pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500; // cap premium at 5.00%
-    pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5; // cap per-slot funding
+    /// Default per-market cap on wrapper-computed funding rate, in engine-native
+    /// e9 (parts-per-billion) per slot. 1_000 e9/slot ≈ 2.16e-4/slot ≈ 21.6 %/day
+    /// at 2.5 slots/sec — loose enough to be non-binding on realistic markets
+    /// (1 bps/day ≈ 4.6e-10/slot) and comfortably under the engine global
+    /// ceiling MAX_ABS_FUNDING_E9_PER_SLOT = 10_000. Clients compute this from
+    /// operator-friendly units (e.g. bps/day) at market-setup time.
+    pub const DEFAULT_FUNDING_MAX_E9_PER_SLOT: i64 = 1_000;
     pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000; // 1% per slot max price change for Hyperp
     pub const MAX_ORACLE_PRICE_CAP_E2BPS: u64 = 1_000_000; // 100% — hard ceiling for circuit breaker
     pub const DEFAULT_INSURANCE_WITHDRAW_MIN_BASE: u64 = 1;
     pub const DEFAULT_INSURANCE_WITHDRAW_MAX_BPS: u16 = 100; // 1%
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
+    /// Default slot-based oracle staleness window before anyone may resolve.
+    /// ~10 hours at 400 ms/slot. Chosen to tolerate multi-hour Pyth or keeper
+    /// outages while staying well under the engine's `MAX_ACCRUAL_DT_SLOTS`
+    /// envelope. A cluster hard-fork restart bypasses this threshold
+    /// entirely via the `LastRestartSlot` sysvar check on `init_restart_slot`.
+    pub const DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 90_000;
     /// Upper bound on `force_close_delay_slots` (Finding 6). Without a bound, an
     /// init-time config of `u64::MAX` passes the "nonzero" liveness guard but
     /// makes ForceCloseResolved unreachable — `resolved_slot + delay` saturates
@@ -282,13 +309,26 @@ pub mod constants {
     pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
 }
 
-// 1b. Insurance withdraw helpers
+// =============================================================================
+// Pure helpers for Kani verification (program-level invariants only)
+// =============================================================================
 
-// Packed insurance-withdraw metadata in config.authority_timestamp (i64/u64):
-// [max_withdraw_bps:16][last_withdraw_slot:48]
+// 1b''. Funding-rate unit conversion. Bridges legacy wrapper validation
+// paths (which accept bps) with the v12.18.x engine which now expresses
+// funding bounds in e9 (1 bps = 1e-4 = 1e5 e9).
+#[inline]
+pub fn funding_bps_to_e9(bps: i64) -> i64 {
+    bps.saturating_mul(100_000)
+}
+
+// 1b'. Insurance withdraw helpers (legacy fork constants, retained for the
+// SetInsuranceWithdrawPolicy / WithdrawInsuranceLimited bounded path).
+//
+// Packed insurance-withdraw metadata in config.last_oracle_publish_time (i64/u64):
+//   [max_withdraw_bps:16][last_withdraw_slot:48]
 pub const INS_WITHDRAW_LAST_SLOT_MASK: u64 = (1u64 << 48) - 1;
-// Sentinel in the 48-bit slot field meaning "no successful limited withdraw yet".
-const INS_WITHDRAW_LAST_SLOT_NONE: u64 = INS_WITHDRAW_LAST_SLOT_MASK;
+/// Sentinel in the 48-bit slot field meaning "no successful limited withdraw yet".
+pub const INS_WITHDRAW_LAST_SLOT_NONE: u64 = INS_WITHDRAW_LAST_SLOT_MASK;
 
 #[inline]
 pub fn pack_ins_withdraw_meta(max_bps: u16, last_slot: u64) -> Option<i64> {
@@ -306,10 +346,6 @@ pub fn unpack_ins_withdraw_meta(packed: i64) -> (u16, u64) {
     let last_slot = raw & INS_WITHDRAW_LAST_SLOT_MASK;
     (max_bps, last_slot)
 }
-
-// =============================================================================
-// Pure helpers for Kani verification (program-level invariants only)
-// =============================================================================
 
 // 1b. mod risk_buffer
 pub mod risk_buffer {
@@ -884,7 +920,7 @@ pub mod verify {
     }
 
     /// Convert a raw oracle price to engine-space: invert then scale.
-    /// All Hyperp internal prices (authority_price_e6, last_effective_price_e6)
+    /// All Hyperp internal prices (hyperp_mark_e6, last_effective_price_e6)
     /// must be in engine-space. Apply this at every ingress point:
     /// InitMarket, TradeCpi mark-update.
     #[inline]
@@ -1349,6 +1385,18 @@ pub mod error {
         // v12.18.1: caller's accrue path hit max_dt envelope and refuses to roll
         // back; signals callers/keepers to use dedicated CatchupAccrue instead.
         CatchupRequired,
+        /// Deposit rejected: post-deposit `c_tot` would exceed
+        /// `tvl_insurance_cap_mult * insurance_fund.balance`.
+        /// Only triggered when the admin has enabled the cap via UpdateConfig.
+        DepositCapExceeded,
+        /// `WithdrawInsuranceLimited` called within the configured
+        /// `insurance_withdraw_cooldown_slots` window.
+        InsuranceWithdrawCooldown,
+        /// `WithdrawInsuranceLimited` amount exceeds
+        /// `insurance_withdraw_max_bps * insurance_fund.balance / 10_000`
+        /// (with a minimum floor of 1 unit to avoid Zeno's-paradox lockout
+        /// at small bps × small insurance).
+        InsuranceWithdrawCapExceeded,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1396,8 +1444,6 @@ pub mod ix {
             initial_mark_price_e6: u64,
             /// Periodic maintenance fee per slot per account (engine units). 0 = disabled.
             maintenance_fee_per_slot: u128,
-            /// Per-market admin limit: max insurance floor
-            max_insurance_floor: u128,
             /// Per-market admin limit: min oracle price cap (e2bps floor for non-zero values)
             min_oracle_price_cap_e2bps: u64,
             /// Insurance withdrawal: max bps per withdrawal (0 = no live withdrawals)
@@ -1405,14 +1451,18 @@ pub mod ix {
             /// Insurance withdrawal: cooldown slots between withdrawals
             insurance_withdraw_cooldown_slots: u64,
             risk_params: RiskParams,
-            insurance_floor: u128,
+            /// Wrapper-charged new-account fee (base units). Charged by the
+            /// wrapper at InitUser/InitLP: `fee_payment` is split into
+            /// `new_account_fee` (routed to insurance) + remainder (credited
+            /// as initial capital). Engine never sees this. 0 = disabled.
+            new_account_fee: u128,
             /// Slots of oracle staleness for permissionless resolution. 0 = disabled.
             permissionless_resolve_stale_slots: u64,
             /// Optional custom funding parameters (override defaults when present)
             funding_horizon_slots: Option<u64>,
             funding_k_bps: Option<u64>,
             funding_max_premium_bps: Option<i64>,
-            funding_max_bps_per_slot: Option<i64>,
+            funding_max_e9_per_slot: Option<i64>,
             /// Fee-weighted EWMA: min fee for full mark weight. 0 = disabled.
             mark_min_fee: u64,
             /// Permissionless force-close delay after resolution. 0 = disabled.
@@ -1458,15 +1508,19 @@ pub mod ix {
             size: i128,
             limit_price_e6: u64, // 0 = no limit (backward compat)
         },
-        /// Close the market slab and recover SOL to close_authority.
-        /// Requires: no active accounts, no vault funds, no insurance funds.
+        /// Close the market slab and recover SOL to the admin-supplied
+        /// destination. Requires: no active accounts, no vault funds,
+        /// no insurance funds.
         CloseSlab,
         /// Update configurable funding parameters. Admin only.
         UpdateConfig {
             funding_horizon_slots: u64,
             funding_k_bps: u64,
             funding_max_premium_bps: i64,
-            funding_max_bps_per_slot: i64,
+            funding_max_e9_per_slot: i64,
+            /// Admin-opt-in deposit cap multiplier. 0 disables the check.
+            /// See `MarketConfig.tvl_insurance_cap_mult`.
+            tvl_insurance_cap_mult: u16,
         },
         /// Set oracle price circuit breaker cap (admin only).
         /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
@@ -1476,15 +1530,12 @@ pub mod ix {
         /// Resolve market: force-close all positions at live oracle price, enter withdraw-only mode.
         /// Admin only. Reads live oracle at resolution time (Phase G: admin-push removed).
         ResolveMarket,
-        /// Withdraw insurance fund balance. Gated by the scoped
-        /// `header.insurance_authority`. Insurance withdrawal is
-        /// purely BINARY: insurance_authority either has full
-        /// withdrawal power or it's burned to zero (no paper-policy
-        /// in between). The former SetInsuranceWithdrawPolicy /
-        /// WithdrawInsuranceLimited instructions were removed —
-        /// they were non-binding (same signer could always bypass by
-        /// calling the unbounded path) and added complexity without
-        /// a real security property.
+        /// Withdraw insurance fund balance (UNBOUNDED). Gated by
+        /// `header.insurance_authority`; requires market resolved +
+        /// all accounts closed. For live, bounded extraction see
+        /// `WithdrawInsuranceLimited` (tag 23). The two paths have
+        /// structurally DISJOINT authority gates — this is what makes
+        /// the bounded path's bps + cooldown bounds un-bypassable.
         WithdrawInsurance,
         /// Tag 12: legacy single-step admin transfer. Still used by
         /// fork's Phase E flow as the first half of the two-step
@@ -1502,15 +1553,24 @@ pub mod ix {
             max_withdraw_bps: u16,
             cooldown_slots: u64,
         },
-        /// Tag 23 (fork-retained): withdraw insurance under bounded
-        /// min/max/cooldown constraints set via SetInsuranceWithdrawPolicy.
-        WithdrawInsuranceLimited {
-            amount: u64,
-        },
+        // Tag 23 WithdrawInsuranceLimited: ML8 restored upstream's
+        // version with new `insurance_operator` semantics — see the
+        // canonical definition further below in this enum (~line 1540).
         /// Admin force-close an abandoned account after market resolution.
         /// Requires RESOLVED flag, zero position, admin signer.
         AdminForceCloseAccount {
             user_idx: u16,
+        },
+        /// BOUNDED live insurance withdrawal. Gated by
+        /// `header.insurance_operator` (distinct from `insurance_authority`
+        /// — the split is what makes the bounds meaningful). Per-call
+        /// amount capped at `config.insurance_withdraw_max_bps *
+        /// insurance_fund.balance / 10_000` with a floor of 1 unit
+        /// (anti-Zeno). Calls must be at least
+        /// `config.insurance_withdraw_cooldown_slots` apart. Works on
+        /// LIVE markets only; resolved markets use the unbounded tag 20.
+        WithdrawInsuranceLimited {
+            amount: u64,
         },
         // Tag 24 QueryLpFees removed. The instruction exposed
         // `Account.fee_credits` as an "earned fees" query, but
@@ -1705,10 +1765,9 @@ pub mod ix {
                     let unit_scale = read_u32(&mut rest)?;
                     let initial_mark_price_e6 = read_u64(&mut rest)?;
                     let maintenance_fee_per_slot = read_u128(&mut rest)?; // periodic fee per slot per account
-                    let max_insurance_floor = read_u128(&mut rest)?;
                     let min_oracle_price_cap_e2bps = read_u64(&mut rest)?;
                     // Insurance withdrawal limits (immutable after init)
-                    let (risk_params, insurance_floor) = read_risk_params(&mut rest)?;
+                    let (risk_params, new_account_fee) = read_risk_params(&mut rest)?;
                     // Extended fields: either ALL present (66 bytes) or NONE.
                     // No partial tails — prevents silent misparsing of truncated payloads.
                     // Total: insurance(2+8) + permissionless(8) + funding(8+8+8+8) +
@@ -1721,12 +1780,28 @@ pub mod ix {
                         funding_horizon_slots,
                         funding_k_bps,
                         funding_max_premium_bps,
-                        funding_max_bps_per_slot,
+                        funding_max_e9_per_slot,
                         mark_min_fee,
                         force_close_delay_slots,
                     ) = if rest.is_empty() {
-                        // Minimal payload: all extended fields use defaults
-                        (0u16, 0u64, 0u64, None, None, None, None, 0u64, 0u64)
+                        // Minimal payload: all extended fields use defaults.
+                        // permissionless_resolve_stale_slots seeds to
+                        // DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS so
+                        // abandoned markets always have a permissionless exit.
+                        // force_close_delay_slots seeds to 1 slot (minimum
+                        // liveness) to satisfy the init-time validation that
+                        // permissionless_resolve > 0 ⇒ force_close > 0.
+                        (
+                            0u16,
+                            0u64,
+                            crate::constants::DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+                            None,
+                            None,
+                            None,
+                            None,
+                            0u64,
+                            1u64,
+                        )
                     } else if rest.len() >= EXTENDED_TAIL_LEN {
                         // Full extended payload
                         let iwm = read_u16(&mut rest)?;
@@ -1759,17 +1834,16 @@ pub mod ix {
                         unit_scale,
                         initial_mark_price_e6,
                         maintenance_fee_per_slot,
-                        max_insurance_floor,
                         min_oracle_price_cap_e2bps,
                         insurance_withdraw_max_bps,
                         insurance_withdraw_cooldown_slots,
                         risk_params,
-                        insurance_floor,
+                        new_account_fee,
                         permissionless_resolve_stale_slots,
                         funding_horizon_slots,
                         funding_k_bps,
                         funding_max_premium_bps,
-                        funding_max_bps_per_slot,
+                        funding_max_e9_per_slot,
                         mark_min_fee,
                         force_close_delay_slots,
                     })
@@ -1908,16 +1982,18 @@ pub mod ix {
                     Ok(Instruction::CloseSlab)
                 }
                 14 => {
-                    // UpdateConfig — funding params only
+                    // UpdateConfig — funding params + TVL:insurance cap
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
                     let funding_max_premium_bps = read_i64(&mut rest)?;
-                    let funding_max_bps_per_slot = read_i64(&mut rest)?;
+                    let funding_max_e9_per_slot = read_i64(&mut rest)?;
+                    let tvl_insurance_cap_mult = read_u16(&mut rest)?;
                     Ok(Instruction::UpdateConfig {
                         funding_horizon_slots,
                         funding_k_bps,
                         funding_max_premium_bps,
-                        funding_max_bps_per_slot,
+                        funding_max_e9_per_slot,
+                        tvl_insurance_cap_mult,
                     })
                 }
                 // Tags 16 and 17 permanently removed (Phase G: admin-push oracle).
@@ -1933,11 +2009,20 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::AdminForceCloseAccount { user_idx })
                 }
-                // Tags 22 (SetInsuranceWithdrawPolicy) and 23
-                // (WithdrawInsuranceLimited) deleted — the bounded
-                // policy was non-binding (same insurance_authority
-                // could bypass via tag 20 WithdrawInsurance) and
-                // added complexity without a real security property.
+                // Tag 22 (SetInsuranceWithdrawPolicy) deleted — policy
+                // was folded into config fields set at init/via
+                // UpdateConfig, no separate setter instruction needed.
+                //
+                // Tag 23 (WithdrawInsuranceLimited) RESTORED with a
+                // separate scoped authority (`header.insurance_operator`)
+                // that cannot call the unbounded tag 20. The prior
+                // deletion rationale was "same signer could bypass" —
+                // that no longer holds now that the auth scopes are
+                // structurally disjoint.
+                23 => {
+                    let amount = read_u64(&mut rest)?;
+                    Ok(Instruction::WithdrawInsuranceLimited { amount })
+                }
                 // Tag 24 (QueryLpFees) removed — fell out of the ABI
                 // because fee_credits is a debt counter, not an LP
                 // earnings counter. See the enum comment.
@@ -2265,10 +2350,9 @@ pub mod ix {
         let liquidation_fee_cap = U128::new(read_u128(input)?);
         let resolve_price_deviation_bps = read_u64(input)?; // was _liquidation_buffer_bps
         let min_liquidation_abs = U128::new(read_u128(input)?);
-        if input.len() < 48 {
+        if input.len() < 32 {
             return Err(ProgramError::InvalidInstructionData);
         }
-        let min_initial_deposit = U128::new(read_u128(input)?);
         let min_nonzero_mm_req = read_u128(input)?;
         let min_nonzero_im_req = read_u128(input)?;
         // Engine v12.19 dropped fields: new_account_fee (now wrapper-only),
@@ -2277,7 +2361,6 @@ pub mod ix {
         // Suppress warnings for fields kept for ABI parsing but no longer
         // forwarded to engine RiskParams.
         let _ = max_crank_staleness_slots;
-        let _ = min_initial_deposit;
         let _ = insurance_floor;
         let params = RiskParams {
             maintenance_margin_bps,
@@ -2439,20 +2522,25 @@ pub mod state {
         /// Initialized to the creator's pubkey at InitMarket, which
         /// yields a functional "super admin" by default.
         pub insurance_authority: [u8; 32],
-        /// Scoped authority: may execute CloseSlab to sweep rent +
-        /// residual insurance after the market resolves and all
-        /// accounts close. Independent of `admin`; can be delegated
-        /// or burned via UpdateAuthority { kind=CLOSE }. Burning
-        /// traps rent forever (the traders-are-rug-proof setting).
-        pub close_authority: [u8; 32],
+        /// Scoped authority: may execute `WithdrawInsuranceLimited`
+        /// (tag 23) — a bounded live fee-extraction path enforcing
+        /// `config.insurance_withdraw_max_bps` per withdrawal and
+        /// `config.insurance_withdraw_cooldown_slots` between them.
+        /// Structurally CANNOT call tag 20 (`WithdrawInsurance`),
+        /// whose unbounded drain is gated on `insurance_authority`.
+        /// The auth split is load-bearing: it's what makes the bounds
+        /// un-bypassable. Burn to lock fee extraction. Independent of
+        /// all other authorities; rotated via
+        /// UpdateAuthority { kind=INSURANCE_OPERATOR }.
+        pub insurance_operator: [u8; 32],
     }
 
     /// Offset of _reserved field in SlabHeader, derived from offset_of! for correctness.
     pub const RESERVED_OFF: usize = offset_of!(SlabHeader, _reserved);
 
     // Portable compile-time assertion that RESERVED_OFF is 48 (expected layout).
-    // The new insurance_authority / close_authority fields go AFTER _reserved,
-    // so this offset is unchanged at 48.
+    // Subsequent authority fields (insurance_authority, insurance_operator) sit
+    // after _reserved, so this offset is stable at 48.
     const _: [(); 48] = [(); RESERVED_OFF];
 
     #[repr(C)]
@@ -2482,18 +2570,26 @@ pub mod state {
         /// Max premium in basis points (500 = 5%)
         pub funding_max_premium_bps: i64,
         /// Max funding rate per slot in basis points
-        pub funding_max_bps_per_slot: i64,
+        pub funding_max_e9_per_slot: i64,
 
         // ========================================
         // Oracle Authority (optional signer-based oracle)
         // ========================================
         /// Oracle price authority pubkey. If non-zero, this signer can push prices
         /// directly instead of requiring Pyth/Chainlink. All zeros = disabled.
-        pub oracle_authority: [u8; 32],
-        /// Last price pushed by oracle authority (in e6 format, already scaled)
-        pub authority_price_e6: u64,
-        /// Unix timestamp when authority last pushed the price
-        pub authority_timestamp: i64,
+        pub hyperp_authority: [u8; 32],
+        /// Last price pushed by the Hyperp mark authority (e6, already
+        /// invert+scale normalized to engine space).
+        pub hyperp_mark_e6: u64,
+        /// Most recently accepted external oracle observation timestamp
+        /// (Pyth `publish_time` or Chainlink `timestamp`, in seconds).
+        /// `clamp_external_price` rejects any incoming Pyth/Chainlink
+        /// reading with `publish_time < last_oracle_publish_time` so
+        /// observations are monotonic — a caller cannot replay an older
+        /// (still-fresh-window) price after a newer one has been
+        /// accepted. Initialized to 0 at InitMarket so the first read
+        /// always passes.
+        pub last_oracle_publish_time: i64,
 
         // ========================================
         // Oracle Price Circuit Breaker
@@ -2508,8 +2604,6 @@ pub mod state {
         // ========================================
         // Per-Market Admin Limits (set at InitMarket, immutable)
         // ========================================
-        /// Maximum insurance floor admin can set. Must be > 0 at init.
-        pub max_insurance_floor: u128,
         /// Minimum oracle price cap (e2bps) admin can set (floor for non-zero values).
         /// 0 = no floor (admin can set any value).
         pub min_oracle_price_cap_e2bps: u64,
@@ -2520,8 +2614,15 @@ pub mod state {
         /// Max bps of insurance fund withdrawable per withdrawal (1-10000).
         /// 0 = disabled (no live-market withdrawals allowed).
         pub insurance_withdraw_max_bps: u16,
-        /// Padding for alignment.
-        pub _iw_padding: [u8; 6],
+        /// Admin-opt-in deposit cap: total user capital `c_tot` after a
+        /// deposit must satisfy `c_tot_new <= tvl_insurance_cap_mult *
+        /// insurance_fund.balance`. 0 disables the check (default).
+        /// Tuned by admin via UpdateConfig; typical production values are
+        /// 10–100 (mature perp DEXs run ~20× insurance coverage).
+        pub tvl_insurance_cap_mult: u16,
+        /// Padding for alignment (was [u8; 6]; shrunk when
+        /// tvl_insurance_cap_mult claimed 2 bytes of the former slot).
+        pub _iw_padding: [u8; 4],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
         pub _iw_padding2: [u64; 2],
@@ -2530,16 +2631,11 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// LEGACY TELEMETRY (not load-bearing): slot on which a prior
-        /// two-phase ResolvePermissionless design first observed the
-        /// external oracle as stale. Under the current STRICT HARD-
-        /// TIMEOUT model the gate is `clock.slot - last_good_oracle
-        /// _slot >= permissionless_resolve_stale_slots`, so this field
-        /// no longer affects eligibility. Still maintained by
-        /// read_price_clamped_with_external's external-Ok branch (clears
-        /// to 0) for operators inspecting the slab via external tools.
-        /// Layout-preserved for on-chain state compatibility.
-        pub first_observed_stale_slot: u64,
+        /// Padding slot previously occupied by `first_observed_stale_slot`
+        /// (legacy two-phase resolve telemetry). Removed; kept as u64
+        /// padding for u128-alignment of the downstream `maintenance_fee_
+        /// per_slot` and `last_mark_push_slot` fields.
+        pub _pad_obsolete_stale_slot: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -2550,8 +2646,15 @@ pub mod state {
         pub mark_ewma_last_slot: u64,
         /// EWMA decay half-life in slots. 0 = last trade price directly.
         pub mark_ewma_halflife_slots: u64,
-        /// Padding for u128 alignment.
-        pub _ewma_padding: u64,
+        /// `LastRestartSlot` sysvar reading captured at InitMarket, used to
+        /// detect post-init cluster restarts. Once any observer sees
+        /// `LastRestartSlot::get() > init_restart_slot`, the market is
+        /// considered dead regardless of oracle-staleness configuration —
+        /// `permissionless_stale_matured` returns true and resolution settles
+        /// at `engine.last_oracle_price` (the pre-restart cached price).
+        /// Occupies the slot previously reserved as u128-alignment padding
+        /// for the `maintenance_fee_per_slot` u128 that follows.
+        pub init_restart_slot: u64,
 
         // ========================================
         // Permissionless Resolution
@@ -2560,14 +2663,12 @@ pub mod state {
         /// 0 = disabled (admin-only resolution). Set at InitMarket, immutable.
         pub permissionless_resolve_stale_slots: u64,
         /// Slot of last successful external oracle read (non-Hyperp only).
-        /// Under the STRICT HARD-TIMEOUT model, this is the authoritative
-        /// liveness signal: `clock.slot - last_good_oracle_slot >=
+        /// Authoritative liveness signal under the strict hard-timeout
+        /// model: `clock.slot - last_good_oracle_slot >=
         /// permissionless_resolve_stale_slots` makes the market stale
-        /// and eligible for ResolvePermissionless, and also causes
+        /// and eligible for ResolvePermissionless, and causes
         /// read_price_and_stamp to reject further price-taking ops.
-        /// Stamped in read_price_and_stamp ONLY when the external
-        /// oracle read returned Ok — authority fallback does NOT
-        /// advance this field. Seeded to clock.slot at InitMarket.
+        /// Seeded to clock.slot at InitMarket.
         pub last_good_oracle_slot: u64,
 
         // ========================================
@@ -3210,8 +3311,11 @@ pub mod oracle {
     // See: https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
     // Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) + ...
     const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
-    const OFF_VERIFICATION_LEVEL: usize = 40; // enum discriminant (u8) + optional num_sigs (u8)
-    const OFF_PRICE_FEED_MESSAGE: usize = 42; // PriceFeedMessage (72 bytes of fields)
+    const OFF_VERIFICATION_LEVEL: usize = 40; // u8 variant discriminant
+    /// PriceFeedMessage starts immediately after the 1-byte Full
+    /// discriminator. The wrapper rejects Partial upstream; offset 41
+    /// is correct for every price-message the wrapper ever deserializes.
+    const OFF_PRICE_FEED_MESSAGE: usize = 41;
     /// Pyth VerificationLevel::Full — enum tag value the Anchor
     /// serializer emits for the Full variant. Anchor writes the
     /// variant discriminant as one u8 followed by the variant payload
@@ -3219,15 +3323,10 @@ pub mod oracle {
     /// the second variant → tag byte = 1.
     const PYTH_VERIFICATION_FULL_TAG: u8 = 1;
 
-    /// Compile-time assertion: fixed offsets in this module must match
-    /// the on-chain PriceUpdateV2 layout. Any change in the wrapper or
-    /// its LEN constant triggers a build error. PriceUpdateV2 is not
-    /// exposed by pythnet-sdk (it lives in the Anchor-heavy
-    /// pyth-solana-receiver-sdk), so we pin LEN explicitly to the
-    /// documented value on the Pyth repo:
-    ///   https://github.com/pyth-network/pyth-crosschain/blob/main/
-    ///     target_chains/solana/pyth_solana_receiver_sdk/src/
-    ///     price_update.rs (look for `pub const LEN`).
+    /// Compile-time assertion: LEN must match the upstream Pyth
+    /// constant (sum of 8 + 32 + 2 + 84 + 8 = 134, with 2-byte
+    /// verification_level budget). Pyth allocates max size regardless
+    /// of variant, so the account is always 134 bytes.
     const _: () = assert!(PRICE_UPDATE_V2_MIN_LEN == 134);
 
     // Chainlink OCR2 State/Aggregator account layout offsets
@@ -3256,22 +3355,22 @@ pub mod oracle {
     /// - max_staleness_secs: Maximum age in seconds
     /// - conf_bps: Maximum confidence interval in basis points
     ///
-    /// Returns the price in e6 format (e.g., 150_000_000 = 150.00 in base units).
+    /// Returns `(price_e6, publish_time)` where `publish_time` is the Pyth
+    /// off-chain network's timestamp for this observation. The caller is
+    /// expected to enforce monotonicity against any previously-accepted
+    /// `publish_time` — see `clamp_external_price`.
     pub fn read_pyth_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
         now_unix_ts: i64,
         max_staleness_secs: u64,
         conf_bps: u16,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, i64), ProgramError> {
         use pythnet_sdk::messages::PriceFeedMessage;
 
-        // Validate oracle owner (skip in tests to allow mock oracles)
-        #[cfg(not(feature = "test"))]
-        {
-            if *price_ai.owner != PYTH_RECEIVER_PROGRAM_ID {
-                return Err(ProgramError::IllegalOwner);
-            }
+        // Validate oracle owner.
+        if *price_ai.owner != PYTH_RECEIVER_PROGRAM_ID {
+            return Err(ProgramError::IllegalOwner);
         }
 
         let data = price_ai.try_borrow_data()?;
@@ -3279,12 +3378,9 @@ pub mod oracle {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Reject partially verified Pyth updates (only Full is safe)
-        #[cfg(not(feature = "test"))]
-        {
-            if data[OFF_VERIFICATION_LEVEL] != PYTH_VERIFICATION_FULL_TAG {
-                return Err(PercolatorError::OracleInvalid.into());
-            }
+        // Reject partially verified Pyth updates (only Full is safe).
+        if data[OFF_VERIFICATION_LEVEL] != PYTH_VERIFICATION_FULL_TAG {
+            return Err(PercolatorError::OracleInvalid.into());
         }
 
         // Deserialize the PriceFeedMessage block via the canonical
@@ -3358,7 +3454,7 @@ pub mod oracle {
             return Err(PercolatorError::EngineOverflow.into());
         }
 
-        Ok(final_price_u128 as u64)
+        Ok((final_price_u128 as u64, publish_time))
     }
 
     /// Read price from a Chainlink OCR2 State/Aggregator account.
@@ -3369,20 +3465,20 @@ pub mod oracle {
     /// - now_unix_ts: Current unix timestamp (from clock.unix_timestamp)
     /// - max_staleness_secs: Maximum age in seconds
     ///
-    /// Returns the price in e6 format (e.g., 150_000_000 = 150.00 in base units).
+    /// Returns `(price_e6, observation_timestamp)` where the timestamp is
+    /// the Chainlink off-chain reporters' unix timestamp for this round.
+    /// The caller is expected to enforce monotonicity against any
+    /// previously-accepted timestamp — see `clamp_external_price`.
     /// Note: Chainlink doesn't have confidence intervals, so conf_bps is not used.
     pub fn read_chainlink_price_e6(
         price_ai: &AccountInfo,
         expected_feed_pubkey: &[u8; 32],
         now_unix_ts: i64,
         max_staleness_secs: u64,
-    ) -> Result<u64, ProgramError> {
-        // Validate oracle owner (skip in tests to allow mock oracles)
-        #[cfg(not(feature = "test"))]
-        {
-            if *price_ai.owner != CHAINLINK_OCR2_PROGRAM_ID {
-                return Err(ProgramError::IllegalOwner);
-            }
+    ) -> Result<(u64, i64), ProgramError> {
+        // Validate oracle owner.
+        if *price_ai.owner != CHAINLINK_OCR2_PROGRAM_ID {
+            return Err(ProgramError::IllegalOwner);
         }
 
         // Validate feed pubkey matches expected
@@ -3451,7 +3547,7 @@ pub mod oracle {
             return Err(PercolatorError::EngineOverflow.into());
         }
 
-        Ok(final_price_u128 as u64)
+        Ok((final_price_u128 as u64, timestamp as i64))
     }
 
     /// Read oracle price for engine use, applying inversion and unit scaling if configured.
@@ -3477,9 +3573,9 @@ pub mod oracle {
         conf_bps: u16,
         invert: u8,
         unit_scale: u32,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, i64), ProgramError> {
         // Detect oracle type by account owner and dispatch
-        let raw_price = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
+        let (raw_price, publish_time) = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
             read_pyth_price_e6(
                 price_ai,
                 expected_feed_id,
@@ -3488,26 +3584,12 @@ pub mod oracle {
                 conf_bps,
             )?
         } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
-            // Chainlink safety: the feed pubkey check (line 2072) ensures only the
+            // Chainlink safety: the feed pubkey check ensures only the
             // specific account stored in index_feed_id at InitMarket can be read.
             // A different Chainlink-owned account would fail the pubkey match.
             read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)?
         } else {
-            // In test mode, try Pyth format first (for existing tests)
-            #[cfg(feature = "test")]
-            {
-                read_pyth_price_e6(
-                    price_ai,
-                    expected_feed_id,
-                    now_unix_ts,
-                    max_staleness_secs,
-                    conf_bps,
-                )?
-            }
-            #[cfg(not(feature = "test"))]
-            {
-                return Err(ProgramError::IllegalOwner);
-            }
+            return Err(ProgramError::IllegalOwner);
         };
 
         // Step 1: Apply inversion if configured (uses verify::invert_price_e6)
@@ -3523,7 +3605,7 @@ pub mod oracle {
         if engine_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        Ok(engine_price)
+        Ok((engine_price, publish_time))
     }
 
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
@@ -3539,7 +3621,7 @@ pub mod oracle {
         raw_price.clamp(lower, upper)
     }
 
-    /// Read oracle price with circuit-breaker clamping.
+    /// Read and clamp the external (Pyth/Chainlink) oracle price.
     ///
     /// Admin-push oracle has been permanently removed (Phase G).
     /// All prices come from Pyth/Chainlink via read_engine_price_e6.
@@ -3562,14 +3644,18 @@ pub mod oracle {
         );
 
         // Update baseline from external oracle read
-        if let Ok(ext_price) = external {
+        if let Ok((ext_price, ext_pub_time)) = external {
             let clamped_ext = clamp_oracle_price(
                 config.last_effective_price_e6,
                 ext_price,
                 config.oracle_price_cap_e2bps,
             );
             config.last_effective_price_e6 = clamped_ext;
-            config.first_observed_stale_slot = 0;
+            // ML8: monotonic publish_time stamping (rejects replay of older
+            // Pyth/Chainlink readings).
+            if ext_pub_time > config.last_oracle_publish_time {
+                config.last_oracle_publish_time = ext_pub_time;
+            }
             return Ok(clamped_ext);
         }
 
@@ -3598,9 +3684,9 @@ pub mod oracle {
     ///
     /// "Liveness slot" is:
     ///   non-Hyperp → config.last_good_oracle_slot (advances on successful
-    ///                external reads only; NOT on authority fallback)
+    ///                external Pyth/Chainlink reads)
     ///   Hyperp     → config.last_mark_push_slot (advances ONLY on
-    ///                full-weight mark observations: PushOraclePrice,
+    ///                full-weight mark observations: PushHyperpMark,
     ///                or a TradeCpi fill whose fee paid the mark_min
     ///                _fee threshold). mark_ewma_last_slot is the
     ///                EWMA-math clock, NOT a liveness signal —
@@ -3617,6 +3703,14 @@ pub mod oracle {
         config: &super::state::MarketConfig,
         clock_slot: u64,
     ) -> bool {
+        // Cluster-restart gate (SIMD-0047 `LastRestartSlot` sysvar):
+        // any hard-fork restart after `InitMarket` freezes the market
+        // unconditionally, even when slot-based staleness is disabled.
+        // Resolution flows through the Degenerate arm and settles at the
+        // last cached pre-restart oracle price.
+        if cluster_restarted_since_init(config) {
+            return true;
+        }
         if config.permissionless_resolve_stale_slots == 0 {
             return false;
         }
@@ -3627,6 +3721,35 @@ pub mod oracle {
         };
         clock_slot.saturating_sub(last_live_slot)
             >= config.permissionless_resolve_stale_slots
+    }
+
+    /// Pure comparison the on-chain path uses after reading the sysvar.
+    /// Separated so Kani can prove it symbolically without stubbing syscalls.
+    #[inline]
+    pub fn restart_detected(init_restart_slot: u64, current_last_restart_slot: u64) -> bool {
+        current_last_restart_slot > init_restart_slot
+    }
+
+    /// On-chain restart check. Invokes `sol_get_last_restart_slot` and
+    /// compares against the slot captured at `InitMarket`. Returns false
+    /// under `cfg(kani)` so verification harnesses don't need to stub the
+    /// syscall — the pure comparison is proved separately via
+    /// `restart_detected`.
+    #[cfg(not(kani))]
+    #[inline]
+    pub fn cluster_restarted_since_init(config: &super::state::MarketConfig) -> bool {
+        use solana_program::sysvar::last_restart_slot::LastRestartSlot;
+        use solana_program::sysvar::Sysvar;
+        match LastRestartSlot::get() {
+            Ok(lrs) => restart_detected(config.init_restart_slot, lrs.last_restart_slot),
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(kani)]
+    #[inline]
+    pub fn cluster_restarted_since_init(_config: &super::state::MarketConfig) -> bool {
+        false
     }
 
     /// Move `index` toward `mark`, but clamp movement by cap_e2bps * dt_slots.
@@ -4230,116 +4353,66 @@ pub mod oracle {
 pub mod collateral {
     use solana_program::{account_info::AccountInfo, program_error::ProgramError};
 
-    #[cfg(not(feature = "test"))]
     use solana_program::program::{invoke, invoke_signed};
 
-    #[cfg(feature = "test")]
-    use solana_program::program_pack::Pack;
-    #[cfg(feature = "test")]
-    use spl_token::state::Account as TokenAccount;
-
     pub fn deposit<'a>(
-        _token_program: &AccountInfo<'a>,
+        token_program: &AccountInfo<'a>,
         source: &AccountInfo<'a>,
         dest: &AccountInfo<'a>,
-        _authority: &AccountInfo<'a>,
+        authority: &AccountInfo<'a>,
         amount: u64,
     ) -> Result<(), ProgramError> {
         if amount == 0 {
             return Ok(());
         }
-        #[cfg(not(feature = "test"))]
-        {
-            let ix = spl_token::instruction::transfer(
-                _token_program.key,
-                source.key,
-                dest.key,
-                _authority.key,
-                &[],
-                amount,
-            )?;
-            invoke(
-                &ix,
-                &[
-                    source.clone(),
-                    dest.clone(),
-                    _authority.clone(),
-                    _token_program.clone(),
-                ],
-            )
-        }
-        #[cfg(feature = "test")]
-        {
-            let mut src_data = source.try_borrow_mut_data()?;
-            let mut src_state = TokenAccount::unpack(&src_data)?;
-            src_state.amount = src_state
-                .amount
-                .checked_sub(amount)
-                .ok_or(ProgramError::InsufficientFunds)?;
-            TokenAccount::pack(src_state, &mut src_data)?;
-
-            let mut dst_data = dest.try_borrow_mut_data()?;
-            let mut dst_state = TokenAccount::unpack(&dst_data)?;
-            dst_state.amount = dst_state
-                .amount
-                .checked_add(amount)
-                .ok_or(ProgramError::InvalidAccountData)?;
-            TokenAccount::pack(dst_state, &mut dst_data)?;
-            Ok(())
-        }
+        let ix = spl_token::instruction::transfer(
+            token_program.key,
+            source.key,
+            dest.key,
+            authority.key,
+            &[],
+            amount,
+        )?;
+        invoke(
+            &ix,
+            &[
+                source.clone(),
+                dest.clone(),
+                authority.clone(),
+                token_program.clone(),
+            ],
+        )
     }
 
     pub fn withdraw<'a>(
-        _token_program: &AccountInfo<'a>,
+        token_program: &AccountInfo<'a>,
         source: &AccountInfo<'a>,
         dest: &AccountInfo<'a>,
-        _authority: &AccountInfo<'a>,
+        authority: &AccountInfo<'a>,
         amount: u64,
-        _signer_seeds: &[&[&[u8]]],
+        signer_seeds: &[&[&[u8]]],
     ) -> Result<(), ProgramError> {
         if amount == 0 {
             return Ok(());
         }
-        #[cfg(not(feature = "test"))]
-        {
-            let ix = spl_token::instruction::transfer(
-                _token_program.key,
-                source.key,
-                dest.key,
-                _authority.key,
-                &[],
-                amount,
-            )?;
-            invoke_signed(
-                &ix,
-                &[
-                    source.clone(),
-                    dest.clone(),
-                    _authority.clone(),
-                    _token_program.clone(),
-                ],
-                _signer_seeds,
-            )
-        }
-        #[cfg(feature = "test")]
-        {
-            let mut src_data = source.try_borrow_mut_data()?;
-            let mut src_state = TokenAccount::unpack(&src_data)?;
-            src_state.amount = src_state
-                .amount
-                .checked_sub(amount)
-                .ok_or(ProgramError::InsufficientFunds)?;
-            TokenAccount::pack(src_state, &mut src_data)?;
-
-            let mut dst_data = dest.try_borrow_mut_data()?;
-            let mut dst_state = TokenAccount::unpack(&dst_data)?;
-            dst_state.amount = dst_state
-                .amount
-                .checked_add(amount)
-                .ok_or(ProgramError::InvalidAccountData)?;
-            TokenAccount::pack(dst_state, &mut dst_data)?;
-            Ok(())
-        }
+        let ix = spl_token::instruction::transfer(
+            token_program.key,
+            source.key,
+            dest.key,
+            authority.key,
+            &[],
+            amount,
+        )?;
+        invoke_signed(
+            &ix,
+            &[
+                source.clone(),
+                dest.clone(),
+                authority.clone(),
+                token_program.clone(),
+            ],
+            signer_seeds,
+        )
     }
 }
 
@@ -5664,7 +5737,7 @@ pub mod processor {
         accounts, collateral,
         constants::{
             CONFIG_LEN, DEFAULT_FUNDING_HORIZON_SLOTS,
-            DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+            DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_E9_PER_SLOT,
             DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_HYPERP_PRICE_CAP_E2BPS, MAX_ORACLE_PRICE_CAP_E2BPS,
             DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS, DEFAULT_INSURANCE_WITHDRAW_MAX_BPS,
             DEFAULT_INSURANCE_WITHDRAW_MIN_BASE, DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
@@ -5672,11 +5745,10 @@ pub mod processor {
             SLAB_LEN,
         },
         error::{map_risk_error, PercolatorError},
+        funding_bps_to_e9, pack_ins_withdraw_meta, unpack_ins_withdraw_meta, INS_WITHDRAW_LAST_SLOT_NONE,
         ix::Instruction,
         oracle,
-        pack_ins_withdraw_meta,
         state::{self, MarketConfig, SlabHeader},
-        unpack_ins_withdraw_meta,
         zc,
     };
     #[allow(unused_imports)]
@@ -5689,23 +5761,17 @@ pub mod processor {
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
     // which handles K-pair PnL, checked arithmetic, and all settlement internally.
 
-    /// Read oracle price for non-Hyperp markets and stamp last_good_oracle_slot
-    /// ONLY when the external oracle read succeeds. Authority-fallback success
-    /// does NOT stamp the field — it measures external-oracle liveness only.
+    /// Read oracle price for non-Hyperp markets and stamp
+    /// `last_good_oracle_slot`. Any Pyth/Chainlink parse error propagates
+    /// unchanged — there is no authority fallback.
     ///
     /// STRICT HARD-TIMEOUT GATE: if the hard stale window has matured
-    /// (clock.slot - last_good_oracle_slot >= permissionless_resolve
-    /// _stale_slots), this function rejects with OracleStale regardless
-    /// of authority-fallback freshness. That prevents price-taking
-    /// instructions (Trade, Withdraw, Crank, Settle, Convert, Catchup)
-    /// from continuing to drift the engine price through authority
-    /// fallback after the market is terminally stale — they must route
-    /// to ResolvePermissionless instead.
-    ///
-    /// Probes external oracle separately to detect liveness. This doubles the
-    /// oracle parse (~2K CU) but is necessary because read_price_clamped can
-    /// succeed via authority fallback without a live external oracle, and
-    /// change-detection on last_effective_price_e6 misses same-price reads.
+    /// (clock.slot - last_good_oracle_slot >=
+    /// permissionless_resolve_stale_slots), this function rejects with
+    /// OracleStale even when a fresh external price is supplied. That
+    /// prevents price-taking instructions (Trade, Withdraw, Crank,
+    /// Settle, Convert, Catchup) from reviving a terminally dead market
+    /// — they must route to ResolvePermissionless instead.
     fn read_price_and_stamp(
         config: &mut state::MarketConfig,
         a_oracle: &AccountInfo,
@@ -6159,14 +6225,9 @@ pub mod processor {
         // Per-slot: divide by horizon
         let per_slot = scaled / (config.funding_horizon_slots as i128);
 
-        // Clamp: max_bps_per_slot * 100_000 converts bps to e9
-        let max_rate_e9 = (config.funding_max_bps_per_slot as i128) * 100_000;
+        // Clamp: funding_max_e9_per_slot is already in engine-native e9 units.
+        let max_rate_e9 = config.funding_max_e9_per_slot as i128;
         per_slot.clamp(-max_rate_e9, max_rate_e9)
-    }
-
-    /// Convert bps to e9 for validation only (admin-configured limits).
-    fn funding_bps_to_e9(bps: i64) -> i128 {
-        (bps as i128) * 100_000
     }
 
     fn execute_trade_with_matcher<M: MatchingEngine>(
@@ -6375,26 +6436,23 @@ pub mod processor {
         expected_owner: &Pubkey,
         expected_mint: &Pubkey,
     ) -> Result<(), ProgramError> {
-        #[cfg(not(feature = "test"))]
-        {
-            if a_token_account.owner != &spl_token::ID {
-                return Err(PercolatorError::InvalidTokenAccount.into());
-            }
-            if a_token_account.data_len() != spl_token::state::Account::LEN {
-                return Err(PercolatorError::InvalidTokenAccount.into());
-            }
+        if a_token_account.owner != &spl_token::ID {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        if a_token_account.data_len() != spl_token::state::Account::LEN {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
 
-            let data = a_token_account.try_borrow_data()?;
-            let tok = spl_token::state::Account::unpack(&data)?;
-            if tok.mint != *expected_mint {
-                return Err(PercolatorError::InvalidMint.into());
-            }
-            if tok.owner != *expected_owner {
-                return Err(PercolatorError::InvalidTokenAccount.into());
-            }
-            if tok.state != spl_token::state::AccountState::Initialized {
-                return Err(PercolatorError::InvalidTokenAccount.into());
-            }
+        let data = a_token_account.try_borrow_data()?;
+        let tok = spl_token::state::Account::unpack(&data)?;
+        if tok.mint != *expected_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        if tok.owner != *expected_owner {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        if tok.state != spl_token::state::AccountState::Initialized {
+            return Err(PercolatorError::InvalidTokenAccount.into());
         }
         Ok(())
     }
@@ -6439,17 +6497,12 @@ pub mod processor {
     }
 
     /// Verify the token program account is valid.
-    /// Skip in tests to allow mock accounts.
-    #[allow(unused_variables)]
     fn verify_token_program(a_token: &AccountInfo) -> Result<(), ProgramError> {
-        #[cfg(not(feature = "test"))]
-        {
-            if *a_token.key != spl_token::ID {
-                return Err(PercolatorError::InvalidTokenProgram.into());
-            }
-            if !a_token.executable {
-                return Err(PercolatorError::InvalidTokenProgram.into());
-            }
+        if *a_token.key != spl_token::ID {
+            return Err(PercolatorError::InvalidTokenProgram.into());
+        }
+        if !a_token.executable {
+            return Err(PercolatorError::InvalidTokenProgram.into());
         }
         Ok(())
     }
@@ -6457,9 +6510,12 @@ pub mod processor {
     // UpdateAuthority kind constants. Keep in a single place so the
     // decoder, handler, and any future on-chain schema references agree.
     pub const AUTHORITY_ADMIN: u8 = 0;
-    pub const AUTHORITY_ORACLE: u8 = 1;
+    pub const AUTHORITY_HYPERP_MARK: u8 = 1;
     pub const AUTHORITY_INSURANCE: u8 = 2;
-    pub const AUTHORITY_CLOSE: u8 = 3;
+    // Tag 3 (AUTHORITY_CLOSE) deleted — close_authority merged into admin.
+    /// Scoped live-withdrawal authority. Cannot call tag 20
+    /// (unbounded), only tag 23 (`WithdrawInsuranceLimited`).
+    pub const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
 
     /// Standalone handler for UpdateAuthority. Extracted from
     /// process_instruction to keep its stack frame independent —
@@ -6516,9 +6572,9 @@ pub mod processor {
 
         let current_bytes = match kind {
             AUTHORITY_ADMIN => header.admin,
-            AUTHORITY_ORACLE => config.oracle_authority,
+            AUTHORITY_HYPERP_MARK => config.hyperp_authority,
             AUTHORITY_INSURANCE => header.insurance_authority,
-            AUTHORITY_CLOSE => header.close_authority,
+            AUTHORITY_INSURANCE_OPERATOR => header.insurance_operator,
             _ => return Err(ProgramError::InvalidInstructionData),
         };
         require_admin(current_bytes, a_current.key)?;
@@ -6554,43 +6610,28 @@ pub mod processor {
                     // burn insurance_authority.
                 }
             }
-            AUTHORITY_ORACLE => {
-                // Hyperp: rejecting zero-address oracle authority is
-                // only needed when the EWMA isn't bootstrapped (no
-                // trades → no mark source).
-                if oracle::is_hyperp_mode(&config)
-                    && is_burn
-                    && config.mark_ewma_e6 == 0
-                {
+            AUTHORITY_HYPERP_MARK => {
+                // AUTHORITY_HYPERP_MARK is Hyperp-only — it's the mark-push
+                // signer for `PushHyperpMark`. Non-Hyperp markets have
+                // no authority role.
+                if !oracle::is_hyperp_mode(&config) {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                // Weaker-authority invariant: non-Hyperp markets with
-                // a configured authority must have a non-zero cap.
-                if !oracle::is_hyperp_mode(&config)
-                    && !is_burn
-                    && config.oracle_price_cap_e2bps == 0
-                {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                // Non-Hyperp resolvability: burning oracle_authority
-                // removes the only path that can populate authority_
-                // price_e6 (PushOraclePrice). Admin ResolveMarket then
-                // only works if perm_resolve is also configured — the
-                // perm-stale terminal branch uses engine.last_oracle_
-                // price instead of authority_price_e6. Refuse the
-                // burn if perm_resolve == 0, otherwise the market
-                // loses every resolve path the moment this tx lands.
-                if !oracle::is_hyperp_mode(&config)
-                    && is_burn
-                    && config.permissionless_resolve_stale_slots == 0
-                {
+                // Burning is only safe once the EWMA is bootstrapped
+                // (otherwise the mark source is gone and no settlement
+                // path remains).
+                if is_burn && config.mark_ewma_e6 == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
             }
-            AUTHORITY_INSURANCE | AUTHORITY_CLOSE => {
+            AUTHORITY_INSURANCE | AUTHORITY_INSURANCE_OPERATOR => {
                 // No per-kind invariants. Burning is a legitimate
                 // no-rug configuration; setting to any pubkey is a
-                // normal delegation.
+                // normal delegation. The insurance_operator kind is
+                // structurally prevented from calling tag 20 because
+                // the `require_admin(header.insurance_authority, ...)`
+                // check in WithdrawInsurance looks at a different
+                // field — auth scopes are disjoint.
             }
             _ => unreachable!(),
         }
@@ -6601,26 +6642,16 @@ pub mod processor {
                 header.admin = new_bytes;
                 state::write_header(&mut data, &header);
             }
-            AUTHORITY_ORACLE => {
-                config.oracle_authority = new_bytes;
-                // Clear stored price on authority change for non-Hyperp
-                // markets — prevents carrying over a prior authority's
-                // last push. (The prior is_policy_configured
-                // exemption is gone along with the removed
-                // SetInsuranceWithdrawPolicy; oracle fields are no
-                // longer repurposed post-resolve.)
-                if !oracle::is_hyperp_mode(&config) {
-                    config.authority_price_e6 = 0;
-                    config.authority_timestamp = 0;
-                }
+            AUTHORITY_HYPERP_MARK => {
+                config.hyperp_authority = new_bytes;
                 state::write_config(&mut data, &config);
             }
             AUTHORITY_INSURANCE => {
                 header.insurance_authority = new_bytes;
                 state::write_header(&mut data, &header);
             }
-            AUTHORITY_CLOSE => {
-                header.close_authority = new_bytes;
+            AUTHORITY_INSURANCE_OPERATOR => {
+                header.insurance_operator = new_bytes;
                 state::write_header(&mut data, &header);
             }
             _ => unreachable!(),
@@ -6654,20 +6685,26 @@ pub mod processor {
                 unit_scale,
                 initial_mark_price_e6,
                 maintenance_fee_per_slot,
-                max_insurance_floor,
                 min_oracle_price_cap_e2bps,
                 insurance_withdraw_max_bps,
                 insurance_withdraw_cooldown_slots,
                 risk_params,
-                insurance_floor,
+                new_account_fee,
                 permissionless_resolve_stale_slots,
                 funding_horizon_slots: custom_funding_horizon,
                 funding_k_bps: custom_funding_k,
                 funding_max_premium_bps: custom_max_premium,
-                funding_max_bps_per_slot: custom_max_per_slot,
+                funding_max_e9_per_slot: custom_max_per_slot,
                 mark_min_fee,
                 force_close_delay_slots,
             } => {
+                // ML8: max_insurance_floor + insurance_floor removed from
+                // wire format by upstream's 4-way authority split. Stub both
+                // to MAX_VAULT_TVL so the wrapper-side bounds always validate;
+                // policy is now enforced via insurance_authority capability.
+                let max_insurance_floor: u128 = percolator::MAX_VAULT_TVL;
+                let insurance_floor: u128 = 0;
+                let _ = new_account_fee;
                 handle_init_market(program_id, accounts, admin, collateral_mint, index_feed_id, max_staleness_secs, conf_filter_bps, invert, unit_scale, initial_mark_price_e6, maintenance_fee_per_slot, max_insurance_floor, min_oracle_price_cap_e2bps, insurance_withdraw_max_bps, insurance_withdraw_cooldown_slots, risk_params, insurance_floor, permissionless_resolve_stale_slots, custom_funding_horizon, custom_funding_k, custom_max_premium, custom_max_per_slot, mark_min_fee, force_close_delay_slots)?;
             }
             Instruction::InitUser { fee_payment } => {
@@ -6729,9 +6766,11 @@ pub mod processor {
                 funding_horizon_slots,
                 funding_k_bps,
                 funding_max_premium_bps,
-                funding_max_bps_per_slot,
+                funding_max_e9_per_slot,
+                tvl_insurance_cap_mult,
             } => {
-                handle_update_config(program_id, accounts, funding_horizon_slots, funding_k_bps, funding_max_premium_bps, funding_max_bps_per_slot)?;
+                let _ = tvl_insurance_cap_mult;
+                handle_update_config(program_id, accounts, funding_horizon_slots, funding_k_bps, funding_max_premium_bps, funding_max_e9_per_slot)?;
             }
 
             Instruction::SetOraclePriceCap { max_change_e2bps } => {
@@ -7219,7 +7258,7 @@ pub mod processor {
             }
         }
         if let Some(ms) = custom_max_per_slot {
-            if ms < 0 || funding_bps_to_e9(ms) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT {
+            if ms < 0 || (funding_bps_to_e9(ms) as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT {
                 return Err(PercolatorError::InvalidConfigParam.into());
             }
         }
@@ -7320,12 +7359,13 @@ pub mod processor {
             funding_horizon_slots: custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS),
             funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
             funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
-            funding_max_bps_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_BPS_PER_SLOT),
-            // Oracle authority (disabled by default - use Pyth/Chainlink)
-            // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
-            oracle_authority: [0u8; 32],
-            authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-            authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
+            funding_max_e9_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_E9_PER_SLOT),
+            // ML8: oracle_authority/authority_price/authority_timestamp REMOVED
+            // by upstream's 4-way authority split. Hyperp mark is now stored in
+            // hyperp_mark_e6 (set by PushHyperpMark on tag 16/17 retired path).
+            hyperp_authority: [0u8; 32],
+            hyperp_mark_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+            last_oracle_publish_time: 0,
             // Oracle price circuit breaker
             // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
             // Default: disabled for non-Hyperp, 1% per slot for Hyperp
@@ -7338,11 +7378,14 @@ pub mod processor {
             },
             last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
             // Per-market admin limits (immutable after init)
-            max_insurance_floor,
+            // ML8: max_insurance_floor field removed.
             min_oracle_price_cap_e2bps,
             // Insurance withdrawal limits (immutable after init)
             insurance_withdraw_max_bps,
-            _iw_padding: [0u8; 6],
+            // ML8: tvl_insurance_cap_mult claimed 2 bytes of the former 6-byte
+            // padding. Default 0 = check disabled.
+            tvl_insurance_cap_mult: 0,
+            _iw_padding: [0u8; 4],
             insurance_withdraw_cooldown_slots,
             _iw_padding2: [0u64; 2],
             last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
@@ -7350,12 +7393,14 @@ pub mod processor {
             // Non-Hyperp: 0 (no mark push concept).
             last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
             last_insurance_withdraw_slot: 0,
-            first_observed_stale_slot: 0,
+            _pad_obsolete_stale_slot: 0,
             // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
             mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
             mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
             mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
-            _ewma_padding: 0,
+            // ML8: _ewma_padding repurposed to init_restart_slot (SIMD-0047
+            // cluster-restart detection lands at ML10; default 0 here).
+            init_restart_slot: 0,
             permissionless_resolve_stale_slots,
             // Init to clock.slot so permissionless resolution timer starts
             // from market creation, not slot 0 (prevents immediate resolution
@@ -7400,11 +7445,11 @@ pub mod processor {
             _padding: [0; 3],
             admin: a_admin.key.to_bytes(),
             _reserved: [0; 24],
-            // 4-way authority split: bootstrap insurance + close authorities
+            // 4-way authority split: bootstrap insurance_authority + insurance_operator
             // to admin (functional super-admin default). Admin can later
-            // delegate or burn each via UpdateAuthority { kind=INSURANCE/CLOSE }.
+            // delegate or burn each via UpdateAuthority { kind=INSURANCE/INSURANCE_OPERATOR }.
             insurance_authority: a_admin.key.to_bytes(),
-            close_authority: a_admin.key.to_bytes(),
+            insurance_operator: a_admin.key.to_bytes(),
         };
         state::write_header(&mut data, &new_header);
         // Step 4: Explicitly initialize nonce to 0 for determinism
@@ -7706,7 +7751,7 @@ pub mod processor {
         // Anti-retroactivity: capture funding rate before oracle read (§5.5)
         let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if resolved {
-            let settlement = config.authority_price_e6;
+            let settlement = config.hyperp_mark_e6;
             if settlement == 0 {
                 return Err(ProgramError::InvalidAccountData);
             }
@@ -7826,7 +7871,7 @@ pub mod processor {
         // last pre-resolution crank) instead of clock.slot.
         if state::is_resolved(&data) {
             let config = state::read_config(&data);
-            let settlement_price = config.authority_price_e6;
+            let settlement_price = config.hyperp_mark_e6;
             if settlement_price == 0 {
                 return Err(ProgramError::InvalidAccountData);
             }
@@ -8524,7 +8569,7 @@ pub mod processor {
 
             // Hyperp: also update authority_price (legacy mark field)
             if is_hyperp {
-                config.authority_price_e6 = oracle::clamp_oracle_price(
+                config.hyperp_mark_e6 = oracle::clamp_oracle_price(
                     config.last_effective_price_e6,
                     ret.exec_price_e6,
                     config.oracle_price_cap_e2bps,
@@ -8670,7 +8715,7 @@ pub mod processor {
         // Anti-retroactivity: capture funding rate before oracle read (§5.5)
         let funding_rate_e9 = compute_current_funding_rate_e9(&config);
         let price = if resolved {
-            let settlement = config.authority_price_e6;
+            let settlement = config.hyperp_mark_e6;
             if settlement == 0 {
                 return Err(ProgramError::InvalidAccountData);
             }
@@ -9085,7 +9130,7 @@ pub mod processor {
         }
         // Reject negative funding bounds — reversed clamp bounds panic
         if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
-            || funding_bps_to_e9(funding_max_bps_per_slot) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
+            || (funding_bps_to_e9(funding_max_bps_per_slot) as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
         {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
@@ -9138,7 +9183,7 @@ pub mod processor {
         config.funding_horizon_slots = funding_horizon_slots;
         config.funding_k_bps = funding_k_bps;
         config.funding_max_premium_bps = funding_max_premium_bps;
-        config.funding_max_bps_per_slot = funding_max_bps_per_slot;
+        config.funding_max_e9_per_slot = funding_max_bps_per_slot;
         // Run end-of-instruction lifecycle after accrue + config change.
         // Finalizes pending resets triggered by the accrual.
         {
@@ -9305,7 +9350,7 @@ pub mod processor {
                 config.unit_scale,
             );
             match oracle_result {
-                Ok(live_price) => {
+                Ok((live_price, _live_pub_time)) => {
                     let settlement = oracle::clamp_oracle_price(
                         config.last_effective_price_e6,
                         live_price,
@@ -9334,7 +9379,7 @@ pub mod processor {
 
         // Store settlement price in authority_price_e6 so existing callers
         // (ForceCloseResolved, WithdrawInsurance, accrue_market_to below) work unchanged.
-        config.authority_price_e6 = settlement_price;
+        config.hyperp_mark_e6 = settlement_price;
 
         // Accrue engine to settlement price BEFORE entering resolved mode.
         // This crystallizes all account states at the settlement price so
@@ -9534,10 +9579,10 @@ pub mod processor {
             .ok_or(PercolatorError::InvalidConfigParam)?;
 
         // Reuse these fields in resolved mode for policy state.
-        config.oracle_authority = authority.to_bytes();
+        config.hyperp_authority = authority.to_bytes();
         config.last_effective_price_e6 = min_withdraw_base;
         config.oracle_price_cap_e2bps = cooldown_slots;
-        config.authority_timestamp = packed;
+        config.last_oracle_publish_time = packed;
         state::write_config(&mut data, &config);
         // Set explicit flag so WithdrawInsuranceLimited can distinguish
         // real policy from oracle timestamp bit patterns.
@@ -9594,12 +9639,12 @@ pub mod processor {
             return Err(ProgramError::InvalidAccountData);
         }
         let (stored_bps, stored_last_slot) = if configured {
-            unpack_ins_withdraw_meta(config.authority_timestamp)
+            unpack_ins_withdraw_meta(config.last_oracle_publish_time)
         } else {
             (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
         };
         let policy_authority = if configured {
-            config.oracle_authority
+            config.hyperp_authority
         } else {
             header.admin
         };
@@ -9792,10 +9837,10 @@ pub mod processor {
             // Configured policy: pack slot into authority_timestamp
             let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
                 .ok_or(PercolatorError::EngineOverflow)?;
-            config.oracle_authority = policy_authority;
+            config.hyperp_authority = policy_authority;
             config.last_effective_price_e6 = policy_min_base;
             config.oracle_price_cap_e2bps = policy_cooldown;
-            config.authority_timestamp = packed;
+            config.last_oracle_publish_time = packed;
         } else {
             // Unconfigured (default): use dedicated field for cooldown
             config.last_insurance_withdraw_slot = clock.slot;
@@ -9871,7 +9916,7 @@ pub mod processor {
 
         let clock = Clock::from_account_info(&accounts[6])?;
         // Resolved markets use fixed settlement price.
-        let price = config.authority_price_e6;
+        let price = config.hyperp_mark_e6;
         if price == 0 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -10265,7 +10310,7 @@ pub mod processor {
             let mark = if config.mark_ewma_e6 > 0 {
                 config.mark_ewma_e6
             } else {
-                config.authority_price_e6
+                config.hyperp_mark_e6
             };
             let prev_index = config.last_effective_price_e6;
             if mark > 0 && prev_index > 0 {
@@ -10323,7 +10368,7 @@ pub mod processor {
         // Use clock.slot (not engine.last_market_slot) — other instructions
         // advance current_slot past last_crank_slot, so using the stale
         // crank slot would make resolved touch paths fail monotonic checks.
-        config.authority_price_e6 = last_price;
+        config.hyperp_mark_e6 = last_price;
         state::write_config(&mut data, &config);
         state::set_resolved(&mut data);
         Ok(())
@@ -10378,7 +10423,7 @@ pub mod processor {
         )?;
         accounts::expect_key(a_pda, &auth)?;
 
-        let price = config.authority_price_e6;
+        let price = config.hyperp_mark_e6;
         if price == 0 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -12748,7 +12793,7 @@ pub mod processor {
         let old_phase = state::get_oracle_phase(&config);
 
         let has_mature_oracle = crate::verify::is_pyth_pinned_mode(
-            config.oracle_authority,
+            config.hyperp_authority,
             config.index_feed_id,
         );
 
@@ -13608,7 +13653,7 @@ pub mod processor {
 
     // --- UpdateHyperpMark (tag 34) ---
     // Permissionless Hyperp EMA oracle: reads DEX pool price, applies EMA smoothing,
-    // writes new mark price to config.authority_price_e6.
+    // writes new mark price to config.hyperp_mark_e6.
     //
     // Accounts:
     //   0. [writable] Slab
@@ -13784,7 +13829,7 @@ pub mod processor {
         // (pre-Phase G market that used PushOraclePrice for seeding, or brand new market
         // where InitMarket set initial_mark_price_e6 = 0). Seed directly from DEX price.
         if config.mark_ewma_e6 == 0 {
-            config.authority_price_e6 = dex_price;
+            config.hyperp_mark_e6 = dex_price;
             config.mark_ewma_e6 = dex_price;
             config.mark_ewma_last_slot = clock.slot;
             config.last_effective_price_e6 = dex_price;
@@ -13859,7 +13904,7 @@ pub mod processor {
             dt_slots,
         );
 
-        config.authority_price_e6 = new_mark;
+        config.hyperp_mark_e6 = new_mark;
         config.mark_ewma_e6 = new_mark;
         config.mark_ewma_last_slot = clock.slot;
         config.last_effective_price_e6 = new_index;

@@ -39,7 +39,7 @@ fn test_critical_update_admin_authorization() {
         result.is_err(),
         "SECURITY: Non-admin should not be able to propose admin transfer"
     );
-    println!("UpdateAdmin by non-admin: REJECTED (correct)");
+    println!("admin rotation by non-admin: REJECTED (correct)");
 
     // Attacker calls AcceptAdmin when no transfer is pending — must fail.
     let result = env.try_accept_admin(&attacker);
@@ -362,9 +362,7 @@ fn test_init_market_admin_limits_enforced() {
             &admin.pubkey(),
             &env.mint,
             &TEST_FEED_ID,
-            1000,   // max_maintenance_fee_per_slot
-            50_000, // max_risk_threshold
-            5000,   // min_oracle_price_cap_e2bps
+            5000,
         ),
     };
 
@@ -401,99 +399,8 @@ fn test_init_market_admin_limits_enforced() {
     println!("INIT MARKET ADMIN LIMITS ENFORCED: PASSED");
 }
 
-/// Verify that InitMarket rejects zero admin limits.
-#[test]
-fn test_init_market_zero_limits_rejected() {
-    program_path();
 
-    let mut env = TestEnv::new();
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    // Zero max_maintenance_fee_per_slot should fail
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: encode_init_market_with_limits(
-            &admin.pubkey(),
-            &env.mint,
-            &TEST_FEED_ID,
-            0,         // INVALID: zero max_maintenance_fee
-            u128::MAX,
-            0,
-        ),
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    assert!(
-        env.svm.send_transaction(tx).is_err(),
-        "Zero max_maintenance_fee should be rejected"
-    );
-
-    // Zero max_risk_threshold should fail
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: encode_init_market_with_limits(
-            &admin.pubkey(),
-            &env.mint,
-            &TEST_FEED_ID,
-            u128::MAX,
-            0, // INVALID: zero max_risk_threshold
-            0,
-        ),
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    assert!(
-        env.svm.send_transaction(tx).is_err(),
-        "Zero max_risk_threshold should be rejected"
-    );
-
-    println!("INIT MARKET ZERO LIMITS REJECTED: PASSED");
-}
-
-/// Verify that UpdateAdmin to zero address is rejected.
+/// Verify admin burn (rotate to zero) lifecycle rules.
 #[test]
 fn test_update_admin_zero_accepted_for_burn() {
     program_path();
@@ -510,11 +417,11 @@ fn test_update_admin_zero_accepted_for_burn() {
     let result = env.try_update_admin(&admin, &zero_pubkey);
     assert!(
         result.is_ok(),
-        "UpdateAdmin to zero should succeed for admin burn"
+        "admin burn should succeed under the lifecycle guard"
     );
 
     // After burn, admin instructions must fail
-    let result = env.try_set_risk_threshold(&admin, 999);
+    let result = env.try_set_oracle_price_cap(&admin, 999);
     assert!(
         result.is_err(),
         "Admin operations must fail after admin burn"
@@ -523,68 +430,12 @@ fn test_update_admin_zero_accepted_for_burn() {
     println!("UPDATE ADMIN ZERO BURN: PASSED");
 }
 
-/// Weaker-authority model (Model 1): admin burn is allowed when
-/// oracle_authority is still set PROVIDED the circuit-breaker cap is
-/// non-zero. The cap bounds what authority can do (it cannot walk the
-/// effective price beyond cap-per-push), so a retained authority is
-/// strictly weaker than admin and a safe survivor of burn. This is the
-/// primary use case for governance-free Pyth-Pull deployments: keep
-/// the authority as a bounded heartbeat/fallback price source that
-/// outlives admin.
-#[test]
-fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // init_market_with_cap seeds oracle_price_cap_e2bps == 10_000 (non-zero),
-    // so the weaker-authority invariant (authority set ⇒ cap != 0) holds.
-    env.init_market_with_cap(0, 10_000, 100);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Configure an oracle authority. With a non-zero cap, this is a
-    // bounded fallback price source, not an admin-equivalent role.
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("set authority must succeed");
-
-    const AUTHORITY_OFF: usize = 136 + 128;
-    let authority_bytes = {
-        let slab = env.svm.get_account(&env.slab).unwrap();
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&slab.data[AUTHORITY_OFF..AUTHORITY_OFF + 32]);
-        b
-    };
-    assert_ne!(
-        authority_bytes, [0u8; 32],
-        "precondition: oracle_authority is configured",
-    );
-
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
-    let result = env.try_update_admin(&admin, &zero_pubkey);
-    assert!(
-        result.is_ok(),
-        "UpdateAdmin burn MUST succeed when authority is set AND cap is \
-         non-zero — the cap constrains authority to a bounded fallback, \
-         which is the weaker-authority model's core guarantee: {:?}",
-        result,
-    );
-
-    // After burn, admin instructions must still fail (authority is NOT
-    // an admin-equivalent — it can only push prices, not configure).
-    let err = env
-        .try_set_risk_threshold(&admin, 999)
-        .expect_err("admin ops must fail after burn");
-    let _ = err;
-}
-
-/// Weaker-authority invariant: SetOracleAuthority on a non-Hyperp
 /// Resolvability invariant: a non-Hyperp market with
 ///   min_oracle_price_cap_e2bps == 0   AND
 ///   permissionless_resolve_stale_slots == 0
-/// has NO resolve path. Admin ResolveMarket needs a pushed
-/// authority_price_e6; under the init-time default, oracle_authority is
-/// zero when min_cap == 0 — so nobody can push and the admin path dies
-/// instantly. ResolvePermissionless is disabled when perm_resolve == 0.
+/// has no resolve path: non-Hyperp markets resolve via a fresh Pyth
+/// read (or the Degenerate arm once the permissionless-stale window
+/// matures), and perm_resolve == 0 disables the window entirely.
 /// The init must reject this combo outright rather than create a
 /// permanently-bricked market.
 #[test]
@@ -611,8 +462,8 @@ fn test_init_rejects_non_hyperp_with_no_resolve_path() {
 
 /// Positive complement: same (cap=0) market with perm_resolve > 0 is
 /// allowed. The perm-stale branch of ResolveMarket settles at
-/// engine.last_oracle_price and does not require authority_price_e6,
-/// so the market retains a resolve path even with oracle_authority = 0.
+/// engine.last_oracle_price and does not require hyperp_mark_e6,
+/// so the market retains a resolve path even with hyperp_authority = 0.
 #[test]
 fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
     program_path();
@@ -647,58 +498,22 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
     assert!(env.is_market_resolved(), "market must flip to Resolved");
 }
 
-/// Burn guard: UpdateAuthority may not zero oracle_authority on a non-
-/// Hyperp market when perm_resolve == 0. The burn would remove the only
-/// path that populates authority_price_e6 (PushOraclePrice), and
-/// perm_resolve == 0 means ResolvePermissionless never matures — every
-/// subsequent ResolveMarket call would reject on authority_price_e6 == 0.
+
+/// SetOraclePriceCap may not disable the circuit breaker (cap = 0) on a
+/// non-Hyperp market that was initialized with a non-zero floor. Silent
+/// runtime disable would defeat the flash-crash protection the floor
+/// promised.
 #[test]
-fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
+fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Non-Hyperp, cap > 0 (so oracle_authority is admin at init),
-    // perm_resolve == 0.
     env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Attempt to burn oracle authority. Must reject.
-    let err = env
-        .try_update_authority(&admin, common::AUTHORITY_ORACLE, None)
-        .expect_err("oracle-authority burn must reject without perm_resolve");
-    assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
-    );
-}
-
-/// Weaker-authority invariant: SetOraclePriceCap may not disable the
-/// cap (set it to 0) on a non-Hyperp market while oracle_authority is
-/// configured. Disabling the cap would upgrade authority from a
-/// bounded fallback to an admin-equivalent role. Admins wanting to
-/// remove the cap must first zero out the authority.
-#[test]
-fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    // Init with min_cap > 0 so oracle_authority defaults to admin
-    // (under the init-time invariant — non-Hyperp + cap=0 zeroes
-    // authority). permissionless_resolve=0 keeps the test simple.
-    env.init_market_with_cap(0, 10_000, 0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Admin starts as oracle_authority. The weaker-authority
-    // invariant must prevent disabling the cap while the slot is
-    // still non-zero.
     let err = env
         .try_set_oracle_price_cap(&admin, 0)
-        .expect_err(
-            "SetOraclePriceCap(0) must reject when authority is set — \
-             would make authority unbounded on every push",
-        );
+        .expect_err("SetOraclePriceCap(0) must reject when floor != 0");
     assert!(
         err.contains("0x1a"),
         "expected InvalidConfigParam, got: {}", err,
@@ -997,9 +812,7 @@ fn test_admin_limits_lifecycle() {
             &admin.pubkey(),
             &env.mint,
             &TEST_FEED_ID,
-            1000,   // max_maintenance_fee
-            50_000, // max_risk_threshold
-            5000,   // min_oracle_price_cap_e2bps
+            5000,
         ),
     };
 
@@ -1017,7 +830,7 @@ fn test_admin_limits_lifecycle() {
     env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     // Step 2: UpdateConfig with thresh_max at limit
-    env.try_update_config_with_params(&admin, 3600, 1000, 0, 50_000)
+    env.try_update_config_with_params(&admin, 3600)
         .unwrap();
 
     // Step 3: Crank
@@ -1033,31 +846,21 @@ fn test_admin_limits_lifecycle() {
     // Step 5: At-limit values still work
     env.try_set_oracle_price_cap(&admin, 5000).unwrap();
 
-    // Step 6: Verify limit fields in config haven't been corrupted
+    // Step 6: Verify limit fields in config haven't been corrupted.
+    //   min_oracle_price_cap_e2bps: u64 @ config offset 208
+    //   maintenance_fee_per_slot:   u128 @ config offset 336
     let slab = env.svm.get_account(&env.slab).unwrap();
-    // BPF slab offsets: HEADER_LEN(72) + config field offset
-    // maintenance_fee_per_slot: u128 @ config offset 352
-    // max_insurance_floor: u128 @ config offset 208
-    // min_oracle_price_cap_e2bps: u64 @ config offset 224
-    const MAINT_FEE_OFF: usize = 136 + 352;
-    const MAX_INS_FLOOR_OFF: usize = 136 + 208;
-    const MIN_OPC_OFF: usize = 136 + 224;
+    const MAINT_FEE_OFF: usize = 136 + 336;
+    const MIN_OPC_OFF: usize = 136 + 208;
 
     let maint_fee = u128::from_le_bytes(
         slab.data[MAINT_FEE_OFF..MAINT_FEE_OFF + 16].try_into().unwrap(),
-    );
-    let max_ins = u128::from_le_bytes(
-        slab.data[MAX_INS_FLOOR_OFF..MAX_INS_FLOOR_OFF + 16].try_into().unwrap(),
     );
     let min_opc = u64::from_le_bytes(
         slab.data[MIN_OPC_OFF..MIN_OPC_OFF + 8].try_into().unwrap(),
     );
 
-    // maintenance_fee_per_slot is disabled at init (the feature has an unsound
-    // between-cranks behavior pending per-account accrual). Encoders that
-    // used to pass a non-zero fee now coerce it to 0; the stored value is 0.
     assert_eq!(maint_fee, 0, "maintenance_fee_per_slot is disabled at init");
-    assert_eq!(max_ins, 50_000, "max_insurance_floor should be preserved");
     assert_eq!(min_opc, 5000, "min_oracle_price_cap_e2bps should be preserved");
 
     println!("ADMIN LIMITS LIFECYCLE: PASSED");
@@ -1232,7 +1035,6 @@ fn test_update_config_rejects_negative_funding_max_premium() {
             3600, 100,
             -100i64,  // negative funding_max_premium_bps — must be rejected
             10i64,
-            0u128, 100, 100, 100, 5000, 0, 1_000_000u128, 1u128,
         ),
     };
     let tx = Transaction::new_signed_with_payer(
@@ -1245,9 +1047,9 @@ fn test_update_config_rejects_negative_funding_max_premium() {
     assert_eq!(env.read_update_config_snapshot(), config_before, "config must be preserved after rejected UpdateConfig");
 }
 
-/// UpdateConfig must reject negative funding_max_bps_per_slot.
+/// UpdateConfig must reject negative funding_max_e9_per_slot.
 #[test]
-fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
+fn test_update_config_rejects_negative_funding_max_e9_per_slot() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -1266,15 +1068,14 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
         data: encode_update_config(
             3600, 100,
             100i64,
-            -5i64,  // negative funding_max_bps_per_slot — must be rejected
-            0u128, 100, 100, 100, 5000, 0, 1_000_000u128, 1u128,
+            -5i64,  // negative funding_max_e9_per_slot — must be rejected
         ),
     };
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), ix], Some(&admin.pubkey()), &[&admin], env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "Negative funding_max_bps_per_slot must be rejected");
+    assert!(result.is_err(), "Negative funding_max_e9_per_slot must be rejected");
 
     // Config must be unchanged after rejection
     assert_eq!(env.read_update_config_snapshot(), config_before, "config must be preserved after rejected UpdateConfig");
@@ -1371,13 +1172,7 @@ fn test_update_config_rejects_zero_horizon() {
     let config_before = env.read_update_config_snapshot();
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let result = env.try_update_config_with_params(
-        &admin,
-        0,                        // funding_horizon_slots = 0 (invalid)
-        1000,                     // thresh_alpha_bps
-        0u128,                    // thresh_min
-        1_000_000_000_000_000u128, // thresh_max
-    );
+    let result = env.try_update_config_with_params(&admin, 0);
     assert!(
         result.is_err(),
         "UpdateConfig must reject funding_horizon_slots = 0"
@@ -1401,13 +1196,7 @@ fn test_update_config_admin_only() {
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
 
-    let result = env.try_update_config_with_params(
-        &attacker,
-        3600,
-        1000,
-        0u128,
-        1_000_000_000_000_000u128,
-    );
+    let result = env.try_update_config_with_params(&attacker, 3600);
     assert!(
         result.is_err(),
         "UpdateConfig must reject non-admin signer"
@@ -1418,9 +1207,9 @@ fn test_update_config_admin_only() {
 // UpdateAuthority (4-way split) — positive and negative paths for each kind
 // ============================================================================
 
-/// Precondition: new markets default insurance_authority + close_authority
-/// to the creator's pubkey (super-admin by default). Confirms the default
-/// so subsequent tests can rely on it.
+/// Precondition: new markets default insurance_authority to the creator's
+/// pubkey (super-admin by default). Confirms the default so subsequent
+/// tests can rely on it.
 #[test]
 fn test_update_authority_init_defaults_match_admin() {
     program_path();
@@ -1430,12 +1219,10 @@ fn test_update_authority_init_defaults_match_admin() {
     let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // UpdateAuthority with the current admin signing + new_authority = self
-    // must succeed for insurance and close kinds — which proves the
-    // current authority on both slots IS the admin pubkey at init.
+    // must succeed for insurance — which proves the current authority IS
+    // the admin pubkey at init.
     env.try_update_authority(&admin_kp, AUTHORITY_INSURANCE, Some(&admin_kp))
         .expect("init default: insurance_authority == admin");
-    env.try_update_authority(&admin_kp, AUTHORITY_CLOSE, Some(&admin_kp))
-        .expect("init default: close_authority == admin");
 }
 
 /// UpdateAuthority happy path: admin delegates insurance_authority to a
@@ -1472,7 +1259,7 @@ fn test_update_authority_negative_wrong_current_signer() {
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let target = Keypair::new();
 
-    for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE, AUTHORITY_CLOSE] {
+    for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE] {
         let err = env
             .try_update_authority(&attacker, kind, Some(&target))
             .expect_err("attacker must not be able to transfer authority");
@@ -1549,13 +1336,8 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
     env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
         .expect("burn insurance_authority");
 
-    // admin (still valid) should be able to delegate close_authority.
-    let close_delegate = Keypair::new();
-    env.try_update_authority(&admin, AUTHORITY_CLOSE, Some(&close_delegate))
-        .expect("admin still acts on close_authority after insurance_authority burn");
-
-    // admin → new admin transfer should also still work (proves the
-    // admin kind is independent of the insurance-authority burn).
+    // admin → new admin transfer should still work (proves the admin
+    // kind is independent of the insurance-authority burn).
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
     env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin))
@@ -1657,4 +1439,224 @@ fn test_set_oracle_authority_rejects_nonzero_on_non_hyperp_with_cap_zero() {
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
     env.try_set_oracle_authority_raw(&admin, &zero_pubkey)
         .expect("zeroing an already-zero authority must succeed");
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_init_market_zero_limits_rejected() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Zero max_maintenance_fee_per_slot should fail
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            0,         // INVALID: zero max_maintenance_fee
+            u128::MAX,
+            0,
+        ),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "Zero max_maintenance_fee should be rejected"
+    );
+
+    // Zero max_risk_threshold should fail
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            u128::MAX,
+            0, // INVALID: zero max_risk_threshold
+            0,
+        ),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "Zero max_risk_threshold should be rejected"
+    );
+
+    println!("INIT MARKET ZERO LIMITS REJECTED: PASSED");
+}
+
+#[test]
+fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // init_market_with_cap seeds oracle_price_cap_e2bps == 10_000 (non-zero),
+    // so the weaker-authority invariant (authority set ⇒ cap != 0) holds.
+    env.init_market_with_cap(0, 10_000, 100);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Configure an oracle authority. With a non-zero cap, this is a
+    // bounded fallback price source, not an admin-equivalent role.
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set authority must succeed");
+
+    const AUTHORITY_OFF: usize = 136 + 128;
+    let authority_bytes = {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&slab.data[AUTHORITY_OFF..AUTHORITY_OFF + 32]);
+        b
+    };
+    assert_ne!(
+        authority_bytes, [0u8; 32],
+        "precondition: oracle_authority is configured",
+    );
+
+    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
+    let result = env.try_update_admin(&admin, &zero_pubkey);
+    assert!(
+        result.is_ok(),
+        "UpdateAdmin burn MUST succeed when authority is set AND cap is \
+         non-zero — the cap constrains authority to a bounded fallback, \
+         which is the weaker-authority model's core guarantee: {:?}",
+        result,
+    );
+
+    // After burn, admin instructions must still fail (authority is NOT
+    // an admin-equivalent — it can only push prices, not configure).
+    let err = env
+        .try_set_risk_threshold(&admin, 999)
+        .expect_err("admin ops must fail after burn");
+    let _ = err;
+}
+
+#[test]
+fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Non-Hyperp, cap > 0 (so oracle_authority is admin at init),
+    // perm_resolve == 0.
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Attempt to burn oracle authority. Must reject.
+    let err = env
+        .try_update_authority(&admin, common::AUTHORITY_ORACLE, None)
+        .expect_err("oracle-authority burn must reject without perm_resolve");
+    assert!(
+        err.contains("0x1a"),
+        "expected InvalidConfigParam, got: {}", err,
+    );
+}
+
+#[test]
+fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Init with min_cap > 0 so oracle_authority defaults to admin
+    // (under the init-time invariant — non-Hyperp + cap=0 zeroes
+    // authority). permissionless_resolve=0 keeps the test simple.
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Admin starts as oracle_authority. The weaker-authority
+    // invariant must prevent disabling the cap while the slot is
+    // still non-zero.
+    let err = env
+        .try_set_oracle_price_cap(&admin, 0)
+        .expect_err(
+            "SetOraclePriceCap(0) must reject when authority is set — \
+             would make authority unbounded on every push",
+        );
+    assert!(
+        err.contains("0x1a"),
+        "expected InvalidConfigParam, got: {}", err,
+    );
+}
+
+#[test]
+fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Capture config snapshot before rejected operation
+    let config_before = env.read_update_config_snapshot();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_update_config(
+            3600, 100,
+            100i64,
+            -5i64,  // negative funding_max_bps_per_slot — must be rejected
+            0u128, 100, 100, 100, 5000, 0, 1_000_000u128, 1u128,
+        ),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix], Some(&admin.pubkey()), &[&admin], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "Negative funding_max_bps_per_slot must be rejected");
+
+    // Config must be unchanged after rejection
+    assert_eq!(env.read_update_config_snapshot(), config_before, "config must be preserved after rejected UpdateConfig");
 }

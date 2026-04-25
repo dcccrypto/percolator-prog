@@ -27,6 +27,31 @@ pub use std::path::PathBuf;
 pub const SLAB_LEN: usize = 1484728; // v12.17 + Phase A (+48) + Phase E (+32) = 1484648+80
 pub const MAX_ACCOUNTS: usize = 4096;
 
+// BPF-target offsets within RiskEngine — cfg-gated because the
+// bitmap and free_list arrays scale with MAX_ACCOUNTS. The BITMAP
+// offset itself is tier-independent (fields before it are size-
+// invariant); NUM_USED_OFFSET = BITMAP + bitmap_size; ACCOUNTS_OFFSET
+// = NUM_USED + 4 (num_used_accounts u16 + free_head u16) + 4 (align
+// padding to 8) + 2 × MAX_ACCOUNTS × 2 (next_free + prev_free u16
+// arrays). Values observed against the compiled BPF binary for each
+// tier.
+pub const ENGINE_BITMAP_OFFSET: usize = 696;
+
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const ENGINE_NUM_USED_OFFSET: usize = 728;
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 1760;
+
+#[cfg(all(feature = "medium", not(feature = "small")))]
+pub const ENGINE_NUM_USED_OFFSET: usize = 824;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 4928;
+
+#[cfg(not(any(feature = "small", feature = "medium")))]
+pub const ENGINE_NUM_USED_OFFSET: usize = 1208;
+#[cfg(not(any(feature = "small", feature = "medium")))]
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 17600;
+
 // Pyth Receiver program ID
 pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
@@ -124,7 +149,18 @@ pub fn make_mint_data() -> Vec<u8> {
     data
 }
 
-/// Create PriceUpdateV2 mock data (Pyth Pull format)
+/// Create PriceUpdateV2 mock data (Pyth Pull format — Full variant).
+///
+/// Byte layout matches the on-chain Pyth Solana Receiver v2 account
+/// as verified against real mainnet snapshots. VerificationLevel::Full
+/// is Borsh-encoded as a single discriminant byte (0x01) with no
+/// payload, so price_message begins at byte 41 (not 42). Accounts are
+/// allocated to LEN=134 but only 133 bytes are used for Full variant;
+/// byte 133 is unused trailing zero. Fields in PriceFeedMessage match
+/// pythnet-sdk 2.3.1 declaration order:
+///   feed_id(32) price(8) conf(8) exponent(4) publish_time(8)
+///   prev_publish_time(8) ema_price(8) ema_conf(8) = 84 bytes
+/// followed by posted_slot(8).
 pub fn make_pyth_data(
     feed_id: &[u8; 32],
     price: i64,
@@ -133,13 +169,17 @@ pub fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
-    // verification_level = 1 (Full) at offset 40 (u16 LE)
-    data[40..42].copy_from_slice(&1u16.to_le_bytes());
-    data[42..74].copy_from_slice(feed_id);
-    data[74..82].copy_from_slice(&price.to_le_bytes());
-    data[82..90].copy_from_slice(&conf.to_le_bytes());
-    data[90..94].copy_from_slice(&expo.to_le_bytes());
-    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
+    // VerificationLevel::Full = 1-byte discriminant 0x01 at offset 40.
+    data[40] = 1;
+    // PriceFeedMessage starts at byte 41.
+    data[41..73].copy_from_slice(feed_id);                       // 32
+    data[73..81].copy_from_slice(&price.to_le_bytes());          //  8
+    data[81..89].copy_from_slice(&conf.to_le_bytes());           //  8
+    data[89..93].copy_from_slice(&expo.to_le_bytes());           //  4
+    data[93..101].copy_from_slice(&publish_time.to_le_bytes());  //  8
+    // prev_publish_time @ 101..109, ema_price @ 109..117, ema_conf @
+    // 117..125 are all zeroed — tests don't rely on them today.
+    // posted_slot @ 125..133, also zeroed.
     data
 }
 
@@ -195,7 +235,6 @@ pub fn encode_init_market_hyperp_with_stale(
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&initial_mark_price_e6.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps (Hyperp default kicks in)
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
@@ -204,7 +243,6 @@ pub fn encode_init_market_hyperp_with_stale(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     // max_crank_staleness: must be < perm_resolve
     let max_crank = if permissionless_resolve_stale_slots > 0 {
@@ -217,7 +255,6 @@ pub fn encode_init_market_hyperp_with_stale(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
@@ -226,7 +263,7 @@ pub fn encode_init_market_hyperp_with_stale(
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
     // force_close_delay must be > 0 when perm_resolve > 0
     let force_close = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 };
@@ -255,7 +292,6 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&initial_mark_price_e6.to_le_bytes()); // initial_mark_price_e6
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     // Resolvability invariant: ship max cap for non-Hyperp since the
     // default tail has perm_resolve=0.
     let default_cap: u64 = if feed_id == &[0u8; 32] { 0 } else { 1_000_000 };
@@ -267,15 +303,13 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     append_default_extended_tail(&mut data);
@@ -301,7 +335,6 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(&initial_mark_price_e6.to_le_bytes()); // initial_mark_price_e6
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
     // rejected at init. Default tail uses perm_resolve=0, so non-Hyperp
     // feeds need cap > 0. Hyperp (feed_id all-zero) is exempt and can
@@ -317,15 +350,13 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     // Full extended tail (required — no partial tails allowed)
@@ -354,7 +385,6 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
     // Per-market admin limits
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
@@ -363,7 +393,6 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     // max_crank_staleness_slots: use bounded value when permissionless resolve is enabled
@@ -378,7 +407,6 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     // Full extended tail (82 bytes)
@@ -409,7 +437,7 @@ pub fn encode_init_market_with_funding(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
     funding_max_premium_bps: i64,
-    funding_max_bps_per_slot: i64,
+    funding_max_e9_per_slot: i64,
 ) -> Vec<u8> {
     let mut data = encode_init_market_with_cap(
         admin,
@@ -426,7 +454,7 @@ pub fn encode_init_market_with_funding(
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
-    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
+    data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
     let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 };
     data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
@@ -444,14 +472,14 @@ pub fn encode_init_market_with_min_fee(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
     funding_max_premium_bps: i64,
-    funding_max_bps_per_slot: i64,
+    funding_max_e9_per_slot: i64,
     mark_min_fee: u64,
 ) -> Vec<u8> {
     let mut data = encode_init_market_with_funding(
         admin, mint, feed_id, invert,
         min_oracle_price_cap_e2bps, permissionless_resolve_stale_slots,
         funding_horizon_slots, funding_k_bps,
-        funding_max_premium_bps, funding_max_bps_per_slot,
+        funding_max_premium_bps, funding_max_e9_per_slot,
     );
     // Truncate default mark_min_fee + force_close_delay (16 bytes), replace with custom
     data.truncate(data.len() - 16);
@@ -482,7 +510,6 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
@@ -491,15 +518,13 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
@@ -510,7 +535,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     // mark_min_fee
     data.extend_from_slice(&mark_min_fee.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
@@ -541,7 +566,6 @@ pub fn encode_init_market_with_maint_fee_bounded(
     // maintenance_fee_per_slot now passed through (engine v12.18.4 supports
     // per-account fee accrual via sync_account_fee_to_slot_not_atomic).
     data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
     // rejected at init. This helper's tail uses perm_resolve=0, so
     // promote cap=0 callers to the max cap (100%/read — essentially
@@ -560,15 +584,13 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     append_default_extended_tail(&mut data);
@@ -819,8 +841,8 @@ impl TestEnv {
 
     pub fn init_market_with_invert(&mut self, invert: u8) {
         // Delegate to init_market_with_cap with min_cap=10_000 so the
-        // init-time invariant (non-Hyperp + cap=0 → oracle_authority=0)
-        // doesn't zero oracle_authority for tests that later expect to
+        // init-time invariant (non-Hyperp + cap=0 → hyperp_authority=0)
+        // doesn't zero hyperp_authority for tests that later expect to
         // use it. Tests that want the cap=0 behavior use
         // init_market_with_cap directly with 0.
         self.init_market_with_cap(invert, 10_000, 0);
@@ -891,7 +913,7 @@ impl TestEnv {
         funding_horizon_slots: u64,
         funding_k_bps: u64,
         funding_max_premium_bps: i64,
-        funding_max_bps_per_slot: i64,
+        funding_max_e9_per_slot: i64,
     ) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
@@ -931,7 +953,7 @@ impl TestEnv {
                 funding_horizon_slots,
                 funding_k_bps,
                 funding_max_premium_bps,
-                funding_max_bps_per_slot,
+                funding_max_e9_per_slot,
             ),
         };
 
@@ -1613,8 +1635,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    // min_oracle_price_cap_e2bps = 10_000 so oracle_authority defaults
+    // min_oracle_price_cap_e2bps = 10_000 so hyperp_authority defaults
     // to admin under the init-time invariant. Tests that specifically
     // want cap=0 should use init_market_with_cap(..., 0, ...) directly.
     data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
@@ -1625,15 +1646,13 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&new_account_fee.to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     append_default_extended_tail(&mut data);
@@ -1659,7 +1678,6 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     // Resolvability invariant: non-Hyperp + cap=0 + perm_resolve=0 is
     // rejected at init. Default tail has perm_resolve=0, so ship max
     // cap to satisfy the invariant without restricting test oracle
@@ -1672,15 +1690,13 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     append_default_extended_tail(&mut data);
@@ -1833,10 +1849,10 @@ impl TestEnv {
         u16::from_le_bytes(bytes)
     }
 
-    /// Read authority_price_e6 from config (mark price for Hyperp, settlement for non-Hyperp)
+    /// Read hyperp_mark_e6 from config (mark price for Hyperp, settlement for non-Hyperp)
     pub fn read_authority_price(&self) -> u64 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        percolator_prog::state::read_config(&d).authority_price_e6
+        percolator_prog::state::read_config(&d).hyperp_mark_e6
     }
 
     /// Read last_effective_price_e6 from config (index for Hyperp, baseline for non-Hyperp)
@@ -1882,10 +1898,10 @@ impl TestEnv {
         percolator_prog::state::read_config(&d).funding_max_premium_bps
     }
 
-    /// Read funding_max_bps_per_slot from config
-    pub fn read_funding_max_bps_per_slot(&self) -> i64 {
+    /// Read funding_max_e9_per_slot from config
+    pub fn read_funding_max_e9_per_slot(&self) -> i64 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        percolator_prog::state::read_config(&d).funding_max_bps_per_slot
+        percolator_prog::state::read_config(&d).funding_max_e9_per_slot
     }
 
     /// Read mark_min_fee from config.
@@ -2634,26 +2650,36 @@ pub fn encode_liquidate(target_idx: u16) -> Vec<u8> {
 pub fn encode_update_config(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
-    funding_max_premium_bps: i64,        // i64!
-    funding_max_bps_per_slot: i64,       // i64!
-    // Legacy trailing threshold fields kept in the signature so test call
-    // sites compile unchanged. The wrapper's UpdateConfig ABI no longer
-    // accepts them — the decoder rejects trailing bytes — so we swallow
-    // them here instead of writing them.
-    _thresh_floor: u128,
-    _thresh_risk_bps: u64,
-    _thresh_update_interval_slots: u64,
-    _thresh_step_bps: u64,
-    _thresh_alpha_bps: u64,
-    _thresh_min: u128,
-    _thresh_max: u128,
-    _thresh_min_step: u128,
+    funding_max_premium_bps: i64,
+    funding_max_e9_per_slot: i64,
 ) -> Vec<u8> {
     let mut data = vec![14u8]; // Tag 14: UpdateConfig
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
-    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes()); // i64
-    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes()); // i64
+    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
+    data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
+    // tvl_insurance_cap_mult (u16): default helper keeps the cap disabled (0);
+    // use encode_update_config_with_cap to set it explicitly.
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data
+}
+
+/// Variant of encode_update_config that sets the admin-opt-in deposit cap
+/// (tvl_insurance_cap_mult). 0 disables; nonzero enforces
+/// `c_tot_new <= k * insurance_fund.balance` on DepositCollateral.
+pub fn encode_update_config_with_cap(
+    funding_horizon_slots: u64,
+    funding_k_bps: u64,
+    funding_max_premium_bps: i64,
+    funding_max_e9_per_slot: i64,
+    tvl_insurance_cap_mult: u16,
+) -> Vec<u8> {
+    let mut data = vec![14u8]; // Tag 14: UpdateConfig
+    data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
+    data.extend_from_slice(&funding_k_bps.to_le_bytes());
+    data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
+    data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
+    data.extend_from_slice(&tvl_insurance_cap_mult.to_le_bytes());
     data
 }
 
@@ -2862,16 +2888,11 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Raw single-call ResolvePermissionless. Production semantics: first call
-    /// during a stale window stamps `first_observed_stale_slot` and returns
-    /// OracleStale; a second call after `permissionless_resolve_stale_slots`
-    /// have elapsed succeeds. Tests asserting specific single-call behavior
-    /// (e.g., rejecting a premature resolve after idle) should use this.
-    /// ResolvePermissionless in the strict hard-timeout model takes just
-    /// the slab and clock sysvar — no oracle account. The timer anchor
-    /// is config.last_good_oracle_slot (non-Hyperp) or the mark slot
-    /// (Hyperp). Single-call: the instruction either succeeds
-    /// (window matured) or returns OracleStale (not yet).
+    /// Single-call ResolvePermissionless. The instruction takes just the
+    /// slab + clock sysvar (no oracle account) under the strict hard-
+    /// timeout model: the timer anchor is `config.last_good_oracle_slot`
+    /// (non-Hyperp) or the mark slot (Hyperp). Succeeds if the window
+    /// matured, otherwise returns OracleStale.
     pub fn try_resolve_permissionless_once(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
@@ -3105,18 +3126,10 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
-                3600,                      // funding_horizon_slots
-                100,                       // funding_k_bps
-                100i64,                    // funding_max_premium_bps (i64)
-                10i64,                     // funding_max_bps_per_slot (i64)
-                0u128,                     // thresh_floor (u128)
-                100,                       // thresh_risk_bps
-                100,                       // thresh_update_interval_slots
-                100,                       // thresh_step_bps
-                1000,                      // thresh_alpha_bps
-                0u128,                     // thresh_min
-                1_000_000_000_000_000u128, // thresh_max
-                1u128,                     // thresh_min_step
+                3600,// funding_horizon_slots
+                100,// funding_k_bps
+                100i64,// funding_max_premium_bps (i64)
+                10i64,// funding_max_e9_per_slot (i64)
             ),
         };
         let tx = Transaction::new_signed_with_payer(
@@ -3131,72 +3144,6 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 }
-
-// ============================================================================
-// Test: UpdateAdmin authorization
-// ============================================================================
-
-/// CRITICAL: UpdateAdmin only callable by current admin
-
-
-// ============================================================================
-// Test: SetRiskThreshold authorization
-// ============================================================================
-
-/// CRITICAL: SetRiskThreshold admin-only
-// ============================================================================
-// Test: SetOracleAuthority and PushOraclePrice (admin oracle)
-// ============================================================================
-
-/// CRITICAL: Admin oracle mechanism for Hyperp mode
-
-
-// ============================================================================
-// Test: SetOraclePriceCap authorization
-// ============================================================================
-
-/// CRITICAL: SetOraclePriceCap admin-only
-
-
-// ============================================================================
-// Test: SetMaintenanceFee authorization
-// ============================================================================
-
-/// CRITICAL: SetMaintenanceFee admin-only
-// ============================================================================
-// Test: UpdateConfig authorization
-// ============================================================================
-
-/// CRITICAL: UpdateConfig admin-only with all parameters
-
-
-// ============================================================================
-// Test: CloseSlab requires zero balances
-// ============================================================================
-
-/// CRITICAL: CloseSlab only by admin, requires zero vault/insurance
-
-
-// ============================================================================
-// Test: Double initialization rejected
-// ============================================================================
-
-/// CRITICAL: InitMarket rejects already initialized slab
-
-
-// ============================================================================
-// Test: Invalid account indices rejected
-// ============================================================================
-
-/// CRITICAL: Invalid user_idx/lp_idx are rejected
-
-
-// ============================================================================
-// Test: Sell trades (negative size)
-// ============================================================================
-
-/// Test that sell trades (negative size) work correctly
-
 
 // ============================================================================
 // TradeCpi Program-Match Tests
@@ -4836,12 +4783,12 @@ impl TestEnv {
 /// Expected: Owner check rejects.
 
 
-/// ATTACK: Non-admin tries admin operations (UpdateAdmin,
+/// ATTACK: Non-admin tries admin operations (UpdateAuthority { AUTHORITY_ADMIN },
 /// UpdateConfig, SetMaintenanceFee, ResolveMarket).
 /// Expected: All admin operations fail for non-admin.
 
 
-/// UpdateAdmin to zero address permanently burns admin authority.
+/// UpdateAuthority burn: zero address permanently removes admin.
 /// After burning, all admin instructions must fail.
 
 
@@ -4860,12 +4807,10 @@ impl TestEnv {
 /// ATTACK: OI-increasing trade when long side is in DrainOnly mode (spec §9.6).
 /// Expected: Trade rejected with SideBlocked → EngineRiskReductionOnlyMode (0x16).
 ///
-/// The new spec (§9.6) uses side-mode gating: trades that increase net side OI
-/// on DrainOnly/ResetPending sides are rejected (RiskError::SideBlocked →
-/// EngineRiskReductionOnlyMode). The old insurance_floor is no longer a trade gate;
-/// it governs insurance withdrawal reserves only.
+/// Side-mode gating (§9.6): trades that increase net side OI on
+/// DrainOnly/ResetPending sides are rejected.
 ///
-/// To trigger DrainOnly in a live integration scenario requires many ADL cycles
+/// Triggering DrainOnly in a live integration scenario requires many ADL cycles
 /// (A_side decaying below MIN_A_SIDE = 2^64), which is impractical to set up.
 /// Instead, this test directly sets side_mode_long = DrainOnly (1) via raw byte
 /// manipulation of the slab, then verifies the gating and error code mapping.
@@ -5121,7 +5066,6 @@ impl TestEnv {
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         // Per-market admin limits (uncapped defaults for tests)
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
-        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
         // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
         data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
         // RiskParams
@@ -5131,15 +5075,13 @@ impl TestEnv {
         data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-        data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
         data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-        data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+        data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
 
@@ -5211,15 +5153,13 @@ impl TestEnv {
         data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-        data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
         data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-        data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+        data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-        data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
         data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
         append_default_extended_tail(&mut data);
@@ -5690,9 +5630,6 @@ impl TestEnv {
 /// Expected: Engine-level guards prevent dangerous configurations.
 
 
-/// Admin can rapidly toggle insurance_floor via SetRiskThreshold.
-/// Per spec v10.5, insurance_floor does NOT gate trades — it only reserves
-/// insurance fund balance. Trades succeed regardless of floor value.
 // ============================================================================
 // 20. Integer Boundary Tests
 // ============================================================================
@@ -5750,9 +5687,6 @@ impl TestEnv {
         &mut self,
         signer: &Keypair,
         funding_horizon_slots: u64,
-        thresh_alpha_bps: u64,
-        thresh_min: u128,
-        thresh_max: u128,
     ) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
@@ -5767,17 +5701,9 @@ impl TestEnv {
             ],
             data: encode_update_config(
                 funding_horizon_slots,
-                100, // funding_k_bps
-                100i64, // funding_max_premium_bps
-                10i64,  // funding_max_bps_per_slot
-                0u128,  // thresh_floor
-                100,    // thresh_risk_bps
-                100,    // thresh_update_interval_slots
-                100,    // thresh_step_bps
-                thresh_alpha_bps,
-                thresh_min,
-                thresh_max,
-                1u128, // thresh_min_step
+                100,// funding_k_bps
+                100i64,// funding_max_premium_bps
+                10i64,// funding_max_e9_per_slot
             ),
         };
         let tx = Transaction::new_signed_with_payer(
@@ -5829,8 +5755,8 @@ impl TestEnv {
 // 23. Oracle Authority Lifecycle
 // ============================================================================
 
-/// ATTACK: Setting oracle authority to [0;32] disables authority price and clears stored price.
-/// Expected: After setting to zero, PushOraclePrice fails, authority_price_e6 is cleared.
+/// ATTACK: burning hyperp_authority disables PushHyperpMark.
+/// Expected: After zeroing the authority, PushHyperpMark fails.
 
 
 /// ATTACK: Oracle authority change mid-flight (while positions open).
@@ -6276,7 +6202,7 @@ impl TestEnv {
 /// Many tiny trades should not accumulate rounding profit.
 
 
-/// ATTACK: UpdateAdmin to zero address is now rejected at the instruction level.
+/// ATTACK: UpdateAuthority { AUTHORITY_ADMIN } to zero is rejected when the lifecycle guard fails.
 /// Verify that the zero-admin foot-gun guard prevents the lockout.
 
 
@@ -6477,7 +6403,7 @@ impl TestEnv {
 /// After closing, trying to use the freed slot as counterparty should error.
 
 
-/// ATTACK: UpdateAdmin then attempt old admin operations.
+/// ATTACK: rotate admin, then attempt old admin operations.
 /// After admin transfer, old admin should be unable to perform admin operations.
 
 
@@ -6492,7 +6418,7 @@ impl TestEnv {
 // ============================================================================
 
 /// ATTACK: UpdateConfig with extreme funding parameters.
-/// Set funding_max_bps_per_slot to max i64, verify crank doesn't overflow.
+/// Set funding_max_e9_per_slot to max i64, verify crank doesn't overflow.
 
 
 /// ATTACK: Zero-slot crank loops shouldn't compound funding.
@@ -6568,7 +6494,7 @@ impl TestEnv {
 
 
 /// ATTACK: Funding with extreme max_bps_per_slot.
-/// Set funding_max_bps_per_slot to extreme value, verify engine caps at ±10,000.
+/// Set funding_max_e9_per_slot to extreme value, verify engine caps at ±10,000.
 
 
 /// ATTACK: Deposit with wrong mint token account.
@@ -6681,14 +6607,14 @@ impl TestEnv {
 /// CloseSlab requires num_used_accounts == 0, so dormant accounts block it.
 
 
-/// ATTACK: UpdateAdmin transfers control, old admin tries operation.
-/// After UpdateAdmin, the old admin should be unauthorized.
+/// ATTACK: admin rotated; old admin tries operation.
+/// After the rotation the previous admin should be unauthorized.
 
 
 
 /// ATTACK: Set maintenance fee to extreme value, accrue fees.
 /// Verify fee debt accumulates but doesn't cause overflow or negative capital.
-/// ATTACK: SetOracleAuthority to zero disables PushOraclePrice.
+/// ATTACK: burning hyperp_authority disables PushHyperpMark.
 /// Oracle authority cleared means stored price is cleared and push fails.
 
 
@@ -6696,14 +6622,11 @@ impl TestEnv {
 /// Verify each LP's position is tracked independently and conservation holds.
 
 
-/// Per spec v10.5, insurance_floor (SetRiskThreshold) does NOT gate trades.
-/// Trade gating is side-mode based (DrainOnly/ResetPending only).
-/// This test verifies that changing insurance_floor does not affect trading.
 /// ATTACK: Close account after round-trip trade with PnL.
 /// Protocol requires position=0 and PnL=0 for close.
 
 
-/// ATTACK: UpdateAdmin to same address (no-op).
+/// ATTACK: UpdateAuthority { AUTHORITY_ADMIN } to same address (no-op).
 /// Should succeed without side effects.
 
 
@@ -6964,7 +6887,7 @@ impl TestEnv {
 /// Changing funding parameters mid-flight should not cause retroactive errors.
 
 
-/// ATTACK: PushOraclePrice with same price as last effective price.
+/// ATTACK: PushHyperpMark with same price as last effective price.
 /// When price doesn't change, circuit breaker should produce stable state.
 
 
@@ -6996,11 +6919,11 @@ impl TestEnv {
 /// Admin config changes should be blocked after market resolution.
 
 
-/// ATTACK: PushOraclePrice after resolution.
+/// ATTACK: PushHyperpMark after resolution.
 /// Settlement parameters must be frozen once market is resolved.
 
 
-/// ATTACK: SetOracleAuthority after resolution.
+/// ATTACK: UpdateAuthority { AUTHORITY_HYPERP_MARK } after resolution.
 /// Oracle authority must remain frozen once market is resolved.
 
 
@@ -7021,10 +6944,6 @@ impl TestEnv {
 /// Tests slot reuse and state cleanliness after GC in multi-user scenario.
 
 
-/// SetRiskThreshold sets insurance_floor. Per spec §4.7, insurance_floor
-/// reserves a portion of the insurance fund that cannot be withdrawn.
-/// Trades are NOT gated by insurance_floor (spec v10.5 uses side-mode gating).
-/// This test verifies insurance_floor can be set and the engine state is consistent.
 /// ATTACK: LP tries to withdraw when haircut is active (vault < c_tot + insurance).
 /// After a user takes a large loss, LP capital might be haircutted - can LP
 /// withdraw more than their haircutted equity?
@@ -7702,8 +7621,6 @@ pub fn encode_init_market_with_limits(
     admin: &Pubkey,
     mint: &Pubkey,
     feed_id: &[u8; 32],
-    max_maintenance_fee: u128,
-    max_risk_threshold: u128,
     min_oracle_price_cap_e2bps: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
@@ -7715,14 +7632,8 @@ pub fn encode_init_market_with_limits(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    // Per-market admin limits.
-    // maintenance_fee_per_slot is gated to 0 at init — the feature is disabled
-    // pending per-account accrual. Ignore the `max_maintenance_fee` arg and
-    // always write 0 so these test helpers keep compiling without touching
-    // every call site.
-    let _ = max_maintenance_fee;
+    // maintenance_fee_per_slot is disabled at init.
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (disabled)
-    data.extend_from_slice(&max_risk_threshold.to_le_bytes());
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
@@ -7731,15 +7642,13 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     append_default_extended_tail(&mut data);
@@ -7768,7 +7677,6 @@ pub fn encode_init_market_with_maintenance_fee(
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes()); // maintenance_fee_per_slot
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
@@ -7777,9 +7685,8 @@ pub fn encode_init_market_with_maintenance_fee(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -7907,7 +7814,7 @@ impl TestEnv {
         use bytemuck::Zeroable;
         let d = self.svm.get_account(&self.slab).unwrap().data;
         let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
-        let gen_table_size = 4096 * 8; // MAX_ACCOUNTS * sizeof(u64)
+        let gen_table_size = MAX_ACCOUNTS * 8;
         let buf_off = SLAB_LEN - gen_table_size - buf_size;
         let mut buf = percolator_prog::risk_buffer::RiskBuffer::zeroed();
         bytemuck::bytes_of_mut(&mut buf).copy_from_slice(&d[buf_off..buf_off + buf_size]);

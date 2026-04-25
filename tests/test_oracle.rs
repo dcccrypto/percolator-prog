@@ -120,7 +120,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
     const HEADER_CONFIG_LEN: usize = 584;
-    const NUM_USED_OFF: usize = 1776;
+    let NUM_USED_OFF: usize = 536 + common::ENGINE_NUM_USED_OFFSET;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {
         let vault_data = svm.get_account(&vault).unwrap().data;
@@ -286,12 +286,13 @@ fn test_hyperp_init_market_with_valid_price() {
     let slab_data = svm.get_account(&slab).unwrap().data;
     let magic = u64::from_le_bytes(slab_data[0..8].try_into().unwrap());
     let config = percolator_prog::state::read_config(&slab_data);
-    let mark = config.authority_price_e6;
+    let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
     let cap = config.oracle_price_cap_e2bps;
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
+    let used_off = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
@@ -444,12 +445,13 @@ fn test_hyperp_init_market_with_inverted_price() {
     let slab_data = svm.get_account(&slab).unwrap().data;
     let magic = u64::from_le_bytes(slab_data[0..8].try_into().unwrap());
     let config = percolator_prog::state::read_config(&slab_data);
-    let mark = config.authority_price_e6;
+    let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
     let cap = config.oracle_price_cap_e2bps;
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
+    let used_off = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
@@ -1014,9 +1016,7 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
             ],
             data: encode_update_config(
                 100, k_bps,
-                10_000i64, 10i64,  // funding_max_bps_per_slot=10 fits engine's e9=1e6 cap
-                0u128, 100, 100, 100, 1000,
-                0u128, 1_000_000_000_000_000u128, 1u128,
+                10_000i64, 10i64,  // funding_max_e9_per_slot=10 fits engine's e9=1e6 cap
             ),
         };
         let tx = Transaction::new_signed_with_payer(
@@ -1123,13 +1123,96 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     println!("FUNDING ANTI-RETROACTIVITY UpdateConfig: PASSED");
 }
 
-/// Regression: PushOraclePrice on a non-Hyperp market must reject a push
-/// whose timestamp is already stale relative to max_staleness_secs.
-/// Without this guard, a monotonic-but-ancient timestamp can pass the
-/// monotonicity + non-future checks, clear first_observed_stale_slot,
-/// yet be ignored by read_authority_price (age > max_staleness_secs) —
-/// yielding a freeze state where the stale-resolve window never matures
-/// even though the market cannot actually be priced.
+
+/// Oracle observation monotonicity: a Pyth update with a `publish_time`
+/// strictly older than the last accepted observation must be rejected,
+/// even if its age is within `max_staleness_secs`. Without this guard
+/// a caller could submit a valid-but-older Pyth account after a newer
+/// one has been processed and price their op against the older
+/// reading (within the circuit-breaker cap).
+#[test]
+fn test_oracle_publish_time_monotonicity_rejects_older_observation() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // First crank: fresh Pyth at publish_time = 200, advances baseline.
+    env.set_slot_and_price(100, 138_000_000);
+    env.crank();
+
+    // Read last_oracle_publish_time from the slab to confirm advance.
+    const LAST_ORACLE_PUB_TS_OFF: usize = 320; // HEADER_LEN(136) + last_oracle_publish_time(184)
+    let pub_ts_after_first = {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        i64::from_le_bytes(
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert!(
+        pub_ts_after_first > 0,
+        "first crank must advance last_oracle_publish_time, got {}",
+        pub_ts_after_first,
+    );
+
+    // Replace the on-chain Pyth account with an OLDER (but still
+    // within max_staleness_secs) update at publish_time = pub_ts - 30.
+    // The clock stays at the post-first-crank slot, so the update is
+    // not staleness-rejected — it must be MONOTONICITY-rejected.
+    let older_publish_time = pub_ts_after_first - 30;
+    let older_pyth = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1, older_publish_time);
+    env.svm
+        .set_account(
+            env.pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: older_pyth,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let result = env.try_crank();
+    assert!(
+        result.is_err(),
+        "crank with older Pyth observation must reject (monotonicity violation), got: {:?}",
+        result,
+    );
+
+    // Sanity: the stored publish_time must NOT have moved backward.
+    let pub_ts_after_attack = {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        i64::from_le_bytes(
+            d[LAST_ORACLE_PUB_TS_OFF..LAST_ORACLE_PUB_TS_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        pub_ts_after_attack, pub_ts_after_first,
+        "rejected older observation must not rewind last_oracle_publish_time",
+    );
+}
+
+/// Equal `publish_time` must be accepted — two transactions in the same
+/// slot reading the same on-chain Pyth update is not "out of order".
+#[test]
+fn test_oracle_publish_time_monotonicity_allows_equal_observation() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // First crank stamps publish_time.
+    env.set_slot_and_price(100, 138_000_000);
+    env.crank();
+
+    // Second crank without advancing the Pyth account: same publish_time.
+    // This must succeed (equal is not "older").
+    env.crank();
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
 #[test]
 fn test_push_oracle_price_rejects_stale_timestamp() {
     program_path();
@@ -1183,4 +1266,3 @@ fn test_push_oracle_price_rejects_stale_timestamp() {
          ignores the stored price, creating a liveness freeze"
     );
 }
-

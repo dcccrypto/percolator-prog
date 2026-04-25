@@ -13,8 +13,6 @@ use solana_sdk::{
     sysvar,
     transaction::Transaction,
 };
-use spl_token::state::{Account as TokenAccount, AccountState};
-
 /// Test that an inverted market can successfully run crank operations.
 ///
 /// This verifies the funding calculation uses market price (inverted) correctly.
@@ -1142,9 +1140,9 @@ fn test_comprehensive_funding_accrual() {
     env.top_up_insurance(&ins_payer, 1_000_000_000);
     let vault_before = env.vault_balance();
 
-    // Run many cranks to accrue funding
+    // Run many cranks to accrue funding (keep Pyth fresh at each slot).
     for i in 0..10 {
-        env.set_slot(200 + i * 100);
+        env.set_slot_and_price(200 + i * 100, 138_000_000);
         env.crank();
     }
 
@@ -1715,7 +1713,6 @@ fn test_withdrawal_under_haircut_conditions() {
     // Their initial deposit was 5B; if they got full PnL they'd get significantly more.
     // Verify returned amount is less than initial deposit + generous upper bound.
     // (This confirms the haircut mechanism is working.)
-    let winner_initial_deposit: u64 = 5_000_000_000;
     assert!(
         returned_to_winner <= vault_before_close,
         "Returned capital cannot exceed vault balance (conservation)"
@@ -2182,7 +2179,7 @@ fn test_settle_account_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2195,7 +2192,7 @@ fn test_settle_account_blocked_on_resolved() {
     env.set_slot(200);
     env.crank();
 
-    // Resolve the market.
+    // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(300);
@@ -2203,7 +2200,7 @@ fn test_settle_account_blocked_on_resolved() {
     assert!(env.is_market_resolved(), "Market must be resolved");
 
     // SettleAccount on a resolved market should fail.
-    env.set_slot(400);
+    env.set_slot_and_price(400, 138_000_000);
     let result = env.try_settle_account(user_idx);
     assert!(
         result.is_err(),
@@ -2480,7 +2477,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin (for later push)
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so hyperp_authority defaults to admin (for later push)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2493,7 +2490,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     env.set_slot(200);
     env.crank();
 
-    // Resolve the market.
+    // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(300);
@@ -2501,7 +2498,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     assert!(env.is_market_resolved(), "Market must be resolved");
 
     // ConvertReleasedPnl should fail on resolved market.
-    env.set_slot(400);
+    env.set_slot_and_price(400, 138_000_000);
     let result = env.try_convert_released_pnl(&user, user_idx, 1_000_000);
     assert!(
         result.is_err(),
@@ -2557,32 +2554,6 @@ fn test_init_user_blocked_on_resolved() {
     assert!(
         result.is_err(),
         "InitUser must be rejected on a resolved market"
-    );
-}
-
-/// Spec: InitUser fee_payment below min_initial_deposit is rejected.
-#[test]
-fn test_init_user_requires_min_deposit() {
-    program_path();
-    let mut env = TestEnv::new();
-    // min_initial_deposit = 100 (set in encode_init_market_full_v2)
-    env.init_market_with_invert(0);
-
-    let num_used_before = env.read_num_used_accounts();
-
-    let user = Keypair::new();
-    // Provide only 50 tokens -- below min_initial_deposit of 100
-    let result = env.try_init_user_with_fee(&user, 50);
-    assert!(
-        result.is_err(),
-        "InitUser must reject fee_payment below min_initial_deposit"
-    );
-
-    // State preservation: num_used_accounts must not change on rejection
-    let num_used_after = env.read_num_used_accounts();
-    assert_eq!(
-        num_used_after, num_used_before,
-        "num_used_accounts must not change on rejection"
     );
 }
 
@@ -2738,7 +2709,7 @@ fn test_reclaim_rejects_account_with_position() {
 fn test_reclaim_blocked_on_resolved() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → oracle_authority defaults to admin
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2750,7 +2721,7 @@ fn test_reclaim_blocked_on_resolved() {
     env.crank();
     env.try_withdraw(&user, user_idx, 100).unwrap();
 
-    // Resolve the market
+    // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
     env.try_resolve_market(&admin).unwrap();
@@ -3953,14 +3924,14 @@ fn test_init_market_custom_funding_max_premium() {
     );
 }
 
-/// InitMarket with custom funding_max_bps_per_slot overrides the default (5).
+/// InitMarket with custom funding_max_e9_per_slot overrides the default (5).
 #[test]
 fn test_init_market_custom_funding_max_per_slot() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_funding(0, 10_000, 0, 500, 100, 500, 10);
     assert_eq!(
-        env.read_funding_max_bps_per_slot(),
+        env.read_funding_max_e9_per_slot(),
         10,
         "Custom max_bps_per_slot must be stored"
     );
@@ -3971,13 +3942,13 @@ fn test_init_market_custom_funding_max_per_slot() {
 fn test_init_market_custom_all_funding_params() {
     program_path();
     let mut env = TestEnv::new();
-    // funding_max_bps_per_slot must fit the engine's per-market envelope
+    // funding_max_e9_per_slot must fit the engine's per-market envelope
     // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
     env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);
-    assert_eq!(env.read_funding_max_bps_per_slot(), 10);
+    assert_eq!(env.read_funding_max_e9_per_slot(), 10);
 }
 
 /// Without trailing funding params, defaults should be used (backward compat).
@@ -3991,7 +3962,7 @@ fn test_init_market_no_funding_params_uses_defaults() {
     assert_eq!(env.read_funding_horizon(), 500, "Default horizon");
     assert_eq!(env.read_funding_k_bps(), 100, "Default k_bps");
     assert_eq!(env.read_funding_max_premium_bps(), 500, "Default max_premium");
-    assert_eq!(env.read_funding_max_bps_per_slot(), 5, "Default max_per_slot");
+    assert_eq!(env.read_funding_max_e9_per_slot(), 1_000, "Default max_per_slot");
 }
 
 // ============================================================================
@@ -4045,7 +4016,7 @@ fn test_init_market_rejects_negative_max_premium() {
     assert!(result.is_err(), "negative funding_max_premium_bps must be rejected");
 }
 
-/// InitMarket with negative funding_max_bps_per_slot must be rejected.
+/// InitMarket with negative funding_max_e9_per_slot must be rejected.
 #[test]
 fn test_init_market_rejects_negative_max_per_slot() {
     program_path();
@@ -4057,7 +4028,7 @@ fn test_init_market_rejects_negative_max_per_slot() {
         -1, // negative (invalid)
     );
     let result = env.try_init_market_raw(data);
-    assert!(result.is_err(), "negative funding_max_bps_per_slot must be rejected");
+    assert!(result.is_err(), "negative funding_max_e9_per_slot must be rejected");
 }
 
 /// InitMarket cap check for mark_min_fee is against MAX_PROTOCOL_FEE_ABS
@@ -4493,7 +4464,6 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_ins_floor
         data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap = 1%
         // RiskParams with 10 bps trading fee
         data.extend_from_slice(&0u64.to_le_bytes()); // warmup
@@ -4502,7 +4472,6 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&10u64.to_le_bytes()); // trading_fee_bps = 10 (0.1%)
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
-        data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
         data.extend_from_slice(&1u64.to_le_bytes()); // h_max
         let max_crank = 99u64; // permissionless > max_crank
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
@@ -4510,7 +4479,6 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
-        data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
         data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
@@ -4554,7 +4522,8 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         env.svm.send_transaction(tx).expect("init failed");
     }
 
-    // Set bounded staleness for permissionless resolution
+    // Set bounded staleness for permissionless resolution.
+    // Slab offset = HEADER_LEN(168) + config.max_staleness_secs(96) = 264.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
@@ -4960,4 +4929,30 @@ fn test_init_market_rejects_excessive_mark_min_fee() {
     );
     let result = env.try_init_market_raw(data);
     assert!(result.is_err(), "mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected");
+}
+
+// === Recovered fork-only tests (auto-merge silently dropped) ===
+#[test]
+fn test_init_user_requires_min_deposit() {
+    program_path();
+    let mut env = TestEnv::new();
+    // min_initial_deposit = 100 (set in encode_init_market_full_v2)
+    env.init_market_with_invert(0);
+
+    let num_used_before = env.read_num_used_accounts();
+
+    let user = Keypair::new();
+    // Provide only 50 tokens -- below min_initial_deposit of 100
+    let result = env.try_init_user_with_fee(&user, 50);
+    assert!(
+        result.is_err(),
+        "InitUser must reject fee_payment below min_initial_deposit"
+    );
+
+    // State preservation: num_used_accounts must not change on rejection
+    let num_used_after = env.read_num_used_accounts();
+    assert_eq!(
+        num_used_after, num_used_before,
+        "num_used_accounts must not change on rejection"
+    );
 }

@@ -722,7 +722,7 @@ fn test_admin_force_close_admin_only() {
 
 /// End-to-end Hyperp lifecycle test covering all admin operations.
 ///
-/// Steps: InitMarket(Hyperp) -> SetOracleAuthority -> PushOraclePrice (x2)
+/// Steps: InitMarket(Hyperp) -> UpdateAuthority{HYPERP_MARK} -> PushHyperpMark (x2)
 /// -> Crank (index smoothing) -> UpdateConfig -> SetOraclePriceCap
 /// -> InitUser+Deposit -> ResolveMarket -> resolved Crank -> AdminForceCloseAccount
 /// -> WithdrawInsurance -> CloseSlab.
@@ -796,8 +796,6 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
         ],
         data: encode_update_config(
             7200, 200, 200i64, 10i64,
-            0u128, 100, 100, 100, 1000,
-            0u128, 1_000_000_000_000_000u128, 1u128,
         ),
     };
     let tx = Transaction::new_signed_with_payer(
@@ -1115,14 +1113,14 @@ fn test_governance_free_full_lifecycle() {
         200,    // funding_horizon_slots (custom, not default 500)
         200,    // funding_k_bps (2x, not default 1x)
         1000,   // funding_max_premium_bps (10%, not default 5%)
-        10,     // funding_max_bps_per_slot (custom cap)
+        10,     // funding_max_e9_per_slot (custom cap)
     );
 
     // Verify custom params stored
     assert_eq!(env.read_funding_horizon(), 200);
     assert_eq!(env.read_funding_k_bps(), 200);
     assert_eq!(env.read_funding_max_premium_bps(), 1000);
-    assert_eq!(env.read_funding_max_bps_per_slot(), 10);
+    assert_eq!(env.read_funding_max_e9_per_slot(), 10);
 
     // Step 2: Set bounded staleness (so oracle can go stale for permissionless resolution)
     {
@@ -1575,11 +1573,6 @@ fn test_resolve_market_passes_fresh_live_oracle_to_engine() {
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "ResolveMarket with fresh oracle should succeed: {:?}", result);
     assert!(env.is_market_resolved(), "Market must be resolved");
-
-    // Verify: if the wrapper were still using stale engine.last_oracle_price,
-    // resolution before the first crank would fail (last_oracle_price = 1 sentinel).
-    // This test proves the fresh path works by resolving after a crank at the
-    // same price — the engine's band check passes because live_oracle matches.
 }
 
 /// ResolveMarket before first crank should work when a fresh external oracle
@@ -1697,18 +1690,15 @@ fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
     // doesn't need to warp far.
     env.init_market_with_cap(0, 10_000, 50);
 
-    // Under the 4-way split, oracle_authority defaults to admin at
-    // init. Burn it so the test exercises the "no authority
-    // configured" permissionless-resolve path.
-    let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_update_authority(&admin_kp, AUTHORITY_ORACLE, None)
-        .expect("burn oracle_authority");
+    // Non-Hyperp markets have hyperp_authority == 0 at init (no
+    // authority role), so no burn is needed — the "no authority
+    // configured" precondition is the default.
     {
         let slab = env.svm.get_account(&env.slab).unwrap();
         let config = percolator_prog::state::read_config(&slab.data);
         assert_eq!(
-            config.oracle_authority, [0u8; 32],
-            "precondition: oracle_authority burned",
+            config.hyperp_authority, [0u8; 32],
+            "precondition: non-Hyperp markets init with zero authority",
         );
     }
 
@@ -1757,8 +1747,7 @@ fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
 
     // Configure a FRESH oracle authority.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
-    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+    // authority push removed — fresh Pyth is used directly.
 
     // Warp clock far enough that
     // clock.slot - last_good_oracle_slot >= 50.
@@ -1773,7 +1762,7 @@ fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
     // the market is terminally dead. ResolvePermissionless succeeds
     // in a single call regardless of whether an authority was ever
     // configured. (Attempting to push a fresh authority price at
-    // this point would ALSO be rejected by PushOraclePrice's own
+    // this point would ALSO be rejected by PushHyperpMark's own
     // hard-timeout gate — the strict model closes every revival
     // channel.)
     env.try_resolve_permissionless_once()
@@ -1788,9 +1777,9 @@ fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
 /// Strict hard-timeout regression: after the window matures, admin
 /// ResolveMarket settles at engine.last_oracle_price via the same
 /// Degenerate arm ResolvePermissionless uses — NOT at
-/// authority_price_e6. This closes the admin-revive channel where a
-/// rogue admin could PushOraclePrice past maturity and then settle at
-/// the pushed price. (PushOraclePrice itself now also rejects past
+/// hyperp_mark_e6. This closes the admin-revive channel where a
+/// rogue admin could PushHyperpMark past maturity and then settle at
+/// the pushed price. (PushHyperpMark itself now also rejects past
 /// maturity, but the admin-resolve Degenerate path is the safety net.)
 #[test]
 fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
@@ -1804,7 +1793,7 @@ fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
     // Use the read_engine_last_price helper by reading the slab directly:
     // the engine struct starts at ENGINE_OFF = 472 and last_oracle_price
     // is an early field. We only need the value shape; read it via the
-    // authority_price_e6 post-resolve assertion indirectly.
+    // hyperp_mark_e6 post-resolve assertion indirectly.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Warp clock far past the maturity window.
@@ -1815,7 +1804,7 @@ fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
     });
 
     // Admin ResolveMarket must succeed via the Degenerate branch —
-    // authority_price_e6 == 0 (never pushed), so the old path would
+    // hyperp_mark_e6 == 0 (never pushed), so the old path would
     // return InvalidAccountData, but the new Degenerate fast-path
     // runs first and succeeds at engine.last_oracle_price.
     env.try_resolve_market(&admin)

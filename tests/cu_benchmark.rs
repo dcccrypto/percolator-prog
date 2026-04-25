@@ -129,18 +129,15 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
-    // verification_level = Full (1) at offset 40
-    data[40..42].copy_from_slice(&1u16.to_le_bytes());
-    // feed_id at offset 42
-    data[42..74].copy_from_slice(feed_id);
-    // price at offset 74
-    data[74..82].copy_from_slice(&price.to_le_bytes());
-    // conf at offset 82
-    data[82..90].copy_from_slice(&conf.to_le_bytes());
-    // expo at offset 90
-    data[90..94].copy_from_slice(&expo.to_le_bytes());
-    // publish_time at offset 94
-    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
+    // VerificationLevel::Full = 1-byte discriminant 0x01 at offset 40.
+    // PriceFeedMessage begins at byte 41 (Borsh enum variants are
+    // variable-size; Full has no payload).
+    data[40] = 1;
+    data[41..73].copy_from_slice(feed_id);
+    data[73..81].copy_from_slice(&price.to_le_bytes());
+    data[81..89].copy_from_slice(&conf.to_le_bytes());
+    data[89..93].copy_from_slice(&expo.to_le_bytes());
+    data[93..101].copy_from_slice(&publish_time.to_le_bytes());
     data
 }
 
@@ -163,7 +160,6 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (within engine bounds)
     data.extend_from_slice(&0u128.to_le_bytes()); // max_maintenance_fee_per_slot (legacy, ignored)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps (resolvability invariant)
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
@@ -172,14 +168,12 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&risk_reduction_threshold.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // max_crank_staleness_slots
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&1000u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
@@ -188,7 +182,7 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
     data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
     data
@@ -829,12 +823,6 @@ fn encode_top_up_insurance(amount: u64) -> Vec<u8> {
     data
 }
 
-fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
-    let mut data = vec![11u8];
-    data.extend_from_slice(&new_threshold.to_le_bytes());
-    data
-}
-
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
     // UpdateAuthority { kind: AUTHORITY_ADMIN = 0, new_pubkey }
     let mut data = vec![32u8];
@@ -851,7 +839,7 @@ fn encode_update_config(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
     funding_max_premium_bps: i64,
-    funding_max_bps_per_slot: i64,
+    funding_max_e9_per_slot: i64,
 ) -> Vec<u8> {
     // UpdateConfig wire format in v12.18.1: tag (1) + 4 u64/i64 funding params.
     // Earlier revisions had trailing threshold fields; the decoder now rejects
@@ -860,7 +848,8 @@ fn encode_update_config(
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
-    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
+    data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes()); // tvl_insurance_cap_mult (disabled)
     data
 }
 
@@ -871,7 +860,7 @@ fn encode_set_maintenance_fee(new_fee: u128) -> Vec<u8> {
 }
 
 fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    // UpdateAuthority { kind: AUTHORITY_ORACLE = 1, new_pubkey }
+    // UpdateAuthority { kind: AUTHORITY_HYPERP_MARK = 1, new_pubkey }
     let mut data = vec![32u8];
     data.push(1u8);
     data.extend_from_slice(new_authority.as_ref());
@@ -946,6 +935,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
 
 #[cfg(not(feature = "test"))]
 #[test]
+#[cfg(not(any(feature = "small", feature = "medium")))]
 fn benchmark_worst_case_scenarios() {
     println!("\n=== WORST-CASE CRANK CU BENCHMARK ===");
     println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
@@ -1771,6 +1761,7 @@ fn benchmark_worst_case_scenarios() {
 /// Measures CU consumed for each instruction under typical conditions.
 #[cfg(not(feature = "test"))]
 #[test]
+#[cfg(not(any(feature = "small", feature = "medium")))]
 fn benchmark_all_instructions() {
     println!("\n=== PER-INSTRUCTION CU BENCHMARK ===\n");
 
@@ -1893,24 +1884,7 @@ fn benchmark_all_instructions() {
         println!("TopUpInsurance:        {:>8} CU", cu);
     }
 
-    // --- SetRiskThreshold (Tag 11) ---
-    {
-        env.set_price(100_000_000, 500);
-        let ix = Instruction {
-            program_id: env.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-            ],
-            data: encode_set_risk_threshold(1_000_000),
-        };
-        // SetRiskThreshold always rejects (I_floor immutable per spec §2.2.1)
-        match measure(&mut env.svm, ix, &[&admin]) {
-            Ok(cu) => println!("SetRiskThreshold:      {:>8} CU (rejected)", cu),
-            Err(_) => println!("SetRiskThreshold:      (rejected — I_floor immutable)"),
-        }
-    }
+    // Tag 11 (SetRiskThreshold) benchmark removed: instruction deleted.
 
     // --- UpdateConfig (Tag 14) ---
     {
@@ -1928,7 +1902,7 @@ fn benchmark_all_instructions() {
                 3600,   // funding_horizon_slots
                 100,    // funding_k_bps
                 500,    // funding_max_premium_bps
-                5,      // funding_max_bps_per_slot
+                5,      // funding_max_e9_per_slot
             ),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
