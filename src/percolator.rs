@@ -1399,7 +1399,14 @@ pub mod ix {
         /// known good oracle price from engine.last_oracle_price.
         ResolvePermissionless,
         /// Permissionless force-close for resolved markets (tag 30).
-        /// Requires RESOLVED + delay. Sends capital to stored owner ATA.
+        /// Requires RESOLVED + delay. Admin-only. Sends capital to any
+        /// valid SPL token account whose token-owner matches the stored
+        /// owner and whose mint matches `collateral_mint` — the caller
+        /// chooses the destination (typically but not necessarily the
+        /// canonical ATA). The wrapper enforces owner + mint equality
+        /// via `verify_token_account`; it does NOT derive the
+        /// Associated Token Address, so a non-ATA account owned by the
+        /// stored owner is also accepted.
         ForceCloseResolved {
             user_idx: u16,
         },
@@ -2057,12 +2064,14 @@ pub mod state {
         pub hyperp_mark_e6: u64,
         /// Most recently accepted external oracle observation timestamp
         /// (Pyth `publish_time` or Chainlink `timestamp`, in seconds).
-        /// `clamp_external_price` rejects any incoming Pyth/Chainlink
-        /// reading with `publish_time < last_oracle_publish_time` so
-        /// observations are monotonic — a caller cannot replay an older
-        /// (still-fresh-window) price after a newer one has been
-        /// accepted. Initialized to 0 at InitMarket so the first read
-        /// always passes.
+        /// Used as a one-way clock on observations: incoming reads with
+        /// `publish_time < last_oracle_publish_time` are served from
+        /// `last_effective_price_e6` and do NOT advance baseline or
+        /// timestamp. This both preserves caller liveness (offline
+        /// signers can't be deadlocked by a newer update landing
+        /// between sign and submit) and prevents baseline-rewind via
+        /// replay. See `oracle::clamp_external_price` for the full
+        /// policy. Initialized at InitMarket from the genesis Pyth read.
         pub last_oracle_publish_time: i64,
 
         // ========================================
@@ -2784,29 +2793,41 @@ pub mod oracle {
         clamp_external_price(config, external)
     }
 
-    /// Circuit-breaker clamp applied to an already-parsed external price,
-    /// plus monotonicity enforcement on the source-feed timestamp.
+    /// Circuit-breaker clamp applied to an already-parsed external
+    /// observation, with strict source-feed timestamp ordering.
     ///
     /// Pyth's `publish_time` and Chainlink's `timestamp` are signed by
-    /// the off-chain network — they can't be forged by a caller — so we
-    /// can use them as a strict ordering on observations. Any reading
-    /// with `publish_time < config.last_oracle_publish_time` is
-    /// rejected as `OracleStale`. This closes the cherry-pick attack
-    /// where a caller submits a still-fresh-window-but-older Pyth
-    /// account after a newer one has been accepted, choosing the more
-    /// favorable price within the circuit-breaker cap.
+    /// the off-chain network and can't be forged by the caller, so we
+    /// use them as a strictly increasing clock on observations:
     ///
-    /// Equal timestamps are accepted (allows two transactions in the
-    /// same slot to read the same Pyth update). The first observation
-    /// after init always passes because `last_oracle_publish_time`
-    /// initializes to 0 and any real Pyth `publish_time` is > 0.
+    ///   publish_time >  last_oracle_publish_time
+    ///       → fresh observation. Clamp against baseline, then
+    ///         advance baseline and timestamp.
+    ///
+    ///   publish_time <= last_oracle_publish_time
+    ///       → stale or duplicate. Return stored
+    ///         `last_effective_price_e6` and DO NOT advance any
+    ///         field. Caller's tx still succeeds (offline signers,
+    ///         hardware wallets, and multi-sigs that signed before
+    ///         a competing keeper updated Pyth aren't deadlocked),
+    ///         but the wrapper's view of the oracle does not move
+    ///         and no liveness signal is recorded for this read.
+    ///
+    /// The strict-greater branch is the ONLY way the baseline or
+    /// timestamp advance. This closes the cap-walk attack where a
+    /// caller replayed the same observation N times to walk
+    /// `last_effective_price_e6` by N cap-steps. Callers needing to
+    /// decide whether THIS particular read advanced state (e.g. to
+    /// stamp `last_good_oracle_slot`) should snapshot
+    /// `config.last_oracle_publish_time` before the call and compare
+    /// after.
     pub fn clamp_external_price(
         config: &mut super::state::MarketConfig,
         external: Result<(u64, i64), ProgramError>,
     ) -> Result<u64, ProgramError> {
         let (ext_price, publish_time) = external?;
-        if publish_time < config.last_oracle_publish_time {
-            return Err(PercolatorError::OracleStale.into());
+        if publish_time <= config.last_oracle_publish_time {
+            return Ok(config.last_effective_price_e6);
         }
         let clamped = clamp_oracle_price(
             config.last_effective_price_e6,
@@ -3163,10 +3184,18 @@ pub mod processor {
             config.invert,
             config.unit_scale,
         );
+        // Snapshot the source-feed clock before the call so we can
+        // tell whether THIS read advanced state. Stale/duplicate
+        // observations get the cached price from
+        // `clamp_external_price` without advancing the timestamp; we
+        // must not stamp the liveness cursor on those — otherwise an
+        // attacker can replay an old Pyth account to extend market
+        // life past `permissionless_resolve_stale_slots`.
+        let prev_publish_time = config.last_oracle_publish_time;
         let price = oracle::clamp_external_price(config, external)?;
-
-        // External succeeded (we have a price); advance liveness cursor.
-        config.last_good_oracle_slot = clock_slot;
+        if config.last_oracle_publish_time > prev_publish_time {
+            config.last_good_oracle_slot = clock_slot;
+        }
         let _ = slab_data; // reserved for future per-read slab stamping
         Ok(price)
     }
@@ -3556,6 +3585,43 @@ pub mod processor {
                     )
                     .map_err(map_risk_error)?;
                 syncs_done += 1;
+
+                // Permissionless dust reclaim: fee accrual just charged
+                // this account; if that drained capital to zero on a
+                // flat account (no position, no PnL, no reserve, no
+                // pending, no positive fee_credits), free the slot now.
+                // Without this, an attacker could fill `max_accounts`
+                // with dust and brick onboarding even when fees drain
+                // capital, because slot reclamation would still require
+                // an explicit per-account `ReclaimEmptyAccount` call.
+                //
+                // All six flat-clean predicates the engine's reclaim
+                // checks are mirrored here so the call CANNOT hit an
+                // `Undercollateralized` / `CorruptState` early return.
+                // That lets us propagate any remaining error with `?`
+                // rather than silently swallowing a `_not_atomic`
+                // failure — per the engine contract, a failing
+                // `_not_atomic` may have already mutated state and the
+                // caller must abort the transaction. Envelope /
+                // market-mode guards upstream (KeeperCrank's oracle
+                // read + is_resolved gate + accrue_market_to) ensure
+                // the remaining engine preconditions hold, so in
+                // practice the `?` is unreachable — but if a future
+                // engine change introduces a new precondition, we get
+                // a transaction rollback instead of silent corruption.
+                let acc = &engine.accounts[idx];
+                if acc.capital.is_zero()
+                    && acc.position_basis_q == 0
+                    && acc.pnl == 0
+                    && acc.reserved_pnl == 0
+                    && acc.sched_present == 0
+                    && acc.pending_present == 0
+                    && acc.fee_credits.get() <= 0
+                {
+                    engine
+                        .reclaim_empty_account_not_atomic(idx as u16, now_slot)
+                        .map_err(map_risk_error)?;
+                }
             }
             // Word fully drained — advance to next word, reset bit cursor.
             word_cursor = (word_cursor + 1) % BITMAP_WORDS;
@@ -4128,6 +4194,18 @@ pub mod processor {
                 if new_account_fee > percolator::MAX_VAULT_TVL {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // Scale alignment: `new_account_fee` is paid in BASE units
+                // and split out of `fee_payment` at InitUser/InitLP. The
+                // wrapper rejects misaligned `fee_payment` (the outer
+                // dust check), but the SPLIT into (fee, capital) can
+                // still produce dust on each side if `new_account_fee`
+                // itself isn't aligned to `unit_scale`. That dust is
+                // silently discarded into the vault by the units-conversion.
+                // Reject the misconfig at init so admins can't ship a
+                // market that leaks per-account dust to the vault.
+                if unit_scale > 0 && new_account_fee % (unit_scale as u128) != 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 // Oracle cap floor: hard-bounded to MAX (100%)
                 if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
@@ -4290,6 +4368,36 @@ pub mod processor {
                 if (mark_min_fee as u128) > percolator::MAX_PROTOCOL_FEE_ABS {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+
+                // F2: Hyperp liveness spoof defense. When a Hyperp
+                // market enables permissionless resolution, the ONLY
+                // hard-timeout liveness signal is `last_mark_push_slot`,
+                // which advances on any "full-weight" trade. With
+                // `mark_min_fee == 0`, every trade is full-weight —
+                // a permissionless attacker with their own matcher can
+                // self-trade every slot to keep the market "live"
+                // indefinitely, blocking ResolvePermissionless. Require
+                // a nonzero threshold so cheap self-trades can't refresh
+                // liveness. Non-perm-resolve Hyperp markets (admin-only
+                // resolve) don't have this bricking vector.
+                let is_hyperp_init = index_feed_id == [0u8; 32];
+                if is_hyperp_init
+                    && permissionless_resolve_stale_slots > 0
+                    && mark_min_fee == 0
+                {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
+                // F3 (config-risk, not enforced): when a market ships
+                // with BOTH `new_account_fee == 0` AND
+                // `maintenance_fee_per_slot == 0`, the wrapper has no
+                // mechanism to prevent an attacker from filling
+                // `max_accounts` slots with 1-unit dust deposits. The
+                // check is intentionally NOT enforced at init — trusted-
+                // admin / KYC'd deployments may legitimately want
+                // neither gate on — but operators deploying
+                // permissionless markets SHOULD pick at least one.
+                // See `scripts/security.md` for details.
 
                 #[cfg(debug_assertions)]
                 {
@@ -5180,6 +5288,20 @@ pub mod processor {
                 // on consecutive entries, which is idempotent at the same
                 // anchor). The wrapper skips duplicate SYNC calls purely
                 // to save CU — dedup is within the loop, not the budget.
+                // Capture the pre-fee-collection insurance balance so the
+                // reward base reflects EVERY fee this crank swept in —
+                // candidate-directed syncs AND the bitmap sweep. Earlier
+                // revisions captured `ins_before` between the two phases,
+                // which silently dropped the reward to zero whenever the
+                // risk buffer auto-populated `combined` (i.e. on every
+                // crank after the first live crank). Including both
+                // phases is safe: `sync_account_fee_to_slot_not_atomic`
+                // is idempotent at same-slot and the shared FEE_SWEEP
+                // _BUDGET still caps total syncs, so a caller cannot
+                // inflate the reward by stuffing candidates — duplicates
+                // are dedup'd, already-synced accounts are no-ops, and
+                // unused slots are skipped before consuming budget.
+                let ins_before = engine.insurance_fund.balance.get();
                 let mut candidate_syncs = 0usize;
                 if config.maintenance_fee_per_slot > 0 {
                     // Candidate syncs share the FEE_SWEEP_BUDGET with
@@ -5231,11 +5353,6 @@ pub mod processor {
                     }
                 }
 
-                // Sweep with the REMAINING fee-sync budget. Keeper
-                // reward (sweep_delta) is computed from balance
-                // BEFORE the sweep, so candidate-sync deltas are
-                // excluded from the reward.
-                let ins_before = engine.insurance_fund.balance.get();
                 let remaining_budget = crate::constants::FEE_SWEEP_BUDGET
                     .saturating_sub(candidate_syncs);
                 sweep_maintenance_fees(engine, &mut config, clock.slot, remaining_budget)?;
@@ -5563,10 +5680,20 @@ pub mod processor {
                         fee_paid_nocpi,
                         config.mark_min_fee,
                     );
-                    // Only update the EWMA clock when the mark actually moved.
-                    // Zero-weight trades must not refresh the clock — that would
-                    // shrink future dt and damp legitimate updates.
-                    if config.mark_ewma_e6 != old_ewma {
+                    // Only full-weight observations advance the EWMA clock
+                    // (Finding 7). Sub-threshold trades can still nudge the
+                    // EWMA value via partial alpha, but their clock bump
+                    // would make the clock a liveness signal attackers can
+                    // cheaply refresh — and on Hyperp markets the soft-
+                    // staleness check reads `max(mark_ewma_last_slot,
+                    // last_mark_push_slot)`, so any clock bump on dust
+                    // trades keeps an otherwise-dead Hyperp market live.
+                    // Gating on full-weight collapses the two-clock
+                    // dichotomy: both clocks now only refresh on
+                    // observation-eligible fills.
+                    let full_weight_observation_nocpi = config.mark_min_fee == 0
+                        || fee_paid_nocpi >= config.mark_min_fee;
+                    if full_weight_observation_nocpi {
                         config.mark_ewma_last_slot = clock.slot;
                     }
                     // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
@@ -5950,14 +6077,28 @@ pub mod processor {
                     engine
                         .accrue_market_to(clock.slot, price, funding_rate_e9_pre)
                         .map_err(map_risk_error)?;
-                    // Restore pre-oracle config, but preserve oracle/index state
-                    // that legitimately advanced during the instruction:
-                    // - last_good_oracle_slot: liveness proof from successful read
-                    // - last_effective_price_e6: index legitimately moved toward mark
-                    // - last_hyperp_index_slot: prevents dt-accumulation attack
+                    // Restore pre-oracle config, but preserve oracle/index
+                    // state that legitimately advanced during the instruction:
+                    // - last_good_oracle_slot:        liveness proof from
+                    //                                 successful read
+                    // - last_effective_price_e6:      baseline (clamped from
+                    //                                 the fresh observation)
+                    // - last_oracle_publish_time:     MUST be preserved
+                    //                                 atomically with the
+                    //                                 baseline — otherwise a
+                    //                                 zero-fill could keep
+                    //                                 the new baseline while
+                    //                                 rolling the timestamp
+                    //                                 back, letting the same
+                    //                                 Pyth update advance
+                    //                                 baseline N times via
+                    //                                 interleaved zero-fills.
+                    // - last_hyperp_index_slot:       prevents dt-accumulation
+                    //                                 attack on Hyperp index.
                     let mut restored = config_pre_oracle;
                     restored.last_good_oracle_slot = config.last_good_oracle_slot;
                     restored.last_effective_price_e6 = config.last_effective_price_e6;
+                    restored.last_oracle_publish_time = config.last_oracle_publish_time;
                     restored.last_hyperp_index_slot = config.last_hyperp_index_slot;
                     state::write_config(&mut data, &restored);
                     state::write_req_nonce(&mut data, req_id);
@@ -6083,23 +6224,21 @@ pub mod processor {
                             fee_paid_cpi,
                             config.mark_min_fee,
                         );
-                        // EWMA math clock refreshes when:
-                        //   (a) the EWMA VALUE changed (any partial-
-                        //       fee sub-threshold trade that moves
-                        //       mark_ewma_e6 must advance the clock,
-                        //       otherwise the next ewma_update sees
-                        //       a stale dt and over-weights), OR
-                        //   (b) the trade was a full-weight
-                        //       observation (same-price trades don't
-                        //       move the value but do reset the dt
-                        //       anchor to "we just saw this price").
-                        // This is distinct from Hyperp liveness
-                        // (below), which only counts full-weight
-                        // observations.
+                        // Only full-weight observations advance the EWMA
+                        // clock (Finding 7). Partial-alpha nudges from
+                        // sub-threshold trades still mutate the EWMA
+                        // value, but the clock is treated strictly as a
+                        // liveness signal — otherwise dust trades on
+                        // Hyperp markets refresh the soft-staleness check
+                        // `max(mark_ewma_last_slot, last_mark_push_slot)`,
+                        // keeping an otherwise-dead market alive. The
+                        // minor EWMA-dt drift (next full-weight trade
+                        // sees `dt = time_since_last_full_weight`, not
+                        // `time_since_last_partial`) is an acceptable
+                        // tradeoff.
                         let full_weight_observation = config.mark_min_fee == 0
                             || fee_paid_cpi >= config.mark_min_fee;
-                        let ewma_moved = config.mark_ewma_e6 != old_ewma_cpi;
-                        if ewma_moved || full_weight_observation {
+                        if full_weight_observation {
                             config.mark_ewma_last_slot = clock.slot;
                         }
                         // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
@@ -7101,21 +7240,28 @@ pub mod processor {
                     );
                     match oracle_result {
                         Ok((fresh_oracle, publish_time)) => {
-                            // Monotonicity guard: an older Pyth/Chainlink
-                            // observation can't be used as the settlement
-                            // anchor after a newer one has been accepted.
-                            if publish_time < config.last_oracle_publish_time {
-                                return Err(PercolatorError::OracleStale.into());
+                            if publish_time <= config.last_oracle_publish_time {
+                                // Stale or duplicate observation: substitute
+                                // the stored baseline as the live anchor and
+                                // do not advance baseline or timestamp.
+                                // Mirrors the live policy in
+                                // `clamp_external_price` — admin resolve
+                                // doesn't error when a newer update has
+                                // already landed, but the wrapper's view
+                                // of the oracle does not move on this read.
+                                fresh_live_oracle = Some(config.last_effective_price_e6);
+                            } else {
+                                fresh_live_oracle = Some(fresh_oracle);
+                                // Advance the circuit-breaker baseline so
+                                // compute_current_funding_rate_e9 uses the
+                                // freshest index.
+                                config.last_effective_price_e6 = oracle::clamp_oracle_price(
+                                    config.last_effective_price_e6,
+                                    fresh_oracle,
+                                    config.oracle_price_cap_e2bps,
+                                );
+                                config.last_oracle_publish_time = publish_time;
                             }
-                            fresh_live_oracle = Some(fresh_oracle);
-                            // Update the circuit-breaker baseline from this fresh read
-                            // so compute_current_funding_rate_e9 uses the freshest index.
-                            config.last_effective_price_e6 = oracle::clamp_oracle_price(
-                                config.last_effective_price_e6,
-                                fresh_oracle,
-                                config.oracle_price_cap_e2bps,
-                            );
-                            config.last_oracle_publish_time = publish_time;
                             // NOTE on design: pass the RAW fresh oracle (not the
                             // clamped value) as the engine's live_oracle_price.
                             // The resolve deviation band
@@ -8284,9 +8430,9 @@ pub mod processor {
                     // Rollback selectively: revert price/index state that
                     // would retroactively apply a post-observation index to
                     // pre-observation engine slots, but PRESERVE the
-                    // liveness stamp from the successful read so partial
-                    // catchups during oracle recovery can't resurrect a
-                    // previously-expired stale window.
+                    // liveness stamp and its source-feed timestamp so
+                    // partial catchups can't replay a single observation
+                    // to advance liveness multiple times.
                     //
                     // Fields rolled back (price/index — time-travel risk):
                     //   - last_effective_price_e6     (baseline)
@@ -8295,8 +8441,16 @@ pub mod processor {
                     // Fields preserved from the fresh read (liveness):
                     //   - last_good_oracle_slot       (stamp proving
                     //       external oracle was observed live this call)
+                    //   - last_oracle_publish_time    (MUST be preserved
+                    //       atomically with last_good_oracle_slot —
+                    //       otherwise the one-way-clock invariant
+                    //       `clamp_external_price` relies on is broken:
+                    //       the same Pyth observation would be "fresh"
+                    //       again on the next partial catchup and
+                    //       stamp last_good_oracle_slot a second time)
                     let mut restored = config_pre;
                     restored.last_good_oracle_slot = config.last_good_oracle_slot;
+                    restored.last_oracle_publish_time = config.last_oracle_publish_time;
                     state::write_config(&mut data, &restored);
                 }
 

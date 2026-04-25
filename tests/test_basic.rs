@@ -5235,6 +5235,173 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     );
 }
 
+/// Regression: reward must pay on the SECOND crank of a market with live
+/// positions, not just the first.
+///
+/// The earlier `test_keeper_crank_reward_pays_half...` test only exercises
+/// the first crank against a market with no open positions. That path keeps
+/// the risk buffer empty, so `combined` stays empty, no candidate-sync
+/// happens, and all fees flow through `sweep_maintenance_fees` — giving
+/// `sweep_delta > 0` and paying the reward.
+///
+/// On a real market, Phase C of the crank's risk-buffer maintenance
+/// populates the buffer with every used account that holds a non-zero
+/// effective position. On the NEXT crank, those accounts show up in
+/// `combined`, and the candidate-sync loop realizes their fees to insurance
+/// BEFORE `ins_before` is captured. `sweep_maintenance_fees` then finds
+/// nothing left to charge (all touched accounts have `last_fee_slot == now`
+/// already), so `sweep_delta == 0` and the reward branch silently skips.
+///
+/// That was the devnet bug: cranker capital drops by their own fee with no
+/// offsetting reward, even though every gate condition appears satisfied.
+/// Fix: capture `ins_before` BEFORE the candidate-sync loop so the reward
+/// base reflects ALL fee collection this crank did — candidate-directed or
+/// bitmap-swept.
+#[test]
+fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // LP + user with an actual trade so both end up with non-zero
+    // effective positions. Phase C then upserts them into the risk
+    // buffer on the first crank — that's the precondition that
+    // surfaces the bug on the second crank.
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(10);
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
+
+    // Crank #1 at slot 500: empty risk buffer, all fees flow through the
+    // sweep, reward pays. Phase C at the end populates the buffer.
+    env.set_slot(500);
+    env.crank_as(&user, user_idx);
+    env.svm.expire_blockhash();
+
+    // Crank #2 at slot 1000: buffer is populated, `combined` includes
+    // LP + user. Without the fix, candidate-sync realizes their fees
+    // to insurance before ins_before is captured → sweep_delta == 0 →
+    // reward gate fails silently.
+    env.set_slot(1000);
+    let cap_before = env.read_account_capital(user_idx);
+    let ins_before = env.read_insurance_balance();
+    env.crank_as(&user, user_idx);
+    let cap_after = env.read_account_capital(user_idx);
+    let ins_after = env.read_insurance_balance();
+
+    let cap_delta: i128 = (cap_after as i128) - (cap_before as i128);
+    let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
+
+    // Each of the 2 used accounts (LP, user) owes fee = 1_000 × 500 =
+    // 500_000 for the [500, 1000] interval. Total fee = 1_000_000.
+    // Reward = 500_000 to cranker, insurance keeps 500_000. Cranker's
+    // net = reward − own fee = 500_000 − 500_000 = 0.
+    let per_account_fee: i128 = 1_000 * 500;
+    let total_fee: i128 = per_account_fee * 2;
+    let reward: i128 = total_fee / 2;
+    let insurance_share: i128 = total_fee / 2;
+    let expected_cap_delta: i128 = reward - per_account_fee;
+
+    assert_eq!(
+        cap_delta, expected_cap_delta,
+        "second-crank reward must still pay (expected cap Δ = {expected_cap_delta}, got {cap_delta}). \
+         Bug symptom on devnet: cap Δ = −{per_account_fee} with no reward credit."
+    );
+    assert_eq!(
+        ins_delta, insurance_share,
+        "insurance must keep exactly 50% (expected {insurance_share}, got {ins_delta}). \
+         Full-sweep-to-insurance is the devnet bug signature."
+    );
+}
+
+/// Regression (PR #33): InitUser/InitLP must reject rather than silently
+/// wrap when the global materialization counter would overflow u64::MAX.
+///
+/// The counter (`_reserved[8..16]` in the slab header) supplies the
+/// per-account `lp_account_id`. Wrapping to 0 would collide with the
+/// "never-materialized" sentinel that TradeCpi rejects — every further
+/// InitLP would silently materialize an account whose lp_account_id
+/// makes it permanently untradeable. checked_add + `?` surfaces the
+/// condition explicitly instead.
+///
+/// Repro: poke the counter byte-field directly to u64::MAX via
+/// svm.set_account, then attempt InitUser. The wrapper's
+/// `next_mat_counter` returns `None`, callers convert to
+/// `PercolatorError::EngineOverflow` (code 0x12), and the tx fails.
+#[test]
+fn test_init_user_rejects_when_mat_counter_would_overflow() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = common::encode_init_market_full(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0,    // invert
+        1,    // unit_scale
+        1000, // new_account_fee
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    // Poke mat_counter to u64::MAX so the next increment would overflow.
+    // RESERVED_OFF = 48 (see percolator.rs), counter lives at +8..+16.
+    const RESERVED_OFF: usize = 48;
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    acct.data[RESERVED_OFF + 8..RESERVED_OFF + 16]
+        .copy_from_slice(&u64::MAX.to_le_bytes());
+    env.svm.set_account(env.slab, acct).unwrap();
+
+    // Sanity: confirm the poke took hold.
+    let counter = {
+        let a = env.svm.get_account(&env.slab).unwrap();
+        u64::from_le_bytes(
+            a.data[RESERVED_OFF + 8..RESERVED_OFF + 16].try_into().unwrap()
+        )
+    };
+    assert_eq!(
+        counter, u64::MAX,
+        "setup failure: mat_counter poke did not persist"
+    );
+
+    // InitUser must REJECT with overflow rather than succeeding — silent
+    // wrap would produce generation=0, which TradeCpi rejects as the
+    // never-materialized sentinel. Use a well-funded fee payment so the
+    // transfer/fee paths succeed and execution reaches next_mat_counter.
+    // fee_payment must exceed new_account_fee (1000) so non-zero capital
+    // remains after the fee split — otherwise InitUser rejects early with
+    // EngineInsufficientBalance and we never reach next_mat_counter.
+    let user = Keypair::new();
+    let err = env
+        .try_init_user_with_fee(&user, 2000)
+        .expect_err(
+            "InitUser must fail with overflow when mat_counter is at u64::MAX. \
+             If this succeeds, next_mat_counter wraps silently and new accounts \
+             inherit generation=0 — the TradeCpi sentinel that blocks trading.",
+        );
+    // 0x12 = PercolatorError::EngineOverflow (18th variant in declaration order).
+    // The engine-Overflow mapping routes RiskError::Overflow here too; either
+    // the next_mat_counter branch or the engine check can fire — both are
+    // the correct "reject overflow" signal.
+    assert!(
+        err.contains("0x12") || err.contains("Overflow"),
+        "expected EngineOverflow (0x12), got: {err}"
+    );
+}
+
 /// Permissionless crank must not pay a reward — the caller has no account.
 #[test]
 fn test_keeper_crank_permissionless_pays_no_reward() {
@@ -5272,3 +5439,404 @@ fn test_keeper_crank_permissionless_pays_no_reward() {
 
 
 
+
+/// InitMarket must reject `new_account_fee` not aligned to `unit_scale`.
+/// The InitUser/InitLP split divides `fee_payment` into (fee, capital);
+/// if `new_account_fee` isn't a multiple of `unit_scale`, the
+/// per-side units conversion silently discards dust into the vault
+/// every time an account is created. Reject the misconfig at init.
+#[test]
+fn test_init_market_rejects_new_account_fee_not_scale_aligned() {
+    let mut env = TestEnv::new();
+    // unit_scale = 1000, new_account_fee = 1500 → split would discard
+    // 500 base from fee side and 500 from capital side per InitUser.
+    let data = common::encode_init_market_full(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0,    // invert
+        1000, // unit_scale
+        1500, // new_account_fee (NOT aligned to 1000)
+    );
+    let err = env
+        .try_init_market_raw(data)
+        .expect_err("init must reject misaligned new_account_fee");
+    assert!(
+        err.contains("InvalidInstructionData") || err.contains("0x0"),
+        "expected InvalidInstructionData, got: {}",
+        err,
+    );
+}
+
+/// Counterpart: aligned `new_account_fee` is accepted.
+#[test]
+fn test_init_market_accepts_scale_aligned_new_account_fee() {
+    let mut env = TestEnv::new();
+    let data = common::encode_init_market_full(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0,
+        1000, // unit_scale
+        2000, // new_account_fee (aligned)
+    );
+    env.try_init_market_raw(data)
+        .expect("aligned new_account_fee must be accepted");
+}
+
+/// Counterpart: with `unit_scale = 0` (no scaling), any `new_account_fee`
+/// is trivially aligned.
+#[test]
+fn test_init_market_accepts_any_new_account_fee_when_unit_scale_zero() {
+    let mut env = TestEnv::new();
+    let data = common::encode_init_market_full(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0,
+        0,    // unit_scale = 0 → no scaling, alignment trivial
+        1500, // any value is fine
+    );
+    env.try_init_market_raw(data)
+        .expect("unit_scale=0 makes alignment trivial");
+}
+
+/// Slot-exhaustion DoS defense: maintenance fees + permissionless
+/// crank reclaim must drain dust accounts and free their slots
+/// WITHOUT any other user action. The wrapper's fee-sweep visits
+/// the account, fees drain capital to zero, and the same sweep
+/// immediately calls `reclaim_empty_account_not_atomic` on the
+/// flat zero-capital account.
+#[test]
+fn test_dust_account_drained_and_gc_by_crank_alone() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Maintenance fee = 1 unit per slot. Tight enough to drain a
+    // 100-unit dust account in ~100 slots without a long-running test.
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1000, // max_maintenance_fee_per_slot (vestigial arg, ignored)
+        1,    // maintenance_fee_per_slot
+        0,    // min_oracle_price_cap (helper auto-promotes to MAX)
+    );
+    env.try_init_market_raw(data).expect("init");
+
+    // Create the dust account with 100 base units (= 100 units at unit_scale=0).
+    let attacker = Keypair::new();
+    let attacker_idx = env.init_user_with_fee(&attacker, 100);
+    assert_eq!(
+        env.read_num_used_accounts(), 1,
+        "precondition: attacker account materialized",
+    );
+    let cap_after_init = env.read_account_capital(attacker_idx);
+    assert_eq!(cap_after_init, 100, "attacker holds 100 dust units");
+
+    // Run cranks at advancing slots. The wrapper's
+    // sweep_maintenance_fees charges (now_slot - last_fee_slot) ×
+    // fee_per_slot on every visit. A single account in the bitmap is
+    // visited every crank, so we just need enough cumulative dt.
+    //
+    // Strategy: 12 cranks with +10 slots each = +120 slots total.
+    // Capital 100 - 120 = saturating to 0; debt forgiven by GC.
+    for i in 1..=12 {
+        env.set_slot_and_price(100 + i * 10, 138_000_000);
+        env.crank();
+    }
+
+    let cap_after_drain = env.read_account_capital(attacker_idx);
+    assert_eq!(
+        cap_after_drain, 0,
+        "maintenance fees should drain capital to 0, got {}",
+        cap_after_drain,
+    );
+
+    // One more crank to let `garbage_collect_dust` visit the now-zero
+    // -capital flat account and free the slot.
+    env.set_slot_and_price(100 + 13 * 10, 138_000_000);
+    env.crank();
+
+    assert_eq!(
+        env.read_num_used_accounts(), 0,
+        "GC must free the dust account slot — slot exhaustion is \
+         impossible when maintenance_fee_per_slot > 0",
+    );
+}
+
+/// Stronger variant: account holds an open position. The chain is
+/// fees → equity drops below `min_nonzero_mm_req` (the absolute MM
+/// floor that prevents dust positions from staying "permanently
+/// healthy" at ~0 equity) → risk-buffer scan flags the account →
+/// next crank's liquidation pass closes the position → subsequent
+/// fee sweep drains residual capital → reclaim. End-to-end: just
+/// keep cranking.
+#[test]
+fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Aggressive fee so the test drains in reasonable iterations:
+    // capital 150M, fee 1M/slot → ~150 slots to bankruptcy. With
+    // each set_slot_and_price advancing the slot by 5, ~30 cranks
+    // drain capital and the position becomes liquidatable.
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000,                  // max_maintenance_fee (vestigial arg)
+        1_000_000,                      // maintenance_fee_per_slot
+        0,
+    );
+    env.try_init_market_raw(data).expect("init");
+
+    // LP with healthy capital so trades can match.
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // User: 0.15 SOL capital (matches the "minimal-equity" pattern
+    // already used in `test_position_flip_minimal_equity`). Enough to
+    // back a 1M-size position at 10% initial margin (notional = 138M,
+    // IM = 13.8M).
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 150_000_000);
+    env.set_slot_and_price(100, 138_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let pos_after_open = env.read_account_position(user_idx);
+    assert!(
+        pos_after_open != 0,
+        "precondition: user has open position, got {}",
+        pos_after_open,
+    );
+
+    let used_after_open = env.read_num_used_accounts();
+    assert_eq!(used_after_open, 2, "LP + user materialized");
+
+    // Crank repeatedly with advancing slots. Pipeline:
+    //   1. Maintenance fees drain user capital each crank.
+    //   2. Once equity < maint_margin (≈ 6.9M), risk-buffer scan
+    //      flags the user.
+    //   3. Following crank's `combined` candidate list runs
+    //      liquidation; FullClose closes the position.
+    //   4. User is now flat. Further fee-sweep visits drain residual
+    //      capital to 0 and reclaim the slot.
+    let mut user_freed = false;
+    for i in 1..=400 {
+        env.set_slot_and_price(100 + i * 5, 138_000_000);
+        env.crank();
+        if env.read_num_used_accounts() < used_after_open {
+            user_freed = true;
+            break;
+        }
+    }
+
+    assert!(
+        user_freed,
+        "user account must be liquidated and reclaimed within 400 \
+         cranks purely from maintenance-fee accrual; saw num_used = {}",
+        env.read_num_used_accounts(),
+    );
+}
+
+/// Finding 7 (TDD regression): a sub-threshold (dust) trade must NOT
+/// advance `mark_ewma_last_slot` even when its partial-alpha
+/// contribution nudges the EWMA value by a tiny amount.
+///
+/// Why the clock bump matters for security: on Hyperp markets, soft-
+/// staleness reads `max(mark_ewma_last_slot, last_mark_push_slot)`.
+/// `last_mark_push_slot` is already full-weight-gated (correct), but
+/// if `mark_ewma_last_slot` advances on dust trades, an attacker can
+/// keep a Hyperp market indefinitely "live" by spamming dust fills
+/// even though no genuine observation has been made.
+///
+/// Even on non-Hyperp (where this clock isn't load-bearing for
+/// staleness) the invariant still holds: dust should not refresh
+/// either clock.
+#[test]
+fn test_dust_trade_must_not_advance_mark_ewma_last_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Large fee rate + high mark_min_fee so the seed trade is
+    // full-weight AND a sub-threshold partial has a NON-ZERO
+    // effective_alpha (otherwise u128 integer division rounds the
+    // partial-alpha contribution to 0 and `ewma_moved` never fires).
+    //   - trading_fee_bps = 1000 (10%): fees are large enough.
+    //   - mark_min_fee   = 100_000_000: partial fills are clearly sub.
+    //   - seed (size 10M at $138): fee ≈ 276M, full-weight.
+    //   - dust (size 1M  at $139): fee ≈ 27.8M, sub-threshold but
+    //     partial-alpha contribution ≈ 222k EWMA units — nonzero,
+    //     so `ewma_moved` is true and the buggy clock bump fires.
+    env.init_market_fee_weighted(0, 10_000, 1000, 100_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Seed EWMA with a full-weight trade.
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+    let ewma_seed = env.read_mark_ewma();
+    assert!(ewma_seed > 0, "EWMA must be seeded");
+
+    // Read mark_ewma_last_slot after seed.
+    let read_ewma_clock = |env: &TestEnv| -> u64 {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        percolator_prog::state::read_config(&d).mark_ewma_last_slot
+    };
+    let clock_after_seed = read_ewma_clock(&env);
+
+    // Advance oracle price and do a sub-threshold trade.
+    env.set_slot_and_price(500, 139_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    // Sanity: the dust trade's partial-alpha MUST have produced a
+    // nonzero EWMA move — otherwise `ewma_moved` never fires and
+    // the test can't distinguish the bug from correct behavior.
+    let ewma_after_dust = env.read_mark_ewma();
+    assert_ne!(
+        ewma_after_dust, ewma_seed,
+        "test misconfigured: partial-alpha rounded to 0, so the \
+         bug surface (ewma_moved=true while full_weight=false) \
+         wasn't exercised",
+    );
+
+    // The dust trade's fee is sub-threshold. Partial-alpha EWMA
+    // update may nudge `mark_ewma_e6` by a tiny amount, but the
+    // clock MUST NOT advance — otherwise the partial-fee fill
+    // refreshes the liveness/staleness signal attackers can spam.
+    let clock_after_dust = read_ewma_clock(&env);
+    assert_eq!(
+        clock_after_dust, clock_after_seed,
+        "dust trade (fee < mark_min_fee) must not advance \
+         mark_ewma_last_slot: seed_clock={} post_dust_clock={}",
+        clock_after_seed, clock_after_dust,
+    );
+
+    // Sanity: a full-weight trade DOES advance the clock.
+    // Use a different size so the tx signature differs from the seed
+    // (LiteSVM doesn't auto-advance blockhash between txs).
+    env.set_slot_and_price(1000, 140_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 15_000_000);
+    let clock_after_full = read_ewma_clock(&env);
+    assert!(
+        clock_after_full > clock_after_dust,
+        "full-weight trade must advance mark_ewma_last_slot: \
+         before={} after={}",
+        clock_after_dust, clock_after_full,
+    );
+}
+
+/// F2: Hyperp markets with permissionless_resolve_stale_slots > 0
+/// MUST set mark_min_fee > 0 at init. Otherwise an attacker with
+/// their own LP + matcher can self-trade every slot and refresh
+/// `last_mark_push_slot` (the ONLY Hyperp hard-timeout liveness
+/// signal), permanently blocking `ResolvePermissionless`.
+#[test]
+fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
+    let mut env = TestEnv::new();
+    // Hyperp + perm_resolve > 0 + mark_min_fee = 0 → must reject.
+    let data = common::encode_init_market_hyperp_with_fees(
+        &env.payer.pubkey(),
+        &env.mint,
+        1_000_000, // initial_mark_price
+        86_400,    // max_staleness_secs
+        0,         // trading_fee_bps
+        0,         // mark_min_fee (THE HOLE)
+    );
+    // The helper's perm_resolve = 0 in its default tail — need a
+    // variant with perm_resolve > 0. For this test, craft inline.
+    let mut data = data;
+    // Find and patch perm_resolve_stale_slots (u64). In the helper,
+    // perm_resolve sits at the start of the extended tail after
+    // insurance_withdraw_max_bps(u16) + insurance_withdraw_cooldown_slots(u64).
+    // Simpler: rebuild inline.
+    let _ = data;
+
+    // Inline construction with perm_resolve = 1000, mark_min_fee = 0.
+    let mut payload = vec![0u8];
+    payload.extend_from_slice(env.payer.pubkey().as_ref());
+    payload.extend_from_slice(env.mint.as_ref());
+    payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
+    payload.extend_from_slice(&86_400u64.to_le_bytes());
+    payload.extend_from_slice(&500u16.to_le_bytes());
+    payload.push(0u8); // invert
+    payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    payload.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark
+    payload.extend_from_slice(&0u128.to_le_bytes()); // maint_fee
+    payload.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap
+    payload.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    payload.extend_from_slice(&999u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=1000)
+    payload.extend_from_slice(&50u64.to_le_bytes());
+    payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes());
+    payload.extend_from_slice(&1u128.to_le_bytes());
+    payload.extend_from_slice(&2u128.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes()); // perm_resolve = 1000 (ENABLED)
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&500i64.to_le_bytes());
+    payload.extend_from_slice(&1_000i64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee = 0 (THE HOLE)
+    payload.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay
+
+    let err = env
+        .try_init_market_raw(payload)
+        .expect_err("Hyperp+perm_resolve+mark_min_fee=0 must reject");
+    assert!(
+        err.contains("InvalidInstructionData") || err.contains("0x0"),
+        "expected InvalidInstructionData, got: {}",
+        err,
+    );
+}
+
+/// Counterpart: Hyperp + perm_resolve + nonzero mark_min_fee is accepted.
+#[test]
+fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
+    let mut env = TestEnv::new();
+    let mut payload = vec![0u8];
+    payload.extend_from_slice(env.payer.pubkey().as_ref());
+    payload.extend_from_slice(env.mint.as_ref());
+    payload.extend_from_slice(&[0u8; 32]);
+    payload.extend_from_slice(&86_400u64.to_le_bytes());
+    payload.extend_from_slice(&500u16.to_le_bytes());
+    payload.push(0u8);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&1_000_000u64.to_le_bytes());
+    payload.extend_from_slice(&1u128.to_le_bytes()); // maintenance_fee_per_slot=1 (F3 gate)
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes());
+    payload.extend_from_slice(&1u64.to_le_bytes());
+    payload.extend_from_slice(&999u64.to_le_bytes());
+    payload.extend_from_slice(&50u64.to_le_bytes());
+    payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&0u128.to_le_bytes());
+    payload.extend_from_slice(&1u128.to_le_bytes());
+    payload.extend_from_slice(&2u128.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.extend_from_slice(&1000u64.to_le_bytes());
+    payload.extend_from_slice(&500u64.to_le_bytes());
+    payload.extend_from_slice(&100u64.to_le_bytes());
+    payload.extend_from_slice(&500i64.to_le_bytes());
+    payload.extend_from_slice(&1_000i64.to_le_bytes());
+    payload.extend_from_slice(&1u64.to_le_bytes()); // mark_min_fee = 1 (nonzero)
+    payload.extend_from_slice(&50u64.to_le_bytes());
+    env.try_init_market_raw(payload)
+        .expect("Hyperp+perm_resolve+nonzero mark_min_fee must succeed");
+}

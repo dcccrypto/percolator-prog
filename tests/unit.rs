@@ -930,14 +930,6 @@ fn test_permissionless_crank_gc() {
     }
 }
 
-#[test]
-fn test_funding_rate_is_zero_rate_profile() {
-    // The engine uses a zero-rate core profile: recompute_r_last_from_final_state
-    // always sets funding_rate to 0. Funding accrual is handled internally via
-    // the K-coefficient mechanism, not via external rate injection.
-    // The old compute_inventory_funding_bps_per_slot was dead code and was removed.
-}
-
 // Admin rotation coverage lives in the integration suite
 // (tests/test_admin.rs::test_update_authority_*). The native unit
 // harness here cannot host the Clock sysvar that UpdateAuthority's

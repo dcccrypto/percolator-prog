@@ -2813,24 +2813,6 @@ fn kani_clamp_oracle_price_universal() {
     );
 }
 
-// =============================================================================
-// Insurance withdraw metadata packing roundtrip
-// =============================================================================
-
-/// Prove: pack_ins_withdraw_meta / unpack_ins_withdraw_meta is a perfect roundtrip
-/// for all valid (max_bps, last_slot) pairs.
-#[kani::proof]
-fn kani_ins_withdraw_meta_roundtrip() {
-    let max_bps: u16 = kani::any();
-    let last_slot: u64 = kani::any();
-    kani::assume(max_bps >= 1 && max_bps <= 10_000);
-    kani::assume(last_slot <= percolator_prog::INS_WITHDRAW_LAST_SLOT_MASK);
-    let packed = percolator_prog::pack_ins_withdraw_meta(max_bps, last_slot).unwrap();
-    let (rt_bps, rt_slot) = percolator_prog::unpack_ins_withdraw_meta(packed);
-    assert_eq!(rt_bps, max_bps);
-    assert_eq!(rt_slot, last_slot);
-}
-
 // ============================================================================
 // Fee-Weighted EWMA Proofs
 // ============================================================================
