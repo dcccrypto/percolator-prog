@@ -178,13 +178,12 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
-                                                   // v12.19 solvency envelope: 2 bps/slot * 100 = 200, funding 10_000 e9/slot *
-                                                   // 100 * 10_000 / 1e9 = 10, liq_fee 50 — sum 260 <= maintenance_margin 500 OK.
-    data.extend_from_slice(&2u64.to_le_bytes()); // max_price_move_bps_per_slot
+    // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED in
+    // read_risk_params (F-B1 = 4); not part of the wire layout.
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-                                                 // v12.19.6: perm_resolve must be > max_crank_staleness (50) AND <= MAX_ACCRUAL_DT_SLOTS (100).
-    data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    // v12.19 + F-B1: perm_resolve must EXCEED max_accrual_dt_slots (100).
+    data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
@@ -417,6 +416,7 @@ impl TestEnv {
 
         // InitMarket requires a successful oracle read at init (no sentinel).
         let _ = dummy_ata;
+        // v12.19 InitMarket expects 9 accounts.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -424,8 +424,11 @@ impl TestEnv {
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(self.mint, false),
                 AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_params(
                 &admin.pubkey(),
