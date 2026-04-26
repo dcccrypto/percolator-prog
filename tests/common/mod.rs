@@ -3372,9 +3372,9 @@ impl TestEnv {
     /// Read insurance fund balance from engine
     pub fn read_insurance_balance(&self) -> u128 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // v12.19: ENGINE_OFFSET=600, vault u128 at engine+0,
-        // InsuranceFund.balance u128 at engine+16.
-        let off = ENGINE_OFFSET + 16;
+        // v12.19 BPF: engine.vault u128 at engine+16, insurance.balance at
+        // engine+32 (probed; deposits raise +16, insurance topups raise both).
+        let off = ENGINE_OFFSET + 32;
         u128::from_le_bytes(slab_account.data[off..off + 16].try_into().unwrap())
     }
 
@@ -4389,9 +4389,8 @@ impl TradeCpiTestEnv {
 
     pub fn read_insurance_balance(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // v12.19: ENGINE_OFFSET=600, vault u128 at engine+0,
-        // InsuranceFund.balance u128 at engine+16.
-        let off = ENGINE_OFFSET + 16;
+        // v12.19 BPF: insurance.balance at engine+32 (vault at engine+16).
+        let off = ENGINE_OFFSET + 32;
         u128::from_le_bytes(slab_data[off..off + 16].try_into().unwrap())
     }
 
@@ -4958,7 +4957,10 @@ impl TestEnv {
     /// Read vault balance from engine state
     pub fn read_engine_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const VAULT_OFFSET: usize = 600;
+        // v12.19 BPF: engine.vault U128 lives at engine+16 (probed; the
+        // expected engine+0 slot is zeroed in this build — likely an
+        // 8-byte-aligned padding field that precedes vault).
+        pub const VAULT_OFFSET: usize = 600 + 16;
         u128::from_le_bytes(
             slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
                 .try_into()
