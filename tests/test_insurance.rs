@@ -2346,7 +2346,7 @@ fn test_withdraw_limited_operator_cannot_call_tag_20() {
     // the operator — and the new operator is not insurance_authority.
     let operator = Keypair::new();
     env.svm.airdrop(&operator.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&operator.pubkey()))
+    env.try_update_authority_with_new_signer(&admin, AUTHORITY_INSURANCE_OPERATOR, &operator)
         .expect("rotate insurance_operator");
 
     // Sanity: the operator CAN use tag 23.
@@ -2420,7 +2420,7 @@ fn test_withdraw_limited_rotation_swaps_authority() {
     // Rotate operator to a fresh key.
     let new_op = Keypair::new();
     env.svm.airdrop(&new_op.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&new_op.pubkey()))
+    env.try_update_authority_with_new_signer(&admin, AUTHORITY_INSURANCE_OPERATOR, &new_op)
         .expect("rotate operator");
 
     env.set_slot(200);
@@ -2820,7 +2820,7 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     // Rotate oracle authority.
     let new_oracle = Keypair::new();
     env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle.pubkey()))
+    env.try_update_authority_with_new_signer(&admin, AUTHORITY_ORACLE, &new_oracle)
         .expect("oracle rotation must succeed");
 
     // Under the no-policy branch, the clear fires as before.

@@ -1196,12 +1196,12 @@ fn test_update_authority_insurance_positive_delegation() {
     env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
 
     // Delegate insurance_authority to a fresh key (requires both signers).
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegate.pubkey()))
+    env.try_update_authority_with_new_signer(&admin, AUTHORITY_INSURANCE, &delegate)
         .expect("two-sig delegation must succeed");
 
     // Verify by attempting a re-delegation that requires the new key
     // to sign as current — proves the authority transferred.
-    env.try_update_authority(&delegate, AUTHORITY_INSURANCE, Some(&admin.pubkey()))
+    env.try_update_authority_with_new_signer(&delegate, AUTHORITY_INSURANCE, &admin)
         .expect("delegate should now be able to act as insurance_authority");
 }
 
@@ -1218,7 +1218,7 @@ fn test_update_authority_negative_wrong_current_signer() {
 
     for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE] {
         let err = env
-            .try_update_authority(&attacker, kind, Some(&target.pubkey()))
+            .try_update_authority_with_new_signer(&attacker, kind, &target)
             .expect_err("attacker must not be able to transfer authority");
         let _ = err;
     }
@@ -1276,7 +1276,7 @@ fn test_update_authority_burn_single_sig_and_then_dead() {
     // After burn, admin can no longer act as insurance_authority.
     let new_target = Keypair::new();
     let err = env
-        .try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&new_target.pubkey()))
+        .try_update_authority_with_new_signer(&admin, AUTHORITY_INSURANCE, &new_target)
         .expect_err("after burn, no one can set insurance_authority again");
     let _ = err;
 }
@@ -1297,7 +1297,7 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
     // kind is independent of the insurance-authority burn).
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin.pubkey()))
+    env.try_update_authority_with_new_signer(&admin, AUTHORITY_ADMIN, &new_admin)
         .expect("admin transfer still works after insurance_authority burn");
 }
 
@@ -1337,7 +1337,7 @@ fn test_update_authority_insurance_survives_admin_burn() {
     env.svm
         .airdrop(&ins_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&ins_authority.pubkey()))
+    env.try_update_authority_with_new_signer(&admin, AUTHORITY_INSURANCE, &ins_authority)
         .expect("delegate insurance_authority");
 
     // Burn admin (live market with perm-resolve + force-close configured).
@@ -1350,7 +1350,7 @@ fn test_update_authority_insurance_survives_admin_burn() {
     // UpdateAuthority is a sufficient liveness indicator.)
     let new_ins = Keypair::new();
     env.svm.airdrop(&new_ins.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&ins_authority, AUTHORITY_INSURANCE, Some(&new_ins.pubkey()))
+    env.try_update_authority_with_new_signer(&ins_authority, AUTHORITY_INSURANCE, &new_ins)
         .expect("insurance_authority survives admin burn");
 }
 
