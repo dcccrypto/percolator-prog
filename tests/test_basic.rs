@@ -4446,7 +4446,7 @@ fn test_init_market_custom_funding_horizon() {
     program_path();
     let mut env = TestEnv::new();
     // Custom horizon=1000, k=100 (default), max_premium=500 (default), max_per_slot=5 (default)
-    env.init_market_with_funding(0, 80, 1000, 100, 500, 5);
+    env.init_market_with_funding(0, 200, 1000, 100, 500, 5);
     assert_eq!(
         env.read_funding_horizon(),
         1000,
@@ -4459,7 +4459,7 @@ fn test_init_market_custom_funding_horizon() {
 fn test_init_market_custom_funding_k() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 80, 500, 200, 500, 5);
+    env.init_market_with_funding(0, 200, 500, 200, 500, 5);
     assert_eq!(env.read_funding_k_bps(), 200, "Custom k_bps must be stored");
 }
 
@@ -4468,7 +4468,7 @@ fn test_init_market_custom_funding_k() {
 fn test_init_market_custom_funding_max_premium() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 80, 500, 100, 1000, 5);
+    env.init_market_with_funding(0, 200, 500, 100, 1000, 5);
     assert_eq!(
         env.read_funding_max_premium_bps(),
         1000,
@@ -4481,7 +4481,7 @@ fn test_init_market_custom_funding_max_premium() {
 fn test_init_market_custom_funding_max_per_slot() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 80, 500, 100, 500, 10);
+    env.init_market_with_funding(0, 200, 500, 100, 500, 10);
     assert_eq!(
         env.read_funding_max_e9_per_slot(),
         10,
@@ -4496,7 +4496,7 @@ fn test_init_market_custom_all_funding_params() {
     let mut env = TestEnv::new();
     // funding_max_e9_per_slot must fit the engine's per-market envelope
     // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
-    env.init_market_with_funding(0, 80, 2000, 300, 800, 10);
+    env.init_market_with_funding(0, 200, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);

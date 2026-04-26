@@ -2002,6 +2002,7 @@ fn encode_update_config_with_cap_tag(k: u16) -> Vec<u8> {
 }
 
 fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), String> {
+    // v12.19: UpdateConfig expects exactly 3 accounts: admin, slab, clock.
     let ix = solana_sdk::instruction::Instruction {
         program_id: env.program_id,
         accounts: vec![
@@ -2011,7 +2012,6 @@ fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), 
                 solana_sdk::sysvar::clock::ID,
                 false,
             ),
-            solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
         ],
         data: encode_update_config_with_cap_tag(k),
     };

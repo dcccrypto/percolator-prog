@@ -292,7 +292,8 @@ pub fn encode_init_market_hyperp_with_stale(
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
     data.extend_from_slice(&permissionless_resolve_stale_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
@@ -408,7 +409,8 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req    append_default_extended_tail_for(&mut data, is_hyperp);
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    append_default_extended_tail_for(&mut data, is_hyperp);
     data
 }
 
@@ -645,11 +647,12 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
 
-    // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
-    let perm_resolve: u64 = if is_hyperp { 0 } else { 80 };
+    // v12.19 sync: perm_resolve must EXCEED max_accrual_dt_slots (=100). Pick 200.
+    let perm_resolve: u64 = if is_hyperp { 0 } else { 200 };
     data.extend_from_slice(&perm_resolve.to_le_bytes());
     // Custom funding params (required before mark_min_fee)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
@@ -708,7 +711,8 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req    append_default_extended_tail_for(&mut data, is_hyperp);
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    append_default_extended_tail_for(&mut data, is_hyperp);
     data
 }
 
@@ -1900,7 +1904,8 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req    append_default_extended_tail_for(&mut data, is_hyperp_full);
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    append_default_extended_tail_for(&mut data, is_hyperp_full);
     data
 }
 
@@ -1949,14 +1954,13 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req                                                                             // Extended tail: scale perm_resolve so h_max <= perm_resolve (§14.1).
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-                                                 // v12.19.6: perm_resolve must satisfy `perm_resolve > h_max` AND
-                                                 // `perm_resolve > max_crank_staleness(50)` AND `perm_resolve <= 100`.
-                                                 // For tests that pass warmup >= 100 there's no valid value — the
-                                                 // caller should use a shorter warmup.
+                                                 // v12.19 sync: perm_resolve must satisfy
+                                                 // `perm_resolve > risk_params.max_accrual_dt_slots = 100` AND
+                                                 // `perm_resolve > h_max` AND `force_close > 0`.
     let perm_resolve: u64 = if is_hyperp {
         0
     } else {
-        100.min(warmup_period_slots.saturating_add(10).max(80))
+        warmup_period_slots.saturating_add(101).max(200)
     };
     data.extend_from_slice(&perm_resolve.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
@@ -2917,11 +2921,15 @@ impl TestEnv {
 // CRITICAL SECURITY TESTS - L7 DEEP DIVE
 // ============================================================================
 
-// Legacy encoders — the on-chain UpdateAdmin (tag 12) and
-// SetOracleAuthority (tag 16) instructions were deleted. These
-// helpers now route through UpdateAuthority (tag 32).
+// Fork's Phase E single-step UpdateAdmin (tag 12) is preserved alongside
+// UpdateAuthority (tag 83). Tag 12's wrapper expects 2 accounts (admin,
+// slab) and does NOT require new_admin signature — sets pending_admin and
+// AcceptAdmin (tag 82) completes the rotate. Use this encoder for Phase E
+// tests; use encode_update_authority directly for v12.18.x 4-way splits.
 pub fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    encode_update_authority(AUTHORITY_ADMIN, Some(new_admin))
+    let mut data = vec![12u8]; // Tag 12: UpdateAdmin (Phase E single-step)
+    data.extend_from_slice(new_admin.as_ref());
+    data
 }
 
 pub fn encode_accept_admin() -> Vec<u8> {
@@ -2988,20 +2996,13 @@ impl TestEnv {
     /// pending_admin only; caller must also call try_accept_admin(&new_admin_kp)
     /// to complete the transfer. new_admin == default() still burns immediately.
     pub fn try_update_admin(&mut self, signer: &Keypair, new_admin: &Pubkey) -> Result<(), String> {
-        let is_burn = *new_admin == Pubkey::default();
-        let is_self = *new_admin == signer.pubkey();
-        // Mark new as signer only on self-transfer (one tx sig covers
-        // both slots). Cross-Keypair transfers are marked non-signer
-        // and the program rejects at expect_signer — this matches
-        // the "negative test expects rejection" pattern used by
-        // legacy call-sites. Positive cross-Keypair transfers should
-        // use try_update_authority directly with Some(&new_kp).
-        let new_is_signer = !is_burn && is_self;
+        let _ = new_admin;
+        // Phase E single-step UpdateAdmin (tag 12): 2 accounts (admin, slab).
+        // Sets pending_admin; AcceptAdmin (tag 82) completes the rotate.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new(*new_admin, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_admin(new_admin),
@@ -3143,16 +3144,14 @@ impl TestEnv {
     /// Try ResolveMarket instruction (admin only). `mode`: 0 = Ordinary,
     /// 1 = Degenerate.
     pub fn try_resolve_market(&mut self, admin: &Keypair, mode: u8) -> Result<(), String> {
+        // v12.19 ResolveMarket expects exactly 4 accounts: admin, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_resolve_market(mode),
         };
@@ -3404,16 +3403,13 @@ impl TestEnv {
 
     /// Try UpdateConfig instruction
     pub fn try_update_config(&mut self, signer: &Keypair) -> Result<(), String> {
+        // v12.19: UpdateConfig expects exactly 3 accounts (admin, slab, clock).
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                // Non-Hyperp UpdateConfig REQUIRES the oracle account. Admin
-                // can no longer select the degenerate zero-funding arm by
-                // omission; only a confirmed-stale oracle triggers it.
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 3600,   // funding_horizon_slots
@@ -4294,16 +4290,14 @@ impl TradeCpiTestEnv {
     }
 
     pub fn try_resolve_market(&mut self, admin: &Keypair, mode: u8) -> Result<(), String> {
+        // v12.19 ResolveMarket expects exactly 4 accounts: admin, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_resolve_market(mode),
         };
@@ -5344,8 +5338,7 @@ impl TestEnv {
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
                                                      // Per-market admin limits (uncapped defaults for tests)
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
-        // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
-        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+        // v12.19 sync: min_oracle_price_cap_e2bps removed from wire format.
         // RiskParams
         data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -5367,7 +5360,7 @@ impl TestEnv {
                                                                                  // perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
         data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-        data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots
+        data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve_stale_slots (v12.19: > 100)
         data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
         data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
         data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
@@ -5435,15 +5428,14 @@ impl TestEnv {
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-        data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+        // v12.19 sync: max_insurance_floor + min_oracle_price_cap_e2bps removed from wire.
         data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
         data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
         data.extend_from_slice(&trading_fee_bps.to_le_bytes()); // trading_fee_bps
         data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-        // §12.19.6 F8 anti-spam (non-Hyperp default tail: perm_resolve=80).
         data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee (dust)
+        data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 sync: still in wire)
         data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
         data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
@@ -5452,7 +5444,8 @@ impl TestEnv {
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
         data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-        data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req        append_default_extended_tail_for(&mut data, false);
+        data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    append_default_extended_tail_for(&mut data, false);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -5524,15 +5517,13 @@ impl TestEnv {
         let mut data = vec![26u8];
         data.extend_from_slice(&user_idx.to_le_bytes());
 
+        // v12.19 SettleAccount expects exactly 3 accounts: slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
         };
@@ -5964,16 +5955,13 @@ impl TestEnv {
         signer: &Keypair,
         funding_horizon_slots: u64,
     ) -> Result<(), String> {
+        // v12.19 UpdateConfig expects exactly 3 accounts: admin, slab, clock.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                // Non-Hyperp UpdateConfig REQUIRES the oracle account. Admin
-                // can no longer select the degenerate zero-funding arm by
-                // omission; only a confirmed-stale oracle triggers it.
-                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_update_config(
                 funding_horizon_slots,
@@ -7649,7 +7637,8 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req    append_default_extended_tail_for(&mut data, is_hyperp);
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    append_default_extended_tail_for(&mut data, is_hyperp);
     data
 }
 
@@ -7718,9 +7707,7 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    // Resolvability invariant: ship max cap (default tail has perm_resolve=0).
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // v12.19 sync: max_insurance_floor + min_oracle_price_cap_e2bps removed from wire format.
     // RiskParams
     data.extend_from_slice(&1u64.to_le_bytes()); /* v12.19: h_min must be >= 1 */ // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -7738,7 +7725,8 @@ pub fn encode_init_market_with_insurance_floor(
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req    append_default_extended_tail_for(&mut data, is_hyperp);
+    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    append_default_extended_tail_for(&mut data, is_hyperp);
     data
 }
 
@@ -8014,10 +8002,18 @@ impl TestEnv {
         kind: u8,
         new_pubkey: Option<&Pubkey>,
     ) -> Result<(), String> {
+        // v12.18.x UpdateAuthority expects exactly 3 accounts:
+        // current authority (signer), new authority, slab. For burn
+        // (new_pubkey == None), pass system_program::ID as a non-signer
+        // placeholder — wrapper skips signer check on burn.
+        let burn = solana_sdk::system_program::ID;
+        let new_key = new_pubkey.copied().unwrap_or(burn);
+        let new_is_signer = new_pubkey.is_some();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(new_key, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_authority(kind, new_pubkey),

@@ -7566,7 +7566,11 @@ pub mod processor {
             }
         }
         if let Some(ms) = custom_max_per_slot {
-            if ms < 0 || (funding_bps_to_e9(ms) as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT {
+            /* fix: ML10 renamed `funding_max_bps_per_slot` → `funding_max_e9_per_slot`,
+             * so `ms` is already in e9. The previous bps_to_e9 conversion (×1e5)
+             * caused valid wire values like 1_000 e9 to be rejected as
+             * 100_000_000 > 10_000. Compare against the engine ceiling directly. */
+            if ms < 0 || (ms as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT {
                 return Err(PercolatorError::InvalidConfigParam.into());
             }
         }
@@ -9466,9 +9470,12 @@ pub mod processor {
         if funding_horizon_slots == 0 {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
-        // Reject negative funding bounds — reversed clamp bounds panic
+        // Reject negative funding bounds — reversed clamp bounds panic.
+        /* fix: ML10 renamed funding_max_bps_per_slot → funding_max_e9_per_slot.
+         * `funding_max_bps_per_slot` (param name kept for ABI continuity) is
+         * already in e9; do NOT pass through funding_bps_to_e9. */
         if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
-            || (funding_bps_to_e9(funding_max_bps_per_slot) as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
+            || (funding_max_bps_per_slot as i128) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
         {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
