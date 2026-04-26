@@ -101,8 +101,11 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(
             &payer.pubkey(),
@@ -256,8 +259,11 @@ fn test_hyperp_init_market_with_valid_price() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(
             &payer.pubkey(),
@@ -290,7 +296,7 @@ fn test_hyperp_init_market_with_valid_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap_off = common::ENGINE_OFFSET + 32 + 160;
+    let cap_off = common::ENGINE_OFFSET + 32 + 176;
     let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
@@ -423,8 +429,11 @@ fn test_hyperp_init_market_with_inverted_price() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_full_v2(
             &payer.pubkey(),
@@ -457,7 +466,7 @@ fn test_hyperp_init_market_with_inverted_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap_off = common::ENGINE_OFFSET + 32 + 160;
+    let cap_off = common::ENGINE_OFFSET + 32 + 176;
     let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
@@ -710,8 +719,11 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_hyperp(&payer.pubkey(), &mint, initial_price_e6),
     };
@@ -820,7 +832,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
     // Read the engine-level `max_price_move_bps_per_slot` — v12.19
     // replacement for `oracle_price_cap`.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = common::ENGINE_OFFSET + 32 + 160;
+    const CAP_OFF: usize = common::ENGINE_OFFSET + 32 + 176;
     let cap = u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
     assert_eq!(
         cap,

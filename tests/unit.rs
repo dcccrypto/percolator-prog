@@ -904,8 +904,11 @@ fn test_set_risk_threshold() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
+            f.token_prog.to_info(),
             f.clock.to_info(),
+            f.rent.to_info(),
             f.pyth_index.to_info(),
+            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &init_data).unwrap();
     }
@@ -937,8 +940,11 @@ fn test_set_risk_threshold_non_admin_fails() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
+            f.token_prog.to_info(),
             f.clock.to_info(),
+            f.rent.to_info(),
             f.pyth_index.to_info(),
+            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accs, &init_data).unwrap();
     }

@@ -59,22 +59,24 @@ pub const DEFAULT_INIT_CAPITAL: u64 = DEFAULT_INIT_PAYMENT - DEFAULT_NEW_ACCOUNT
 // Verified empirically via tests/probe_offset.rs (insurance.balance hit
 // at 616 = ENGINE_OFFSET + 16).
 pub const ENGINE_OFFSET: usize = 600;
+// v12.19 layout (RiskParams expanded by ~16 bytes pushed downstream
+// fields). Probed via tests/probe_offset.rs against the small build
+// (MAX_ACCOUNTS=256). num_used_accounts is a u16 inside the fixed
+// engine prefix (offset feature-invariant).
 pub const ENGINE_BITMAP_OFFSET: usize = 712;
+pub const ENGINE_NUM_USED_OFFSET: usize = 592;
 
+// ENGINE_ACCOUNTS_OFFSET = end of bitmap + per-slot K/F arrays. Scales
+// with MAX_ACCOUNTS. small probed at engine+17632; medium/default need
+// their own probe before the offset-dependent tests run on those tiers.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-pub const ENGINE_NUM_USED_OFFSET: usize = 744;
-#[cfg(all(feature = "small", not(feature = "medium")))]
-pub const ENGINE_ACCOUNTS_OFFSET: usize = 1776;
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 17632;
 
 #[cfg(all(feature = "medium", not(feature = "small")))]
-pub const ENGINE_NUM_USED_OFFSET: usize = 840;
-#[cfg(all(feature = "medium", not(feature = "small")))]
-pub const ENGINE_ACCOUNTS_OFFSET: usize = 4944;
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 17632;
 
 #[cfg(not(any(feature = "small", feature = "medium")))]
-pub const ENGINE_NUM_USED_OFFSET: usize = 1224;
-#[cfg(not(any(feature = "small", feature = "medium")))]
-pub const ENGINE_ACCOUNTS_OFFSET: usize = 17616;
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 17632;
 
 // Pyth Receiver program ID
 pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -1745,6 +1747,7 @@ impl TestEnv {
         let (vault_pda, _) =
             Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
+        // v12.19 AdminForceCloseAccount: 8 accounts.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -1755,6 +1758,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(vault_pda, false), // 4: vault_pda
                 AccountMeta::new_readonly(spl_token::ID, false), // 5: token program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // 6: clock
+                AccountMeta::new_readonly(self.pyth_index, false),   // 7: oracle
             ],
             data: encode_admin_force_close_account(user_idx),
         };
@@ -2155,7 +2159,7 @@ impl TestEnv {
         // SBF-written RiskEngine bytes must be read with SBF offsets, not by
         // casting to the host RiskEngine layout. RiskEngine.params starts at
         // engine+32; RiskParams.max_price_move_bps_per_slot is at params+160.
-        const MAX_PRICE_MOVE_BPS_OFFSET: usize = ENGINE_OFFSET + 32 + 160;
+        const MAX_PRICE_MOVE_BPS_OFFSET: usize = ENGINE_OFFSET + 32 + 176;
         u64::from_le_bytes(
             d[MAX_PRICE_MOVE_BPS_OFFSET..MAX_PRICE_MOVE_BPS_OFFSET + 8]
                 .try_into()
@@ -2871,16 +2875,14 @@ impl TestEnv {
     pub fn try_liquidate(&mut self, target_idx: u16) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
-
+        // v12.19 LiquidateAtOracle: 4 accounts: caller(signer), slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_liquidate(target_idx),
         };
@@ -3261,6 +3263,8 @@ impl TestEnv {
         let (vault_pda, _) =
             Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
 
+        // v12.19 ForceCloseResolved expects 7 accounts: slab, vault, owner_ata,
+        // vault_pda, token, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -3270,6 +3274,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(vault_pda, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_force_close_resolved(user_idx),
         };
@@ -7861,7 +7866,8 @@ impl TestEnv {
 
 impl TestEnv {
     /// Tag 16 SetOracleAuthority — Phase G dispatch removed in wrapper;
-    /// helper retained for compile compatibility. Tests #[ignore]'d.
+    /// now routes through UpdateAuthority (tag 83) with kind=ORACLE.
+    /// Wrapper expects 3 accounts: current(signer), new_authority, slab.
     pub fn try_set_oracle_authority(
         &mut self,
         signer: &Keypair,
@@ -7871,6 +7877,7 @@ impl TestEnv {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(*new_authority, false),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_set_oracle_authority(new_authority),
@@ -8037,6 +8044,7 @@ impl TradeCpiTestEnv {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(*new_authority, false),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_set_oracle_authority(new_authority),
@@ -8120,9 +8128,9 @@ pub const AUTHORITY_INSURANCE: u8 = 2;
 pub const AUTHORITY_INSURANCE_OPERATOR: u8 = 3;
 
 pub fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    let mut data = vec![16u8];
-    data.extend_from_slice(new_authority.as_ref());
-    data
+    // Phase G dispatch removed tag 16; oracle authority is now set via
+    // UpdateAuthority (tag 83) with kind=1 (ORACLE).
+    encode_update_authority(AUTHORITY_ORACLE, Some(new_authority))
 }
 
 pub fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
