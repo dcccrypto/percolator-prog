@@ -5115,6 +5115,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&10u64.to_le_bytes());
         data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (required when permissionless_resolve > 0)
 
+        // v12.19 InitMarket expects 9 accounts.
         let ix = Instruction {
             program_id: env.program_id,
             accounts: vec![
@@ -5122,8 +5123,11 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
                 AccountMeta::new(env.slab, false),
                 AccountMeta::new_readonly(env.mint, false),
                 AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(env.pyth_index, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data,
         };
