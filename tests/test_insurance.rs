@@ -2890,12 +2890,11 @@ fn setup_bounded_withdrawal(
     env.top_up_insurance(&insurance_payer, insurance);
 
     // Direct slab edits: insurance_withdraw_max_bps + cooldown_slots.
-    // Offsets relative to start of MarketConfig (after SlabHeader). v12.19
-    // layout left these field positions stable from pre-sync.
+    // v12.19 layout (probed via tests/probe_config.rs):
+    //   insurance_withdraw_max_bps (u16) at absolute offset 336
+    //   insurance_withdraw_cooldown_slots (u64) at absolute offset 344
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    // insurance_withdraw_max_bps (u16): HEADER_LEN(168) + config offset 232 = 400
-    slab.data[400..402].copy_from_slice(&max_bps.to_le_bytes());
-    // insurance_withdraw_cooldown_slots (u64): HEADER_LEN(168) + 240 = 408
-    slab.data[408..416].copy_from_slice(&cooldown_slots.to_le_bytes());
+    slab.data[336..338].copy_from_slice(&max_bps.to_le_bytes());
+    slab.data[344..352].copy_from_slice(&cooldown_slots.to_le_bytes());
     env.svm.set_account(env.slab, slab).unwrap();
 }
