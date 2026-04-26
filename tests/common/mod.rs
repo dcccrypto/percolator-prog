@@ -4186,12 +4186,63 @@ impl TradeCpiTestEnv {
     }
 
     pub fn set_slot(&mut self, slot: u64) {
-        let effective_slot = slot + 100;
+        // v12.19 envelope: max_accrual_dt_slots = 100. Walk the clock in
+        // 80-slot chunks with a best-effort crank between each step so the
+        // engine's last_market_slot stays within range; otherwise the next
+        // cranking instruction trips Custom(18) Overflow.
+        const CHUNK: u64 = 80;
+        let cur = self.svm.get_sysvar::<Clock>().slot;
+        let target_effective = slot + 100;
+        if target_effective <= cur {
+            self.svm.set_sysvar(&Clock {
+                slot: target_effective,
+                unix_timestamp: target_effective as i64,
+                ..Clock::default()
+            });
+            return;
+        }
+        let mut s = cur;
+        while s + CHUNK < target_effective {
+            s += CHUNK;
+            self.svm.set_sysvar(&Clock {
+                slot: s,
+                unix_timestamp: s as i64,
+                ..Clock::default()
+            });
+            // Best-effort: tolerate failure (some tests intentionally
+            // probe error paths via set_slot).
+            let _ = self.try_crank_once_internal();
+        }
         self.svm.set_sysvar(&Clock {
-            slot: effective_slot,
-            unix_timestamp: effective_slot as i64,
+            slot: target_effective,
+            unix_timestamp: target_effective as i64,
             ..Clock::default()
         });
+    }
+
+    fn try_crank_once_internal(&mut self) -> Result<(), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_crank_permissionless(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
     }
 
     /// Advance the clock to `target_slot` in CHUNK-sized steps, cranking
