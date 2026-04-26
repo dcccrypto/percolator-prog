@@ -3674,11 +3674,19 @@ pub mod oracle {
 
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
     /// Units: 1_000_000 e2bps = 100%. 0 = disabled (no cap). last_price == 0 = first-time.
-    pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_bps: u64) -> u64 {
-        if max_change_bps == 0 || last_price == 0 {
+    /// Circuit breaker for oracle reads: clamp `raw_price` to within
+    /// `max_change_e2bps` (units: 0.01 bps; `1_000_000 = 100%`) of `last_price`.
+    ///
+    /// F-B3 fix: divisor changed from `/10_000` (bps) to `/1_000_000` (e2bps)
+    /// to match every production caller, all of which pass
+    /// `config.oracle_price_cap_e2bps`. Pre-fix the cap was 100x looser than
+    /// admin-configured. See kani_repair/F-B3_clamp_divisor.md.
+    pub fn clamp_oracle_price(last_price: u64, raw_price: u64, max_change_e2bps: u64) -> u64 {
+        if max_change_e2bps == 0 || last_price == 0 {
             return raw_price;
         }
-        let max_delta_128 = (last_price as u128) * (max_change_bps as u128) / 10_000;
+        // F-B3: divisor is 1_000_000 (e2bps), not 10_000 (bps).
+        let max_delta_128 = (last_price as u128) * (max_change_e2bps as u128) / 1_000_000;
         let max_delta = core::cmp::min(max_delta_128, u64::MAX as u128) as u64;
         let lower = last_price.saturating_sub(max_delta);
         let upper = last_price.saturating_add(max_delta);
@@ -3695,11 +3703,18 @@ pub mod oracle {
         config: &mut super::state::MarketConfig,
         price_ai: &AccountInfo,
         now_unix_ts: i64,
-        max_change_bps: u64,
+        // F-B3: param renamed for naming consistency. Function body actually
+        // reads `config.oracle_price_cap_e2bps` directly; this argument is
+        // forwarded by callers but currently unused inside the body.
+        max_change_e2bps: u64,
         p_last: u64,
         price_move_dt_slots: u64,
         oi_any: bool,
     ) -> Result<u64, ProgramError> {
+        let _ = max_change_e2bps;
+        let _ = p_last;
+        let _ = price_move_dt_slots;
+        let _ = oi_any;
         // Read from external oracle (Pyth/Chainlink)
         let external = read_engine_price_e6(
             price_ai,
@@ -3822,18 +3837,25 @@ pub mod oracle {
     /// External-oracle target/effective staircase. Unlike the Hyperp helper
     /// below, this intentionally does not cap accumulated dt; the caller passes
     /// the engine-relevant residual dt for the actual accrual step.
-    pub fn clamp_toward_engine_dt(p_last: u64, target: u64, cap_bps: u64, dt_slots: u64) -> u64 {
+    ///
+    /// F-B3 fix: `cap_e2bps` units are 0.01 bps (`1_000_000 = 100%`). Divisor
+    /// changed from `/10_000` (bps) to `/1_000_000` (e2bps) to match the
+    /// only caller (`get_engine_oracle_price_e6`), which passes
+    /// `config.oracle_price_cap_e2bps` through `max_change_e2bps`.
+    /// See kani_repair/F-B3_clamp_divisor.md.
+    pub fn clamp_toward_engine_dt(p_last: u64, target: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
         if p_last == 0 || target == 0 {
             return target;
         }
-        if cap_bps == 0 || dt_slots == 0 {
+        if cap_e2bps == 0 || dt_slots == 0 {
             return p_last;
         }
 
+        // F-B3: divisor is 1_000_000 (e2bps), not 10_000 (bps).
         let max_delta_u128 = (p_last as u128)
-            .saturating_mul(cap_bps as u128)
+            .saturating_mul(cap_e2bps as u128)
             .saturating_mul(dt_slots as u128)
-            / 10_000u128;
+            / 1_000_000u128;
         let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
         if target > p_last {
             core::cmp::min(target, p_last.saturating_add(max_delta))
@@ -3842,32 +3864,39 @@ pub mod oracle {
         }
     }
 
-    /// Move `index` toward `mark`, but clamp movement by cap_bps * dt_slots.
-    /// cap_bps units: standard bps (10_000 = 100%).
+    /// Move `index` toward `mark`, but clamp movement by cap_e2bps * dt_slots.
+    /// cap_e2bps units: 0.01 bps (`1_000_000 = 100%`).
     /// Returns the new index value.
     ///
-    /// Security: When dt_slots == 0 (same slot) or cap_bps == 0 (cap disabled),
-    /// returns index unchanged to prevent bypassing rate limits.
+    /// Security: When dt_slots == 0 (same slot) or cap_e2bps == 0 (cap
+    /// disabled), returns index unchanged to prevent bypassing rate limits.
+    ///
+    /// F-B3 fix: divisor changed from `/10_000` (bps) to `/1_000_000` (e2bps)
+    /// to match every production caller, all of which pass
+    /// `config.oracle_price_cap_e2bps`. Pre-fix the cap was 100x looser than
+    /// admin-configured. See kani_repair/F-B3_clamp_divisor.md.
+    ///
     /// Maximum effective dt for rate-limiting. Caps accumulated movement to
     /// prevent a crank pause from allowing a full-magnitude index jump.
     /// ~1 hour at 2.5 slots/sec = 9000 slots.
     const MAX_CLAMP_DT_SLOTS: u64 = 9_000;
 
-    pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_bps: u64, dt_slots: u64) -> u64 {
+    pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
         if index == 0 {
             return mark;
         }
-        if cap_bps == 0 || dt_slots == 0 {
+        if cap_e2bps == 0 || dt_slots == 0 {
             return index;
         }
 
         // Cap dt to bound accumulated movement after crank pauses
         let capped_dt = dt_slots.min(MAX_CLAMP_DT_SLOTS);
 
+        // F-B3: divisor is 1_000_000 (e2bps), not 10_000 (bps).
         let max_delta_u128 = (index as u128)
-            .saturating_mul(cap_bps as u128)
+            .saturating_mul(cap_e2bps as u128)
             .saturating_mul(capped_dt as u128)
-            / 10_000u128;
+            / 1_000_000u128;
 
         let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
         let lo = index.saturating_sub(max_delta);
@@ -3886,7 +3915,9 @@ pub mod oracle {
         now_unix_ts: i64,
         config: &mut super::state::MarketConfig,
         a_oracle: &AccountInfo,
-        max_change_bps: u64,
+        // F-B3: e2bps semantics throughout the oracle clamp chain
+        // (1_000_000 = 100%). All callers pass `config.oracle_price_cap_e2bps`.
+        max_change_e2bps: u64,
         oi_any: bool,
     ) -> Result<u64, ProgramError> {
         // Strict hard-timeout gate (applies to both Hyperp and non-Hyperp):
@@ -3932,7 +3963,7 @@ pub mod oracle {
                 mark
             };
             let new_index = if oi_any {
-                clamp_toward_engine_dt(anchor, mark, max_change_bps, price_move_dt_slots)
+                clamp_toward_engine_dt(anchor, mark, max_change_e2bps, price_move_dt_slots)
             } else {
                 mark
             };
@@ -3950,7 +3981,7 @@ pub mod oracle {
             config,
             a_oracle,
             now_unix_ts,
-            max_change_bps,
+            max_change_e2bps,
             engine_last_oracle_price,
             price_move_dt_slots,
             oi_any,

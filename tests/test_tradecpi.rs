@@ -1863,7 +1863,7 @@ fn test_attack_hyperp_index_lag_exploitation() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
     env.set_oracle_price_e6(1_000_000);
-    env.try_set_oracle_price_cap(&admin, 10_000).unwrap(); // 100% per slot cap
+    env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap(); // F-B3 fix: 100% per slot cap = 1_000_000 e2bps
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);

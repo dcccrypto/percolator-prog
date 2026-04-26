@@ -3789,7 +3789,7 @@ use percolator_prog::policy::{ewma_update, mark_ewma_clamp_base};
 #[test]
 fn test_ewma_single_slot_max_movement() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
+    let cap: u64 = 10_000; // F-B3 fix: 1% in e2bps (clamp_oracle_price uses /1_000_000)
     let halflife: u64 = 100;
 
     // Attacker exec price: as far from index as circuit breaker allows
@@ -3815,7 +3815,7 @@ fn test_ewma_single_slot_max_movement() {
 #[test]
 fn test_ewma_walkup_clamp_against_mark_vulnerable() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
+    let cap: u64 = 10_000; // F-B3 fix: 1% in e2bps (clamp_oracle_price uses /1_000_000)
     let halflife: u64 = 100;
     let mut mark = index;
 
@@ -3840,7 +3840,7 @@ fn test_ewma_walkup_clamp_against_mark_vulnerable() {
 #[test]
 fn test_ewma_walkup_clamp_against_index_bounded() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
+    let cap: u64 = 10_000; // F-B3 fix: 1% in e2bps (clamp_oracle_price uses /1_000_000)
     let halflife: u64 = 100;
     let mut mark = index;
 
@@ -3850,9 +3850,9 @@ fn test_ewma_walkup_clamp_against_index_bounded() {
         let clamped = clamp_oracle_price(clamp_base, 200_000_000, cap);
         mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
-    // Mark must be within cap of index (1% = 1_000_000)
-    // v12.19: clamp uses bps (denominator 10_000), not e2bps (1_000_000).
-    let max_gap = index as u128 * cap as u128 / 10_000;
+    // Mark must be within cap of index (1% = 1_000_000 in e2bps).
+    // F-B3 fix: clamp uses e2bps (denominator 1_000_000), not bps (10_000).
+    let max_gap = index as u128 * cap as u128 / 1_000_000;
     assert!(
         (mark as u128) <= index as u128 + max_gap,
         "Index-clamped walk must be bounded: mark={} index={} max_gap={}",
@@ -3865,7 +3865,7 @@ fn test_ewma_walkup_clamp_against_index_bounded() {
 /// Test 1.4: Legitimate price discovery — mark tracks moving index.
 #[test]
 fn test_ewma_tracks_moving_index() {
-    let cap: u64 = 100; // 1% in bps (v12.19: clamp_oracle_price uses bps, not e2bps)
+    let cap: u64 = 10_000; // F-B3 fix: 1% in e2bps (clamp_oracle_price uses /1_000_000)
     let halflife: u64 = 100;
     let mut index: u64 = 100_000_000;
     let mut mark = index;
@@ -3899,7 +3899,7 @@ fn test_ewma_tracks_moving_index() {
 #[test]
 fn test_ewma_walkdown_clamp_against_index_bounded() {
     let index: u64 = 100_000_000;
-    let cap: u64 = 10_000;
+    let cap: u64 = 1_000_000; // F-B3 fix: 100% in e2bps (was 10_000 bps = same 100%)
     let halflife: u64 = 100;
     let mut mark = index;
 
@@ -3908,8 +3908,8 @@ fn test_ewma_walkdown_clamp_against_index_bounded() {
         let clamped = clamp_oracle_price(clamp_base, 1, cap); // attack downward
         mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
-    // v12.19: clamp uses bps (denominator 10_000), not e2bps (1_000_000).
-    let max_gap = index as u128 * cap as u128 / 10_000;
+    // F-B3 fix: clamp uses e2bps (denominator 1_000_000), not bps (10_000).
+    let max_gap = index as u128 * cap as u128 / 1_000_000;
     assert!(
         mark as u128 >= index as u128 - max_gap,
         "Downward walk must be bounded: mark={} index={} max_gap={}",
