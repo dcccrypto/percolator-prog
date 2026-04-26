@@ -6888,9 +6888,21 @@ pub mod processor {
         let mut header = state::read_header(&data);
         let mut config = state::read_config(&data);
 
+        // v12.19 bootstrap allowance for HYPERP_MARK only (closeout sweep):
+        // a fresh Hyperp market has config.hyperp_authority = [0u8; 32] and
+        // no other path exists to seed it. Allow the current `header.admin`
+        // to bootstrap an unset hyperp_authority. INSURANCE and
+        // INSURANCE_OPERATOR keep strict signer-match semantics — burning
+        // them is intentionally permanent (rug-proofing).
         let current_bytes = match kind {
             AUTHORITY_ADMIN => header.admin,
-            AUTHORITY_HYPERP_MARK => config.hyperp_authority,
+            AUTHORITY_HYPERP_MARK => {
+                if config.hyperp_authority == [0u8; 32] {
+                    header.admin
+                } else {
+                    config.hyperp_authority
+                }
+            }
             AUTHORITY_INSURANCE => header.insurance_authority,
             AUTHORITY_INSURANCE_OPERATOR => header.insurance_operator,
             _ => return Err(ProgramError::InvalidInstructionData),
