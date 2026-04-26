@@ -8214,9 +8214,12 @@ impl TradeCpiTestEnv {
 
 // 4-way authority split (ML4) constants.
 pub const AUTHORITY_ADMIN: u8 = 0;
-pub const AUTHORITY_ORACLE: u8 = 1;
+pub const AUTHORITY_ORACLE: u8 = 1; // wrapper calls this AUTHORITY_HYPERP_MARK
 pub const AUTHORITY_INSURANCE: u8 = 2;
-pub const AUTHORITY_INSURANCE_OPERATOR: u8 = 3;
+// kind=3 (AUTHORITY_CLOSE) was deleted upstream; close_authority merged
+// into admin. AUTHORITY_INSURANCE_OPERATOR moved to 4 to keep stable
+// numbering while the deleted slot stays unmapped.
+pub const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
 
 pub fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
     // Phase G dispatch removed tag 16; oracle authority is now set via
