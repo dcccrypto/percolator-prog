@@ -40,7 +40,9 @@ fn assert_custom_error(err: &str, code_hex: &str, context: &str) {
 
 fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 624;
+    // v12.19: shifted from engine+624 → engine+640 (consistent +16 shift
+    // with last_market_slot at +656 and the rest of the engine layout).
+    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 640;
     u64::from_le_bytes(
         d[LAST_ORACLE_PRICE_OFFSET..LAST_ORACLE_PRICE_OFFSET + 8]
             .try_into()

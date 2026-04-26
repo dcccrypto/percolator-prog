@@ -63,7 +63,9 @@ pub const ENGINE_OFFSET: usize = 600;
 // fields). Probed via tests/probe_offset.rs against the small build
 // (MAX_ACCOUNTS=256). num_used_accounts is a u16 inside the fixed
 // engine prefix (offset feature-invariant).
-pub const ENGINE_BITMAP_OFFSET: usize = 712;
+// v12.19: bitmap shifted from engine+712 → engine+728 (probed via
+// tests/probe_offset.rs; 3 used slots → word 0 = 7).
+pub const ENGINE_BITMAP_OFFSET: usize = 728;
 pub const ENGINE_NUM_USED_OFFSET: usize = 592;
 
 // ENGINE_ACCOUNTS_OFFSET = end of bitmap + per-slot K/F arrays. Scales
@@ -2114,8 +2116,9 @@ impl TestEnv {
     /// Read num_used_accounts from engine state
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = 584, num_used_accounts at engine offset 1224
-        pub const NUM_USED_OFFSET: usize = 600 + 1224;
+        // v12.19: num_used_accounts u16 at engine+592 (probed; was at +1224
+        // in v12.17 before the engine field reordering).
+        pub const NUM_USED_OFFSET: usize = 600 + 592;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -2172,7 +2175,8 @@ impl TestEnv {
     /// need to verify forward progress through the SBF-written slab.
     pub fn read_last_market_slot(&self) -> u64 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        const LAST_MARKET_SLOT_OFFSET: usize = ENGINE_OFFSET + 640;
+        // v12.19: shifted from engine+640 → engine+656 (probed).
+        const LAST_MARKET_SLOT_OFFSET: usize = ENGINE_OFFSET + 656;
         u64::from_le_bytes(
             d[LAST_MARKET_SLOT_OFFSET..LAST_MARKET_SLOT_OFFSET + 8]
                 .try_into()
@@ -2220,9 +2224,9 @@ impl TestEnv {
     /// Check if a slot is marked as used in the bitmap
     pub fn is_slot_used(&self, idx: u16) -> bool {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
-        // ENGINE_OFF = 584, offset of RiskEngine.used = 712
-        // Bitmap is [u64; 64] at offset 600 + 712 = 1216
-        pub const BITMAP_OFFSET: usize = 600 + 712;
+        // v12.19: bitmap u64 array at engine+728 (probed empirically;
+        // shifted from +712 by the engine field reordering).
+        pub const BITMAP_OFFSET: usize = 600 + 728;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -4500,8 +4504,9 @@ impl TradeCpiTestEnv {
 
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF (584) + num_used_accounts offset (1224) = 1808
-        u16::from_le_bytes(slab_data[1808..1810].try_into().unwrap())
+        // v12.19: ENGINE_OFFSET=600, num_used_accounts u16 at engine+592.
+        const OFF: usize = 600 + 592;
+        u16::from_le_bytes(slab_data[OFF..OFF + 2].try_into().unwrap())
     }
 
     /// Read pnl_pos_tot aggregate from slab

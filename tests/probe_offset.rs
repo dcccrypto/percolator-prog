@@ -3,7 +3,7 @@ use common::*;
 use solana_sdk::signature::{Keypair, Signer};
 
 #[test]
-fn probe_engine_post_crank() {
+fn probe_last_market_slot() {
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
     let lp = Keypair::new();
@@ -14,13 +14,21 @@ fn probe_engine_post_crank() {
     env.deposit(&user, user_idx, 5_000_000_000);
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
 
+    // Bump slot via set_slot_and_price walk + crank
+    env.set_slot_and_price(50, 138_000_000);
+
     let s = env.svm.get_account(&env.slab).unwrap();
-    println!("=== Engine field scan post-trade ===");
-    for i in (220..680).step_by(8) {
-        let off = 600 + i;
-        let v64 = u64::from_le_bytes(s.data[off..off + 8].try_into().unwrap());
-        if v64 != 0 && v64 < (1u64 << 56) {
-            println!("  engine+{}: u64={}", i, v64);
+    // last_market_slot should be ~150 (50 + 100 effective offset)
+    let needles = [50u64, 51, 100, 150];
+    for n in needles {
+        let needle = n.to_le_bytes();
+        let mut hits = vec![];
+        for i in 600..1300 {
+            if s.data[i..i + 8] == needle {
+                hits.push(i);
+            }
         }
+        println!("u64={} hits in engine range: {:?}, rel: {:?}",
+            n, hits, hits.iter().map(|h| h - 600).collect::<Vec<_>>());
     }
 }
