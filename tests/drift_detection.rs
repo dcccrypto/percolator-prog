@@ -137,14 +137,15 @@ use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 /// for reference — those are enforced at build time in src/percolator.rs via
 /// compile-time asserts.
 mod layout_constants {
-    /// HEADER_LEN: size_of::<SlabHeader>() = 72 bytes
-    pub const HEADER_LEN_EXPECTED: usize = 72;
-    /// CONFIG_LEN: size_of::<MarketConfig>()
-    // 2026-04-17: CONFIG_LEN extended from 432 → 480 by Phase A (7 new fields),
-    // then 480 → 512 by Phase E (+32 bytes for pending_admin for two-step UpdateAdmin).
-    pub const CONFIG_LEN_EXPECTED: usize = 512;
-    /// ACCOUNT_SIZE: size_of::<Account>() — v12.17 two-bucket warmup
-    pub const ACCOUNT_SIZE_EXPECTED: usize = 368;
+    /// HEADER_LEN: size_of::<SlabHeader>() — v12.19 expanded to 136 bytes
+    /// (added 4-way authority pubkeys + pending_admin slot).
+    pub const HEADER_LEN_EXPECTED: usize = 136;
+    /// CONFIG_LEN: size_of::<MarketConfig>() — v12.19 trimmed to 480
+    /// (legacy fields removed during ML9..ML12 sync).
+    pub const CONFIG_LEN_EXPECTED: usize = 480;
+    /// ACCOUNT_SIZE: size_of::<Account>() — v12.19 expanded to 384
+    /// (Account gained per-account fields during the sync).
+    pub const ACCOUNT_SIZE_EXPECTED: usize = 384;
     /// ENGINE_OFF: align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN)
     /// Computed live from the program's own constant — this is intentional:
     /// if the constant changes, the test catches it via other assertions.
@@ -865,7 +866,9 @@ fn encode_risk_params_wire(
     v.extend_from_slice(&liquidation_fee_cap.to_le_bytes());
     v.extend_from_slice(&liquidation_buffer_bps.to_le_bytes());
     v.extend_from_slice(&min_liquidation_abs.to_le_bytes());
-    v.extend_from_slice(&min_initial_deposit.to_le_bytes());
+    // v12.19 wrapper: min_initial_deposit removed from wire (wrapper enforces
+    // it as policy at InitUser/InitLP rather than via the RiskParams payload).
+    let _ = min_initial_deposit;
     v.extend_from_slice(&min_nonzero_mm_req.to_le_bytes());
     v.extend_from_slice(&min_nonzero_im_req.to_le_bytes());
     v
@@ -887,17 +890,17 @@ const RISK_PARAMS_WIRE_LEN: usize =
   + 16  // liquidation_fee_cap (u128)
   + 8   // liquidation_buffer_bps wire-only (u64)
   + 16  // min_liquidation_abs (u128)
-  + 16  // min_initial_deposit (u128)
+  // v12.19: min_initial_deposit removed from wire (wrapper-enforced policy).
   + 16  // min_nonzero_mm_req (u128)
   + 16; // min_nonzero_im_req (u128)
 
 #[test]
-fn risk_params_wire_len_is_184_bytes() {
-    // 184 bytes: v12.17 removed h_max padding (was 192 with 8-byte pad)
+fn risk_params_wire_len_is_168_bytes() {
+    // v12.19: 168 bytes (down 16 from v12.17's 184 — min_initial_deposit removed).
     assert_eq!(
         RISK_PARAMS_WIRE_LEN,
-        184,
-        "RiskParams wire format byte count changed: got {}, expected 184",
+        168,
+        "RiskParams wire format byte count changed: got {}, expected 168",
         RISK_PARAMS_WIRE_LEN
     );
 }

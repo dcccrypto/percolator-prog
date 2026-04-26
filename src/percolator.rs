@@ -2283,11 +2283,12 @@ pub mod ix {
                 }
                 69 => {
                     let user_idx = read_u16(&mut rest)?;
-                    let mut new_owner = [0u8; 32];
                     if rest.len() < 32 {
                         return Err(ProgramError::InvalidInstructionData);
                     }
+                    let mut new_owner = [0u8; 32];
                     new_owner.copy_from_slice(&rest[..32]);
+                    rest = &rest[32..];
                     Ok(Instruction::TransferOwnershipCpi { user_idx, new_owner })
                 }
                 70 => {
