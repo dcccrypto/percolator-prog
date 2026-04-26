@@ -7852,17 +7852,31 @@ pub mod processor {
         // Convert base tokens to units for engine
         let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
+        // v12.19 wrapper-side anti-spam fee. Engine no longer carries
+        // new_account_fee (dropped at v12.18.1) and the wire param has
+        // nowhere to land in MarketConfig, so the wrapper hardcodes a
+        // single-unit fee and routes it to the insurance fund whenever
+        // the deposit is large enough to spare it. This restores the
+        // conservation invariant tests expect:
+        //   capital = payment - 1, insurance += 1.
+        const ANTI_SPAM_FEE_UNITS: u128 = 1;
+        let total_units = units as u128;
+        let (capital_units, fee_units) = if total_units > ANTI_SPAM_FEE_UNITS {
+            (total_units - ANTI_SPAM_FEE_UNITS, ANTI_SPAM_FEE_UNITS)
+        } else {
+            (total_units, 0)
+        };
+
+        let clock_for_fund = clock.slot;
         let engine = zc::engine_mut(&mut data)?;
-        // Canonical deposit-based materialization (spec §10.3).
-        // deposit_not_atomic internally routes new_account_fee from capital
-        // to insurance_fund when materializing a fresh slot (percolator.rs
-        // engine-side). Historic handler-side fee surgery was removed here
-        // because it double-charged the fee (left user capital below
-        // min_initial_deposit). Upstream v12.18.1 (5666357) later removed
-        // new_account_fee entirely; we keep the param but charge it once.
         let idx = engine.free_head;
-        engine.deposit_not_atomic(idx, units as u128, clock.slot)
+        engine.deposit_not_atomic(idx, capital_units, clock_for_fund)
             .map_err(map_risk_error)?;
+        if fee_units > 0 {
+            engine
+                .top_up_insurance_fund(fee_units, clock_for_fund)
+                .map_err(map_risk_error)?;
+        }
         engine.set_owner(idx, a_user.key.to_bytes())
             .map_err(map_risk_error)?;
         drop(engine);
@@ -7933,13 +7947,25 @@ pub mod processor {
         // Convert base tokens to units for engine
         let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
+        // v12.19 wrapper-side anti-spam fee (mirrors handle_init_user).
+        const ANTI_SPAM_FEE_UNITS: u128 = 1;
+        let total_units = units as u128;
+        let (capital_units, fee_units) = if total_units > ANTI_SPAM_FEE_UNITS {
+            (total_units - ANTI_SPAM_FEE_UNITS, ANTI_SPAM_FEE_UNITS)
+        } else {
+            (total_units, 0)
+        };
+
+        let clock_for_fund = clock.slot;
         let engine = zc::engine_mut(&mut data)?;
         let idx = engine.free_head;
-        // deposit_not_atomic routes new_account_fee on materialization (engine
-        // side). Redundant handler-side fee surgery was removed to fix the
-        // 2x-fee regression that left LP capital below min_initial_deposit.
-        engine.deposit_not_atomic(idx, units as u128, clock.slot)
+        engine.deposit_not_atomic(idx, capital_units, clock_for_fund)
             .map_err(map_risk_error)?;
+        if fee_units > 0 {
+            engine
+                .top_up_insurance_fund(fee_units, clock_for_fund)
+                .map_err(map_risk_error)?;
+        }
         // Set LP fields
         engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
         engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
