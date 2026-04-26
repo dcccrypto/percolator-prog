@@ -276,7 +276,7 @@ fn test_init_market_rejects_zero_materialization_cost_on_all_market_types() {
         &external_env.mint,
         &TEST_FEED_ID,
         0,
-        80,
+        200, // v12.19 + F-B1: must EXCEED max_accrual_dt_slots (100).
     );
     put_u128(&mut external, INIT_MAINTENANCE_FEE_OFFSET, 0);
     put_u128(&mut external, INIT_NEW_ACCOUNT_FEE_OFFSET, 0);
@@ -4631,7 +4631,7 @@ fn test_init_market_mark_min_fee_sanity_cap_admits_full_u64() {
         &env.mint,
         &TEST_FEED_ID,
         0,
-        80,
+        200, // v12.19 + F-B1: perm_resolve must EXCEED max_accrual_dt_slots (100).
         500,
         100,
         500,
@@ -5097,14 +5097,12 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
         data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
         data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
-        data.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
+        // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED in
+        // read_risk_params (F-B1 = 4); not part of the wire layout.
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-                                                     // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 100 —
-                                                     // the upper bound. The test's 60+ slot dust-wash sequence must
-                                                     // now fit within this window (the test may need to tighten its
-                                                     // own cadence).
-        data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
+        // v12.19 + F-B1: perm_resolve must EXCEED max_accrual_dt_slots (100).
+        data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve = 200
                                                        // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_k_bps (2x)

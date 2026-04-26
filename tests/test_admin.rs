@@ -397,8 +397,8 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
     let mut env = TestEnv::new();
     // encode_init_market_with_cap auto-sets max_crank_staleness and
     // force_close_delay when perm_resolve > 0. v12.19.6: perm_resolve
-    // must be <= MAX_ACCRUAL_DT_SLOTS = 100.
-    let perm_resolve: u64 = 80;
+    // v12.19 + F-B1: must EXCEED MAX_ACCRUAL_DT_SLOTS = 100.
+    let perm_resolve: u64 = 200;
     let data = common::encode_init_market_with_cap(
         &env.payer.pubkey(),
         &env.mint,

@@ -255,6 +255,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u64(0, &mut data); // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(1, &mut data); // new_account_fee (§12.19.6 F8 anti-spam)
+    encode_u128(0, &mut data); // insurance_floor (v12.19 wire format)
     encode_u64(1, &mut data); // h_max (v12.18.1: must be >= 1)
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data); // liquidation_fee_bps
@@ -263,14 +264,14 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u128(0, &mut data); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
-    encode_u64(2, &mut data); // max_price_move_bps_per_slot (v12.19)
+    // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED in
+    // read_risk_params (F-B1 = 4); not part of the wire layout.
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
     encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
 
-    // v12.19.6: non-Hyperp needs perm_resolve > max_crank_staleness AND
-    // perm_resolve <= MAX_ACCRUAL_DT_SLOTS (= 100). Callers must pass
-    // crank_staleness < 100 for a resolvable market.
-    encode_u64(crank_staleness.saturating_add(1).min(100), &mut data); // permissionless_resolve_stale_slots
+    // v12.19 + F-B1: perm_resolve must EXCEED max_accrual_dt_slots (100).
+    // crank_staleness must be < perm_resolve. Pick perm_resolve >= 200.
+    encode_u64(crank_staleness.saturating_add(101).max(200), &mut data); // permissionless_resolve_stale_slots
     encode_u64(500, &mut data); // funding_horizon_slots
     encode_u64(100, &mut data); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
@@ -304,6 +305,7 @@ fn encode_init_market_invert(
     encode_u64(0, &mut data); // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(1, &mut data); // new_account_fee (§12.19.6 F8 anti-spam)
+    encode_u128(0, &mut data); // insurance_floor (v12.19 wire format)
     encode_u64(1, &mut data); // h_max
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data); // liquidation_fee_bps
@@ -312,13 +314,12 @@ fn encode_init_market_invert(
     encode_u128(0, &mut data); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
-    encode_u64(2, &mut data); // max_price_move_bps_per_slot (v12.19)
+    // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED.
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
     encode_u64(0, &mut data); // insurance_withdraw_cooldown_slots
 
-    // v12.19.6: non-Hyperp needs perm_resolve > max_crank_staleness AND
-    // perm_resolve <= MAX_ACCRUAL_DT_SLOTS (= 100).
-    encode_u64(crank_staleness.saturating_add(1).min(100), &mut data); // permissionless_resolve_stale_slots
+    // v12.19 + F-B1: perm_resolve must EXCEED max_accrual_dt_slots (100).
+    encode_u64(crank_staleness.saturating_add(101).max(200), &mut data); // permissionless_resolve_stale_slots
     encode_u64(500, &mut data); // funding_horizon_slots
     encode_u64(100, &mut data); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
@@ -728,13 +729,17 @@ fn test_init_market() {
     let data = encode_init_market(&f, 50);
 
     {
+        // v12.19: InitMarket expects 9 accounts (admin/slab/mint/vault/token/clock/rent/oracle/system).
         let accounts = vec![
             f.admin.to_info(),
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
+            f.token_prog.to_info(),
             f.clock.to_info(),
+            f.rent.to_info(),
             f.pyth_index.to_info(),
+            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &data).unwrap();
     }
@@ -753,13 +758,16 @@ fn test_vault_validation() {
     f.vault.owner = solana_program::system_program::id();
     let init_data = encode_init_market(&f, 50);
     let init_accounts = vec![
-        f.admin.to_info(),
-        f.slab.to_info(),
-        f.mint.to_info(),
-        f.vault.to_info(),
-        f.clock.to_info(),
-        f.pyth_index.to_info(),
-    ];
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            f.clock.to_info(),
+            f.rent.to_info(),
+            f.pyth_index.to_info(),
+            f.system.to_info(),
+        ];
     let res = process_instruction(&f.program_id, &init_accounts, &init_data);
     assert_eq!(res, Err(PercolatorError::InvalidVaultAta.into()));
 }
@@ -775,8 +783,11 @@ fn test_trade() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
+            f.token_prog.to_info(),
             f.clock.to_info(),
+            f.rent.to_info(),
             f.pyth_index.to_info(),
+            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
     }
@@ -1257,8 +1268,11 @@ fn test_permissionless_crank_gc() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
+            f.token_prog.to_info(),
             f.clock.to_info(),
+            f.rent.to_info(),
             f.pyth_index.to_info(),
+            f.system.to_info(),
         ];
         process_instruction(&f.program_id, &accounts, &init_data).unwrap();
     }
@@ -1666,8 +1680,11 @@ fn test_unit_scale_validation_at_init() {
             f.slab.to_info(),
             f.mint.to_info(),
             f.vault.to_info(),
+            f.token_prog.to_info(),
             f.clock.to_info(),
+            f.rent.to_info(),
             f.pyth_index.to_info(),
+            f.system.to_info(),
         ];
         let res = process_instruction(&f.program_id, &accounts, &data);
         assert_eq!(

@@ -403,10 +403,10 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
     data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
-    data.extend_from_slice(&2u64.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
+    // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED.
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots (v12.19.6 invariant: > 50 and <= 100)
+    data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve_stale_slots (v12.19+F-B1: > 100)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
