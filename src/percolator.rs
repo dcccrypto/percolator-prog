@@ -2421,21 +2421,32 @@ pub mod ix {
             h_min,
             h_max,
             resolve_price_deviation_bps,
-            // Envelope defaults: ADL_ONE * MAX_ORACLE_PRICE * rate * dt <= i128::MAX
-            // With v12.19 tightened MAX_ABS_FUNDING_E9_PER_SLOT = 10_000:
-            // 1e15 * 1e12 * 1e4 * 1e5 = 1e36 < i128::MAX (1.7e38). ✓
-            max_accrual_dt_slots: 100_000,
+            /* F-B1 fix (envelope defaults must pass v12.19's
+             * validate_exact_solvency_envelope, not just the per-call
+             * funding-overflow check): the prior hardcoded combo
+             * (max_accrual_dt_slots=100_000 × max_price_move_bps_per_slot=1000
+             *  = 100_000_000 bps = 1_000_000% price budget per envelope) blew
+             * the solvency proof and caused init_in_place to return Overflow.
+             * v12.19 spec values (matches percolator/tests/unit_tests.rs):
+             *   - max_accrual_dt_slots=100, max_price_move_bps_per_slot=4
+             *     → price_budget = 400 bps
+             *   - funding_budget = ceil(rate * dt * 10000 / FUNDING_DEN)
+             *                    = ceil(10_000 * 100 * 10000 / 1e9) = 10 bps
+             *   - liquidation_fee_bps = 50 (test default)
+             *   - sum = 460 ≤ maintenance_margin_bps = 500 (test default). ✓
+             * Per-call overflow check:
+             *   ADL_ONE(1e15) × MAX_ORACLE_PRICE(1e12) × rate(1e4) × dt(1e2)
+             *   = 1e33 ≤ i128::MAX (1.7e38). ✓
+             * Lifetime check:
+             *   1e15 × 1e12 × 1e4 × 1e7 = 1e38 ≤ 1.7e38. ✓
+             * 4 also matches tests/common/mod.rs::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT
+             * so the test-side walking helper computes the right slots-needed
+             * for staircased price moves. */
+            max_accrual_dt_slots: 100,
             max_abs_funding_e9_per_slot: 10_000,
-            // v12.19 added: cumulative-F lifetime floor (spec §1.4).
-            // Must satisfy ADL_ONE * MAX_ORACLE_PRICE * 10_000 * X <= i128::MAX
-            // (X <= 1.7e7) AND X >= max_accrual_dt_slots.
-            min_funding_lifetime_slots: 1_700_000,
-            // v12.19 added: per-side active position cap (spec §1.4).
-            // Default to max_accounts (no extra cap beyond engine MAX_ACCOUNTS).
+            min_funding_lifetime_slots: 10_000_000,
             max_active_positions_per_side: max_accounts,
-            // v12.19 added: per-slot price-move cap (spec §1.4) — replaces
-            // the legacy oracle_price_cap_e2bps. Default 1000 bps = 10%/slot.
-            max_price_move_bps_per_slot: 1_000,
+            max_price_move_bps_per_slot: 4,
         };
         Ok((params, new_account_fee.get()))
     }
@@ -7638,7 +7649,13 @@ pub mod processor {
         }
 
         let engine = zc::engine_mut(&mut data)?;
-        engine.init_in_place(risk_params, clock.slot, init_price);
+        /* F-B1 fix: init_in_place returns Result; the prior code dropped it,
+         * so a failed validate_params left the engine partially initialized
+         * (free list never built). Subsequent init_lp then tripped
+         * EngineCorruptState in materialize_at when reading uninitialized
+         * free_head/prev_free/next_free pointers. Propagate the error. */
+        engine.init_in_place(risk_params, clock.slot, init_price)
+            .map_err(map_risk_error)?;
         // init_in_place sets last_crank_slot = 0; override to init slot
         // so first crank doesn't see a huge staleness gap.
         engine.last_market_slot = clock.slot;

@@ -63,7 +63,7 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 100_000_000_000);
@@ -253,7 +253,7 @@ fn test_init_market_rejects_zero_public_warmup() {
 
     let mut env = TestEnv::new();
     let mut data =
-        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 80);
+        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 200);
     put_u64(&mut data, INIT_H_MIN_OFFSET, 0);
 
     let err = env
@@ -1990,7 +1990,7 @@ fn test_position_flip_minimal_equity() {
 fn test_liquidation_reduces_position_and_charges_fee() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // liquidation test: max cap (100%/read), unrestricted for these moves
+    env.init_market_with_cap(0, 200); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2196,7 +2196,7 @@ fn test_partial_withdrawal_with_position_succeeds() {
 fn test_keeper_crank_format_v1_full_close() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // max cap; unrestricted for $138→$120 move
+    env.init_market_with_cap(0, 200); // max cap; unrestricted for $138→$120 move
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -2621,7 +2621,7 @@ fn test_settle_account_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // cap > 0 so hyperp_authority defaults to admin
+    env.init_market_with_cap(0, 200); // cap > 0 so hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2959,7 +2959,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // cap > 0 so hyperp_authority defaults to admin (for later push)
+    env.init_market_with_cap(0, 200); // cap > 0 so hyperp_authority defaults to admin (for later push)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3202,7 +3202,7 @@ fn test_reclaim_rejects_account_with_position() {
 fn test_reclaim_blocked_on_resolved() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // cap > 0 → hyperp_authority defaults to admin
+    env.init_market_with_cap(0, 200); // cap > 0 → hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4246,7 +4246,7 @@ fn test_funding_bootstrap_ewma_seeded_on_first_trade() {
     program_path();
     let mut env = TestEnv::new();
     // cap = 10_000 e2bps = 1% per slot, no permissionless resolve
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
 
     // Before any trade, EWMA should be 0
     assert_eq!(
@@ -4280,7 +4280,7 @@ fn test_funding_bootstrap_ewma_seeded_on_first_trade() {
 fn test_funding_bootstrap_rate_stamped_after_trade() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4333,7 +4333,7 @@ fn test_funding_bootstrap_inverted_market() {
     program_path();
     let mut env = TestEnv::new();
     // Inverted market with cap enabled
-    env.init_market_with_cap(1, 80);
+    env.init_market_with_cap(1, 200);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4373,7 +4373,7 @@ fn test_funding_bootstrap_inverted_market() {
 fn test_funding_bootstrap_multiple_trades_and_crank() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4423,7 +4423,7 @@ fn test_funding_bootstrap_multiple_trades_and_crank() {
 fn test_funding_bootstrap_default_params() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
 
     let horizon = env.read_funding_horizon();
     let cap = env.read_oracle_price_cap();
@@ -4510,7 +4510,7 @@ fn test_init_market_no_funding_params_uses_defaults() {
     program_path();
     let mut env = TestEnv::new();
     // init_market_with_cap doesn't append funding params
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     assert_eq!(env.read_funding_horizon(), 500, "Default horizon");
     assert_eq!(env.read_funding_k_bps(), 100, "Default k_bps");
     assert_eq!(
@@ -4766,7 +4766,7 @@ fn test_trading_fee_exact_amounts() {
 fn test_liquidation_fee_goes_to_insurance() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // liquidation test: max cap (100%/read), unrestricted for these moves
+    env.init_market_with_cap(0, 200); // liquidation test: max cap (100%/read), unrestricted for these moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4908,7 +4908,7 @@ fn test_init_market_default_mark_min_fee_backward_compat() {
     program_path();
     let mut env = TestEnv::new();
     // init_market_with_cap omits funding params and mark_min_fee
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     assert_eq!(
         env.read_mark_min_fee(),
         0,

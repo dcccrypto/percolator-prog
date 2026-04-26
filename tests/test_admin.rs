@@ -333,7 +333,7 @@ fn test_update_admin_zero_accepted_for_burn() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
@@ -1177,7 +1177,7 @@ fn test_update_config_admin_only() {
 fn test_update_authority_init_defaults_match_admin() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
 
     let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1196,7 +1196,7 @@ fn test_update_authority_init_defaults_match_admin() {
 fn test_update_authority_insurance_positive_delegation() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let delegate = Keypair::new();
     env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
@@ -1217,7 +1217,7 @@ fn test_update_authority_insurance_positive_delegation() {
 fn test_update_authority_negative_wrong_current_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let target = Keypair::new();
@@ -1237,7 +1237,7 @@ fn test_update_authority_negative_wrong_current_signer() {
 fn test_update_authority_negative_new_pubkey_not_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let target_pubkey = Pubkey::new_unique();
 
@@ -1272,7 +1272,7 @@ fn test_update_authority_negative_new_pubkey_not_signer() {
 fn test_update_authority_burn_single_sig_and_then_dead() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Burn insurance_authority (single-sig: only current signs).
@@ -1293,7 +1293,7 @@ fn test_update_authority_burn_single_sig_and_then_dead() {
 fn test_update_authority_burning_one_kind_leaves_others_intact() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
@@ -1318,7 +1318,7 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
 fn test_update_authority_negative_invalid_kind() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env
@@ -1335,7 +1335,7 @@ fn test_update_authority_negative_invalid_kind() {
 fn test_update_authority_insurance_survives_admin_burn() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Before admin burn: delegate insurance_authority to a dedicated key.
@@ -1496,7 +1496,7 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
     let mut env = TestEnv::new();
     // init_market_with_cap seeds oracle_price_cap_e2bps == 10_000 (non-zero),
     // so the weaker-authority invariant (authority set ⇒ cap != 0) holds.
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 

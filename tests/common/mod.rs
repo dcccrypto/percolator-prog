@@ -210,9 +210,8 @@ pub fn append_default_extended_tail_for(data: &mut Vec<u8>, is_hyperp: bool) {
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
 
-    // Must be > max_crank_staleness_slots (= 50, below) AND <= 100
-    // (MAX_ACCRUAL_DT_SLOTS). Pick 80.
-    let perm_resolve: u64 = if is_hyperp { 0 } else { 80 };
+    // v12.19 sync: must be > risk_params.max_accrual_dt_slots = 100. Pick 200.
+    let perm_resolve: u64 = if is_hyperp { 0 } else { 200 };
     data.extend_from_slice(&perm_resolve.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
@@ -400,6 +399,7 @@ pub fn encode_init_market_with_conf_bps(
     // §12.19.6 F8 anti-spam (non-Hyperp default tail: perm_resolve=80).
     let new_account_fee: u128 = 1;
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 sync: still in wire)
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
@@ -448,6 +448,7 @@ pub fn encode_init_market_full_v2(
     // satisfies the invariant without perturbing per-slot accounting.
     let new_account_fee: u128 = 1;
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 sync: still in wire)
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
@@ -720,7 +721,7 @@ pub fn encode_init_market_with_force_close(
 ) -> Vec<u8> {
     // Build base with cap + permissionless resolve (full 82-byte tail).
     // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Use 80.
-    let mut data = encode_init_market_with_cap(admin, mint, feed_id, 0, 80);
+    let mut data = encode_init_market_with_cap(admin, mint, feed_id, 0, 200);
     // Truncate default force_close_delay_slots (last 8 bytes), replace with custom
     data.truncate(data.len() - 8);
     data.extend_from_slice(&force_close_delay_slots.to_le_bytes());
@@ -763,12 +764,13 @@ pub fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
 }
 
 pub fn encode_crank_permissionless() -> Vec<u8> {
-    // Two-phase crank: pass first 128 account indices as candidates.
+    // Two-phase crank: pass first N account indices as candidates.
+    // v12.19 caps MAX_CANDIDATES = LIQ_BUDGET_PER_CRANK * 2 = 48.
     // format_version=1: (u16 idx, u8 policy_tag) per candidate.
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes()); // caller_idx = permissionless
     data.push(1u8); // format_version = 1
-    for i in 0..128u16 {
+    for i in 0..48u16 {
         data.extend_from_slice(&i.to_le_bytes()); // idx
         data.push(0u8); // tag 0 = FullClose
     }
@@ -1397,17 +1399,16 @@ impl TestEnv {
 
     pub fn trade(&mut self, user: &Keypair, lp: &Keypair, lp_idx: u16, user_idx: u16, size: i128) {
         let cu_ix = cu_ix();
+        // v12.19 wrapper TradeNoCpi expects EXACTLY 5 accounts (strict
+        // expect_len): user, lp, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(lp.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_trade(lp_idx, user_idx, size),
         };
@@ -1432,16 +1433,14 @@ impl TestEnv {
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
 
         let cu_ix = cu_ix();
+        // v12.19 KeeperCrank expects exactly 4 accounts: caller, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(caller.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_crank_permissionless(),
         };
@@ -1548,16 +1547,14 @@ impl TestEnv {
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
 
         let cu_ix = cu_ix();
+        // v12.19 KeeperCrank expects exactly 4 accounts: caller, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(caller.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_crank_permissionless(),
         };
@@ -1674,16 +1671,14 @@ impl TestEnv {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
         let cu_ix = cu_ix();
+        // v12.19 KeeperCrank expects exactly 4 accounts: caller, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(caller.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_crank_permissionless(),
         };
@@ -1896,6 +1891,7 @@ pub fn encode_init_market_full(
         new_account_fee
     };
     data.extend_from_slice(&new_account_fee_enforced.to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 sync: still in wire)
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
     data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
@@ -1941,6 +1937,7 @@ pub fn encode_init_market_with_warmup(
     // §12.19.6 F8 anti-spam (non-Hyperp gets perm_resolve > 0 below).
     let new_account_fee: u128 = 1;
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 sync: still in wire)
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
     data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
@@ -4216,16 +4213,14 @@ impl TradeCpiTestEnv {
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
 
         let cu_ix = cu_ix();
+        // v12.19 KeeperCrank expects exactly 4 accounts: caller, slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(caller.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_crank_permissionless(),
         };

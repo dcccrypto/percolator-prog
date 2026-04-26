@@ -472,7 +472,7 @@ fn test_attack_burned_admin_cannot_act() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
@@ -3560,7 +3560,7 @@ fn test_attack_liquidate_healthy_account() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // max cap (100%/read)
+    env.init_market_with_cap(0, 200); // max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -3629,7 +3629,7 @@ fn test_attack_update_admin_to_zero_locks_out() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -5620,7 +5620,7 @@ fn test_attack_liquidation_after_price_crash() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // max cap (100%/read)
+    env.init_market_with_cap(0, 200); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -5847,7 +5847,7 @@ fn test_attack_same_slot_triple_crank_convergence() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // max cap (100%/read)
+    env.init_market_with_cap(0, 200); // max cap (100%/read)
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 

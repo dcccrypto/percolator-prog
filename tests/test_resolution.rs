@@ -953,7 +953,7 @@ fn test_resolve_permissionless_after_staleness() {
     program_path();
     let mut env = TestEnv::new();
     // Init with permissionless resolve enabled (stale_slots=100, cap=10000)
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     // Override max_staleness_secs to 30 for faster staleness detection
     {
@@ -1394,7 +1394,7 @@ fn test_resolve_permissionless_inverted_settlement_price() {
 fn test_resolve_permissionless_inverted_with_positions() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(1, 80);
+    env.init_market_with_cap(1, 200);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -1454,7 +1454,7 @@ fn test_resolve_permissionless_inverted_with_positions() {
 fn test_resolve_permissionless_empty_market_at_sentinel() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -1891,7 +1891,7 @@ fn test_admin_degenerate_resolve_rejects_live_oracle() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80);
+    env.init_market_with_cap(0, 200);
     env.crank();
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 

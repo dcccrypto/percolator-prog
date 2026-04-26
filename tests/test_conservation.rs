@@ -2116,7 +2116,7 @@ fn test_property_authorization_exhaustive() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 100);
+    env.init_market_with_cap(0, 200);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let attacker = Keypair::new();
