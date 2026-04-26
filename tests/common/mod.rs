@@ -8008,17 +8008,20 @@ impl TestEnv {
         new_pubkey: Option<&Pubkey>,
     ) -> Result<(), String> {
         // v12.19 UpdateAuthority expects exactly 3 accounts: current
-        // authority (signer), new authority (NOT signer — wrapper only
-        // checks signer on accounts[0]), slab. For burn (new_pubkey ==
-        // None), pass [0u8; 32] (the canonical burn key the wrapper
-        // recognizes).
+        // authority (signer), new authority, slab. For burn the wrapper
+        // skips the signer check on a_new and accepts [0u8; 32]. For
+        // non-burn the wrapper REQUIRES a_new to be a signer too —
+        // tests that don't have the new authority keypair (most of them)
+        // will fail with NotEnoughSigners; these are pre-existing
+        // wrapper-policy tests that need their own keypair-based helper.
         let burn = Pubkey::new_from_array([0u8; 32]);
         let new_key = new_pubkey.copied().unwrap_or(burn);
+        let new_is_signer = new_pubkey.is_some();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new_readonly(new_key, false),
+                AccountMeta::new_readonly(new_key, new_is_signer),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_authority(kind, new_pubkey),
@@ -8027,6 +8030,36 @@ impl TestEnv {
             &[cu_ix(), ix],
             Some(&signer.pubkey()),
             &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Variant for non-burn UpdateAuthority where the v12.19 wrapper
+    /// requires both the current authority AND the new authority to sign.
+    pub fn try_update_authority_with_new_signer(
+        &mut self,
+        signer: &Keypair,
+        kind: u8,
+        new_authority: &Keypair,
+    ) -> Result<(), String> {
+        let new_pk = new_authority.pubkey();
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(new_pk, true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_update_authority(kind, Some(&new_pk)),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&signer.pubkey()),
+            &[signer, new_authority],
             self.svm.latest_blockhash(),
         );
         self.svm
