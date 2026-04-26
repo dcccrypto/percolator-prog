@@ -8007,18 +8007,18 @@ impl TestEnv {
         kind: u8,
         new_pubkey: Option<&Pubkey>,
     ) -> Result<(), String> {
-        // v12.18.x UpdateAuthority expects exactly 3 accounts:
-        // current authority (signer), new authority, slab. For burn
-        // (new_pubkey == None), pass system_program::ID as a non-signer
-        // placeholder — wrapper skips signer check on burn.
-        let burn = solana_sdk::system_program::ID;
+        // v12.19 UpdateAuthority expects exactly 3 accounts: current
+        // authority (signer), new authority (NOT signer — wrapper only
+        // checks signer on accounts[0]), slab. For burn (new_pubkey ==
+        // None), pass [0u8; 32] (the canonical burn key the wrapper
+        // recognizes).
+        let burn = Pubkey::new_from_array([0u8; 32]);
         let new_key = new_pubkey.copied().unwrap_or(burn);
-        let new_is_signer = new_pubkey.is_some();
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new(new_key, new_is_signer),
+                AccountMeta::new_readonly(new_key, false),
                 AccountMeta::new(self.slab, false),
             ],
             data: encode_update_authority(kind, new_pubkey),
