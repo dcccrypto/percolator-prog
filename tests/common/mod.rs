@@ -6206,17 +6206,15 @@ impl TestEnv {
         user_idx: u16,
         size: i128,
     ) -> Result<(), String> {
+        // v12.19 TradeNoCpi: 5 accounts: user(s), lp(s), slab, clock, oracle.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(user.pubkey(), true),
                 AccountMeta::new(victim.pubkey(), true), // victim acts as "LP"
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_trade(victim_idx, user_idx, size), // pass user idx as lp_idx
         };

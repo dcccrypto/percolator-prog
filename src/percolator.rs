@@ -9493,7 +9493,16 @@ pub mod processor {
         funding_max_premium_bps: i64,
         funding_max_bps_per_slot: i64,
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 3)?;
+        // v12.19 cluster sweep: SDK + several test sites pass 4 accounts
+        // (admin, slab, clock, oracle) because non-Hyperp accrual was thought
+        // to need a fresh oracle read. The wrapper actually uses the engine's
+        // stored `last_oracle_price`, so the oracle account is unused — but
+        // strict expect_len(3) rejected the 4-account form. Accept either 3
+        // or 4 accounts; treat the 4th slot as a documented no-op for SDK
+        // ergonomics.
+        if accounts.len() != 3 && accounts.len() != 4 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
         let a_admin = &accounts[0];
         let a_slab = &accounts[1];
         let a_clock = &accounts[2];

@@ -12470,8 +12470,11 @@ fn test_attack_settlement_guard_bypass_cap_zero_poisoning() {
             AccountMeta::new(env.slab, false),
             AccountMeta::new_readonly(env.mint, false),
             AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_limits(
             &admin.pubkey(),

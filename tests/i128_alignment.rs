@@ -581,8 +581,11 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market(&payer.pubkey(), &mint, &TEST_FEED_ID),
     };
