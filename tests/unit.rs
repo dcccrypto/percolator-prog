@@ -443,9 +443,9 @@ fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
 }
 
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    // UpdateAuthority { kind: AUTHORITY_ADMIN = 0, new_pubkey }
-    let mut data = vec![32u8];
-    data.push(0u8); // AUTHORITY_ADMIN
+    // v12.19 Phase E: tag 12 single-step UpdateAdmin (sets pending_admin
+    // for non-default; immediate burn for default Pubkey).
+    let mut data = vec![12u8];
     encode_pubkey(new_admin, &mut data);
     data
 }

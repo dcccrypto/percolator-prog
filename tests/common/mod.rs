@@ -5245,11 +5245,13 @@ pub fn encode_crank_with_panic(_allow_panic: u8) -> Vec<u8> {
 }
 
 pub fn encode_crank_self(caller_idx: u16) -> Vec<u8> {
-    // format_version=1, all FullClose
+    // v12.19: wrapper caps candidates at LIQ_BUDGET_PER_CRANK*2 = 48; the
+    // self-crank helper now emits a small batch within bounds rather than
+    // 128 pre-cap entries which would now be rejected.
     let mut data = vec![5u8];
     data.extend_from_slice(&caller_idx.to_le_bytes());
     data.push(1u8); // format_version = 1
-    for i in 0..128u16 {
+    for i in 0..32u16 {
         data.extend_from_slice(&i.to_le_bytes());
         data.push(0u8); // FullClose
     }
@@ -5288,18 +5290,16 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// Try self-crank (caller_idx = specific account)
+    /// Try self-crank (caller_idx = specific account).
+    /// v12.19 KeeperCrank: 4 accounts: caller(signer), slab, clock, oracle.
     pub fn try_crank_self(&mut self, owner: &Keypair, caller_idx: u16) -> Result<(), String> {
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_crank_self(caller_idx),
         };
