@@ -7644,6 +7644,11 @@ pub mod processor {
             if p.trading_fee_bps > 10_000 || p.liquidation_fee_bps > 10_000 {
                 return Err(ProgramError::InvalidInstructionData);
             }
+            // v12.19: public live warmup floor must be >= 1; h_min == 0
+            // would short-circuit the spec §6.1 admission gate.
+            if p.h_min == 0 || p.h_max < p.h_min {
+                return Err(PercolatorError::InvalidConfigParam.into());
+            }
             // v12.19: min_initial_deposit, insurance_floor, new_account_fee
             // moved out of engine RiskParams; validate against wrapper-side
             // local variables (parsed by read_risk_params).

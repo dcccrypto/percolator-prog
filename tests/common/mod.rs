@@ -223,7 +223,10 @@ pub fn append_default_extended_tail_for(data: &mut Vec<u8>, is_hyperp: bool) {
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps (default)
-    data.extend_from_slice(&0i64.to_le_bytes()); /* v12.19: funding_bps_to_e9(5) = 500_000 > MAX(10_000); use 0 */ // funding_max_bps_per_slot (default)
+    // v12.19: funding_max_e9_per_slot is in e9 units; ceiling is
+    // MAX_ABS_FUNDING_E9_PER_SLOT = 10_000. Default 1000 matches what
+    // test_init_market_no_funding_params_uses_defaults expects.
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot (default)
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
     let force_close: u64 = if is_hyperp { 0 } else { 50 };
     data.extend_from_slice(&force_close.to_le_bytes()); // force_close_delay_slots
@@ -529,7 +532,10 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps (default)
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps (default)
-    data.extend_from_slice(&0i64.to_le_bytes()); /* v12.19: funding_bps_to_e9(5) = 500_000 > MAX(10_000); use 0 */ // funding_max_bps_per_slot (default)
+    // v12.19: funding_max_e9_per_slot is in e9 units; ceiling is
+    // MAX_ABS_FUNDING_E9_PER_SLOT = 10_000. Default 1000 matches what
+    // test_init_market_no_funding_params_uses_defaults expects.
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot (default)
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
                                                  // force_close_delay must be > 0 when permissionless_resolve > 0
     let force_close = if permissionless_resolve_stale_slots > 0 {
