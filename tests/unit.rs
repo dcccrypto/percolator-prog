@@ -516,30 +516,20 @@ fn test_matcher_nonzero_partial_requires_partial_ok() {
     .is_ok());
 }
 
+// v12.19 sync: oracle::clamp_external_price was inlined into read_price_clamped
+// and the oracle_target_price_e6 field was removed (unified resolve policy now
+// derives the arm from runtime oracle/admin state). Both tests retired —
+// behavior is now exercised through the integration paths in test_oracle.rs.
 #[test]
+#[ignore = "v12.19 sync: function + field removed (see Phase B retired_tests.md)"]
 fn test_external_oracle_flat_market_uses_raw_target() {
-    let mut config = state::MarketConfig::zeroed();
-
-    let price =
-        oracle::clamp_external_price(&mut config, Ok((120_000_000, 1)), 100_000_000, 1, 0, false)
-            .unwrap();
-
-    assert_eq!(price, 120_000_000);
-    assert_eq!(config.last_effective_price_e6, 120_000_000);
-    assert_eq!(config.oracle_target_price_e6, 120_000_000);
+    let _ = state::MarketConfig::zeroed();
 }
 
 #[test]
+#[ignore = "v12.19 sync: function + field removed (see Phase B retired_tests.md)"]
 fn test_external_oracle_with_open_interest_respects_zero_dt_clamp() {
-    let mut config = state::MarketConfig::zeroed();
-
-    let price =
-        oracle::clamp_external_price(&mut config, Ok((120_000_000, 1)), 100_000_000, 1, 0, true)
-            .unwrap();
-
-    assert_eq!(price, 100_000_000);
-    assert_eq!(config.last_effective_price_e6, 100_000_000);
-    assert_eq!(config.oracle_target_price_e6, 120_000_000);
+    let _ = state::MarketConfig::zeroed();
 }
 
 #[test]
@@ -2500,10 +2490,10 @@ fn test_nonce_on_success_rejects_overflow() {
 
 #[test]
 fn test_nonce_overflow_does_not_reopen_request_id_space() {
-    let at_max = percolator_prog::verify::nonce_on_success(u64::MAX);
+    let at_max = percolator_prog::policy::nonce_on_success(u64::MAX);
     assert!(at_max.is_none(), "Must reject at u64::MAX");
 
-    let before_max = percolator_prog::verify::nonce_on_success(u64::MAX - 1);
+    let before_max = percolator_prog::policy::nonce_on_success(u64::MAX - 1);
     assert_eq!(before_max, Some(u64::MAX), "u64::MAX-1 should advance to u64::MAX");
 }
 
@@ -2618,7 +2608,7 @@ fn print_offsets() {
     eprintln!();
     eprintln!("--- MarketConfig field offsets ---");
     eprintln!("MarketConfig.maintenance_fee_per_slot = {}", offset_of!(MarketConfig, maintenance_fee_per_slot));
-    eprintln!("MarketConfig.max_insurance_floor = {}", offset_of!(MarketConfig, max_insurance_floor));
+    // v12.19 sync: MarketConfig.max_insurance_floor field removed.
     eprintln!("MarketConfig.min_oracle_price_cap_e2bps = {}", offset_of!(MarketConfig, min_oracle_price_cap_e2bps));
 }
 

@@ -267,7 +267,6 @@ fn test_account_struct_alignment() {
         pending_remaining_q: 0,
         pending_horizon: 0,
         pending_created_slot: 0,
-        last_fee_slot: 0,
     };
 
     // Verify all fields round-trip correctly

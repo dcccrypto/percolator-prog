@@ -127,9 +127,11 @@ fn phase1_market_creation(env: &mut TestEnv) -> (Keypair, u16, Pubkey) {
     // If SLAB_LEN were the wrong value, InitMarket would fail with ConstraintRaw.
     // 2026-04-17: v12.17 + Phase A (+48) + Phase E (+32) = 1_484_728 for MAX_ACCOUNTS=4096.
     println!("[1] SLAB_LEN = {} bytes", SLAB_LEN);
-    assert_eq!(SLAB_LEN, 1_484_728,
-        "SLAB_LEN mismatch: must match SBF layout (1_484_728 = v12.17 + Phase A/E MarketConfig extension)");
-    println!("    SLAB_LEN verified: SBF layout (1_484_728)");
+    // v12.19 sync: SBF layout grew by 40_480 bytes (per-account
+    // `last_fee_slot: u64` + bitmap/cursor reshuffle).
+    assert_eq!(SLAB_LEN, 1_525_208,
+        "SLAB_LEN mismatch: must match v12.19 SBF layout");
+    println!("    SLAB_LEN verified: v12.19 SBF layout (1_525_208)");
 
     // Step 2 — InitMarket with full 352-byte payload.
     // encode_init_market_full_v2 produces opcode(1) + admin(32) + mint(32) +
@@ -503,7 +505,7 @@ fn phase4_cleanup(env: &mut TestEnv, user: &Keypair, user_idx: u16, lp_owner: &K
     // Step 20 — ResolveMarket.
     println!("[20] ResolveMarket...");
     env.set_oracle_price_e6(150_000_000);
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("ResolveMarket must succeed");
     assert!(env.is_market_resolved(), "Market must be RESOLVED after ResolveMarket");
     println!("    ResolveMarket OK: market is RESOLVED");

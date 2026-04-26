@@ -1375,7 +1375,7 @@ fn test_push_oracle_price_rejects_stale_timestamp() {
 
     let mut env = TestEnv::new();
     // Non-Hyperp market with non-zero cap so authority can be enabled.
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_set_oracle_authority_raw(&admin, &admin.pubkey())

@@ -2638,7 +2638,7 @@ fn test_settle_account_blocked_on_resolved() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(300);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved(), "Market must be resolved");
 
     // SettleAccount on a resolved market should fail.
@@ -2976,7 +2976,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(300);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved(), "Market must be resolved");
 
     // ConvertReleasedPnl should fail on resolved market.
@@ -3028,7 +3028,7 @@ fn test_init_user_blocked_on_resolved() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(1_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved());
 
     let user = Keypair::new();
@@ -3106,7 +3106,7 @@ fn test_init_lp_blocked_on_resolved() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(1_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved());
 
     let lp = Keypair::new();
@@ -3217,7 +3217,7 @@ fn test_reclaim_blocked_on_resolved() {
     // Resolve the market at a fresh external price.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved());
 
     let result = env.try_reclaim_empty_account(user_idx);
@@ -5569,7 +5569,12 @@ fn test_init_market_rejects_excessive_mark_min_fee() {
     let mut env = TestEnv::new();
     let data = encode_init_market_with_min_fee(
         &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
-        0, 10_000, 0,
+        // v12.19 sync: signature dropped the legacy `min_oracle_price_cap_e2bps`
+        // arg (the 0 between 10_000 and 500); arg list is now:
+        // (admin, mint, feed_id, invert, perm_resolve_slots,
+        //  funding_horizon, funding_k, funding_max_premium,
+        //  funding_max_e9_per_slot, mark_min_fee).
+        0, 80,
         500, 100, 500, 5,
         u64::MAX, // way too large
     );
@@ -5611,7 +5616,7 @@ fn test_funding_no_cap_means_no_ewma() {
     // cap = 0 means EWMA is disabled. Pair with perm_resolve > 0 so the
     // market still has a resolve path (non-Hyperp + cap=0 + perm=0 is
     // now rejected at init as unresolvable).
-    env.init_market_with_cap(0, 0, 50_000);
+    env.init_market_with_cap(0, 50_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);

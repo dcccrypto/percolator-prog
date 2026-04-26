@@ -138,7 +138,7 @@ fn test_limited_insurance_withdraw_defaults_enforced() {
 
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before insurance withdraw");
     assert!(env.is_market_resolved(), "market should be resolved");
 
@@ -215,7 +215,7 @@ fn test_limited_insurance_withdraw_custom_policy_enforced() {
     env.top_up_insurance(&admin, 10_000_000_000);
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
 
     let delegated = Keypair::new();
@@ -332,7 +332,7 @@ fn test_limited_insurance_withdraw_cooldown_enforced_from_slot_zero() {
     env.top_up_insurance(&admin, 10_000_000_000);
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
 
     // Use custom policy so cooldown must be enforced exactly from first successful withdraw.
@@ -392,7 +392,7 @@ fn test_limited_insurance_withdraw_min_floor_when_percent_cap_small() {
     env.top_up_insurance(&admin, 10_000);
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
 
     // min=1000, max=1% => percent cap on 10_000 is only 100.
@@ -460,7 +460,7 @@ fn test_limited_insurance_withdraw_default_min_floor_respects_unit_scale() {
 
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before limited withdraw");
 
     // Sanity-check resolved config state for default-policy path.
@@ -538,7 +538,7 @@ fn test_limited_insurance_withdraw_failed_attempts_do_not_arm_cooldown() {
     env.top_up_insurance(&admin, 10_000_000_000);
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
 
     let delegated = Keypair::new();
@@ -633,7 +633,7 @@ fn test_limited_insurance_policy_validation_and_resolution_gates() {
     env.top_up_insurance(&admin, 1_000_000_000);
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve should succeed");
 
     // Validation: min_withdraw_base > 0.
@@ -716,7 +716,7 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
     env.crank();
 
     // Resolve market.
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("resolve should succeed");
 
     // SetInsuranceWithdrawPolicy requires all accounts closed (prevents
@@ -807,7 +807,7 @@ fn test_admin_withdraw_insurance_bypasses_limited_policy() {
 
     env.set_slot(100);
     env.crank();
-    env.try_resolve_market(&admin).expect("resolve");
+    env.try_resolve_market(&admin, 0).expect("resolve");
     assert!(env.is_market_resolved(), "market should be resolved");
 
     // Configure a restrictive limited policy: delegated authority, 1% max, 100k-slot cooldown
@@ -1773,7 +1773,7 @@ fn test_insurance_withdraw_cooldown_enforcement() {
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(200);
     env.crank();
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Configure: 100% per withdrawal, 1000 slot cooldown
     env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1, 10_000, 1000).unwrap();
@@ -1809,7 +1809,7 @@ fn test_insurance_withdraw_bps_cap() {
     env.set_oracle_price_e6(138_000_000);
     env.set_slot(200);
     env.crank();
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Configure: max 50% (5000 bps) per withdrawal
     env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1, 5_000, 1).unwrap();
@@ -1930,7 +1930,7 @@ fn test_top_up_insurance_blocked_on_resolved() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(1_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved());
 
     let payer = Keypair::new();
@@ -2350,7 +2350,7 @@ fn test_withdraw_limited_operator_cannot_call_tag_20() {
     // the operator — and the new operator is not insurance_authority.
     let operator = Keypair::new();
     env.svm.airdrop(&operator.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&operator))
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&operator.pubkey()))
         .expect("rotate insurance_operator");
 
     // Sanity: the operator CAN use tag 23.
@@ -2424,7 +2424,7 @@ fn test_withdraw_limited_rotation_swaps_authority() {
     // Rotate operator to a fresh key.
     let new_op = Keypair::new();
     env.svm.airdrop(&new_op.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&new_op))
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE_OPERATOR, Some(&new_op.pubkey()))
         .expect("rotate operator");
 
     env.set_slot(200);
@@ -2830,7 +2830,7 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     // Rotate oracle authority.
     let new_oracle = Keypair::new();
     env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle))
+    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_oracle.pubkey()))
         .expect("oracle rotation must succeed");
 
     // Under the no-policy branch, the clear fires as before.
@@ -2843,4 +2843,69 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     };
     assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
     assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
+}
+
+// ============================================================================
+// Phase B: local helpers for bounded WithdrawInsuranceLimited tests
+// (auto-merge dropped these; restored from git history of commit 232d35e).
+// ============================================================================
+
+use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+fn send_withdraw_limited(
+    env: &mut TestEnv,
+    operator: &Keypair,
+    amount: u64,
+) -> Result<(), String> {
+    let operator_ata = env.create_ata(&operator.pubkey(), 0);
+    let (vault_pda, _) = SdkPubkey::find_program_address(
+        &[b"vault", env.slab.as_ref()],
+        &env.program_id,
+    );
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(operator.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(operator_ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+        ],
+        data: encode_withdraw_insurance_limited(amount),
+    };
+    let _ = env.svm.airdrop(&operator.pubkey(), 1_000_000_000);
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&operator.pubkey()),
+        &[operator],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+}
+
+/// Configure a market with bounded-withdrawal enabled: seed insurance and
+/// set `insurance_withdraw_max_bps` + `insurance_withdraw_cooldown_slots`
+/// via direct slab edits.
+fn setup_bounded_withdrawal(
+    env: &mut TestEnv,
+    insurance: u64,
+    max_bps: u16,
+    cooldown_slots: u64,
+) {
+    env.init_market_with_invert(0);
+    let insurance_payer = Keypair::new();
+    env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
+    env.top_up_insurance(&insurance_payer, insurance);
+
+    // Direct slab edits: insurance_withdraw_max_bps + cooldown_slots.
+    // Offsets relative to start of MarketConfig (after SlabHeader). v12.19
+    // layout left these field positions stable from pre-sync.
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    // insurance_withdraw_max_bps (u16): HEADER_LEN(168) + config offset 232 = 400
+    slab.data[400..402].copy_from_slice(&max_bps.to_le_bytes());
+    // insurance_withdraw_cooldown_slots (u64): HEADER_LEN(168) + 240 = 408
+    slab.data[408..416].copy_from_slice(&cooldown_slots.to_le_bytes());
+    env.svm.set_account(env.slab, slab).unwrap();
 }

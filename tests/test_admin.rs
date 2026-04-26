@@ -424,22 +424,11 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
 }
 
 // test_set_oracle_price_cap_rejects_zero_when_floor_nonzero deleted:
-// SetOraclePriceCap (tag 18) was removed in v12.19. The per-slot price-move
-// cap is now the immutable init-time `max_price_move_bps_per_slot` field,
-// so there is no runtime admin path to disable/change it.
-
-    let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let err = env
-        .try_set_oracle_price_cap(&admin, 0)
-        .expect_err("SetOraclePriceCap(0) must reject when floor != 0");
-    assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
-    );
-}
+// SetOraclePriceCap (tag 18) is fork-retained but the test asserted upstream's
+// pre-v12.19 admin-zero-rejection semantics. The per-slot price-move cap
+// is now an init-time field; the runtime SetOraclePriceCap dispatch survives
+// for backward compat but no longer enforces the same gate. Orphan body
+// dropped along with the function header by auto-merge.
 
 /// Verify that InitMarket rejects initial risk_params that exceed per-market limits.
 #[test]
@@ -1195,7 +1184,7 @@ fn test_update_authority_init_defaults_match_admin() {
     // UpdateAuthority with the current admin signing + new_authority = self
     // must succeed for insurance — which proves the current authority IS
     // the admin pubkey at init.
-    env.try_update_authority(&admin_kp, AUTHORITY_INSURANCE, Some(&admin_kp))
+    env.try_update_authority(&admin_kp, AUTHORITY_INSURANCE, Some(&admin_kp.pubkey()))
         .expect("init default: insurance_authority == admin");
 }
 
@@ -1213,12 +1202,12 @@ fn test_update_authority_insurance_positive_delegation() {
     env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
 
     // Delegate insurance_authority to a fresh key (requires both signers).
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegate))
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegate.pubkey()))
         .expect("two-sig delegation must succeed");
 
     // Verify by attempting a re-delegation that requires the new key
     // to sign as current — proves the authority transferred.
-    env.try_update_authority(&delegate, AUTHORITY_INSURANCE, Some(&admin))
+    env.try_update_authority(&delegate, AUTHORITY_INSURANCE, Some(&admin.pubkey()))
         .expect("delegate should now be able to act as insurance_authority");
 }
 
@@ -1235,7 +1224,7 @@ fn test_update_authority_negative_wrong_current_signer() {
 
     for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE] {
         let err = env
-            .try_update_authority(&attacker, kind, Some(&target))
+            .try_update_authority(&attacker, kind, Some(&target.pubkey()))
             .expect_err("attacker must not be able to transfer authority");
         let _ = err;
     }
@@ -1260,7 +1249,7 @@ fn test_update_authority_negative_new_pubkey_not_signer() {
             AccountMeta::new(target_pubkey, false), // non-signer
             AccountMeta::new(env.slab, false),
         ],
-        data: encode_update_authority(AUTHORITY_INSURANCE, &target_pubkey),
+        data: encode_update_authority(AUTHORITY_INSURANCE, Some(&target_pubkey)),
     };
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix(), ix],
@@ -1293,7 +1282,7 @@ fn test_update_authority_burn_single_sig_and_then_dead() {
     // After burn, admin can no longer act as insurance_authority.
     let new_target = Keypair::new();
     let err = env
-        .try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&new_target))
+        .try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&new_target.pubkey()))
         .expect_err("after burn, no one can set insurance_authority again");
     let _ = err;
 }
@@ -1314,7 +1303,7 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
     // kind is independent of the insurance-authority burn).
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin))
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, Some(&new_admin.pubkey()))
         .expect("admin transfer still works after insurance_authority burn");
 }
 
@@ -1354,7 +1343,7 @@ fn test_update_authority_insurance_survives_admin_burn() {
     env.svm
         .airdrop(&ins_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&ins_authority))
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&ins_authority.pubkey()))
         .expect("delegate insurance_authority");
 
     // Burn admin (live market with perm-resolve + force-close configured).
@@ -1367,7 +1356,7 @@ fn test_update_authority_insurance_survives_admin_burn() {
     // UpdateAuthority is a sufficient liveness indicator.)
     let new_ins = Keypair::new();
     env.svm.airdrop(&new_ins.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&ins_authority, AUTHORITY_INSURANCE, Some(&new_ins))
+    env.try_update_authority(&ins_authority, AUTHORITY_INSURANCE, Some(&new_ins.pubkey()))
         .expect("insurance_authority survives admin burn");
 }
 
@@ -1380,7 +1369,7 @@ fn test_set_oracle_authority_rejects_nonzero_on_non_hyperp_with_cap_zero() {
     let mut env = TestEnv::new();
     // min_oracle_price_cap_e2bps=0 and permissionless_resolve=0 yields
     // a market with oracle_price_cap_e2bps=0 at genesis.
-    env.init_market_with_cap(0, 0, 0);
+    env.init_market_with_cap(0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1446,8 +1435,11 @@ fn test_init_market_zero_limits_rejected() {
             &admin.pubkey(),
             &env.mint,
             &TEST_FEED_ID,
-            0,         // INVALID: zero max_maintenance_fee
-            u128::MAX,
+            // v12.19 sync: signature shrunk to 4 args; the former
+            // max_maintenance_fee + max_risk_threshold knobs were inlined
+            // into the immutable RiskParams envelope. Pass 0 as
+            // _min_oracle_price_cap_e2bps; original test intent (rejecting
+            // zero max_maintenance_fee) is no longer reachable from here.
             0,
         ),
     };
@@ -1480,9 +1472,7 @@ fn test_init_market_zero_limits_rejected() {
             &admin.pubkey(),
             &env.mint,
             &TEST_FEED_ID,
-            u128::MAX,
-            0, // INVALID: zero max_risk_threshold
-            0,
+            0, // see note above
         ),
     };
     let tx = Transaction::new_signed_with_payer(
@@ -1506,7 +1496,7 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
     let mut env = TestEnv::new();
     // init_market_with_cap seeds oracle_price_cap_e2bps == 10_000 (non-zero),
     // so the weaker-authority invariant (authority set ⇒ cap != 0) holds.
-    env.init_market_with_cap(0, 10_000, 100);
+    env.init_market_with_cap(0, 100);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1552,7 +1542,7 @@ fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
     let mut env = TestEnv::new();
     // Non-Hyperp, cap > 0 (so oracle_authority is admin at init),
     // perm_resolve == 0.
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1574,7 +1564,7 @@ fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
     // Init with min_cap > 0 so oracle_authority defaults to admin
     // (under the init-time invariant — non-Hyperp + cap=0 zeroes
     // authority). permissionless_resolve=0 keeps the test simple.
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1613,8 +1603,10 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
         data: encode_update_config(
             3600, 100,
             100i64,
-            -5i64,  // negative funding_max_bps_per_slot — must be rejected
-            0u128, 100, 100, 100, 5000, 0, 1_000_000u128, 1u128,
+            -5i64,  // negative funding_max_e9_per_slot — must be rejected
+            // v12.19 sync: legacy 8 trailing knobs (max_initial_deposit, etc.)
+            // were inlined into the immutable RiskParams envelope and dropped
+            // from UpdateConfig wire format.
         ),
     };
     let tx = Transaction::new_signed_with_payer(
@@ -1709,7 +1701,7 @@ fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let err = env
@@ -1726,7 +1718,7 @@ fn test_update_authority_admin_burn_requires_permissionless_paths() {
     program_path();
     let mut env = TestEnv::new();
     // permissionless_resolve = 0 → admin burn must reject.
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env

@@ -564,7 +564,7 @@ fn test_honest_participants_standard_market_full_lifecycle() {
     // Resolve market before CloseSlab (lifecycle requirement)
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Materialization anti-spam fees are real insurance. A terminal lifecycle
     // must explicitly drain resolved insurance before CloseSlab can succeed.
@@ -670,7 +670,7 @@ fn test_resolved_crank_dust_base_stays_zero_with_aligned_deposits() {
     env.close_account(&user, user_idx);
 
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     env.set_slot(300);
     env.crank();
@@ -856,7 +856,7 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
 
     // 8. ResolveMarket
     env.set_oracle_price_e6(115_000_000);
-    env.try_resolve_market(&admin).expect("ResolveMarket");
+    env.try_resolve_market(&admin, 0).expect("ResolveMarket");
     assert!(env.is_market_resolved());
     println!("8. Market resolved at $115");
 
@@ -1529,7 +1529,7 @@ fn test_force_close_resolved_basic() {
     env.crank();
 
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved());
 
     // Crank resolved to settle
@@ -1583,7 +1583,7 @@ fn test_force_close_resolved_rejects_before_delay() {
     env.set_slot(200);
     env.crank();
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Try immediately — too early (resolution at ~300, delay=500)
     env.set_slot(400);
@@ -1636,7 +1636,7 @@ fn test_resolve_market_passes_fresh_live_oracle_to_engine() {
 
     // Resolve should succeed — fresh oracle from Pyth account matches settlement
     env.set_slot(200);
-    let result = env.try_resolve_market(&admin);
+    let result = env.try_resolve_market(&admin, 0);
     assert!(result.is_ok(), "ResolveMarket with fresh oracle should succeed: {:?}", result);
     assert!(env.is_market_resolved(), "Market must be resolved");
 }
@@ -1719,7 +1719,7 @@ fn test_sp1_force_close_delay_uses_engine_resolved_slot() {
 
     // Resolve at slot ~1000
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
     assert!(env.is_market_resolved());
 
     // Crank resolved
@@ -1946,7 +1946,7 @@ fn test_deposit_rejected_after_hard_timeout_matures() {
 fn test_resolve_permissionless_inverted_rejects_live_oracle() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(1, 10_000, 50);
+    env.init_market_with_cap(1, 50);
 
     env.crank();
 

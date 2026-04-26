@@ -9871,7 +9871,7 @@ fn test_attack_close_slab_clean_shutdown() {
     // Resolve market before CloseSlab (lifecycle requirement)
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Close slab should succeed
     let result = env.try_close_slab();
@@ -10744,7 +10744,7 @@ fn test_attack_update_config_after_resolution() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(140_000_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     let insurance_before = env.read_insurance_balance();
     let spl_vault_before = env.vault_balance();
@@ -10800,7 +10800,7 @@ fn test_attack_set_oracle_price_cap_after_resolution_rejected() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.set_oracle_price_e6(140_000_000);
     env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap();
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     const CAP_OFF: usize = 392; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
