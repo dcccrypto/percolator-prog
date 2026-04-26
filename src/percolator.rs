@@ -9830,9 +9830,18 @@ pub mod processor {
         state::write_config(&mut data, &config);
 
         // Set engine market_mode to Resolved so force_close_resolved_not_atomic accepts it.
+        // Also crystallise the engine's resolved_slot snapshot so the
+        // engine-side `current_slot == resolved_slot` invariant holds in
+        // every downstream resolved-mode path (force_close_resolved,
+        // reconcile_resolved). The wrapper bypasses
+        // engine.resolve_market_not_atomic for its own price/accrual flow,
+        // so this snapshot must be set explicitly here.
         {
             let engine = zc::engine_mut(&mut data)?;
             engine.market_mode = percolator::MarketMode::Resolved;
+            engine.resolved_slot = engine.current_slot;
+            engine.resolved_price = settlement_price;
+            engine.resolved_live_price = settlement_price;
         }
 
         state::set_resolved(&mut data);
