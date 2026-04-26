@@ -581,7 +581,7 @@ fn test_attack_trade_risk_increase_when_gated() {
 
     // Directly set side_mode_long = DrainOnly (1) in the slab raw bytes.
     // v12.17+Phase A/E layout: ENGINE_OFF=584, side_mode_long at engine offset 536 (BPF)
-    const SIDE_MODE_LONG_OFF: usize = 584 + 536; // BPF ENGINE_OFF (Phase A +48 + Phase E +32) + side_mode_long
+    const SIDE_MODE_LONG_OFF: usize = 600 + 536; // BPF ENGINE_OFF (Phase A +48 + Phase E +32) + side_mode_long
     {
         let original_slab = env.svm.get_account(&env.slab).expect("slab must exist");
         let mut modified_slab = original_slab.clone();
@@ -1184,7 +1184,7 @@ fn test_attack_double_init_market() {
         &[admin],
         env.svm.latest_blockhash(),
     );
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
@@ -2417,7 +2417,7 @@ fn test_attack_truncated_instruction_data() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
@@ -2479,7 +2479,7 @@ fn test_attack_unknown_instruction_tag() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
@@ -2533,7 +2533,7 @@ fn test_attack_empty_instruction_data() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
@@ -8323,7 +8323,7 @@ fn test_attack_instruction_tag_just_above_max() {
         &[&user],
         env.svm.latest_blockhash(),
     );
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let spl_vault_before = env.vault_balance();
@@ -8677,7 +8677,7 @@ fn test_attack_init_market_admin_mismatch() {
         &[&admin],
         svm.latest_blockhash(),
     );
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = svm.get_account(&vault).unwrap().data;
     let result = svm.send_transaction(tx);
@@ -8790,7 +8790,7 @@ fn test_attack_init_market_mint_mismatch() {
         &[&admin],
         svm.latest_blockhash(),
     );
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = svm.get_account(&vault).unwrap().data;
     let result = svm.send_transaction(tx);

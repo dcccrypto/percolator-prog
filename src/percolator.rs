@@ -2059,10 +2059,22 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::AdminForceCloseAccount { user_idx })
                 }
-                // Tag 22 (SetInsuranceWithdrawPolicy) deleted — policy
-                // was folded into config fields set at init/via
-                // UpdateConfig, no separate setter instruction needed.
-                //
+                // Tag 22 (SetInsuranceWithdrawPolicy): fork-retained
+                // bounded-policy setter. Persists policy parameters into
+                // oracle-fields slot and sets FLAG_POLICY_CONFIGURED, used
+                // to gate WithdrawInsuranceLimited (tag 23) bounds.
+                22 => {
+                    let authority = read_pubkey(&mut rest)?;
+                    let min_withdraw_base = read_u64(&mut rest)?;
+                    let max_withdraw_bps = read_u16(&mut rest)?;
+                    let cooldown_slots = read_u64(&mut rest)?;
+                    Ok(Instruction::SetInsuranceWithdrawPolicy {
+                        authority,
+                        min_withdraw_base,
+                        max_withdraw_bps,
+                        cooldown_slots,
+                    })
+                }
                 // Tag 23 (WithdrawInsuranceLimited) RESTORED with a
                 // separate scoped authority (`header.insurance_operator`)
                 // that cannot call the unbounded tag 20. The prior
@@ -9943,8 +9955,13 @@ pub mod processor {
         amount: u64,
     ) -> ProgramResult {
         // Limited insurance withdraw (configured authority + min/max/cooldown checks)
-        // Accept 7 or 8 accounts: optional oracle for same-instruction accrual
-        accounts::expect_len(accounts, 7)?;
+        // Accept 7 or 8 accounts: optional oracle for same-instruction accrual.
+        // expect_len_min instead of expect_len because the trailing oracle is
+        // documented as optional — callers operating on idle markets can omit
+        // it; live markets rely on the 8th slot for funding accrual.
+        if accounts.len() != 7 && accounts.len() != 8 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
         let a_authority = &accounts[0];
         let a_slab = &accounts[1];
         let a_authority_ata = &accounts[2];

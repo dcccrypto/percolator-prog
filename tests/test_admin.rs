@@ -259,7 +259,7 @@ fn test_critical_init_market_rejects_double_init() {
         env.svm.latest_blockhash(),
     );
     // Snapshot state after first init and before rejected second init.
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let used_before = env.read_num_used_accounts();
     let vault_before = env.vault_balance();
@@ -464,7 +464,6 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     // Per-market admin limits
     data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&50_000u128.to_le_bytes()); // max_risk_threshold = 50_000
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams with risk_reduction_threshold EXCEEDING the limit
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -479,7 +478,6 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
 
@@ -538,7 +536,6 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     data2.extend_from_slice(&0u64.to_le_bytes());
     // Per-market admin limits
     data2.extend_from_slice(&1000u128.to_le_bytes()); // max_maintenance_fee = 1000
-    data2.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data2.extend_from_slice(&0u64.to_le_bytes());
     // RiskParams with maintenance_fee_per_slot EXCEEDING the limit
     data2.extend_from_slice(&0u64.to_le_bytes());
@@ -619,10 +616,8 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     // Per-market admin limits (current wire format)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     // Non-Hyperp + cap=0 + perm_resolve=0 is rejected by the
     // resolvability invariant; ship cap=MAX to satisfy it.
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -637,7 +632,6 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     // Extended tail (required for v2 format)

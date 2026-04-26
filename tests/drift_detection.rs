@@ -930,8 +930,6 @@ fn risk_params_three_trailing_fields_are_mandatory() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     // maintenance_fee_per_slot removed in v12.15
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
 
     // Append risk params body but omit the last 3 fields (48 bytes)
     let full_wire = encode_risk_params_wire(
@@ -978,8 +976,6 @@ fn risk_params_full_round_trip_via_init_market() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&1_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (legacy wire field, still decoded)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     let h_max: u64 = 0;
     data.extend_from_slice(&encode_risk_params_wire(
         warmup, mm_bps, im_bps, fee_bps, max_accts, new_acct_fee, insurance_floor,

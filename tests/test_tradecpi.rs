@@ -5314,6 +5314,7 @@ fn init_market_inverted(env: &mut TradeCpiTestEnv) {
         )
         .unwrap();
 
+    // v12.19 InitMarket expects 9 accounts (admin/slab/mint/vault/<pad>/clock/<pad>/oracle/<pad>).
     let ix = Instruction {
         program_id: env.program_id,
         accounts: vec![
@@ -5321,8 +5322,11 @@ fn init_market_inverted(env: &mut TradeCpiTestEnv) {
             AccountMeta::new(env.slab, false),
             AccountMeta::new_readonly(env.mint, false),
             AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
             AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market_with_invert(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 1),
     };

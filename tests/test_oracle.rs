@@ -116,7 +116,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
 
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
-    const HEADER_CONFIG_LEN: usize = 584;
+    const HEADER_CONFIG_LEN: usize = 600;
     let NUM_USED_OFF: usize = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {

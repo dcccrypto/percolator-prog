@@ -359,7 +359,6 @@ fn encode_init_market_burn_safe(fixture: &MarketFixture, crank_staleness: u64) -
     encode_u128(0, &mut data);  // liquidation_fee_cap
     encode_u64(100, &mut data); // resolve_price_deviation_bps
     encode_u128(0, &mut data);  // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
     encode_u16(0, &mut data); // insurance_withdraw_max_bps
