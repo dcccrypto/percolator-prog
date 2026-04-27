@@ -129,18 +129,15 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
-    // verification_level = Full (1) at offset 40
-    data[40..42].copy_from_slice(&1u16.to_le_bytes());
-    // feed_id at offset 42
-    data[42..74].copy_from_slice(feed_id);
-    // price at offset 74
-    data[74..82].copy_from_slice(&price.to_le_bytes());
-    // conf at offset 82
-    data[82..90].copy_from_slice(&conf.to_le_bytes());
-    // expo at offset 90
-    data[90..94].copy_from_slice(&expo.to_le_bytes());
-    // publish_time at offset 94
-    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
+    // VerificationLevel::Full = 1-byte discriminant 0x01 at offset 40.
+    // PriceFeedMessage begins at byte 41 (Borsh enum variants are
+    // variable-size; Full has no payload).
+    data[40] = 1;
+    data[41..73].copy_from_slice(feed_id);
+    data[73..81].copy_from_slice(&price.to_le_bytes());
+    data[81..89].copy_from_slice(&conf.to_le_bytes());
+    data[89..93].copy_from_slice(&expo.to_le_bytes());
+    data[93..101].copy_from_slice(&publish_time.to_le_bytes());
     data
 }
 
@@ -161,41 +158,43 @@ fn encode_init_market_with_params(
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
-    // Per-market admin limits (within engine bounds)
-    data.extend_from_slice(&0u128.to_le_bytes()); // max_maintenance_fee_per_slot (legacy, ignored)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
+                                                 // maintenance_fee_per_slot (0 = disabled). The v12.19 wire format dropped
+                                                 // the standalone `min_oracle_price_cap_e2bps` field in favour of a
+                                                 // RiskParams entry (see max_price_move_bps_per_slot below).
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+                                                  // RiskParams
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&risk_reduction_threshold.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee (anti-spam floor)
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 wire)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (< perm_resolve <= MAX_ACCRUAL_DT_SLOTS)
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&1000u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED in
+    // read_risk_params (F-B1 = 4); not part of the wire layout.
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    // v12.19 + F-B1: perm_resolve must EXCEED max_accrual_dt_slots (100).
+    data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (perm_resolve>0 ⇒ >0)
     data
 }
 
 fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<u8> {
-    encode_init_market_with_params(admin, mint, feed_id, 0, 0)
+    encode_init_market_with_params(admin, mint, feed_id, 0, 1)
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
@@ -392,7 +391,7 @@ impl TestEnv {
     }
 
     fn init_market(&mut self) {
-        self.init_market_with_params(0, 0);
+        self.init_market_with_params(0, 1);
     }
 
     fn init_market_with_params(
@@ -415,7 +414,9 @@ impl TestEnv {
             )
             .unwrap();
 
-        // InitMarket now expects 9 accounts (removed pyth_index and pyth_col)
+        // InitMarket requires a successful oracle read at init (no sentinel).
+        let _ = dummy_ata;
+        // v12.19 InitMarket expects 9 accounts.
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -426,7 +427,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_params(
@@ -539,8 +540,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(matcher, false),
-                AccountMeta::new_readonly(ctx, false),
             ],
             data: encode_init_lp(&matcher, &ctx, 100),
         };
@@ -568,7 +567,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
             ],
             data: encode_init_user(100),
         };
@@ -830,14 +828,10 @@ fn encode_top_up_insurance(amount: u64) -> Vec<u8> {
     data
 }
 
-fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
-    let mut data = vec![11u8];
-    data.extend_from_slice(&new_threshold.to_le_bytes());
-    data
-}
-
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8];
+    // UpdateAuthority { kind: AUTHORITY_ADMIN = 0, new_pubkey }
+    let mut data = vec![32u8];
+    data.push(0u8);
     data.extend_from_slice(new_admin.as_ref());
     data
 }
@@ -850,29 +844,17 @@ fn encode_update_config(
     funding_horizon_slots: u64,
     funding_k_bps: u64,
     funding_max_premium_bps: i64,
-    funding_max_bps_per_slot: i64,
-    thresh_floor: u128,
-    thresh_risk_bps: u64,
-    thresh_update_interval_slots: u64,
-    thresh_step_bps: u64,
-    thresh_alpha_bps: u64,
-    thresh_min: u128,
-    thresh_max: u128,
-    thresh_min_step: u128,
+    funding_max_e9_per_slot: i64,
 ) -> Vec<u8> {
+    // UpdateConfig wire format in v12.18.1: tag (1) + 4 u64/i64 funding params.
+    // Earlier revisions had trailing threshold fields; the decoder now rejects
+    // them explicitly so the benchmark must not append them either.
     let mut data = vec![14u8];
     data.extend_from_slice(&funding_horizon_slots.to_le_bytes());
     data.extend_from_slice(&funding_k_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
-    data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
-    data.extend_from_slice(&thresh_floor.to_le_bytes());
-    data.extend_from_slice(&thresh_risk_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_update_interval_slots.to_le_bytes());
-    data.extend_from_slice(&thresh_step_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_alpha_bps.to_le_bytes());
-    data.extend_from_slice(&thresh_min.to_le_bytes());
-    data.extend_from_slice(&thresh_max.to_le_bytes());
-    data.extend_from_slice(&thresh_min_step.to_le_bytes());
+    data.extend_from_slice(&funding_max_e9_per_slot.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes()); // tvl_insurance_cap_mult (disabled)
     data
 }
 
@@ -883,7 +865,9 @@ fn encode_set_maintenance_fee(new_fee: u128) -> Vec<u8> {
 }
 
 fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    let mut data = vec![16u8];
+    // UpdateAuthority { kind: AUTHORITY_HYPERP_MARK = 1, new_pubkey }
+    let mut data = vec![32u8];
+    data.push(1u8);
     data.extend_from_slice(new_authority.as_ref());
     data
 }
@@ -895,14 +879,9 @@ fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
     data
 }
 
-fn encode_set_oracle_price_cap(max_change_e2bps: u64) -> Vec<u8> {
-    let mut data = vec![18u8];
-    data.extend_from_slice(&max_change_e2bps.to_le_bytes());
-    data
-}
-
 fn encode_resolve_market() -> Vec<u8> {
-    vec![19u8]
+    // Ordinary mode (0); live oracle required.
+    vec![19u8, 0u8]
 }
 
 fn encode_withdraw_insurance() -> Vec<u8> {
@@ -912,12 +891,6 @@ fn encode_withdraw_insurance() -> Vec<u8> {
 fn encode_admin_force_close_account(user_idx: u16) -> Vec<u8> {
     let mut data = vec![21u8];
     data.extend_from_slice(&user_idx.to_le_bytes());
-    data
-}
-
-fn encode_query_lp_fees(lp_idx: u16) -> Vec<u8> {
-    let mut data = vec![24u8];
-    data.extend_from_slice(&lp_idx.to_le_bytes());
     data
 }
 
@@ -937,7 +910,6 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_col, false),
             ],
             data: encode_init_user(100),
         };
@@ -962,6 +934,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
 
 #[cfg(not(feature = "test"))]
 #[test]
+#[cfg(not(any(feature = "small", feature = "medium")))]
 fn benchmark_worst_case_scenarios() {
     println!("\n=== WORST-CASE CRANK CU BENCHMARK ===");
     println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
@@ -1039,7 +1012,6 @@ fn benchmark_worst_case_scenarios() {
                     AccountMeta::new(env.vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(sysvar::clock::ID, false),
-                    AccountMeta::new_readonly(env.pyth_col, false),
                 ],
                 data: encode_init_user(100),
             };
@@ -1105,7 +1077,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1299,7 +1270,9 @@ fn benchmark_worst_case_scenarios() {
             // Use normal threshold - insurance starts at 0 which is <= 0 threshold
             // This should trigger force_realize_losses path when there are unpaid losses
             // warmup_period > 0 so winners' PnL stays unwrapped
-            env.init_market_with_params(0, 100); // threshold=0, warmup=100 slots
+            // warmup≤perm_resolve(80) per §14.1: h_max must fit inside the
+            // permissionless-resolve window.
+            env.init_market_with_params(0, 50); // threshold=0, warmup=50 slots
 
             let lp = Keypair::new();
             env.init_lp(&lp);
@@ -1327,7 +1300,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1418,7 +1390,7 @@ fn benchmark_worst_case_scenarios() {
             }
 
             let mut env = TestEnv::new();
-            env.init_market_with_params(0, 100); // warmup=100 slots
+            env.init_market_with_params(0, 50); // warmup<=perm_resolve(80) per §14.1
 
             let lp = Keypair::new();
             env.init_lp(&lp);
@@ -1445,7 +1417,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1524,7 +1495,7 @@ fn benchmark_worst_case_scenarios() {
             }
 
             let mut env = TestEnv::new();
-            env.init_market_with_params(0, 100);
+            env.init_market_with_params(0, 50); // warmup<=perm_resolve(80) per §14.1
 
             let lp = Keypair::new();
             env.init_lp(&lp);
@@ -1550,7 +1521,6 @@ fn benchmark_worst_case_scenarios() {
                         AccountMeta::new(env.vault, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(sysvar::clock::ID, false),
-                        AccountMeta::new_readonly(env.pyth_col, false),
                     ],
                     data: encode_init_user(100),
                 };
@@ -1792,6 +1762,7 @@ fn benchmark_worst_case_scenarios() {
 /// Measures CU consumed for each instruction under typical conditions.
 #[cfg(not(feature = "test"))]
 #[test]
+#[cfg(not(any(feature = "small", feature = "medium")))]
 fn benchmark_all_instructions() {
     println!("\n=== PER-INSTRUCTION CU BENCHMARK ===\n");
 
@@ -1811,20 +1782,21 @@ fn benchmark_all_instructions() {
     env.crank();
 
     // Helper: send instruction, return CU consumed
-    let measure = |svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]| -> Result<u64, String> {
-        let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
-        let payer = signers[0];
-        let tx = Transaction::new_signed_with_payer(
-            &[budget, ix],
-            Some(&payer.pubkey()),
-            signers,
-            svm.latest_blockhash(),
-        );
-        match svm.send_transaction(tx) {
-            Ok(r) => Ok(r.compute_units_consumed),
-            Err(e) => Err(format!("{:?}", e)),
-        }
-    };
+    let measure =
+        |svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]| -> Result<u64, String> {
+            let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+            let payer = signers[0];
+            let tx = Transaction::new_signed_with_payer(
+                &[budget, ix],
+                Some(&payer.pubkey()),
+                signers,
+                svm.latest_blockhash(),
+            );
+            match svm.send_transaction(tx) {
+                Ok(r) => Ok(r.compute_units_consumed),
+                Err(e) => Err(format!("{:?}", e)),
+            }
+        };
 
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
@@ -1914,24 +1886,7 @@ fn benchmark_all_instructions() {
         println!("TopUpInsurance:        {:>8} CU", cu);
     }
 
-    // --- SetRiskThreshold (Tag 11) ---
-    {
-        env.set_price(100_000_000, 500);
-        let ix = Instruction {
-            program_id: env.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-            ],
-            data: encode_set_risk_threshold(1_000_000),
-        };
-        // SetRiskThreshold always rejects (I_floor immutable per spec §2.2.1)
-        match measure(&mut env.svm, ix, &[&admin]) {
-            Ok(cu) => println!("SetRiskThreshold:      {:>8} CU (rejected)", cu),
-            Err(_) => println!("SetRiskThreshold:      (rejected — I_floor immutable)"),
-        }
-    }
+    // Tag 11 (SetRiskThreshold) benchmark removed: instruction deleted.
 
     // --- UpdateConfig (Tag 14) ---
     {
@@ -1941,20 +1896,15 @@ fn benchmark_all_instructions() {
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                // Oracle is REQUIRED on non-Hyperp UpdateConfig — admin cannot
+                // select the degenerate zero-funding arm by omission.
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_update_config(
-                3600,   // funding_horizon_slots
-                100,    // funding_k_bps
-                500,    // funding_max_premium_bps
-                5,      // funding_max_bps_per_slot
-                0,      // thresh_floor
-                100,    // thresh_risk_bps
-                100,    // thresh_update_interval_slots
-                100,    // thresh_step_bps
-                5000,   // thresh_alpha_bps
-                0,      // thresh_min
-                1_000_000_000_000_000, // thresh_max (must be <= max_insurance_floor)
-                1,      // thresh_min_step
+                3600, // funding_horizon_slots
+                100,  // funding_k_bps
+                500,  // funding_max_premium_bps
+                5,    // funding_max_e9_per_slot
             ),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
@@ -1965,53 +1915,46 @@ fn benchmark_all_instructions() {
     // SetOracleAuthority (Tag 16) — removed in Phase G. Decoder rejects.
     // PushOraclePrice    (Tag 17) — removed in Phase G. Decoder rejects.
 
-    // --- SetOraclePriceCap (Tag 18) ---
-    {
-        let ix = Instruction {
-            program_id: env.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-            ],
-            data: encode_set_oracle_price_cap(10_000),
-        };
-        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("SetOraclePriceCap:     {:>8} CU", cu);
-    }
+    // SetOraclePriceCap (Tag 18) removed in v12.19; the per-slot cap is now
+    // the immutable init-time `max_price_move_bps_per_slot` RiskParam.
 
-    // --- QueryLpFees (Tag 24) ---
-    {
-        let ix = Instruction {
-            program_id: env.program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(env.slab, false),
-            ],
-            data: encode_query_lp_fees(lp_idx),
-        };
-        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("QueryLpFees:           {:>8} CU", cu);
-    }
+    // Tag 24 (QueryLpFees) removed from the wire format.
 
     // --- LiquidateAtOracle (Tag 7) ---
-    // Make user underwater first
+    // Measure liquidation in an isolated market. The setup intentionally
+    // creates a sharp oracle move; keeping that state out of the main
+    // benchmark market prevents later live-path measurements from tripping
+    // the target/effective catch-up guard for the wrong reason.
     {
-        // Big price drop to make user liquidatable
-        env.set_price(50_000_000, 700); // $100 -> $50
-        env.crank();
+        let mut liq_env = TestEnv::new();
+        liq_env.init_market();
+        let liq_lp = Keypair::new();
+        let liq_lp_idx = liq_env.init_lp(&liq_lp);
+        liq_env.deposit(&liq_lp, liq_lp_idx, 50_000_000_000);
+        let liq_user = Keypair::new();
+        let liq_user_idx = liq_env.init_user(&liq_user);
+        liq_env.deposit(&liq_user, liq_user_idx, 10_000_000_000);
+        liq_env.set_price(100_000_000, 200);
+        liq_env.crank();
+        liq_env.trade(&liq_user, &liq_lp, liq_lp_idx, liq_user_idx, 100_000);
+        liq_env.set_price(50_000_000, 700); // $100 -> $50
+        liq_env.crank();
+
         let caller = Keypair::new();
-        env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+        liq_env
+            .svm
+            .airdrop(&caller.pubkey(), 1_000_000_000)
+            .unwrap();
         let ix = Instruction {
-            program_id: env.program_id,
+            program_id: liq_env.program_id,
             accounts: vec![
-                AccountMeta::new(caller.pubkey(), true),
-                AccountMeta::new(env.slab, false),
+                AccountMeta::new(liq_env.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_index, false),
+                AccountMeta::new_readonly(liq_env.pyth_index, false),
             ],
-            data: encode_liquidate(user_idx),
+            data: encode_liquidate(liq_user_idx),
         };
-        match measure(&mut env.svm, ix, &[&caller]) {
+        match measure(&mut liq_env.svm, ix, &[&caller]) {
             Ok(cu) => println!("LiquidateAtOracle:     {:>8} CU", cu),
             Err(_) => println!("LiquidateAtOracle:     (user not liquidatable at this price)"),
         }
@@ -2049,18 +1992,19 @@ fn benchmark_all_instructions() {
         }
     }
 
-    // --- UpdateAdmin (Tag 12) ---
+    // --- UpdateAuthority(ADMIN) (Tag 32) — replaces legacy Tag 12 ---
     {
         let ix = Instruction {
             program_id: env.program_id,
             accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
             ],
             data: encode_update_admin(&admin.pubkey()),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("UpdateAdmin:           {:>8} CU", cu);
+        println!("UpdateAuthority(ADMIN): {:>8} CU", cu);
     }
 
     // --- ResolveMarket + resolved-path instructions ---
@@ -2102,7 +2046,6 @@ fn benchmark_all_instructions() {
                 AccountMeta::new_readonly(vault_pda, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_admin_force_close_account(lp_idx),
         };

@@ -256,6 +256,7 @@ fn test_account_struct_alignment() {
         matcher_context: [0xBB; 32],
         owner: [0xCC; 32],
         fee_credits: I128::new(-999),
+        last_fee_slot: 0, /* v12.19: new Account field (per-account recurring-fee checkpoint) */
         sched_present: 0,
         sched_remaining_q: 0,
         sched_anchor_q: 0,
@@ -273,10 +274,7 @@ fn test_account_struct_alignment() {
         account.capital.get(),
         0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210
     );
-    assert_eq!(
-        account.pnl,
-        -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10i128
-    );
+    assert_eq!(account.pnl, -0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10i128);
     assert_eq!(account.reserved_pnl, 0xDEAD_BEEF_CAFE_BABEu128);
     assert_eq!(account.position_basis_q, -1_000_000_000_000i128);
     assert_eq!(account.fee_credits.get(), -999);
@@ -365,12 +363,15 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
-    data[40..42].copy_from_slice(&1u16.to_le_bytes()); // verification_level = Full
-    data[42..74].copy_from_slice(feed_id);
-    data[74..82].copy_from_slice(&price.to_le_bytes());
-    data[82..90].copy_from_slice(&conf.to_le_bytes());
-    data[90..94].copy_from_slice(&expo.to_le_bytes());
-    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
+    // VerificationLevel::Full = 1-byte discriminant at offset 40. Borsh
+    // enum variants are variable-size; Full carries no payload, so
+    // PriceFeedMessage begins at byte 41.
+    data[40] = 1;
+    data[41..73].copy_from_slice(feed_id);
+    data[73..81].copy_from_slice(&price.to_le_bytes());
+    data[81..89].copy_from_slice(&conf.to_le_bytes());
+    data[89..93].copy_from_slice(&expo.to_le_bytes());
+    data[93..101].copy_from_slice(&publish_time.to_le_bytes());
     data
 }
 
@@ -384,36 +385,35 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
-    // Per-market admin limits (within engine bounds)
+                                                 // v12.19: `min_oracle_price_cap_e2bps` field dropped; runtime cap moved to
+                                                 // RiskParams as `max_price_move_bps_per_slot` (immutable init-time).
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min (warmup_period_slots)
+                                                  // RiskParams
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (warmup_period_slots)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee (anti-spam floor)
+    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor (v12.19 wire)
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (< perm_resolve <= MAX_ACCRUAL_DT_SLOTS)
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    // v12.19 wrapper: max_price_move_bps_per_slot is HARDCODED.
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve_stale_slots (v12.19+F-B1: > 100)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (perm_resolve>0 ⇒ >0)
     data
 }
 
@@ -584,13 +584,18 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: encode_init_market(&payer.pubkey(), &mint, &TEST_FEED_ID),
     };
+    // InitMarket now reads the oracle at genesis (§2.7, no sentinel), which
+    // pushes it past the default 200K CU budget. Request 1.4M like the rest
+    // of the test suite.
+    let cu_ix =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[cu_ix, ix],
         Some(&payer.pubkey()),
         &[&payer],
         svm.latest_blockhash(),
@@ -638,8 +643,6 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
-            AccountMeta::new_readonly(matcher, false),
-            AccountMeta::new_readonly(ctx, false),
         ],
         data: encode_init_lp(&matcher, &ctx, 100),
     };
@@ -678,7 +681,6 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(pyth_col, false),
         ],
         data: encode_init_user(100),
     };

@@ -137,14 +137,15 @@ use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 /// for reference — those are enforced at build time in src/percolator.rs via
 /// compile-time asserts.
 mod layout_constants {
-    /// HEADER_LEN: size_of::<SlabHeader>() = 72 bytes
-    pub const HEADER_LEN_EXPECTED: usize = 72;
-    /// CONFIG_LEN: size_of::<MarketConfig>()
-    // 2026-04-17: CONFIG_LEN extended from 432 → 480 by Phase A (7 new fields),
-    // then 480 → 512 by Phase E (+32 bytes for pending_admin for two-step UpdateAdmin).
-    pub const CONFIG_LEN_EXPECTED: usize = 512;
-    /// ACCOUNT_SIZE: size_of::<Account>() — v12.17 two-bucket warmup
-    pub const ACCOUNT_SIZE_EXPECTED: usize = 368;
+    /// HEADER_LEN: size_of::<SlabHeader>() — v12.19 expanded to 136 bytes
+    /// (added 4-way authority pubkeys + pending_admin slot).
+    pub const HEADER_LEN_EXPECTED: usize = 136;
+    /// CONFIG_LEN: size_of::<MarketConfig>() — v12.19 trimmed to 480
+    /// (legacy fields removed during ML9..ML12 sync).
+    pub const CONFIG_LEN_EXPECTED: usize = 480;
+    /// ACCOUNT_SIZE: size_of::<Account>() — v12.19 expanded to 384
+    /// (Account gained per-account fields during the sync).
+    pub const ACCOUNT_SIZE_EXPECTED: usize = 384;
     /// ENGINE_OFF: align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN)
     /// Computed live from the program's own constant — this is intentional:
     /// if the constant changes, the test catches it via other assertions.
@@ -173,7 +174,7 @@ mod layout_constants {
     pub const ENGINE_PNL_MATURED_POS_TOT_OFF: usize =
         core::mem::offset_of!(percolator::RiskEngine, pnl_matured_pos_tot);
     pub const ENGINE_LIQ_CURSOR_OFF: usize =
-        core::mem::offset_of!(percolator::RiskEngine, gc_cursor);
+        0; // v12.19: gc_cursor field retired (sweep cursors restructured)
     pub const ENGINE_NUM_USED_ACCOUNTS_OFF: usize =
         core::mem::offset_of!(percolator::RiskEngine, num_used_accounts);
     pub const ENGINE_ACCOUNTS_OFF: usize =
@@ -332,11 +333,7 @@ fn layout_engine_field_offsets_pinned() {
         layout_constants::ENGINE_PNL_MATURED_POS_TOT_OFF,
         "RiskEngine.pnl_matured_pos_tot offset drift"
     );
-    assert_eq!(
-        offset_of!(RiskEngine, gc_cursor),
-        layout_constants::ENGINE_LIQ_CURSOR_OFF,
-        "RiskEngine.gc_cursor offset drift"
-    );
+    // v12.19: gc_cursor field retired
     assert_eq!(
         offset_of!(RiskEngine, num_used_accounts),
         layout_constants::ENGINE_NUM_USED_ACCOUNTS_OFF,
@@ -869,7 +866,9 @@ fn encode_risk_params_wire(
     v.extend_from_slice(&liquidation_fee_cap.to_le_bytes());
     v.extend_from_slice(&liquidation_buffer_bps.to_le_bytes());
     v.extend_from_slice(&min_liquidation_abs.to_le_bytes());
-    v.extend_from_slice(&min_initial_deposit.to_le_bytes());
+    // v12.19 wrapper: min_initial_deposit removed from wire (wrapper enforces
+    // it as policy at InitUser/InitLP rather than via the RiskParams payload).
+    let _ = min_initial_deposit;
     v.extend_from_slice(&min_nonzero_mm_req.to_le_bytes());
     v.extend_from_slice(&min_nonzero_im_req.to_le_bytes());
     v
@@ -891,17 +890,17 @@ const RISK_PARAMS_WIRE_LEN: usize =
   + 16  // liquidation_fee_cap (u128)
   + 8   // liquidation_buffer_bps wire-only (u64)
   + 16  // min_liquidation_abs (u128)
-  + 16  // min_initial_deposit (u128)
+  // v12.19: min_initial_deposit removed from wire (wrapper-enforced policy).
   + 16  // min_nonzero_mm_req (u128)
   + 16; // min_nonzero_im_req (u128)
 
 #[test]
-fn risk_params_wire_len_is_184_bytes() {
-    // 184 bytes: v12.17 removed h_max padding (was 192 with 8-byte pad)
+fn risk_params_wire_len_is_168_bytes() {
+    // v12.19: 168 bytes (down 16 from v12.17's 184 — min_initial_deposit removed).
     assert_eq!(
         RISK_PARAMS_WIRE_LEN,
-        184,
-        "RiskParams wire format byte count changed: got {}, expected 184",
+        168,
+        "RiskParams wire format byte count changed: got {}, expected 168",
         RISK_PARAMS_WIRE_LEN
     );
 }
@@ -934,8 +933,6 @@ fn risk_params_three_trailing_fields_are_mandatory() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     // maintenance_fee_per_slot removed in v12.15
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
 
     // Append risk params body but omit the last 3 fields (48 bytes)
     let full_wire = encode_risk_params_wire(
@@ -982,8 +979,6 @@ fn risk_params_full_round_trip_via_init_market() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&1_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (legacy wire field, still decoded)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     let h_max: u64 = 0;
     data.extend_from_slice(&encode_risk_params_wire(
         warmup, mm_bps, im_bps, fee_bps, max_accts, new_acct_fee, insurance_floor,
@@ -1009,18 +1004,12 @@ fn risk_params_full_round_trip_via_init_market() {
             assert_eq!(risk_params.initial_margin_bps, im_bps, "initial_margin_bps");
             assert_eq!(risk_params.trading_fee_bps, fee_bps, "trading_fee_bps");
             assert_eq!(risk_params.max_accounts, max_accts, "max_accounts");
-            assert_eq!(
-                risk_params.new_account_fee.get(),
-                new_acct_fee,
-                "new_account_fee"
-            );
+            // v12.19: new_account_fee moved to wrapper MarketConfig
+            let _ = new_acct_fee;
             // maintenance_fee_per_slot assertion removed in v12.15
             let _ = maint_fee;
-            assert_eq!(
-                risk_params.max_crank_staleness_slots,
-                crank_staleness,
-                "max_crank_staleness_slots"
-            );
+            // v12.19: max_crank_staleness_slots replaced by max_accrual_dt_slots
+            let _ = crank_staleness;
             assert_eq!(risk_params.liquidation_fee_bps, liq_fee_bps, "liquidation_fee_bps");
             assert_eq!(
                 risk_params.liquidation_fee_cap.get(),
@@ -1033,18 +1022,12 @@ fn risk_params_full_round_trip_via_init_market() {
                 "min_liquidation_abs"
             );
             // Three mandatory trailing fields (PERC-spec: truncated payloads rejected)
-            assert_eq!(
-                risk_params.min_initial_deposit.get(),
-                min_init_deposit,
-                "min_initial_deposit"
-            );
+            // v12.19: min_initial_deposit moved to wrapper policy
+            let _ = min_init_deposit;
             assert_eq!(risk_params.min_nonzero_mm_req, min_nonzero_mm, "min_nonzero_mm_req");
             assert_eq!(risk_params.min_nonzero_im_req, min_nonzero_im, "min_nonzero_im_req");
-            assert_eq!(
-                risk_params.insurance_floor.get(),
-                insurance_floor,
-                "insurance_floor"
-            );
+            // v12.19: insurance_floor moved to wrapper policy
+            let _ = insurance_floor;
         }
         other => panic!("Expected InitMarket to decode, got {:?}", other),
     }
@@ -1228,12 +1211,13 @@ fn engine_aggregate_fields_relative_order() {
     let c_tot_off = offset_of!(RiskEngine, c_tot);
     let pnl_pos_off = offset_of!(RiskEngine, pnl_pos_tot);
     let pnl_mat_off = offset_of!(RiskEngine, pnl_matured_pos_tot);
-    let gc_cursor_off = offset_of!(RiskEngine, gc_cursor);
+    let _gc_cursor_off: usize = 0;
+    let rr_cursor_off = offset_of!(RiskEngine, rr_cursor_position); // v12.19: gc_cursor retired
 
     assert!(vault_off < c_tot_off, "vault must precede c_tot");
     assert!(c_tot_off < pnl_pos_off, "c_tot must precede pnl_pos_tot");
     assert!(pnl_pos_off < pnl_mat_off, "pnl_pos_tot must precede pnl_matured_pos_tot");
-    assert!(pnl_mat_off < gc_cursor_off, "pnl_matured_pos_tot must precede gc_cursor");
+    assert!(pnl_mat_off < rr_cursor_off, "pnl_matured_pos_tot must precede rr_cursor_position /* v12.19 rename */");
 }
 
 #[test]

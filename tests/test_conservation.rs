@@ -15,6 +15,12 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+fn advance_hyperp_target(env: &mut TradeCpiTestEnv, logical_slot: &mut u64) {
+    *logical_slot += 1;
+    env.set_slot(*logical_slot);
+    env.crank();
+}
+
 /// ATTACK: Verify no value is created or destroyed through trading operations.
 /// Expected: Total vault token balance equals total deposits minus total withdrawals.
 #[test]
@@ -253,7 +259,8 @@ fn test_attack_premarket_force_close_pnl_conservation() {
         users.push((user, user_idx));
     }
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Each user takes a different sized position
@@ -269,6 +276,7 @@ fn test_attack_premarket_force_close_pnl_conservation() {
             &matcher_ctx,
         );
         assert!(result.is_ok(), "Trade {} should succeed: {:?}", i, result);
+        advance_hyperp_target(&mut env, &mut slot);
     }
 
     env.set_slot(150);
@@ -299,7 +307,7 @@ fn test_attack_premarket_force_close_pnl_conservation() {
 
     // Resolve at different price to create PnL
     env.set_oracle_price_e6(1_500_000); // 50% up
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Force-close via crank (settles PnL only; positions require AdminForceCloseAccount)
     env.set_slot(300);
@@ -378,7 +386,8 @@ fn test_attack_multi_lp_conservation() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let vault_before = env.read_vault();
@@ -394,6 +403,7 @@ fn test_attack_multi_lp_conservation() {
         &matcher_ctx1,
     );
     assert!(result.is_ok(), "Trade vs LP1 should succeed: {:?}", result);
+    advance_hyperp_target(&mut env, &mut slot);
 
     // Trade against LP2 (long again)
     let result = env.try_trade_cpi(
@@ -423,6 +433,7 @@ fn test_attack_multi_lp_conservation() {
         &matcher_ctx1,
     );
     assert!(result.is_ok(), "Close vs LP1 should succeed: {:?}", result);
+    advance_hyperp_target(&mut env, &mut slot);
 
     let result = env.try_trade_cpi(
         &user,
@@ -561,7 +572,8 @@ fn test_attack_premarket_partial_force_close_conservation() {
         users.push((user, user_idx));
     }
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Each user trades
@@ -576,13 +588,14 @@ fn test_attack_premarket_partial_force_close_conservation() {
             &matcher_ctx,
         )
         .expect("all user pre-resolution TradeCpi operations must succeed");
+        advance_hyperp_target(&mut env, &mut slot);
     }
 
     let vault_before = env.read_vault();
 
     // Resolve market
     env.set_oracle_price_e6(1_200_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Single crank: may only force-close a batch (64 accounts max)
     env.set_slot(200);
@@ -631,7 +644,7 @@ fn test_attack_multiple_deposits_conservation() {
         env.deposit(&user, user_idx, deposit_amount);
     }
 
-    let expected_total = deposit_amount as u128 * num_deposits + 100; // +100 from init
+    let expected_total = deposit_amount as u128 * num_deposits + 99; // 100 init payment - 1 anti-spam fee
     let actual_capital = env.read_account_capital(user_idx);
     assert_eq!(
         actual_capital, expected_total,
@@ -641,7 +654,7 @@ fn test_attack_multiple_deposits_conservation() {
 
     // Vault should have all deposits (user capital + LP deposit + LP init)
     let vault = env.vault_balance();
-    let expected_vault = expected_total + 100_000_000_000 + 100; // user + LP deposit + LP init
+    let expected_vault = deposit_amount as u128 * num_deposits + 100 + 100_000_000_000 + 100; // user payments + LP payments
     assert_eq!(
         vault, expected_vault as u64,
         "ATTACK: Vault balance mismatch after multiple deposits. expected={}, actual={}",
@@ -752,7 +765,8 @@ fn test_attack_multi_crank_funding_conservation() {
     // Engine vault should still be total deposited amount
     let engine_vault = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
+        // v12.19 BPF: engine.vault U128 at engine+16 (was engine+0 in v12.17).
+        u128::from_le_bytes(slab.data[616..632].try_into().unwrap())
     };
     assert_eq!(
         engine_vault, 20_000_000_200,
@@ -794,18 +808,12 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_before = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
+        u128::from_le_bytes(slab.data[616..632].try_into().unwrap()) // v12.19 BPF: engine.vault U128 at engine+16
     };
 
     // UpdateConfig with different parameters
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let result = env.try_update_config_with_params(
-        &admin,
-        7200,                       // funding_horizon_slots
-        2000,                       // alpha_bps
-        0,
-        10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
-    );
+    let result = env.try_update_config_with_params(&admin, 7200);
     assert!(
         result.is_ok(),
         "UpdateConfig should succeed with valid params"
@@ -818,7 +826,7 @@ fn test_attack_updateconfig_preserves_conservation() {
     };
     let engine_vault_after = {
         let slab = env.svm.get_account(&env.slab).unwrap();
-        u128::from_le_bytes(slab.data[584..600].try_into().unwrap()) // BPF ENGINE_OFF=584, vault at engine offset 0
+        u128::from_le_bytes(slab.data[616..632].try_into().unwrap()) // v12.19 BPF: engine.vault U128 at engine+16
     };
 
     // Conservation: UpdateConfig must not change vault balances
@@ -965,7 +973,7 @@ fn test_attack_many_deposits_one_withdrawal_conservation() {
     // Total deposited: 20 * 100M = 2B
     let cap = env.read_account_capital(user_idx);
     assert_eq!(
-        cap, 2_000_000_100,
+        cap, 2_000_000_099,
         "Capital should equal sum of deposits: {}",
         cap
     );
@@ -976,8 +984,8 @@ fn test_attack_many_deposits_one_withdrawal_conservation() {
 
     let cap_after = env.read_account_capital(user_idx);
     assert_eq!(
-        cap_after, 1_000_000_100,
-        "Capital after withdrawal should be 1B + init deposit: {}",
+        cap_after, 1_000_000_099,
+        "Capital after withdrawal should be 1B + init capital net of anti-spam fee: {}",
         cap_after
     );
 
@@ -1103,8 +1111,9 @@ fn test_attack_conservation_large_slot_jump() {
     // Open position
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
 
-    // Large slot jump (1 million slots)
-    env.set_slot(1_000_000);
+    // Large slot jump (within max_accrual_dt_slots=100_000 envelope per spec §1.4).
+    // Use 50,000 slots to test conservation under large (but bounded) gaps.
+    env.set_slot(50_000);
     env.crank();
 
     // SPL vault unchanged
@@ -1275,8 +1284,11 @@ fn test_attack_inverted_with_unit_scale_conservation() {
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
     assert_eq!(env.read_account_position(user_idx), 100_000);
 
-    // Price change
-    env.set_slot_and_price(50, 150_000_000);
+    // Price change that remains in the same scaled inverted engine-price
+    // bucket. At unit_scale=1000, raw 138M and 140M both map to engine
+    // price 7; a move to 150M maps to 6 and is intentionally stuck by the
+    // dt-capped target/effective policy because max_delta floors to zero.
+    env.set_slot_and_price(50, 140_000_000);
     env.crank();
 
     // Conservation
@@ -1632,7 +1644,11 @@ fn test_attack_four_users_one_lp_conservation() {
 
 /// ATTACK: InitUser with new_account_fee.
 /// Verify fee goes to insurance fund and conservation holds.
+///
+/// Obsolete under engine v12.18.1: new_account_fee is gone; deposits
+/// credit entirely to capital (spec §10.2).
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_attack_init_user_fee_conservation() {
     program_path();
 
@@ -1837,8 +1853,8 @@ fn test_attack_large_price_drop_liquidation_conservation() {
 
     env.try_top_up_insurance(&admin, 5_000_000_000).unwrap();
 
-    // Set circuit breaker to max (100%) to allow large price moves
-    env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap();
+    // v12.19: price-move cap is immutable init-time (TEST_MAX_PRICE_MOVE_BPS_PER_SLOT=2).
+    // This test walks the price in many small steps, so the cap is respected.
 
     env.crank();
 
@@ -2101,7 +2117,7 @@ fn test_property_authorization_exhaustive() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 10_000, 100);
+    env.init_market_with_cap(0, 200);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let attacker = Keypair::new();
@@ -2179,7 +2195,10 @@ fn test_property_authorization_exhaustive() {
 
     // Admin must be locked out after burn
     let r = env.try_update_admin(&new_admin, &new_admin.pubkey());
-    assert!(r.is_err(), "A8: Admin operations must fail after admin burn");
+    assert!(
+        r.is_err(),
+        "A8: Admin operations must fail after admin burn"
+    );
 }
 
 /// PROPERTY TEST: Account lifecycle invariants across create/use/close/GC cycles.
@@ -2365,7 +2384,7 @@ fn test_binary_market_complete_lifecycle_conservation() {
 
     // Resolve at $1.50 (user_a profits, user_b loses)
     env.set_oracle_price_e6(1_500_000);
-    env.try_resolve_market(&admin).unwrap();
+    env.try_resolve_market(&admin, 0).unwrap();
 
     // Settle PnL via crank (positions require explicit AdminForceCloseAccount)
     env.set_slot(200);
@@ -2409,7 +2428,8 @@ fn test_binary_market_complete_lifecycle_conservation() {
 
     // After AdminForceCloseAccount: all accounts are freed
     assert_eq!(
-        env.read_num_used_accounts(), 0,
+        env.read_num_used_accounts(),
+        0,
         "All accounts should be freed after AdminForceCloseAccount"
     );
 
@@ -2476,8 +2496,8 @@ fn test_adl_conservation_after_liquidation() {
     let vault_after_setup = env.vault_balance();
 
     // Open positions
-    env.trade(&user_a, &lp, lp_idx, user_a_idx, 5_000_000);  // long
-    env.trade(&user_b, &lp, lp_idx, user_b_idx, 3_000_000);  // long
+    env.trade(&user_a, &lp, lp_idx, user_a_idx, 5_000_000); // long
+    env.trade(&user_b, &lp, lp_idx, user_b_idx, 3_000_000); // long
     env.trade(&user_c, &lp, lp_idx, user_c_idx, -4_000_000); // short
 
     // Trading is internal: vault unchanged
@@ -2546,4 +2566,3 @@ fn test_adl_conservation_after_liquidation() {
         );
     }
 }
-

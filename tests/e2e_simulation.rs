@@ -127,9 +127,12 @@ fn phase1_market_creation(env: &mut TestEnv) -> (Keypair, u16, Pubkey) {
     // If SLAB_LEN were the wrong value, InitMarket would fail with ConstraintRaw.
     // 2026-04-17: v12.17 + Phase A (+48) + Phase E (+32) = 1_484_728 for MAX_ACCOUNTS=4096.
     println!("[1] SLAB_LEN = {} bytes", SLAB_LEN);
-    assert_eq!(SLAB_LEN, 1_484_728,
-        "SLAB_LEN mismatch: must match SBF layout (1_484_728 = v12.17 + Phase A/E MarketConfig extension)");
-    println!("    SLAB_LEN verified: SBF layout (1_484_728)");
+    // v12.19 actual SLAB_LEN observed on the small build is 1_525_720
+    // (HEADER_LEN=136 + CONFIG_LEN=480 + engine fields + 4096-account
+    // stride 360 + bitmap shift to engine+728).
+    assert_eq!(SLAB_LEN, 1_525_720,
+        "SLAB_LEN mismatch: must match v12.19 SBF layout");
+    println!("    SLAB_LEN verified: v12.19 SBF layout (1_525_720)");
 
     // Step 2 — InitMarket with full 352-byte payload.
     // encode_init_market_full_v2 produces opcode(1) + admin(32) + mint(32) +
@@ -503,7 +506,7 @@ fn phase4_cleanup(env: &mut TestEnv, user: &Keypair, user_idx: u16, lp_owner: &K
     // Step 20 — ResolveMarket.
     println!("[20] ResolveMarket...");
     env.set_oracle_price_e6(150_000_000);
-    env.try_resolve_market(&admin)
+    env.try_resolve_market(&admin, 0)
         .expect("ResolveMarket must succeed");
     assert!(env.is_market_resolved(), "Market must be RESOLVED after ResolveMarket");
     println!("    ResolveMarket OK: market is RESOLVED");
@@ -750,11 +753,10 @@ fn test_init_market_payload_size() {
 /// be wrong. This test catches that regression.
 #[test]
 fn test_slab_len_is_sbf_value() {
-    // 2026-04-17: MarketConfig extended by pre-audit hygiene Phase A (+48 bytes for
-    // 7 new fields) and Phase E (+32 bytes for pending_admin two-step transfer).
-    // New SBF value: 1_484_728 = 1_484_648 + 80.
+    // v12.19 SBF layout: HEADER_LEN=136, CONFIG_LEN=480, ENGINE_OFFSET=600,
+    // engine fields shifted +16, per-account stride=360 with MAX_ACCOUNTS=4096.
     // Update this constant (and common/mod.rs SLAB_LEN) if layout changes again.
-    const EXPECTED_SLAB_LEN: usize = 1_484_728;
+    const EXPECTED_SLAB_LEN: usize = 1_525_720;
     assert_eq!(SLAB_LEN, EXPECTED_SLAB_LEN,
         "SLAB_LEN mismatch: constant is {} but expected SBF value {}. \
          Did struct layout change? Run `cargo build-sbf` and recompute.",

@@ -118,7 +118,7 @@ fn chainlink_happy_path_btc_8_decimals() {
     let data = make_chainlink_account(8, 1_700_000_050, answer);
     let mut acct = TestAccount::new(key, owner, data);
 
-    let price = read_chainlink_price_e6(&acct.to_info(), &expected_feed, now, max_stale)
+    let (price, _publish_time) = read_chainlink_price_e6(&acct.to_info(), &expected_feed, now, max_stale)
         .expect("happy path should succeed");
 
     // answer * 10^(6-8) = 6_543_210_000_000 / 100 = 65_432_100_000
@@ -135,7 +135,7 @@ fn chainlink_6_decimals_no_scaling() {
     let data = make_chainlink_account(6, 1_000, 1_500_000);
     let mut acct = TestAccount::new(key, owner, data);
 
-    let price = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
+    let (price, _publish_time) = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
         .expect("6-decimal happy path should succeed");
 
     assert_eq!(price, 1_500_000, "scale=0 when decimals == 6");
@@ -152,7 +152,7 @@ fn chainlink_0_decimals_scales_up_by_1e6() {
     let data = make_chainlink_account(0, 1_000, 100);
     let mut acct = TestAccount::new(key, owner, data);
 
-    let price = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
+    let (price, _publish_time) = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
         .expect("0-decimal happy path should succeed");
 
     assert_eq!(price, 100_000_000, "100 * 10^6 = 100_000_000");
@@ -169,7 +169,7 @@ fn chainlink_18_decimals_scales_down() {
     let data = make_chainlink_account(18, 1_000, 1_000_000_000_000_000_000i128);
     let mut acct = TestAccount::new(key, owner, data);
 
-    let price = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
+    let (price, _publish_time) = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
         .expect("18-decimal happy path should succeed");
 
     assert_eq!(price, 1_000_000, "1e18 / 10^12 = 1_000_000 ($1.00)");
@@ -186,7 +186,7 @@ fn chainlink_staleness_at_boundary_succeeds() {
     let data = make_chainlink_account(8, 1_000, 100_000_000);
     let mut acct = TestAccount::new(key, owner, data);
 
-    let price = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_060, 60)
+    let (price, _publish_time) = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_060, 60)
         .expect("boundary staleness should succeed");
 
     assert_eq!(price, 1_000_000, "scale=-2 * 100_000_000 = 1_000_000");
@@ -231,7 +231,7 @@ fn chainlink_zero_feed_pubkey_matching_accepted() {
     let data = make_chainlink_account(8, 1_000, 100_000_000);
     let mut acct = TestAccount::new(acct_key, owner, data);
 
-    let price = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
+    let (price, _publish_time) = read_chainlink_price_e6(&acct.to_info(), &expected_feed, 1_050, 100)
         .expect("strict equality check does not special-case zero pubkey");
     assert_eq!(price, 1_000_000);
 }
@@ -544,7 +544,7 @@ fn chainlink_dispatched_via_engine_price_reader() {
 
     // read_engine_price_e6(ai, feed, now, max_stale, conf_bps, invert, unit_scale)
     // conf_bps is ignored by Chainlink path; invert=0, unit_scale=0 → raw pass-through.
-    let price = read_engine_price_e6(&acct.to_info(), &expected_feed, 1_050, 100, 0, 0, 0)
+    let (price, _publish_time) = read_engine_price_e6(&acct.to_info(), &expected_feed, 1_050, 100, 0, 0, 0)
         .expect("dispatch to Chainlink should succeed");
 
     assert_eq!(price, 100_000_000, "$100 e6");

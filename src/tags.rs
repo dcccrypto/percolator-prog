@@ -195,6 +195,11 @@ pub const TAG_SET_LP_COLLATERAL_PARAMS: u8 = 81;
 /// two-step UpdateAdmin). Signer MUST be the address in config.pending_admin.
 /// Data: tag(1) = 1 byte. No payload.
 pub const TAG_ACCEPT_ADMIN: u8 = 82;
+/// v12.18.x 4-way authority split — unified mutator for the
+/// admin / oracle / insurance / close authorities.
+/// Data: tag(1) + kind(1) + new_pubkey(32) = 34 bytes.
+/// kind: 0=ADMIN, 1=ORACLE, 2=INSURANCE, 3=CLOSE.
+pub const TAG_UPDATE_AUTHORITY: u8 = 83;
 
 #[cfg(test)]
 mod tests {
@@ -284,6 +289,7 @@ mod tests {
             TAG_SET_DISPUTE_PARAMS,
             TAG_SET_LP_COLLATERAL_PARAMS,
             TAG_ACCEPT_ADMIN,
+            TAG_UPDATE_AUTHORITY,
         ];
 
         for i in 0..tags.len() {
@@ -378,6 +384,7 @@ mod tests {
             TAG_SET_DISPUTE_PARAMS,
             TAG_SET_LP_COLLATERAL_PARAMS,
             TAG_ACCEPT_ADMIN,
+            TAG_UPDATE_AUTHORITY,
         ];
 
         // Verify monotonically increasing (allows gaps for removed instructions)
