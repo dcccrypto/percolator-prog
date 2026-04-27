@@ -7002,6 +7002,17 @@ pub mod processor {
             AUTHORITY_ADMIN => {
                 header.admin = new_bytes;
                 state::write_header(&mut data, &header);
+                // H-NEW-1: invalidate any stale pending transfer when admin
+                // is rotated atomically. Tag 12 → 82 is async; tag 83 commits
+                // immediately so any pending proposal becomes inapplicable.
+                // Without this clear, a previously-proposed admin (Eve) could
+                // call AcceptAdmin (tag 82) after the current admin rotates
+                // (or burns) via tag 83 and steal admin from the new admin
+                // (or unburn the market).
+                if config.pending_admin != [0u8; 32] {
+                    config.pending_admin = [0u8; 32];
+                    state::write_config(&mut data, &config);
+                }
             }
             AUTHORITY_HYPERP_MARK => {
                 config.hyperp_authority = new_bytes;

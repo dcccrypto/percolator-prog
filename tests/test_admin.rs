@@ -1720,3 +1720,106 @@ fn test_update_authority_admin_burn_requires_permissionless_paths() {
         .expect_err("admin burn on live market without perm-resolve must reject");
     let _ = err;
 }
+
+/// H-NEW-1 regression: tag 83 (UpdateAuthority{kind=ADMIN}) atomic transfer
+/// must clear `config.pending_admin` set by a prior tag 12 (UpdateAdmin)
+/// proposal. Without the clear, a previously-proposed admin (Eve) can call
+/// AcceptAdmin (tag 82) after Alice rotates admin to Bob via tag 83 and
+/// silently take admin from Bob.
+#[test]
+fn test_pending_admin_cleared_by_update_authority_admin() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let alice = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let eve = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&eve.pubkey(), 1_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+
+    // Step 1: Alice proposes Eve via tag 12 (sets pending_admin = Eve).
+    env.try_update_admin(&alice, &eve.pubkey())
+        .expect("Alice proposes Eve as next admin");
+
+    // Step 2: Alice + Bob co-sign tag 83 → header.admin = Bob.
+    // H-NEW-1: this MUST also clear config.pending_admin.
+    env.svm.expire_blockhash();
+    env.try_update_authority_with_new_signer(&alice, AUTHORITY_ADMIN, &bob)
+        .expect("Alice and Bob co-sign atomic admin rotation");
+
+    // Step 3: Eve attempts AcceptAdmin → MUST reject (pending was cleared).
+    env.svm.expire_blockhash();
+    let result = env.try_accept_admin(&eve);
+    assert!(
+        result.is_err(),
+        "H-NEW-1: Eve must NOT be able to take admin after tag 83 rotated to Bob \
+         (pending_admin should have been cleared)"
+    );
+
+    // Step 4: Bob has admin authority — proves the rotation completed.
+    // Use UpdateAdmin (tag 12) as the probe; it's admin-gated and accepted
+    // at decode in v12.19. (SetMaintenanceFee tag 15 is rejected at decode.)
+    env.svm.expire_blockhash();
+    env.try_update_admin(&bob, &bob.pubkey())
+        .expect("Bob (new admin) can exercise admin authority via UpdateAdmin");
+
+    // Step 5 (defensive): Alice no longer has admin authority.
+    env.svm.expire_blockhash();
+    let result = env.try_update_admin(&alice, &alice.pubkey());
+    assert!(
+        result.is_err(),
+        "Alice (former admin) must no longer have authority after rotation"
+    );
+}
+
+/// H-NEW-1 regression: tag 83 (UpdateAuthority{kind=ADMIN}) atomic burn must
+/// clear `config.pending_admin`. Without the clear, an operator who burns
+/// admin via tag 83 to permanently rug-proof the market can have a previously-
+/// proposed admin (Eve) UNBURN it via AcceptAdmin (tag 82).
+#[test]
+fn test_pending_admin_cleared_by_update_authority_burn() {
+    program_path();
+    let mut env = TestEnv::new();
+    // perm-resolve + force-close required for admin burn (R4-H1 liveness guard).
+    env.init_market_with_cap(0, 200);
+
+    let alice = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let eve = Keypair::new();
+    env.svm.airdrop(&eve.pubkey(), 1_000_000_000).unwrap();
+
+    // Step 1: Alice proposes Eve via tag 12 (sets pending_admin = Eve).
+    env.try_update_admin(&alice, &eve.pubkey())
+        .expect("Alice proposes Eve as next admin");
+
+    // Step 2: Alice burns admin via tag 83 with new=default().
+    // H-NEW-1: this MUST also clear config.pending_admin.
+    env.svm.expire_blockhash();
+    env.try_update_authority(&alice, AUTHORITY_ADMIN, None)
+        .expect("Alice burns admin (live-market guard satisfied)");
+
+    // Step 3: Eve attempts AcceptAdmin → MUST reject (pending was cleared).
+    env.svm.expire_blockhash();
+    let result = env.try_accept_admin(&eve);
+    assert!(
+        result.is_err(),
+        "H-NEW-1: Eve must NOT be able to UNBURN the market via AcceptAdmin \
+         after Alice burned admin via tag 83 (pending_admin should have been cleared)"
+    );
+
+    // Step 4: Verify market is still admin-burned — any admin op fails.
+    // Use UpdateAdmin (tag 12) as the probe; admin-gated and accepted at
+    // decode in v12.19. (SetMaintenanceFee tag 15 is rejected at decode.)
+    env.svm.expire_blockhash();
+    let result = env.try_update_admin(&alice, &alice.pubkey());
+    assert!(
+        result.is_err(),
+        "Market must remain permanently admin-burned (Alice has no authority)"
+    );
+    env.svm.expire_blockhash();
+    let result = env.try_update_admin(&eve, &eve.pubkey());
+    assert!(
+        result.is_err(),
+        "Eve also has no authority (her stale pending was correctly invalidated)"
+    );
+}
