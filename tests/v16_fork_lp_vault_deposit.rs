@@ -23,7 +23,7 @@
 use litesvm::LiteSVM;
 use percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT;
 use percolator_prog::ix::Instruction as ProgInstruction;
-use percolator_prog::processor::ASSET_ACTION_ACTIVATE;
+use percolator_prog::processor::{ASSET_ACTION_ACTIVATE, ASSET_AUTH_BACKING_BUCKET};
 use percolator_prog::state::{
     self, derive_lp_backing_ledger, derive_lp_vault_mint, derive_lp_vault_registry,
 };
@@ -710,4 +710,189 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
         &ata_program,
     )
     .0
+}
+
+/// Attempt to rotate an asset's backing-bucket authority. `registry` is the
+/// optional 4th account the guard consults; `None` omits it.
+fn try_rotate_backing_authority(
+    env: &mut Env,
+    asset_index: u16,
+    signer: &Keypair,
+    new_authority: &Keypair,
+    registry: Option<Pubkey>,
+) -> Result<(), String> {
+    let mut accounts = vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new_readonly(new_authority.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+    if let Some(registry) = registry {
+        accounts.push(AccountMeta::new_readonly(registry, false));
+    }
+    let mut signers: Vec<&Keypair> = vec![signer];
+    if new_authority.pubkey() != signer.pubkey() {
+        signers.push(new_authority);
+    }
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index,
+            kind: ASSET_AUTH_BACKING_BUCKET,
+            new_pubkey: new_authority.pubkey().to_bytes(),
+        },
+        accounts,
+        &signers,
+    )
+}
+
+fn backing_authority_of(env: &Env, asset_index: usize) -> [u8; 32] {
+    let market_acct = env.svm.get_account(&env.market).unwrap();
+    state::read_asset_oracle_profile(&market_acct.data, asset_index)
+        .unwrap()
+        .backing_bucket_authority
+}
+
+/// An LP vault's custody rests on `backing_bucket_authority == registry_pda`.
+/// `handle_update_asset_authority`'s `admin_signed` branch skips the current-holder
+/// check, and the registry PDA can never co-sign to defend itself, so without the
+/// guard the asset's `asset_admin` could rotate the authority to itself and
+/// withdraw every depositor's principal via WithdrawBackingBucket.
+///
+/// Omitting the registry account must NOT be a way around the guard.
+#[test]
+fn live_lp_vault_backing_authority_cannot_be_rotated_by_asset_admin() {
+    let mut env = setup();
+    let (registry, mint, ledger, depositor, lp_ata, source) = ready_vault(&mut env);
+    let admin = env.admin.insecure_clone();
+
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
+        &[&depositor],
+    )
+    .expect("deposit");
+    assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64);
+    assert_eq!(backing_authority_of(&env, APPEND_ASSET_INDEX as usize), registry.to_bytes());
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 100_000_000_000).unwrap();
+
+    // With the registry account supplied, the guard sees a live vault and refuses.
+    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &admin, &attacker, Some(registry))
+        .expect_err("rotation away from a live LP vault must be rejected");
+
+    // Omitting it must also fail — the guard rejects on absence rather than
+    // skipping, so it cannot be sidestepped by sending fewer accounts.
+    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &admin, &attacker, None)
+        .expect_err("omitting the registry account must not bypass the guard");
+
+    assert_eq!(
+        backing_authority_of(&env, APPEND_ASSET_INDEX as usize),
+        registry.to_bytes(),
+        "authority unchanged"
+    );
+    assert_eq!(
+        token_amount(&env.svm, env.vault_token),
+        DEPOSIT as u64,
+        "depositor principal untouched"
+    );
+}
+
+/// Same guard, exercised through the delegated role rather than the market
+/// authority: `asset_admin` is per-asset and can be handed to a third party, who
+/// would otherwise be able to seize the vault with no marketauth signature.
+#[test]
+fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
+    let mut env = setup();
+    let (registry, mint, ledger, depositor, lp_ata, source) = ready_vault(&mut env);
+    let admin = env.admin.insecure_clone();
+
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
+        &[&depositor],
+    )
+    .expect("deposit");
+
+    let manager = Keypair::new();
+    env.svm.airdrop(&manager.pubkey(), 100_000_000_000).unwrap();
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: APPEND_ASSET_INDEX,
+            kind: percolator_prog::processor::ASSET_AUTH_ADMIN,
+            new_pubkey: manager.pubkey().to_bytes(),
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(manager.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &manager],
+    )
+    .expect("delegate asset_admin");
+
+    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &manager, &manager, Some(registry))
+        .expect_err("delegated asset_admin must not seize a live vault's backing authority");
+
+    assert_eq!(backing_authority_of(&env, APPEND_ASSET_INDEX as usize), registry.to_bytes());
+    assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64);
+}
+
+/// The guard must key on a LIVE vault, not on the address alone. A lifecycle
+/// activation can plant the registry PDA verbatim with no co-signature, and
+/// CloseLpVault zeroes the registry while leaving the mint on-chain (so
+/// CreateLpVault can never re-run). If the guard welded the value permanently,
+/// the bucket could never be re-pointed at a signable key — stranding the
+/// dead-share floor's backing residue and, with it, CloseSlab, which requires
+/// `header.vault == 0`. With no initialised registry, rotation must be allowed.
+#[test]
+fn backing_authority_rotation_is_allowed_when_no_lp_vault_registry_exists() {
+    let mut env = setup();
+    let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
+    let admin = env.admin.insecure_clone();
+
+    // Activate the asset with the registry PDA as its backing authority, but
+    // never create the vault — the registry account stays uninitialised.
+    activate(&mut env, registry).expect("append asset 1 with registry authority");
+    assert_eq!(backing_authority_of(&env, APPEND_ASSET_INDEX as usize), registry.to_bytes());
+
+    let rescue = Keypair::new();
+    env.svm.airdrop(&rescue.pubkey(), 100_000_000_000).unwrap();
+    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &admin, &rescue, Some(registry))
+        .expect("rotation must remain possible when no LP vault is bound");
+
+    assert_eq!(
+        backing_authority_of(&env, APPEND_ASSET_INDEX as usize),
+        rescue.pubkey().to_bytes(),
+        "authority re-pointed at a signable key"
+    );
 }

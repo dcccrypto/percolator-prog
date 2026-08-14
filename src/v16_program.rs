@@ -12381,6 +12381,40 @@ pub mod processor {
         if !admin_signed {
             expect_live_authority(&current_value, current.key)?;
         }
+        // An LP vault's custody rests entirely on `backing_bucket_authority ==
+        // registry_pda` (handle_create_lp_vault's FIND-1 binding). Rotating that
+        // away hands every depositor's principal to an arbitrary key via
+        // WithdrawBackingBucket, and the registry PDA can never co-sign to defend
+        // itself — no path CPIs back into this program to sign as it — so the
+        // `admin_signed` branch above would otherwise skip consent entirely.
+        //
+        // The registry account is consulted ONLY on this branch, and its ABSENCE
+        // rejects: omitting it cannot be used to skip the guard, and `expect_key`
+        // pins the address so no substitute is accepted. Scoped to the vault's own
+        // asset so an unrelated slot that merely happens to carry this value (a
+        // lifecycle activation can plant it verbatim, with no co-signature) is not
+        // welded shut.
+        //
+        // Rotation becomes possible again once CloseLpVault zeroes the registry,
+        // which is the wind-down path and must stay open: that handler leaves the
+        // LP mint on-chain, so CreateLpVault can never re-run for this market, and
+        // the dead-share floor's backing residue stays in the bucket. Reclaiming
+        // that residue — and reaching CloseSlab, which requires header.vault == 0 —
+        // needs this authority re-pointed at a signable key.
+        if kind == ASSET_AUTH_BACKING_BUCKET {
+            let (registry_pda, _) = state::derive_lp_vault_registry(program_id, market_ai.key);
+            if current_value == registry_pda.to_bytes() {
+                let registry_ai = account(accounts, 3)?;
+                expect_key(registry_ai, &registry_pda)?;
+                let registry_data = registry_ai.try_borrow_data()?;
+                if state::is_initialized(&registry_data) {
+                    let registry = state::read_lp_vault_registry(&registry_data)?;
+                    if registry.domain as usize / 2 == asset_index {
+                        return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+                    }
+                }
+            }
+        }
         match kind {
             ASSET_AUTH_ADMIN => profile.asset_admin = new_pubkey,
             ASSET_AUTH_INSURANCE => profile.insurance_authority = new_pubkey,
