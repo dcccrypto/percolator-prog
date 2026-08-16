@@ -65,7 +65,7 @@ const ALLOWED_RIGHT_HAND_SIDES: [&str; 8] = [
 /// The third element is a source fragment that must be present in the shipped program
 /// for the guard to actually exist. Without it this table is an unchecked claim: the
 /// binding would be certified "guarded" purely because it is listed here, which is how
-/// a canary starts lying. See `guarded_pda_bindings_are_still_present`.
+/// a canary starts lying. See `guarded_pda_bindings_name_a_guard_that_exists`.
 const GUARDED_PDA_BINDINGS: [(&str, &str, &str); 1] = [(
     "backing_bucket_authority = registry_pda.to_bytes()",
     "#415: handle_update_asset_authority rejects rotating ASSET_AUTH_BACKING_BUCKET away \
@@ -96,6 +96,14 @@ const _DOCUMENTED_SCANNER_GAPS: () = ();
 /// punctuation is dropped, and a `<recv>.<field>` carry-forward is collapsed to
 /// `<recv>.<field>`, since the source field always matches the assignment target.
 fn normalise_rhs(rhs: &str, field: &str) -> String {
+    // Cut at the statement terminator first, so anything sharing the line — a
+    // closing brace, a second statement — does not leak into the value. Without
+    // this, `if c { profile.f = v.to_bytes(); }` yields `v.to_bytes(); }` and no
+    // allowlist entry can ever match it.
+    let rhs = match rhs.find(';') {
+        Some(end) => &rhs[..end],
+        None => rhs,
+    };
     // Only statement punctuation — never `)`, which would corrupt `to_bytes()`.
     let rhs = rhs.trim().trim_end_matches([',', ';']).trim();
     match rhs.strip_suffix(field) {
@@ -181,31 +189,41 @@ fn authority_assignments(src: &str) -> Vec<(&'static str, String, usize)> {
             // continuation assert below was unreachable: the scanner skipped the line
             // silently. That is exactly the shape a long PDA derivation takes, i.e. the
             // shape this canary exists to catch.
+            //
+            // EVERY occurrence on the line is examined, not just the first. Rejecting a
+            // non-write by `continue`ing the whole field would let a comparison hide a
+            // real write that shares the line, e.g.
+            //     if a.oracle_authority == b { profile.oracle_authority = pda; }
+            // where the first hit is the `==` and the assignment after it is the thing
+            // this canary exists to catch.
             let needle = format!("{field} =");
-            let Some(at) = code.find(&needle) else {
-                continue;
-            };
-            // Reject a longer identifier that merely ends in the same suffix.
-            if matches!(code[..at].chars().next_back(), Some(c) if c.is_alphanumeric() || c == '_')
-            {
-                continue;
+            let mut search_from = 0usize;
+            while let Some(rel) = code[search_from..].find(&needle) {
+                let at = search_from + rel;
+                search_from = at + needle.len();
+
+                // Reject a longer identifier that merely ends in the same suffix.
+                if matches!(code[..at].chars().next_back(), Some(c) if c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let after = &code[at + needle.len()..];
+                // `==` is a comparison, not a write. `=>` is a match arm.
+                if after.starts_with('=') || after.starts_with('>') {
+                    continue;
+                }
+                let rhs = normalise_rhs(after, field);
+                // A continuation line carries its value on the next line; the scanner is
+                // line-based, so surface it rather than silently treating it as unknown.
+                assert!(
+                    !rhs.is_empty(),
+                    "src/v16_program.rs:{}: `{field} =` continues on the next line; the \
+                     line-based scanner cannot read it. Fold the assignment onto one line or \
+                     teach the scanner to join continuations.",
+                    idx + 1
+                );
+                found.push((field, rhs, idx + 1));
             }
-            let after = &code[at + needle.len()..];
-            // `==` is a comparison, not a write. `=>` is a match arm.
-            if after.starts_with('=') || after.starts_with('>') {
-                continue;
-            }
-            let rhs = normalise_rhs(after, field);
-            // A continuation line carries its value on the next line; the scanner is
-            // line-based, so surface it rather than silently treating it as unknown.
-            assert!(
-                !rhs.is_empty(),
-                "src/v16_program.rs:{}: `{field} =` continues on the next line; the \
-                 line-based scanner cannot read it. Fold the assignment onto one line or \
-                 teach the scanner to join continuations.",
-                idx + 1
-            );
-            found.push((field, rhs, idx + 1));
         }
     }
     found
@@ -270,6 +288,33 @@ fn f() {
         "expected only the match-arm write, got: {found:?}"
     );
     assert_eq!(found[0].0, "asset_admin");
+
+    // A comparison must not HIDE a write that shares the line. Rejecting a
+    // non-write by skipping the whole field would make the assignment after the
+    // `==` invisible — the exact shape this canary exists to catch.
+    let same_line = "\
+fn f() {
+    if a.oracle_authority == b { profile.oracle_authority = some_pda.to_bytes(); }
+}
+";
+    let found = authority_assignments(same_line);
+    assert_eq!(
+        found.len(),
+        1,
+        "a write sharing a line with a comparison must still be seen: {found:?}"
+    );
+    assert_eq!(found[0].0, "oracle_authority");
+    assert_eq!(found[0].1, "some_pda.to_bytes()");
+
+    // Two writes to the same field on one line are both reported.
+    let two_writes = "\
+fn f() { profile.oracle_authority = a_pda.to_bytes(); other.oracle_authority = b_pda.to_bytes(); }
+";
+    assert_eq!(
+        authority_assignments(two_writes).len(),
+        2,
+        "both same-line writes must be reported"
+    );
 }
 
 #[test]
