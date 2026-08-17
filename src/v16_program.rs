@@ -14542,43 +14542,42 @@ pub mod processor {
             state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
         }
 
-        let rent = Rent::get()?;
         let market_bytes = market_ai.key.to_bytes();
 
         // Create the program-owned registry PDA account.
         let registry_len = state::lp_vault_registry_account_len();
-        invoke_signed(
-            &system_instruction::create_account(
-                admin.key,
-                registry_ai.key,
-                rent.minimum_balance(registry_len),
-                registry_len as u64,
-                program_id,
-            ),
-            &[admin.clone(), registry_ai.clone(), system_program_ai.clone()],
-            &[&[
-                crate::constants::LP_VAULT_REGISTRY_SEED,
-                market_bytes.as_ref(),
-                &[registry_bump],
-            ]],
+        let registry_bump_bytes = [registry_bump];
+        let registry_seeds: &[&[u8]] = &[
+            crate::constants::LP_VAULT_REGISTRY_SEED,
+            market_bytes.as_ref(),
+            registry_bump_bytes.as_ref(),
+        ];
+
+        create_pda_account(
+            admin,
+            registry_ai,
+            system_program_ai,
+            registry_len,
+            program_id,
+            registry_seeds,
         )?;
 
         // Create the spl_token-owned LP share mint PDA account.
         let mint_len = spl_token::state::Mint::LEN;
-        invoke_signed(
-            &system_instruction::create_account(
-                admin.key,
-                mint_ai.key,
-                rent.minimum_balance(mint_len),
-                mint_len as u64,
-                token_program.key,
-            ),
-            &[admin.clone(), mint_ai.clone(), system_program_ai.clone()],
-            &[&[
-                crate::constants::LP_VAULT_MINT_SEED,
-                market_bytes.as_ref(),
-                &[mint_bump],
-            ]],
+        let mint_bump_bytes = [mint_bump];
+        let mint_seeds: &[&[u8]] = &[
+            crate::constants::LP_VAULT_MINT_SEED,
+            market_bytes.as_ref(),
+            mint_bump_bytes.as_ref(),
+        ];
+
+        create_pda_account(
+            admin,
+            mint_ai,
+            system_program_ai,
+            mint_len,
+            token_program.key,
+            mint_seeds,
         )?;
 
         // Initialize the LP share mint: authority = registry PDA, no freeze.
@@ -14735,23 +14734,23 @@ pub mod processor {
         };
         expect_writable(target_ledger_ai)?;
         if target_ledger_ai.data_is_empty() {
-            let rent = Rent::get()?;
             let len = state::backing_domain_ledger_account_len();
-            invoke_signed(
-                &system_instruction::create_account(
-                    depositor.key,
-                    target_ledger_ai.key,
-                    rent.minimum_balance(len),
-                    len as u64,
-                    program_id,
-                ),
-                &[depositor.clone(), target_ledger_ai.clone(), system_program_ai.clone()],
-                &[&[
-                    crate::constants::LP_BACKING_LEDGER_SEED,
-                    market_ai.key.as_ref(),
-                    &target_domain.to_le_bytes(),
-                    &[target_ledger_bump],
-                ]],
+            let target_domain_bytes = target_domain.to_le_bytes();
+            let target_ledger_bump_bytes = [target_ledger_bump];
+            let target_ledger_seeds: &[&[u8]] = &[
+                crate::constants::LP_BACKING_LEDGER_SEED,
+                market_ai.key.as_ref(),
+                target_domain_bytes.as_ref(),
+                target_ledger_bump_bytes.as_ref(),
+            ];
+
+            create_pda_account(
+                depositor,
+                target_ledger_ai,
+                system_program_ai,
+                len,
+                program_id,
+                target_ledger_seeds,
             )?;
         }
 
@@ -14943,23 +14942,23 @@ pub mod processor {
         let (escrow_pda, escrow_bump) = state::derive_lp_escrow(program_id, &market_key);
         expect_key(escrow_ai, &escrow_pda)?;
         if escrow_ai.data_is_empty() {
-            let rent = Rent::get()?;
             let len = spl_token::state::Account::LEN;
-            invoke_signed(
-                &system_instruction::create_account(
-                    redeemer.key,
-                    escrow_ai.key,
-                    rent.minimum_balance(len),
-                    len as u64,
-                    token_program.key,
-                ),
-                &[redeemer.clone(), escrow_ai.clone(), system_program_ai.clone()],
-                &[&[
-                    crate::constants::LP_ESCROW_SEED,
-                    market_key.as_ref(),
-                    &[escrow_bump],
-                ]],
+            let escrow_bump_bytes = [escrow_bump];
+            let escrow_seeds: &[&[u8]] = &[
+                crate::constants::LP_ESCROW_SEED,
+                market_key.as_ref(),
+                escrow_bump_bytes.as_ref(),
+            ];
+
+            create_pda_account(
+                redeemer,
+                escrow_ai,
+                system_program_ai,
+                len,
+                token_program.key,
+                escrow_seeds,
             )?;
+
             let init_ix = spl_token::instruction::initialize_account3(
                 token_program.key,
                 escrow_ai.key,
@@ -14978,23 +14977,22 @@ pub mod processor {
             return Err(PercolatorError::AlreadyInitialized.into());
         }
         {
-            let rent = Rent::get()?;
             let rlen = state::lp_redemption_account_len();
-            invoke_signed(
-                &system_instruction::create_account(
-                    redeemer.key,
-                    redemption_ai.key,
-                    rent.minimum_balance(rlen),
-                    rlen as u64,
-                    program_id,
-                ),
-                &[redeemer.clone(), redemption_ai.clone(), system_program_ai.clone()],
-                &[&[
-                    crate::constants::LP_REDEMPTION_SEED,
-                    registry_pda.as_ref(),
-                    redeemer.key.as_ref(),
-                    &[redemption_bump],
-                ]],
+            let redemption_bump_bytes = [redemption_bump];
+            let redemption_seeds: &[&[u8]] = &[
+                crate::constants::LP_REDEMPTION_SEED,
+                registry_pda.as_ref(),
+                redeemer.key.as_ref(),
+                redemption_bump_bytes.as_ref(),
+            ];
+
+            create_pda_account(
+                redeemer,
+                redemption_ai,
+                system_program_ai,
+                rlen,
+                program_id,
+                redemption_seeds,
             )?;
         }
 
@@ -15129,23 +15127,23 @@ pub mod processor {
         // Destination ledger is lazily created on first arrival, exactly as
         // handle_deposit_to_lp_vault does for its own domain.
         if to_ledger_ai.data_is_empty() {
-            let rent = Rent::get()?;
             let len = state::backing_domain_ledger_account_len();
-            invoke_signed(
-                &system_instruction::create_account(
-                    cranker.key,
-                    to_ledger_ai.key,
-                    rent.minimum_balance(len),
-                    len as u64,
-                    program_id,
-                ),
-                &[cranker.clone(), to_ledger_ai.clone(), system_program_ai.clone()],
-                &[&[
-                    crate::constants::LP_BACKING_LEDGER_SEED,
-                    market_ai.key.as_ref(),
-                    &to_domain.to_le_bytes(),
-                    &[to_ledger_bump],
-                ]],
+            let to_domain_bytes = to_domain.to_le_bytes();
+            let to_ledger_bump_bytes = [to_ledger_bump];
+            let to_ledger_seeds: &[&[u8]] = &[
+                crate::constants::LP_BACKING_LEDGER_SEED,
+                market_ai.key.as_ref(),
+                to_domain_bytes.as_ref(),
+                to_ledger_bump_bytes.as_ref(),
+            ];
+
+            create_pda_account(
+                cranker,
+                to_ledger_ai,
+                system_program_ai,
+                len,
+                program_id,
+                to_ledger_seeds,
             )?;
         }
 
@@ -16138,23 +16136,23 @@ pub mod processor {
         };
         expect_writable(ledger_ai)?;
         if ledger_ai.data_is_empty() {
-            let rent = Rent::get()?;
             let len = state::backing_domain_ledger_account_len();
-            invoke_signed(
-                &system_instruction::create_account(
-                    cranker.key,
-                    ledger_ai.key,
-                    rent.minimum_balance(len),
-                    len as u64,
-                    program_id,
-                ),
-                &[cranker.clone(), ledger_ai.clone(), system_program_ai.clone()],
-                &[&[
-                    crate::constants::LP_BACKING_LEDGER_SEED,
-                    market_ai.key.as_ref(),
-                    &target_domain.to_le_bytes(),
-                    &[ledger_bump],
-                ]],
+            let target_domain_bytes = target_domain.to_le_bytes();
+            let ledger_bump_bytes = [ledger_bump];
+            let ledger_seeds: &[&[u8]] = &[
+                crate::constants::LP_BACKING_LEDGER_SEED,
+                market_ai.key.as_ref(),
+                target_domain_bytes.as_ref(),
+                ledger_bump_bytes.as_ref(),
+            ];
+
+            create_pda_account(
+                cranker,
+                ledger_ai,
+                system_program_ai,
+                len,
+                program_id,
+                ledger_seeds,
             )?;
         }
         expect_owner(ledger_ai, program_id)?;
@@ -16633,22 +16631,21 @@ pub mod processor {
         if registry_ai.owner == &system_program::ID && registry_ai.data_is_empty() {
             // CREATE path.
             let registry_len = state::nft_registry_account_len();
-            let rent = Rent::get()?;
             let market_bytes = market_ai.key.to_bytes();
-            invoke_signed(
-                &system_instruction::create_account(
-                    admin.key,
-                    registry_ai.key,
-                    rent.minimum_balance(registry_len),
-                    registry_len as u64,
-                    program_id,
-                ),
-                &[admin.clone(), registry_ai.clone(), system_program_ai.clone()],
-                &[&[
-                    crate::constants::NFT_REGISTRY_SEED,
-                    market_bytes.as_ref(),
-                    &[bump],
-                ]],
+            let bump_bytes = [bump];
+            let registry_seeds: &[&[u8]] = &[
+                crate::constants::NFT_REGISTRY_SEED,
+                market_bytes.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+
+            create_pda_account(
+                admin,
+                registry_ai,
+                system_program_ai,
+                registry_len,
+                program_id,
+                registry_seeds,
             )?;
             let new_reg = state::NftRegistryV16 {
                 market_group: market_ai.key.to_bytes(),
@@ -16982,6 +16979,60 @@ pub mod processor {
         idx: usize,
     ) -> Result<&'a AccountInfo<'a>, ProgramError> {
         accounts.get(idx).ok_or(ProgramError::NotEnoughAccountKeys)
+    }
+
+
+    fn create_pda_account<'a>(
+        payer: &AccountInfo<'a>,
+        target: &AccountInfo<'a>,
+        system_program_ai: &AccountInfo<'a>,
+        len: usize,
+        owner: &Pubkey,
+        signer_seeds: &[&[u8]],
+    ) -> ProgramResult {
+        let rent_lamports = Rent::get()?.minimum_balance(len);
+        let have = target.lamports();
+
+        if have == 0 {
+            invoke_signed(
+                &system_instruction::create_account(
+                    payer.key,
+                    target.key,
+                    rent_lamports,
+                    len as u64,
+                    owner,
+                ),
+                &[payer.clone(), target.clone(), system_program_ai.clone()],
+                &[signer_seeds],
+            )
+        } else {
+            if target.owner != &system_program::ID || !target.data_is_empty() {
+                return Err(PercolatorError::AlreadyInitialized.into());
+            }
+
+            if have < rent_lamports {
+                invoke(
+                    &system_instruction::transfer(
+                        payer.key,
+                        target.key,
+                        rent_lamports - have,
+                    ),
+                    &[payer.clone(), target.clone(), system_program_ai.clone()],
+                )?;
+            }
+
+            invoke_signed(
+                &system_instruction::allocate(target.key, len as u64),
+                &[target.clone(), system_program_ai.clone()],
+                &[signer_seeds],
+            )?;
+
+            invoke_signed(
+                &system_instruction::assign(target.key, owner),
+                &[target.clone(), system_program_ai.clone()],
+                &[signer_seeds],
+            )
+        }
     }
 
     fn expect_signer(ai: &AccountInfo) -> Result<(), ProgramError> {

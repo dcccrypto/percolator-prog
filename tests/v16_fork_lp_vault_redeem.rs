@@ -2172,3 +2172,73 @@ fn crank_fees_creates_the_ledger_of_a_pot_that_has_none() {
         "cranked fees landed in the newly created ledger"
     );
 }
+
+#[test]
+fn request_redeem_succeeds_with_prefunded_escrow_and_redemption() {
+    let mut env = setup_vault(0);
+    let depositor = new_depositor(&mut env, DEPOSIT);
+
+    // Simulate the #418 griefing condition:
+    // both lazily-created PDAs already hold lamports but still have empty data
+    // and are System-owned.
+    env.svm
+        .set_account(
+            env.escrow,
+            Account {
+                lamports: 1,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    env.svm
+        .set_account(
+            depositor.redemption,
+            Account {
+                lamports: 1,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let accounts = request_accounts(&env, &depositor);
+
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::RequestRedeemLpShares { shares: MINTED },
+            accounts,
+        )],
+        &[&depositor.kp],
+    )
+    .expect("RequestRedeemLpShares must tolerate pre-funded escrow and redemption PDAs");
+
+    let escrow_acct = env.svm.get_account(&env.escrow).expect("escrow exists");
+    assert_eq!(escrow_acct.owner, spl_token::ID, "escrow must become token-owned");
+    let escrow = TokenAccount::unpack(&escrow_acct.data).expect("escrow token account decodes");
+    assert_eq!(escrow.owner, env.registry, "escrow owner must be registry PDA");
+    assert_eq!(escrow.amount, MINTED as u64, "escrow must hold requested LP shares");
+
+    let redemption_acct = env
+        .svm
+        .get_account(&depositor.redemption)
+        .expect("redemption PDA exists");
+    assert_eq!(
+        redemption_acct.owner, env.program_id,
+        "redemption PDA must become program-owned"
+    );
+    assert!(
+        !redemption_acct.data.is_empty(),
+        "redemption PDA must be initialized"
+    );
+}
