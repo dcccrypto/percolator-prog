@@ -299,3 +299,87 @@ fn create_lp_vault_rejects_fee_share_above_cap() {
     let res = send(&mut env.svm, env.program_id, &env.payer, create_lp_vault_ix(10_001), accounts, &[&admin]);
     assert!(res.is_err(), "fee_share_bps > 10_000 must be rejected: {res:?}");
 }
+
+/// Regression for #418: an unprivileged wallet can pre-fund a deterministic
+/// LP-vault PDA before initialization. The wrapper must still be able to
+/// initialize a System-owned, zero-data PDA that already holds lamports.
+#[test]
+fn create_lp_vault_succeeds_with_prefunded_registry_and_mint() {
+    let mut env = setup();
+
+    let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
+    let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
+
+    // Simulate an unrelated wallet pre-funding both deterministic PDAs.
+    // Neither destination signs the transfer.
+    for target in [registry, mint] {
+        let ix = solana_sdk::system_instruction::transfer(
+            &env.payer.pubkey(),
+            &target,
+            1,
+        );
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&env.payer.pubkey()),
+            &[&env.payer],
+            env.svm.latest_blockhash(),
+        );
+
+        env.svm
+            .send_transaction(tx)
+            .expect("pre-fund PDA with one lamport");
+
+        let account = env
+            .svm
+            .get_account(&target)
+            .expect("pre-funded PDA must exist");
+
+        assert_eq!(
+            account.owner,
+            solana_sdk::system_program::ID,
+            "pre-funded PDA must remain System-owned"
+        );
+        assert!(
+            account.data.is_empty(),
+            "pre-funded PDA must still have zero data"
+        );
+        assert_eq!(
+            account.lamports, 1,
+            "pre-funded PDA must hold exactly one lamport"
+        );
+    }
+
+    let admin = env.admin.insecure_clone();
+
+    let result = send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        create_lp_vault_ix(5_000),
+        create_lp_vault_accounts(
+            env.market,
+            registry,
+            mint,
+            admin.pubkey(),
+        ),
+        &[&admin],
+    );
+
+    assert!(
+        result.is_ok(),
+        "CreateLpVault must tolerate pre-funded System-owned zero-data PDAs: {result:?}"
+    );
+
+    // Creation must still produce the canonical account ownership.
+    let registry_account = env
+        .svm
+        .get_account(&registry)
+        .expect("registry must exist after creation");
+    assert_eq!(registry_account.owner, env.program_id);
+
+    let mint_account = env
+        .svm
+        .get_account(&mint)
+        .expect("LP mint must exist after creation");
+    assert_eq!(mint_account.owner, spl_token::ID);
+}
