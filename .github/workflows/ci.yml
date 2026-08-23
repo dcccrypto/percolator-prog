@@ -29,16 +29,24 @@ jobs:
       - name: checkout engine (path dependency)
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator, path: percolator, token: '${{ secrets.GITHUB_TOKEN }}' }
-      - name: checkout matcher
+      # Sibling PROGRAMS are pinned to their DEPLOYED commits, not main. They are
+      # separate on-chain programs that keep running their deployed build after we
+      # upgrade the wrapper, so the wrapper must be tested against those bytes. Using
+      # main here tests a program mix that will not exist on chain — and measurably
+      # produces false failures: matcher main restored an lp_pda signer check
+      # (33e1185, BUG-001) that deployed 585f492 does not have, which alone caused 11
+      # spurious v16_cu failures.
+      #
+      # The ENGINE is deliberately NOT pinned: it compiles into the wrapper, so main
+      # is exactly what we are shipping and what these tests must cover.
+      - name: checkout matcher (pinned to the deployed commit)
         uses: actions/checkout@v4
-        with: { repository: dcccrypto/percolator-match, path: percolator-match, token: '${{ secrets.GITHUB_TOKEN }}' }
-      - name: checkout nft
+        with: { repository: dcccrypto/percolator-match, path: percolator-match, ref: '585f492', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: checkout nft (pinned to the deployed commit)
         uses: actions/checkout@v4
-        with: { repository: dcccrypto/percolator-nft, path: percolator-nft, token: '${{ secrets.GITHUB_TOKEN }}' }
-      # Pinned to the DEPLOYED stake commit, not main: main carries the 408-byte
-      # StakePool layout that is deliberately NOT deployed (25 live pools are 392
-      # bytes). Testing against main here would test a configuration that does not
-      # and must not exist on chain.
+        with: { repository: dcccrypto/percolator-nft, path: percolator-nft, ref: 'f18da24', token: '${{ secrets.GITHUB_TOKEN }}' }
+      # Stake likewise, and for an extra reason: main carries the 408-byte StakePool
+      # layout that is deliberately NOT deployed (25 live pools are 392 bytes).
       - name: checkout stake (pinned to the deployed commit)
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '474079f', token: '${{ secrets.GITHUB_TOKEN }}' }

@@ -2,30 +2,34 @@
 # failing set matches this file EXACTLY -- a new failure is a regression, and an entry
 # that starts passing must be deleted here, so the list cannot silently rot.
 #
-# Counts as of 2026-08-23 (546 passed / 55 failed, all four sibling BPFs built):
+# 2026-08-23: 567 passed / 34 failed, all sibling programs pinned to their DEPLOYED
+# commits. Pinning matters enormously -- the journey was:
 #
-#   40  sol_invoke_signed() not available
-#       tests/v16_wrapper.rs uses a native in-process run_ix/TestAccount harness with
-#       no BPF loader, so invoke_signed is a stubbed no-op. Structural: these paths
-#       need LiteSVM or a real validator. Documented in the file itself around :18173.
+#     no sibling BPFs at all ............ 515 passed /  86 failed
+#     all siblings at main .............. 546 /  55
+#     + matcher pinned to 585f492 ....... 560 /  41
+#     + nft pinned to f18da24 ........... 567 /  34
 #
-#   14  MissingRequiredSignature during matcher-context init
-#       The mounted matcher program id does not match what the harness signs for.
-#       NOT yet diagnosed -- suspected fixture/program-id mismatch rather than a
-#       product defect. Tracked, not excused.
+# 11 of those "failures" were matcher version drift alone: main's 33e1185 restored an
+# lp_pda.is_signer check (BUG-001) that the deployed 585f492 does not have.
 #
-#    ~  Custom(60)/Custom(23)/Custom(24) error-code mismatches in v16_fee_split
-#       Expected operative code differs from observed. Ruled OUT: stake version skew
-#       (re-tested against the deployed 474079f, identical result). Undiagnosed.
+# Remaining 34, by cause:
 #
-# Reducing this list is tracked work. It is not a licence to ignore failures.
+#   19  sol_invoke_signed() not available            [STRUCTURAL - cannot be fixed here]
+#       tests/v16_wrapper.rs uses a native in-process run_ix/TestAccount harness with no
+#       BPF loader, so invoke_signed is a stubbed no-op. These paths need LiteSVM or a
+#       real validator. The file documents this itself around :18173.
+#
+#    9  v16_fee_split error-code mismatches          [UNDIAGNOSED - tracked]
+#       Expected operative code differs from observed (e.g. Custom(60) vs Custom(55)).
+#       Ruled OUT: stake version skew (retested against deployed 474079f, identical).
+#
+#    4  v16_five_program_crosscut                    [UNDIAGNOSED - tracked]
+#    2  v16_nft_e2e                                  [UNDIAGNOSED - tracked]
+#
+# Reducing this list is tracked work, not a licence to ignore failures.
 e2e::e2e_cross_portfolio_substitution_rejects
 e2e::e2e_direct_hook_invocation_rejects
-e2e::e2e_gate_liquidation_lock_rejects
-e2e::e2e_gate_mid_close_rejects
-e2e::e2e_gate_resolved_payout_rejects
-e2e::e2e_gate_stale_state_rejects
-e2e::e2e_happy_path_transfer_hook_owner_assertion
 tag87_blocks_the_creator_forged_stake_pool_exploit
 tag87_end_to_end_from_a_real_trade_fee_with_no_seeding
 tag87_moves_real_tokens_into_the_stake_vault_and_conserves_value
@@ -35,17 +39,6 @@ tag87_pool_content_failures_have_distinct_codes
 tag87_rejects_a_market_with_no_bound_stake_pool
 tag87_succeeds_with_asset_admin_live_proving_the_burn_gate_is_gone
 tag87_with_nothing_accrued_returns_custom_53
-v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_matured
-v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_matured
-v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product
-v16_bpf_trade_paths_respect_source_credit_watermark_permutations
-v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded
-v16_bpf_tradecpi_external_matcher_executes_on_added_asset
-v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle
-v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt
-v16_fix_w1_matcher_tail_rejects_signer_account
-v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher
-v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher
 v16_wrapper_close_portfolio_rejects_non_empty_and_closes_empty
 v16_wrapper_close_slab_requires_admin_resolved_empty_market
 v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_secondary_mint
@@ -65,12 +58,7 @@ v16_wrapper_underfunded_flat_sync_sweeps_remaining_capital_once
 v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_claims
 v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authority
 v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
-x0_matcher_tradecpi_real_fill_at_mainnet
-x0_nft_transfer_hook_b3_ownership_at_mainnet
 x0_stake_flush_to_insurance_at_mainnet
 x2_flush_race_liquidation_crank_order_independent
 x2_flush_race_resolved_market_reverts_mode_not_live
-x5_nft_locked_portfolio_transfer_rejected
 x5_terminal_reclaim_liveness_via_rotate_no_lockout
-x6_ledger_collateral_conservation_across_lifecycle
-x8_matcher_delegate_scoped_per_maker_rejects_mismatch
