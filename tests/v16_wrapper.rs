@@ -20567,3 +20567,112 @@ fn v17_wrapper_lp_survives_zero_net_price_churn_end_to_end() {
         equity_after - equity_before
     );
 }
+
+/// Issue #428 — `UpdateMaintenanceFeePerSlot` (tag 88) has no MarketMode gate.
+///
+/// Its sibling `handle_update_backing_fee_policy` rejects with `EngineLockActive`
+/// when `mode != Live`. This handler checks only `expect_live_authority(&cfg.marketauth)`,
+/// so the rate can be changed after the market has left Live — and a permissionless
+/// crank then charges it.
+#[test]
+fn v16_wrapper_update_maintenance_fee_per_slot_is_live_only() {
+    let mut admin = signer().writable();
+    let mut market = market_account();
+    let _mint = init_market(&mut admin, &mut market);
+
+    // Live: the rate change is legitimate.
+    run_ix(
+        Instruction::UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: 7,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .expect("rate change must be allowed while Live");
+
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    let resolved = market.data.clone();
+
+    // Not Live: the rate change must be refused, and the market left untouched.
+    let after_resolve = run_ix(
+        Instruction::UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: 999_999,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(after_resolve, &market, &resolved);
+}
+
+/// Issues #416 / #417 — `asset_admin` bypasses current-holder consent on the
+/// insurance authority fields.
+///
+/// `handle_update_asset_authority` skips `expect_live_authority(&current_value, ..)`
+/// whenever `admin_signed`, and #424's custody guard is scoped to
+/// `ASSET_AUTH_BACKING_BUCKET` only. So an `asset_admin` can take
+/// `insurance_authority` (#417) or `insurance_operator` (#416) away from their
+/// current holder without that holder ever signing.
+#[test]
+fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
+    let mut admin = signer().writable();
+    let mut market = market_account();
+    let mut holder = signer();
+    let mut attacker = signer();
+    let _mint = init_market(&mut admin, &mut market);
+
+    // Legitimately hand insurance_authority to `holder` (holder co-signs).
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE,
+            new_pubkey: holder.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut holder, &mut market],
+    )
+    .expect("holder-consented rotation must succeed");
+
+    let held = market.data.clone();
+
+    // asset_admin now tries to take it away. `holder` does NOT sign.
+    let seized = run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE,
+            new_pubkey: attacker.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut attacker, &mut market],
+    );
+    assert_err_and_market_unchanged(seized, &market, &held);
+}
+
+/// Companion to the above for `insurance_operator` (#416) — the leg that reaches
+/// stake-governed insurance through `handle_withdraw_insurance_asset`'s
+/// `local_authorized` branch, which the D-STAKE-1 guard does not cover.
+#[test]
+fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
+    let mut admin = signer().writable();
+    let mut market = market_account();
+    let mut holder = signer();
+    let mut attacker = signer();
+    let _mint = init_market(&mut admin, &mut market);
+
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE_OPERATOR,
+            new_pubkey: holder.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut holder, &mut market],
+    )
+    .expect("holder-consented rotation must succeed");
+
+    let held = market.data.clone();
+
+    let seized = run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE_OPERATOR,
+            new_pubkey: attacker.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut attacker, &mut market],
+    );
+    assert_err_and_market_unchanged(seized, &market, &held);
+}

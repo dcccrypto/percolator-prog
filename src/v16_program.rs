@@ -12378,7 +12378,21 @@ pub mod processor {
         if new_pubkey == [0u8; 32] && kind != ASSET_AUTH_ADMIN {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        if !admin_signed {
+        // #416/#417: the `admin_signed` bypass must not reach the insurance legs.
+        // `asset_admin` could otherwise take `insurance_authority` (terminal budget
+        // entitlement, evaluated from the CURRENT profile at withdrawal time) or
+        // `insurance_operator` (which satisfies `local_authorized` in
+        // handle_withdraw_insurance_asset, a branch the D-STAKE-1 guard does not
+        // cover) away from a holder that never consented. Same root cause as #414;
+        // #424's custody guard was scoped to ASSET_AUTH_BACKING_BUCKET only.
+        //
+        // Assigning an UNHELD role (current_value == 0) still uses the admin path —
+        // there is no holder to defend, and bootstrapping must stay possible.
+        let admin_bypass_permitted = !matches!(
+            kind,
+            ASSET_AUTH_INSURANCE | ASSET_AUTH_INSURANCE_OPERATOR
+        ) || current_value == [0u8; 32];
+        if !(admin_signed && admin_bypass_permitted) {
             expect_live_authority(&current_value, current.key)?;
         }
         // An LP vault's custody rests entirely on `backing_bucket_authority ==
@@ -13241,8 +13255,14 @@ pub mod processor {
         if maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        let (mut cfg, _, _, _) =
+        let (mut cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        // #428: gate on Live, mirroring handle_update_backing_fee_policy. Without this
+        // the maintenance rate can be changed after the market has left Live, and a
+        // permissionless crank then charges the new rate against account equity.
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         expect_live_authority(&cfg.marketauth, admin.key)?;
         cfg.maintenance_fee_per_slot = maintenance_fee_per_slot;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
