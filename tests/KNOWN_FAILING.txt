@@ -1,3 +1,24 @@
+# Tests that CANNOT pass in this checkout, with the reason. CI is GREEN only when the
+# failing set matches this file EXACTLY -- a new failure is a regression, and an entry
+# that starts passing must be deleted here, so the list cannot silently rot.
+#
+# Counts as of 2026-08-23 (546 passed / 55 failed, all four sibling BPFs built):
+#
+#   40  sol_invoke_signed() not available
+#       tests/v16_wrapper.rs uses a native in-process run_ix/TestAccount harness with
+#       no BPF loader, so invoke_signed is a stubbed no-op. Structural: these paths
+#       need LiteSVM or a real validator. Documented in the file itself around :18173.
+#
+#   14  MissingRequiredSignature during matcher-context init
+#       The mounted matcher program id does not match what the harness signs for.
+#       NOT yet diagnosed -- suspected fixture/program-id mismatch rather than a
+#       product defect. Tracked, not excused.
+#
+#    ~  Custom(60)/Custom(23)/Custom(24) error-code mismatches in v16_fee_split
+#       Expected operative code differs from observed. Ruled OUT: stake version skew
+#       (re-tested against the deployed 474079f, identical result). Undiagnosed.
+#
+# Reducing this list is tracked work. It is not a licence to ignore failures.
 e2e::e2e_cross_portfolio_substitution_rejects
 e2e::e2e_direct_hook_invocation_rejects
 e2e::e2e_gate_liquidation_lock_rejects
@@ -5,11 +26,6 @@ e2e::e2e_gate_mid_close_rejects
 e2e::e2e_gate_resolved_payout_rejects
 e2e::e2e_gate_stale_state_rejects
 e2e::e2e_happy_path_transfer_hook_owner_assertion
-result: FAILED. 11 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
-result: FAILED. 218 passed; 19 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.08s
-result: FAILED. 28 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
-result: FAILED. 7 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
-result: FAILED. 88 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.64s
 tag87_blocks_the_creator_forged_stake_pool_exploit
 tag87_end_to_end_from_a_real_trade_fee_with_no_seeding
 tag87_moves_real_tokens_into_the_stake_vault_and_conserves_value

@@ -41,8 +41,8 @@ echo "::group::cargo test --no-fail-fast"
 cargo test --no-fail-fast 2>&1 | tee /tmp/ci_test.log | tail -40
 echo "::endgroup::"
 
-grep -E "^test .* FAILED" /tmp/ci_test.log | sed 's/^test //;s/ \.\.\. FAILED$//' | sort -u > /tmp/ci_failing.txt
-sort -u tests/KNOWN_FAILING.txt > /tmp/ci_known.txt
+grep -E "^test [A-Za-z0-9_:]+ \.\.\. FAILED$" /tmp/ci_test.log | sed "s/^test //;s/ \.\.\. FAILED$//" | sort -u > /tmp/ci_failing.txt
+grep -vE "^\s*(#|$)" tests/KNOWN_FAILING.txt | sort -u > /tmp/ci_known.txt
 
 passed=$(grep -E "^test result:" /tmp/ci_test.log | awk '{p+=$4} END{print p}')
 failed=$(grep -E "^test result:" /tmp/ci_test.log | awk '{f+=$6} END{print f}')
