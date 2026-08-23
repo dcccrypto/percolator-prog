@@ -1,0 +1,56 @@
+name: CI
+
+# This repository had NO CI at all. The last runs were 2026-04-08 and failed.
+# 241 Kani proofs and 25 test suites were running only when someone remembered.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + test (with sibling programs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: checkout percolator-prog
+        uses: actions/checkout@v4
+        with: { path: percolator-prog }
+
+      # The wrapper compiles the engine through `path = "../percolator"`, and mounts
+      # the matcher / nft / stake .so for its cross-program suites. All four must sit
+      # as siblings or large parts of the suite silently do not execute.
+      - name: checkout engine (path dependency)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator, path: percolator, token: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: checkout matcher
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-match, path: percolator-match, token: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: checkout nft
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-nft, path: percolator-nft, token: '${{ secrets.GITHUB_TOKEN }}' }
+      # Pinned to the DEPLOYED stake commit, not main: main carries the 408-byte
+      # StakePool layout that is deliberately NOT deployed (25 live pools are 392
+      # bytes). Testing against main here would test a configuration that does not
+      # and must not exist on chain.
+      - name: checkout stake (pinned to the deployed commit)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '474079f', token: '${{ secrets.GITHUB_TOKEN }}' }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install solana toolchain (cargo build-sbf)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: percolator-prog }
+
+      - name: run suite and diff against the allowlist
+        working-directory: percolator-prog
+        run: ./scripts/ci-test.sh
