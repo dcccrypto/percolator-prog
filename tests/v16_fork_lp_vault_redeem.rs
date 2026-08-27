@@ -599,7 +599,8 @@ fn execute_redemption_backing_state_matches_withdraw() {
     let admin_a = env_a.admin.insecure_clone();
     let src_a = Pubkey::new_unique();
     set_token(&mut env_a.svm, src_a, env_a.collateral_mint, admin_a.pubkey(), 10_000_000);
-    let ledger_a = Pubkey::new_unique();
+    let (ledger_a, _) =
+        state::derive_lp_backing_ledger(&env_a.program_id, &env_a.market, DOMAIN);
     env_a.svm.set_account(ledger_a, Account { lamports: 1_000_000_000, data: vec![0u8; state::backing_domain_ledger_account_len()], owner: env_a.program_id, executable: false, rent_epoch: 0 }).unwrap();
     let dest_a = Pubkey::new_unique();
     set_token(&mut env_a.svm, dest_a, env_a.collateral_mint, admin_a.pubkey(), 0);

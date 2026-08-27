@@ -7323,6 +7323,13 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut attacker = signer();
 
     let mint = init_market(&mut admin, &mut market);
+    let (ledger_key, _) = state::derive_lp_backing_ledger(&program_id(), &market.key, 1);
+    let mut ledger = TestAccount::new(
+        ledger_key,
+        program_id(),
+        state::backing_domain_ledger_account_len(),
+    )
+    .writable();
     // v17: backing_bucket_authority is per-asset; use UpdateAssetAuthority for asset-0.
     run_ix(
         Instruction::UpdateAssetAuthority {
@@ -7349,6 +7356,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut source,
             &mut vault,
             &mut token_program,
+            &mut ledger,
         ],
     )
     .unwrap();
@@ -7358,6 +7366,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let source_epoch_after_topup = after_topup_group.source_credit[1].credit_epoch;
 
     let topped_up = market.data.clone();
+    let ledger_before = ledger.data.clone();
     let mut attacker_dest = user_token_account(attacker.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
     let unauthorized = run_ix(
@@ -7375,6 +7384,44 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         ],
     );
     assert_err_and_market_unchanged(unauthorized, &market, &topped_up);
+    assert_eq!(ledger.data, ledger_before);
+
+    let mut missing_ledger_dest = user_token_account(bucket_authority.key, mint, 0);
+    let missing_ledger = run_ix(
+        Instruction::WithdrawBackingBucket {
+            domain: 1,
+            amount: 1,
+        },
+        &mut [
+            &mut bucket_authority,
+            &mut market,
+            &mut missing_ledger_dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert_err_and_market_unchanged(missing_ledger, &market, &topped_up);
+    assert_eq!(ledger.data, ledger_before);
+
+    let mut impostor_ledger = backing_domain_ledger_account();
+    let substituted_ledger = run_ix(
+        Instruction::WithdrawBackingBucket {
+            domain: 1,
+            amount: 1,
+        },
+        &mut [
+            &mut bucket_authority,
+            &mut market,
+            &mut missing_ledger_dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut impostor_ledger,
+        ],
+    );
+    assert_err_and_market_unchanged(substituted_ledger, &market, &topped_up);
+    assert_eq!(ledger.data, ledger_before);
 
     let mut dest = user_token_account(bucket_authority.key, mint, 0);
     run_ix(
@@ -7389,6 +7436,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut ledger,
         ],
     )
     .unwrap();
@@ -7414,6 +7462,9 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         group.source_credit[1].fresh_reserved_backing_num,
         60 * BOUND_SCALE
     );
+    let ledger_after_withdraw = state::read_backing_domain_ledger(&ledger.data).unwrap();
+    assert_eq!(ledger_after_withdraw.total_principal_atoms, 60);
+    assert_eq!(ledger_after_withdraw.total_principal_withdrawn_atoms, 40);
 
     let before_overdraw = market.data.clone();
     let overdraw = run_ix(
@@ -7428,6 +7479,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut ledger,
         ],
     );
     assert_err_and_market_unchanged(overdraw, &market, &before_overdraw);
@@ -7458,6 +7510,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut ledger,
         ],
     )
     .unwrap();
@@ -7490,6 +7543,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut ledger,
         ],
     );
     assert_err_and_market_unchanged(claim_dilution, &market, &claim_backed);
@@ -7501,6 +7555,13 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     let mut market = market_account();
 
     let mint = init_market(&mut admin, &mut market);
+    let (ledger_key, _) = state::derive_lp_backing_ledger(&program_id(), &market.key, 1);
+    let mut ledger = TestAccount::new(
+        ledger_key,
+        program_id(),
+        state::backing_domain_ledger_account_len(),
+    )
+    .writable();
     let mut source = user_token_account(admin.key, mint, 25);
     let mut vault = vault_token_account(&market, mint, 25);
     let mut token_program = token_program_account();
@@ -7516,6 +7577,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             &mut source,
             &mut vault,
             &mut token_program,
+            &mut ledger,
         ],
     )
     .unwrap();
@@ -7534,6 +7596,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut ledger,
         ],
     );
     assert!(zero.is_err());
@@ -7562,6 +7625,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
                 &mut vault,
                 &mut vault_auth,
                 &mut token_program,
+                &mut ledger,
             ],
         );
         assert_err_and_market_unchanged(stressed_withdraw, &market, &stressed);
@@ -7580,6 +7644,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut ledger,
         ],
     )
     .unwrap();
@@ -7681,8 +7746,14 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
 fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdraw() {
     let mut admin = signer();
     let mut market = market_account();
-    let mut ledger = backing_domain_ledger_account();
     let mint = init_market(&mut admin, &mut market);
+    let (ledger_key, _) = state::derive_lp_backing_ledger(&program_id(), &market.key, 1);
+    let mut ledger = TestAccount::new(
+        ledger_key,
+        program_id(),
+        state::backing_domain_ledger_account_len(),
+    )
+    .writable();
 
     let mut source = user_token_account(admin.key, mint, 100);
     let mut vault = vault_token_account(&market, mint, 0);

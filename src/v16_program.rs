@@ -10403,16 +10403,19 @@ pub mod processor {
         let vault_token = account(accounts, 3)?;
         let vault_authority_ai = account(accounts, 4)?;
         let token_program = account(accounts, 5)?;
-        let ledger_ai = accounts.get(6);
+        // Principal withdrawals must always update the backing-domain ledger.
+        // Treating this trailing account as optional allowed callers to skip
+        // both the principal-consistency check and the ledger decrement.
+        let ledger_ai = account(accounts, 6)?;
         expect_signer(authority)?;
         expect_writable(market_ai)?;
         expect_writable(dest_token)?;
         expect_writable(vault_token)?;
         expect_owner(market_ai, program_id)?;
-        if let Some(ledger_ai) = ledger_ai {
-            expect_writable(ledger_ai)?;
-            expect_owner(ledger_ai, program_id)?;
-        }
+        expect_writable(ledger_ai)?;
+        expect_owner(ledger_ai, program_id)?;
+        let (ledger_pda, _) = state::derive_lp_backing_ledger(program_id, market_ai.key, domain);
+        expect_key(ledger_ai, &ledger_pda)?;
         verify_token_program(token_program)?;
         if amount == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
@@ -10476,46 +10479,31 @@ pub mod processor {
             };
 
             let (_, bucket) = backing_domain_parts_view(&group, domain_usize)?;
-            let mut ledger_data = if let Some(ledger_ai) = ledger_ai {
-                Some(ledger_ai.try_borrow_mut_data()?)
-            } else {
-                None
-            };
-            let mut ledger_state = if let Some(data) = ledger_data.as_deref() {
-                let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
-                    data,
-                    market_ai.key.to_bytes(),
-                    ledger_authority,
-                    domain,
-                    &bucket,
-                )?;
-                sync_backing_domain_ledger(&mut ledger, &bucket)?;
-                if amount > ledger.total_principal_atoms {
-                    return Err(PercolatorError::EngineCounterUnderflow.into());
-                }
-                Some((ledger, initialized))
-            } else {
-                None
-            };
+            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                ledger_authority,
+                domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            if amount > ledger.total_principal_atoms {
+                return Err(PercolatorError::EngineCounterUnderflow.into());
+            }
             group
                 .withdraw_fresh_counterparty_backing_not_atomic(domain_usize, amount)
                 .map_err(map_v16_error)?;
-            if let Some((ledger, _)) = ledger_state.as_mut() {
-                ledger.total_principal_atoms = ledger
-                    .total_principal_atoms
-                    .checked_sub(amount)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                ledger.total_principal_withdrawn_atoms = ledger
-                    .total_principal_withdrawn_atoms
-                    .checked_add(amount)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            }
+            ledger.total_principal_atoms = ledger
+                .total_principal_atoms
+                .checked_sub(amount)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            ledger.total_principal_withdrawn_atoms = ledger
+                .total_principal_withdrawn_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             group.validate_shape().map_err(map_v16_error)?;
-            if let (Some(data), Some((ledger, initialized))) =
-                (ledger_data.as_deref_mut(), ledger_state.as_ref())
-            {
-                write_or_init_backing_domain_ledger(data, ledger, *initialized)?;
-            }
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
         }
 
         let bump_arr = [bump];

@@ -844,6 +844,25 @@ impl V16CuEnv {
         self.program_account(state::backing_domain_ledger_account_len())
     }
 
+    fn canonical_backing_domain_ledger_account(&mut self, domain: u16) -> Pubkey {
+        let (ledger, _) = state::derive_lp_backing_ledger(&self.program_id, &self.market, domain);
+        if self.svm.get_account(&ledger).is_none() {
+            self.svm
+                .set_account(
+                    ledger,
+                    Account {
+                        lamports: 1_000_000_000,
+                        data: vec![0u8; state::backing_domain_ledger_account_len()],
+                        owner: self.program_id,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        }
+        ledger
+    }
+
     fn insurance_ledger_account(&mut self) -> Pubkey {
         self.program_account(state::insurance_ledger_account_len())
     }
@@ -2171,6 +2190,7 @@ impl V16CuEnv {
         amount: u128,
         expiry_slot: u64,
     ) -> u64 {
+        let ledger = self.canonical_backing_domain_ledger_account(domain);
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2186,6 +2206,7 @@ impl V16CuEnv {
                 AccountMeta::new(source, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
             ],
             &[&self.admin],
         )
@@ -2305,6 +2326,7 @@ impl V16CuEnv {
         amount: u128,
         expiry_slot: u64,
     ) -> (Pubkey, u64) {
+        let ledger = self.canonical_backing_domain_ledger_account(domain);
         let source = Pubkey::new_unique();
         self.svm
             .set_account(
@@ -2333,6 +2355,7 @@ impl V16CuEnv {
                 AccountMeta::new(source, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
             ],
             &[&self.admin],
         )
@@ -2390,6 +2413,7 @@ impl V16CuEnv {
         amount: u128,
         expiry_slot: u64,
     ) -> Pubkey {
+        let ledger = self.canonical_backing_domain_ledger_account(domain);
         self.ensure_signer_account(authority.pubkey());
         let source = self.token_account(authority.pubkey(), amount as u64);
         send_tx(
@@ -2407,6 +2431,7 @@ impl V16CuEnv {
                 AccountMeta::new(source, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
             ],
             &[authority],
         )
@@ -2549,6 +2574,7 @@ impl V16CuEnv {
         domain: u16,
         amount: u128,
     ) -> u64 {
+        let ledger = self.canonical_backing_domain_ledger_account(domain);
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2561,6 +2587,7 @@ impl V16CuEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
             ],
             &[&self.admin],
         )
@@ -2573,6 +2600,7 @@ impl V16CuEnv {
         domain: u16,
         amount: u128,
     ) -> Result<u64, String> {
+        let ledger = self.canonical_backing_domain_ledger_account(domain);
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2585,6 +2613,7 @@ impl V16CuEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
             ],
             &[&self.admin],
         )
@@ -2605,6 +2634,7 @@ impl V16CuEnv {
         domain: u16,
         amount: u128,
     ) -> u64 {
+        let ledger = self.canonical_backing_domain_ledger_account(domain);
         self.ensure_signer_account(authority.pubkey());
         send_tx(
             &mut self.svm,
@@ -2618,6 +2648,7 @@ impl V16CuEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
             ],
             &[authority],
         )
@@ -3715,6 +3746,84 @@ fn v16_bpf_privileged_reactivate_uses_authenticated_slot() {
             recovery_reason: 0,
         },
     );
+}
+
+#[test]
+fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
+    let mut env = V16CuEnv::new();
+    let domain = 1;
+    let ledger = env.canonical_backing_domain_ledger_account(domain);
+    env.top_up_backing_bucket(domain, 100, 10);
+    let dest = env.token_account(env.admin.pubkey(), 0);
+
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    let ledger_before = env.svm.get_account(&ledger).unwrap().data;
+    let vault_before = env.token_amount(env.vault);
+    let dest_before = env.token_amount(dest);
+    let impostor = env.backing_domain_ledger_account();
+
+    let withdraw_accounts = |ledger: Option<Pubkey>| {
+        let mut accounts = vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ];
+        if let Some(ledger) = ledger {
+            accounts.push(AccountMeta::new(ledger, false));
+        }
+        accounts
+    };
+
+    let omitted = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        withdraw_accounts(None),
+        &[&env.admin],
+    );
+    assert!(omitted.is_err(), "omitting the ledger must fail closed");
+
+    env.svm.expire_blockhash();
+    let substituted = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        withdraw_accounts(Some(impostor)),
+        &[&env.admin],
+    );
+    assert!(
+        substituted.is_err(),
+        "a noncanonical program-owned ledger must fail closed"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
+    assert_eq!(env.svm.get_account(&ledger).unwrap().data, ledger_before);
+    assert_eq!(env.token_amount(env.vault), vault_before);
+    assert_eq!(env.token_amount(dest), dest_before);
+
+    env.svm.expire_blockhash();
+    send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        withdraw_accounts(Some(ledger)),
+        &[&env.admin],
+    )
+    .expect("canonical ledger withdrawal");
+
+    let ledger_after = state::read_backing_domain_ledger(
+        &env.svm.get_account(&ledger).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(ledger_after.total_principal_atoms, 60);
+    assert_eq!(ledger_after.total_principal_withdrawn_atoms, 40);
+    assert_eq!(env.token_amount(env.vault), 60);
+    assert_eq!(env.token_amount(dest), 40);
 }
 
 #[test]
@@ -8930,6 +9039,7 @@ fn v16_attack_resolved_backing_withdraw_requires_full_user_wind_down() {
     );
     let vault_before = g.vault;
     let dest_before = env.token_amount(dest);
+    let ledger = env.canonical_backing_domain_ledger_account(1);
     env.svm.expire_blockhash();
     let r = env.send(
         ProgInstruction::WithdrawBackingBucket {
@@ -8943,6 +9053,7 @@ fn v16_attack_resolved_backing_withdraw_requires_full_user_wind_down() {
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
         ],
         &[&env.admin.insecure_clone()],
     );
