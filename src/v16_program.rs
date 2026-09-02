@@ -13668,14 +13668,33 @@ pub mod processor {
         expect_signer(authority)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
-        let (mut cfg, asset0_insurance_authority, max_trading_fee_bps) = {
+        // #445: gate on `cfg.marketauth`, like every other MARKET-WIDE fee-policy
+        // setter (UpdateFeeSplit, UpdateFeeRedirectPolicy, UpdateLiquidationFeePolicy,
+        // UpdateMaintenanceFeePolicy, UpdateMaintenanceFeePerSlot,
+        // UpdateMarketInitFeePolicy).
+        //
+        // This used to read asset 0's per-asset `insurance_authority` while writing
+        // `cfg.trade_fee_base_bps`, which is NOT scoped to asset 0: it is the floor
+        // in `hybrid_trade_fee_bps_view` (`base = max(caller_fee_bps, ...)`) and in
+        // `handle_trade_cpi` (`fee_floor_pre`), so it applies to every asset in the
+        // market. A per-asset role therefore controlled a market-wide field.
+        //
+        // Divergence between the two is an ORDINARY operational state — marketauth
+        // handed to a governance multisig while the creator keeps asset 0's insurance
+        // role, or that role delegated to an insurance manager — so this is not a
+        // theoretical split.
+        //
+        // The change also unfreezes a field that could become permanently unsettable:
+        // on a staked market, `BindInsuranceAuthority` parks asset 0's
+        // `insurance_authority` on a stake PDA that cannot sign, which left
+        // `trade_fee_base_bps` writable by nobody.
+        let (mut cfg, max_trading_fee_bps) = {
             let market_data = market_ai.try_borrow_data()?;
             let (cfg, _, _, _, max_trading_fee_bps) =
                 state::read_market_trade_preflight(&market_data, 0)?;
-            let profile0 = read_oracle_profile_for_asset(&market_data, &cfg, 0)?;
-            (cfg, profile0.insurance_authority, max_trading_fee_bps)
+            (cfg, max_trading_fee_bps)
         };
-        expect_live_authority(&asset0_insurance_authority, authority.key)?;
+        expect_live_authority(&cfg.marketauth, authority.key)?;
         if trade_fee_base_bps > max_trading_fee_bps
             || trade_fee_base_bps > constants::MAX_DYNAMIC_TRADE_FEE_BPS
         {

@@ -1789,8 +1789,24 @@ fn v16_wrapper_maintenance_fee_policy_is_admin_gated_and_bounds_share() {
     assert_eq!(cfg.maintenance_cranker_fee_share_bps, 4_000);
 }
 
+/// INVERTED 2026-09-02 for #445 (was
+/// `..._trade_fee_policy_is_insurance_authority_gated_and_bounds_fee`), following
+/// the same invert-and-rename convention as the retired two-rate-floor guards
+/// below.
+///
+/// `trade_fee_base_bps` is MARKET-WIDE — it is the floor in
+/// `hybrid_trade_fee_bps_view` and in `handle_trade_cpi`'s `fee_floor_pre`,
+/// neither scoped to asset 0 — so gating it on asset 0's per-asset
+/// `insurance_authority` let a per-asset role move the fee floor for every asset
+/// in the market. It now gates on `cfg.marketauth`, like every other market-wide
+/// fee-policy setter.
+///
+/// The old test asserted the exact opposite of the fix: it pinned that the
+/// marketauth admin is REJECTED once asset 0's insurance authority is rotated
+/// away, and that the insurance authority is the one who may write. Both
+/// assertions are inverted here, so re-introducing the old gate fails this test.
 #[test]
-fn v16_wrapper_trade_fee_policy_is_insurance_authority_gated_and_bounds_fee() {
+fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gated() {
     let mut admin = signer();
     let mut attacker = signer();
     let mut insurance_authority = signer();
@@ -1829,27 +1845,37 @@ fn v16_wrapper_trade_fee_policy_is_insurance_authority_gated_and_bounds_fee() {
     );
     assert_err_and_market_unchanged(rejected_attacker, &market, &before);
 
-    let rejected_admin_after_rotation = run_ix(
+    // #445: asset 0's insurance authority is NO LONGER the gate. This is the
+    // half that matters operationally — divergence between marketauth and asset
+    // 0's insurance role is an ordinary state (governance multisig holds
+    // marketauth while the creator keeps the insurance role), and on a staked
+    // market `BindInsuranceAuthority` parks it on a stake PDA that cannot sign
+    // at all, which used to leave this field writable by nobody.
+    let rejected_insurance_authority = run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 2,
         },
-        &mut [&mut admin, &mut market],
+        &mut [&mut insurance_authority, &mut market],
     );
-    assert_err_and_market_unchanged(rejected_admin_after_rotation, &market, &before);
+    assert_err_and_market_unchanged(rejected_insurance_authority, &market, &before);
 
+    // The bps caps still apply, and are checked against the authority that is
+    // now allowed through, so this proves the bound and not just the gate.
     let rejected_over_engine_cap = run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 101,
         },
-        &mut [&mut insurance_authority, &mut market],
+        &mut [&mut admin, &mut market],
     );
     assert_err_and_market_unchanged(rejected_over_engine_cap, &market, &before);
 
+    // marketauth writes it, even though asset 0's insurance authority was
+    // rotated to someone else above.
     run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 25,
         },
-        &mut [&mut insurance_authority, &mut market],
+        &mut [&mut admin, &mut market],
     )
     .unwrap();
     let (cfg, _) = state::read_market(&market.data).unwrap();
