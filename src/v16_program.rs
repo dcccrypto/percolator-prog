@@ -12291,7 +12291,14 @@ pub mod processor {
         if reduce_q == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, _cfg| {
+        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, cfg| {
+            // #446: restore the upstream maturity gate dropped in our port. Once a
+            // market has matured into a permissionless resolve, an owner-signed
+            // rebalance-reduce must not still mutate positions — the same gate guards
+            // the sibling path at :6661.
+            if group.header.mode == 0 && permissionless_resolve_matured_now_view(cfg, group) {
+                return Err(V16Error::LockActive);
+            }
             group
                 .rebalance_reduce_position_not_atomic(
                     portfolio,
@@ -12744,8 +12751,16 @@ pub mod processor {
         let secondary_key = Pubkey::new_from_array(secondary_mint);
         expect_key(primary_mint_ai, &primary_key)?;
         expect_key(secondary_mint_ai, &secondary_key)?;
-        verify_mint(primary_mint_ai)?;
-        verify_mint(secondary_mint_ai)?;
+        // #447: the primary and secondary collateral mints are both denominated in
+        // engine base units. Mismatched decimals silently rescale every deposit and
+        // withdrawal through the secondary mint. Upstream rejects it here; our port
+        // dropped the check by calling `verify_mint`, which discards the mint it
+        // unpacks.
+        let primary_mint_state = unpack_mint(primary_mint_ai)?;
+        let secondary_mint_state = unpack_mint(secondary_mint_ai)?;
+        if primary_mint_state.decimals != secondary_mint_state.decimals {
+            return Err(PercolatorError::InvalidMint.into());
+        }
 
         let mut data = market_ai.try_borrow_mut_data()?;
         let mut cfg = {
@@ -18781,6 +18796,20 @@ pub mod processor {
         spl_token::state::Mint::unpack(&data)
             .map(|_| ())
             .map_err(|_| PercolatorError::InvalidMint.into())
+    }
+
+    /// #447: same checks as `verify_mint`, but RETURNS the unpacked mint so callers
+    /// can compare fields (upstream's `unpack_mint`). `verify_mint` discards it with
+    /// `.map(|_| ())`, which is why the decimals-parity guard was silently droppable.
+    fn unpack_mint(mint_ai: &AccountInfo) -> Result<spl_token::state::Mint, ProgramError> {
+        if mint_ai.owner != &spl_token::ID {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        if mint_ai.data_len() != spl_token::state::Mint::LEN {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        let data = mint_ai.try_borrow_data()?;
+        spl_token::state::Mint::unpack(&data).map_err(|_| PercolatorError::InvalidMint.into())
     }
 
     fn verify_token_program(token_program: &AccountInfo) -> Result<(), ProgramError> {

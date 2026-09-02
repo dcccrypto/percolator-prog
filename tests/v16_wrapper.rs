@@ -21134,3 +21134,120 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
     );
     assert!(over.is_err(), "stale_slots above MAX must still be rejected");
 }
+
+fn mint_account_with_decimals(decimals: u8) -> TestAccount {
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(
+        Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        },
+        &mut data,
+    )
+    .unwrap();
+    TestAccount::new_with_data(Pubkey::new_unique(), spl_token::ID, data)
+}
+
+/// #447 — the primary and secondary collateral mints are both denominated in engine
+/// base units, so mismatched decimals silently rescale every secondary-mint deposit
+/// and withdrawal. Upstream rejects it; our port dropped the check by calling
+/// `verify_mint`, which unpacks the mint and discards it.
+#[test]
+fn v16_wrapper_update_base_unit_mints_rejects_mismatched_decimals() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market_with_ix(&mut admin, &mut market, init_market_ix_with(|_| {}));
+
+    let mut primary = mint_account_with_decimals(6);
+    let mut mismatched = mint_account_with_decimals(9);
+    let rejected = run_ix(
+        Instruction::UpdateBaseUnitMints {
+            primary_mint: primary.key.to_bytes(),
+            secondary_mint: mismatched.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut market, &mut primary, &mut mismatched],
+    );
+    assert!(
+        rejected.is_err(),
+        "#447: mints with different decimals must be rejected"
+    );
+
+    let mut matched = mint_account_with_decimals(6);
+    let accepted = run_ix(
+        Instruction::UpdateBaseUnitMints {
+            primary_mint: primary.key.to_bytes(),
+            secondary_mint: matched.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut market, &mut primary, &mut matched],
+    );
+    assert!(
+        accepted.is_ok(),
+        "matching decimals must still be accepted: {accepted:?}"
+    );
+}
+
+/// #446 — upstream gates `RebalanceReduce` on maturity: once a Live market has
+/// matured into a permissionless resolve, an owner-signed reduce must not still
+/// mutate positions. Our port bound `_cfg` and dropped the two-line gate; the same
+/// gate guards the sibling path at `reject_permissionless_resolve_matured_live_view`.
+#[test]
+fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+
+    init_market_with_ix(&mut admin, &mut market, init_market_ix_with(|_| {}));
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    // Drive the market into a MATURED permissionless resolve while still mode 0 (Live).
+    {
+        let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+        cfg.permissionless_resolve_stale_slots = 9_000;
+        cfg.last_good_oracle_slot = 0;
+        group.current_slot = 20_000;
+        assert_eq!(group.mode, MarketModeV16::Live, "must still be Live for this gate");
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before = market.data.clone();
+    let blocked = run_ix(
+        Instruction::RebalanceReduce {
+            asset_index: 0,
+            reduce_q: POS_SCALE / 2,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    );
+    assert!(
+        blocked.is_err(),
+        "#446: rebalance-reduce must be blocked once the resolve has matured"
+    );
+    assert_eq!(
+        market.data, before,
+        "#446: a blocked reduce must not mutate market state"
+    );
+}
