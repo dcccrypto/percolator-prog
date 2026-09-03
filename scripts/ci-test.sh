@@ -95,7 +95,35 @@ done
 echo "::endgroup::"
 
 echo "::group::build wrapper BPF"
-cargo build-sbf --no-default-features || exit 1
+# --features devnet is NOT optional, and leaving it off is what made main red from
+# 15eb8b0c (2026-08-31) onward.
+#
+# `devnet` is not a default feature (default = ["anchor-v2"]). Without it, tag 87
+# (WithdrawInsuranceReserveToStake) compiles to an unconditional
+# `return Err(StakeProgramNotPinned)` -- Custom(60) -- because a non-devnet build has
+# no pinned percolator-stake id to send tokens to. See the `#[cfg(not(feature =
+# "devnet"))]` arm in src/v16_program.rs and the `devnet` entry in Cargo.toml.
+#
+# So every tag87_* test fails closed at Custom(60) no matter what the stake sibling
+# pin says. #441 removed the nine tag87_* entries from tests/KNOWN_FAILING.txt on the
+# strength of a local run -- correctly, since a local `cargo build-sbf` takes the
+# default features and a developer testing tag 87 naturally builds devnet. In CI they
+# could not pass, and had never once passed here.
+#
+# Building devnet is also the ONLY build under which these tests mean anything. The
+# suite's sibling pins are all deployed-DEVNET refs, and the deployed devnet wrapper
+# is itself built `--features devnet` (that is what reproduces DhSkE7u byte-for-byte).
+# A non-devnet build tests a configuration that is not deployed anywhere, and it
+# silently skipped the whole tag-87 security surface -- including
+# `tag87_blocks_the_creator_forged_stake_pool_exploit` and
+# `tag87_owner_pin_fires_before_any_pool_byte_is_read`, which exist specifically to
+# prove the owner pin fires before any pool byte is read.
+#
+# Measured on be8c8dd2 with the pinned siblings (stake d0c6ecb, nft 215842e,
+# matcher d4d4f1c):
+#   --no-default-features : passed=596 failed=30  -> 9 NEW failures vs the allowlist
+#   --features devnet     : passed=603 failed=21  -> exact allowlist match, 0 new, 0 stale
+cargo build-sbf --features devnet || exit 1
 echo "::endgroup::"
 
 echo "::group::cargo test --no-fail-fast"
