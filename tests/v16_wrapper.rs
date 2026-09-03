@@ -3,9 +3,9 @@
 use percolator::{
     AssetLifecycleV16, AssetStateV16Account, BackingBucketStatusV16, CloseProgressLedgerV16,
     EngineAssetSlotV16Account, MarketGroupV16HeaderAccount, MarketModeV16,
-    PermissionlessRecoveryReasonV16, PortfolioAccountV16Account,
-    PortfolioLegV16, ResolvedPayoutLedgerV16, ResolvedPayoutReceiptV16, SideModeV16, SideV16,
-    V16Config, BOUND_SCALE, POS_SCALE,
+    PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
+    ResolvedPayoutLedgerV16, ResolvedPayoutReceiptV16, SideModeV16, SideV16, V16Config,
+    BOUND_SCALE, POS_SCALE,
 };
 use percolator_prog::{
     constants::{
@@ -18,8 +18,10 @@ use percolator_prog::{
     },
     ix::Instruction,
     oracle_v16, policy_v16, processor,
-    processor::{ASSET_AUTH_BACKING_BUCKET, ASSET_AUTH_INSURANCE, ASSET_AUTH_INSURANCE_OPERATOR,
-                ASSET_AUTH_ORACLE, ASSET_AUTH_ADMIN},
+    processor::{
+        ASSET_AUTH_ADMIN, ASSET_AUTH_BACKING_BUCKET, ASSET_AUTH_INSURANCE,
+        ASSET_AUTH_INSURANCE_OPERATOR, ASSET_AUTH_ORACLE,
+    },
     state,
     state::{AssetOracleProfileV16, MarketGroupV16, PortfolioAccountV16},
 };
@@ -159,8 +161,8 @@ fn clamped_price_after_one_step_ref(
     max_accrual_dt_slots: u64,
 ) -> u64 {
     let segment_dt = elapsed_slots.min(max_accrual_dt_slots) as u128;
-    let max_delta = (old_price as u128 * max_price_move_bps_per_slot as u128 * segment_dt)
-        / MAX_MARGIN_BPS_REF;
+    let max_delta =
+        (old_price as u128 * max_price_move_bps_per_slot as u128 * segment_dt) / MAX_MARGIN_BPS_REF;
     old_price + max_delta as u64
 }
 
@@ -251,7 +253,12 @@ fn backing_domain_ledger_account() -> TestAccount {
 /// here even though it can be on chain.
 fn canonical_backing_ledger_account(market: &TestAccount, domain: u16) -> TestAccount {
     let (key, _) = state::derive_lp_backing_ledger(&program_id(), &market.key, domain);
-    TestAccount::new(key, program_id(), state::backing_domain_ledger_account_len()).writable()
+    TestAccount::new(
+        key,
+        program_id(),
+        state::backing_domain_ledger_account_len(),
+    )
+    .writable()
 }
 
 /// System program, passed to `TopUpBackingBucket` so it CAN create the ledger. Never invoked
@@ -511,8 +518,13 @@ fn run_trade_cpi_with_matcher(
     let maker_owner_bytes = state::read_portfolio_owner_preflight(&account_b.data)
         .map(|(_, owner)| Pubkey::new_from_array(owner))
         .unwrap_or(owner_b.key);
-    let mut delegate =
-        matcher_delegate_account(market, account_b, &maker_owner_bytes, &matcher_program, &matcher_context);
+    let mut delegate = matcher_delegate_account(
+        market,
+        account_b,
+        &maker_owner_bytes,
+        &matcher_program,
+        &matcher_context,
+    );
 
     // v17 behavioral change (matrix row 29 + LP-matcher design): handle_trade_cpi requires the
     // B-side LP to have called SetMatcherConfig first, registering the specific (matcher_prog,
@@ -1020,10 +1032,9 @@ fn top_up_backing_bucket(
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg1,
-        &mut __sp1,
-    ],
+            &mut __lg1,
+            &mut __sp1,
+        ],
     )
     .unwrap();
 }
@@ -1193,7 +1204,8 @@ fn v16_wrapper_init_binds_market_and_portfolio_provenance() {
     let acct = *state::read_portfolio_boxed_for_market_slots(
         &portfolio.data,
         group.config.max_market_slots as usize,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(group.market_group_id, market.key.to_bytes());
     assert_eq!(group.materialized_portfolio_count, 1);
     assert_eq!(
@@ -2481,10 +2493,9 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
             &mut backing_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg2,
-        &mut __sp2,
-    ],
+            &mut __lg2,
+            &mut __sp2,
+        ],
     )
     .unwrap();
 
@@ -2595,9 +2606,8 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg1,
-    ],
+            &mut __lg1,
+        ],
     )
     .unwrap();
 
@@ -2858,9 +2868,8 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg2,
-    ],
+            &mut __lg2,
+        ],
     )
     .unwrap();
     let mut admin_backing_dest = user_token_account(admin.key, mint, 0);
@@ -2877,9 +2886,8 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg3,
-    ],
+            &mut __lg3,
+        ],
     )
     .unwrap();
 
@@ -3011,7 +3019,8 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
 
     let insurance_operator_key = Pubkey::new_unique();
     let insurance_operator = insurance_operator_key.to_bytes();
-    let mut insurance_operator_acct = TestAccount::new(insurance_operator_key, Pubkey::new_unique(), 0).signer();
+    let mut insurance_operator_acct =
+        TestAccount::new(insurance_operator_key, Pubkey::new_unique(), 0).signer();
     let oracle_authority = admin.key.to_bytes();
     let mut init_fee_source = user_token_account(attacker.key, mint, 25);
     let mut init_fee_vault = vault_token_account(&market, mint, 0);
@@ -3184,7 +3193,10 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut insurance_op_dest = user_token_account(insurance_operator_key, mint, 0);
     // v17: WithdrawInsuranceAsset; insurance_operator must sign (D-STAKE-1 blocks marketauth).
     run_ix(
-        Instruction::WithdrawInsuranceAsset { asset_index: 1, amount: 6 },
+        Instruction::WithdrawInsuranceAsset {
+            asset_index: 1,
+            amount: 6,
+        },
         &mut [
             &mut insurance_operator_acct,
             &mut market,
@@ -3196,7 +3208,10 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     )
     .unwrap();
     run_ix(
-        Instruction::WithdrawInsuranceAsset { asset_index: 1, amount: 4 },
+        Instruction::WithdrawInsuranceAsset {
+            asset_index: 1,
+            amount: 4,
+        },
         &mut [
             &mut insurance_operator_acct,
             &mut market,
@@ -3221,9 +3236,8 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
                 &mut vault,
                 &mut vault_auth,
                 &mut token_program,
-            
-            &mut __lg4,
-        ],
+                &mut __lg4,
+            ],
         )
         .unwrap();
     }
@@ -3375,9 +3389,8 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
             &mut vault,
             &mut token_program,
             &mut local_backing_ledger,
-        
-        &mut __sp3,
-    ],
+            &mut __sp3,
+        ],
     )
     .unwrap();
     {
@@ -3474,7 +3487,10 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     .unwrap();
     let op_insurance_ledger_state =
         state::read_insurance_ledger(&op_insurance_ledger.data).unwrap();
-    assert_eq!(op_insurance_ledger_state.authority, insurance_operator.key.to_bytes());
+    assert_eq!(
+        op_insurance_ledger_state.authority,
+        insurance_operator.key.to_bytes()
+    );
     assert_eq!(op_insurance_ledger_state.total_withdrawn_atoms, 9);
 
     // Backing withdrawals use admin (admin is backing_bucket_authority for asset 1).
@@ -3534,9 +3550,8 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg5,
-    ],
+            &mut __lg5,
+        ],
     )
     .unwrap();
 
@@ -5050,7 +5065,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     assert_eq!(final_group.assets[2].oi_eff_long_q, prediction_q);
     assert_eq!(final_group.assets[2].oi_eff_short_q, prediction_q);
     // v17: cfg.admin replaced by cfg.marketauth (matrix row 27).
-    assert_eq!(cfg.marketauth, state::read_market(&market.data).unwrap().0.marketauth);
+    assert_eq!(
+        cfg.marketauth,
+        state::read_market(&market.data).unwrap().0.marketauth
+    );
 }
 
 #[test]
@@ -6559,10 +6577,9 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg4,
-        &mut __sp4,
-    ],
+            &mut __lg4,
+            &mut __sp4,
+        ],
     );
     assert_err_and_market_unchanged(top_up_backing, &market, &before);
 }
@@ -6957,10 +6974,9 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
             &mut backing_source,
             &mut primary_vault,
             &mut token_program,
-        
-        &mut __lg5,
-        &mut __sp5,
-    ],
+            &mut __lg5,
+            &mut __sp5,
+        ],
     )
     .unwrap();
     {
@@ -7004,9 +7020,8 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
             &mut secondary_vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg6,
-    ],
+            &mut __lg6,
+        ],
     );
     assert_err_and_market_unchanged(admin_backing, &market, &before_admin_backing);
 
@@ -7098,9 +7113,8 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
             &mut secondary_vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg7,
-    ],
+            &mut __lg7,
+        ],
     )
     .unwrap();
 
@@ -7153,10 +7167,9 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
             &mut admin_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg6,
-        &mut __sp6,
-    ],
+            &mut __lg6,
+            &mut __sp6,
+        ],
     );
     assert_err_and_market_unchanged(unauthorized, &market, &before);
 
@@ -7175,10 +7188,9 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg7,
-        &mut __sp7,
-    ],
+            &mut __lg7,
+            &mut __sp7,
+        ],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -7305,10 +7317,9 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             &mut attacker_src,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg8,
-        &mut __sp8,
-    ],
+            &mut __lg8,
+            &mut __sp8,
+        ],
     );
     assert_err_and_market_unchanged(unauthorized, &market, &before);
 
@@ -7327,10 +7338,9 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg9,
-        &mut __sp9,
-    ],
+            &mut __lg9,
+            &mut __sp9,
+        ],
     )
     .unwrap();
 
@@ -7374,10 +7384,9 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg10,
-        &mut __sp10,
-    ],
+            &mut __lg10,
+            &mut __sp10,
+        ],
     );
     assert_err_and_market_unchanged(bad_domain, &market, &before_bad_domain);
 
@@ -7397,10 +7406,9 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg11,
-        &mut __sp11,
-    ],
+            &mut __lg11,
+            &mut __sp11,
+        ],
     );
     assert_err_and_market_unchanged(inactive_domain, &market, &before_inactive_domain);
 
@@ -7420,10 +7428,9 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg12,
-        &mut __sp12,
-    ],
+            &mut __lg12,
+            &mut __sp12,
+        ],
     );
     assert_err_and_market_unchanged(bad_expiry, &market, &before_bad_expiry);
 
@@ -7485,9 +7492,8 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault,
             &mut token_program,
             &mut ledger,
-        
-        &mut __sp13,
-    ],
+            &mut __sp13,
+        ],
     )
     .unwrap();
 
@@ -7512,9 +7518,8 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg8,
-    ],
+            &mut __lg8,
+        ],
     );
     assert_err_and_market_unchanged(unauthorized, &market, &topped_up);
     assert_eq!(ledger.data, ledger_before);
@@ -7535,8 +7540,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault_auth,
             &mut token_program,
             &mut impostor_ledger,
-        
-    ],
+        ],
     );
     assert_err_and_market_unchanged(substituted_ledger, &market, &topped_up);
     assert_eq!(ledger.data, ledger_before);
@@ -7556,8 +7560,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -7601,8 +7604,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     );
     assert_err_and_market_unchanged(overdraw, &market, &before_overdraw);
 
@@ -7634,8 +7636,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -7669,8 +7670,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     );
     assert_err_and_market_unchanged(claim_dilution, &market, &claim_backed);
 }
@@ -7706,9 +7706,8 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             &mut vault,
             &mut token_program,
             &mut ledger,
-        
-        &mut __sp14,
-    ],
+            &mut __sp14,
+        ],
     )
     .unwrap();
 
@@ -7728,8 +7727,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     );
     assert!(zero.is_err());
 
@@ -7759,8 +7757,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
                 &mut vault_auth,
                 &mut token_program,
                 &mut ledger,
-            
-        ],
+            ],
         );
         assert_err_and_market_unchanged(stressed_withdraw, &market, &stressed);
     }
@@ -7780,8 +7777,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -7817,10 +7813,9 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg15,
-        &mut __sp15,
-    ],
+            &mut __lg15,
+            &mut __sp15,
+        ],
     )
     .unwrap();
 
@@ -7841,9 +7836,8 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
             &mut vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg17,
-    ],
+            &mut __lg17,
+        ],
     );
     assert_err_and_market_unchanged(wrong_dest, &market, &before_wrong_dest);
 
@@ -7863,9 +7857,8 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
             &mut vault,
             &mut wrong_vault_auth,
             &mut token_program,
-        
-        &mut __lg18,
-    ],
+            &mut __lg18,
+        ],
     );
     assert_err_and_market_unchanged(wrong_auth, &market, &before_wrong_auth);
 
@@ -7885,9 +7878,8 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
             &mut wrong_vault,
             &mut vault_auth,
             &mut token_program,
-        
-        &mut __lg19,
-    ],
+            &mut __lg19,
+        ],
     );
     assert_err_and_market_unchanged(wrong_vault_result, &market, &before_wrong_vault);
 }
@@ -7923,9 +7915,8 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
             &mut vault,
             &mut token_program,
             &mut ledger,
-        
-        &mut __sp16,
-    ],
+            &mut __sp16,
+        ],
     )
     .unwrap();
 
@@ -8000,8 +7991,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
             &mut vault_auth,
             &mut token_program,
             &mut ledger,
-        
-    ],
+        ],
     )
     .unwrap();
     let ledger_state = state::read_backing_domain_ledger(&ledger.data).unwrap();
@@ -8042,9 +8032,8 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
             &mut vault,
             &mut token_program,
             &mut ledger,
-        
-        &mut __sp17,
-    ],
+            &mut __sp17,
+        ],
     )
     .unwrap();
 
@@ -8101,9 +8090,8 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
             &mut vault,
             &mut token_program,
             &mut ledger,
-        
-        &mut __sp18,
-    ],
+            &mut __sp18,
+        ],
     )
     .unwrap();
     run_ix(
@@ -8146,9 +8134,8 @@ fn v16_wrapper_backing_domain_ledger_rejects_wrong_authority_and_domain() {
             &mut vault,
             &mut token_program,
             &mut ledger,
-        
-        &mut __sp19,
-    ],
+            &mut __sp19,
+        ],
     )
     .unwrap();
 
@@ -8281,10 +8268,9 @@ fn v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance() 
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg20,
-        &mut __sp20,
-    ],
+            &mut __lg20,
+            &mut __sp20,
+        ],
     )
     .unwrap();
 
@@ -8365,10 +8351,9 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg21,
-        &mut __sp21,
-    ],
+            &mut __lg21,
+            &mut __sp21,
+        ],
     )
     .unwrap();
 
@@ -8427,10 +8412,9 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
             &mut source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg22,
-        &mut __sp22,
-    ],
+            &mut __lg22,
+            &mut __sp22,
+        ],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -8497,10 +8481,9 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
             &mut unrelated_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg23,
-        &mut __sp23,
-    ],
+            &mut __lg23,
+            &mut __sp23,
+        ],
     )
     .unwrap();
 
@@ -8606,10 +8589,9 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
             &mut unrelated_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg24,
-        &mut __sp24,
-    ],
+            &mut __lg24,
+            &mut __sp24,
+        ],
     )
     .unwrap();
     let mut __lg25 = canonical_backing_ledger_account(&market, 2);
@@ -8626,10 +8608,9 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
             &mut corrupt_domain_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg25,
-        &mut __sp25,
-    ],
+            &mut __lg25,
+            &mut __sp25,
+        ],
     )
     .unwrap();
 
@@ -8747,10 +8728,9 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
             &mut legit_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg26,
-        &mut __sp26,
-    ],
+            &mut __lg26,
+            &mut __sp26,
+        ],
     )
     .unwrap();
 
@@ -8932,7 +8912,13 @@ fn v16_wrapper_insurance_policy_rejects_live_unbounded_or_zero_cooldown() {
     let mut token_program = token_program_account();
     run_ix(
         Instruction::TopUpInsurance { amount: 10 },
-        &mut [&mut admin, &mut market, &mut source, &mut vault, &mut token_program],
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+        ],
     )
     .unwrap();
 
@@ -8941,7 +8927,14 @@ fn v16_wrapper_insurance_policy_rejects_live_unbounded_or_zero_cooldown() {
     let before = market.data.clone();
     let live_reject = run_ix(
         Instruction::WithdrawInsurance { amount: 1 },
-        &mut [&mut admin, &mut market, &mut dest, &mut vault, &mut vault_auth, &mut token_program],
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
     );
     assert_err_and_market_unchanged(live_reject, &market, &before);
 }
@@ -9705,7 +9698,7 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         insurance_operator: [1u8; 32],
         backing_bucket_authority: [1u8; 32],
         oracle_authority: [1u8; 32],
-        asset_admin: [1u8; 32],  // v17: per-asset cold-storage admin (matrix row 30)
+        asset_admin: [1u8; 32], // v17: per-asset cold-storage admin (matrix row 30)
         max_staleness_secs: 0,
         hybrid_soft_stale_slots: 0,
         mark_ewma_e6: percolator::MAX_ORACLE_PRICE + 1,
@@ -10108,7 +10101,10 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
         },
         &mut [&mut admin, &mut new_key, &mut market],
     );
-    assert!(burn_rejected.is_err(), "v17: burning marketauth to zero must be rejected on live market");
+    assert!(
+        burn_rejected.is_err(),
+        "v17: burning marketauth to zero must be rejected on live market"
+    );
     let (cfg, group) = state::read_market(&market.data).unwrap();
     assert_eq!(group.mode, MarketModeV16::Live);
     // marketauth is still set (non-zero) — burn was rejected.
@@ -10756,10 +10752,9 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
             &mut admin_source,
             &mut frozen_vault,
             &mut token_program,
-        
-        &mut __lg27,
-        &mut __sp27,
-    ],
+            &mut __lg27,
+            &mut __sp27,
+        ],
     );
     assert_err_and_market_unchanged(frozen_backing_vault, &market, &before_market);
     assert_eq!(portfolio.data, before_portfolio);
@@ -10843,10 +10838,9 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
             &mut admin_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg28,
-        &mut __sp28,
-    ],
+            &mut __lg28,
+            &mut __sp28,
+        ],
     );
     assert_err_and_market_unchanged(backing_too_large, &market, &before_market);
     assert_eq!(portfolio.data, before_portfolio);
@@ -10932,10 +10926,9 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
             &mut admin_source,
             &mut vault,
             &mut token_program,
-        
-        &mut __lg29,
-        &mut __sp29,
-    ],
+            &mut __lg29,
+            &mut __sp29,
+        ],
     )
     .unwrap();
     assert_eq!(market.data, before_market);
@@ -12562,7 +12555,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     )
     .unwrap();
     let (_, flattened) = state::read_market(&market.data).unwrap();
-    assert_eq!(flattened.assets[0].oi_eff_long_q, 0, "asset 0 OI must be zero after flattening");
+    assert_eq!(
+        flattened.assets[0].oi_eff_long_q, 0,
+        "asset 0 OI must be zero after flattening"
+    );
 
     // With no positions, oracle reconfiguration of the empty asset 1 is permitted and
     // advancing slot_last is safe (there are no exposed positions to misprice fees against).
@@ -13922,7 +13918,11 @@ fn v16_wrapper_tradecpi_requires_bilateral_signatures_before_matcher_cpi() {
     let mut matcher_context = matcher_context_account(&matcher_program);
     // v17: matcher_delegate includes maker_owner in PDA seeds.  owner_b IS the maker_owner.
     let mut delegate = matcher_delegate_account(
-        &market, &account_b, &owner_b.key, &matcher_program, &matcher_context,
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
     );
 
     init_market(&mut admin, &mut market);
@@ -14013,7 +14013,11 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
 
     // v17: matcher_delegate includes maker_owner in PDA seeds.
     let mut delegate = matcher_delegate_account(
-        &market, &account_b, &owner_b.key, &matcher_program, &matcher_context,
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
     );
     let mut program_owned_tail = TestAccount::new(Pubkey::new_unique(), program_id(), 0).writable();
     let unsafe_tail = run_ix(
@@ -14084,7 +14088,11 @@ fn v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher() {
     init_portfolio(&mut owner_a, &mut market, &mut account_a);
     init_portfolio(&mut owner_b, &mut market, &mut account_b);
     let mut delegate = matcher_delegate_account(
-        &market, &account_b, &owner_b.key, &matcher_program, &matcher_context,
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
     );
     deposit(&mut owner_a, &mut market, &mut account_a, 1_000_000);
     deposit(&mut owner_b, &mut market, &mut account_b, 1_000_000);
@@ -14256,7 +14264,11 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
     init_portfolio(&mut owner_a, &mut market, &mut account_a);
     init_portfolio(&mut owner_b, &mut market, &mut account_b);
     let mut delegate = matcher_delegate_account(
-        &market, &account_b, &owner_b.key, &matcher_program, &matcher_context,
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
     );
     run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
 
@@ -14309,7 +14321,11 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_fee_above_cap_before_success() {
     init_portfolio(&mut owner_a, &mut market, &mut account_a);
     init_portfolio(&mut owner_b, &mut market, &mut account_b);
     let mut delegate = matcher_delegate_account(
-        &market, &account_b, &owner_b.key, &matcher_program, &matcher_context,
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
     );
     let (_, group) = state::read_market(&market.data).unwrap();
     let req_id = group.current_slot.wrapping_add(1);
@@ -14373,7 +14389,11 @@ fn v16_wrapper_tradecpi_rejects_corrupt_backing_fee_policy_before_later_checks()
     init_portfolio(&mut owner_a, &mut market, &mut account_a);
     init_portfolio(&mut owner_b, &mut market, &mut account_b);
     let mut delegate = matcher_delegate_account(
-        &market, &account_b, &owner_b.key, &matcher_program, &matcher_context,
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
     );
 
     let (mut cfg, _group) = state::read_market(&market.data).unwrap();
@@ -14638,8 +14658,14 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     let short = state::read_portfolio(&short_account.data).unwrap();
     assert_eq!(group.slot_last, 2);
     assert_eq!(group.assets[0].effective_price, 400);
-    assert_eq!(short.capital, 0, "bankrupt account's capital must be fully consumed");
-    assert_eq!(short.pnl, 0, "settled loss must not leave a dangling pnl balance");
+    assert_eq!(
+        short.capital, 0,
+        "bankrupt account's capital must be fully consumed"
+    );
+    assert_eq!(
+        short.pnl, 0,
+        "settled loss must not leave a dangling pnl balance"
+    );
     assert!(
         percolator::active_bitmap_is_empty(short.active_bitmap),
         "a genuinely bankrupt account (certified_equity < 0) must be fully closed through the \
@@ -14832,8 +14858,12 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     // the liquidation in the same instruction.
     push_base_ewma_mark(&mut admin, &mut market, 100, 999_999_999);
 
-    let landed_price =
-        clamped_price_after_one_step_ref(100, max_price_move_bps_per_slot, 100, max_accrual_dt_slots);
+    let landed_price = clamped_price_after_one_step_ref(
+        100,
+        max_price_move_bps_per_slot,
+        100,
+        max_accrual_dt_slots,
+    );
     let expected_fee = ceil_liquidation_fee_ref(
         100 * POS_SCALE,
         landed_price,
@@ -15034,8 +15064,12 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     // the liquidation in the same instruction.
     push_base_ewma_mark(&mut admin, &mut market, 100, 999_999_999);
 
-    let landed_price =
-        clamped_price_after_one_step_ref(100, max_price_move_bps_per_slot, 100, max_accrual_dt_slots);
+    let landed_price = clamped_price_after_one_step_ref(
+        100,
+        max_price_move_bps_per_slot,
+        100,
+        max_accrual_dt_slots,
+    );
     let expected_fee = ceil_liquidation_fee_ref(
         100 * POS_SCALE,
         landed_price,
@@ -15082,7 +15116,10 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
          and not more (would mean rounding is accumulating beyond the engine's own ceil-per-close \
          guarantee)"
     );
-    assert_eq!(group.vault, vault_before, "internal liquidation fee must not move SPL vault custody");
+    assert_eq!(
+        group.vault, vault_before,
+        "internal liquidation fee must not move SPL vault custody"
+    );
 }
 
 #[test]
@@ -16363,8 +16400,10 @@ fn v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger() {
     // payout receipt/ledger (that path is reserved for non-source-backed junior-pool
     // PnL that may need proration). So the correct post-condition is NO receipt: the
     // backing guarantee means the winner is paid in one shot with nothing deferred.
-    assert!(!account.resolved_payout_receipt.present,
-        "source-backed positive PnL pays directly; no resolved_payout_receipt should remain");
+    assert!(
+        !account.resolved_payout_receipt.present,
+        "source-backed positive PnL pays directly; no resolved_payout_receipt should remain"
+    );
 }
 
 #[test]
@@ -17223,10 +17262,9 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                         &mut admin_tok,
                         &mut vault_tok,
                         &mut token_program,
-                    
-                    &mut __lg30,
-                    &mut __sp30,
-                ],
+                        &mut __lg30,
+                        &mut __sp30,
+                    ],
                 );
                 if res.is_ok() {
                     fresh[d] += amount;
@@ -17244,9 +17282,8 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                         &mut vault_tok,
                         &mut vault_auth,
                         &mut token_program,
-                    
-                    &mut __lg21,
-                ],
+                        &mut __lg21,
+                    ],
                 );
                 if res.is_ok() {
                     fresh[d] -= amount;
@@ -17276,9 +17313,8 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                         &mut vault_tok,
                         &mut vault_auth,
                         &mut token_program,
-                    
-                    &mut __lg22,
-                ],
+                        &mut __lg22,
+                    ],
                 );
                 assert!(
                     res.is_err(),
@@ -17389,10 +17425,9 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
             &mut admin_src,
             &mut vault_tok,
             &mut token_program,
-        
-        &mut __lg31,
-        &mut __sp31,
-    ],
+            &mut __lg31,
+            &mut __sp31,
+        ],
     )
     .unwrap();
 
@@ -17730,9 +17765,15 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
     }
     {
         let (_, group) = state::read_market(&market.data).unwrap();
-        assert_eq!(group.assets[0].slot_last, 0, "asset 0 stays stale at slot 0");
+        assert_eq!(
+            group.assets[0].slot_last, 0,
+            "asset 0 stays stale at slot 0"
+        );
         assert_eq!(group.assets[1].slot_last, 5, "asset 1 is fresh at slot 5");
-        assert_eq!(group.slot_last, 0, "header.slot_last is pinned by the stale asset 0");
+        assert_eq!(
+            group.slot_last, 0,
+            "header.slot_last is pinned by the stale asset 0"
+        );
         assert_eq!(group.current_slot, 5);
         assert_eq!(group.assets[1].effective_price, 100);
     }
@@ -17780,8 +17821,14 @@ fn v16_wrapper_crank_clamp_uses_per_asset_dt_not_group_dt() {
         group.assets[1].effective_price, 110,
         "crank price must be clamped to asset 1's own per-slot envelope (100 -> 110), not the wider group window",
     );
-    assert_eq!(group.assets[1].slot_last, 6, "asset 1 accrued to the crank slot");
-    assert_eq!(group.assets[0].slot_last, 0, "the stale asset is untouched and still recoverable");
+    assert_eq!(
+        group.assets[1].slot_last, 6,
+        "asset 1 accrued to the crank slot"
+    );
+    assert_eq!(
+        group.assets[0].slot_last, 0,
+        "the stale asset is untouched and still recoverable"
+    );
     assert_eq!(group.mode, MarketModeV16::Live);
 }
 
@@ -17938,9 +17985,15 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
     deposit(&mut a1_short_owner, &mut market, &mut a1_short, 1_000_000);
     {
         let (_, group) = state::read_market(&market.data).unwrap();
-        assert_eq!(group.assets[0].slot_last, 0, "asset 0 stays stale at slot 0");
+        assert_eq!(
+            group.assets[0].slot_last, 0,
+            "asset 0 stays stale at slot 0"
+        );
         assert_eq!(group.assets[1].slot_last, 5, "asset 1 is fresh at slot 5");
-        assert_eq!(group.slot_last, 0, "header.slot_last pinned by stale asset 0 -> group dt = 5");
+        assert_eq!(
+            group.slot_last, 0,
+            "header.slot_last pinned by stale asset 0 -> group dt = 5"
+        );
         assert_eq!(group.current_slot, 5);
     }
 
@@ -17962,14 +18015,19 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             &mut a1_short,
         ],
     )
-    .expect("a trade on a fresh asset must not be blocked by an unrelated stale co-asset's group dt");
+    .expect(
+        "a trade on a fresh asset must not be blocked by an unrelated stale co-asset's group dt",
+    );
 
     let (_, group) = state::read_market(&market.data).unwrap();
     assert_eq!(
         group.assets[1].oi_eff_long_q, POS_SCALE,
         "the fresh-asset trade went through and opened interest",
     );
-    assert_eq!(group.assets[0].slot_last, 0, "the stale co-asset is still untouched and recoverable");
+    assert_eq!(
+        group.assets[0].slot_last, 0,
+        "the stale co-asset is still untouched and recoverable"
+    );
 }
 
 #[test]
@@ -17989,7 +18047,12 @@ fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
         init_portfolio(&mut long_owner, &mut market, &mut long_account);
         init_portfolio(&mut short_owner, &mut market, &mut short_account);
         deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-        deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+        deposit(
+            &mut short_owner,
+            &mut market,
+            &mut short_account,
+            10_000_000,
+        );
         let (_, before) = state::read_market(&market.data).unwrap();
         assert_eq!(before.assets[0].effective_price, 100);
 
@@ -18009,7 +18072,9 @@ fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
             ],
         )
         .unwrap_or_else(|e| {
-            panic!("degenerate exec_price {exec_price} must be accepted (settles on the mark): {e:?}")
+            panic!(
+                "degenerate exec_price {exec_price} must be accepted (settles on the mark): {e:?}"
+            )
         });
 
         let (_, group) = state::read_market(&market.data).unwrap();
@@ -18041,7 +18106,12 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
         init_portfolio(&mut long_owner, &mut market, &mut long_account);
         init_portfolio(&mut short_owner, &mut market, &mut short_account);
         deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-        deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+        deposit(
+            &mut short_owner,
+            &mut market,
+            &mut short_account,
+            10_000_000,
+        );
         run_ix(
             Instruction::TradeNoCpi {
                 asset_index: 0,
@@ -18077,9 +18147,15 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
 // Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
 // the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -18091,7 +18167,11 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
 // the exact code) proves the rejection is the address pin, not an unrelated failure. Without the
 // pin an attacker funds a second vault-authority-owned account and fragments liquidity.
 
-fn noncanonical_vault_token_account(market: &TestAccount, mint: Pubkey, amount: u64) -> TestAccount {
+fn noncanonical_vault_token_account(
+    market: &TestAccount,
+    mint: Pubkey,
+    amount: u64,
+) -> TestAccount {
     // Correct owner + mint + state — ONLY the address is wrong (random, not the canonical ATA).
     TestAccount::new_with_data(
         Pubkey::new_unique(),
@@ -18116,7 +18196,14 @@ fn v16_wrapper_deposit_rejects_noncanonical_vault() {
     let mut token_program = token_program_account();
     let rejected = run_ix(
         Instruction::Deposit { amount: 1_000_000 },
-        &mut [&mut owner, &mut market, &mut portfolio, &mut source_token, &mut bad_vault, &mut token_program],
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut source_token,
+            &mut bad_vault,
+            &mut token_program,
+        ],
     );
     assert_eq!(
         rejected,
@@ -18144,7 +18231,15 @@ fn v16_wrapper_withdraw_rejects_noncanonical_vault() {
     let mut token_program = token_program_account();
     let rejected = run_ix(
         Instruction::Withdraw { amount: 500_000 },
-        &mut [&mut owner, &mut market, &mut portfolio, &mut dest_token, &mut bad_vault, &mut vault_auth, &mut token_program],
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut dest_token,
+            &mut bad_vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
     );
     assert_eq!(
         rejected,
@@ -18168,11 +18263,20 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
     let mut __lg32 = canonical_backing_ledger_account(&market, 0);
     let mut __sp32 = system_program_account();
     let rejected = run_ix(
-        Instruction::TopUpBackingBucket { domain: 0, amount: 1_000, expiry_slot: 1_000_000 },
-        &mut [&mut admin, &mut market, &mut source, &mut bad_vault, &mut token_program,
-        &mut __lg32,
-        &mut __sp32,
-    ],
+        Instruction::TopUpBackingBucket {
+            domain: 0,
+            amount: 1_000,
+            expiry_slot: 1_000_000,
+        },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut source,
+            &mut bad_vault,
+            &mut token_program,
+            &mut __lg32,
+            &mut __sp32,
+        ],
     );
     assert_eq!(
         rejected,
@@ -18216,7 +18320,12 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_before.protocol_fee_accrued_atoms, 0);
@@ -18243,9 +18352,9 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     let (cfg_after, group_after) = state::read_market(&market.data).unwrap();
     let total_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
     let expected_protocol_cut = total_fee * 2_000 / 10_000; // fee_share_floor, PROTOCOL_FEE_BPS
-    // Four-way split (2026-07-19): the creator no longer gets "the complement"
-    // of the protocol cut -- it gets its own configured share, with LP and
-    // insurance now also carved out of what used to be 100% creator.
+                                                            // Four-way split (2026-07-19): the creator no longer gets "the complement"
+                                                            // of the protocol cut -- it gets its own configured share, with LP and
+                                                            // insurance now also carved out of what used to be 100% creator.
     let expected_creator_cut = total_fee * cfg_before.creator_share_bps as u128 / 10_000;
     let expected_lp_cut = total_fee * cfg_before.lp_share_bps as u128 / 10_000;
     // Insurance is the remainder leg in split_trade_fee (absorbs rounding dust),
@@ -18266,7 +18375,10 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     // to its own counter. `expected_creator_cut` is nonzero here (16 atoms at
     // the fixture's 1600 bps of a 100-atom fee), so the assertion is not
     // satisfiable by a no-op.
-    assert_ne!(expected_creator_cut, 0, "fixture must produce a nonzero creator leg");
+    assert_ne!(
+        expected_creator_cut, 0,
+        "fixture must produce a nonzero creator leg"
+    );
     assert_eq!(
         cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
         expected_creator_cut as u64,
@@ -18360,7 +18472,10 @@ fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_accrues_creator_leg_off_the
 
     assert_eq!(group_after.insurance - group_before.insurance, total_fee);
     assert_eq!(cfg_after.protocol_fee_accrued_atoms, expected_protocol_cut);
-    assert_ne!(expected_creator_cut, 0, "fixture must produce a nonzero creator leg");
+    assert_ne!(
+        expected_creator_cut, 0,
+        "fixture must produce a nonzero creator leg"
+    );
     assert_eq!(
         cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
         expected_creator_cut as u64,
@@ -18404,7 +18519,12 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
 
@@ -18454,7 +18574,10 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_
     // `credit_trade_fees_to_market_budgets_view` -- it credited
     // `credit_fee_to_domain_budget_view` DIRECTLY from inside the leg loop, and
     // was nearly missed. It gets its own accrual + its own negative assertion.
-    assert_ne!(expected_creator_cut, 0, "fixture must produce a nonzero creator leg");
+    assert_ne!(
+        expected_creator_cut, 0,
+        "fixture must produce a nonzero creator leg"
+    );
     assert_eq!(
         cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
         expected_creator_cut as u64,
@@ -18677,7 +18800,10 @@ fn v16_wrapper_withdraw_protocol_fee_unauthorized_signer_rejected() {
         Err(ProgramError::Custom(8)), // Unauthorized
         "a signer that isn't cfg.protocol_fee_authority must be rejected"
     );
-    assert_eq!(market.data, before, "rejected withdrawal must not mutate the market");
+    assert_eq!(
+        market.data, before,
+        "rejected withdrawal must not mutate the market"
+    );
 }
 
 #[test]
@@ -18714,7 +18840,10 @@ fn v16_wrapper_withdraw_protocol_fee_clamps_to_surplus_and_double_withdraw_bound
         cfg_after.protocol_fee_withdrawn_atoms, 60,
         "clamped to the actually-available surplus, not the full 100 accrued"
     );
-    assert_eq!(group_after.insurance, 0, "surplus fully drained by the clamped transfer");
+    assert_eq!(
+        group_after.insurance, 0,
+        "surplus fully drained by the clamped transfer"
+    );
 
     // A second withdrawal attempt: claim capacity is now accrued(100) -
     // withdrawn(60) = 40, but there's zero surplus left on-chain -- must be
@@ -18771,7 +18900,10 @@ fn v16_wrapper_withdraw_protocol_fee_rejects_amount_exceeding_accrued_claim() {
             &mut token_program,
         ],
     );
-    assert!(rejected.is_err(), "amount beyond the accrued claim must be rejected");
+    assert!(
+        rejected.is_err(),
+        "amount beyond the accrued claim must be rejected"
+    );
     assert_eq!(market.data, before);
 }
 
@@ -18843,7 +18975,10 @@ fn v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed() {
         // to remain exactly as the real deposit+resolve sequence above left
         // them, since that's the precondition under test).
         let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
-        assert_ne!(group.materialized_portfolio_count, 0, "init_portfolio must have materialized one portfolio");
+        assert_ne!(
+            group.materialized_portfolio_count, 0,
+            "init_portfolio must have materialized one portfolio"
+        );
         assert_ne!(group.c_tot, 0, "deposit(10) must have raised c_tot");
         cfg.protocol_fee_authority = admin.key.to_bytes();
         cfg.protocol_fee_accrued_atoms = 100;
@@ -18886,7 +19021,11 @@ fn program_data_account(upgrade_authority: Option<Pubkey>) -> TestAccount {
         None => data[12] = 0,
     }
     TestAccount::new_with_data(
-        Pubkey::find_program_address(&[program_id().as_ref()], &solana_program::bpf_loader_upgradeable::id()).0,
+        Pubkey::find_program_address(
+            &[program_id().as_ref()],
+            &solana_program::bpf_loader_upgradeable::id(),
+        )
+        .0,
         solana_program::bpf_loader_upgradeable::id(),
         data,
     )
@@ -19071,13 +19210,21 @@ fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulate
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
 
     let (cfg_before, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_before.creator_fee_claimable_atoms, 0);
     let per_trade_fee = taker_only_fee(10 * POS_SCALE, 100, 1_000);
     let per_trade_creator = per_trade_fee * cfg_before.creator_share_bps as u128 / 10_000;
-    assert_ne!(per_trade_creator, 0, "fixture must produce a nonzero creator leg");
+    assert_ne!(
+        per_trade_creator, 0,
+        "fixture must produce a nonzero creator leg"
+    );
 
     // Raw slot in the market account: 16-byte header + 568-byte config prefix.
     const CLAIMABLE_OFF: usize = 16 + 568;
@@ -19135,7 +19282,12 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
     {
         let (mut cfg, group) = state::read_market(&market.data).unwrap();
         cfg.creator_fee_claimable_atoms = u64::MAX;
@@ -19163,7 +19315,10 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
         Err(ProgramError::Custom(15)), // EngineArithmeticOverflow
         "an accrual that cannot fit u64 must reject the trade with EngineArithmeticOverflow"
     );
-    assert_eq!(market.data, before, "the rejected trade must not mutate the market");
+    assert_eq!(
+        market.data, before,
+        "the rejected trade must not mutate the market"
+    );
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(
         cfg_after.creator_fee_claimable_atoms,
@@ -19188,7 +19343,12 @@ fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_w
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
     {
         let (mut cfg, group) = state::read_market(&market.data).unwrap();
         cfg.creator_fee_claimable_atoms = u64::MAX;
@@ -19218,7 +19378,10 @@ fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_w
         Err(ProgramError::Custom(15)), // EngineArithmeticOverflow
         "the batch fold must reject with EngineArithmeticOverflow, not wrap"
     );
-    assert_eq!(market.data, before, "the rejected batch must not mutate the market");
+    assert_eq!(
+        market.data, before,
+        "the rejected batch must not mutate the market"
+    );
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_after.creator_fee_claimable_atoms, u64::MAX);
 }
@@ -19307,7 +19470,10 @@ fn v16_wrapper_withdraw_creator_fee_at_capacity_drains_to_zero_then_rejects() {
     )
     .expect("claiming exactly the capacity must succeed");
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg_after.creator_fee_claimable_atoms, 0, "capacity must drain to exactly 0");
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms, 0,
+        "capacity must drain to exactly 0"
+    );
 
     let drained = market.data.clone();
     // NO-ROLLBACK harness: the "must not underflow-wrap" claim below is about
@@ -19575,7 +19741,11 @@ fn v16_wrapper_withdraw_creator_fee_survives_the_staked_create_flow_and_only_ass
     .unwrap();
 
     let (cfg_rotated, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg_rotated.marketauth, pool_pda.key.to_bytes(), "marketauth must have rotated");
+    assert_eq!(
+        cfg_rotated.marketauth,
+        pool_pda.key.to_bytes(),
+        "marketauth must have rotated"
+    );
     let profile_after = state::read_asset_oracle_profile(&market.data, 0).unwrap();
     assert_eq!(
         profile_after.insurance_operator,
@@ -19676,7 +19846,10 @@ fn v16_wrapper_withdraw_creator_fee_cannot_reduce_any_insurance_domain_budget() 
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
     let (_, group_before) = state::read_market(&market.data).unwrap();
-    assert_eq!(group_before.insurance_domain_budget[0], 150, "fixture must fund the backstop");
+    assert_eq!(
+        group_before.insurance_domain_budget[0], 150,
+        "fixture must fund the backstop"
+    );
     assert_eq!(group_before.insurance_domain_budget[1], 100);
 
     let mut dest = user_token_account(admin.key, mint, 0);
@@ -19727,7 +19900,12 @@ fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
 
     let (cfg_before, _) = state::read_market(&market.data).unwrap();
     run_ix(
@@ -19812,8 +19990,7 @@ fn v16_wrapper_withdraw_creator_fee_requires_the_asset_admin_to_actually_sign() 
     let mut unsigned_operator = TestAccount::new(admin.key, Pubkey::new_unique(), 0);
     assert!(!unsigned_operator.is_signer);
     assert_eq!(
-        unsigned_operator.key,
-        admin.key,
+        unsigned_operator.key, admin.key,
         "the fixture must present the RIGHT key, so only the signer gate can reject"
     );
 
@@ -19837,7 +20014,10 @@ fn v16_wrapper_withdraw_creator_fee_requires_the_asset_admin_to_actually_sign() 
         Err(ProgramError::Custom(6)), // ExpectedSigner
         "naming the creator's pubkey without signing for it must reject with ExpectedSigner"
     );
-    assert_eq!(market.data, before, "a non-signed claim must not debit the counter");
+    assert_eq!(
+        market.data, before,
+        "a non-signed claim must not debit the counter"
+    );
     let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_after.creator_fee_claimable_atoms, 100);
 
@@ -20225,7 +20405,12 @@ fn v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg() {
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_before.creator_fee_claimable_atoms, 0);
@@ -20469,7 +20654,9 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
         let mut market = market_account();
         init_market(&mut admin, &mut market);
         run_ix(
-            Instruction::UpdateTradeFeePolicy { trade_fee_base_bps: 4 },
+            Instruction::UpdateTradeFeePolicy {
+                trade_fee_base_bps: 4,
+            },
             &mut [&mut admin, &mut market],
         )
         .unwrap();
@@ -20509,7 +20696,9 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
         let mut market = market_account();
         init_market(&mut admin, &mut market);
         run_ix(
-            Instruction::UpdateTradeFeePolicy { trade_fee_base_bps: 5 },
+            Instruction::UpdateTradeFeePolicy {
+                trade_fee_base_bps: 5,
+            },
             &mut [&mut admin, &mut market],
         )
         .unwrap();
@@ -20708,7 +20897,10 @@ fn v16_wrapper_lp_fee_claim_is_junior_to_bad_debt_coverage() {
 
     // The draw actually happened and paid out.
     assert_eq!(payer_after.capital, 50, "charged 5/slot * 10 slots");
-    assert_eq!(cranker_after.capital, 20, "cranker takes 40% of the 50 charged");
+    assert_eq!(
+        cranker_after.capital, 20,
+        "cranker takes 40% of the 50 charged"
+    );
 
     // AND the claimable surplus is now BELOW the outstanding claim. This is the
     // seniority statement itself: the claim was not protected, and what backs it
@@ -21014,11 +21206,20 @@ fn v16_wrapper_insurance_withdraw_policy_is_settable() {
     let _mint = init_market(&mut admin, &mut market);
 
     let (before, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(before.insurance_withdraw_cooldown_slots, 0, "init writes zero");
-    assert_eq!(before.insurance_withdraw_deposits_only, 0, "init writes zero");
+    assert_eq!(
+        before.insurance_withdraw_cooldown_slots, 0,
+        "init writes zero"
+    );
+    assert_eq!(
+        before.insurance_withdraw_deposits_only, 0,
+        "init writes zero"
+    );
 
     run_ix(
-        Instruction::UpdateInsuranceWithdrawPolicy { deposits_only: 1, cooldown_slots: 100 },
+        Instruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 1,
+            cooldown_slots: 100,
+        },
         &mut [&mut admin, &mut market],
     )
     .expect("#427: marketauth must be able to set the insurance-withdrawal policy");
@@ -21030,7 +21231,10 @@ fn v16_wrapper_insurance_withdraw_policy_is_settable() {
     // Zero must stay legal — it is how a market turns the limit back OFF. Refusing it
     // would make the policy one-way, which is a different defect in the same family.
     run_ix(
-        Instruction::UpdateInsuranceWithdrawPolicy { deposits_only: 0, cooldown_slots: 0 },
+        Instruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 0,
+            cooldown_slots: 0,
+        },
         &mut [&mut admin, &mut market],
     )
     .expect("clearing the policy must remain possible");
@@ -21047,22 +21251,34 @@ fn v16_wrapper_insurance_withdraw_cooldown_is_bounded() {
 
     let max = percolator_prog::constants::MAX_INSURANCE_WITHDRAW_COOLDOWN_SLOTS;
     run_ix(
-        Instruction::UpdateInsuranceWithdrawPolicy { deposits_only: 0, cooldown_slots: max },
+        Instruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 0,
+            cooldown_slots: max,
+        },
         &mut [&mut admin, &mut market],
     )
     .expect("the cap itself must be accepted (boundary inclusive)");
 
     let over = run_ix(
-        Instruction::UpdateInsuranceWithdrawPolicy { deposits_only: 0, cooldown_slots: max + 1 },
+        Instruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 0,
+            cooldown_slots: max + 1,
+        },
         &mut [&mut admin, &mut market],
     );
     assert!(over.is_err(), "cooldown above the cap must be rejected");
 
     let forever = run_ix(
-        Instruction::UpdateInsuranceWithdrawPolicy { deposits_only: 0, cooldown_slots: u64::MAX },
+        Instruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 0,
+            cooldown_slots: u64::MAX,
+        },
         &mut [&mut admin, &mut market],
     );
-    assert!(forever.is_err(), "u64::MAX would freeze insurance withdrawals permanently");
+    assert!(
+        forever.is_err(),
+        "u64::MAX would freeze insurance withdrawals permanently"
+    );
 }
 
 #[test]
@@ -21073,12 +21289,21 @@ fn v16_wrapper_insurance_withdraw_policy_requires_marketauth() {
     let _mint = init_market(&mut admin, &mut market);
 
     let seized = run_ix(
-        Instruction::UpdateInsuranceWithdrawPolicy { deposits_only: 1, cooldown_slots: 10 },
+        Instruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 1,
+            cooldown_slots: 10,
+        },
         &mut [&mut attacker, &mut market],
     );
-    assert!(seized.is_err(), "a non-marketauth signer must not set the withdrawal policy");
+    assert!(
+        seized.is_err(),
+        "a non-marketauth signer must not set the withdrawal policy"
+    );
     let (cfg, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg.insurance_withdraw_cooldown_slots, 0, "state must be unchanged");
+    assert_eq!(
+        cfg.insurance_withdraw_cooldown_slots, 0,
+        "state must be unchanged"
+    );
 }
 
 // REACHABILITY PROOF: NOT HERE. `handle_withdraw_insurance` /
@@ -21126,7 +21351,10 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
              permanently resolve the market, and resolution is one-way"
         );
         let (cfg, _) = state::read_market(&market.data).unwrap();
-        assert_eq!(cfg.permissionless_resolve_stale_slots, 0, "state must be unchanged");
+        assert_eq!(
+            cfg.permissionless_resolve_stale_slots, 0,
+            "state must be unchanged"
+        );
     }
 
     // PROOF OF LIFE: both boundaries are inclusive and the instruction still works. Without
@@ -21158,7 +21386,10 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
         },
         &mut [&mut admin, &mut market],
     );
-    assert!(over.is_err(), "stale_slots above MAX must still be rejected");
+    assert!(
+        over.is_err(),
+        "stale_slots above MAX must still be rejected"
+    );
 }
 
 fn mint_account_with_decimals(decimals: u8) -> TestAccount {
@@ -21232,7 +21463,12 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
     run_ix(
         Instruction::TradeNoCpi {
             asset_index: 0,
@@ -21256,7 +21492,11 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
         cfg.permissionless_resolve_stale_slots = 9_000;
         cfg.last_good_oracle_slot = 0;
         group.current_slot = 20_000;
-        assert_eq!(group.mode, MarketModeV16::Live, "must still be Live for this gate");
+        assert_eq!(
+            group.mode,
+            MarketModeV16::Live,
+            "must still be Live for this gate"
+        );
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
 

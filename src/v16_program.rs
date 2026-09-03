@@ -28,8 +28,7 @@ use solana_program::{
     program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction,
-    system_program,
+    system_instruction, system_program,
     sysvar::Sysvar,
 };
 
@@ -43,11 +42,11 @@ pub mod constants {
     };
 
     pub const MAGIC: u64 = 0x5045_5243_5631_3600; // "PERCV16\0"
-    // Protocol-fee program change (taker-only trade fee + 20% protocol skim,
-    // see ~/v17/PROTOCOL-FEE-DESIGN.md): WrapperConfigV16 grows 432 -> 496 B
-    // (additive at the tail). Bump VERSION so `check_header` fail-closed
-    // rejects any pre-existing (old-layout) account rather than misparsing
-    // it -- this forces the explicitly-allowed devnet re-seed.
+                                                  // Protocol-fee program change (taker-only trade fee + 20% protocol skim,
+                                                  // see ~/v17/PROTOCOL-FEE-DESIGN.md): WrapperConfigV16 grows 432 -> 496 B
+                                                  // (additive at the tail). Bump VERSION so `check_header` fail-closed
+                                                  // rejects any pre-existing (old-layout) account rather than misparsing
+                                                  // it -- this forces the explicitly-allowed devnet re-seed.
     pub const VERSION: u16 = 17;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
@@ -141,7 +140,7 @@ pub mod constants {
     /// T summing to FEE_SHARE_TOTAL_BPS (8000), so each floor is `pct * 8000`.
     /// These three sum to exactly 8000, i.e. they are precisely complementary.
     pub const MAX_CREATOR_SHARE_BPS: u16 = 3600; // 45% of the remainder
-    pub const MIN_LP_SHARE_BPS: u16 = 3200;      // 40% of the remainder
+    pub const MIN_LP_SHARE_BPS: u16 = 3200; // 40% of the remainder
     pub const MIN_INSURANCE_SHARE_BPS: u16 = 1200; // 15% of the remainder
     /// Hardcoded fallback destination for the protocol's accrued fee share,
     /// set unconditionally at `InitMarket` (never an instruction argument).
@@ -425,8 +424,8 @@ pub mod constants {
         assert!(KIND_LP_VAULT_REGISTRY > KIND_INSURANCE_LEDGER); // 5 > 4
     const _ASSERT_KIND_LP_REDEMPTION_ABOVE: () =
         assert!(KIND_LP_REDEMPTION > KIND_LP_VAULT_REGISTRY); // 6 > 5
-    const _ASSERT_KIND_NFT_REGISTRY_ABOVE: () =
-        assert!(KIND_NFT_REGISTRY > KIND_LP_REDEMPTION); // 7 > 6
+    const _ASSERT_KIND_NFT_REGISTRY_ABOVE: () = assert!(KIND_NFT_REGISTRY > KIND_LP_REDEMPTION);
+    // 7 > 6
 }
 
 pub mod error {
@@ -468,18 +467,18 @@ pub mod error {
         // ── Fork LP Vault error codes (appended; ordinals 30-41 in enum order) ──
         // INVARIANT: these must remain appended after InvalidOracleKey (ordinal 29).
         // CI test in tests/v16_kani.rs asserts each ordinal. Do NOT reorder.
-        LpVaultAlreadyExists,        // Custom(30)
-        LpVaultNotFound,             // Custom(31)
-        LpVaultPaused,               // Custom(32)
-        LpVaultSharesOutstanding,    // Custom(33)
-        LpVaultZeroAmount,           // Custom(34)
-        LpVaultInsufficientShares,   // Custom(35)
-        LpVaultCooldownActive,       // Custom(36)
+        LpVaultAlreadyExists,         // Custom(30)
+        LpVaultNotFound,              // Custom(31)
+        LpVaultPaused,                // Custom(32)
+        LpVaultSharesOutstanding,     // Custom(33)
+        LpVaultZeroAmount,            // Custom(34)
+        LpVaultInsufficientShares,    // Custom(35)
+        LpVaultCooldownActive,        // Custom(36)
         LpVaultOiReservationViolated, // Custom(37)
-        LpVaultNoFeesToCrank,        // Custom(38)
-        LpVaultSupplyMismatch,       // Custom(39)
-        LpVaultAuthorityMismatch,    // Custom(40)
-        LpVaultZeroSharesMinted,     // Custom(41)
+        LpVaultNoFeesToCrank,         // Custom(38)
+        LpVaultSupplyMismatch,        // Custom(39)
+        LpVaultAuthorityMismatch,     // Custom(40)
+        LpVaultZeroSharesMinted,      // Custom(41)
         // ── Fork NFT / B-3 error codes (ordinals 42-46) ─────────────────────
         NftRegistryNotFound,         // Custom(42)
         NftPortfolioNotTransferable, // Custom(43)
@@ -488,7 +487,7 @@ pub mod error {
         NftPortfolioProvenance,      // Custom(46)
         // ── Insurance withdrawal policy enforcement (F-1 / F-2) ──────────────
         // Appended after NftPortfolioProvenance (ordinal 46). Do NOT reorder.
-        InsuranceWithdrawCooldownActive,  // Custom(47) — F-1: cooldown not elapsed
+        InsuranceWithdrawCooldownActive, // Custom(47) — F-1: cooldown not elapsed
         InsuranceWithdrawCeilingExceeded, // Custom(48) — F-2: deposits-only ceiling exceeded
         // ── FIX-2: distinct initial-margin failure code ─────────────────────
         // Appended after InsuranceWithdrawCeilingExceeded (ordinal 48). Do NOT reorder.
@@ -496,7 +495,7 @@ pub mod error {
         /// Previously collapsed into EngineInvalidConfig (0xe), now surfaced separately
         /// so clients can display "insufficient margin" rather than a generic config error.
         /// SDK agent: add `EngineInsufficientInitialMargin = 49` to the client error map.
-        EngineInsufficientInitialMargin,  // Custom(49)
+        EngineInsufficientInitialMargin, // Custom(49)
         // ── BUG-2 / N7: LP vault genesis dead-share floor ───────────────────
         // Appended after EngineInsufficientInitialMargin (ordinal 49). Do NOT reorder.
         /// The LP vault's TRUE first deposit (`registry.total_lp_shares_outstanding
@@ -654,9 +653,7 @@ pub mod error {
             V16Error::RecoveryRequired => PercolatorError::EngineRecoveryRequired,
             V16Error::CounterOverflow => PercolatorError::EngineCounterOverflow,
             V16Error::CounterUnderflow => PercolatorError::EngineCounterUnderflow,
-            V16Error::InsufficientInitialMargin => {
-                PercolatorError::EngineInsufficientInitialMargin
-            }
+            V16Error::InsufficientInitialMargin => PercolatorError::EngineInsufficientInitialMargin,
             // percolator#150 moved the zero-share deposit reject OUT of the wrapper and
             // INTO `lp_vault::lp_shares_for_deposit`, so the engine can now raise this
             // directly. It maps onto the Custom(41) the wrapper already raises at :14974
@@ -1538,19 +1535,14 @@ pub mod state {
     }
 
     #[inline]
-    pub fn commit_market_matcher_req_id(
-        data: &mut [u8],
-        req_id: u64,
-    ) -> Result<(), ProgramError> {
+    pub fn commit_market_matcher_req_id(data: &mut [u8], req_id: u64) -> Result<(), ProgramError> {
         check_header(data, KIND_MARKET)?;
         if req_id == 0 || req_id > MARKET_MATCHER_NONCE_MAX {
             return Err(PercolatorError::EngineArithmeticOverflow.into());
         }
-        data.get_mut(
-            MARKET_MATCHER_NONCE_OFF..MARKET_MATCHER_NONCE_OFF + MARKET_MATCHER_NONCE_LEN,
-        )
-        .ok_or(PercolatorError::InvalidAccountLen)?
-        .copy_from_slice(&req_id.to_le_bytes()[..MARKET_MATCHER_NONCE_LEN]);
+        data.get_mut(MARKET_MATCHER_NONCE_OFF..MARKET_MATCHER_NONCE_OFF + MARKET_MATCHER_NONCE_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&req_id.to_le_bytes()[..MARKET_MATCHER_NONCE_LEN]);
         Ok(())
     }
 
@@ -3516,8 +3508,8 @@ pub mod state {
     // ── Fork LP Vault state types (v17 re-expression) ─────────────────────
     use crate::constants::{
         KIND_LP_REDEMPTION, KIND_LP_VAULT_REGISTRY, KIND_NFT_REGISTRY, LP_ESCROW_SEED,
-        LP_VAULT_MINT_SEED, LP_VAULT_REGISTRY_SEED,
-        LP_VAULT_VERSION, NFT_REGISTRY_SEED, NFT_REGISTRY_VERSION,
+        LP_VAULT_MINT_SEED, LP_VAULT_REGISTRY_SEED, LP_VAULT_VERSION, NFT_REGISTRY_SEED,
+        NFT_REGISTRY_VERSION,
     };
 
     /// LP Vault registry account. Stored at `["lp_vault", market_group]` PDA.
@@ -3525,22 +3517,22 @@ pub mod state {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct LpVaultRegistryV16 {
-        pub market_group: [u8; 32],                // 0..32
-        pub lp_mint: [u8; 32],                     // 32..64
-        pub total_lp_shares_outstanding: u128,     // 64..80
-        pub insurance_fee_snapshot_atoms: u128,    // 80..96
-        pub fee_distribution_total_atoms: u128,    // 96..112
-        pub epoch: u64,                            // 112..120
-        pub redemption_cooldown_slots: u64,        // 120..128
-        pub fee_share_bps: u16,                    // 128..130
-        pub oi_reservation_threshold_bps: u16,     // 130..132
-        pub domain: u16,                           // 132..134
-        pub paused: u8,                            // 134
-        pub version: u8,                           // 135
-        pub bump: u8,                              // 136
-        pub mint_bump: u8,                         // 137
-        pub _padding: [u8; 6],                     // 138..144
-        pub _reserved: [u8; 16],                   // 144..160
+        pub market_group: [u8; 32],             // 0..32
+        pub lp_mint: [u8; 32],                  // 32..64
+        pub total_lp_shares_outstanding: u128,  // 64..80
+        pub insurance_fee_snapshot_atoms: u128, // 80..96
+        pub fee_distribution_total_atoms: u128, // 96..112
+        pub epoch: u64,                         // 112..120
+        pub redemption_cooldown_slots: u64,     // 120..128
+        pub fee_share_bps: u16,                 // 128..130
+        pub oi_reservation_threshold_bps: u16,  // 130..132
+        pub domain: u16,                        // 132..134
+        pub paused: u8,                         // 134
+        pub version: u8,                        // 135
+        pub bump: u8,                           // 136
+        pub mint_bump: u8,                      // 137
+        pub _padding: [u8; 6],                  // 138..144
+        pub _reserved: [u8; 16],                // 144..160
     }
     const _: () = assert!(core::mem::size_of::<LpVaultRegistryV16>() == 160);
 
@@ -3585,9 +3577,7 @@ pub mod state {
         Ok(())
     }
 
-    pub fn read_lp_vault_registry(
-        data: &[u8],
-    ) -> Result<LpVaultRegistryV16, ProgramError> {
+    pub fn read_lp_vault_registry(data: &[u8]) -> Result<LpVaultRegistryV16, ProgramError> {
         if data.len() < lp_vault_registry_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
@@ -3621,13 +3611,13 @@ pub mod state {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct LpRedemptionV16 {
-        pub registry: [u8; 32],   // 0..32
-        pub redeemer: [u8; 32],   // 32..64
-        pub shares: u128,         // 64..80
-        pub request_slot: u64,    // 80..88
-        pub version: u8,          // 88
-        pub bump: u8,             // 89
-        pub _padding: [u8; 6],    // 90..96
+        pub registry: [u8; 32], // 0..32
+        pub redeemer: [u8; 32], // 32..64
+        pub shares: u128,       // 64..80
+        pub request_slot: u64,  // 80..88
+        pub version: u8,        // 88
+        pub bump: u8,           // 89
+        pub _padding: [u8; 6],  // 90..96
     }
     const _: () = assert!(core::mem::size_of::<LpRedemptionV16>() == 96);
 
@@ -3890,7 +3880,6 @@ pub mod state {
             nft_program_id,
         )
     }
-
 }
 
 pub mod ix {
@@ -6330,13 +6319,11 @@ pub mod policy_v16 {
     /// HISTORICAL and no longer true — see the RETIRED banner on the
     /// declaration below. It is left in place because it documents the
     /// reasoning that produced the function.
-    #[deprecated(
-        note = "RETIRED: no live call sites. `2b3a6a65` removed this from \
+    #[deprecated(note = "RETIRED: no live call sites. `2b3a6a65` removed this from \
                 handle_update_backing_fee_policy / handle_update_trade_fee_policy. \
                 Live fee-split floors are enforced by `validate_fee_split`, called \
                 from `handle_update_fee_split` (tag 86). Retained only so its Kani \
-                proof and unit tests still compile."
-    )]
+                proof and unit tests still compile.")]
     pub fn fee_split_floor_ok(
         trade_fee_base_bps: u64,
         backing_fee_bps: u64,
@@ -6467,7 +6454,12 @@ pub mod policy_v16 {
         let insurance = fee
             .checked_sub(assigned)
             .ok_or(PercolatorError::EngineCounterUnderflow)?;
-        Ok(FeeSplitParts { protocol, creator, lp, insurance })
+        Ok(FeeSplitParts {
+            protocol,
+            creator,
+            lp,
+            insurance,
+        })
     }
 
     /// Exact fee-split validation for `UpdateFeeSplit` (2026-07-19 design).
@@ -6575,8 +6567,8 @@ pub mod processor {
         if max_abs_funding_e9_per_slot == 0 || max_accrual_dt_slots == 0 || initial_price == 0 {
             return;
         }
-        let rate_times_dt = (max_abs_funding_e9_per_slot as u128)
-            .saturating_mul(max_accrual_dt_slots as u128);
+        let rate_times_dt =
+            (max_abs_funding_e9_per_slot as u128).saturating_mul(max_accrual_dt_slots as u128);
         let best_case = rate_times_dt.saturating_mul(initial_price as u128);
         if best_case >= percolator::FUNDING_DEN {
             return;
@@ -7639,7 +7631,11 @@ pub mod processor {
                 to_domain,
                 amount,
             } => handle_rebalance_lp_vault_backing(
-                program_id, accounts, from_domain, to_domain, amount,
+                program_id,
+                accounts,
+                from_domain,
+                to_domain,
+                amount,
             ),
             Instruction::RequestRedeemLpShares { shares } => {
                 handle_request_redeem_lp_shares(program_id, accounts, shares)
@@ -7991,7 +7987,13 @@ pub mod processor {
             // Optional trailing accounts [6]=nft_registry [7]=PositionNft PDA [8]=signer NFT ATA.
             // Lets an NFT holder margin-defend a wrapped position (#146).
             let nft = optional_nft_holder_accounts(accounts, 6);
-            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
+            authorize_owner_or_nft_holder(
+                &portfolio,
+                portfolio_ai.key,
+                owner.key,
+                nft,
+                program_id,
+            )?;
             group
                 .deposit_not_atomic(&mut portfolio, amount)
                 .map_err(map_v16_error)?;
@@ -8056,7 +8058,13 @@ pub mod processor {
             // FUND-SAFETY: the dest-token check uses `owner.key` (the SIGNER), so an
             // NFT-holder withdrawal pays the HOLDER, never the escrow PDA.
             let nft = optional_nft_holder_accounts(accounts, 7);
-            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
+            authorize_owner_or_nft_holder(
+                &portfolio,
+                portfolio_ai.key,
+                owner.key,
+                nft,
+                program_id,
+            )?;
             group
                 .withdraw_not_atomic(&mut portfolio, amount)
                 .map_err(map_v16_error)?;
@@ -9430,7 +9438,11 @@ pub mod processor {
         ];
         invoke_signed(
             &ix,
-            &[matcher_delegate.clone(), matcher_ctx.clone(), matcher_prog.clone()],
+            &[
+                matcher_delegate.clone(),
+                matcher_ctx.clone(),
+                matcher_prog.clone(),
+            ],
             &[seeds],
         )
     }
@@ -10249,7 +10261,11 @@ pub mod processor {
         sibling_ledger_data: &[u8],
     ) -> Result<u128, ProgramError> {
         let own = lp_vault_domain_available_principal_atoms(
-            group, market_group, authority, domain, own_ledger_data,
+            group,
+            market_group,
+            authority,
+            domain,
+            own_ledger_data,
         )?;
         let sib = lp_vault_domain_available_principal_atoms(
             group,
@@ -10294,7 +10310,12 @@ pub mod processor {
             .header
             .insurance
             .get()
-            .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
+            .saturating_sub(
+                group
+                    .header
+                    .source_insurance_credit_reserved_total_atoms
+                    .get(),
+            )
             .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
         Ok(claim_capacity
             .min(engine_available)
@@ -10311,7 +10332,12 @@ pub mod processor {
         sibling_ledger_data: &[u8],
     ) -> Result<u128, ProgramError> {
         let own = lp_vault_domain_nav_atoms(
-            group, market_group, authority, domain, fee_share_bps, own_ledger_data,
+            group,
+            market_group,
+            authority,
+            domain,
+            fee_share_bps,
+            own_ledger_data,
         )?;
         let sib = lp_vault_domain_nav_atoms(
             group,
@@ -10600,8 +10626,7 @@ pub mod processor {
                 // not a newly observed recovery. Re-baseline it so the next
                 // sync cannot count the refill twice.
                 if !*initialized {
-                    let (_, bucket_after) =
-                        backing_domain_parts_view(&group, domain as usize)?;
+                    let (_, bucket_after) = backing_domain_parts_view(&group, domain as usize)?;
                     ledger.last_observed_unavailable_principal_atoms =
                         backing_unavailable_principal_atoms(&bucket_after)?;
                 }
@@ -10632,11 +10657,7 @@ pub mod processor {
 
                 seed_legacy_backing_domain_ledger(&mut ledger, &bucket)?;
                 group.validate_shape().map_err(map_v16_error)?;
-                write_or_init_backing_domain_ledger(
-                    &mut ledger_data,
-                    &ledger,
-                    initialized,
-                )?;
+                write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
             }
         }
 
@@ -11440,7 +11461,12 @@ pub mod processor {
                 .header
                 .insurance
                 .get()
-                .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
+                .saturating_sub(
+                    group
+                        .header
+                        .source_insurance_credit_reserved_total_atoms
+                        .get(),
+                )
                 .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
             let (transfer_amount, next_withdrawn) = protocol_fee_withdraw_amount(
                 cfg.protocol_fee_accrued_atoms,
@@ -12069,7 +12095,12 @@ pub mod processor {
                 .header
                 .insurance
                 .get()
-                .saturating_sub(group.header.source_insurance_credit_reserved_total_atoms.get())
+                .saturating_sub(
+                    group
+                        .header
+                        .source_insurance_credit_reserved_total_atoms
+                        .get(),
+                )
                 .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
             let transfer_amount = claim_capacity
                 .min(engine_available)
@@ -12332,7 +12363,13 @@ pub mod processor {
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 6.
             let nft = optional_nft_holder_accounts(accounts, 6);
-            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
+            authorize_owner_or_nft_holder(
+                &portfolio,
+                portfolio_ai.key,
+                owner.key,
+                nft,
+                program_id,
+            )?;
             group
                 .cure_and_cancel_close_not_atomic(&mut portfolio, optional_deposit)
                 .map_err(map_v16_error)?;
@@ -12463,8 +12500,10 @@ pub mod processor {
                             cfg_pre.maintenance_fee_per_slot,
                         )
                         .map_err(map_v16_error)?;
-                    let reward =
-                        maintenance_cranker_reward(charged, cfg_pre.maintenance_cranker_fee_share_bps)?;
+                    let reward = maintenance_cranker_reward(
+                        charged,
+                        cfg_pre.maintenance_cranker_fee_share_bps,
+                    )?;
                     if reward != 0 {
                         group
                             .credit_account_from_insurance_not_atomic(
@@ -12514,8 +12553,10 @@ pub mod processor {
                             cfg_pre.maintenance_fee_per_slot,
                         )
                         .map_err(map_v16_error)?;
-                    let reward =
-                        maintenance_cranker_reward(charged, cfg_pre.maintenance_cranker_fee_share_bps)?;
+                    let reward = maintenance_cranker_reward(
+                        charged,
+                        cfg_pre.maintenance_cranker_fee_share_bps,
+                    )?;
                     if reward != 0 {
                         group
                             .credit_account_from_insurance_not_atomic(
@@ -13132,7 +13173,8 @@ pub mod processor {
             // while seeing already-committed engine effects (active slot, decremented
             // free_market_slot_count). Performing the transfer first means the hook fires against
             // the pre-activation state, eliminating the re-entrancy window.
-            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts {
+            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
+            {
                 transfer_tokens(
                     token_program,
                     source_token,
@@ -13384,7 +13426,9 @@ pub mod processor {
                     // it must keep falling through untouched.
                     if matches!(
                         group.markets[asset_index].engine.asset.lifecycle,
-                        ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY | ASSET_LIFECYCLE_RECOVERY
+                        ASSET_LIFECYCLE_ACTIVE
+                            | ASSET_LIFECYCLE_DRAIN_ONLY
+                            | ASSET_LIFECYCLE_RECOVERY
                     ) {
                         return Err(PercolatorError::AssetSlotAlreadyConfigured.into());
                     }
@@ -14469,7 +14513,13 @@ pub mod processor {
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
             let nft = optional_nft_holder_accounts(accounts, 7);
-            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
+            authorize_owner_or_nft_holder(
+                &portfolio,
+                portfolio_ai.key,
+                owner.key,
+                nft,
+                program_id,
+            )?;
             if group.header.mode != 1 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -14560,7 +14610,13 @@ pub mod processor {
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
             let nft = optional_nft_holder_accounts(accounts, 7);
-            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
+            authorize_owner_or_nft_holder(
+                &portfolio,
+                portfolio_ai.key,
+                owner.key,
+                nft,
+                program_id,
+            )?;
             let payout = group
                 .claim_resolved_payout_topup_not_atomic(&mut portfolio)
                 .map_err(map_v16_error)?;
@@ -14772,7 +14828,10 @@ pub mod processor {
                     .insurance
                     .get()
                     .saturating_sub(insurance_before);
-                let reward = maintenance_cranker_reward(retained_fee, cfg.liquidation_cranker_fee_share_bps)?;
+                let reward = maintenance_cranker_reward(
+                    retained_fee,
+                    cfg.liquidation_cranker_fee_share_bps,
+                )?;
                 let reward = core::cmp::min(reward, retained_fee);
                 if reward != 0 {
                     // Protocol-fee RESERVE amendment: same reservation
@@ -15303,11 +15362,17 @@ pub mod processor {
         } else {
             shares
         };
-        let shares_u64 = u64::try_from(shares_to_mint)
-            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let shares_u64 =
+            u64::try_from(shares_to_mint).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
 
         // ── Phase 2: move depositor collateral into the backing vault. ──
-        transfer_tokens(token_program, source_token, vault_token, depositor, amount_u64)?;
+        transfer_tokens(
+            token_program,
+            source_token,
+            vault_token,
+            depositor,
+            amount_u64,
+        )?;
 
         // ── Phase 3: backing-bucket + ledger update. ──
         {
@@ -15488,7 +15553,10 @@ pub mod processor {
                 lp_mint.key,
                 &registry_pda,
             )?;
-            invoke(&init_ix, &[escrow_ai.clone(), lp_mint.clone(), token_program.clone()])?;
+            invoke(
+                &init_ix,
+                &[escrow_ai.clone(), lp_mint.clone(), token_program.clone()],
+            )?;
         }
 
         // Redemption PDA: one pending request per (registry, redeemer). Fail
@@ -15520,7 +15588,13 @@ pub mod processor {
         }
 
         // Escrow the shares (redeemer signs — owns the source).
-        transfer_tokens(token_program, redeemer_lp_ata, escrow_ai, redeemer, shares_u64)?;
+        transfer_tokens(
+            token_program,
+            redeemer_lp_ata,
+            escrow_ai,
+            redeemer,
+            shares_u64,
+        )?;
 
         // Record the request. total_lp_shares_outstanding UNCHANGED (I2 holds).
         let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
@@ -15894,8 +15968,7 @@ pub mod processor {
             return Err(PercolatorError::LpVaultNotFound.into());
         }
         let redeemer = Pubkey::new_from_array(redemption.redeemer);
-        let (redemption_pda, _) =
-            state::derive_lp_redemption(program_id, &registry_pda, &redeemer);
+        let (redemption_pda, _) = state::derive_lp_redemption(program_id, &registry_pda, &redeemer);
         expect_key(redemption_ai, &redemption_pda)?;
         if lp_mint.key.to_bytes() != registry.lp_mint {
             return Err(PercolatorError::InvalidMint.into());
@@ -17087,9 +17160,7 @@ pub mod processor {
         if p.resolved_payout_receipt.present != 0 {
             return Err(PercolatorError::NftPortfolioNotTransferable.into());
         }
-        if p.close_progress.active != 0
-            && p.close_progress.asset_index.get() == asset_index_u32
-        {
+        if p.close_progress.active != 0 && p.close_progress.asset_index.get() == asset_index_u32 {
             return Err(PercolatorError::NftPortfolioNotTransferable.into());
         }
         if leg.b_stale != 0 || leg.stale != 0 {
@@ -17100,8 +17171,7 @@ pub mod processor {
         p.owner = new_owner;
         p.provenance_header.owner = new_owner;
         debug_assert_eq!(
-            p.owner,
-            p.provenance_header.owner,
+            p.owner, p.provenance_header.owner,
             "b3: dual-write invariant violated"
         );
         debug_assert_eq!(p.owner, new_owner, "b3: owner not written");
@@ -17152,8 +17222,7 @@ pub mod processor {
         p.owner = new_owner;
         p.provenance_header.owner = new_owner;
         debug_assert_eq!(
-            p.owner,
-            p.provenance_header.owner,
+            p.owner, p.provenance_header.owner,
             "unwrap: dual-write invariant violated"
         );
         debug_assert_eq!(p.owner, new_owner, "unwrap: owner not written");
@@ -17293,8 +17362,7 @@ pub mod processor {
 
         // Read NftRegistry — FAIL-CLOSED: uninitialized = NftRegistryNotFound.
         let market_group_key = Pubkey::new_from_array(market_group_bytes);
-        let (expected_registry_pda, _) =
-            state::derive_nft_registry(program_id, &market_group_key);
+        let (expected_registry_pda, _) = state::derive_nft_registry(program_id, &market_group_key);
         expect_key(registry_ai, &expected_registry_pda)?;
         expect_owner(registry_ai, program_id)?;
 
@@ -17317,8 +17385,7 @@ pub mod processor {
             let p = state::portfolio_wire_mut(&mut data)?;
             b3_check_and_rewrite_owner(p, new_owner, asset_index)?;
             debug_assert_eq!(
-                p.owner,
-                p.provenance_header.owner,
+                p.owner, p.provenance_header.owner,
                 "b3 handler: dual-write invariant violated"
             );
         }
@@ -17372,8 +17439,7 @@ pub mod processor {
         };
 
         let market_group_key = Pubkey::new_from_array(market_group_bytes);
-        let (expected_registry_pda, _) =
-            state::derive_nft_registry(program_id, &market_group_key);
+        let (expected_registry_pda, _) = state::derive_nft_registry(program_id, &market_group_key);
         expect_key(registry_ai, &expected_registry_pda)?;
         expect_owner(registry_ai, program_id)?;
 
@@ -17398,8 +17464,7 @@ pub mod processor {
             let p = state::portfolio_wire_mut(&mut data)?;
             unwrap_check_and_rewrite_owner(p, new_owner, expected_mint_auth.to_bytes())?;
             debug_assert_eq!(
-                p.owner,
-                p.provenance_header.owner,
+                p.owner, p.provenance_header.owner,
                 "unwrap handler: dual-write invariant violated"
             );
         }
@@ -17411,9 +17476,7 @@ pub mod processor {
     // These are private to the processor module; identical logic to the original
     // fork but using percolator::wide_math (fork-facade re-export) for U256.
 
-    fn source_credit_available_backing_num(
-        state: SourceCreditStateV16,
-    ) -> Result<u128, V16Error> {
+    fn source_credit_available_backing_num(state: SourceCreditStateV16) -> Result<u128, V16Error> {
         if state.fresh_reserved_backing_num < state.valid_liened_backing_num
             || state.spent_backing_num < state.provider_receivable_num
         {
@@ -17429,15 +17492,11 @@ pub mod processor {
         state
             .fresh_reserved_backing_num
             .checked_sub(state.valid_liened_backing_num)
-            .and_then(|v| {
-                v.checked_add(state.insurance_credit_reserved_num - insurance_encumbered)
-            })
+            .and_then(|v| v.checked_add(state.insurance_credit_reserved_num - insurance_encumbered))
             .ok_or(V16Error::ArithmeticOverflow)
     }
 
-    fn expected_source_credit_rate_num(
-        state: SourceCreditStateV16,
-    ) -> Result<u128, V16Error> {
+    fn expected_source_credit_rate_num(state: SourceCreditStateV16) -> Result<u128, V16Error> {
         if state.exact_positive_claim_num > state.positive_claim_bound_num
             || state.credit_rate_num > percolator::CREDIT_RATE_SCALE
         {
@@ -17527,8 +17586,7 @@ pub mod processor {
                 .checked_add(amount_num)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?,
         );
-        source.credit_rate_num =
-            expected_source_credit_rate_num(source).map_err(map_v16_error)?;
+        source.credit_rate_num = expected_source_credit_rate_num(source).map_err(map_v16_error)?;
         source.credit_epoch = source
             .credit_epoch
             .checked_add(1)
@@ -17552,7 +17610,6 @@ pub mod processor {
     ) -> Result<&'a AccountInfo<'a>, ProgramError> {
         accounts.get(idx).ok_or(ProgramError::NotEnoughAccountKeys)
     }
-
 
     fn create_pda_account<'a>(
         payer: &AccountInfo<'a>,
@@ -17584,11 +17641,7 @@ pub mod processor {
 
             if have < rent_lamports {
                 invoke(
-                    &system_instruction::transfer(
-                        payer.key,
-                        target.key,
-                        rent_lamports - have,
-                    ),
+                    &system_instruction::transfer(payer.key, target.key, rent_lamports - have),
                     &[payer.clone(), target.clone(), system_program_ai.clone()],
                 )?;
             }
@@ -17781,16 +17834,24 @@ pub mod processor {
                 return Err(PercolatorError::Unauthorized.into());
             }
             let mut pa = [0u8; 32];
-            pa.copy_from_slice(&data[NFT_PDA_OFF_PORTFOLIO_ACCOUNT..NFT_PDA_OFF_PORTFOLIO_ACCOUNT + 32]);
+            pa.copy_from_slice(
+                &data[NFT_PDA_OFF_PORTFOLIO_ACCOUNT..NFT_PDA_OFF_PORTFOLIO_ACCOUNT + 32],
+            );
             let mut mint = [0u8; 32];
             mint.copy_from_slice(&data[NFT_PDA_OFF_NFT_MINT..NFT_PDA_OFF_NFT_MINT + 32]);
             let mut mid = [0u8; 8];
-            mid.copy_from_slice(&data[NFT_PDA_OFF_MARKET_ID_AT_MINT..NFT_PDA_OFF_MARKET_ID_AT_MINT + 8]);
+            mid.copy_from_slice(
+                &data[NFT_PDA_OFF_MARKET_ID_AT_MINT..NFT_PDA_OFF_MARKET_ID_AT_MINT + 8],
+            );
             (pa, mint, u64::from_le_bytes(mid))
         };
         // (3) Canonical PDA for that market_id under the trusted NFT program.
         let (expected_nft_pda, _) = Pubkey::find_program_address(
-            &[NFT_POSITION_SEED, portfolio_key.as_ref(), &market_id.to_le_bytes()],
+            &[
+                NFT_POSITION_SEED,
+                portfolio_key.as_ref(),
+                &market_id.to_le_bytes(),
+            ],
             &nft_program_id,
         );
         let pda_is_canonical = nft.nft_account.key == &expected_nft_pda;
@@ -18075,7 +18136,12 @@ pub mod processor {
             state::portfolio_view_mut_for_market_slots(&mut account_a_data, max_market_slots)?;
         let account_b =
             state::portfolio_view_mut_for_market_slots(&mut account_b_data, max_market_slots)?;
-        ensure_cpi_trade_asset_lifecycle_before_matcher(&group, &account_a, &account_b, cpi_requests)
+        ensure_cpi_trade_asset_lifecycle_before_matcher(
+            &group,
+            &account_a,
+            &account_b,
+            cpi_requests,
+        )
     }
 
     fn ensure_trade_portfolios_current_for_requests_view(
@@ -18087,7 +18153,6 @@ pub mod processor {
         ensure_trade_portfolio_current_for_requests_view(group, account_a, requests)?;
         ensure_trade_portfolio_current_for_requests_view(group, account_b, requests)
     }
-
 
     fn close_portfolio_account_to_market_slab(
         portfolio_ai: &AccountInfo<'_>,
@@ -18158,7 +18223,13 @@ pub mod processor {
         if owner_must_sign {
             // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 3.
             let nft = optional_nft_holder_accounts(accounts, 3);
-            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
+            authorize_owner_or_nft_holder(
+                &portfolio,
+                portfolio_ai.key,
+                owner.key,
+                nft,
+                program_id,
+            )?;
         }
         f(&mut group, &mut portfolio, &cfg).map_err(map_v16_error)?;
         group.validate_shape().map_err(map_v16_error)?;
@@ -19480,31 +19551,49 @@ pub mod processor {
             }
 
             // LP vault errors — ordinals 30-41 (matching enum order in error module).
-            assert_eq!(custom_code(PercolatorError::LpVaultAlreadyExists),         30);
-            assert_eq!(custom_code(PercolatorError::LpVaultNotFound),              31);
-            assert_eq!(custom_code(PercolatorError::LpVaultPaused),                32);
-            assert_eq!(custom_code(PercolatorError::LpVaultSharesOutstanding),     33);
-            assert_eq!(custom_code(PercolatorError::LpVaultZeroAmount),            34);
-            assert_eq!(custom_code(PercolatorError::LpVaultInsufficientShares),    35);
-            assert_eq!(custom_code(PercolatorError::LpVaultCooldownActive),        36);
-            assert_eq!(custom_code(PercolatorError::LpVaultOiReservationViolated), 37);
-            assert_eq!(custom_code(PercolatorError::LpVaultNoFeesToCrank),         38);
-            assert_eq!(custom_code(PercolatorError::LpVaultSupplyMismatch),        39);
-            assert_eq!(custom_code(PercolatorError::LpVaultAuthorityMismatch),     40);
-            assert_eq!(custom_code(PercolatorError::LpVaultZeroSharesMinted),      41);
+            assert_eq!(custom_code(PercolatorError::LpVaultAlreadyExists), 30);
+            assert_eq!(custom_code(PercolatorError::LpVaultNotFound), 31);
+            assert_eq!(custom_code(PercolatorError::LpVaultPaused), 32);
+            assert_eq!(custom_code(PercolatorError::LpVaultSharesOutstanding), 33);
+            assert_eq!(custom_code(PercolatorError::LpVaultZeroAmount), 34);
+            assert_eq!(custom_code(PercolatorError::LpVaultInsufficientShares), 35);
+            assert_eq!(custom_code(PercolatorError::LpVaultCooldownActive), 36);
+            assert_eq!(
+                custom_code(PercolatorError::LpVaultOiReservationViolated),
+                37
+            );
+            assert_eq!(custom_code(PercolatorError::LpVaultNoFeesToCrank), 38);
+            assert_eq!(custom_code(PercolatorError::LpVaultSupplyMismatch), 39);
+            assert_eq!(custom_code(PercolatorError::LpVaultAuthorityMismatch), 40);
+            assert_eq!(custom_code(PercolatorError::LpVaultZeroSharesMinted), 41);
 
             // NFT B-3 errors — ordinals 42-46 (matching enum order in error module).
-            assert_eq!(custom_code(PercolatorError::NftRegistryNotFound),          42);
-            assert_eq!(custom_code(PercolatorError::NftPortfolioNotTransferable),  43);
-            assert_eq!(custom_code(PercolatorError::NftTransferSelfOrZero),        44);
-            assert_eq!(custom_code(PercolatorError::NftInvalidMintAuthority),      45);
-            assert_eq!(custom_code(PercolatorError::NftPortfolioProvenance),       46);
-            assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCooldownActive),  47);
-            assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCeilingExceeded), 48);
+            assert_eq!(custom_code(PercolatorError::NftRegistryNotFound), 42);
+            assert_eq!(
+                custom_code(PercolatorError::NftPortfolioNotTransferable),
+                43
+            );
+            assert_eq!(custom_code(PercolatorError::NftTransferSelfOrZero), 44);
+            assert_eq!(custom_code(PercolatorError::NftInvalidMintAuthority), 45);
+            assert_eq!(custom_code(PercolatorError::NftPortfolioProvenance), 46);
+            assert_eq!(
+                custom_code(PercolatorError::InsuranceWithdrawCooldownActive),
+                47
+            );
+            assert_eq!(
+                custom_code(PercolatorError::InsuranceWithdrawCeilingExceeded),
+                48
+            );
             // FIX-2: distinct initial-margin error — ordinal 49.
-            assert_eq!(custom_code(PercolatorError::EngineInsufficientInitialMargin),  49);
+            assert_eq!(
+                custom_code(PercolatorError::EngineInsufficientInitialMargin),
+                49
+            );
             // BUG-2 / N7: LP vault genesis dead-share floor — ordinal 50.
-            assert_eq!(custom_code(PercolatorError::LpVaultDepositBelowMinimumLiquidity), 50);
+            assert_eq!(
+                custom_code(PercolatorError::LpVaultDepositBelowMinimumLiquidity),
+                50
+            );
         }
 
         /// Ordinals 0-29 — the UPSTREAM (toly) variants.
@@ -19539,43 +19628,43 @@ pub mod processor {
             }
 
             // Account//framing errors — 0-13.
-            assert_eq!(custom_code(PercolatorError::InvalidMagic),              0);
-            assert_eq!(custom_code(PercolatorError::InvalidVersion),            1);
-            assert_eq!(custom_code(PercolatorError::AlreadyInitialized),        2);
-            assert_eq!(custom_code(PercolatorError::NotInitialized),            3);
-            assert_eq!(custom_code(PercolatorError::InvalidAccountKind),        4);
-            assert_eq!(custom_code(PercolatorError::InvalidAccountLen),         5);
-            assert_eq!(custom_code(PercolatorError::ExpectedSigner),            6);
-            assert_eq!(custom_code(PercolatorError::ExpectedWritable),          7);
+            assert_eq!(custom_code(PercolatorError::InvalidMagic), 0);
+            assert_eq!(custom_code(PercolatorError::InvalidVersion), 1);
+            assert_eq!(custom_code(PercolatorError::AlreadyInitialized), 2);
+            assert_eq!(custom_code(PercolatorError::NotInitialized), 3);
+            assert_eq!(custom_code(PercolatorError::InvalidAccountKind), 4);
+            assert_eq!(custom_code(PercolatorError::InvalidAccountLen), 5);
+            assert_eq!(custom_code(PercolatorError::ExpectedSigner), 6);
+            assert_eq!(custom_code(PercolatorError::ExpectedWritable), 7);
             // The two the review called out as unprotected.
-            assert_eq!(custom_code(PercolatorError::Unauthorized),              8);
-            assert_eq!(custom_code(PercolatorError::InvalidInstruction),        9);
-            assert_eq!(custom_code(PercolatorError::InvalidMint),              10);
-            assert_eq!(custom_code(PercolatorError::InvalidTokenAccount),      11);
-            assert_eq!(custom_code(PercolatorError::InvalidVaultAccount),      12);
-            assert_eq!(custom_code(PercolatorError::InvalidTokenProgram),      13);
+            assert_eq!(custom_code(PercolatorError::Unauthorized), 8);
+            assert_eq!(custom_code(PercolatorError::InvalidInstruction), 9);
+            assert_eq!(custom_code(PercolatorError::InvalidMint), 10);
+            assert_eq!(custom_code(PercolatorError::InvalidTokenAccount), 11);
+            assert_eq!(custom_code(PercolatorError::InvalidVaultAccount), 12);
+            assert_eq!(custom_code(PercolatorError::InvalidTokenProgram), 13);
 
             // Engine errors — 14-25.
-            assert_eq!(custom_code(PercolatorError::EngineInvalidConfig),      14);
+            assert_eq!(custom_code(PercolatorError::EngineInvalidConfig), 14);
             assert_eq!(custom_code(PercolatorError::EngineArithmeticOverflow), 15);
             assert_eq!(custom_code(PercolatorError::EngineProvenanceMismatch), 16);
-            assert_eq!(custom_code(PercolatorError::EngineHiddenLeg),          17);
-            assert_eq!(custom_code(PercolatorError::EngineInvalidLeg),         18);
-            assert_eq!(custom_code(PercolatorError::EngineStale),              19);
-            assert_eq!(custom_code(PercolatorError::EngineBStale),             20);
-            assert_eq!(custom_code(PercolatorError::EngineLockActive),         21);
-            assert_eq!(custom_code(PercolatorError::EngineNonProgress),        22);
-            assert_eq!(custom_code(PercolatorError::EngineRecoveryRequired),   23);
-            assert_eq!(custom_code(PercolatorError::EngineCounterOverflow),    24);
-            assert_eq!(custom_code(PercolatorError::EngineCounterUnderflow),   25);
+            assert_eq!(custom_code(PercolatorError::EngineHiddenLeg), 17);
+            assert_eq!(custom_code(PercolatorError::EngineInvalidLeg), 18);
+            assert_eq!(custom_code(PercolatorError::EngineStale), 19);
+            assert_eq!(custom_code(PercolatorError::EngineBStale), 20);
+            assert_eq!(custom_code(PercolatorError::EngineLockActive), 21);
+            assert_eq!(custom_code(PercolatorError::EngineNonProgress), 22);
+            assert_eq!(custom_code(PercolatorError::EngineRecoveryRequired), 23);
+            assert_eq!(custom_code(PercolatorError::EngineCounterOverflow), 24);
+            assert_eq!(custom_code(PercolatorError::EngineCounterUnderflow), 25);
 
             // Oracle errors — 26-29. `InvalidOracleKey` (29) is the last
             // upstream variant; ordinal 30 must remain `LpVaultAlreadyExists`,
             // which is the boundary the test above starts from.
-            assert_eq!(custom_code(PercolatorError::OracleInvalid),            26);
-            assert_eq!(custom_code(PercolatorError::OracleStale),              27);
-            assert_eq!(custom_code(PercolatorError::OracleConfTooWide),        28);
-            assert_eq!(custom_code(PercolatorError::InvalidOracleKey),         29);
+            assert_eq!(custom_code(PercolatorError::OracleInvalid), 26);
+            assert_eq!(custom_code(PercolatorError::OracleStale), 27);
+            assert_eq!(custom_code(PercolatorError::OracleConfTooWide), 28);
+            assert_eq!(custom_code(PercolatorError::InvalidOracleKey), 29);
         }
 
         // ── F-1 cooldown gate (check_insurance_withdraw_cooldown) ────────────
@@ -19625,7 +19714,7 @@ pub mod processor {
             // amount <= remaining ⇒ decremented.
             assert_eq!(apply_insurance_withdraw_ceiling(1, 100, 40).unwrap(), 60);
             assert_eq!(apply_insurance_withdraw_ceiling(1, 100, 100).unwrap(), 0); // exact spend ok
-            // amount > remaining ⇒ ceiling exceeded (no underflow).
+                                                                                   // amount > remaining ⇒ ceiling exceeded (no underflow).
             assert_eq!(
                 apply_insurance_withdraw_ceiling(1, 100, 101).unwrap_err(),
                 PercolatorError::InsuranceWithdrawCeilingExceeded.into()

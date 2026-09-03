@@ -33,7 +33,10 @@ use std::path::PathBuf;
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
-    assert!(p.exists(), "wrapper BPF missing — run cargo build-sbf --no-default-features");
+    assert!(
+        p.exists(),
+        "wrapper BPF missing — run cargo build-sbf --no-default-features"
+    );
     p
 }
 
@@ -46,7 +49,10 @@ fn spl_token_program_path() -> PathBuf {
             h
         });
     for reg in std::fs::read_dir(cargo_home.join("registry/src")).expect("registry/src") {
-        let cand = reg.expect("entry").path().join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
+        let cand = reg
+            .expect("entry")
+            .path()
+            .join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
         if cand.exists() {
             return cand;
         }
@@ -111,8 +117,14 @@ fn init_market_ix() -> ProgInstruction {
 fn setup() -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
-    svm.add_program(program_id, &std::fs::read(program_path()).expect("read wrapper BPF"));
-    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("read token BPF"));
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("read wrapper BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("read token BPF"),
+    );
 
     let payer = Keypair::new();
     let admin = Keypair::new();
@@ -137,7 +149,8 @@ fn setup() -> Env {
             lamports: 1_000_000_000,
             data: vec![
                 0u8;
-                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()
+                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                    .unwrap()
             ],
             owner: program_id,
             executable: false,
@@ -160,7 +173,14 @@ fn setup() -> Env {
     )
     .expect("init market");
 
-    Env { svm, program_id, payer, admin, market, collateral_mint }
+    Env {
+        svm,
+        program_id,
+        payer,
+        admin,
+        market,
+        collateral_mint,
+    }
 }
 
 fn send(
@@ -171,7 +191,11 @@ fn send(
     accounts: Vec<AccountMeta>,
     extra_signers: &[&Keypair],
 ) -> Result<(), String> {
-    let instruction = Instruction { program_id, accounts, data: ix.encode() };
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: ix.encode(),
+    };
     let mut signers = vec![payer];
     signers.extend_from_slice(extra_signers);
     let tx = Transaction::new_signed_with_payer(
@@ -185,10 +209,17 @@ fn send(
         &signers,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
-fn create_lp_vault_accounts(market: Pubkey, registry: Pubkey, mint: Pubkey, admin: Pubkey) -> Vec<AccountMeta> {
+fn create_lp_vault_accounts(
+    market: Pubkey,
+    registry: Pubkey,
+    mint: Pubkey,
+    admin: Pubkey,
+) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(admin, true),
         // FIND-1 fix: market must be writable — CreateLpVault now writes
@@ -219,11 +250,21 @@ fn create_lp_vault_happy_path() {
     let admin = env.admin.insecure_clone();
     let accounts = create_lp_vault_accounts(env.market, registry, mint, admin.pubkey());
 
-    send(&mut env.svm, env.program_id, &env.payer, create_lp_vault_ix(5_000), accounts, &[&admin])
-        .expect("create lp vault");
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        create_lp_vault_ix(5_000),
+        accounts,
+        &[&admin],
+    )
+    .expect("create lp vault");
 
     // Registry account exists with expected config.
-    let reg_acct = env.svm.get_account(&registry).expect("registry account exists");
+    let reg_acct = env
+        .svm
+        .get_account(&registry)
+        .expect("registry account exists");
     assert_eq!(reg_acct.owner, env.program_id, "registry owned by wrapper");
     let reg = state::read_lp_vault_registry(&reg_acct.data).expect("registry decodes");
     assert_eq!(reg.market_group, env.market.to_bytes());
@@ -236,9 +277,17 @@ fn create_lp_vault_happy_path() {
 
     // LP mint exists, authority = registry PDA, supply 0, decimals 0.
     let mint_acct = env.svm.get_account(&mint).expect("mint account exists");
-    assert_eq!(mint_acct.owner, spl_token::ID, "mint owned by token program");
+    assert_eq!(
+        mint_acct.owner,
+        spl_token::ID,
+        "mint owned by token program"
+    );
     let m = Mint::unpack(&mint_acct.data).expect("mint decodes");
-    assert_eq!(m.mint_authority, COption::Some(registry), "mint authority is registry PDA");
+    assert_eq!(
+        m.mint_authority,
+        COption::Some(registry),
+        "mint authority is registry PDA"
+    );
     assert_eq!(m.supply, 0, "fresh mint supply 0");
     assert_eq!(m.decimals, 0, "LP shares are integer atoms");
     assert_eq!(m.freeze_authority, COption::None, "no freeze authority");
@@ -247,7 +296,10 @@ fn create_lp_vault_happy_path() {
     // FIND-1: CreateLpVault must bind the registry PDA as the asset's
     // backing_bucket_authority directly — no separate UpdateAssetAuthority
     // co-sign step (which is unreachable from a client for a PDA target).
-    let market_acct = env.svm.get_account(&env.market).expect("market account exists");
+    let market_acct = env
+        .svm
+        .get_account(&env.market)
+        .expect("market account exists");
     let profile = state::read_asset_oracle_profile(&market_acct.data, 0)
         .expect("asset 0 oracle profile decodes");
     assert_eq!(
@@ -263,13 +315,30 @@ fn create_lp_vault_rejects_non_admin() {
     let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
     let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
     let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 100_000_000_000).unwrap();
+    env.svm
+        .airdrop(&attacker.pubkey(), 100_000_000_000)
+        .unwrap();
     let accounts = create_lp_vault_accounts(env.market, registry, mint, attacker.pubkey());
 
-    let res = send(&mut env.svm, env.program_id, &env.payer, create_lp_vault_ix(5_000), accounts, &[&attacker]);
-    assert!(res.is_err(), "non-admin CreateLpVault must be rejected: {res:?}");
-    assert!(env.svm.get_account(&registry).map(|a| a.data.is_empty()).unwrap_or(true),
-        "registry must not be created on a rejected call");
+    let res = send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        create_lp_vault_ix(5_000),
+        accounts,
+        &[&attacker],
+    );
+    assert!(
+        res.is_err(),
+        "non-admin CreateLpVault must be rejected: {res:?}"
+    );
+    assert!(
+        env.svm
+            .get_account(&registry)
+            .map(|a| a.data.is_empty())
+            .unwrap_or(true),
+        "registry must not be created on a rejected call"
+    );
 }
 
 #[test]
@@ -279,13 +348,28 @@ fn create_lp_vault_double_create_rejected() {
     let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
     let admin = env.admin.insecure_clone();
 
-    send(&mut env.svm, env.program_id, &env.payer, create_lp_vault_ix(5_000),
-        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()), &[&admin])
-        .expect("first create");
+    send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        create_lp_vault_ix(5_000),
+        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()),
+        &[&admin],
+    )
+    .expect("first create");
 
-    let res = send(&mut env.svm, env.program_id, &env.payer, create_lp_vault_ix(5_000),
-        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()), &[&admin]);
-    assert!(res.is_err(), "second CreateLpVault on same market must be rejected: {res:?}");
+    let res = send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        create_lp_vault_ix(5_000),
+        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()),
+        &[&admin],
+    );
+    assert!(
+        res.is_err(),
+        "second CreateLpVault on same market must be rejected: {res:?}"
+    );
 }
 
 #[test]
@@ -296,8 +380,18 @@ fn create_lp_vault_rejects_fee_share_above_cap() {
     let admin = env.admin.insecure_clone();
     let accounts = create_lp_vault_accounts(env.market, registry, mint, admin.pubkey());
 
-    let res = send(&mut env.svm, env.program_id, &env.payer, create_lp_vault_ix(10_001), accounts, &[&admin]);
-    assert!(res.is_err(), "fee_share_bps > 10_000 must be rejected: {res:?}");
+    let res = send(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        create_lp_vault_ix(10_001),
+        accounts,
+        &[&admin],
+    );
+    assert!(
+        res.is_err(),
+        "fee_share_bps > 10_000 must be rejected: {res:?}"
+    );
 }
 
 /// Regression for #418: an unprivileged wallet can pre-fund a deterministic
@@ -313,11 +407,7 @@ fn create_lp_vault_succeeds_with_prefunded_registry_and_mint() {
     // Simulate an unrelated wallet pre-funding both deterministic PDAs.
     // Neither destination signs the transfer.
     for target in [registry, mint] {
-        let ix = solana_sdk::system_instruction::transfer(
-            &env.payer.pubkey(),
-            &target,
-            1,
-        );
+        let ix = solana_sdk::system_instruction::transfer(&env.payer.pubkey(), &target, 1);
         let tx = Transaction::new_signed_with_payer(
             &[ix],
             Some(&env.payer.pubkey()),
@@ -356,12 +446,7 @@ fn create_lp_vault_succeeds_with_prefunded_registry_and_mint() {
         env.program_id,
         &env.payer,
         create_lp_vault_ix(5_000),
-        create_lp_vault_accounts(
-            env.market,
-            registry,
-            mint,
-            admin.pubkey(),
-        ),
+        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()),
         &[&admin],
     );
 

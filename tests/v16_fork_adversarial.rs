@@ -39,6 +39,7 @@
 //! `tests/v16_nft_e2e.rs`. The LP-vault deferred tests live in
 //! `tests/v16_fork_lp_vault_*` and a Phase-2.E addition at the bottom of this file.
 
+use litesvm::LiteSVM;
 use percolator::POS_SCALE;
 use percolator_prog::{
     ix::Instruction as ProgInstruction,
@@ -55,7 +56,6 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::{Transaction, TransactionError},
 };
-use litesvm::LiteSVM;
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
@@ -85,18 +85,26 @@ const ASSET: u16 = 1;
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
-    assert!(p.exists(), "wrapper BPF missing at {p:?} — cargo build-sbf --no-default-features");
+    assert!(
+        p.exists(),
+        "wrapper BPF missing at {p:?} — cargo build-sbf --no-default-features"
+    );
     p
 }
 
 fn spl_token_program_path() -> PathBuf {
-    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        let mut h = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
-        h.push(".cargo");
-        h
-    });
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut h = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            h.push(".cargo");
+            h
+        });
     for reg in std::fs::read_dir(cargo_home.join("registry/src")).expect("registry/src") {
-        let cand = reg.expect("entry").path().join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
+        let cand = reg
+            .expect("entry")
+            .path()
+            .join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
         if cand.exists() {
             return cand;
         }
@@ -107,7 +115,13 @@ fn spl_token_program_path() -> PathBuf {
 fn make_mint_data() -> Vec<u8> {
     let mut d = vec![0u8; Mint::LEN];
     Mint::pack(
-        Mint { mint_authority: COption::None, supply: 0, decimals: 0, is_initialized: true, freeze_authority: COption::None },
+        Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals: 0,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        },
         &mut d,
     )
     .unwrap();
@@ -141,9 +155,14 @@ fn make_token_data(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
 fn assert_custom(res: Result<(), TransactionError>, code: u32, label: &str) {
     match res {
         Err(TransactionError::InstructionError(_, InstructionError::Custom(c))) => {
-            assert_eq!(c, code, "{label}: expected operative Custom({code}), got Custom({c})");
+            assert_eq!(
+                c, code,
+                "{label}: expected operative Custom({code}), got Custom({c})"
+            );
         }
-        Err(other) => panic!("{label}: expected operative Custom({code}), got non-Custom {other:?}"),
+        Err(other) => {
+            panic!("{label}: expected operative Custom({code}), got non-Custom {other:?}")
+        }
         Ok(()) => panic!("{label}: expected operative Custom({code}), but the tx SUCCEEDED"),
     }
 }
@@ -207,26 +226,83 @@ impl Env {
     /// maintenance — needed for the liquidation scenarios; low margins require a
     /// correspondingly low `max_price_move_bps_per_slot` to satisfy the engine's
     /// linear-budget config check at v16.rs:1398).
-    fn new_full(maintenance_margin_bps: u64, initial_margin_bps: u64, max_price_move_bps_per_slot: u64, trade_fee_base_bps: u64) -> Self {
+    fn new_full(
+        maintenance_margin_bps: u64,
+        initial_margin_bps: u64,
+        max_price_move_bps_per_slot: u64,
+        trade_fee_base_bps: u64,
+    ) -> Self {
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
-        svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
-        svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("token BPF"));
+        svm.add_program(
+            program_id,
+            &std::fs::read(program_path()).expect("wrapper BPF"),
+        );
+        svm.add_program(
+            spl_token::ID,
+            &std::fs::read(spl_token_program_path()).expect("token BPF"),
+        );
 
         let payer = Keypair::new();
         let admin = Keypair::new();
         let market = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
+        let (vault_authority, _) =
+            Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
         let vault = canonical_vault_ata(&vault_authority, &mint);
         svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 1_000_000_000_000).unwrap();
-        svm.set_account(mint, Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
-        svm.set_account(vault, Account { lamports: 1_000_000_000, data: make_token_data(mint, vault_authority, 0), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
-        svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()], owner: program_id, executable: false, rent_epoch: 0 }).unwrap();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_mint_data(),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            vault,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(mint, vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            market,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![
+                    0u8;
+                    state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                        .unwrap()
+                ],
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-        let portfolio_len = state::portfolio_account_len_for_market_slots(MAX_PORTFOLIO_ASSETS as usize).unwrap();
-        let mut env = Env { svm, program_id, payer, admin, market, mint, vault, vault_authority, portfolio_len };
+        let portfolio_len =
+            state::portfolio_account_len_for_market_slots(MAX_PORTFOLIO_ASSETS as usize).unwrap();
+        let mut env = Env {
+            svm,
+            program_id,
+            payer,
+            admin,
+            market,
+            mint,
+            vault,
+            vault_authority,
+            portfolio_len,
+        };
 
         env.send_ok(
             ProgInstruction::InitMarket {
@@ -279,28 +355,50 @@ impl Env {
                 backing_bucket_authority: admin.pubkey().to_bytes(),
                 oracle_authority: admin.pubkey().to_bytes(),
             },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(self.market, false)],
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
             &[&admin],
         )
         .expect("activate asset");
     }
 
-    fn try_send(&mut self, ix: ProgInstruction, accounts: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<(), TransactionError> {
+    fn try_send(
+        &mut self,
+        ix: ProgInstruction,
+        accounts: Vec<AccountMeta>,
+        signers: &[&Keypair],
+    ) -> Result<(), TransactionError> {
         // Fresh blockhash per send so byte-identical instructions (e.g. repeated
         // wash trades / convert attempts) don't collide as AlreadyProcessed.
         self.svm.expire_blockhash();
         let instructions = vec![
             ComputeBudgetInstruction::request_heap_frame(128 * 1024),
             ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-            Instruction { program_id: self.program_id, accounts, data: ix.encode() },
+            Instruction {
+                program_id: self.program_id,
+                accounts,
+                data: ix.encode(),
+            },
         ];
         let mut all = vec![&self.payer];
         all.extend_from_slice(signers);
-        let tx = Transaction::new_signed_with_payer(&instructions, Some(&self.payer.pubkey()), &all, self.svm.latest_blockhash());
+        let tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&self.payer.pubkey()),
+            &all,
+            self.svm.latest_blockhash(),
+        );
         self.svm.send_transaction(tx).map(|_| ()).map_err(|e| e.err)
     }
 
-    fn send_ok(&mut self, ix: ProgInstruction, accounts: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<(), TransactionError> {
+    fn send_ok(
+        &mut self,
+        ix: ProgInstruction,
+        accounts: Vec<AccountMeta>,
+        signers: &[&Keypair],
+    ) -> Result<(), TransactionError> {
         self.try_send(ix, accounts, signers)
     }
 
@@ -308,11 +406,24 @@ impl Env {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
         let portfolio = Pubkey::new_unique();
         self.svm
-            .set_account(portfolio, Account { lamports: 1_000_000_000, data: vec![0u8; self.portfolio_len], owner: self.program_id, executable: false, rent_epoch: 0 })
+            .set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; self.portfolio_len],
+                    owner: self.program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
             .unwrap();
         self.try_send(
             ProgInstruction::InitPortfolio,
-            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(portfolio, false)],
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
             &[owner],
         )
         .expect("init portfolio");
@@ -322,7 +433,16 @@ impl Env {
     fn deposit(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) {
         let source = Pubkey::new_unique();
         self.svm
-            .set_account(source, Account { lamports: 1_000_000_000, data: make_token_data(self.mint, owner.pubkey(), amount as u64), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, owner.pubkey(), amount as u64),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
             .unwrap();
         self.try_send(
             ProgInstruction::Deposit { amount },
@@ -340,9 +460,23 @@ impl Env {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_trade(&mut self, owner_a: &Keypair, account_a: Pubkey, owner_b: &Keypair, account_b: Pubkey, size_q: i128, exec_price: u64, fee_bps: u64) -> Result<(), TransactionError> {
+    fn try_trade(
+        &mut self,
+        owner_a: &Keypair,
+        account_a: Pubkey,
+        owner_b: &Keypair,
+        account_b: Pubkey,
+        size_q: i128,
+        exec_price: u64,
+        fee_bps: u64,
+    ) -> Result<(), TransactionError> {
         self.try_send(
-            ProgInstruction::TradeNoCpi { asset_index: ASSET, size_q, exec_price, fee_bps },
+            ProgInstruction::TradeNoCpi {
+                asset_index: ASSET,
+                size_q,
+                exec_price,
+                fee_bps,
+            },
             vec![
                 AccountMeta::new(owner_a.pubkey(), true),
                 AccountMeta::new(owner_b.pubkey(), true),
@@ -354,10 +488,25 @@ impl Env {
         )
     }
 
-    fn crank(&mut self, portfolio: Pubkey, action: u8, now_slot: u64) -> Result<(), TransactionError> {
+    fn crank(
+        &mut self,
+        portfolio: Pubkey,
+        action: u8,
+        now_slot: u64,
+    ) -> Result<(), TransactionError> {
         self.try_send(
-            ProgInstruction::PermissionlessCrank { action, asset_index: ASSET, now_slot, funding_rate_e9: 0, recovery_reason: 0 },
-            vec![AccountMeta::new(self.payer.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(portfolio, false)],
+            ProgInstruction::PermissionlessCrank {
+                action,
+                asset_index: ASSET,
+                now_slot,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
             &[],
         )
     }
@@ -366,7 +515,16 @@ impl Env {
         let source = Pubkey::new_unique();
         let admin = self.admin.insecure_clone();
         self.svm
-            .set_account(source, Account { lamports: 1_000_000_000, data: make_token_data(self.mint, admin.pubkey(), amount as u64), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, admin.pubkey(), amount as u64),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
             .unwrap();
         self.try_send(
             ProgInstruction::TopUpInsurance { amount },
@@ -389,8 +547,17 @@ impl Env {
     fn configure_ewma_mark(&mut self, now_slot: u64, initial_mark_e6: u64, halflife_slots: u64) {
         let admin = self.admin.insecure_clone();
         self.try_send(
-            ProgInstruction::ConfigureEwmaMark { asset_index: ASSET, now_slot, initial_mark_e6, mark_ewma_halflife_slots: halflife_slots, mark_min_fee: 0 },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(self.market, false)],
+            ProgInstruction::ConfigureEwmaMark {
+                asset_index: ASSET,
+                now_slot,
+                initial_mark_e6,
+                mark_ewma_halflife_slots: halflife_slots,
+                mark_min_fee: 0,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
             &[&admin],
         )
         .expect("configure ewma mark");
@@ -399,8 +566,15 @@ impl Env {
     fn push_ewma_mark(&mut self, now_slot: u64, mark_e6: u64) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
         self.try_send(
-            ProgInstruction::PushEwmaMark { asset_index: ASSET, now_slot, mark_e6 },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(self.market, false)],
+            ProgInstruction::PushEwmaMark {
+                asset_index: ASSET,
+                now_slot,
+                mark_e6,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
             &[&admin],
         )
     }
@@ -409,7 +583,10 @@ impl Env {
         let admin = self.admin.insecure_clone();
         self.try_send(
             ProgInstruction::ResolveMarket,
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(self.market, false)],
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
             &[&admin],
         )
     }
@@ -419,8 +596,18 @@ impl Env {
     /// argument -- the engine selects it (liquidation_engine_close_request_q).
     fn try_liquidate(&mut self, victim: Pubkey, now_slot: u64) -> Result<(), TransactionError> {
         self.try_send(
-            ProgInstruction::PermissionlessCrank { action: 1, asset_index: ASSET, now_slot, funding_rate_e9: 0, recovery_reason: 0 },
-            vec![AccountMeta::new(self.payer.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(victim, false)],
+            ProgInstruction::PermissionlessCrank {
+                action: 1,
+                asset_index: ASSET,
+                now_slot,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(victim, false),
+            ],
             &[],
         )
     }
@@ -430,30 +617,65 @@ impl Env {
     /// real oracle push + crank would have. Bypasses oracle-feed plumbing only;
     /// the resulting economic state (zero-sum mark-to-market) is faithful. The
     /// adversarial instructions below still go through the real program.
-    fn accrue_mark(&mut self, asset_index: u16, now_slot: u64, effective_price: u64) -> Result<(), String> {
+    fn accrue_mark(
+        &mut self,
+        asset_index: u16,
+        now_slot: u64,
+        effective_price: u64,
+    ) -> Result<(), String> {
         let mut acct = self.svm.get_account(&self.market).expect("market");
         {
-            let (_, mut group) = state::market_view_mut(&mut acct.data).map_err(|e| format!("{e:?}"))?;
+            let (_, mut group) =
+                state::market_view_mut(&mut acct.data).map_err(|e| format!("{e:?}"))?;
             group
-                .accrue_asset_to_not_atomic(asset_index as usize, now_slot, effective_price, 0, true)
+                .accrue_asset_to_not_atomic(
+                    asset_index as usize,
+                    now_slot,
+                    effective_price,
+                    0,
+                    true,
+                )
                 .map_err(|e| format!("{e:?}"))?;
         }
         self.svm.set_account(self.market, acct).unwrap();
         Ok(())
     }
 
-    fn try_convert(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Result<(), TransactionError> {
+    fn try_convert(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        amount: u128,
+    ) -> Result<(), TransactionError> {
         self.try_send(
             ProgInstruction::ConvertReleasedPnl { amount },
-            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(portfolio, false)],
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
             &[owner],
         )
     }
 
-    fn try_withdraw(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Result<(), TransactionError> {
+    fn try_withdraw(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        amount: u128,
+    ) -> Result<(), TransactionError> {
         let dest = Pubkey::new_unique();
         self.svm
-            .set_account(dest, Account { lamports: 1_000_000_000, data: make_token_data(self.mint, owner.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, owner.pubkey(), 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
             .unwrap();
         self.try_send(
             ProgInstruction::Withdraw { amount },
@@ -473,20 +695,39 @@ impl Env {
     fn try_close(&mut self, owner: &Keypair, portfolio: Pubkey) -> Result<(), TransactionError> {
         self.try_send(
             ProgInstruction::ClosePortfolio,
-            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(self.market, false), AccountMeta::new(portfolio, false)],
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
             &[owner],
         )
     }
 
     /// CloseResolved — returns (dest_token_account, result).
     /// dest is always created (owner of the token account = owner.pubkey()).
-    fn try_close_resolved(&mut self, owner: &Keypair, portfolio: Pubkey) -> (Pubkey, Result<(), TransactionError>) {
+    fn try_close_resolved(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+    ) -> (Pubkey, Result<(), TransactionError>) {
         let dest = Pubkey::new_unique();
         self.svm
-            .set_account(dest, Account { lamports: 1_000_000_000, data: make_token_data(self.mint, owner.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, owner.pubkey(), 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
             .unwrap();
         let res = self.try_send(
-            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
             vec![
                 AccountMeta::new_readonly(owner.pubkey(), false),
                 AccountMeta::new(self.market, false),
@@ -502,7 +743,12 @@ impl Env {
     }
 
     /// ClaimResolvedPayoutTopup — reuses an existing dest token account.
-    fn try_claim_resolved_payout_topup(&mut self, owner: &Keypair, portfolio: Pubkey, dest: Pubkey) -> Result<(), TransactionError> {
+    fn try_claim_resolved_payout_topup(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        dest: Pubkey,
+    ) -> Result<(), TransactionError> {
         self.try_send(
             ProgInstruction::ClaimResolvedPayoutTopup,
             vec![
@@ -522,7 +768,16 @@ impl Env {
     fn try_close_slab(&mut self) -> Result<(), TransactionError> {
         let dest = Pubkey::new_unique();
         self.svm
-            .set_account(dest, Account { lamports: 1_000_000_000, data: make_token_data(self.mint, self.admin.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, self.admin.pubkey(), 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
             .unwrap();
         let admin = self.admin.insecure_clone();
         self.try_send(
@@ -544,7 +799,12 @@ impl Env {
     }
 
     fn leg_size(&self, p: Pubkey) -> i128 {
-        self.portfolio(p).legs.iter().find(|l| l.active && l.asset_index as usize == ASSET as usize).map(|l| l.basis_pos_q).unwrap_or(0)
+        self.portfolio(p)
+            .legs
+            .iter()
+            .find(|l| l.active && l.asset_index as usize == ASSET as usize)
+            .map(|l| l.basis_pos_q)
+            .unwrap_or(0)
     }
 
     // -- readers --
@@ -559,7 +819,9 @@ impl Env {
     }
 
     fn token_amount(&self, key: Pubkey) -> u64 {
-        TokenAccount::unpack(&self.svm.get_account(&key).unwrap().data).unwrap().amount
+        TokenAccount::unpack(&self.svm.get_account(&key).unwrap().data)
+            .unwrap()
+            .amount
     }
 
     /// v12 attacker_account_equity (archive L80-84): capital + pnl + fee_credits.
@@ -601,18 +863,41 @@ fn adv_fee_revenue_not_trader_residual() {
 
     let mut successful_trades = 0u64;
     for round in 0..24u64 {
-        let size = if round % 2 == 0 { 20_000_000i128 } else { -20_000_000i128 };
-        if env.try_trade(&user, user_acct, &lp, lp_acct, size, 100, 100).is_ok() {
+        let size = if round % 2 == 0 {
+            20_000_000i128
+        } else {
+            -20_000_000i128
+        };
+        if env
+            .try_trade(&user, user_acct, &lp, lp_acct, size, 100, 100)
+            .is_ok()
+        {
             successful_trades += 1;
         }
         let _ = env.crank(user_acct, 0, 100 + round);
-        assert_eq!(env.residual(), 0, "fees must route to insurance, not residual, after round {round}");
+        assert_eq!(
+            env.residual(),
+            0,
+            "fees must route to insurance, not residual, after round {round}"
+        );
     }
 
     // Anti-hollow guard: the wash trades actually executed.
-    assert!(successful_trades > 0, "probe did not execute any wash trade");
-    assert!(env.group().insurance > insurance_before, "wash-trade fees must accrue into insurance (insurance {} -> {})", insurance_before, env.group().insurance);
-    assert_eq!(env.group().vault as u64, env.token_amount(env.vault), "engine vault and SPL vault must stay synchronized");
+    assert!(
+        successful_trades > 0,
+        "probe did not execute any wash trade"
+    );
+    assert!(
+        env.group().insurance > insurance_before,
+        "wash-trade fees must accrue into insurance (insurance {} -> {})",
+        insurance_before,
+        env.group().insurance
+    );
+    assert_eq!(
+        env.group().vault as u64,
+        env.token_amount(env.vault),
+        "engine vault and SPL vault must stay synchronized"
+    );
 }
 
 // ===========================================================================
@@ -638,8 +923,15 @@ fn adv_fee_cycling_wash_trades_no_rebate_siphon() {
 
     let mut successful_trades = 0u64;
     for round in 0..20u64 {
-        let size = if round % 2 == 0 { 10_000_000i128 } else { -10_000_000i128 };
-        if env.try_trade(&user, user_acct, &lp, lp_acct, size, 100, 100).is_ok() {
+        let size = if round % 2 == 0 {
+            10_000_000i128
+        } else {
+            -10_000_000i128
+        };
+        if env
+            .try_trade(&user, user_acct, &lp, lp_acct, size, 100, 100)
+            .is_ok()
+        {
             successful_trades += 1;
         }
         let _ = env.crank(user_acct, 0, 100 + round);
@@ -647,8 +939,16 @@ fn adv_fee_cycling_wash_trades_no_rebate_siphon() {
         assert!(wealth <= initial_deposits + TOL, "fee-cycling wash trades extracted net value after round {round}: wealth={wealth} deposits={initial_deposits}");
     }
 
-    assert!(successful_trades > 0, "probe did not execute any wash trade");
-    assert!(env.group().insurance >= insurance_before, "wash-trade fees must not reduce insurance: {} -> {}", insurance_before, env.group().insurance);
+    assert!(
+        successful_trades > 0,
+        "probe did not execute any wash trade"
+    );
+    assert!(
+        env.group().insurance >= insurance_before,
+        "wash-trade fees must not reduce insurance: {} -> {}",
+        insurance_before,
+        env.group().insurance
+    );
     assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
 }
 
@@ -682,7 +982,8 @@ fn adv_yfi_style_profit_recycling_no_net_extraction() {
 
     // Open: user long / lp short.
     let size = POS_SCALE as i128 * 100;
-    env.try_trade(&user, ua, &lp, la, size, 100, 0).expect("open long/short");
+    env.try_trade(&user, ua, &lp, la, size, 100, 0)
+        .expect("open long/short");
 
     // Push the long into profit (zero-sum: lp's capital takes the offsetting loss).
     // The clock advances past one accrual segment, so the asset's loss-state is
@@ -692,7 +993,10 @@ fn adv_yfi_style_profit_recycling_no_net_extraction() {
     env.accrue_mark(ASSET, 10, 150).expect("accrue mark up");
     let _ = env.crank(ua, 0, 10);
     let _ = env.crank(la, 0, 10);
-    assert!(env.portfolio(ua).pnl > 0, "fixture must create positive long PnL");
+    assert!(
+        env.portfolio(ua).pnl > 0,
+        "fixture must create positive long PnL"
+    );
 
     // PHASE A — recycle attempt while the losing leg is open. Two layered v16
     // locks reject the premature extraction, each at its OPERATIVE economic gate:
@@ -707,13 +1011,30 @@ fn adv_yfi_style_profit_recycling_no_net_extraction() {
     // Both reject atomically (no capital/PnL movement).
     let cap_before = env.portfolio(ua).capital;
     let pnl_before = env.portfolio(ua).pnl;
-    assert_custom(env.try_convert(&user, ua, 1_000_000_000), E_LOCK_ACTIVE, "convert released PnL while losing leg open (favorable-action lock)");
-    assert_custom(env.try_withdraw(&user, ua, 1), E_STALE, "withdraw while position open");
-    assert_eq!(env.portfolio(ua).capital, cap_before, "rejected convert/withdraw must not move capital");
-    assert_eq!(env.portfolio(ua).pnl, pnl_before, "rejected convert/withdraw must not move PnL");
+    assert_custom(
+        env.try_convert(&user, ua, 1_000_000_000),
+        E_LOCK_ACTIVE,
+        "convert released PnL while losing leg open (favorable-action lock)",
+    );
+    assert_custom(
+        env.try_withdraw(&user, ua, 1),
+        E_STALE,
+        "withdraw while position open",
+    );
+    assert_eq!(
+        env.portfolio(ua).capital,
+        cap_before,
+        "rejected convert/withdraw must not move capital"
+    );
+    assert_eq!(
+        env.portfolio(ua).pnl,
+        pnl_before,
+        "rejected convert/withdraw must not move PnL"
+    );
 
     // PHASE B — realize by closing the leg (sell back at the marked price).
-    env.try_trade(&user, ua, &lp, la, -size, 150, 0).expect("close leg");
+    env.try_trade(&user, ua, &lp, la, -size, 150, 0)
+        .expect("close leg");
     assert_eq!(env.leg_size(ua), 0, "user must be flat after close");
 
     // PHASE C — now genuinely-backed profit is convertible/withdrawable, but the
@@ -731,9 +1052,20 @@ fn adv_yfi_style_profit_recycling_no_net_extraction() {
         assert!(wealth <= initial + TOL, "profit recycling extracted net value: wealth={wealth} initial={initial} withdrawn={withdrawn} ua_eq={} la_eq={}", env.equity(ua), env.equity(la));
     }
 
-    assert!(successful_withdrawals > 0, "probe did not exercise the withdrawal leg after realizing profit");
-    assert_eq!(env.group().insurance, insurance_before, "profit-recycling loop must not draw from insurance");
-    assert_eq!(env.group().vault as u64, env.token_amount(env.vault), "engine vault and SPL vault must stay synchronized");
+    assert!(
+        successful_withdrawals > 0,
+        "probe did not exercise the withdrawal leg after realizing profit"
+    );
+    assert_eq!(
+        env.group().insurance,
+        insurance_before,
+        "profit-recycling loop must not draw from insurance"
+    );
+    assert_eq!(
+        env.group().vault as u64,
+        env.token_amount(env.vault),
+        "engine vault and SPL vault must stay synchronized"
+    );
 }
 
 // ===========================================================================
@@ -759,19 +1091,32 @@ fn adv_lp_side_profit_recycling_no_net_extraction() {
 
     // user long / lp short, then price DOWN -> the short (lp) wins.
     let size = POS_SCALE as i128 * 100;
-    env.try_trade(&user, ua, &lp, la, size, 100, 0).expect("open");
+    env.try_trade(&user, ua, &lp, la, size, 100, 0)
+        .expect("open");
     env.warp(10);
     env.accrue_mark(ASSET, 10, 50).expect("accrue mark down");
     let _ = env.crank(ua, 0, 10);
     let _ = env.crank(la, 0, 10);
-    assert!(env.portfolio(la).pnl > 0, "LP short must be in profit after price drop");
+    assert!(
+        env.portfolio(la).pnl > 0,
+        "LP short must be in profit after price drop"
+    );
 
     // PHASE A — locked while the losing long leg is open.
-    assert_custom(env.try_convert(&lp, la, 1_000_000_000), E_LOCK_ACTIVE, "LP convert while leg open");
-    assert_custom(env.try_withdraw(&lp, la, 1), E_STALE, "LP withdraw while leg open");
+    assert_custom(
+        env.try_convert(&lp, la, 1_000_000_000),
+        E_LOCK_ACTIVE,
+        "LP convert while leg open",
+    );
+    assert_custom(
+        env.try_withdraw(&lp, la, 1),
+        E_STALE,
+        "LP withdraw while leg open",
+    );
 
     // PHASE B/C — realize and extract; bounded by deposits, insurance untouched.
-    env.try_trade(&user, ua, &lp, la, -size, 50, 0).expect("close");
+    env.try_trade(&user, ua, &lp, la, -size, 50, 0)
+        .expect("close");
     assert_eq!(env.leg_size(la), 0);
     let mut withdrawn = 0i128;
     let mut successful_withdrawals = 0u64;
@@ -782,10 +1127,19 @@ fn adv_lp_side_profit_recycling_no_net_extraction() {
             successful_withdrawals += 1;
         }
         let wealth = withdrawn + env.equity(ua) + env.equity(la);
-        assert!(wealth <= initial + TOL, "LP-side recycling extracted net value: wealth={wealth} initial={initial}");
+        assert!(
+            wealth <= initial + TOL,
+            "LP-side recycling extracted net value: wealth={wealth} initial={initial}"
+        );
     }
-    assert!(successful_withdrawals > 0, "LP did not exercise the withdrawal leg");
-    assert!(env.group().insurance >= insurance_before, "LP recycling must not draw from insurance");
+    assert!(
+        successful_withdrawals > 0,
+        "LP did not exercise the withdrawal leg"
+    );
+    assert!(
+        env.group().insurance >= insurance_before,
+        "LP recycling must not draw from insurance"
+    );
     assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
 }
 
@@ -814,7 +1168,8 @@ fn adv_whipsaw_profit_recycling_no_net_extraction() {
     let size = POS_SCALE as i128 * 100;
 
     // Open and hold ONE position across the whole whipsaw (never closed).
-    env.try_trade(&user, ua, &lp, la, size, 100, 0).expect("open");
+    env.try_trade(&user, ua, &lp, la, size, 100, 0)
+        .expect("open");
 
     // Up-swing: user long is in profit. Recycle attempt -> locked at the
     // operative defenses, nothing extracted.
@@ -822,11 +1177,25 @@ fn adv_whipsaw_profit_recycling_no_net_extraction() {
     env.accrue_mark(ASSET, 10, 150).expect("accrue up");
     let _ = env.crank(ua, 0, 10);
     let _ = env.crank(la, 0, 10);
-    assert!(env.portfolio(ua).pnl > 0, "user must be in profit on the up-swing");
-    assert_custom(env.try_convert(&user, ua, 1_000_000_000), E_LOCK_ACTIVE, "convert during up-swing");
-    assert_custom(env.try_withdraw(&user, ua, 250_000_000), E_STALE, "withdraw during up-swing");
+    assert!(
+        env.portfolio(ua).pnl > 0,
+        "user must be in profit on the up-swing"
+    );
+    assert_custom(
+        env.try_convert(&user, ua, 1_000_000_000),
+        E_LOCK_ACTIVE,
+        "convert during up-swing",
+    );
+    assert_custom(
+        env.try_withdraw(&user, ua, 250_000_000),
+        E_STALE,
+        "withdraw during up-swing",
+    );
     let wealth_up = env.equity(ua) + env.equity(la);
-    assert!(wealth_up <= initial + TOL, "up-swing wealth unbounded: {wealth_up} > {initial}");
+    assert!(
+        wealth_up <= initial + TOL,
+        "up-swing wealth unbounded: {wealth_up} > {initial}"
+    );
 
     // Reversal: price falls back; the long's paper profit evaporates. The lock
     // still holds — still nothing extracted.
@@ -834,14 +1203,32 @@ fn adv_whipsaw_profit_recycling_no_net_extraction() {
     env.accrue_mark(ASSET, 20, 100).expect("accrue down");
     let _ = env.crank(ua, 0, 20);
     let _ = env.crank(la, 0, 20);
-    assert_custom(env.try_convert(&user, ua, 1_000_000_000), E_LOCK_ACTIVE, "convert after reversal");
-    assert_custom(env.try_withdraw(&user, ua, 250_000_000), E_STALE, "withdraw after reversal");
+    assert_custom(
+        env.try_convert(&user, ua, 1_000_000_000),
+        E_LOCK_ACTIVE,
+        "convert after reversal",
+    );
+    assert_custom(
+        env.try_withdraw(&user, ua, 250_000_000),
+        E_STALE,
+        "withdraw after reversal",
+    );
 
     // Nothing was ever extracted; wealth bounded; insurance untouched.
     let wealth_final = env.equity(ua) + env.equity(la);
-    assert!(wealth_final <= initial + TOL, "whipsaw extracted net value: {wealth_final} > {initial}");
-    assert_eq!(env.portfolio(ua).capital, user_dep, "no unmatured profit ever became capital");
-    assert!(env.group().insurance >= insurance_before, "whipsaw recycling must not drain insurance");
+    assert!(
+        wealth_final <= initial + TOL,
+        "whipsaw extracted net value: {wealth_final} > {initial}"
+    );
+    assert_eq!(
+        env.portfolio(ua).capital,
+        user_dep,
+        "no unmatured profit ever became capital"
+    );
+    assert!(
+        env.group().insurance >= insurance_before,
+        "whipsaw recycling must not drain insurance"
+    );
     assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
 }
 
@@ -871,7 +1258,8 @@ fn adv_min_position_whipsaw_no_rounding_mint() {
     assert_eq!(env.residual(), 0, "fresh market residual must be 0");
 
     // size_q = 1: a single sub-POS_SCALE quantum long.
-    env.try_trade(&user, ua, &lp, la, 1, 100, 0).expect("open min position");
+    env.try_trade(&user, ua, &lp, la, 1, 100, 0)
+        .expect("open min position");
 
     // Whipsaw the mark through several bounded moves, cranking between.
     let mut slot = 5u64;
@@ -881,16 +1269,29 @@ fn adv_min_position_whipsaw_no_rounding_mint() {
         let _ = env.crank(ua, 0, slot);
         let _ = env.crank(la, 0, slot);
         let wealth = env.equity(ua) + env.equity(la);
-        assert!(wealth <= initial + TOL, "min-position whipsaw minted value at price {price}: {wealth} > {initial}");
+        assert!(
+            wealth <= initial + TOL,
+            "min-position whipsaw minted value at price {price}: {wealth} > {initial}"
+        );
         slot += 5;
     }
 
     // Close the quantum; conservation must still hold exactly.
     let _ = env.try_trade(&user, ua, &lp, la, -1, 100, 0);
     let wealth = env.equity(ua) + env.equity(la);
-    assert!(wealth <= initial + TOL, "min-position whipsaw final extraction: {wealth} > {initial}");
-    assert!(env.group().insurance >= insurance_before, "min-position whipsaw must not drain insurance");
-    assert_eq!(env.group().vault as u64, env.token_amount(env.vault), "engine vault and SPL vault desynced");
+    assert!(
+        wealth <= initial + TOL,
+        "min-position whipsaw final extraction: {wealth} > {initial}"
+    );
+    assert!(
+        env.group().insurance >= insurance_before,
+        "min-position whipsaw must not drain insurance"
+    );
+    assert_eq!(
+        env.group().vault as u64,
+        env.token_amount(env.vault),
+        "engine vault and SPL vault desynced"
+    );
 }
 
 // ===========================================================================
@@ -972,7 +1373,10 @@ fn adv_many_one_unit_trades_no_rounding_accumulation() {
         // `expected_fee_per_trade` (ceil-notional fee) into insurance, taken
         // from the taker's (`ua`) capital. Pre-E4 the floor-notional bug made
         // this fee-less; see the header comment for the derivation.
-        if env.try_trade(&user, ua, &lp, la, size, exec_price, trade_fee_bps).is_ok() {
+        if env
+            .try_trade(&user, ua, &lp, la, size, exec_price, trade_fee_bps)
+            .is_ok()
+        {
             successful += 1;
         }
         if round % 10 == 0 {
@@ -981,12 +1385,19 @@ fn adv_many_one_unit_trades_no_rounding_accumulation() {
             let _ = env.crank(ua, 0, slot);
         }
         let wealth = env.equity(ua) + env.equity(la);
-        assert!(wealth <= initial + TOL, "one-unit trades accumulated value after round {round}: {wealth} > {initial}");
+        assert!(
+            wealth <= initial + TOL,
+            "one-unit trades accumulated value after round {round}: {wealth} > {initial}"
+        );
     }
 
     assert!(successful > 0, "probe did not execute any one-unit trade");
     assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
-    assert_eq!(env.residual(), 0, "one-unit trades must not create trader-claimable residual");
+    assert_eq!(
+        env.residual(),
+        0,
+        "one-unit trades must not create trader-claimable residual"
+    );
 
     // LOAD-BEARING E4 ceil-notional check (repairs the pre-E4 assertion that
     // insurance stayed EXACTLY unchanged, which enshrined the floor-notional
@@ -1013,9 +1424,21 @@ fn adv_many_one_unit_trades_no_rounding_accumulation() {
         "taker capital must be debited by EXACTLY the ceil-notional fee total -- no more (dust \
          accumulation), no less (fee evasion regressing E4)"
     );
-    assert_eq!(env.portfolio(la).capital, lp_dep, "maker capital must be untouched by the taker-only fee");
-    assert_eq!(env.portfolio(ua).pnl, 0, "sub-quantum trades accumulated user PnL dust");
-    assert_eq!(env.portfolio(la).pnl, 0, "sub-quantum trades accumulated LP PnL dust");
+    assert_eq!(
+        env.portfolio(la).capital,
+        lp_dep,
+        "maker capital must be untouched by the taker-only fee"
+    );
+    assert_eq!(
+        env.portfolio(ua).pnl,
+        0,
+        "sub-quantum trades accumulated user PnL dust"
+    );
+    assert_eq!(
+        env.portfolio(la).pnl,
+        0,
+        "sub-quantum trades accumulated LP PnL dust"
+    );
 }
 
 // ===========================================================================
@@ -1054,7 +1477,8 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
 
     // lp long / weak short (1 unit, notional 100, 100% margin -> 100 locked).
     let size = POS_SCALE as i128;
-    env.try_trade(&lp, la, &weak, wa, size, 100, 0).expect("open");
+    env.try_trade(&lp, la, &weak, wa, size, 100, 0)
+        .expect("open");
     let weak_pos_before = env.leg_size(wa).unsigned_abs();
 
     // Push the mark up to 400: the short's loss (300) EXCEEDS its 250 deposit, so
@@ -1066,23 +1490,42 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
         let _ = env.crank(wa, 0, slot);
         let _ = env.crank(la, 0, slot);
     }
-    env.try_liquidate(wa, 30).expect("liquidation of the bankrupt short must succeed");
+    env.try_liquidate(wa, 30)
+        .expect("liquidation of the bankrupt short must succeed");
 
     // EXECUTED-GUARD (load-bearing): the liquidation actually fired — the toxic
     // leg is CLOSED (not merely "not grown"). Without this a silent no-op would
     // pass the bounds below.
-    assert_eq!(env.leg_size(wa), 0, "liquidation must close the toxic leg (it did not fire)");
-    assert!(env.leg_size(wa).unsigned_abs() <= weak_pos_before, "liquidation increased toxic exposure");
+    assert_eq!(
+        env.leg_size(wa),
+        0,
+        "liquidation must close the toxic leg (it did not fire)"
+    );
+    assert!(
+        env.leg_size(wa).unsigned_abs() <= weak_pos_before,
+        "liquidation increased toxic exposure"
+    );
     // OPERATIVE anti-extraction: the attacker controlling both legs cannot end up
     // with more than deposited — a siphon of insurance INTO the attacker's accounts
     // would push wealth above deposits; it does not.
     let wealth = env.equity(wa) + env.equity(la);
-    assert!(wealth <= initial + TOL, "self-liquidation extracted net value: {wealth} > {initial}");
-    assert_eq!(env.group().vault as u64, env.token_amount(env.vault), "engine vault and SPL vault desynced");
+    assert!(
+        wealth <= initial + TOL,
+        "self-liquidation extracted net value: {wealth} > {initial}"
+    );
+    assert_eq!(
+        env.group().vault as u64,
+        env.token_amount(env.vault),
+        "engine vault and SPL vault desynced"
+    );
     // Observation (not the operative guarantee — see header): the plain top-up
     // credited a different domain than the bankrupt short's, so the per-domain
     // backstop draws nothing here.
-    assert_eq!(env.group().insurance, insurance_before, "fixture invariant: untouched insurance lives in a different domain than the loss");
+    assert_eq!(
+        env.group().insurance,
+        insurance_before,
+        "fixture invariant: untouched insurance lives in a different domain than the loss"
+    );
 }
 
 // ===========================================================================
@@ -1105,10 +1548,15 @@ fn adv_zero_insurance_self_liquidation_no_net_extraction() {
     env.deposit(&lp, la, lp_dep);
     // No insurance top-up: insurance starts at 0.
     let initial = (weak_dep + lp_dep) as i128;
-    assert_eq!(env.group().insurance, 0, "fixture must start with zero insurance");
+    assert_eq!(
+        env.group().insurance,
+        0,
+        "fixture must start with zero insurance"
+    );
 
     let size = POS_SCALE as i128;
-    env.try_trade(&lp, la, &weak, wa, size, 100, 0).expect("open");
+    env.try_trade(&lp, la, &weak, wa, size, 100, 0)
+        .expect("open");
     let weak_pos_before = env.leg_size(wa).unsigned_abs();
 
     // Push the mark up past the short's collateral (bankruptcy) over bounded steps.
@@ -1118,17 +1566,36 @@ fn adv_zero_insurance_self_liquidation_no_net_extraction() {
         let _ = env.crank(wa, 0, slot);
         let _ = env.crank(la, 0, slot);
     }
-    env.try_liquidate(wa, 30).expect("liquidation of the bankrupt short must succeed");
+    env.try_liquidate(wa, 30)
+        .expect("liquidation of the bankrupt short must succeed");
 
     // EXECUTED-GUARD: liquidation fired — toxic leg CLOSED. With zero insurance the
     // uncovered loss is socialized via the source-credit haircut / ADL path (never
     // minted, never an insurance siphon — insurance stays exactly 0).
-    assert_eq!(env.leg_size(wa), 0, "liquidation must close the toxic leg (it did not fire)");
-    assert!(env.leg_size(wa).unsigned_abs() <= weak_pos_before, "liquidation increased toxic exposure");
-    assert_eq!(env.group().insurance, 0, "zero-insurance liquidation must not create an insurance siphon");
+    assert_eq!(
+        env.leg_size(wa),
+        0,
+        "liquidation must close the toxic leg (it did not fire)"
+    );
+    assert!(
+        env.leg_size(wa).unsigned_abs() <= weak_pos_before,
+        "liquidation increased toxic exposure"
+    );
+    assert_eq!(
+        env.group().insurance,
+        0,
+        "zero-insurance liquidation must not create an insurance siphon"
+    );
     let wealth = env.equity(wa) + env.equity(la);
-    assert!(wealth <= initial + TOL, "zero-insurance self-liquidation extracted net value: {wealth} > {initial}");
-    assert_eq!(env.group().vault as u64, env.token_amount(env.vault), "engine vault and SPL vault desynced");
+    assert!(
+        wealth <= initial + TOL,
+        "zero-insurance self-liquidation extracted net value: {wealth} > {initial}"
+    );
+    assert_eq!(
+        env.group().vault as u64,
+        env.token_amount(env.vault),
+        "engine vault and SPL vault desynced"
+    );
 }
 
 // ===========================================================================
@@ -1157,13 +1624,17 @@ fn adv_target_lag_withdraw_rejected_atomically() {
     env.deposit(&user, ua, 5_000_000_000);
     env.deposit(&lp, la, 30_000_000_000);
     env.deposit(&flat, fa, 1_000_000);
-    env.try_trade(&user, ua, &lp, la, POS_SCALE as i128 * 100, 100, 0).expect("open");
+    env.try_trade(&user, ua, &lp, la, POS_SCALE as i128 * 100, 100, 0)
+        .expect("open");
 
     // Reproduce the lag: advance the clock far ahead and crank once — the asset
     // accrues only one bounded segment, leaving slot_last < current_slot.
     env.warp(50);
     let _ = env.crank(ua, 0, 50);
-    assert!(env.group().loss_stale_active, "must reproduce the target/effective lag (loss-stale) state");
+    assert!(
+        env.group().loss_stale_active,
+        "must reproduce the target/effective lag (loss-stale) state"
+    );
 
     let cap_before = env.portfolio(ua).capital;
     let leg_before = env.leg_size(ua);
@@ -1171,11 +1642,31 @@ fn adv_target_lag_withdraw_rejected_atomically() {
     let gvault_before = env.group().vault;
 
     // OPEN-position account: withdraw rejects at the open-position guard (Stale 19), atomically.
-    assert_custom(env.try_withdraw(&user, ua, 1), E_STALE, "withdraw with an open position under lag");
-    assert_eq!(env.portfolio(ua).capital, cap_before, "rejected withdraw moved capital");
-    assert_eq!(env.leg_size(ua), leg_before, "rejected withdraw moved position");
-    assert_eq!(env.token_amount(env.vault), vault_before, "rejected withdraw moved SPL vault");
-    assert_eq!(env.group().vault, gvault_before, "rejected withdraw moved engine vault");
+    assert_custom(
+        env.try_withdraw(&user, ua, 1),
+        E_STALE,
+        "withdraw with an open position under lag",
+    );
+    assert_eq!(
+        env.portfolio(ua).capital,
+        cap_before,
+        "rejected withdraw moved capital"
+    );
+    assert_eq!(
+        env.leg_size(ua),
+        leg_before,
+        "rejected withdraw moved position"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        vault_before,
+        "rejected withdraw moved SPL vault"
+    );
+    assert_eq!(
+        env.group().vault,
+        gvault_before,
+        "rejected withdraw moved engine vault"
+    );
 
     // DIVERGENCE PROOF: the FLAT account (no position) withdraws SUCCESSFULLY under
     // the very same loss-stale market — confirming the lag itself is not a
@@ -1233,11 +1724,15 @@ fn adv_target_lag_trade_no_external_value_movement() {
     let la = env.create_portfolio(&lp);
     env.deposit(&user, ua, 5_000_000_000);
     env.deposit(&lp, la, 30_000_000_000);
-    env.try_trade(&user, ua, &lp, la, POS_SCALE as i128 * 100, 100, 0).expect("open");
+    env.try_trade(&user, ua, &lp, la, POS_SCALE as i128 * 100, 100, 0)
+        .expect("open");
 
     env.warp(50);
     let _ = env.crank(ua, 0, 50);
-    assert!(env.group().loss_stale_active, "must reproduce the loss-stale lag");
+    assert!(
+        env.group().loss_stale_active,
+        "must reproduce the loss-stale lag"
+    );
 
     let user_pos_before = env.leg_size(ua);
     let lp_pos_before = env.leg_size(la);
@@ -1246,11 +1741,31 @@ fn adv_target_lag_trade_no_external_value_movement() {
 
     // v16: the consenting trade on the loss-stale asset is rejected (safety over
     // liveness). The economic invariant holds because nothing moves.
-    assert_custom(env.try_trade(&user, ua, &lp, la, POS_SCALE as i128, 100, 0), E_LOCK_ACTIVE, "trade on loss-stale asset");
-    assert_eq!(env.leg_size(ua), user_pos_before, "blocked trade moved user position");
-    assert_eq!(env.leg_size(la), lp_pos_before, "blocked trade moved counterparty position");
-    assert_eq!(env.token_amount(env.vault), vault_before, "blocked trade moved SPL vault (external value)");
-    assert_eq!(env.group().vault, gvault_before, "blocked trade moved engine vault");
+    assert_custom(
+        env.try_trade(&user, ua, &lp, la, POS_SCALE as i128, 100, 0),
+        E_LOCK_ACTIVE,
+        "trade on loss-stale asset",
+    );
+    assert_eq!(
+        env.leg_size(ua),
+        user_pos_before,
+        "blocked trade moved user position"
+    );
+    assert_eq!(
+        env.leg_size(la),
+        lp_pos_before,
+        "blocked trade moved counterparty position"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        vault_before,
+        "blocked trade moved SPL vault (external value)"
+    );
+    assert_eq!(
+        env.group().vault,
+        gvault_before,
+        "blocked trade moved engine vault"
+    );
 }
 
 /// Fresh market + a user long with positive-but-UNMATURED PnL while the
@@ -1265,12 +1780,16 @@ fn unmatured_fixture() -> (Env, Keypair, Pubkey, Keypair, Pubkey) {
     let la = env.create_portfolio(&lp);
     env.deposit(&user, ua, 2_000_000_000);
     env.deposit(&lp, la, 30_000_000_000);
-    env.try_trade(&user, ua, &lp, la, POS_SCALE as i128 * 100, 100, 0).expect("open");
+    env.try_trade(&user, ua, &lp, la, POS_SCALE as i128 * 100, 100, 0)
+        .expect("open");
     env.warp(10);
     env.accrue_mark(ASSET, 10, 150).expect("accrue");
     let _ = env.crank(ua, 0, 10);
     let _ = env.crank(la, 0, 10);
-    assert!(env.portfolio(ua).pnl > 0, "fixture must create positive unmatured PnL");
+    assert!(
+        env.portfolio(ua).pnl > 0,
+        "fixture must create positive unmatured PnL"
+    );
     (env, user, ua, lp, la)
 }
 
@@ -1291,8 +1810,16 @@ fn adv_unmatured_pnl_public_interface_matrix_no_extraction() {
         let (mut env, user, ua, _lp, _la) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
         let pnl = env.portfolio(ua).pnl;
-        assert_custom(env.try_withdraw(&user, ua, cap + 1), E_STALE, "withdraw while unmatured");
-        assert_eq!(env.portfolio(ua).capital, cap, "rejected withdraw moved capital");
+        assert_custom(
+            env.try_withdraw(&user, ua, cap + 1),
+            E_STALE,
+            "withdraw while unmatured",
+        );
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "rejected withdraw moved capital"
+        );
         assert_eq!(env.portfolio(ua).pnl, pnl, "rejected withdraw consumed PnL");
     }
     // (b) ConvertReleasedPnl while unmatured -> EngineLockActive(21), atomic.
@@ -1300,16 +1827,32 @@ fn adv_unmatured_pnl_public_interface_matrix_no_extraction() {
         let (mut env, user, ua, _, _) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
         let pnl = env.portfolio(ua).pnl;
-        assert_custom(env.try_convert(&user, ua, 1_000_000_000), E_LOCK_ACTIVE, "convert while unmatured");
-        assert_eq!(env.portfolio(ua).capital, cap, "rejected convert minted capital");
+        assert_custom(
+            env.try_convert(&user, ua, 1_000_000_000),
+            E_LOCK_ACTIVE,
+            "convert while unmatured",
+        );
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "rejected convert minted capital"
+        );
         assert_eq!(env.portfolio(ua).pnl, pnl, "rejected convert consumed PnL");
     }
     // (c) ClosePortfolio on a non-flat account -> EngineLockActive(21) (dealloc-only guard).
     {
         let (mut env, user, ua, _, _) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
-        assert_custom(env.try_close(&user, ua), E_LOCK_ACTIVE, "close non-flat account with unmatured PnL");
-        assert_eq!(env.portfolio(ua).capital, cap, "rejected close moved capital");
+        assert_custom(
+            env.try_close(&user, ua),
+            E_LOCK_ACTIVE,
+            "close non-flat account with unmatured PnL",
+        );
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "rejected close moved capital"
+        );
     }
     // (d) DepositCollateral credits EXACTLY the amount, never the unmatured PnL.
     {
@@ -1318,9 +1861,21 @@ fn adv_unmatured_pnl_public_interface_matrix_no_extraction() {
         let pnl = env.portfolio(ua).pnl;
         let gv = env.group().vault;
         env.deposit(&user, ua, 1_234);
-        assert_eq!(env.portfolio(ua).capital, cap + 1_234, "deposit must credit only the deposited amount");
-        assert_eq!(env.portfolio(ua).pnl, pnl, "deposit must not consume unmatured PnL");
-        assert_eq!(env.group().vault, gv + 1_234, "deposit must move exactly the deposited units");
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap + 1_234,
+            "deposit must credit only the deposited amount"
+        );
+        assert_eq!(
+            env.portfolio(ua).pnl,
+            pnl,
+            "deposit must not consume unmatured PnL"
+        );
+        assert_eq!(
+            env.group().vault,
+            gv + 1_234,
+            "deposit must move exactly the deposited units"
+        );
     }
     // (e) TopUpInsurance only raises insurance; never unlocks user PnL/capital.
     {
@@ -1329,8 +1884,16 @@ fn adv_unmatured_pnl_public_interface_matrix_no_extraction() {
         let pnl = env.portfolio(ua).pnl;
         let ins = env.group().insurance;
         env.top_up_insurance(1_000);
-        assert_eq!(env.group().insurance, ins + 1_000, "top-up must only raise insurance by the amount");
-        assert_eq!(env.portfolio(ua).capital, cap, "top-up unlocked user capital");
+        assert_eq!(
+            env.group().insurance,
+            ins + 1_000,
+            "top-up must only raise insurance by the amount"
+        );
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "top-up unlocked user capital"
+        );
         assert_eq!(env.portfolio(ua).pnl, pnl, "top-up consumed user PnL");
     }
 }
@@ -1358,17 +1921,33 @@ fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
         let cap = env.portfolio(ua).capital;
         let pnl = env.portfolio(ua).pnl;
         env.warp(20);
-        env.crank(ua, 0, 20).expect("permissionless Refresh crank must remain callable");
-        assert_eq!(env.portfolio(ua).capital, cap, "Refresh crank unlocked capital");
-        assert!(env.portfolio(ua).pnl <= pnl + 1, "Refresh crank must not increase realizable PnL into capital");
+        env.crank(ua, 0, 20)
+            .expect("permissionless Refresh crank must remain callable");
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "Refresh crank unlocked capital"
+        );
+        assert!(
+            env.portfolio(ua).pnl <= pnl + 1,
+            "Refresh crank must not increase realizable PnL into capital"
+        );
     }
     // (2) Bad action tag (action 3 > 2) -> InvalidInstruction(9), atomic.
     {
         let (mut env, _user, ua, _, _) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
         env.warp(20);
-        assert_custom(env.crank(ua, 3, 20), E_INVALID_INSTRUCTION, "crank with bad action tag (>2)");
-        assert_eq!(env.portfolio(ua).capital, cap, "rejected bad-tag crank moved capital");
+        assert_custom(
+            env.crank(ua, 3, 20),
+            E_INVALID_INSTRUCTION,
+            "crank with bad action tag (>2)",
+        );
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "rejected bad-tag crank moved capital"
+        );
     }
     // (3) SettleB (action 2) with no B-state decodes and no-ops; unlocks nothing.
     {
@@ -1376,7 +1955,11 @@ fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
         let cap = env.portfolio(ua).capital;
         env.warp(20);
         let _ = env.crank(ua, 2, 20); // no-op branch (no pending B-settlement state)
-        assert_eq!(env.portfolio(ua).capital, cap, "SettleB no-op unlocked capital");
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "SettleB no-op unlocked capital"
+        );
     }
     // (5) Resolved-market crank: after ResolveMarket the market is no longer Live;
     // a crank must not settle/pay accounts (early-return / lock), no extraction.
@@ -1389,13 +1972,21 @@ fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
         env.deposit(&user, ua, 1_000_000_000);
         env.deposit(&lp, la, 1_000_000_000);
         env.warp(1); // align SVM clock with current_slot (set to 1 at activation)
-        // flat market (no open positions) is resolvable.
+                     // flat market (no open positions) is resolvable.
         env.resolve().expect("resolve flat market");
         let cap = env.portfolio(ua).capital;
         let gv = env.group().vault;
         let _ = env.crank(ua, 0, 1); // resolved crank: early-return / reject, never settles
-        assert_eq!(env.portfolio(ua).capital, cap, "resolved-market crank moved capital");
-        assert_eq!(env.group().vault, gv, "resolved-market crank moved engine vault");
+        assert_eq!(
+            env.portfolio(ua).capital,
+            cap,
+            "resolved-market crank moved capital"
+        );
+        assert_eq!(
+            env.group().vault,
+            gv,
+            "resolved-market crank moved engine vault"
+        );
         assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
     }
 }
@@ -1420,7 +2011,7 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     // --- Setup ---------------------------------------------------------------
     let mut env = Env::new(0);
     let user = Keypair::new(); // long winner
-    let lp = Keypair::new();   // short loser (absorbs the loss)
+    let lp = Keypair::new(); // short loser (absorbs the loss)
     let ua = env.create_portfolio(&user);
     let la = env.create_portfolio(&lp);
 
@@ -1431,35 +2022,58 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     env.deposit(&lp, la, lp_dep);
 
     let vault_before = env.group().vault;
-    assert_eq!(vault_before, user_dep + lp_dep, "vault_before must equal total deposits");
+    assert_eq!(
+        vault_before,
+        user_dep + lp_dep,
+        "vault_before must equal total deposits"
+    );
 
     // --- Open: user long / lp short ------------------------------------------
     let size = POS_SCALE as i128 * 100;
-    env.try_trade(&user, ua, &lp, la, size, 100, 0).expect("open long/short");
+    env.try_trade(&user, ua, &lp, la, size, 100, 0)
+        .expect("open long/short");
 
     // --- Push mark up so user long is in profit --------------------------------
     env.warp(10);
     env.accrue_mark(ASSET, 10, 150).expect("accrue mark up");
-    env.crank(ua, 0, 10).expect("crank winner (MTM) must succeed");
-    env.crank(la, 0, 10).expect("crank loser (MTM) must succeed");
+    env.crank(ua, 0, 10)
+        .expect("crank winner (MTM) must succeed");
+    env.crank(la, 0, 10)
+        .expect("crank loser (MTM) must succeed");
 
     // ANTI-HOLLOW gate: the fixture must produce a real winner.
-    assert!(env.portfolio(ua).pnl > 0, "fixture must create positive long PnL — check accrue_mark");
+    assert!(
+        env.portfolio(ua).pnl > 0,
+        "fixture must create positive long PnL — check accrue_mark"
+    );
 
     // --- Flatten both legs (CloseResolved rejects non-empty active_bitmap) ----
-    env.try_trade(&user, ua, &lp, la, -size, 150, 0).expect("flatten user long");
-    assert_eq!(env.leg_size(ua), 0, "user leg must be flat before CloseResolved");
+    env.try_trade(&user, ua, &lp, la, -size, 150, 0)
+        .expect("flatten user long");
+    assert_eq!(
+        env.leg_size(ua),
+        0,
+        "user leg must be flat before CloseResolved"
+    );
     // The two-sided flatten above already closed lp's short in the same trade.
     // Only act on a residual leg; never blanket-swallow an unexpected error.
     if env.leg_size(la) != 0 {
-        env.try_trade(&lp, la, &user, ua, size, 150, 0).expect("flatten lp short");
+        env.try_trade(&lp, la, &user, ua, size, 150, 0)
+            .expect("flatten lp short");
     }
-    assert_eq!(env.leg_size(la), 0, "lp leg must be flat before CloseResolved");
+    assert_eq!(
+        env.leg_size(la),
+        0,
+        "lp leg must be flat before CloseResolved"
+    );
 
     // --- Capture pre-close state ----------------------------------------------
     let win_cap: u128 = env.portfolio(ua).capital;
     let win_pnl_i128: i128 = env.portfolio(ua).pnl;
-    assert!(win_pnl_i128 > 0, "winner pnl must be positive after flatten");
+    assert!(
+        win_pnl_i128 > 0,
+        "winner pnl must be positive after flatten"
+    );
     let win_pnl: u128 = win_pnl_i128 as u128;
     let expected_winner_payout = win_cap + win_pnl;
 
@@ -1467,7 +2081,11 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     // Warp to a slot >= group.current_slot (activation set current_slot=1).
     env.warp(20);
     env.resolve().expect("resolve market");
-    assert_eq!(env.group().mode, percolator::MarketModeV16::Resolved, "market must be Resolved");
+    assert_eq!(
+        env.group().mode,
+        percolator::MarketModeV16::Resolved,
+        "market must be Resolved"
+    );
 
     // --- RED→GREEN provenance ------------------------------------------------
     // RED (pre-fix): with the old inline body, the winner's CloseResolved at
@@ -1529,10 +2147,18 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     // So for this fully-covered single winner the correct post-condition is a clean
     // teardown with NO dangling receipt, not a present/finalized receipt.
     let win_acct = env.portfolio(ua);
-    assert_eq!(win_acct.pnl, 0, "winner pnl must be fully realized to 0 after direct payout");
-    assert_eq!(win_acct.capital, 0, "winner capital must be fully drained after direct payout");
-    assert!(!win_acct.resolved_payout_receipt.present,
-        "fully-covered winner must leave NO dangling resolved_payout_receipt");
+    assert_eq!(
+        win_acct.pnl, 0,
+        "winner pnl must be fully realized to 0 after direct payout"
+    );
+    assert_eq!(
+        win_acct.capital, 0,
+        "winner capital must be fully drained after direct payout"
+    );
+    assert!(
+        !win_acct.resolved_payout_receipt.present,
+        "fully-covered winner must leave NO dangling resolved_payout_receipt"
+    );
 
     // Step 7e: Conservation — engine vault == SPL vault; total decrement ==
     // winner_payout + loser_payout == vault_before (all capital returned).
@@ -1545,7 +2171,10 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     // Non-vacuity guard for the conservation sum below: both portfolios were paid
     // in full, so the vault is fully drained here — a winner under-payment cannot
     // hide as residual in vault_after.
-    assert_eq!(vault_after, 0, "all deposits returned; vault fully drained after both closes");
+    assert_eq!(
+        vault_after, 0,
+        "all deposits returned; vault fully drained after both closes"
+    );
     assert_eq!(
         vault_before,
         winner_received + loser_payout + vault_after,
@@ -1553,12 +2182,26 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     );
 
     // Step 7f: Teardown — close portfolios, then close slab.
-    env.try_close(&user, ua).expect("ClosePortfolio winner must succeed");
-    env.try_close(&lp, la).expect("ClosePortfolio loser must succeed");
-    assert_eq!(env.group().materialized_portfolio_count, 0, "materialized_portfolio_count must be 0 after both ClosePortfolio");
+    env.try_close(&user, ua)
+        .expect("ClosePortfolio winner must succeed");
+    env.try_close(&lp, la)
+        .expect("ClosePortfolio loser must succeed");
+    assert_eq!(
+        env.group().materialized_portfolio_count,
+        0,
+        "materialized_portfolio_count must be 0 after both ClosePortfolio"
+    );
     assert_eq!(env.group().vault, 0, "vault must be 0 before CloseSlab");
-    assert_eq!(env.group().insurance, 0, "insurance must be 0 (no fees with fee_bps=0)");
-    assert_eq!(env.group().c_tot, 0, "c_tot must be 0 after all portfolios closed");
+    assert_eq!(
+        env.group().insurance,
+        0,
+        "insurance must be 0 (no fees with fee_bps=0)"
+    );
+    assert_eq!(
+        env.group().c_tot,
+        0,
+        "c_tot must be 0 after all portfolios closed"
+    );
     env.close_slab();
 
     // Step 7g: Confirm ClaimResolvedPayoutTopup is reachable (no Custom(21)) even
@@ -1571,9 +2214,15 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
 // Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
 // the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0

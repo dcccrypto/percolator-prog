@@ -33,7 +33,12 @@ fn program_path() -> PathBuf {
 }
 
 /// Byte-for-byte mirror of the SDK's `encodePermissionlessCrank`.
-fn keeper_encode_permissionless_crank(action: u8, asset_index: u16, now_slot: u64, recovery_reason: u8) -> Vec<u8> {
+fn keeper_encode_permissionless_crank(
+    action: u8,
+    asset_index: u16,
+    now_slot: u64,
+    recovery_reason: u8,
+) -> Vec<u8> {
     let mut d = Vec::with_capacity(KEEPER_CRANK_WIRE_LEN);
     d.push(IX_TAG_PERMISSIONLESS_CRANK);
     d.push(action);

@@ -271,7 +271,11 @@ mod tests {
     // Whole-buffer overwrite is an assignment.
     let copied = "fn f() { profile.oracle_authority.copy_from_slice(&some_pda.to_bytes()); }\n";
     let found = authority_assignments(copied);
-    assert_eq!(found.len(), 1, "copy_from_slice overwrite not seen: {found:?}");
+    assert_eq!(
+        found.len(),
+        1,
+        "copy_from_slice overwrite not seen: {found:?}"
+    );
     assert_eq!(found[0].1, "some_pda.to_bytes()");
 
     // Comparisons and match arms are not writes.

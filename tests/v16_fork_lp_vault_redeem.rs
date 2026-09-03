@@ -57,7 +57,10 @@ const MINTED: u128 = DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY;
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
-    assert!(p.exists(), "wrapper BPF missing — cargo build-sbf --no-default-features");
+    assert!(
+        p.exists(),
+        "wrapper BPF missing — cargo build-sbf --no-default-features"
+    );
     p
 }
 
@@ -70,7 +73,10 @@ fn spl_token_program_path() -> PathBuf {
             h
         });
     for reg in std::fs::read_dir(cargo_home.join("registry/src")).expect("registry/src") {
-        let cand = reg.expect("entry").path().join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
+        let cand = reg
+            .expect("entry")
+            .path()
+            .join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
         if cand.exists() {
             return cand;
         }
@@ -116,7 +122,13 @@ fn make_token_data(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
 fn set_token(svm: &mut LiteSVM, key: Pubkey, mint: Pubkey, owner: Pubkey, amount: u64) {
     svm.set_account(
         key,
-        Account { lamports: 1_000_000_000, data: make_token_data(mint, owner, amount), owner: spl_token::ID, executable: false, rent_epoch: 0 },
+        Account {
+            lamports: 1_000_000_000,
+            data: make_token_data(mint, owner, amount),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
     )
     .unwrap();
 }
@@ -136,29 +148,60 @@ struct Env {
     vault_authority: Pubkey,
 }
 
-fn send(svm: &mut LiteSVM, program_id: Pubkey, payer: &Keypair, ixs: Vec<(ProgInstruction, Vec<AccountMeta>)>, extra: &[&Keypair]) -> Result<(), String> {
+fn send(
+    svm: &mut LiteSVM,
+    program_id: Pubkey,
+    payer: &Keypair,
+    ixs: Vec<(ProgInstruction, Vec<AccountMeta>)>,
+    extra: &[&Keypair],
+) -> Result<(), String> {
     let mut instructions = vec![
         ComputeBudgetInstruction::request_heap_frame(128 * 1024),
         ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
     ];
     for (ix, accounts) in ixs {
-        instructions.push(Instruction { program_id, accounts, data: ix.encode() });
+        instructions.push(Instruction {
+            program_id,
+            accounts,
+            data: ix.encode(),
+        });
     }
     let mut signers = vec![payer];
     signers.extend_from_slice(extra);
-    let tx = Transaction::new_signed_with_payer(&instructions, Some(&payer.pubkey()), &signers, svm.latest_blockhash());
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&payer.pubkey()),
+        &signers,
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 fn init_market_ix() -> ProgInstruction {
     ProgInstruction::InitMarket {
-        max_portfolio_assets: MAX_PORTFOLIO_ASSETS, h_min: 0, h_max: 10, initial_price: 100,
-        min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 10_000,
-        initial_margin_bps: 10_000, max_trading_fee_bps: 10_000, trade_fee_base_bps: 0,
-        liquidation_fee_bps: 0, liquidation_fee_cap: 0, min_liquidation_abs: 0,
-        max_price_move_bps_per_slot: 10_000, max_accrual_dt_slots: 1, max_abs_funding_e9_per_slot: 0,
-        min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1, max_bankrupt_close_chunks: 1,
-        max_bankrupt_close_lifetime_slots: 100, public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+        max_portfolio_assets: MAX_PORTFOLIO_ASSETS,
+        h_min: 0,
+        h_max: 10,
+        initial_price: 100,
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
+        maintenance_margin_bps: 10_000,
+        initial_margin_bps: 10_000,
+        max_trading_fee_bps: 10_000,
+        trade_fee_base_bps: 0,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: 0,
+        min_liquidation_abs: 0,
+        max_price_move_bps_per_slot: 10_000,
+        max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 0,
+        min_funding_lifetime_slots: 1,
+        max_account_b_settlement_chunks: 1,
+        max_bankrupt_close_chunks: 1,
+        max_bankrupt_close_lifetime_slots: 100,
+        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }
@@ -174,8 +217,14 @@ fn setup_vault(cooldown_slots: u64) -> Env {
 fn setup_vault_oi(cooldown_slots: u64, oi_reservation_threshold_bps: u16) -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
-    svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
-    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("token BPF"));
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("wrapper BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("token BPF"),
+    );
 
     let payer = Keypair::new();
     let admin = Keypair::new();
@@ -183,44 +232,123 @@ fn setup_vault_oi(cooldown_slots: u64, oi_reservation_threshold_bps: u16) -> Env
     let collateral_mint = Pubkey::new_unique();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 100_000_000_000).unwrap();
-    svm.set_account(collateral_mint, Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()], owner: program_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        collateral_mint,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0u8;
+                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                    .unwrap()
+            ],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    send(&mut svm, program_id, &payer, vec![(init_market_ix(), vec![
-        AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new(market, false),
-        AccountMeta::new_readonly(collateral_mint, false),
-    ])], &[&admin]).expect("init market");
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            init_market_ix(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("init market");
 
     let (registry, _) = derive_lp_vault_registry(&program_id, &market);
     let (lp_mint, _) = derive_lp_vault_mint(&program_id, &market);
     let (ledger, _) = derive_lp_backing_ledger(&program_id, &market, DOMAIN);
     let (escrow, _) = derive_lp_escrow(&program_id, &market);
-    let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
+    let (vault_authority, _) =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
     let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
 
     // Append asset 1 with registry as backing authority, then create vault.
-    send(&mut svm, program_id, &payer, vec![(ProgInstruction::UpdateAssetLifecycle {
-        action: ASSET_ACTION_ACTIVATE, asset_index: APPEND_ASSET_INDEX, now_slot: 1, initial_price: 100,
-        insurance_authority: admin.pubkey().to_bytes(), insurance_operator: admin.pubkey().to_bytes(),
-        backing_bucket_authority: registry.to_bytes(), oracle_authority: admin.pubkey().to_bytes(),
-    }, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)])], &[&admin]).expect("append asset 1");
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            ProgInstruction::UpdateAssetLifecycle {
+                action: ASSET_ACTION_ACTIVATE,
+                asset_index: APPEND_ASSET_INDEX,
+                now_slot: 1,
+                initial_price: 100,
+                insurance_authority: admin.pubkey().to_bytes(),
+                insurance_operator: admin.pubkey().to_bytes(),
+                backing_bucket_authority: registry.to_bytes(),
+                oracle_authority: admin.pubkey().to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("append asset 1");
 
-    send(&mut svm, program_id, &payer, vec![(ProgInstruction::CreateLpVault {
-        fee_share_bps: 5_000, redemption_cooldown_slots: cooldown_slots, oi_reservation_threshold_bps, domain: DOMAIN,
-    }, vec![
-        AccountMeta::new(admin.pubkey(), true),
-        // FIND-1 fix: market must be writable — CreateLpVault now writes
-        // backing_bucket_authority = registry PDA into the asset's oracle profile.
-        AccountMeta::new(market, false),
-        AccountMeta::new(registry, false),
-        AccountMeta::new(lp_mint, false),
-        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-    ])], &[&admin]).expect("create lp vault");
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            ProgInstruction::CreateLpVault {
+                fee_share_bps: 5_000,
+                redemption_cooldown_slots: cooldown_slots,
+                oi_reservation_threshold_bps,
+                domain: DOMAIN,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                // FIND-1 fix: market must be writable — CreateLpVault now writes
+                // backing_bucket_authority = registry PDA into the asset's oracle profile.
+                AccountMeta::new(market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new(lp_mint, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("create lp vault");
 
-    Env { svm, program_id, payer, admin, market, collateral_mint, vault_token, registry, lp_mint, ledger, escrow, vault_authority }
+    Env {
+        svm,
+        program_id,
+        payer,
+        admin,
+        market,
+        collateral_mint,
+        vault_token,
+        registry,
+        lp_mint,
+        ledger,
+        escrow,
+        vault_authority,
+    }
 }
 
 /// A depositor with a funded source + LP ATA who has deposited `amount`.
@@ -232,7 +360,12 @@ struct Depositor {
     redemption: Pubkey,
 }
 
-fn deposit_accounts(env: &Env, lp_ata: Pubkey, source: Pubkey, depositor: Pubkey) -> Vec<AccountMeta> {
+fn deposit_accounts(
+    env: &Env,
+    lp_ata: Pubkey,
+    source: Pubkey,
+    depositor: Pubkey,
+) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(depositor, true),
         AccountMeta::new(env.market, false),
@@ -256,7 +389,13 @@ fn new_depositor(env: &mut Env, amount: u128) -> Depositor {
     let kp = Keypair::new();
     env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        kp.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
     let dest = Pubkey::new_unique();
@@ -267,9 +406,28 @@ fn new_depositor(env: &mut Env, amount: u128) -> Depositor {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = deposit_accounts(env, lp_ata, source, kp.pubkey());
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount, domain: DOMAIN }, accts)], &[&kp]).expect("deposit");
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::DepositToLpVault {
+                amount,
+                domain: DOMAIN,
+            },
+            accts,
+        )],
+        &[&kp],
+    )
+    .expect("deposit");
     let _ = market;
-    Depositor { kp, source, lp_ata, dest, redemption }
+    Depositor {
+        kp,
+        source,
+        lp_ata,
+        dest,
+        redemption,
+    }
 }
 
 fn request_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
@@ -307,7 +465,9 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
 }
 
 fn tok(svm: &LiteSVM, key: Pubkey) -> u64 {
-    TokenAccount::unpack(&svm.get_account(&key).expect("acct").data).expect("decode").amount
+    TokenAccount::unpack(&svm.get_account(&key).expect("acct").data)
+        .expect("decode")
+        .amount
 }
 
 fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> {
@@ -316,7 +476,16 @@ fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> 
     let kp = d.kp.insecure_clone();
     let accts = request_accounts(env, d);
     // v17 CHANGE: field renamed from lp_amount → shares.
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::RequestRedeemLpShares { shares: lp_amount }, accts)], &[&kp])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::RequestRedeemLpShares { shares: lp_amount },
+            accts,
+        )],
+        &[&kp],
+    )
 }
 
 fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
@@ -328,7 +497,13 @@ fn execute_from(env: &mut Env, d: &Depositor, domain: u16) -> Result<(), String>
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = execute_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain }, accts)], &[])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::ExecuteRedemption { domain }, accts)],
+        &[],
+    )
 }
 
 fn resolve_market(env: &mut Env) -> Result<(), String> {
@@ -409,18 +584,26 @@ fn request_then_execute_pays_pro_rata() {
     execute(&mut env, &d).expect("execute");
     // Redeemer paid 1:1 (no earnings) for the shares they actually hold; escrow
     // burned to 0; vault drains down to the dead-share floor's principal.
-    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        MINTED as u64,
+        "redeemer paid pro-rata"
+    );
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow burned to zero");
     assert_eq!(
-        tok(&env.svm, env.vault_token), (DEPOSIT - MINTED) as u64,
+        tok(&env.svm, env.vault_token),
+        (DEPOSIT - MINTED) as u64,
         "vault drained down to the dead-share floor's stranded principal"
     );
     // Registry outstanding back to the dead-share floor, not 0.
-    let reg = state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
+    let reg =
+        state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
     assert_eq!(reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY);
     // Redemption PDA consumed (magic zeroed) → unreadable.
-    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
-        "redemption PDA consumed");
+    assert!(
+        state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
+        "redemption PDA consumed"
+    );
 }
 
 /// FINDING 3 (branch review). `handle_execute_redemption` validated `ledger_ai`
@@ -451,11 +634,22 @@ fn execute_redemption_rejects_a_substituted_backing_ledger() {
     env.svm.expire_blockhash();
 
     // Byte-identical clone of the real ledger, at an address nobody derives.
-    let real = env.svm.get_account(&env.ledger).expect("real ledger exists after deposit");
-    assert_eq!(real.owner, env.program_id, "clone source must be program-owned");
+    let real = env
+        .svm
+        .get_account(&env.ledger)
+        .expect("real ledger exists after deposit");
+    assert_eq!(
+        real.owner, env.program_id,
+        "clone source must be program-owned"
+    );
     let impostor = Pubkey::new_unique();
-    assert_ne!(impostor, env.ledger, "impostor must not be the derived ledger");
-    env.svm.set_account(impostor, real.clone()).expect("plant impostor ledger");
+    assert_ne!(
+        impostor, env.ledger,
+        "impostor must not be the derived ledger"
+    );
+    env.svm
+        .set_account(impostor, real.clone())
+        .expect("plant impostor ledger");
 
     // Swap ONLY the ledger account meta; everything else is the happy path.
     let mut accts = execute_accounts(&env, &d);
@@ -464,26 +658,51 @@ fn execute_redemption_rejects_a_substituted_backing_ledger() {
 
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    let res = send(&mut env.svm, pid, &payer,
-        vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[]);
+    let res = send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)],
+        &[],
+    );
 
-    assert!(res.is_err(), "substituted backing ledger must be rejected, got: {res:?}");
+    assert!(
+        res.is_err(),
+        "substituted backing ledger must be rejected, got: {res:?}"
+    );
     // `expect_key` returns ProgramError::InvalidArgument.
     let msg = format!("{res:?}");
-    assert!(msg.contains("InvalidArgument"),
-        "expected InvalidArgument from expect_key(ledger_ai), got: {msg}");
+    assert!(
+        msg.contains("InvalidArgument"),
+        "expected InvalidArgument from expect_key(ledger_ai), got: {msg}"
+    );
 
     // Fail-closed: no payout, shares still escrowed, impostor untouched.
-    assert_eq!(tok(&env.svm, d.dest), 0, "no payout on a substituted ledger");
-    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "shares still escrowed");
-    assert_eq!(env.svm.get_account(&impostor).expect("impostor").data, real.data,
-        "impostor ledger must not have been written");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        0,
+        "no payout on a substituted ledger"
+    );
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        MINTED as u64,
+        "shares still escrowed"
+    );
+    assert_eq!(
+        env.svm.get_account(&impostor).expect("impostor").data,
+        real.data,
+        "impostor ledger must not have been written"
+    );
 
     // Control: the SAME transaction with the correctly derived ledger succeeds,
     // proving the rejection above is the address check and not broken setup.
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("control: derived ledger still redeems");
-    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "control payout is pro-rata");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        MINTED as u64,
+        "control payout is pro-rata"
+    );
 }
 
 #[test]
@@ -493,7 +712,10 @@ fn execute_before_cooldown_rejects() {
     request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
     let res = execute(&mut env, &d);
-    assert!(res.is_err(), "execute before cooldown must reject (I5): {res:?}");
+    assert!(
+        res.is_err(),
+        "execute before cooldown must reject (I5): {res:?}"
+    );
     assert_eq!(tok(&env.svm, d.dest), 0, "no payout before cooldown");
 }
 
@@ -509,7 +731,10 @@ fn execute_twice_two_tx_second_rejects() {
 
     env.svm.expire_blockhash();
     let res = execute(&mut env, &d);
-    assert!(res.is_err(), "second execute (2nd tx) MUST reject — replay guard: {res:?}");
+    assert!(
+        res.is_err(),
+        "second execute (2nd tx) MUST reject — replay guard: {res:?}"
+    );
     assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "no second payout");
 }
 
@@ -528,15 +753,26 @@ fn execute_twice_same_tx_second_rejects() {
     let payer = env.payer.insecure_clone();
     let a1 = execute_accounts(&env, &d);
     let a2 = execute_accounts(&env, &d);
-    let res = send(&mut env.svm, pid, &payer, vec![
-        (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a1),
-        (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a2),
-    ], &[]);
-    assert!(res.is_err(), "two ExecuteRedemption in one tx MUST fail (2nd rejects on zeroed magic): {res:?}");
+    let res = send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![
+            (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a1),
+            (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a2),
+        ],
+        &[],
+    );
+    assert!(
+        res.is_err(),
+        "two ExecuteRedemption in one tx MUST fail (2nd rejects on zeroed magic): {res:?}"
+    );
     // Atomic rollback: no payout, redemption PDA intact.
     assert_eq!(tok(&env.svm, d.dest), 0, "no payout — tx rolled back");
-    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_ok(),
-        "redemption PDA intact after rolled-back tx");
+    assert!(
+        state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_ok(),
+        "redemption PDA intact after rolled-back tx"
+    );
 }
 
 #[test]
@@ -559,7 +795,11 @@ fn multi_redeemer_each_gets_pro_rata() {
     request(&mut env, &d1, MINTED).expect("request d1");
     request(&mut env, &d2, 2 * DEPOSIT).expect("request d2");
     // I12: escrow holds the sum of both pending redemptions (real shares only).
-    assert_eq!(tok(&env.svm, env.escrow), (MINTED + 2 * DEPOSIT) as u64, "escrow == Σ pending shares");
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        (MINTED + 2 * DEPOSIT) as u64,
+        "escrow == Σ pending shares"
+    );
 
     env.svm.expire_blockhash();
     execute(&mut env, &d1).expect("execute d1");
@@ -570,10 +810,15 @@ fn multi_redeemer_each_gets_pro_rata() {
     assert_eq!(tok(&env.svm, d1.dest), MINTED as u64, "d1 pro-rata");
     assert_eq!(tok(&env.svm, d2.dest), 2 * DEPOSIT as u64, "d2 pro-rata");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow zeroes out");
-    let reg = state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY, "dead-share floor remains, not 0");
+    let reg =
+        state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
     assert_eq!(
-        tok(&env.svm, env.vault_token), (DEPOSIT - MINTED) as u64,
+        reg.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
+        "dead-share floor remains, not 0"
+    );
+    assert_eq!(
+        tok(&env.svm, env.vault_token),
+        (DEPOSIT - MINTED) as u64,
         "vault drained down to the dead-share floor's stranded principal, not fully to 0"
     );
 }
@@ -598,21 +843,87 @@ fn execute_redemption_backing_state_matches_withdraw() {
     // Top up backing via admin so there is principal to withdraw, then withdraw it.
     let admin_a = env_a.admin.insecure_clone();
     let src_a = Pubkey::new_unique();
-    set_token(&mut env_a.svm, src_a, env_a.collateral_mint, admin_a.pubkey(), 10_000_000);
-    let (ledger_a, _) =
-        state::derive_lp_backing_ledger(&env_a.program_id, &env_a.market, DOMAIN);
-    env_a.svm.set_account(ledger_a, Account { lamports: 1_000_000_000, data: vec![0u8; state::backing_domain_ledger_account_len()], owner: env_a.program_id, executable: false, rent_epoch: 0 }).unwrap();
+    set_token(
+        &mut env_a.svm,
+        src_a,
+        env_a.collateral_mint,
+        admin_a.pubkey(),
+        10_000_000,
+    );
+    let (ledger_a, _) = state::derive_lp_backing_ledger(&env_a.program_id, &env_a.market, DOMAIN);
+    env_a
+        .svm
+        .set_account(
+            ledger_a,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; state::backing_domain_ledger_account_len()],
+                owner: env_a.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     let dest_a = Pubkey::new_unique();
-    set_token(&mut env_a.svm, dest_a, env_a.collateral_mint, admin_a.pubkey(), 0);
+    set_token(
+        &mut env_a.svm,
+        dest_a,
+        env_a.collateral_mint,
+        admin_a.pubkey(),
+        0,
+    );
     let pid_a = env_a.program_id;
     let payer_a = env_a.payer.insecure_clone();
-    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::TopUpBackingBucket { domain: DOMAIN, amount: DEPOSIT, expiry_slot: percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT },
-        vec![AccountMeta::new(admin_a.pubkey(), true), AccountMeta::new(env_a.market, false), AccountMeta::new(src_a, false), AccountMeta::new(env_a.vault_token, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new(ledger_a, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false)])], &[&admin_a]).expect("top up");
+    send(
+        &mut env_a.svm,
+        pid_a,
+        &payer_a,
+        vec![(
+            ProgInstruction::TopUpBackingBucket {
+                domain: DOMAIN,
+                amount: DEPOSIT,
+                expiry_slot: percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            },
+            vec![
+                AccountMeta::new(admin_a.pubkey(), true),
+                AccountMeta::new(env_a.market, false),
+                AccountMeta::new(src_a, false),
+                AccountMeta::new(env_a.vault_token, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger_a, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+        )],
+        &[&admin_a],
+    )
+    .expect("top up");
     env_a.svm.expire_blockhash();
-    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::WithdrawBackingBucket { domain: DOMAIN, amount: MINTED },
-        vec![AccountMeta::new(admin_a.pubkey(), true), AccountMeta::new(env_a.market, false), AccountMeta::new(dest_a, false), AccountMeta::new(env_a.vault_token, false), AccountMeta::new_readonly(env_a.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new(ledger_a, false)])], &[&admin_a]).expect("withdraw");
-    let led_a = state::read_backing_domain_ledger(&env_a.svm.get_account(&ledger_a).unwrap().data).unwrap();
-    let (_, group_a) = state::read_market(&env_a.svm.get_account(&env_a.market).unwrap().data).unwrap();
+    send(
+        &mut env_a.svm,
+        pid_a,
+        &payer_a,
+        vec![(
+            ProgInstruction::WithdrawBackingBucket {
+                domain: DOMAIN,
+                amount: MINTED,
+            },
+            vec![
+                AccountMeta::new(admin_a.pubkey(), true),
+                AccountMeta::new(env_a.market, false),
+                AccountMeta::new(dest_a, false),
+                AccountMeta::new(env_a.vault_token, false),
+                AccountMeta::new_readonly(env_a.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger_a, false),
+            ],
+        )],
+        &[&admin_a],
+    )
+    .expect("withdraw");
+    let led_a =
+        state::read_backing_domain_ledger(&env_a.svm.get_account(&ledger_a).unwrap().data).unwrap();
+    let (_, group_a) =
+        state::read_market(&env_a.svm.get_account(&env_a.market).unwrap().data).unwrap();
 
     // Path B: deposit then request+execute (registry authority).
     let mut env_b = setup_vault(0);
@@ -620,16 +931,34 @@ fn execute_redemption_backing_state_matches_withdraw() {
     request(&mut env_b, &d, MINTED).expect("request");
     env_b.svm.expire_blockhash();
     execute(&mut env_b, &d).expect("execute");
-    let led_b = state::read_backing_domain_ledger(&env_b.svm.get_account(&env_b.ledger).unwrap().data).unwrap();
-    let (_, group_b) = state::read_market(&env_b.svm.get_account(&env_b.market).unwrap().data).unwrap();
+    let led_b =
+        state::read_backing_domain_ledger(&env_b.svm.get_account(&env_b.ledger).unwrap().data)
+            .unwrap();
+    let (_, group_b) =
+        state::read_market(&env_b.svm.get_account(&env_b.market).unwrap().data).unwrap();
 
-    assert_eq!(led_a.total_principal_atoms, led_b.total_principal_atoms, "principal drift");
-    assert_eq!(led_a.total_principal_withdrawn_atoms, led_b.total_principal_withdrawn_atoms, "withdrawn drift");
-    assert_eq!(led_a.total_deposited_atoms, led_b.total_deposited_atoms, "deposited drift");
+    assert_eq!(
+        led_a.total_principal_atoms, led_b.total_principal_atoms,
+        "principal drift"
+    );
+    assert_eq!(
+        led_a.total_principal_withdrawn_atoms, led_b.total_principal_withdrawn_atoms,
+        "withdrawn drift"
+    );
+    assert_eq!(
+        led_a.total_deposited_atoms, led_b.total_deposited_atoms,
+        "deposited drift"
+    );
     assert_eq!(led_a.total_earnings_atoms, led_b.total_earnings_atoms);
     assert_eq!(led_a.cumulative_loss_atoms, led_b.cumulative_loss_atoms);
-    assert_eq!(led_a.cumulative_recovery_atoms, led_b.cumulative_recovery_atoms);
-    assert_eq!(group_a.vault, group_b.vault, "vault total drift between Withdraw and ExecuteRedemption");
+    assert_eq!(
+        led_a.cumulative_recovery_atoms,
+        led_b.cumulative_recovery_atoms
+    );
+    assert_eq!(
+        group_a.vault, group_b.vault,
+        "vault total drift between Withdraw and ExecuteRedemption"
+    );
 }
 
 /// Same as setup_vault(0) but the appended asset's backing authority = admin
@@ -638,32 +967,106 @@ fn execute_redemption_backing_state_matches_withdraw() {
 fn setup_vault_admin_authority() -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
-    svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
-    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("token BPF"));
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("wrapper BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("token BPF"),
+    );
     let payer = Keypair::new();
     let admin = Keypair::new();
     let market = Pubkey::new_unique();
     let collateral_mint = Pubkey::new_unique();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 100_000_000_000).unwrap();
-    svm.set_account(collateral_mint, Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()], owner: program_id, executable: false, rent_epoch: 0 }).unwrap();
-    send(&mut svm, program_id, &payer, vec![(init_market_ix(), vec![
-        AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new_readonly(collateral_mint, false),
-    ])], &[&admin]).expect("init market");
+    svm.set_account(
+        collateral_mint,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0u8;
+                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                    .unwrap()
+            ],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            init_market_ix(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("init market");
     let (registry, _) = derive_lp_vault_registry(&program_id, &market);
     let (lp_mint, _) = derive_lp_vault_mint(&program_id, &market);
     let (ledger, _) = derive_lp_backing_ledger(&program_id, &market, DOMAIN);
     let (escrow, _) = derive_lp_escrow(&program_id, &market);
-    let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
+    let (vault_authority, _) =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
     let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
-    send(&mut svm, program_id, &payer, vec![(ProgInstruction::UpdateAssetLifecycle {
-        action: ASSET_ACTION_ACTIVATE, asset_index: APPEND_ASSET_INDEX, now_slot: 1, initial_price: 100,
-        insurance_authority: admin.pubkey().to_bytes(), insurance_operator: admin.pubkey().to_bytes(),
-        backing_bucket_authority: admin.pubkey().to_bytes(), oracle_authority: admin.pubkey().to_bytes(),
-    }, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)])], &[&admin]).expect("append asset 1");
-    Env { svm, program_id, payer, admin, market, collateral_mint, vault_token, registry, lp_mint, ledger, escrow, vault_authority }
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            ProgInstruction::UpdateAssetLifecycle {
+                action: ASSET_ACTION_ACTIVATE,
+                asset_index: APPEND_ASSET_INDEX,
+                now_slot: 1,
+                initial_price: 100,
+                insurance_authority: admin.pubkey().to_bytes(),
+                insurance_operator: admin.pubkey().to_bytes(),
+                backing_bucket_authority: admin.pubkey().to_bytes(),
+                oracle_authority: admin.pubkey().to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("append asset 1");
+    Env {
+        svm,
+        program_id,
+        payer,
+        admin,
+        market,
+        collateral_mint,
+        vault_token,
+        registry,
+        lp_mint,
+        ledger,
+        escrow,
+        vault_authority,
+    }
 }
 
 // ── Phase 2.E deferred LP test #1: OI-reservation reject (I6) ───────────────
@@ -760,9 +1163,16 @@ fn execute_redemption_oi_reservation_violation_rejects() {
     env.svm.expire_blockhash();
     let res = execute(&mut env, &d1);
     let msg = format!("{res:?}");
-    assert!(msg.contains("Custom(37)"), "expected LpVaultOiReservationViolated Custom(37), got: {msg}");
+    assert!(
+        msg.contains("Custom(37)"),
+        "expected LpVaultOiReservationViolated Custom(37), got: {msg}"
+    );
     // Solvency preserved: no payout, no state mutation on the rejected redemption.
-    assert_eq!(tok(&env.svm, d1.dest), 0, "no payout on the rejected under-backed redemption");
+    assert_eq!(
+        tok(&env.svm, d1.dest),
+        0,
+        "no payout on the rejected under-backed redemption"
+    );
 }
 
 /// POSITIVE / NON-VACUOUS fix-proof test (S3): a PARTIAL redemption of a
@@ -795,9 +1205,17 @@ fn execute_redemption_oi_reservation_clean_bucket_partial_succeeds() {
         "partial redemption of a CLEAN (zero-OI) bucket must succeed under any \
          oi_reservation_threshold_bps -- there is no real OI to protect",
     );
-    assert_eq!(tok(&env.svm, d.dest), half as u64, "partial redeemer paid exactly half of MINTED, no dust");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        half as u64,
+        "partial redeemer paid exactly half of MINTED, no dust"
+    );
     let r = reg(&env);
-    assert_eq!(r.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY + (MINTED - half), "remaining outstanding shares exact");
+    assert_eq!(
+        r.total_lp_shares_outstanding,
+        LP_VAULT_MINIMUM_LIQUIDITY + (MINTED - half),
+        "remaining outstanding shares exact"
+    );
 }
 
 /// POSITIVE / NON-VACUOUS fix-proof test (S4): a FULL redemption of a CLEAN
@@ -833,19 +1251,32 @@ fn execute_redemption_oi_reservation_clean_bucket_full_succeeds() {
         "full redemption of a CLEAN (zero-OI) bucket must succeed under any \
          oi_reservation_threshold_bps -- there is no real OI to protect",
     );
-    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata in full");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        MINTED as u64,
+        "redeemer paid pro-rata in full"
+    );
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow burned to zero");
     let r = reg(&env);
-    assert_eq!(r.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY, "dead-share floor remains, not 0");
+    assert_eq!(
+        r.total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
+        "dead-share floor remains, not 0"
+    );
 }
 
 // W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
 // Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
 // the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -860,7 +1291,13 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
 
 fn noncanonical_vault(env: &mut Env, amount: u64) -> Pubkey {
     let bad = Pubkey::new_unique();
-    set_token(&mut env.svm, bad, env.collateral_mint, env.vault_authority, amount);
+    set_token(
+        &mut env.svm,
+        bad,
+        env.collateral_mint,
+        env.vault_authority,
+        amount,
+    );
     bad
 }
 
@@ -870,7 +1307,13 @@ fn deposit_to_lp_vault_rejects_noncanonical_vault() {
     let kp = Keypair::new();
     env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        kp.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
     let bad_vault = noncanonical_vault(&mut env, 0);
@@ -879,15 +1322,34 @@ fn deposit_to_lp_vault_rejects_noncanonical_vault() {
     accts[6] = AccountMeta::new(bad_vault, false); // swap the canonical vault for a fragmenting one
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN }, accts)], &[&kp]);
+    let res = send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::DepositToLpVault {
+                amount: DEPOSIT,
+                domain: DOMAIN,
+            },
+            accts,
+        )],
+        &[&kp],
+    );
     let msg = res.expect_err("DepositToLpVault to a non-canonical vault must reject");
-    assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
+    assert!(
+        msg.contains("Custom(12)"),
+        "expected InvalidVaultAccount Custom(12), got: {msg}"
+    );
 
     // ACCEPT: the canonical vault deposit goes through (this is the vault's TRUE
     // genesis deposit — the rejected attempt above never committed — so
     // BUG-2 / N7's dead-share carve-out applies: MINTED, not DEPOSIT).
     let d = new_depositor(&mut env, DEPOSIT);
-    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "canonical-vault deposit accepted");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        MINTED as u64,
+        "canonical-vault deposit accepted"
+    );
 }
 
 #[test]
@@ -901,9 +1363,18 @@ fn execute_redemption_rejects_noncanonical_vault() {
     accts[6] = AccountMeta::new(noncanonical_vault(&mut env, DEPOSIT as u64), false); // fragmenting vault
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[]);
+    let res = send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)],
+        &[],
+    );
     let msg = res.expect_err("ExecuteRedemption from a non-canonical vault must reject");
-    assert!(msg.contains("Custom(12)"), "expected InvalidVaultAccount Custom(12), got: {msg}");
+    assert!(
+        msg.contains("Custom(12)"),
+        "expected InvalidVaultAccount Custom(12), got: {msg}"
+    );
 
     // The rejected execute reverted; the redemption is still pending and the CANONICAL vault still
     // executes (dual-gate intact) — draining env.vault_token down to the dead-share floor's
@@ -911,10 +1382,15 @@ fn execute_redemption_rejects_noncanonical_vault() {
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("canonical-vault execute accepted");
     assert_eq!(
-        tok(&env.svm, env.vault_token), (DEPOSIT - MINTED) as u64,
+        tok(&env.svm, env.vault_token),
+        (DEPOSIT - MINTED) as u64,
         "canonical vault drained down to the dead-share floor's stranded principal"
     );
-    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata through the canonical vault");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        MINTED as u64,
+        "redeemer paid pro-rata through the canonical vault"
+    );
 }
 
 // ── Conservation tests for the principal/earnings split (v17 bug fix) ────────
@@ -980,7 +1456,10 @@ fn seed_earnings(env: &mut Env, earnings: u128) {
     let earnings_u64 = u64::try_from(earnings).expect("earnings fits u64");
     let mut tok_acct = env.svm.get_account(&env.vault_token).expect("vault_token");
     let mut tok_data = TokenAccount::unpack(&tok_acct.data).expect("unpack vault token");
-    tok_data.amount = tok_data.amount.checked_add(earnings_u64).expect("no overflow");
+    tok_data.amount = tok_data
+        .amount
+        .checked_add(earnings_u64)
+        .expect("no overflow");
     let mut new_data = vec![0u8; TokenAccount::LEN];
     TokenAccount::pack(tok_data, &mut new_data).expect("pack");
     tok_acct.data = new_data;
@@ -1123,7 +1602,10 @@ fn crank_fees_raises_lp_redeemable_claim() {
     let principal_before = ledger(&env).total_principal_atoms;
     let (vault_before, insurance_before) = vault_and_insurance(&env);
     let (accrued_before, withdrawn_before) = lp_fee_counters(&env);
-    assert_eq!(withdrawn_before, 0, "nothing withdrawn before the first crank");
+    assert_eq!(
+        withdrawn_before, 0,
+        "nothing withdrawn before the first crank"
+    );
 
     env.svm.expire_blockhash();
     crank_fees(&mut env).expect("crank with backed, accrued LP fees must succeed");
@@ -1155,12 +1637,24 @@ fn crank_fees_raises_lp_redeemable_claim() {
     // post-crank state through an entirely separate code path.
 
     // ── The counters, including the invariant. ──
-    assert_eq!(principal_after - principal_before, LP_FEES,
-        "ledger.total_principal_atoms must rise by exactly the cranked amount");
-    assert_eq!(accrued_after, accrued_before, "accrued must not move on a crank");
-    assert_eq!(withdrawn_after - withdrawn_before, LP_FEES,
-        "withdrawn advances by exactly the amount applied");
-    assert!(withdrawn_after <= accrued_after, "invariant: withdrawn <= accrued");
+    assert_eq!(
+        principal_after - principal_before,
+        LP_FEES,
+        "ledger.total_principal_atoms must rise by exactly the cranked amount"
+    );
+    assert_eq!(
+        accrued_after, accrued_before,
+        "accrued must not move on a crank"
+    );
+    assert_eq!(
+        withdrawn_after - withdrawn_before,
+        LP_FEES,
+        "withdrawn advances by exactly the amount applied"
+    );
+    assert!(
+        withdrawn_after <= accrued_after,
+        "invariant: withdrawn <= accrued"
+    );
 
     // ── LP-VISIBLE VALUE: the SAME shares now redeem for strictly more. ──
     request(&mut env, &d, MINTED).expect("treatment request");
@@ -1217,7 +1711,11 @@ fn crank_fees_clamps_to_engine_surplus_and_leaves_remainder_claimable() {
         "only the engine-available surplus is applied"
     );
     let (accrued, withdrawn) = lp_fee_counters(&env);
-    assert_eq!(accrued, BACKED + UNBACKED, "accrued is untouched by the clamp");
+    assert_eq!(
+        accrued,
+        BACKED + UNBACKED,
+        "accrued is untouched by the clamp"
+    );
     assert_eq!(
         withdrawn, BACKED,
         "withdrawn advances by the CLAMPED amount actually applied, NOT the requested claim"
@@ -1247,7 +1745,11 @@ fn crank_fees_clamps_to_engine_surplus_and_leaves_remainder_claimable() {
         BACKED + UNBACKED,
         "the full claim eventually reaches the LP ledger across two cranks"
     );
-    assert_eq!(lp_fee_counters(&env), (BACKED + UNBACKED, BACKED + UNBACKED), "fully drained");
+    assert_eq!(
+        lp_fee_counters(&env),
+        (BACKED + UNBACKED, BACKED + UNBACKED),
+        "fully drained"
+    );
 
     // And it is real, redeemable value — not a counter.
     request(&mut env, &d, MINTED).expect("request");
@@ -1328,10 +1830,22 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     let d_a = new_depositor(&mut env, 1_000_000);
     let d_b = new_depositor(&mut env, 2_000_000);
     const MINTED_A: u128 = 1_000_000 - 1_000; // LP_VAULT_MINIMUM_LIQUIDITY carved out of A's genesis mint
-    assert_eq!(tok(&env.svm, d_a.lp_ata), MINTED_A as u64, "A's genesis mint minus dead-share floor");
-    assert_eq!(tok(&env.svm, d_b.lp_ata), 2_000_000, "B's non-genesis mint is 1:1, unaffected");
+    assert_eq!(
+        tok(&env.svm, d_a.lp_ata),
+        MINTED_A as u64,
+        "A's genesis mint minus dead-share floor"
+    );
+    assert_eq!(
+        tok(&env.svm, d_b.lp_ata),
+        2_000_000,
+        "B's non-genesis mint is 1:1, unaffected"
+    );
     assert_eq!(vault_balance(&env), 3_000_000, "vault after deposits");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 3_000_000, "shares after deposits (dead shares included)");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        3_000_000,
+        "shares after deposits (dead shares included)"
+    );
 
     // Seed 400_000 gross earnings into domain bucket.
     seed_earnings(&mut env, 400_000);
@@ -1344,25 +1858,45 @@ fn conservation_with_earnings_partial_then_full_redeem() {
 
     let payout_a = tok(&env.svm, d_a.dest) as u128;
     // atoms_A = floor(999_000 * 3_200_000 / 3_000_000) = 1_065_600
-    assert_eq!(payout_a, 1_065_600, "LP A payout = principal + earnings slice");
+    assert_eq!(
+        payout_a, 1_065_600,
+        "LP A payout = principal + earnings slice"
+    );
 
     // Ledger after A (gross_consumed model):
     //   principal decremented by principal_A = 999_000
     //   total_earnings_withdrawn_atoms += gross_consumed_A = 133_200
     let led_a = ledger(&env);
-    assert_eq!(led_a.total_principal_atoms, 2_001_000, "principal remaining after A");
-    assert_eq!(led_a.total_principal_withdrawn_atoms, 999_000, "principal withdrawn after A");
+    assert_eq!(
+        led_a.total_principal_atoms, 2_001_000,
+        "principal remaining after A"
+    );
+    assert_eq!(
+        led_a.total_principal_withdrawn_atoms, 999_000,
+        "principal withdrawn after A"
+    );
     assert_eq!(
         led_a.total_earnings_withdrawn_atoms, 133_200,
         "earnings_withdrawn = gross_consumed_A (133_200), not LP slice (66_600)"
     );
-    assert_eq!(led_a.total_earnings_atoms, 400_000, "total_earnings_atoms unchanged by redemption");
+    assert_eq!(
+        led_a.total_earnings_atoms, 400_000,
+        "total_earnings_atoms unchanged by redemption"
+    );
 
     // Remaining shares: 2_001_000 — LP B's 2_000_000 PLUS the 1_000 dead shares.
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 2_001_000, "shares after A redeems");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        2_001_000,
+        "shares after A redeems"
+    );
 
     // Vault after A: 3_400_000 - 1_065_600 = 2_334_400
-    assert_eq!(vault_balance(&env), 2_334_400, "vault balance after A redeems");
+    assert_eq!(
+        vault_balance(&env),
+        2_334_400,
+        "vault balance after A redeems"
+    );
 
     // ── LP B redeems all 2_000_000 shares they hold (not "all remaining" —
     // 1_000 dead shares stay behind, permanently unredeemable). ──
@@ -1375,12 +1909,21 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     // lp_earnings_B = floor(266_800 * 5_000 / 10_000) = 133_400
     // NAV_B = 2_001_000 + 133_400 = 2_134_400
     // atoms_B = floor(2_000_000 * 2_134_400 / 2_001_000) = 2_133_333 (dead-share dust)
-    assert_eq!(payout_b, 2_133_333, "LP B payout (diluted by the 1_000 dead shares in the denominator)");
+    assert_eq!(
+        payout_b, 2_133_333,
+        "LP B payout (diluted by the 1_000 dead shares in the denominator)"
+    );
 
     // Ledger after B.
     let led_b = ledger(&env);
-    assert_eq!(led_b.total_principal_atoms, 1_000, "dead-share principal remainder, not zero");
-    assert_eq!(led_b.total_principal_withdrawn_atoms, 2_999_000, "total principal withdrawn (A + B)");
+    assert_eq!(
+        led_b.total_principal_atoms, 1_000,
+        "dead-share principal remainder, not zero"
+    );
+    assert_eq!(
+        led_b.total_principal_withdrawn_atoms, 2_999_000,
+        "total principal withdrawn (A + B)"
+    );
     // gross_consumed_B = ceil(133_333 * 10_000 / 5_000) = 266_666
     // total_earnings_withdrawn_atoms = 133_200 + 266_666 = 399_866
     assert_eq!(
@@ -1389,7 +1932,11 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     );
 
     // Outstanding shares == the LP_VAULT_MINIMUM_LIQUIDITY dead-share floor, not 0.
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 1_000, "dead-share floor remains, not fully zeroed");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        1_000,
+        "dead-share floor remains, not fully zeroed"
+    );
 
     // ── Conservation: vault remainder = insurance stub + dead-share dust. ──
     // Total paid = 1_065_600 + 2_133_333 = 3_198_933
@@ -1398,15 +1945,31 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     // extra 1_067 is the dead-share floor's principal+earnings share,
     // permanently stranded rather than paid to anyone; see doc above).
     let total_payout = payout_a + payout_b;
-    assert_eq!(total_payout, 3_198_933, "total payout = both LPs' real principal + earnings slices");
+    assert_eq!(
+        total_payout, 3_198_933,
+        "total payout = both LPs' real principal + earnings slices"
+    );
     let remainder = vault_balance(&env) as u128;
-    assert_eq!(remainder, 201_067, "vault remainder = insurance stub + dead-share dust");
-    assert_eq!(remainder, 3_400_000 - total_payout, "vault remainder = seeded - paid (conservation holds)");
+    assert_eq!(
+        remainder, 201_067,
+        "vault remainder = insurance stub + dead-share dust"
+    );
+    assert_eq!(
+        remainder,
+        3_400_000 - total_payout,
+        "vault remainder = seeded - paid (conservation holds)"
+    );
 
     // ── Double-redeem guard still holds after split. ──
     env.svm.expire_blockhash();
-    assert!(execute(&mut env, &d_a).is_err(), "double-redeem A must reject");
-    assert!(execute(&mut env, &d_b).is_err(), "double-redeem B must reject");
+    assert!(
+        execute(&mut env, &d_a).is_err(),
+        "double-redeem A must reject"
+    );
+    assert!(
+        execute(&mut env, &d_b).is_err(),
+        "double-redeem B must reject"
+    );
 }
 
 #[test]
@@ -1435,15 +1998,27 @@ fn lp_shares_held_at_resolution_can_redeem_and_teardown_vault() {
     request(&mut env, &d, MINTED).expect("request still succeeds after resolution");
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares are escrowed");
     execute(&mut env, &d).expect("terminal resolved redemption should pay out");
-    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "LP receives collateral payout");
     assert_eq!(
-        vault_balance(&env), (DEPOSIT - MINTED) as u64,
+        tok(&env.svm, d.dest),
+        MINTED as u64,
+        "LP receives collateral payout"
+    );
+    assert_eq!(
+        vault_balance(&env),
+        (DEPOSIT - MINTED) as u64,
         "dead-share floor's collateral stays permanently stranded in the vault"
     );
 
     let admin_dest = Pubkey::new_unique();
-    set_token(&mut env.svm, admin_dest, env.collateral_mint, env.admin.pubkey(), 0);
-    close_lp_vault(&mut env).expect("registry outstanding at the dead-share floor no longer blocks CloseLpVault");
+    set_token(
+        &mut env.svm,
+        admin_dest,
+        env.collateral_mint,
+        env.admin.pubkey(),
+        0,
+    );
+    close_lp_vault(&mut env)
+        .expect("registry outstanding at the dead-share floor no longer blocks CloseLpVault");
     let res = close_slab(&mut env, admin_dest);
     assert!(
         res.is_err(),
@@ -1462,8 +2037,15 @@ fn lp_redemption_after_resolution_requires_terminal_flat_state() {
     set_c_tot_for_test(&mut env, 1);
 
     let blocked = execute(&mut env, &d).expect_err("resolved redemption must wait for c_tot = 0");
-    assert!(blocked.contains("Custom(21)"), "expected EngineLockActive, got {blocked}");
-    assert_eq!(tok(&env.svm, d.dest), 0, "LP payout must not occur before terminal flat state");
+    assert!(
+        blocked.contains("Custom(21)"),
+        "expected EngineLockActive, got {blocked}"
+    );
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        0,
+        "LP payout must not occur before terminal flat state"
+    );
 }
 
 /// RED CONTROL: verifies that the liveness guard no longer blocks redemption
@@ -1492,8 +2074,16 @@ fn liveness_not_blocked_when_earnings_exceed_principal() {
     let mut env = setup_vault(0);
     let d = new_depositor(&mut env, 100_000);
     const MINTED_LOCAL: u128 = 100_000 - 1_000; // LP_VAULT_MINIMUM_LIQUIDITY carved out
-    assert_eq!(tok(&env.svm, d.lp_ata), MINTED_LOCAL as u64, "genesis mint minus dead-share floor");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 100_000, "registry counts the full genesis amount");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        MINTED_LOCAL as u64,
+        "genesis mint minus dead-share floor"
+    );
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        100_000,
+        "registry counts the full genesis amount"
+    );
 
     seed_earnings(&mut env, 300_000);
     // NAV = 100_000 (principal) + 150_000 (50% of 300_000) = 250_000
@@ -1503,20 +2093,36 @@ fn liveness_not_blocked_when_earnings_exceed_principal() {
     request(&mut env, &d, MINTED_LOCAL).expect("request must succeed");
     env.svm.expire_blockhash();
     // POST-FIX: this must succeed. Pre-fix: EngineCounterUnderflow (Custom 5).
-    execute(&mut env, &d).expect("execute must succeed (liveness fix — earnings do not block redemption)");
+    execute(&mut env, &d)
+        .expect("execute must succeed (liveness fix — earnings do not block redemption)");
 
     // LP receives its pro-rata NAV slice: 247_500
-    assert_eq!(tok(&env.svm, d.dest), 247_500, "LP paid pro-rata NAV (principal + earnings)");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        247_500,
+        "LP paid pro-rata NAV (principal + earnings)"
+    );
     // Vault remainder = insurance stub + dead-share dust = 400_000 (100_000 + 300_000) - 247_500 = 152_500
-    assert_eq!(vault_balance(&env), 152_500, "insurance stub + dead-share dust stays in vault");
+    assert_eq!(
+        vault_balance(&env),
+        152_500,
+        "insurance stub + dead-share dust stays in vault"
+    );
     // Ledger: gross_consumed = ceil(148_500 * 10_000 / 5_000) = 297_000
     let led = ledger(&env);
-    assert_eq!(led.total_principal_atoms, 1_000, "dead-share principal remainder, not zero");
+    assert_eq!(
+        led.total_principal_atoms, 1_000,
+        "dead-share principal remainder, not zero"
+    );
     assert_eq!(
         led.total_earnings_withdrawn_atoms, 297_000,
         "earnings_withdrawn = gross_consumed (297_000), not LP slice (148_500)"
     );
-    assert_eq!(reg(&env).total_lp_shares_outstanding, 1_000, "dead-share floor remains, not zero");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        1_000,
+        "dead-share floor remains, not zero"
+    );
 }
 
 /// RED CONTROL STRUCTURAL CHECK: if the old guard logic `atoms > total_principal`
@@ -1612,42 +2218,79 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
     let mut env = setup_vault(0); // fee_share_bps = 5_000, immediate cooldown, asset-1 operator = admin
     let d = new_depositor(&mut env, DEPOSIT);
     seed_earnings(&mut env, 400_000);
-    assert_eq!(vault_balance(&env), 1_400_000, "vault after deposit + earnings seed");
+    assert_eq!(
+        vault_balance(&env),
+        1_400_000,
+        "vault after deposit + earnings seed"
+    );
 
     // ── Full redeem of the real (MINTED) shares → LP paid its pro-rata NAV;
     // insurance stub credited (LPVAULT-359 fix, still exercised here). ──
     request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("execute");
-    assert_eq!(tok(&env.svm, d.dest), 1_198_800, "LP paid pro-rata NAV (principal + earnings slice)");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY, "dead-share floor remains");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        1_198_800,
+        "LP paid pro-rata NAV (principal + earnings slice)"
+    );
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        LP_VAULT_MINIMUM_LIQUIDITY,
+        "dead-share floor remains"
+    );
 
     // The 199_800 stub (+ nothing else visible here) physically remains in the vault SPL account...
-    assert_eq!(vault_balance(&env), 201_200, "insurance stub + dead-share dust remains in the vault");
+    assert_eq!(
+        vault_balance(&env),
+        201_200,
+        "insurance stub + dead-share dust remains in the vault"
+    );
 
     // ...and (THE LPVAULT-359 FIX) the earnings stub IS tracked in header.insurance
     // + the redemption domain's budget, rather than sitting as an un-owned residual.
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
-    assert_eq!(group.insurance, 199_800, "FIX: stub credited to header.insurance");
-    assert_eq!(group.insurance_domain_budget_remaining_total, 199_800,
-        "FIX: stub credited to insurance_domain_budget_remaining_total");
-    assert_eq!(group.insurance_domain_budget[DOMAIN as usize], 199_800,
-        "FIX: stub credited to the redemption domain's per-domain budget");
-    assert_eq!(group.insurance_domain_spent[DOMAIN as usize], 0, "no spend on the domain budget");
+    assert_eq!(
+        group.insurance, 199_800,
+        "FIX: stub credited to header.insurance"
+    );
+    assert_eq!(
+        group.insurance_domain_budget_remaining_total, 199_800,
+        "FIX: stub credited to insurance_domain_budget_remaining_total"
+    );
+    assert_eq!(
+        group.insurance_domain_budget[DOMAIN as usize], 199_800,
+        "FIX: stub credited to the redemption domain's per-domain budget"
+    );
+    assert_eq!(
+        group.insurance_domain_spent[DOMAIN as usize], 0,
+        "no spend on the domain budget"
+    );
     // RESIDUAL NEUTRALITY still holds exactly: vault minus every tracked claim
     // (including the BUG-2 dead-share principal, now nonzero) is ZERO.
-    assert_eq!(group.vault, 201_200, "header.vault still holds the stub + dead-share dust atoms");
+    assert_eq!(
+        group.vault, 201_200,
+        "header.vault still holds the stub + dead-share dust atoms"
+    );
     assert_eq!(group.c_tot, 0, "no counterparty capital");
-    assert_eq!(group.backing_provider_earnings_total, 400, "small earnings dust from the dead-share floor");
+    assert_eq!(
+        group.backing_provider_earnings_total, 400,
+        "small earnings dust from the dead-share floor"
+    );
     assert_eq!(
         group.source_fresh_backing_total_num,
         LP_VAULT_MINIMUM_LIQUIDITY * percolator::BOUND_SCALE,
         "dead-share floor's principal is still nominally 'fresh backing' — permanently unwithdrawable"
     );
     let residual = group.vault
-        - (group.c_tot + group.insurance + group.backing_provider_earnings_total
+        - (group.c_tot
+            + group.insurance
+            + group.backing_provider_earnings_total
             + group.source_fresh_backing_total_num / percolator::BOUND_SCALE);
-    assert_eq!(residual, 0, "residual neutrality: every vault atom is accounted for by SOME counter");
+    assert_eq!(
+        residual, 0,
+        "residual neutrality: every vault atom is accounted for by SOME counter"
+    );
 
     // ── Drain the stub via WithdrawInsuranceAsset (insurance_operator = admin). ──
     // Requires Live mode (asset 1, domain 2). The greedy long-first debit drains
@@ -1656,39 +2299,81 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
     let admin_insurance_dest = Pubkey::new_unique();
-    set_token(&mut env.svm, admin_insurance_dest, env.collateral_mint, admin.pubkey(), 0);
+    set_token(
+        &mut env.svm,
+        admin_insurance_dest,
+        env.collateral_mint,
+        admin.pubkey(),
+        0,
+    );
     env.svm.expire_blockhash();
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::WithdrawInsuranceAsset {
-        asset_index: APPEND_ASSET_INDEX, amount: 199_800,
-    }, vec![
-        AccountMeta::new(admin.pubkey(), true),                 // 0 operator (signer)
-        AccountMeta::new(env.market, false),                    // 1 market
-        AccountMeta::new(admin_insurance_dest, false),          // 2 dest token (operator-owned)
-        AccountMeta::new(env.vault_token, false),               // 3 vault token
-        AccountMeta::new_readonly(env.vault_authority, false),  // 4 vault authority PDA
-        AccountMeta::new_readonly(spl_token::ID, false),        // 5 token program
-    ])], &[&admin]).expect("WithdrawInsuranceAsset drains the earnings stub (LPVAULT-359 fix still works)");
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::WithdrawInsuranceAsset {
+                asset_index: APPEND_ASSET_INDEX,
+                amount: 199_800,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true), // 0 operator (signer)
+                AccountMeta::new(env.market, false),    // 1 market
+                AccountMeta::new(admin_insurance_dest, false), // 2 dest token (operator-owned)
+                AccountMeta::new(env.vault_token, false), // 3 vault token
+                AccountMeta::new_readonly(env.vault_authority, false), // 4 vault authority PDA
+                AccountMeta::new_readonly(spl_token::ID, false), // 5 token program
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("WithdrawInsuranceAsset drains the earnings stub (LPVAULT-359 fix still works)");
 
-    assert_eq!(tok(&env.svm, admin_insurance_dest), 199_800, "operator received the full earnings stub");
+    assert_eq!(
+        tok(&env.svm, admin_insurance_dest),
+        199_800,
+        "operator received the full earnings stub"
+    );
     // The dead-share floor's principal (1_000) + earnings dust (400) remain —
     // NOT drained to zero, unlike the pre-BUG-2 LPVAULT-359 test.
     assert_eq!(
-        vault_balance(&env), 1_400,
+        vault_balance(&env),
+        1_400,
         "dead-share floor's stranded principal + earnings dust remains after the insurance sweep"
     );
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
     assert_eq!(group.insurance, 0, "header.insurance drained to zero");
-    assert_eq!(group.vault, 1_400, "header.vault still holds the permanently-stranded dead-share dust");
-    assert_eq!(group.insurance_domain_budget_remaining_total, 0, "domain budget drained to zero");
+    assert_eq!(
+        group.vault, 1_400,
+        "header.vault still holds the permanently-stranded dead-share dust"
+    );
+    assert_eq!(
+        group.insurance_domain_budget_remaining_total, 0,
+        "domain budget drained to zero"
+    );
 
     // ── ResolveMarket → terminal mode; CloseSlab is now PERMANENTLY blocked. ──
     env.svm.expire_blockhash();
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ResolveMarket, vec![
-        AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new(env.market, false),
-    ])], &[&admin]).expect("resolve market");
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::ResolveMarket,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("resolve market");
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
-    assert_eq!(group.mode, MarketModeV16::Resolved, "market resolved (terminal mode 1)");
+    assert_eq!(
+        group.mode,
+        MarketModeV16::Resolved,
+        "market resolved (terminal mode 1)"
+    );
 
     // CloseSlab gates on vault==0 && insurance==0 && c_tot==0. insurance is 0
     // (fully swept above) but vault == 1_400 (dead-share principal + earnings
@@ -1700,16 +2385,31 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
     // for any market whose LP vault ever took a genesis deposit — an accepted
     // trade-off of the anti-inflation floor, not a bug in either fix.
     let close_dest = Pubkey::new_unique();
-    set_token(&mut env.svm, close_dest, env.collateral_mint, admin.pubkey(), 0);
+    set_token(
+        &mut env.svm,
+        close_dest,
+        env.collateral_mint,
+        admin.pubkey(),
+        0,
+    );
     env.svm.expire_blockhash();
-    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CloseSlab, vec![
-        AccountMeta::new(admin.pubkey(), true),                 // 0 admin (signer, writable, rent dest)
-        AccountMeta::new(env.market, false),                    // 1 market
-        AccountMeta::new(env.vault_token, false),               // 2 vault token
-        AccountMeta::new_readonly(env.vault_authority, false),  // 3 vault authority PDA
-        AccountMeta::new(close_dest, false),                    // 4 dest token (admin-owned)
-        AccountMeta::new_readonly(spl_token::ID, false),        // 5 token program
-    ])], &[&admin]);
+    let res = send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::CloseSlab,
+            vec![
+                AccountMeta::new(admin.pubkey(), true), // 0 admin (signer, writable, rent dest)
+                AccountMeta::new(env.market, false),    // 1 market
+                AccountMeta::new(env.vault_token, false), // 2 vault token
+                AccountMeta::new_readonly(env.vault_authority, false), // 3 vault authority PDA
+                AccountMeta::new(close_dest, false),    // 4 dest token (admin-owned)
+                AccountMeta::new_readonly(spl_token::ID, false), // 5 token program
+            ],
+        )],
+        &[&admin],
+    );
     assert!(
         res.is_err(),
         "CloseSlab must now stay permanently blocked by the dead-share floor's stranded vault dust: {res:?}"
@@ -1775,7 +2475,11 @@ fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_red
     let d1 = new_depositor(&mut env, DEPOSIT);
     let d2 = new_depositor(&mut env, 2 * DEPOSIT);
     let total_backing = source_credit_fresh_reserved_atoms(&env, DOMAIN);
-    assert_eq!(total_backing, DEPOSIT + 2 * DEPOSIT, "sanity: pool backing == sum of deposits (no earnings)");
+    assert_eq!(
+        total_backing,
+        DEPOSIT + 2 * DEPOSIT,
+        "sanity: pool backing == sum of deposits (no earnings)"
+    );
 
     // Hand-craft a live lien for 2_000_000 atoms -- fully covered right now
     // (3_000_000 available >= 2_000_000 claimed), but leaves only 1_000_000
@@ -1797,8 +2501,15 @@ fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_red
     );
     assert_eq!(tok(&env.svm, d1.dest), MINTED as u64, "d1 paid in full");
     let after_d1 = source_credit_fresh_reserved_atoms(&env, DOMAIN);
-    assert_eq!(after_d1, total_backing - MINTED, "backing decremented by exactly d1's principal");
-    assert!(after_d1 >= claim_atoms, "domain must remain fully covered after d1's redemption");
+    assert_eq!(
+        after_d1,
+        total_backing - MINTED,
+        "backing decremented by exactly d1's principal"
+    );
+    assert!(
+        after_d1 >= claim_atoms,
+        "domain must remain fully covered after d1's redemption"
+    );
 
     // D2 now tries to redeem 100_000 of its 2_000_000 shares. Post-redemption
     // backing would be 2_001_000 - 100_000 = 1_901_000 < the 2_000_000 claim
@@ -1812,9 +2523,16 @@ fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_red
         res.is_err(),
         "ExecuteRedemption that would leave the domain under-backed relative to its claim must be rejected: {res:?}"
     );
-    assert_eq!(tok(&env.svm, d2.dest), 0, "no payout on the rejected under-backed redemption");
+    assert_eq!(
+        tok(&env.svm, d2.dest),
+        0,
+        "no payout on the rejected under-backed redemption"
+    );
     let after_rejected = source_credit_fresh_reserved_atoms(&env, DOMAIN);
-    assert_eq!(after_rejected, after_d1, "rejected redemption must not mutate backing state (atomic rollback)");
+    assert_eq!(
+        after_rejected, after_d1,
+        "rejected redemption must not mutate backing state (atomic rollback)"
+    );
 
     // Sanity: the SAME 100_000 request, once the lien is relaxed back to 0,
     // executes cleanly -- confirms the D2 rejection above was specifically
@@ -1822,8 +2540,13 @@ fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_red
     // the pending redemption request survives a prior rejected execute.
     set_source_credit_lien_for_test(&mut env, DOMAIN, 0);
     env.svm.expire_blockhash();
-    execute(&mut env, &d2).expect("same request executes once the lien no longer makes it under-backed");
-    assert_eq!(tok(&env.svm, d2.dest), 100_000, "d2 paid once solvency is restored");
+    execute(&mut env, &d2)
+        .expect("same request executes once the lien no longer makes it under-backed");
+    assert_eq!(
+        tok(&env.svm, d2.dest),
+        100_000,
+        "d2 paid once solvency is restored"
+    );
 }
 
 // ── Finding 1 (mode gate) + Finding 3 (crank with no LPs) ───────────────────
@@ -1874,7 +2597,10 @@ fn crank_fees_rejected_outside_live_mode() {
     let (vault_before, insurance_before) = vault_and_insurance(&env);
     let counters_before = lp_fee_counters(&env);
     assert_eq!(counters_before, (LP_FEES, 0), "a full claim is outstanding");
-    assert!(insurance_before >= LP_FEES, "the claim is fully backed, so ONLY the mode gate can reject");
+    assert!(
+        insurance_before >= LP_FEES,
+        "the claim is fully backed, so ONLY the mode gate can reject"
+    );
 
     set_mode(&mut env, MarketModeV16::Recovery);
     env.svm.expire_blockhash();
@@ -1912,7 +2638,11 @@ fn crank_fees_rejected_outside_live_mode() {
         (v2_before, i2_before),
         "Resolved: header.insurance must be untouched by the rejected crank"
     );
-    assert_eq!(lp_fee_counters(&env2), (LP_FEES, 0), "Resolved: claim intact");
+    assert_eq!(
+        lp_fee_counters(&env2),
+        (LP_FEES, 0),
+        "Resolved: claim intact"
+    );
 
     // ---- Live-but-MATURED: still mode 0, but past the permissionless
     //      stale-resolve horizon, i.e. a market anyone may resolve and that is
@@ -1926,7 +2656,11 @@ fn crank_fees_rejected_outside_live_mode() {
     {
         let mut acct = env3.svm.get_account(&env3.market).expect("market");
         let (mut cfg, group) = state::read_market(&acct.data).expect("read market");
-        assert_eq!(group.mode, MarketModeV16::Live, "still Live -- only maturity differs");
+        assert_eq!(
+            group.mode,
+            MarketModeV16::Live,
+            "still Live -- only maturity differs"
+        );
         // `permissionless_stale_matured`: stale_slots != 0 && now - last_good >= stale_slots.
         cfg.permissionless_resolve_stale_slots = 1;
         cfg.last_good_oracle_slot = 0;
@@ -1939,7 +2673,8 @@ fn crank_fees_rejected_outside_live_mode() {
     // be crossed by actually advancing the chain.
     env3.svm.warp_to_slot(50);
     env3.svm.expire_blockhash();
-    let err3 = crank_fees(&mut env3).expect_err("a permissionless crank on a matured Live market must reject");
+    let err3 = crank_fees(&mut env3)
+        .expect_err("a permissionless crank on a matured Live market must reject");
     assert!(
         err3.contains("Custom(27)"),
         "matured-Live crank must return OracleStale = Custom(27), got: {err3}"
@@ -1949,7 +2684,11 @@ fn crank_fees_rejected_outside_live_mode() {
         (v3_before, i3_before),
         "matured Live: header.insurance must be untouched by the rejected crank"
     );
-    assert_eq!(lp_fee_counters(&env3), (LP_FEES, 0), "matured Live: claim intact");
+    assert_eq!(
+        lp_fee_counters(&env3),
+        (LP_FEES, 0),
+        "matured Live: claim intact"
+    );
 
     // ---- Live control (non-vacuity + claim-not-forfeited). ----
     // The SAME market, SAME claim, SAME backing: only the mode differs. It must
@@ -2004,7 +2743,11 @@ fn crank_fees_after_full_lp_exit_rejects_and_leaves_atoms_in_insurance() {
     // Full LP exit: the sole (genesis) depositor redeems every REAL share.
     request(&mut env, &d, MINTED).expect("request full redemption");
     execute(&mut env, &d).expect("execute full redemption");
-    assert_eq!(tok(&env.svm, d.lp_ata), 0, "no real LP shares left in any ATA");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        0,
+        "no real LP shares left in any ATA"
+    );
     assert_eq!(
         lp_shares_outstanding(&env),
         LP_VAULT_MINIMUM_LIQUIDITY,
@@ -2016,7 +2759,11 @@ fn crank_fees_after_full_lp_exit_rejects_and_leaves_atoms_in_insurance() {
     // state in which the pre-fix crank succeeded and orphaned them.
     let (vault_before, insurance_before) = vault_and_insurance(&env);
     let counters_before = lp_fee_counters(&env);
-    assert_eq!(counters_before, (LP_FEES, 0), "the full LP fee claim is still outstanding");
+    assert_eq!(
+        counters_before,
+        (LP_FEES, 0),
+        "the full LP fee claim is still outstanding"
+    );
     assert!(
         insurance_before >= LP_FEES,
         "and still fully backed -- so ONLY the no-LPs guard can reject this crank"
@@ -2041,7 +2788,11 @@ fn crank_fees_after_full_lp_exit_rejects_and_leaves_atoms_in_insurance() {
         principal_before,
         "no unclaimable principal was credited to the backing ledger"
     );
-    assert_eq!(lp_fee_counters(&env), counters_before, "nothing marked withdrawn");
+    assert_eq!(
+        lp_fee_counters(&env),
+        counters_before,
+        "nothing marked withdrawn"
+    );
 
     // And the vault can still be torn down cleanly, with no stranded principal.
     close_lp_vault(&mut env).expect("CloseLpVault still succeeds at the dead-share floor");
@@ -2054,7 +2805,13 @@ fn new_depositor_into_sibling(env: &mut Env, amount: u128) -> Depositor {
     let kp = Keypair::new();
     env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        kp.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
     let dest = Pubkey::new_unique();
@@ -2067,11 +2824,23 @@ fn new_depositor_into_sibling(env: &mut Env, amount: u128) -> Depositor {
         &mut env.svm,
         pid,
         &payer,
-        vec![(ProgInstruction::DepositToLpVault { amount, domain: DOMAIN ^ 1 }, accts)],
+        vec![(
+            ProgInstruction::DepositToLpVault {
+                amount,
+                domain: DOMAIN ^ 1,
+            },
+            accts,
+        )],
         &[&kp],
     )
     .expect("sibling deposit");
-    Depositor { kp, source, lp_ata, dest, redemption }
+    Depositor {
+        kp,
+        source,
+        lp_ata,
+        dest,
+        redemption,
+    }
 }
 
 /// RED: a redemption must value shares against BOTH pots.
@@ -2102,7 +2871,10 @@ fn redemption_prices_shares_off_combined_nav() {
         "redeemer was paid {paid} for a stake worth ~{DEPOSIT} — NAV is ignoring the \
          sibling pot, so exiting LPs forfeit whatever sits in it"
     );
-    assert!(paid <= DEPOSIT, "must not overpay: got {paid}, stake worth ~{DEPOSIT}");
+    assert!(
+        paid <= DEPOSIT,
+        "must not overpay: got {paid}, stake worth ~{DEPOSIT}"
+    );
 }
 
 /// Piece 4: does the fee crank still behave when the vault's OWN pot is empty
@@ -2225,10 +2997,20 @@ fn request_redeem_succeeds_with_prefunded_escrow_and_redemption() {
     .expect("RequestRedeemLpShares must tolerate pre-funded escrow and redemption PDAs");
 
     let escrow_acct = env.svm.get_account(&env.escrow).expect("escrow exists");
-    assert_eq!(escrow_acct.owner, spl_token::ID, "escrow must become token-owned");
+    assert_eq!(
+        escrow_acct.owner,
+        spl_token::ID,
+        "escrow must become token-owned"
+    );
     let escrow = TokenAccount::unpack(&escrow_acct.data).expect("escrow token account decodes");
-    assert_eq!(escrow.owner, env.registry, "escrow owner must be registry PDA");
-    assert_eq!(escrow.amount, MINTED as u64, "escrow must hold requested LP shares");
+    assert_eq!(
+        escrow.owner, env.registry,
+        "escrow owner must be registry PDA"
+    );
+    assert_eq!(
+        escrow.amount, MINTED as u64,
+        "escrow must hold requested LP shares"
+    );
 
     let redemption_acct = env
         .svm
@@ -2278,10 +3060,21 @@ fn exec_draw_from(env: &mut Env, d: &Depositor, domain: u16) -> Result<(), Strin
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = execute_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain }, accts)], &[])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::ExecuteRedemption { domain }, accts)],
+        &[],
+    )
 }
 
-fn try_rebalance_backing(env: &mut Env, from_domain: u16, to_domain: u16, amount: u128) -> Result<(), String> {
+fn try_rebalance_backing(
+    env: &mut Env,
+    from_domain: u16,
+    to_domain: u16,
+    amount: u128,
+) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let from_ledger = derive_lp_backing_ledger(&env.program_id, &env.market, from_domain).0;
@@ -2298,7 +3091,14 @@ fn try_rebalance_backing(env: &mut Env, from_domain: u16, to_domain: u16, amount
         &mut env.svm,
         pid,
         &payer,
-        vec![(ProgInstruction::RebalanceLpVaultBacking { from_domain, to_domain, amount }, accts)],
+        vec![(
+            ProgInstruction::RebalanceLpVaultBacking {
+                from_domain,
+                to_domain,
+                amount,
+            },
+            accts,
+        )],
         &[],
     )
 }
@@ -2366,7 +3166,10 @@ fn issue_419_dual_domain_lp_can_exit_a_resolved_market_via_rebalance() {
     let paid = tok(&env.svm, d.dest) - before;
     println!("    [#419] atoms paid after consolidation -> {paid}");
 
-    assert!(paid > 0, "#419 REGRESSION — redemption reported success but paid nothing");
+    assert!(
+        paid > 0,
+        "#419 REGRESSION — redemption reported success but paid nothing"
+    );
     assert_eq!(
         paid, MINTED as u64,
         "the LP must be paid its full pro-rata claim once the pots are consolidated"
@@ -2425,7 +3228,10 @@ fn control_equal_deposits_mint_equal_shares_when_no_fees_are_accrued() {
     let sa = tok(&env.svm, a.lp_ata) as u128;
     let sb = tok(&env.svm, b.lp_ata) as u128;
     println!("    [#411-control] a={sa} b={sb}");
-    assert_eq!(sa, sb, "with no fee pool, equal deposits must mint equal shares");
+    assert_eq!(
+        sa, sb,
+        "with no fee pool, equal deposits must mint equal shares"
+    );
 }
 
 #[test]
@@ -2549,7 +3355,9 @@ fn issue_413_a_refill_is_not_counted_as_both_principal_and_recovery() {
     let before = ledger(&env);
     println!(
         "    [#413] after consumption: principal={} loss={} recovery={}",
-        before.total_principal_atoms, before.cumulative_loss_atoms, before.cumulative_recovery_atoms
+        before.total_principal_atoms,
+        before.cumulative_loss_atoms,
+        before.cumulative_recovery_atoms
     );
 
     // The refill: new principal that also pays down the provider receivable.
@@ -2573,10 +3381,14 @@ fn issue_413_a_refill_is_not_counted_as_both_principal_and_recovery() {
         "    [#413] after refill: principal={} loss={} recovery={}",
         after.total_principal_atoms, after.cumulative_loss_atoms, after.cumulative_recovery_atoms
     );
-    println!("    [#413] available={avail} expected={expected} over={}", avail.saturating_sub(expected));
+    println!(
+        "    [#413] available={avail} expected={expected} over={}",
+        avail.saturating_sub(expected)
+    );
 
     assert_eq!(
-        avail, expected,
+        avail,
+        expected,
         "#413 — the refill was counted twice: once as principal by the deposit handler and \
          again as a recovery by sync, because paying down the provider receivable lowers \
          consumed_liened_backing_num. available is overstated by {} atoms, and redemption \

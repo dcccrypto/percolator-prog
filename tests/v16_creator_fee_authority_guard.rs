@@ -359,7 +359,12 @@ fn asset_admin_of(market: &TestAccount, asset_index: usize) -> [u8; 32] {
         .asset_admin
 }
 
-fn activate_ix(asset_index: u16, now_slot: u64, initial_price: u64, authority: [u8; 32]) -> Instruction {
+fn activate_ix(
+    asset_index: u16,
+    now_slot: u64,
+    initial_price: u64,
+    authority: [u8; 32],
+) -> Instruction {
     Instruction::UpdateAssetLifecycle {
         action: processor::ASSET_ACTION_ACTIVATE,
         asset_index,
@@ -514,7 +519,10 @@ fn retired_nonzero_slot_recycling_still_sets_fresh_domain_authorities() {
     run_ix(retire_ix(1, 2), &mut [&mut creator, &mut market])
         .expect("marketauth must be able to retire a nonzero asset slot");
     let (cfg_retired, group_retired) = state::read_market(&market.data).unwrap();
-    assert_eq!(group_retired.assets[1].lifecycle, AssetLifecycleV16::Retired);
+    assert_eq!(
+        group_retired.assets[1].lifecycle,
+        AssetLifecycleV16::Retired
+    );
     assert_eq!(cfg_retired.free_market_slot_count, 1);
 
     run_ix(

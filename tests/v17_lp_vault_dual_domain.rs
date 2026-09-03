@@ -43,7 +43,10 @@ const DEPOSIT: u128 = 1_000_000;
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
-    assert!(p.exists(), "wrapper BPF missing — cargo build-sbf --no-default-features");
+    assert!(
+        p.exists(),
+        "wrapper BPF missing — cargo build-sbf --no-default-features"
+    );
     p
 }
 
@@ -56,7 +59,10 @@ fn spl_token_program_path() -> PathBuf {
             h
         });
     for reg in std::fs::read_dir(cargo_home.join("registry/src")).expect("registry/src") {
-        let cand = reg.expect("entry").path().join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
+        let cand = reg
+            .expect("entry")
+            .path()
+            .join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
         if cand.exists() {
             return cand;
         }
@@ -131,7 +137,11 @@ fn send(
     accounts: Vec<AccountMeta>,
     extra: &[&Keypair],
 ) -> Result<(), String> {
-    let instruction = Instruction { program_id, accounts, data: ix.encode() };
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: ix.encode(),
+    };
     let mut signers = vec![payer];
     signers.extend_from_slice(extra);
     let tx = Transaction::new_signed_with_payer(
@@ -144,7 +154,9 @@ fn send(
         &signers,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 fn init_market_ix() -> ProgInstruction {
@@ -195,8 +207,14 @@ fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstructio
 fn setup() -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
-    svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
-    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("token BPF"));
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("wrapper BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("token BPF"),
+    );
 
     let payer = Keypair::new();
     let admin = Keypair::new();
@@ -219,7 +237,11 @@ fn setup() -> Env {
         market,
         Account {
             lamports: 1_000_000_000,
-            data: vec![0u8; state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()],
+            data: vec![
+                0u8;
+                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                    .unwrap()
+            ],
             owner: program_id,
             executable: false,
             rent_epoch: 0,
@@ -245,7 +267,15 @@ fn setup() -> Env {
     let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
 
-    Env { svm, program_id, payer, admin, market, collateral_mint, vault_token }
+    Env {
+        svm,
+        program_id,
+        payer,
+        admin,
+        market,
+        collateral_mint,
+        vault_token,
+    }
 }
 
 fn create_lp_vault(env: &mut Env, registry: Pubkey, mint: Pubkey) {
@@ -329,9 +359,17 @@ fn ready_vault(env: &mut Env) -> (Pubkey, Pubkey, Pubkey, Keypair, Pubkey, Pubke
     create_lp_vault(env, registry, mint);
 
     let depositor = Keypair::new();
-    env.svm.airdrop(&depositor.pubkey(), 100_000_000_000).unwrap();
+    env.svm
+        .airdrop(&depositor.pubkey(), 100_000_000_000)
+        .unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, depositor.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        depositor.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, mint, depositor.pubkey(), 0);
     (registry, mint, ledger, depositor, lp_ata, source)
@@ -339,7 +377,9 @@ fn ready_vault(env: &mut Env) -> (Pubkey, Pubkey, Pubkey, Keypair, Pubkey, Pubke
 
 fn token_amount(svm: &LiteSVM, key: Pubkey) -> u64 {
     let acct = svm.get_account(&key).expect("token account");
-    TokenAccount::unpack(&acct.data).expect("token decode").amount
+    TokenAccount::unpack(&acct.data)
+        .expect("token decode")
+        .amount
 }
 
 /// FIND-1 regression test: DepositToLpVault must succeed immediately after
@@ -353,9 +393,15 @@ fn token_amount(svm: &LiteSVM, key: Pubkey) -> u64 {
 /// client. This test proves CreateLpVault alone now completes the wiring.
 
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -374,7 +420,9 @@ fn bucket_fresh(svm: &LiteSVM, market: Pubkey, domain: u16) -> u128 {
 fn ledger_principal(svm: &LiteSVM, ledger: Pubkey) -> u128 {
     match svm.get_account(&ledger) {
         Some(a) if !a.data.is_empty() => {
-            state::read_backing_domain_ledger(&a.data).expect("ledger").total_principal_atoms
+            state::read_backing_domain_ledger(&a.data)
+                .expect("ledger")
+                .total_principal_atoms
         }
         _ => 0,
     }
@@ -397,9 +445,18 @@ fn rebalance_moves_idle_backing_to_sibling_domain() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
         deposit_accounts(
-            env.market, env.vault_token, registry, _mint, lp_ata, source, ledger,
+            env.market,
+            env.vault_token,
+            registry,
+            _mint,
+            lp_ata,
+            source,
+            ledger,
             depositor.pubkey(),
         ),
         &[&depositor],
@@ -468,8 +525,10 @@ fn lien_backing(env: &mut Env, domain: u16, lien_num: u128) {
     let mut acct = env.svm.get_account(&env.market).expect("market");
     let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
     let b = &mut group.source_backing_buckets[domain as usize];
-    b.fresh_unliened_backing_num =
-        b.fresh_unliened_backing_num.checked_sub(lien_num).expect("enough idle backing");
+    b.fresh_unliened_backing_num = b
+        .fresh_unliened_backing_num
+        .checked_sub(lien_num)
+        .expect("enough idle backing");
     b.valid_liened_backing_num = b.valid_liened_backing_num.checked_add(lien_num).unwrap();
     state::write_market(&mut acct.data, &cfg, &group).expect("write market");
     env.svm.set_account(env.market, acct).unwrap();
@@ -483,9 +542,18 @@ fn seeded_vault(env: &mut Env) -> (Pubkey, Pubkey, Pubkey, Keypair) {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
         deposit_accounts(
-            env.market, env.vault_token, registry, mint, lp_ata, source, ledger,
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
             depositor.pubkey(),
         ),
         &[&depositor],
@@ -510,7 +578,11 @@ fn try_rebalance(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::RebalanceLpVaultBacking { from_domain, to_domain, amount },
+        ProgInstruction::RebalanceLpVaultBacking {
+            from_domain,
+            to_domain,
+            amount,
+        },
         vec![
             AccountMeta::new(cranker.pubkey(), true),
             AccountMeta::new(env.market, false),
@@ -535,11 +607,20 @@ fn rebalance_cannot_move_liened_backing() {
 
     // Asking for half the original deposit now exceeds what is still idle.
     let err = try_rebalance(
-        &mut env, registry, ledger, sibling_ledger, &cranker, DOMAIN, SIBLING_DOMAIN,
+        &mut env,
+        registry,
+        ledger,
+        sibling_ledger,
+        &cranker,
+        DOMAIN,
+        SIBLING_DOMAIN,
         DEPOSIT / 2,
     )
     .expect_err("must refuse to move liened backing");
-    assert!(err.contains("Custom"), "expected a program error, got {err}");
+    assert!(
+        err.contains("Custom"),
+        "expected a program error, got {err}"
+    );
     assert_eq!(
         bucket_fresh(&env.svm, env.market, SIBLING_DOMAIN),
         0,
@@ -555,10 +636,20 @@ fn rebalance_cannot_cross_into_another_asset() {
     let (registry, ledger, _sibling, cranker) = seeded_vault(&mut env);
     let (foreign_ledger, _) = derive_lp_backing_ledger(&env.program_id, &env.market, 0);
     let err = try_rebalance(
-        &mut env, registry, ledger, foreign_ledger, &cranker, DOMAIN, 0, DEPOSIT / 2,
+        &mut env,
+        registry,
+        ledger,
+        foreign_ledger,
+        &cranker,
+        DOMAIN,
+        0,
+        DEPOSIT / 2,
     )
     .expect_err("must refuse to move backing into another asset");
-    assert!(err.contains("Custom"), "expected a program error, got {err}");
+    assert!(
+        err.contains("Custom"),
+        "expected a program error, got {err}"
+    );
     assert_eq!(
         bucket_fresh(&env.svm, env.market, 0),
         0,
@@ -572,11 +663,20 @@ fn rebalance_cannot_move_more_than_is_there() {
     let mut env = setup();
     let (registry, ledger, sibling_ledger, cranker) = seeded_vault(&mut env);
     let err = try_rebalance(
-        &mut env, registry, ledger, sibling_ledger, &cranker, DOMAIN, SIBLING_DOMAIN,
+        &mut env,
+        registry,
+        ledger,
+        sibling_ledger,
+        &cranker,
+        DOMAIN,
+        SIBLING_DOMAIN,
         DEPOSIT * 10,
     )
     .expect_err("must refuse to move more backing than the domain holds");
-    assert!(err.contains("Custom"), "expected a program error, got {err}");
+    assert!(
+        err.contains("Custom"),
+        "expected a program error, got {err}"
+    );
 }
 
 /// A full move must leave the source domain empty and the sibling holding
@@ -587,7 +687,14 @@ fn rebalance_full_move_conserves_total_principal() {
     let (registry, ledger, sibling_ledger, cranker) = seeded_vault(&mut env);
     let before = bucket_fresh(&env.svm, env.market, DOMAIN);
     try_rebalance(
-        &mut env, registry, ledger, sibling_ledger, &cranker, DOMAIN, SIBLING_DOMAIN, DEPOSIT,
+        &mut env,
+        registry,
+        ledger,
+        sibling_ledger,
+        &cranker,
+        DOMAIN,
+        SIBLING_DOMAIN,
+        DEPOSIT,
     )
     .expect("full move of idle backing");
     assert_eq!(bucket_fresh(&env.svm, env.market, DOMAIN), 0);
@@ -601,7 +708,13 @@ fn new_depositor(env: &mut Env, mint: Pubkey) -> (Keypair, Pubkey, Pubkey) {
     let d = Keypair::new();
     env.svm.airdrop(&d.pubkey(), 100_000_000_000).unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, d.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        d.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, mint, d.pubkey(), 0);
     (d, source, lp_ata)
@@ -627,9 +740,18 @@ fn deposit_prices_shares_off_combined_nav_after_rebalance() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
         deposit_accounts(
-            env.market, env.vault_token, registry, mint, lp_ata1, source1, ledger,
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata1,
+            source1,
+            ledger,
             d1.pubkey(),
         ),
         &[&d1],
@@ -641,7 +763,13 @@ fn deposit_prices_shares_off_combined_nav_after_rebalance() {
     let cranker = Keypair::new();
     env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
     try_rebalance(
-        &mut env, registry, ledger, sibling_ledger, &cranker, DOMAIN, SIBLING_DOMAIN,
+        &mut env,
+        registry,
+        ledger,
+        sibling_ledger,
+        &cranker,
+        DOMAIN,
+        SIBLING_DOMAIN,
         DEPOSIT / 2,
     )
     .expect("move half the backing to the sibling pot");
@@ -651,9 +779,18 @@ fn deposit_prices_shares_off_combined_nav_after_rebalance() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
         deposit_accounts(
-            env.market, env.vault_token, registry, mint, lp_ata2, source2, ledger,
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata2,
+            source2,
+            ledger,
             d2.pubkey(),
         ),
         &[&d2],
@@ -688,9 +825,18 @@ fn deposit_can_be_routed_to_the_sibling_domain() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: SIBLING_DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: SIBLING_DOMAIN,
+        },
         deposit_accounts(
-            env.market, env.vault_token, registry, mint, lp_ata1, source1, ledger,
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata1,
+            source1,
+            ledger,
             d1.pubkey(),
         ),
         &[&d1],
@@ -707,7 +853,11 @@ fn deposit_can_be_routed_to_the_sibling_domain() {
         DEPOSIT * percolator::BOUND_SCALE,
         "the sibling pot must hold the whole deposit"
     );
-    assert_eq!(ledger_principal(&env.svm, ledger), 0, "own ledger untouched");
+    assert_eq!(
+        ledger_principal(&env.svm, ledger),
+        0,
+        "own ledger untouched"
+    );
     assert_eq!(
         ledger_principal(&env.svm, sibling_ledger),
         DEPOSIT,
@@ -725,9 +875,18 @@ fn deposit_cannot_be_routed_into_another_asset() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: 0 },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: 0,
+        },
         deposit_accounts(
-            env.market, env.vault_token, registry, mint, lp_ata1, source1, ledger,
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata1,
+            source1,
+            ledger,
             d1.pubkey(),
         ),
         &[&d1],
@@ -741,5 +900,9 @@ fn deposit_cannot_be_routed_into_another_asset() {
         err.contains("Custom(9)"),
         "expected InvalidInstruction from the same-asset guard, got {err}"
     );
-    assert_eq!(bucket_fresh(&env.svm, env.market, 0), 0, "foreign asset unfunded");
+    assert_eq!(
+        bucket_fresh(&env.svm, env.market, 0),
+        0,
+        "foreign asset unfunded"
+    );
 }

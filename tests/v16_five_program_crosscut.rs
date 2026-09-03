@@ -36,9 +36,8 @@ use common::*;
 
 use litesvm::LiteSVM;
 use percolator::{
-    PortfolioAccountV16Account, PortfolioLegV16Account,
-    ProvenanceHeaderV16Account, V16PodI128, V16PodU16, V16PodU32, V16PodU64, V16_ACCOUNT_VERSION,
-    V16_LAYOUT_DISCRIMINATOR, POS_SCALE,
+    PortfolioAccountV16Account, PortfolioLegV16Account, ProvenanceHeaderV16Account, V16PodI128,
+    V16PodU16, V16PodU32, V16PodU64, POS_SCALE, V16_ACCOUNT_VERSION, V16_LAYOUT_DISCRIMINATOR,
 };
 use percolator_prog::{
     constants::{
@@ -215,7 +214,10 @@ fn x0_smoke_classic_and_token2022_mints_coexist() {
     let t22_acct = svm
         .get_account(&t22_mint.pubkey())
         .expect("token-2022 mint exists");
-    assert_eq!(t22_acct.owner, TOKEN_2022, "token-2022 mint owned by TokenzQd");
+    assert_eq!(
+        t22_acct.owner, TOKEN_2022,
+        "token-2022 mint owned by TokenzQd"
+    );
     // Layout-explicit init check (offset 45 = `is_initialized`) — avoids relying on
     // classic unpack semantics for a Token-2022-owned account.
     assert!(
@@ -239,14 +241,14 @@ fn create_lp_vault_ix(
     Instruction {
         program_id: PERCOLATOR_MAINNET,
         accounts: vec![
-            AccountMeta::new(admin, true),                        // 0 admin (signer, writable)
+            AccountMeta::new(admin, true), // 0 admin (signer, writable)
             // FIND-1 fix: market must be writable — CreateLpVault now writes
             // backing_bucket_authority = registry PDA into the asset's oracle profile.
-            AccountMeta::new(market, false),                      // 1 market (owner==MAINNET; writable)
-            AccountMeta::new(registry, false),                    // 2 registry PDA (writable)
-            AccountMeta::new(mint, false),                        // 3 mint PDA (writable)
+            AccountMeta::new(market, false), // 1 market (owner==MAINNET; writable)
+            AccountMeta::new(registry, false), // 2 registry PDA (writable)
+            AccountMeta::new(mint, false),   // 3 mint PDA (writable)
             AccountMeta::new_readonly(system_program::ID, false), // 4 system program
-            AccountMeta::new_readonly(token_program, false),      // 5 token program (under test)
+            AccountMeta::new_readonly(token_program, false), // 5 token program (under test)
         ],
         data: ProgInstruction::CreateLpVault {
             fee_share_bps: 0,
@@ -288,7 +290,13 @@ fn x0_smoke_wrapper_vault_gate_requires_classic_token_program() {
     let res_t22 = send_ixs(
         &mut svm,
         &payer,
-        vec![create_lp_vault_ix(market, registry, mint, payer.pubkey(), TOKEN_2022)],
+        vec![create_lp_vault_ix(
+            market,
+            registry,
+            mint,
+            payer.pubkey(),
+            TOKEN_2022,
+        )],
         &[],
     );
     assert_custom(
@@ -399,7 +407,8 @@ impl CrosscutEnv {
             },
         )
         .unwrap();
-        let market_len = state::market_account_len_for_capacity(CROSSCUT_MAX_ASSETS as usize).unwrap();
+        let market_len =
+            state::market_account_len_for_capacity(CROSSCUT_MAX_ASSETS as usize).unwrap();
         svm.set_account(
             market,
             Account {
@@ -612,8 +621,16 @@ fn x0_economic_spine_deposit_moves_tokens_at_mainnet() {
         "vault (authority derived under MAINNET) credited"
     );
     // Ledger lockstep: group.vault ledger == on-chain vault balance.
-    assert_eq!(env.group().vault, 1_000, "group.vault ledger == on-chain vault");
-    assert_eq!(env.portfolio(portfolio).capital, 1_000, "portfolio capital credited");
+    assert_eq!(
+        env.group().vault,
+        1_000,
+        "group.vault ledger == on-chain vault"
+    );
+    assert_eq!(
+        env.portfolio(portfolio).capital,
+        1_000,
+        "portfolio capital credited"
+    );
 }
 
 // ── Matcher CPI helpers (mirrors v16_cu.rs:101-128,1121-1234, re-keyed MAINNET) ──
@@ -852,7 +869,13 @@ impl CrosscutEnv {
         {
             let (_, mut group) = state::market_view_mut(&mut acct.data).expect("market view");
             group
-                .accrue_asset_to_not_atomic(CROSSCUT_ASSET as usize, now_slot, effective_price, 0, true)
+                .accrue_asset_to_not_atomic(
+                    CROSSCUT_ASSET as usize,
+                    now_slot,
+                    effective_price,
+                    0,
+                    true,
+                )
                 .expect("accrue");
         }
         self.svm.set_account(self.market, acct).unwrap();
@@ -861,7 +884,12 @@ impl CrosscutEnv {
     /// PermissionlessCrank on CROSSCUT_ASSET (action 0 = refresh, 1 = liquidate).
     /// FIX W3 (upstream #206, pairs with engine E3 / #92): no caller-supplied
     /// close_q -- the engine selects the liquidation size.
-    fn crank(&mut self, portfolio: Pubkey, action: u8, now_slot: u64) -> Result<(), TransactionError> {
+    fn crank(
+        &mut self,
+        portfolio: Pubkey,
+        action: u8,
+        now_slot: u64,
+    ) -> Result<(), TransactionError> {
         let wix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -982,14 +1010,24 @@ impl CrosscutEnv {
                     false,
                 ),
             ],
-            data: ProgInstruction::DepositToLpVault { amount, domain: CROSSCUT_DOMAIN }.encode(),
+            data: ProgInstruction::DepositToLpVault {
+                amount,
+                domain: CROSSCUT_DOMAIN,
+            }
+            .encode(),
         };
         send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp deposit");
         (lp_ata, source)
     }
 
     /// RequestRedeemLpShares (tag 76). `redemption` = `derive_lp_redemption(...)`.
-    fn lp_request_redeem(&mut self, depositor: &Keypair, redemption: Pubkey, lp_ata: Pubkey, lp_amount: u128) {
+    fn lp_request_redeem(
+        &mut self,
+        depositor: &Keypair,
+        redemption: Pubkey,
+        lp_ata: Pubkey,
+        lp_amount: u128,
+    ) {
         let wix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -1060,7 +1098,10 @@ impl CrosscutEnv {
                     false,
                 ),
             ],
-            data: ProgInstruction::ExecuteRedemption { domain: CROSSCUT_DOMAIN }.encode(),
+            data: ProgInstruction::ExecuteRedemption {
+                domain: CROSSCUT_DOMAIN,
+            }
+            .encode(),
         };
         let res = send_ixs(&mut self.svm, &self.payer, vec![wix], &[]);
         (dest, res)
@@ -1088,23 +1129,44 @@ fn x0_lp_vault_lifecycle_at_mainnet() {
 
     // Executed guard: genesis deposit mints amount - MINIMUM_LIQUIDITY, full
     // collateral still moves into the vault.
-    assert_eq!(env.token_amount(lp_ata), minted as u64, "genesis deposit mints amount minus dead-share floor");
-    assert_eq!(env.token_amount(env.vault), DEPOSIT_AMOUNT as u64, "vault received LP collateral");
+    assert_eq!(
+        env.token_amount(lp_ata),
+        minted as u64,
+        "genesis deposit mints amount minus dead-share floor"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        DEPOSIT_AMOUNT as u64,
+        "vault received LP collateral"
+    );
     assert_eq!(env.token_amount(source), 0, "source debited");
     let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, DEPOSIT_AMOUNT, "registry shares == full genesis amount");
+    assert_eq!(
+        reg.total_lp_shares_outstanding, DEPOSIT_AMOUNT,
+        "registry shares == full genesis amount"
+    );
 
     // Redeem the full REAL position (what the depositor actually holds).
-    let redemption = state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
+    let redemption =
+        state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
     env.lp_request_redeem(&depositor, redemption, lp_ata, minted);
     assert_eq!(env.token_amount(lp_ata), 0, "shares moved to escrow");
-    assert_eq!(env.token_amount(env.lp_escrow), minted as u64, "escrow holds the shares");
+    assert_eq!(
+        env.token_amount(env.lp_escrow),
+        minted as u64,
+        "escrow holds the shares"
+    );
 
     let dest = env.lp_execute_redeem(&depositor, redemption);
-    assert_eq!(env.token_amount(dest), minted as u64, "redeemer paid 1:1 for the shares they held");
+    assert_eq!(
+        env.token_amount(dest),
+        minted as u64,
+        "redeemer paid 1:1 for the shares they held"
+    );
     assert_eq!(env.token_amount(env.lp_escrow), 0, "escrow burned to zero");
     assert_eq!(
-        env.token_amount(env.vault), LP_VAULT_MINIMUM_LIQUIDITY as u64,
+        env.token_amount(env.vault),
+        LP_VAULT_MINIMUM_LIQUIDITY as u64,
         "vault drained down to the dead-share floor's stranded principal, not fully to 0"
     );
     let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
@@ -1146,7 +1208,11 @@ fn extra_metas_pda(mint: &Pubkey) -> (Pubkey, u8) {
 }
 fn position_nft_pda(portfolio: &Pubkey, market_id: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[POSITION_NFT_SEED, portfolio.as_ref(), &market_id.to_le_bytes()],
+        &[
+            POSITION_NFT_SEED,
+            portfolio.as_ref(),
+            &market_id.to_le_bytes(),
+        ],
         &NFT_PROGRAM_ID,
     )
 }
@@ -1253,7 +1319,9 @@ fn read_portfolio_owner(data: &[u8]) -> [u8; 32] {
 }
 fn read_provenance_owner(data: &[u8]) -> [u8; 32] {
     let prov_owner_off = HEADER_LEN + 64;
-    data[prov_owner_off..prov_owner_off + 32].try_into().unwrap()
+    data[prov_owner_off..prov_owner_off + 32]
+        .try_into()
+        .unwrap()
 }
 
 /// Real Token-2022 mint init via CPI: create + InitializeTransferHook +
@@ -1458,7 +1526,13 @@ fn place_nft_bundle(
         nft_pda_key,
         Account {
             lamports: 2_000_000,
-            data: nft_pda_data(&portfolio_key, &nft_mint_key, asset_index, market_id, nft_bump),
+            data: nft_pda_data(
+                &portfolio_key,
+                &nft_mint_key,
+                asset_index,
+                market_id,
+                nft_bump,
+            ),
             owner: NFT_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
@@ -1541,9 +1615,13 @@ fn x0_nft_transfer_hook_b3_ownership_at_mainnet() {
     );
 
     let source_wallet = Keypair::new();
-    env.svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&source_wallet.pubkey(), 10_000_000_000)
+        .unwrap();
     let dest_wallet = Keypair::new();
-    env.svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&dest_wallet.pubkey(), 10_000_000_000)
+        .unwrap();
 
     let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) = place_nft_bundle(
         &mut env.svm,
@@ -1570,7 +1648,12 @@ fn x0_nft_transfer_hook_b3_ownership_at_mainnet() {
         &mint_auth,
         &registry,
     );
-    let res = send_ixs(&mut env.svm, &env.payer, vec![transfer_ix], &[&source_wallet]);
+    let res = send_ixs(
+        &mut env.svm,
+        &env.payer,
+        vec![transfer_ix],
+        &[&source_wallet],
+    );
     assert!(
         res.is_ok(),
         "Token-2022 TransferChecked → hook → B-3 must succeed in the 5-program instance: {res:?}"
@@ -1632,14 +1715,32 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
     let pb = env.create_portfolio(&owner_b);
     let src_a = env.deposit(&owner_a, pa, d);
     let src_b = env.deposit(&owner_b, pb, d);
-    assert_eq!(env.token_amount(env.vault), (2 * d) as u64, "vault holds 2 user deposits");
-    assert_eq!(env.group().vault, 2 * d, "group.vault ledger == user collateral");
+    assert_eq!(
+        env.token_amount(env.vault),
+        (2 * d) as u64,
+        "vault holds 2 user deposits"
+    );
+    assert_eq!(
+        env.group().vault,
+        2 * d,
+        "group.vault ledger == user collateral"
+    );
 
     // Matcher trade — opens positions; fee is internal (capital → insurance),
     // no collateral enters/leaves the vault.
     let (ctx, delegate) = env.init_matcher_context(pb, &owner_b);
-    env.trade_cpi(&owner_a, pa, &owner_b, pb, ctx, delegate, CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100)
-        .expect("matcher trade");
+    env.trade_cpi(
+        &owner_a,
+        pa,
+        &owner_b,
+        pb,
+        ctx,
+        delegate,
+        CROSSCUT_ASSET,
+        (10 * POS_SCALE) as i128,
+        100,
+    )
+    .expect("matcher trade");
     // Executed guard: a REAL fill happened (so conservation isn't trivially met by a no-op).
     assert_eq!(
         active_leg_basis(&env.portfolio(pa), CROSSCUT_ASSET),
@@ -1647,8 +1748,16 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
         "matcher opened a real position (conservation is non-trivial)"
     );
     let g = env.group();
-    assert_eq!(env.token_amount(env.vault), (2 * d) as u64, "matcher seam moves no collateral");
-    assert_eq!(g.c_tot + g.insurance, g.vault, "c_tot + insurance == vault (no value created)");
+    assert_eq!(
+        env.token_amount(env.vault),
+        (2 * d) as u64,
+        "matcher seam moves no collateral"
+    );
+    assert_eq!(
+        g.c_tot + g.insurance,
+        g.vault,
+        "c_tot + insurance == vault (no value created)"
+    );
     assert_eq!(g.vault, 2 * d, "group.vault conserved through the trade");
 
     // LP deposit (collateral → same vault, tracked in the backing ledger).
@@ -1658,7 +1767,11 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
     let lp = Keypair::new();
     env.svm.airdrop(&lp.pubkey(), 1_000_000_000).unwrap();
     let (lp_ata, src_lp) = env.lp_deposit(&lp, l);
-    assert_eq!(env.token_amount(env.vault), (2 * d + l) as u64, "vault now holds user + LP collateral");
+    assert_eq!(
+        env.token_amount(env.vault),
+        (2 * d + l) as u64,
+        "vault now holds user + LP collateral"
+    );
 
     // LP redeem (collateral → dest, 1:1 with no earnings) — the depositor can only
     // redeem the REAL shares they hold (minted_lp), not the full l.
@@ -1666,10 +1779,15 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
     env.lp_request_redeem(&lp, redemption, lp_ata, minted_lp);
     let dest_lp = env.lp_execute_redeem(&lp, redemption);
     assert_eq!(
-        env.token_amount(env.vault), (2 * d + LP_VAULT_MINIMUM_LIQUIDITY) as u64,
+        env.token_amount(env.vault),
+        (2 * d + LP_VAULT_MINIMUM_LIQUIDITY) as u64,
         "vault back to user collateral PLUS the dead-share floor's stranded principal"
     );
-    assert_eq!(env.token_amount(dest_lp), minted_lp as u64, "LP redeemed 1:1 for the shares it held");
+    assert_eq!(
+        env.token_amount(dest_lp),
+        minted_lp as u64,
+        "LP redeemed 1:1 for the shares it held"
+    );
 
     // ── Conservation: Σ collateral across every collateral account == created. ──
     // (lp_ata / lp_escrow hold LP SHARES, a different mint — excluded.) Still
@@ -1738,7 +1856,7 @@ fn craft_stake_pool_bytes(
     d[136..168].copy_from_slice(stake_vault.as_ref()); // vault (source)
     d[168..176].copy_from_slice(&total_deposited.to_le_bytes()); // available-for-flush
     d[224..256].copy_from_slice(percolator_program.as_ref()); // CPI target (= MAINNET)
-    // d[280] pool_mode = 0 (insurance LP) — already zero.
+                                                              // d[280] pool_mode = 0 (insurance LP) — already zero.
     d[320..328].copy_from_slice(STAKE_POOL_DISCRIMINATOR);
     d[328] = STAKE_POOL_VERSION;
     d
@@ -1864,7 +1982,11 @@ impl CrosscutEnv {
     /// stake RotateInsuranceAuthority (tag 20) — the no-lockout escape: stake CPIs
     /// the wrapper's UpdateAuthority with the vault_auth PDA signing as the CURRENT
     /// authority and `new_target` co-signing as the successor.
-    fn stake_rotate(&mut self, ctx: &StakeCtx, new_target: &Keypair) -> Result<(), TransactionError> {
+    fn stake_rotate(
+        &mut self,
+        ctx: &StakeCtx,
+        new_target: &Keypair,
+    ) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
         let ix = Instruction {
             program_id: STAKE_ID,
@@ -1937,10 +2059,15 @@ fn x0_stake_flush_to_insurance_at_mainnet() {
     // Bind must precede the first flush (TopUpInsurance is gated by
     // cfg.insurance_authority == signer == vault_auth PDA).
     env.stake_bind(&ctx).expect("BindInsuranceAuthority");
-    env.stake_flush(&ctx, flush_amount).expect("FlushToInsurance");
+    env.stake_flush(&ctx, flush_amount)
+        .expect("FlushToInsurance");
 
     // Executed guards: real token movement + insurance credit through the CPI.
-    assert_eq!(env.token_amount(ctx.stake_vault), 0, "stake vault drained by flush");
+    assert_eq!(
+        env.token_amount(ctx.stake_vault),
+        0,
+        "stake vault drained by flush"
+    );
     assert_eq!(
         env.token_amount(env.vault),
         vault_before + flush_amount,
@@ -1967,9 +2094,21 @@ fn x2_flush_race_resolved_market_reverts_mode_not_live() {
     let insurance_before = env.group().insurance;
     let vault_before = env.token_amount(env.vault);
     env.stake_flush(&ctx, 1_000_000).expect("flush while Live");
-    assert_eq!(env.group().insurance, insurance_before + 1_000_000, "insurance += exactly the flush");
-    assert_eq!(env.token_amount(env.vault), vault_before + 1_000_000, "vault conserved through flush");
-    assert_eq!(env.token_amount(ctx.stake_vault), 1_000_000, "stake vault retains the un-flushed 1M");
+    assert_eq!(
+        env.group().insurance,
+        insurance_before + 1_000_000,
+        "insurance += exactly the flush"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        vault_before + 1_000_000,
+        "vault conserved through flush"
+    );
+    assert_eq!(
+        env.token_amount(ctx.stake_vault),
+        1_000_000,
+        "stake vault retains the un-flushed 1M"
+    );
 
     // Resolve, then a second flush must revert (mode != Live) and change NOTHING.
     env.warp(100); // align SVM clock >= group.current_slot for ResolveMarket
@@ -1978,10 +2117,26 @@ fn x2_flush_race_resolved_market_reverts_mode_not_live() {
     let vault_pre = env.token_amount(env.vault);
     let stake_pre = env.token_amount(ctx.stake_vault);
     let res = env.stake_flush(&ctx, 1_000_000);
-    assert_custom(res, E_LOCK_ACTIVE, "flush into a resolved market reverts mode!=Live");
-    assert_eq!(env.group().insurance, insurance_pre, "rejected flush left insurance unchanged");
-    assert_eq!(env.token_amount(env.vault), vault_pre, "rejected flush left wrapper vault unchanged");
-    assert_eq!(env.token_amount(ctx.stake_vault), stake_pre, "rejected flush left stake vault unchanged");
+    assert_custom(
+        res,
+        E_LOCK_ACTIVE,
+        "flush into a resolved market reverts mode!=Live",
+    );
+    assert_eq!(
+        env.group().insurance,
+        insurance_pre,
+        "rejected flush left insurance unchanged"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        vault_pre,
+        "rejected flush left wrapper vault unchanged"
+    );
+    assert_eq!(
+        env.token_amount(ctx.stake_vault),
+        stake_pre,
+        "rejected flush left stake vault unchanged"
+    );
 }
 
 /// X5-TERMINAL — terminal-reclaim LIVENESS + no-lockout. After a stake flush
@@ -1998,13 +2153,23 @@ fn x5_terminal_reclaim_liveness_via_rotate_no_lockout() {
     let ctx = env.setup_stake_pool(amount);
     env.stake_bind(&ctx).expect("bind");
     env.stake_flush(&ctx, amount).expect("flush");
-    assert_eq!(env.group().insurance, amount as u128, "insurance funded by flush");
-    assert_eq!(env.token_amount(env.vault), amount, "wrapper vault holds the flushed collateral");
+    assert_eq!(
+        env.group().insurance,
+        amount as u128,
+        "insurance funded by flush"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        amount,
+        "wrapper vault holds the flushed collateral"
+    );
 
     // No-lockout escape: rotate the insurance authority off the vault_auth PDA to a
     // signable wallet BEFORE decommission (must be done while Live).
     let reclaim_authority = Keypair::new();
-    env.svm.airdrop(&reclaim_authority.pubkey(), 1_000_000_000).unwrap();
+    env.svm
+        .airdrop(&reclaim_authority.pubkey(), 1_000_000_000)
+        .unwrap();
     env.stake_rotate(&ctx, &reclaim_authority)
         .expect("rotate insurance authority off the PDA (no-lockout)");
 
@@ -2015,8 +2180,16 @@ fn x5_terminal_reclaim_liveness_via_rotate_no_lockout() {
     // Terminal reclaim: the rotated authority withdraws the flushed insurance.
     let (dest, res) = env.wrapper_withdraw_insurance(&reclaim_authority, amount as u128);
     res.expect("terminal WithdrawInsurance must succeed (reclaim liveness holds, no lockout)");
-    assert_eq!(env.token_amount(dest), amount, "reclaimed EXACTLY the flushed insurance");
-    assert_eq!(env.token_amount(env.vault), 0, "wrapper vault drained by terminal reclaim");
+    assert_eq!(
+        env.token_amount(dest),
+        amount,
+        "reclaimed EXACTLY the flushed insurance"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        0,
+        "wrapper vault drained by terminal reclaim"
+    );
     assert_eq!(env.group().insurance, 0, "insurance fully reclaimed");
 }
 
@@ -2079,11 +2252,20 @@ fn x2_flush_race_liquidation_crank_order_independent() {
     assert_eq!(leg_lf, 0, "liquidate-first: bankrupt short liquidated");
 
     // Order independence: identical end state regardless of interleaving.
-    assert_eq!(ins_ff, ins_lf, "insurance order-independent across flush vs liquidation");
-    assert_eq!(vault_ff, vault_lf, "vault order-independent across flush vs liquidation");
+    assert_eq!(
+        ins_ff, ins_lf,
+        "insurance order-independent across flush vs liquidation"
+    );
+    assert_eq!(
+        vault_ff, vault_lf,
+        "vault order-independent across flush vs liquidation"
+    );
 
     // Flush is cleanly additive: the liquidation drew nothing from the flushed insurance.
-    assert_eq!(ins_ff, flush as u128, "insurance == exactly the flushed amount (no liquidation draw)");
+    assert_eq!(
+        ins_ff, flush as u128,
+        "insurance == exactly the flushed amount (no liquidation draw)"
+    );
 }
 
 /// X5-TERMINAL (NFT-lock half) — an NFT-bundled portfolio that is LOCKED
@@ -2097,9 +2279,13 @@ fn x5_nft_locked_portfolio_transfer_rejected() {
     let mut env = CrosscutEnv::new();
     let registry = env.register_nft_program();
     let source_wallet = Keypair::new();
-    env.svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&source_wallet.pubkey(), 10_000_000_000)
+        .unwrap();
     let dest_wallet = Keypair::new();
-    env.svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
+    env.svm
+        .airdrop(&dest_wallet.pubkey(), 10_000_000_000)
+        .unwrap();
 
     // Craft an NFT bundle whose portfolio is LOCKED.
     let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) = place_nft_bundle(
@@ -2133,11 +2319,20 @@ fn x5_nft_locked_portfolio_transfer_rejected() {
         &mint_auth,
         &registry,
     );
-    let res = send_ixs(&mut env.svm, &env.payer, vec![transfer_ix], &[&source_wallet]);
+    let res = send_ixs(
+        &mut env.svm,
+        &env.payer,
+        vec![transfer_ix],
+        &[&source_wallet],
+    );
 
     // The transfer-hook gate blocks a locked portfolio with the exact operative code;
     // ownership is NOT rewritten.
-    assert_custom(res, NFT_TRANSFER_BLOCKED, "locked-portfolio NFT transfer is gate-blocked");
+    assert_custom(
+        res,
+        NFT_TRANSFER_BLOCKED,
+        "locked-portfolio NFT transfer is gate-blocked",
+    );
     assert_eq!(
         read_portfolio_owner(&env.account_data(portfolio)),
         owner_before,
@@ -2172,8 +2367,15 @@ fn x8_matcher_delegate_scoped_per_maker_rejects_mismatch() {
 
     // Y's delegate with maker X's accounts → delegate PDA mismatch.
     let res = env.trade_cpi(
-        &taker_owner, taker, &maker_x_owner, maker_x, ctx_y, delegate_y,
-        CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100,
+        &taker_owner,
+        taker,
+        &maker_x_owner,
+        maker_x,
+        ctx_y,
+        delegate_y,
+        CROSSCUT_ASSET,
+        (10 * POS_SCALE) as i128,
+        100,
     );
     assert_instruction_error(
         &res,
@@ -2183,8 +2385,15 @@ fn x8_matcher_delegate_scoped_per_maker_rejects_mismatch() {
 
     // Positive control: the correctly-bound delegate (maker Y) trades.
     env.trade_cpi(
-        &taker_owner, taker, &maker_y_owner, maker_y, ctx_y, delegate_y,
-        CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100,
+        &taker_owner,
+        taker,
+        &maker_y_owner,
+        maker_y,
+        ctx_y,
+        delegate_y,
+        CROSSCUT_ASSET,
+        (10 * POS_SCALE) as i128,
+        100,
     )
     .expect("correctly-bound maker-Y delegate trades");
     assert_eq!(
@@ -2243,16 +2452,18 @@ fn x7_registry_wrong_nft_program_id_rejects() {
         d[prov_off..prov_off + 32].copy_from_slice(&mint_auth_bytes);
         d
     };
-    env.svm.set_account(
-        portfolio_key,
-        Account {
-            lamports: 10_000_000_000,
-            data: port_data,
-            owner: PERCOLATOR_MAINNET,
-            executable: false,
-            rent_epoch: 0,
-        },
-    ).unwrap();
+    env.svm
+        .set_account(
+            portfolio_key,
+            Account {
+                lamports: 10_000_000_000,
+                data: port_data,
+                owner: PERCOLATOR_MAINNET,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     // Attempt UnwrapEscrowedPortfolio (tag 82) with the REAL mint_auth pubkey as
     // the signer-account (using a fresh Keypair whose pubkey matches — but since
@@ -2335,7 +2546,11 @@ fn x3_lp_redemption_oi_reservation_guard_fires() {
     let minted = l - LP_VAULT_MINIMUM_LIQUIDITY;
     let (lp_ata, _src) = env.lp_deposit(&depositor, l);
     // Executed guard: the deposit really minted shares (the guard isn't trivially met).
-    assert_eq!(env.token_amount(lp_ata), minted as u64, "deposit minted LP shares");
+    assert_eq!(
+        env.token_amount(lp_ata),
+        minted as u64,
+        "deposit minted LP shares"
+    );
 
     // A PARTIAL redemption against a CLEAN (zero-OI) bucket now succeeds under
     // any nonzero threshold — non-vacuously proven to fail pre-fix and pass
@@ -2412,7 +2627,11 @@ fn x3_lp_redemption_oi_reservation_genuine_lien_still_rejects() {
         LP_VAULT_OI_RESERVATION_VIOLATED,
         "redemption leaving a genuine OI lien uncovered is still fail-closed (Custom 37)",
     );
-    assert_eq!(env.token_amount(dest), 0, "no payout on the rejected under-backed redemption");
+    assert_eq!(
+        env.token_amount(dest),
+        0,
+        "no payout on the rejected under-backed redemption"
+    );
 }
 
 /// 3A.1b — a real matcher `TradeCpi` fires through the loaded `percolator_match`
@@ -2445,8 +2664,16 @@ fn x0_matcher_tradecpi_real_fill_at_mainnet() {
     // Executed guard: the real matcher fill opened equal-and-opposite positions.
     let taker_leg = active_leg_basis(&env.portfolio(taker), CROSSCUT_ASSET);
     let maker_leg = active_leg_basis(&env.portfolio(maker), CROSSCUT_ASSET);
-    assert_eq!(taker_leg, (10 * POS_SCALE) as i128, "taker opened long via matcher");
-    assert_eq!(maker_leg, -((10 * POS_SCALE) as i128), "maker opened short via matcher");
+    assert_eq!(
+        taker_leg,
+        (10 * POS_SCALE) as i128,
+        "taker opened long via matcher"
+    );
+    assert_eq!(
+        maker_leg,
+        -((10 * POS_SCALE) as i128),
+        "maker opened short via matcher"
+    );
 
     // The loaded matcher .so actually ran (ABI v3 + echoes the requested asset).
     let mdata = env.account_data(ctx);
@@ -2470,9 +2697,15 @@ fn x0_matcher_tradecpi_real_fill_at_mainnet() {
 // Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
 // the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -2483,9 +2716,25 @@ fn reown_portfolio(env: &mut CrosscutEnv, portfolio: Pubkey, new_owner: &[u8; 32
     let mut d = env.account_data(portfolio);
     d[HEADER_LEN + 100..HEADER_LEN + 132].copy_from_slice(new_owner);
     d[HEADER_LEN + 64..HEADER_LEN + 96].copy_from_slice(new_owner);
-    env.svm.set_account(portfolio, Account { lamports: 10_000_000_000, data: d, owner: PERCOLATOR_MAINNET, executable: false, rent_epoch: 0 }).unwrap();
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: 10_000_000_000,
+                data: d,
+                owner: PERCOLATOR_MAINNET,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 }
-fn attach_nft_to_portfolio(env: &mut CrosscutEnv, holder: &Keypair, portfolio: Pubkey, market_id: u64) -> (Pubkey, Pubkey, Pubkey) {
+fn attach_nft_to_portfolio(
+    env: &mut CrosscutEnv,
+    holder: &Keypair,
+    portfolio: Pubkey,
+    market_id: u64,
+) -> (Pubkey, Pubkey, Pubkey) {
     let nft_mint_kp = Keypair::new();
     let nft_mint = nft_mint_kp.pubkey();
     let (nft_pda, bump) = position_nft_pda(&portfolio, market_id);
@@ -2493,7 +2742,18 @@ fn attach_nft_to_portfolio(env: &mut CrosscutEnv, holder: &Keypair, portfolio: P
     initialize_token2022_mint_with_hook(&mut env.svm, &env.payer, &nft_mint_kp, &NFT_PROGRAM_ID);
     create_ata(&mut env.svm, &env.payer, &holder.pubkey(), &nft_mint);
     mint_one_to_ata(&mut env.svm, &env.payer, &nft_mint, &holder_ata);
-    env.svm.set_account(nft_pda, Account { lamports: 2_000_000, data: nft_pda_data(&portfolio, &nft_mint, 0, market_id, bump), owner: NFT_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    env.svm
+        .set_account(
+            nft_pda,
+            Account {
+                lamports: 2_000_000,
+                data: nft_pda_data(&portfolio, &nft_mint, 0, market_id, bump),
+                owner: NFT_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     (nft_pda, nft_mint, holder_ata)
 }
 
@@ -2559,11 +2819,26 @@ fn x0_e2_nft_holder_withdraws_escrowed_position_to_self_at_mainnet() {
     let dest = make_dest_ata(&mut env, holder.pubkey());
     let res = env.try_wrapper(
         ProgInstruction::Withdraw { amount },
-        e2_withdraw_accounts(&env, &holder, portfolio, dest, registry, nft_pda, holder_nft_ata),
+        e2_withdraw_accounts(
+            &env,
+            &holder,
+            portfolio,
+            dest,
+            registry,
+            nft_pda,
+            holder_nft_ata,
+        ),
         &[&holder],
     );
-    assert!(res.is_ok(), "NFT holder must withdraw an escrowed position: {res:?}");
-    assert_eq!(env.token_amount(dest), amount as u64, "funds routed to the HOLDER, not the escrow PDA");
+    assert!(
+        res.is_ok(),
+        "NFT holder must withdraw an escrowed position: {res:?}"
+    );
+    assert_eq!(
+        env.token_amount(dest),
+        amount as u64,
+        "funds routed to the HOLDER, not the escrow PDA"
+    );
     assert_eq!(env.portfolio(portfolio).capital, 0, "capital withdrawn");
 }
 
@@ -2588,7 +2863,15 @@ fn x0_e2_escrowed_position_rejects_non_holder_at_mainnet() {
     let dest = make_dest_ata(&mut env, attacker.pubkey());
     let res = env.try_wrapper(
         ProgInstruction::Withdraw { amount },
-        e2_withdraw_accounts(&env, &attacker, portfolio, dest, registry, nft_pda, holder_nft_ata),
+        e2_withdraw_accounts(
+            &env,
+            &attacker,
+            portfolio,
+            dest,
+            registry,
+            nft_pda,
+            holder_nft_ata,
+        ),
         &[&attacker],
     );
     let err = res.expect_err("a non-holder must NOT withdraw an escrowed position");
@@ -2596,6 +2879,10 @@ fn x0_e2_escrowed_position_rejects_non_holder_at_mainnet() {
         format!("{err:?}").contains("Custom(8)"),
         "rejection must be Unauthorized (the E2 auth gate), got: {err:?}"
     );
-    assert_eq!(env.portfolio(portfolio).capital, amount, "escrowed capital untouched");
+    assert_eq!(
+        env.portfolio(portfolio).capital,
+        amount,
+        "escrowed capital untouched"
+    );
     assert_eq!(env.token_amount(dest), 0, "no funds moved to the attacker");
 }

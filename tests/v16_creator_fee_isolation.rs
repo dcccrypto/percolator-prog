@@ -29,9 +29,8 @@
 
 use percolator_prog::{ix::Instruction, processor, state};
 use solana_program::{
-    account_info::AccountInfo, clock::Clock, program_error::ProgramError,
-    program_option::COption, program_pack::Pack, program_stubs, pubkey::Pubkey,
-    sysvar::Sysvar,
+    account_info::AccountInfo, clock::Clock, program_error::ProgramError, program_option::COption,
+    program_pack::Pack, program_stubs, pubkey::Pubkey, sysvar::Sysvar,
 };
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 
