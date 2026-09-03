@@ -152,6 +152,11 @@ fn signer() -> TestAccount {
     TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0).signer()
 }
 
+/// A signer with a CHOSEN key — needed to sign as an asset's own `asset_admin`.
+fn signer_with_key(key: Pubkey) -> TestAccount {
+    TestAccount::new(key, Pubkey::new_unique(), 0).signer()
+}
+
 fn market_account() -> TestAccount {
     let capacity = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize;
     TestAccount::new(
@@ -266,8 +271,18 @@ fn run_ix(ix: Instruction, accounts: &mut [&mut TestAccount]) -> Result<(), Prog
 }
 
 fn default_init_market_ix() -> Instruction {
+    default_init_market_ix_with_assets(1)
+}
+
+/// GH#420: the same fixture with a chosen asset count.
+///
+/// The default is single-asset, which cannot express "asset 0's admin drains
+/// asset 1's fees" at all — there is no asset 1, so the claim is rejected as
+/// out-of-range and the test would look like it passed for the right reason
+/// while proving nothing.
+fn default_init_market_ix_with_assets(max_portfolio_assets: u16) -> Instruction {
     Instruction::InitMarket {
-        max_portfolio_assets: 1,
+        max_portfolio_assets,
         h_min: 0,
         h_max: 10,
         initial_price: 100,
@@ -296,6 +311,17 @@ fn init_market(admin: &mut TestAccount, market: &mut TestAccount) -> Pubkey {
     let mut mint = mint_account();
     let mint_key = mint.key;
     run_ix(default_init_market_ix(), &mut [admin, market, &mut mint]).unwrap();
+    mint_key
+}
+
+fn init_market_two_assets(admin: &mut TestAccount, market: &mut TestAccount) -> Pubkey {
+    let mut mint = mint_account();
+    let mint_key = mint.key;
+    run_ix(
+        default_init_market_ix_with_assets(2),
+        &mut [admin, market, &mut mint],
+    )
+    .unwrap();
     mint_key
 }
 
@@ -460,7 +486,10 @@ fn a_fully_drained_backstop_still_leaves_the_creator_claim_payable() {
     );
 
     run_ix(
-        Instruction::WithdrawCreatorFee { amount: 100 },
+        Instruction::WithdrawCreatorFee {
+            amount: 100,
+            asset_index: 0,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -473,6 +502,101 @@ fn a_fully_drained_backstop_still_leaves_the_creator_claim_payable() {
     .expect("and is still payable afterwards");
     let (cfg_end, _) = state::read_market(&market.data).unwrap();
     assert_eq!(cfg_end.creator_fee_claimable_atoms, 0);
+}
+
+/// GH#420: asset 1's creator fees are claimable by ASSET 1's admin, and are NOT
+/// drainable by asset 0's.
+///
+/// This is the headline of the issue. Every asset's creator cut used to accumulate
+/// into one market-wide counter while the withdrawal check named asset 0's
+/// `asset_admin` only, so in a multi-asset market the base deployer could withdraw
+/// fees earned on assets 1..N and those assets' creators could never claim theirs.
+#[test]
+fn asset0_admin_cannot_drain_asset1_creator_fees() {
+    install_clock_stub();
+    let mut admin = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+
+    // Credit asset 1's creator pot directly; the accrual path is covered in
+    // v16_wrapper.rs, and this test is about WHO may withdraw it.
+    // Asset 1 needs a real `asset_admin`: a zeroed one matches NO signer
+    // (`live_authority_matches` rejects a zero authority), so the positive control
+    // below would fail for that reason rather than for the one under test.
+    let asset1_admin_key = Pubkey::new_unique();
+    {
+        let mut p1 = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+        p1.creator_fee_claimable_atoms = 100;
+        p1.asset_admin = asset1_admin_key.to_bytes();
+        state::write_asset_oracle_profile(&mut market.data, 1, &p1).unwrap();
+    }
+    seed_both_pots(&mut market, 100, 150, 90);
+
+    let mut dest = user_token_account(admin.key, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 10_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    // Asset 0's admin claiming AGAINST ASSET 1 must be refused. Before GH#420 the
+    // authority check read asset 0's profile regardless of whose fees these were,
+    // so this succeeded and the atoms left with the wrong party.
+    let before = market.data.clone();
+    let stolen = run_ix(
+        Instruction::WithdrawCreatorFee {
+            amount: 100,
+            asset_index: 1,
+        },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert!(
+        stolen.is_err(),
+        "asset 0's admin must NOT be able to claim asset 1's creator fees"
+    );
+    assert_eq!(
+        market.data, before,
+        "the refused claim must leave the market byte-identical"
+    );
+    assert_eq!(
+        state::read_asset_oracle_profile(&market.data, 1)
+            .unwrap()
+            .creator_fee_claimable_atoms,
+        100,
+        "asset 1's pot must be untouched"
+    );
+
+    // POSITIVE CONTROL: asset 1's OWN admin can claim it. Without this the
+    // rejection above would pass against a handler that refused everything.
+    let mut owner = signer_with_key(asset1_admin_key);
+    let mut dest1 = user_token_account(owner.key, mint, 0);
+    run_ix(
+        Instruction::WithdrawCreatorFee {
+            amount: 100,
+            asset_index: 1,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut dest1,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    )
+    .expect("asset 1's own admin must be able to claim asset 1's creator fees");
+    assert_eq!(
+        state::read_asset_oracle_profile(&market.data, 1)
+            .unwrap()
+            .creator_fee_claimable_atoms,
+        0,
+        "asset 1's pot must be drained by its own admin"
+    );
 }
 
 /// The mirror of direction A, asserted here too because this binary is the only
@@ -492,7 +616,10 @@ fn withdraw_creator_fee_leaves_the_backstop_fully_spendable_by_tag57() {
     let mut token_program = token_program_account();
 
     run_ix(
-        Instruction::WithdrawCreatorFee { amount: 100 },
+        Instruction::WithdrawCreatorFee {
+            amount: 100,
+            asset_index: 0,
+        },
         &mut [
             &mut admin,
             &mut market,

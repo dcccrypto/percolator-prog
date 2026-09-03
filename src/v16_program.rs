@@ -55,7 +55,11 @@ pub mod constants {
 
     pub const HEADER_LEN: usize = 16;
     pub const WRAPPER_CONFIG_LEN: usize = 576;
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 400;
+    // GH#420: 400 -> 408 for the per-asset `creator_fee_claimable_atoms`. Safe
+    // because the profile lives inside the fixed 512-byte
+    // `ASSET_ORACLE_WRAPPER_LEN` slot and 112 of those bytes were spare —
+    // `MARKET_ASSET_SLOT_LEN` is unchanged and no offset moves.
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 408;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1371,6 +1375,30 @@ pub mod state {
         // (insurance/operator/backing/oracle) and itself, and can be burned (set to 0). Isolated:
         // it can never act on another asset. Set to the activator at creation.
         pub asset_admin: [u8; 32],
+
+        /// GH#420: THIS asset's unclaimed creator share of trade fees, in collateral
+        /// atoms. Claimed via `WithdrawCreatorFee` (tag 90) by this asset's own
+        /// `asset_admin`.
+        ///
+        /// Previously every asset's creator cut accumulated into the single global
+        /// `WrapperConfigV16::creator_fee_claimable_atoms`, while the withdrawal
+        /// authority check named ASSET 0's admin only. In a multi-asset market that
+        /// meant the base deployer could drain fees earned on assets 1..N, and those
+        /// assets' creators could never claim their own.
+        ///
+        /// THERE IS NO LAYOUT COST. `ASSET_ORACLE_PROFILE_LEN` grows 400 -> 408, and
+        /// the profile is stored inside a fixed `ASSET_ORACLE_WRAPPER_LEN` (512) byte
+        /// slot — 112 bytes of it were spare, so `MARKET_ASSET_SLOT_LEN` is unchanged
+        /// and NO offset moves. This is the opposite of the config counter's
+        /// situation, where `WRAPPER_CONFIG_LEN` is exactly 576 and growing it would
+        /// shift `MARKET_GROUP_OFF` and brick every deployed market.
+        ///
+        /// Deployed markets have these bytes ZEROED (they were slot padding), so
+        /// after an in-place upgrade each asset reads 0 and accrues fresh — no
+        /// migration. The already-accrued GLOBAL balance is deliberately left in
+        /// `WrapperConfigV16::creator_fee_claimable_atoms` and stays claimable by
+        /// asset 0's admin, so nothing earned before this change is stranded.
+        pub creator_fee_claimable_atoms: u64,
     }
 
     /// Aggregate backing-domain accounting for an authority-controlled vault.
@@ -2052,6 +2080,7 @@ pub mod state {
             oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
             oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
             asset_admin: [0u8; 32],
+            creator_fee_claimable_atoms: 0,
         }
     }
 
@@ -2089,6 +2118,7 @@ pub mod state {
             oracle_leg_prices_e6: config.oracle_leg_prices_e6,
             oracle_leg_publish_times: config.oracle_leg_publish_times,
             asset_admin: config.marketauth,
+            creator_fee_claimable_atoms: 0,
         }
     }
 
@@ -4363,6 +4393,10 @@ pub mod ix {
         /// and a silent 0-atom transfer is a caller bug, not a claim.
         WithdrawCreatorFee {
             amount: u128,
+            /// GH#420: WHICH asset's creator fees. Appended after `amount`, so the
+            /// wire grows 1+16 -> 1+16+2 = 19 bytes and an old 17-byte caller fails
+            /// to decode rather than being silently treated as asset 0.
+            asset_index: u16,
         },
     }
 
@@ -4706,6 +4740,7 @@ pub mod ix {
                 },
                 90 => Self::WithdrawCreatorFee {
                     amount: read_u128(&mut rest)?,
+                    asset_index: read_u16(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -5236,9 +5271,13 @@ pub mod ix {
                     out.push(89);
                     push_u16(&mut out, domain);
                 }
-                Self::WithdrawCreatorFee { amount } => {
+                Self::WithdrawCreatorFee {
+                    amount,
+                    asset_index,
+                } => {
                     out.push(90);
                     push_u128(&mut out, amount);
+                    push_u16(&mut out, asset_index);
                 }
             }
             out
@@ -7717,9 +7756,10 @@ pub mod processor {
             Instruction::ExpireBackingBucket { domain } => {
                 handle_expire_backing_bucket(program_id, accounts, domain)
             }
-            Instruction::WithdrawCreatorFee { amount } => {
-                handle_withdraw_creator_fee(program_id, accounts, amount)
-            }
+            Instruction::WithdrawCreatorFee {
+                amount,
+                asset_index,
+            } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index),
         }
     }
 
@@ -8275,7 +8315,19 @@ pub mod processor {
                 // fit the 8 spare bytes of `_padding_split`. Overflow (either
                 // the narrowing or the add) ERRORS the whole trade rather than
                 // wrapping or saturating.
-                cfg.creator_fee_claimable_atoms = cfg
+                // GH#420: the creator cut accrues to THIS ASSET's profile, not to
+                // the market-wide config counter. The old global accumulator paid
+                // out against asset 0's `asset_admin` only, so in a multi-asset
+                // market the base deployer could drain fees earned on assets 1..N
+                // and those assets' creators could never claim their own.
+                // Mutate the `oracle_profile` ALREADY IN SCOPE rather than doing a
+                // fresh read/write here. That profile was read earlier in this
+                // function and is written back below; a separate write at this
+                // point is silently CLOBBERED by that later write-back, which is
+                // exactly what happened in the first version of this change and
+                // what `..._creator_fee_accrual_is_written_back_to_the_account_...`
+                // caught. Same pattern as the batch path.
+                oracle_profile.creator_fee_claimable_atoms = oracle_profile
                     .creator_fee_claimable_atoms
                     .checked_add(
                         u64::try_from(creator_cut_total)
@@ -8588,6 +8640,21 @@ pub mod processor {
                     creator_cut_running_total = creator_cut_running_total
                         .checked_add(split_leg.creator)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    // GH#420: credit THIS leg's creator cut to THIS leg's asset
+                    // profile. A batch can span several assets, so a single
+                    // post-loop total cannot say which creator earned what — that
+                    // is precisely how every asset's fees ended up in one pot
+                    // payable to asset 0's admin.
+                    //
+                    // Persisted by the existing `write_oracle_profile_to_view` at
+                    // the end of this same iteration; no extra write.
+                    oracle_profile.creator_fee_claimable_atoms = oracle_profile
+                        .creator_fee_claimable_atoms
+                        .checked_add(
+                            u64::try_from(split_leg.creator)
+                                .map_err(|_| PercolatorError::EngineArithmeticOverflow)?,
+                        )
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                     // NOTE (behaviour preserved): the creator leg used to be
                     // credited only under `if taker_paid { .. } else if
                     // maker_paid { .. }`, i.e. dropped when NEITHER side paid.
@@ -8642,13 +8709,14 @@ pub mod processor {
                 // counter is u64 because it had to fit the spare 8 bytes of
                 // `_padding_split`. Overflow ERRORS the whole batch rather
                 // than wrapping or saturating.
-                cfg.creator_fee_claimable_atoms = cfg
-                    .creator_fee_claimable_atoms
-                    .checked_add(
-                        u64::try_from(creator_cut_running_total)
-                            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?,
-                    )
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // GH#420: intentionally NOT folded into the config counter here.
+                // The batch's creator cut is credited PER LEG to that leg's own
+                // asset profile inside the loop above, because a batch can span
+                // several assets and a single running total cannot say which
+                // creator earned what. `creator_cut_running_total` is retained
+                // solely as the write-back trigger below and as the value the
+                // conservation assertions compare against.
+                let _ = creator_cut_running_total;
                 // CRITICAL: same write-back-forcing requirement as the
                 // single-trade site -- a missed write-back here would
                 // silently discard accrued fees for all four legs.
@@ -11560,6 +11628,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         amount: u128,
+        asset_index: u16,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -11607,8 +11676,20 @@ pub mod processor {
             // `UpdateAssetAuthority` -- the stake flow never touches it. It is the
             // one field that reliably tracks the creator through staking, and it
             // already gates other creator ops (e.g. RestartAssetOracle).
-            let asset0_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
-            if !live_authority_matches(&asset0_profile.asset_admin, authority.key) {
+            // GH#420: authorise against THIS ASSET's `asset_admin`, not asset 0's.
+            //
+            // Every asset's creator cut used to accrue into one market-wide counter
+            // while this check named asset 0 only, so in a multi-asset market the
+            // base deployer could withdraw fees earned on assets 1..N and those
+            // assets' creators could never claim their own.
+            // Range is enforced by the profile read itself (`read_asset_oracle_profile`
+            // bounds `asset_index` against the market's slot capacity), so there is no
+            // second bound here. An earlier draft added one against
+            // `config.max_market_slots`, which is NOT the same basis and rejected a
+            // legitimate asset 1 as InvalidInstruction — one invariant, one owner.
+            let mut claim_profile =
+                read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
+            if !live_authority_matches(&claim_profile.asset_admin, authority.key) {
                 return Err(PercolatorError::Unauthorized.into());
             }
             verify_withdrawable_token_accounts(
@@ -11628,7 +11709,25 @@ pub mod processor {
             // hence its own ordinal rather than the engine's
             // `EngineCounterUnderflow`, which stays reserved for the
             // fail-closed `checked_sub` below.
-            if amount > cfg.creator_fee_claimable_atoms as u128 {
+            // GH#420: the claimable pot is THIS asset's, plus — for asset 0 only —
+            // the pre-existing market-wide counter.
+            //
+            // Fees accrued BEFORE this change are all sitting in
+            // `cfg.creator_fee_claimable_atoms`, and asset 0's admin was the only
+            // party who could ever withdraw them. Leaving that balance claimable by
+            // asset 0 keeps the historical behaviour exactly as it was for the party
+            // who already had it, and strands nothing. Assets 1..N draw only from
+            // their own counter, which starts at zero on a deployed market because
+            // those bytes were slot padding.
+            let legacy_pot = if asset_index == 0 {
+                cfg.creator_fee_claimable_atoms
+            } else {
+                0
+            };
+            let claimable = (claim_profile.creator_fee_claimable_atoms as u128)
+                .checked_add(legacy_pot as u128)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if amount > claimable {
                 return Err(PercolatorError::CreatorFeeOverClaim.into());
             }
             let transfer_amount_u64 = amount_to_u64(amount)?;
@@ -11642,13 +11741,30 @@ pub mod processor {
             group
                 .withdraw_insurance_surplus_not_atomic(amount)
                 .map_err(map_v16_error)?;
-            // `checked_sub` cannot fail after the clamp above; it is kept so a
+            // Debit THIS asset's counter first, then the legacy pot for whatever
+            // remains. Draining the per-asset counter first means a market that has
+            // migrated fully stops touching the legacy value at all, and the legacy
+            // balance can only ever shrink.
+            //
+            // `checked_sub` cannot fail after the clamp above; both are kept so a
             // future edit that weakens the clamp still fails closed rather than
-            // wrapping the counter to ~1.8e19 claimable atoms.
-            cfg.creator_fee_claimable_atoms = cfg
+            // wrapping a counter to ~1.8e19 claimable atoms.
+            let amount_u64 = amount as u64;
+            let from_asset = amount_u64.min(claim_profile.creator_fee_claimable_atoms);
+            claim_profile.creator_fee_claimable_atoms = claim_profile
                 .creator_fee_claimable_atoms
-                .checked_sub(amount as u64)
+                .checked_sub(from_asset)
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            let from_legacy = amount_u64
+                .checked_sub(from_asset)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            if from_legacy != 0 {
+                cfg.creator_fee_claimable_atoms = cfg
+                    .creator_fee_claimable_atoms
+                    .checked_sub(from_legacy)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            }
+            write_oracle_profile_to_view(&mut group, asset_index as usize, &claim_profile)?;
             group.validate_shape().map_err(map_v16_error)?;
             (transfer_amount_u64, cfg)
         };
@@ -14118,6 +14234,7 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
+                creator_fee_claimable_atoms: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs,
@@ -14240,6 +14357,7 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
+                creator_fee_claimable_atoms: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -14344,6 +14462,7 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
+                creator_fee_claimable_atoms: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,

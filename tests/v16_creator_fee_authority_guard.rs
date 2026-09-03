@@ -402,7 +402,10 @@ fn withdraw_creator_fee(
     let mut vault_auth = vault_authority_account(market);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::WithdrawCreatorFee { amount },
+        Instruction::WithdrawCreatorFee {
+            amount,
+            asset_index: 0,
+        },
         &mut [
             authority,
             market,
