@@ -59,6 +59,8 @@ fn hybrid_profile(max_staleness_secs: u64) -> AssetOracleProfileV16 {
         // v17: per-asset cold-storage admin key (collision matrix row N/A).
         asset_admin: [0u8; 32],
         creator_fee_claimable_atoms: 0,
+        maintenance_fee_checkpoint_slot: 0,
+        maintenance_fee_previous_rate: 0,
     }
 }
 

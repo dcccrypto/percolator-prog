@@ -1423,6 +1423,90 @@ fn v16_wrapper_permissionless_maintenance_fee_charges_flat_portfolio_to_insuranc
 }
 
 #[test]
+/// GH#444: raising the maintenance rate must NOT bill the time before the raise.
+///
+/// `last_fee_slot` is anchored at account creation and advanced only by
+/// SyncMaintenanceFee, so while the rate is 0 nobody cranks and it stays pinned at
+/// creation. Before this fix, the moment `marketauth` raised the rate the next
+/// PERMISSIONLESS crank billed `new_rate x (the account's whole age)` — every slot
+/// during which the rate was 0 — capped only by capital. A small-looking rate took
+/// up to 100% of a flat account, and the two instructions bundle atomically so the
+/// victim never got a turn.
+#[test]
+fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+
+    // Rate starts at ZERO — the state in which nobody cranks.
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 0;
+            }
+        }),
+    );
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000);
+
+    // Let a long idle window accrue at rate 0. Nothing is owed for it.
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            asset_index: 0,
+            now_slot: 1_000,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // NOW raise the rate, and crank immediately — the bundled attack.
+    run_ix(
+        Instruction::UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: 5,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    sync_maintenance_fee(&mut market, &mut portfolio, 1_010).unwrap();
+
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    // Only the 10 slots AFTER the raise may be billed: 10 * 5 = 50.
+    //
+    // Without the checkpoint this charged 5 * ~910 = 4_550, clamped to the
+    // account's entire 1_000 capital — i.e. everything.
+    assert_eq!(
+        account.capital, 950,
+        "#444: only the window AFTER the rate change may be billed; the 900 slots \
+         at rate 0 must not be billed at the new rate"
+    );
+    assert_ne!(
+        account.capital, 0,
+        "#444: the account must not be drained by a rate raise"
+    );
+}
+
 fn v16_wrapper_init_portfolio_anchors_fee_slot_at_market_current_slot() {
     let mut admin = signer();
     let mut market = market_account();
@@ -9762,6 +9846,8 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
         oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
         creator_fee_claimable_atoms: 0,
+        maintenance_fee_checkpoint_slot: 0,
+        maintenance_fee_previous_rate: 0,
     };
     assert!(
         state::validate_asset_oracle_profile(&profile).is_err(),
@@ -17800,6 +17886,8 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             oracle_authority: admin.key.to_bytes(),
             asset_admin: admin.key.to_bytes(),
             creator_fee_claimable_atoms: 0,
+            maintenance_fee_checkpoint_slot: 0,
+            maintenance_fee_previous_rate: 0,
             max_staleness_secs: 0,
             hybrid_soft_stale_slots: 0,
             mark_ewma_e6: 100,
@@ -18017,6 +18105,8 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             oracle_authority: admin.key.to_bytes(),
             asset_admin: admin.key.to_bytes(),
             creator_fee_claimable_atoms: 0,
+            maintenance_fee_checkpoint_slot: 0,
+            maintenance_fee_previous_rate: 0,
             max_staleness_secs: 0,
             hybrid_soft_stale_slots: 0,
             mark_ewma_e6: 100,
