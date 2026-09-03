@@ -15986,6 +15986,13 @@ pub mod processor {
         // both span the two pots; omitting it would underpay the redeemer by
         // whatever sits in the sibling. Pinned by address below.
         let sibling_ledger_ai = account(accounts, 11)?;
+        // GH#412: the redeemer's own SOL account, so the redemption PDA's rent goes
+        // back to whoever paid it. APPENDED at the tail rather than inserted, so
+        // every existing account index is unchanged and an old caller fails loudly
+        // with NotEnoughAccountKeys instead of having account 12 silently
+        // reinterpreted. Pinned to `redemption.redeemer` below — it is not a
+        // caller-chosen destination.
+        let redeemer_rent_dest = account(accounts, 12)?;
 
         expect_signer(cranker)?;
         expect_writable(market_ai)?;
@@ -16567,10 +16574,26 @@ pub mod processor {
         }
 
         // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
+        //
+        // GH#412: the rent goes to the REDEEMER, not the cranker.
+        //
+        // It used to go to whoever cranked, while `CancelRedemption` returned it to
+        // the redeemer — the same lamports, two different recipients depending on
+        // how the request ended. The rent was the redeemer's money either way; the
+        // cranker's incentive is a separate question and does not get funded out of
+        // someone else's rent deposit by accident of which path ran.
+        //
+        // Pinned to the RECORDED redeemer, so this cannot become a caller-chosen
+        // payout: `redemption.redeemer` was written at request time and is the same
+        // value `verify_user_token_account` already checks `redeemer_dest` against.
+        if redeemer_rent_dest.key.to_bytes() != redemption.redeemer {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        expect_writable(redeemer_rent_dest)?;
         state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
         let reclaim = redemption_ai.lamports();
         **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **cranker.try_borrow_mut_lamports()? = cranker
+        **redeemer_rent_dest.try_borrow_mut_lamports()? = redeemer_rent_dest
             .lamports()
             .checked_add(reclaim)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
