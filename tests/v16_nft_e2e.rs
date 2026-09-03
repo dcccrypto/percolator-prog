@@ -93,26 +93,22 @@
 mod e2e {
     use litesvm::LiteSVM;
     use percolator::{
-        PortfolioAccountV16Account, PortfolioLegV16Account, ProvenanceHeaderV16Account,
-        V16PodI128, V16PodU16, V16PodU32, V16PodU64, V16_ACCOUNT_VERSION,
-        V16_LAYOUT_DISCRIMINATOR,
+        PortfolioAccountV16Account, PortfolioLegV16Account, ProvenanceHeaderV16Account, V16PodI128,
+        V16PodU16, V16PodU32, V16PodU64, V16_ACCOUNT_VERSION, V16_LAYOUT_DISCRIMINATOR,
     };
     use percolator_prog::{
-        constants::{
-            HEADER_LEN, KIND_PORTFOLIO, MAGIC, NFT_REGISTRY_SEED, VERSION,
-        },
+        constants::{HEADER_LEN, KIND_PORTFOLIO, MAGIC, NFT_REGISTRY_SEED, VERSION},
         ix::Instruction as WrapperInstruction,
     };
-    use solana_sdk::program_pack::Pack;
     use solana_program::pubkey;
+    use solana_sdk::program_pack::Pack;
     use solana_sdk::{
         account::Account,
         compute_budget::ComputeBudgetInstruction,
         instruction::{AccountMeta, Instruction},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
-        system_program,
-        sysvar,
+        system_program, sysvar,
         transaction::Transaction,
     };
     use std::path::PathBuf;
@@ -122,12 +118,10 @@ mod e2e {
     // The wrapper BPF is loaded at PERCOLATOR_MAINNET (not at percolator_prog::id()
     // which is the test placeholder "Perco1ator…") because the NFT program's
     // verify_portfolio_program allowlist only accepts these two keys.
-    const PERCOLATOR_MAINNET: Pubkey =
-        pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+    const PERCOLATOR_MAINNET: Pubkey = pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
 
     // NFT program ID derived from ../percolator-nft/target/deploy/percolator_nft-keypair.json
-    const NFT_PROGRAM_ID: Pubkey =
-        pubkey!("2kYRqexMf5JnwTK15Vj8qxQX3qkBDzBZvH45SVFRmKYU");
+    const NFT_PROGRAM_ID: Pubkey = pubkey!("2kYRqexMf5JnwTK15Vj8qxQX3qkBDzBZvH45SVFRmKYU");
 
     // Token-2022 program ID (loaded via with_spl_programs()).
     const TOKEN_2022: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
@@ -149,8 +143,7 @@ mod e2e {
     // ExtraAccountMetaList layout (from processor.rs).
     const EXTRA_META_ENTRY_LEN: usize = 35;
     const EXTRA_META_COUNT: usize = 7;
-    const EXTRA_METAS_ACCOUNT_LEN: usize =
-        8 + 4 + 4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
+    const EXTRA_METAS_ACCOUNT_LEN: usize = 8 + 4 + 4 + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
 
     // TransferHook Execute discriminator: SHA256("spl-transfer-hook-interface:execute")[:8]
     const EXECUTE_DISCRIMINATOR: [u8; 8] = [105, 37, 101, 197, 75, 251, 102, 26];
@@ -163,14 +156,22 @@ mod e2e {
     fn wrapper_path() -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("target/deploy/percolator_prog.so");
-        assert!(p.exists(), "wrapper BPF missing — run `cargo build-sbf` first: {}", p.display());
+        assert!(
+            p.exists(),
+            "wrapper BPF missing — run `cargo build-sbf` first: {}",
+            p.display()
+        );
         p
     }
 
     fn nft_path() -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("../percolator-nft/target/deploy/percolator_nft.so");
-        assert!(p.exists(), "NFT BPF missing — run `cargo build-sbf` in percolator-nft first: {}", p.display());
+        assert!(
+            p.exists(),
+            "NFT BPF missing — run `cargo build-sbf` in percolator-nft first: {}",
+            p.display()
+        );
         p
     }
 
@@ -193,7 +194,11 @@ mod e2e {
     /// PositionNft PDA (per-leg, per-portfolio, per-program).
     fn position_nft_pda(portfolio: &Pubkey, market_id: u64) -> (Pubkey, u8) {
         Pubkey::find_program_address(
-            &[POSITION_NFT_SEED, portfolio.as_ref(), &market_id.to_le_bytes()],
+            &[
+                POSITION_NFT_SEED,
+                portfolio.as_ref(),
+                &market_id.to_le_bytes(),
+            ],
             &NFT_PROGRAM_ID,
         )
     }
@@ -217,7 +222,11 @@ mod e2e {
         accounts: Vec<AccountMeta>,
         signers: &[&Keypair],
     ) -> Result<(), String> {
-        let ix = Instruction { program_id: pid, accounts, data };
+        let ix = Instruction {
+            program_id: pid,
+            accounts,
+            data,
+        };
         let mut all_signers = vec![payer];
         all_signers.extend_from_slice(signers);
         let tx = Transaction::new_signed_with_payer(
@@ -230,7 +239,9 @@ mod e2e {
             &all_signers,
             svm.latest_blockhash(),
         );
-        svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+        svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
     }
 
     /// Craft a minimal Token-2022 ATA account data (165 bytes base layout).
@@ -314,13 +325,13 @@ mod e2e {
         d[12..16].copy_from_slice(&(EXTRA_META_COUNT as u32).to_le_bytes());
 
         let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
-            (*nft_pda, false, true),                          // [5] PositionNft PDA — writable
-            (*portfolio, false, true),                        // [6] Portfolio — writable
-            (PERCOLATOR_MAINNET, false, false),               // [7] Percolator program
-            (*mint_auth, false, false),                       // [8] Mint authority
-            (sysvar::instructions::id(), false, false),       // [9] Instructions sysvar
-            (NFT_PROGRAM_ID, false, false),                   // [10] NFT program (self)
-            (*registry, false, false),                        // [11] NFT registry
+            (*nft_pda, false, true),                    // [5] PositionNft PDA — writable
+            (*portfolio, false, true),                  // [6] Portfolio — writable
+            (PERCOLATOR_MAINNET, false, false),         // [7] Percolator program
+            (*mint_auth, false, false),                 // [8] Mint authority
+            (sysvar::instructions::id(), false, false), // [9] Instructions sysvar
+            (NFT_PROGRAM_ID, false, false),             // [10] NFT program (self)
+            (*registry, false, false),                  // [11] NFT registry
         ];
         for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
             let off = 16 + i * EXTRA_META_ENTRY_LEN;
@@ -451,7 +462,9 @@ mod e2e {
         //   portfolio_account_id: [u8;32] @32
         //   owner: [u8;32] @64
         let prov_owner_off = pod_offset + 64;
-        data[prov_owner_off..prov_owner_off + 32].try_into().unwrap()
+        data[prov_owner_off..prov_owner_off + 32]
+            .try_into()
+            .unwrap()
     }
 
     // ── Env setup ─────────────────────────────────────────────────────────────
@@ -486,10 +499,7 @@ mod e2e {
 
     /// Create an initialized market account and register the NFT program.
     /// Returns (market_key, registry_key, admin_keypair).
-    fn setup_market_and_registry(
-        svm: &mut LiteSVM,
-        payer: &Keypair,
-    ) -> (Pubkey, Pubkey, Keypair) {
+    fn setup_market_and_registry(svm: &mut LiteSVM, payer: &Keypair) -> (Pubkey, Pubkey, Keypair) {
         use percolator_prog::state::market_account_len_for_capacity;
 
         let admin = Keypair::new();
@@ -630,7 +640,7 @@ mod e2e {
         // Wire: outer_tag(1)=36, sub_tag(1)=0, authority(32)=zero(None), program_id(32)
         let mut hook_init_data = Vec::with_capacity(66);
         hook_init_data.push(36u8); // TRANSFER_HOOK_EXTENSION_TAG
-        hook_init_data.push(0u8);  // initialize sub-tag
+        hook_init_data.push(0u8); // initialize sub-tag
         hook_init_data.extend_from_slice(&[0u8; 32]); // authority = None (zero = None)
         hook_init_data.extend_from_slice(hook_program_id.as_ref());
         let hook_init_ix = Instruction {
@@ -650,7 +660,7 @@ mod e2e {
         let (nft_mint_auth_key, _) = mint_auth_pda();
         let mut close_auth_data = Vec::with_capacity(34);
         close_auth_data.push(25u8); // IX_INITIALIZE_MINT_CLOSE_AUTHORITY
-        close_auth_data.push(1u8);  // COption::Some
+        close_auth_data.push(1u8); // COption::Some
         close_auth_data.extend_from_slice(nft_mint_auth_key.as_ref()); // close authority = mint_auth PDA
         let close_auth_ix = Instruction {
             program_id: TOKEN_2022,
@@ -660,10 +670,10 @@ mod e2e {
 
         // InitializeMint2: tag(1)=20, decimals(1)=0, mint_authority(32), freeze_option(1)=0
         let mut init_mint_data = Vec::with_capacity(35);
-        init_mint_data.push(20u8);       // IX_INITIALIZE_MINT2
-        init_mint_data.push(0u8);        // decimals = 0
+        init_mint_data.push(20u8); // IX_INITIALIZE_MINT2
+        init_mint_data.push(0u8); // decimals = 0
         init_mint_data.extend_from_slice(payer.pubkey().as_ref()); // mint authority = payer
-        init_mint_data.push(0u8);        // no freeze authority
+        init_mint_data.push(0u8); // no freeze authority
         let init_mint_ix = Instruction {
             program_id: TOKEN_2022,
             accounts: vec![AccountMeta::new(mint_kp.pubkey(), false)],
@@ -687,7 +697,8 @@ mod e2e {
             &[payer, mint_kp],
             svm.latest_blockhash(),
         );
-        svm.send_transaction(tx).expect("initialize Token-2022 mint with transfer hook");
+        svm.send_transaction(tx)
+            .expect("initialize Token-2022 mint with transfer hook");
         lamports
     }
 
@@ -743,7 +754,6 @@ mod e2e {
         );
         svm.send_transaction(tx).expect("mint 1 NFT to ATA");
     }
-
 
     /// Variant of `place_nft_bundle` that initializes the Token-2022 mint via
     /// actual CPI calls so Token-2022 v1.0.0 accepts it for Burn / TransferChecked.
@@ -808,7 +818,13 @@ mod e2e {
             nft_pda_key,
             Account {
                 lamports: 2_000_000,
-                data: nft_pda_data(&portfolio_key, &nft_mint_key, asset_index, market_id, nft_bump),
+                data: nft_pda_data(
+                    &portfolio_key,
+                    &nft_mint_key,
+                    asset_index,
+                    market_id,
+                    nft_bump,
+                ),
                 owner: NFT_PROGRAM_ID,
                 executable: false,
                 rent_epoch: 0,
@@ -908,7 +924,13 @@ mod e2e {
             nft_pda_key,
             Account {
                 lamports: 2_000_000,
-                data: nft_pda_data(&portfolio_key, &nft_mint_key, asset_index, market_id, nft_bump),
+                data: nft_pda_data(
+                    &portfolio_key,
+                    &nft_mint_key,
+                    asset_index,
+                    market_id,
+                    nft_bump,
+                ),
                 owner: NFT_PROGRAM_ID,
                 executable: false,
                 rent_epoch: 0,
@@ -1065,7 +1087,8 @@ mod e2e {
         let (market, registry, _admin) = setup_market_and_registry(&mut svm, &payer);
 
         let source_wallet = Keypair::new();
-        svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+        svm.airdrop(&source_wallet.pubkey(), 10_000_000_000)
+            .unwrap();
 
         let dest_wallet = Keypair::new();
         svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
@@ -1134,7 +1157,10 @@ mod e2e {
         // The position stays escrowed (owner unchanged from pre-transfer state).
         // Assert that portfolio.owner and provenance_header.owner are UNCHANGED by
         // the transfer — they remain equal to source_wallet (set at bundle creation).
-        let port_data = svm.get_account(&portfolio_key).expect("portfolio account").data;
+        let port_data = svm
+            .get_account(&portfolio_key)
+            .expect("portfolio account")
+            .data;
         let actual_owner = read_portfolio_owner(&port_data);
         let actual_prov_owner = read_provenance_owner(&port_data);
 
@@ -1163,12 +1189,18 @@ mod e2e {
         // (We just check the dest_ata account data since Token-2022 moved the balance.)
         let dest_ata_data = svm.get_account(&dest_ata_key).expect("dest ATA").data;
         let dest_balance = u64::from_le_bytes(dest_ata_data[64..72].try_into().unwrap());
-        assert_eq!(dest_balance, 1, "dest ATA must hold 1 NFT token after transfer");
+        assert_eq!(
+            dest_balance, 1,
+            "dest ATA must hold 1 NFT token after transfer"
+        );
 
         // Verify source ATA now has 0 balance.
         let src_ata_data = svm.get_account(&source_ata_key).expect("source ATA").data;
         let src_balance = u64::from_le_bytes(src_ata_data[64..72].try_into().unwrap());
-        assert_eq!(src_balance, 0, "source ATA must have 0 balance after transfer");
+        assert_eq!(
+            src_balance, 0,
+            "source ATA must have 0 balance after transfer"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1250,7 +1282,8 @@ mod e2e {
         //
         // Fake source/dest ATAs for the standard 4 hook interface accounts.
         let attacker_wallet = Keypair::new();
-        svm.airdrop(&attacker_wallet.pubkey(), 10_000_000_000).unwrap();
+        svm.airdrop(&attacker_wallet.pubkey(), 10_000_000_000)
+            .unwrap();
         let victim_wallet = Pubkey::new_from_array(owner_b_bytes);
 
         let fake_src_ata = ata_address(&attacker_wallet.pubkey(), &nft_mint_a_key);
@@ -1285,18 +1318,18 @@ mod e2e {
         hook_data.extend_from_slice(&1u64.to_le_bytes());
 
         let hook_accounts = vec![
-            AccountMeta::new_readonly(fake_src_ata, false),     // 0: source ATA
-            AccountMeta::new_readonly(nft_mint_a_key, false),   // 1: mint
-            AccountMeta::new_readonly(fake_dst_ata, false),     // 2: dest ATA (VALID Token-2022) — so the dest-ATA shape check passes and the attack reaches the operative defense
+            AccountMeta::new_readonly(fake_src_ata, false), // 0: source ATA
+            AccountMeta::new_readonly(nft_mint_a_key, false), // 1: mint
+            AccountMeta::new_readonly(fake_dst_ata, false), // 2: dest ATA (VALID Token-2022) — so the dest-ATA shape check passes and the attack reaches the operative defense
             AccountMeta::new_readonly(attacker_wallet.pubkey(), true), // 3: source authority
-            AccountMeta::new_readonly(extra_metas_a_key, false),// 4: extra metas
-            AccountMeta::new(nft_pda_a_key, false),             // 5: PositionNft PDA (A)
-            AccountMeta::new(portfolio_b_key, false),           // 6: SUBSTITUTED portfolio B
-            AccountMeta::new_readonly(PERCOLATOR_MAINNET, false),// 7: percolator prog
-            AccountMeta::new_readonly(mint_auth_key, false),    // 8: mint auth
+            AccountMeta::new_readonly(extra_metas_a_key, false), // 4: extra metas
+            AccountMeta::new(nft_pda_a_key, false),         // 5: PositionNft PDA (A)
+            AccountMeta::new(portfolio_b_key, false),       // 6: SUBSTITUTED portfolio B
+            AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 7: percolator prog
+            AccountMeta::new_readonly(mint_auth_key, false), // 8: mint auth
             AccountMeta::new_readonly(sysvar::instructions::id(), false), // 9: sysvar_ix
-            AccountMeta::new_readonly(NFT_PROGRAM_ID, false),   // 10: nft program
-            AccountMeta::new_readonly(registry, false),         // 11: registry
+            AccountMeta::new_readonly(NFT_PROGRAM_ID, false), // 10: nft program
+            AccountMeta::new_readonly(registry, false),     // 11: registry
         ];
 
         let result = send(
@@ -1476,7 +1509,10 @@ mod e2e {
             &[&impostor],
         );
 
-        assert!(result.is_err(), "Wrong signer must be rejected by wrapper B-3");
+        assert!(
+            result.is_err(),
+            "Wrong signer must be rejected by wrapper B-3"
+        );
         // Assert the SPECIFIC rejection: NftInvalidMintAuthority = Custom(45).
         // B-3 check order: signer present (passes, impostor IS signer), portfolio
         // owner/header valid, registry found (SetNftProgramId was called), then
@@ -1522,7 +1558,13 @@ mod e2e {
             .unwrap();
             svm.set_account(
                 collateral_mint,
-                Account { lamports: 1_000_000_000, data: cdata, owner: spl_token::ID, executable: false, rent_epoch: 0 },
+                Account {
+                    lamports: 1_000_000_000,
+                    data: cdata,
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
             )
             .unwrap();
         }
@@ -1543,15 +1585,25 @@ mod e2e {
             &payer,
             WrapperInstruction::InitMarket {
                 max_portfolio_assets: 1,
-                h_min: 0, h_max: 10, initial_price: 100,
-                min_nonzero_mm_req: 1, min_nonzero_im_req: 2,
-                maintenance_margin_bps: 10_000, initial_margin_bps: 10_000,
-                max_trading_fee_bps: 10_000, trade_fee_base_bps: 0,
-                liquidation_fee_bps: 0, liquidation_fee_cap: 0,
-                min_liquidation_abs: 0, max_price_move_bps_per_slot: 10_000,
-                max_accrual_dt_slots: 1, max_abs_funding_e9_per_slot: 0,
-                min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
-                max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 100,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 100,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
                 maintenance_fee_per_slot: 0,
             }
@@ -1601,7 +1653,10 @@ mod e2e {
             &[&fake_caller],
         );
 
-        assert!(result.is_err(), "Unregistered NFT program must cause B-3 to fail-closed");
+        assert!(
+            result.is_err(),
+            "Unregistered NFT program must cause B-3 to fail-closed"
+        );
         // Assert the SPECIFIC rejection.  B-3's check order:
         //   1. expect_signer (impostor IS signer — passes)
         //   2. expect_owner(portfolio, program_id) — passes (portfolio owned by wrapper)
@@ -1675,11 +1730,7 @@ mod e2e {
 
     /// Assert that portfolio account bytes are UNCHANGED after a failed transfer
     /// attempt (partial-write conservation guarantee).
-    fn assert_owner_unchanged(
-        svm: &LiteSVM,
-        portfolio_key: &Pubkey,
-        original_owner: &[u8; 32],
-    ) {
+    fn assert_owner_unchanged(svm: &LiteSVM, portfolio_key: &Pubkey, original_owner: &[u8; 32]) {
         let data = svm.get_account(portfolio_key).expect("portfolio").data;
         assert_eq!(
             read_portfolio_owner(&data),
@@ -1713,7 +1764,8 @@ mod e2e {
         portfolio_mutate: impl FnMut(&mut Vec<u8>),
     ) {
         let source_wallet = Keypair::new();
-        svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+        svm.airdrop(&source_wallet.pubkey(), 10_000_000_000)
+            .unwrap();
         let dest_wallet = Keypair::new();
         svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
 
@@ -1730,8 +1782,8 @@ mod e2e {
             market,
             registry,
             &source_wallet,
-            0,   // asset_index
-            42,  // market_id
+            0,         // asset_index
+            42,        // market_id
             1_000_000, // basis_pos_q (nonzero active leg — gate fields block transfer)
             portfolio_mutate,
         );
@@ -1899,7 +1951,8 @@ mod e2e {
         let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
 
         let source_wallet = Keypair::new();
-        svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+        svm.airdrop(&source_wallet.pubkey(), 10_000_000_000)
+            .unwrap();
 
         let (
             portfolio_key,
@@ -1994,7 +2047,10 @@ mod e2e {
         );
         let result = svm.send_transaction(tx);
 
-        assert!(result.is_err(), "self-transfer must be rejected by B-3 Guardrail 4");
+        assert!(
+            result.is_err(),
+            "self-transfer must be rejected by B-3 Guardrail 4"
+        );
 
         // portfolio.owner must be unchanged (Solana revert guarantee).
         assert_owner_unchanged(&svm, &portfolio_key, &source_wallet.pubkey().to_bytes());
@@ -2053,8 +2109,7 @@ mod e2e {
         let original_owner = [0xAAu8; 32];
         let portfolio_key = Pubkey::new_unique();
 
-        let mut data =
-            portfolio_data(&portfolio_key, &market, &original_owner, 0, 42, 1_000_000);
+        let mut data = portfolio_data(&portfolio_key, &market, &original_owner, 0, 42, 1_000_000);
         {
             let pod_offset = HEADER_LEN;
             let pod_len = core::mem::size_of::<PortfolioAccountV16Account>();
@@ -2172,7 +2227,7 @@ mod e2e {
             0,
             42,
             0, // basis_pos_q = 0 (flat/closed) — so emergency_burn_ok passes
-               // and the handler reaches the holder check
+            // and the handler reaches the holder check
             |data| {
                 // #105 escrow-at-mint: set portfolio.owner = mint_auth PDA (escrow invariant).
                 // This ensures the processor reaches the holder-ATA check (not the unwrap guard).
@@ -2208,15 +2263,15 @@ mod e2e {
             &payer,
             vec![5u8], // TAG_EMERGENCY_BURN
             vec![
-                AccountMeta::new(non_holder.pubkey(), true),          // 0: holder[signer]
-                AccountMeta::new(nft_pda_key, false),                 // 1: nft_pda[w]
-                AccountMeta::new(nft_mint_key, false),                // 2: nft_mint[w]
-                AccountMeta::new(non_holder_ata, false),              // 3: holder_ata[w]
-                AccountMeta::new(portfolio_key, false),               // 4: portfolio[W]
-                AccountMeta::new_readonly(mint_auth_key, false),      // 5: mint_auth
-                AccountMeta::new_readonly(TOKEN_2022, false),         // 6: token_program
-                AccountMeta::new(extra_metas_key, false),             // 7: extra_metas[w]
-                AccountMeta::new_readonly(nft_registry_key_nh, false),// 8: nft_registry[ro]
+                AccountMeta::new(non_holder.pubkey(), true), // 0: holder[signer]
+                AccountMeta::new(nft_pda_key, false),        // 1: nft_pda[w]
+                AccountMeta::new(nft_mint_key, false),       // 2: nft_mint[w]
+                AccountMeta::new(non_holder_ata, false),     // 3: holder_ata[w]
+                AccountMeta::new(portfolio_key, false),      // 4: portfolio[W]
+                AccountMeta::new_readonly(mint_auth_key, false), // 5: mint_auth
+                AccountMeta::new_readonly(TOKEN_2022, false), // 6: token_program
+                AccountMeta::new(extra_metas_key, false),    // 7: extra_metas[w]
+                AccountMeta::new_readonly(nft_registry_key_nh, false), // 8: nft_registry[ro]
                 AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 9: percolator_prog[ro]
             ],
             &[&non_holder],
@@ -2277,8 +2332,8 @@ mod e2e {
             &registry,
             owner_bytes,
             0,
-            42,          // market_id = 42 (matching nft_state.market_id_at_mint)
-            1_000_000,   // basis_pos_q nonzero -> position still open
+            42,        // market_id = 42 (matching nft_state.market_id_at_mint)
+            1_000_000, // basis_pos_q nonzero -> position still open
             |data| {
                 // #105 escrow-at-mint: portfolio.owner = mint_auth PDA (escrow).
                 let owner_off = HEADER_LEN + 100;
@@ -2297,15 +2352,15 @@ mod e2e {
             &payer,
             vec![5u8],
             vec![
-                AccountMeta::new(holder.pubkey(), true),              // 0: holder[signer]
-                AccountMeta::new(nft_pda_key, false),                 // 1: nft_pda[w]
-                AccountMeta::new(nft_mint_key, false),                // 2: nft_mint[w]
-                AccountMeta::new(source_ata_key, false),              // 3: holder_ata[w]
-                AccountMeta::new(portfolio_key, false),               // 4: portfolio[W]
-                AccountMeta::new_readonly(mint_auth_key, false),      // 5: mint_auth
-                AccountMeta::new_readonly(TOKEN_2022, false),         // 6: token_program
-                AccountMeta::new(extra_metas_key, false),             // 7: extra_metas[w]
-                AccountMeta::new_readonly(nft_registry_key_op, false),// 8: nft_registry[ro]
+                AccountMeta::new(holder.pubkey(), true), // 0: holder[signer]
+                AccountMeta::new(nft_pda_key, false),    // 1: nft_pda[w]
+                AccountMeta::new(nft_mint_key, false),   // 2: nft_mint[w]
+                AccountMeta::new(source_ata_key, false), // 3: holder_ata[w]
+                AccountMeta::new(portfolio_key, false),  // 4: portfolio[W]
+                AccountMeta::new_readonly(mint_auth_key, false), // 5: mint_auth
+                AccountMeta::new_readonly(TOKEN_2022, false), // 6: token_program
+                AccountMeta::new(extra_metas_key, false), // 7: extra_metas[w]
+                AccountMeta::new_readonly(nft_registry_key_op, false), // 8: nft_registry[ro]
                 AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 9: percolator_prog[ro]
             ],
             &[&holder],
@@ -2391,15 +2446,15 @@ mod e2e {
             &payer,
             vec![5u8],
             vec![
-                AccountMeta::new(holder.pubkey(), true),              // 0: holder[signer]
-                AccountMeta::new(nft_pda_key, false),                 // 1: nft_pda[w]
-                AccountMeta::new(nft_mint_key, false),                // 2: nft_mint[w]
-                AccountMeta::new(source_ata_key, false),              // 3: holder_ata[w]
-                AccountMeta::new(portfolio_key, false),               // 4: portfolio[W — writable]
-                AccountMeta::new_readonly(mint_auth_key, false),      // 5: mint_auth
-                AccountMeta::new_readonly(TOKEN_2022, false),         // 6: token_program
-                AccountMeta::new(extra_metas_key, false),             // 7: extra_metas[w]
-                AccountMeta::new_readonly(nft_registry_key, false),   // 8: nft_registry[ro]
+                AccountMeta::new(holder.pubkey(), true), // 0: holder[signer]
+                AccountMeta::new(nft_pda_key, false),    // 1: nft_pda[w]
+                AccountMeta::new(nft_mint_key, false),   // 2: nft_mint[w]
+                AccountMeta::new(source_ata_key, false), // 3: holder_ata[w]
+                AccountMeta::new(portfolio_key, false),  // 4: portfolio[W — writable]
+                AccountMeta::new_readonly(mint_auth_key, false), // 5: mint_auth
+                AccountMeta::new_readonly(TOKEN_2022, false), // 6: token_program
+                AccountMeta::new(extra_metas_key, false), // 7: extra_metas[w]
+                AccountMeta::new_readonly(nft_registry_key, false), // 8: nft_registry[ro]
                 AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 9: percolator_prog[ro]
             ],
             &[&holder],
@@ -2432,7 +2487,10 @@ mod e2e {
         // After EmergencyBurn the PDA lamports are transferred to holder and
         // data zeroed. LiteSVM may or may not remove the account; check lamports.
         if let Some(acc) = nft_pda_after {
-            assert_eq!(acc.lamports, 0, "nft_pda must have 0 lamports after EmergencyBurn");
+            assert_eq!(
+                acc.lamports, 0,
+                "nft_pda must have 0 lamports after EmergencyBurn"
+            );
         }
 
         // Holder must have recovered rent (at minimum the PDA lamports).

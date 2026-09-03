@@ -40,7 +40,15 @@ fn dust_goes_to_insurance_and_total_is_still_exact() {
 #[test]
 fn zero_fee_splits_to_all_zeros() {
     let parts = split_trade_fee(0, P, C, L, I).unwrap();
-    assert_eq!(parts, FeeSplitParts { protocol: 0, creator: 0, lp: 0, insurance: 0 });
+    assert_eq!(
+        parts,
+        FeeSplitParts {
+            protocol: 0,
+            creator: 0,
+            lp: 0,
+            insurance: 0
+        }
+    );
 }
 
 #[test]
@@ -117,7 +125,11 @@ fn creator_fee_counter_is_at_568_and_the_three_share_fields_have_not_moved() {
     );
 
     let bytes = bytemuck::bytes_of(&cfg);
-    assert_eq!(bytes.len(), 576, "config must serialize to exactly 576 bytes");
+    assert_eq!(
+        bytes.len(),
+        576,
+        "config must serialize to exactly 576 bytes"
+    );
 
     assert_eq!(
         &bytes[560..562],
@@ -180,7 +192,10 @@ fn preexisting_market_with_zeroed_pad_tail_parses_as_zero_claimable() {
         parsed.creator_fee_claimable_atoms, 0,
         "an old market's zeroed pad tail must read as a zero claimable balance"
     );
-    assert_eq!(parsed.creator_share_bps, 1600, "shares must survive the zeroed tail");
+    assert_eq!(
+        parsed.creator_share_bps, 1600,
+        "shares must survive the zeroed tail"
+    );
     assert_eq!(parsed.lp_share_bps, 4800);
     assert_eq!(parsed.insurance_share_bps, 1600);
 }
@@ -196,7 +211,10 @@ fn creator_fee_counter_did_not_shift_market_group_off() {
     assert_eq!(WRAPPER_CONFIG_LEN, 576);
     assert_eq!(core::mem::size_of::<WrapperConfigV16>(), WRAPPER_CONFIG_LEN);
     assert_eq!(MARKET_GROUP_OFF, HEADER_LEN + 576);
-    assert_eq!(MARKET_GROUP_OFF, 592, "deployed 576-byte markets pin this to 592");
+    assert_eq!(
+        MARKET_GROUP_OFF, 592,
+        "deployed 576-byte markets pin this to 592"
+    );
 }
 
 #[test]
@@ -409,8 +427,8 @@ use percolator_prog::ix::Instruction as ProgInstruction;
 use percolator_prog::state;
 use solana_program::instruction::{AccountMeta, Instruction};
 use solana_sdk::{account::Account, pubkey::Pubkey, signature::Keypair, signer::Signer};
-use spl_token::state::Account as TokenAccount;
 use spl_token::solana_program::program_pack::Pack;
+use spl_token::state::Account as TokenAccount;
 
 const FS_MAX_ASSETS: u16 = 2;
 
@@ -419,7 +437,11 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
         .parse()
         .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -456,7 +478,7 @@ fn craft_stake_pool_v4(
     d[168..176].copy_from_slice(&total_deposited.to_le_bytes());
     d[176..184].copy_from_slice(&total_lp_supply.to_le_bytes());
     d[224..256].copy_from_slice(percolator_program.as_ref()); // CPI target
-    // d[280] pool_mode = 0 (insurance LP) — already zero.
+                                                              // d[280] pool_mode = 0 (insurance LP) — already zero.
     d[320..328].copy_from_slice(b"SPOOL_V1"); // discriminator
     d[328] = 4; // CURRENT_VERSION
     d
@@ -735,8 +757,9 @@ impl FeeEnv {
             data: vec![19u8],
         };
         let payer = self.payer.insecure_clone();
-        send_ixs(&mut self.svm, &payer, vec![ix], &[&admin])
-            .expect("BindInsuranceAuthority (v3 pool) — layout constants must match the stake program");
+        send_ixs(&mut self.svm, &payer, vec![ix], &[&admin]).expect(
+            "BindInsuranceAuthority (v3 pool) — layout constants must match the stake program",
+        );
 
         self.pool_pda = pool_pda;
         self.vault_auth = vault_auth;
@@ -759,8 +782,7 @@ impl FeeEnv {
         let mut acct = self.svm.get_account(&self.market).unwrap();
         {
             let (_, group) = state::market_view_mut(&mut acct.data).unwrap();
-            group.header.insurance_domain_budget_remaining_total =
-                percolator::V16PodU128::new(0);
+            group.header.insurance_domain_budget_remaining_total = percolator::V16PodU128::new(0);
         }
         self.svm.set_account(self.market, acct).unwrap();
     }
@@ -771,8 +793,7 @@ impl FeeEnv {
     /// driven to an exact boundary.
     fn set_reserve_accrued(&mut self, atoms: u128) {
         let mut acct = self.svm.get_account(&self.market).unwrap();
-        let (mut cfg, _, _, _) =
-            state::read_market_config_mode_and_capacity(&acct.data).unwrap();
+        let (mut cfg, _, _, _) = state::read_market_config_mode_and_capacity(&acct.data).unwrap();
         cfg.insurance_reserve_accrued_atoms = atoms;
         state::write_wrapper_config(&mut acct.data, &cfg).unwrap();
         self.svm.set_account(self.market, acct).unwrap();
@@ -780,8 +801,7 @@ impl FeeEnv {
 
     fn reserve_counters(&self) -> (u128, u128) {
         let acct = self.svm.get_account(&self.market).unwrap();
-        let (cfg, _, _, _) =
-            state::read_market_config_mode_and_capacity(&acct.data).unwrap();
+        let (cfg, _, _, _) = state::read_market_config_mode_and_capacity(&acct.data).unwrap();
         (
             cfg.insurance_reserve_accrued_atoms,
             cfg.insurance_reserve_withdrawn_atoms,
@@ -1006,7 +1026,10 @@ fn tag87_moves_real_tokens_into_the_stake_vault_and_conserves_value() {
         "header.vault must fall by exactly the transferred amount"
     );
     // ── The counter advanced by what was TRANSFERRED. ──
-    assert_eq!(accrued_after, ACCRUED, "accrued is monotonic, untouched here");
+    assert_eq!(
+        accrued_after, ACCRUED,
+        "accrued is monotonic, untouched here"
+    );
     assert_eq!(
         withdrawn_after - withdrawn_before,
         stake_after as u128 - stake_before as u128,
@@ -1048,7 +1071,11 @@ fn tag87_end_to_end_from_a_real_trade_fee_with_no_seeding() {
     let (ins_start, vault_start) = env.header_insurance_and_vault();
     assert_eq!(ins_start, 0, "no insurance before any trade");
     assert_eq!(vault_start, 0, "no vault before any deposit");
-    assert_eq!(env.header_domain_budget(), 0, "no domain budget to begin with");
+    assert_eq!(
+        env.header_domain_budget(),
+        0,
+        "no domain budget to begin with"
+    );
     assert_eq!(env.reserve_counters(), (0, 0), "nothing accrued yet");
 
     // Two real traders with real collateral.
@@ -1101,7 +1128,9 @@ fn tag87_end_to_end_from_a_real_trade_fee_with_no_seeding() {
         ins_after_trade >= accrued,
         "engine_available ({ins_after_trade}) must cover the accrued leg ({accrued})"
     );
-    println!("EVIDENCE real-accrual: insurance={ins_after_trade} accrued={accrued} domain_budget=0");
+    println!(
+        "EVIDENCE real-accrual: insurance={ins_after_trade} accrued={accrued} domain_budget=0"
+    );
 
     // ── The crank, on genuinely earned atoms. ──
     let stake_before = env.token_amount(env.stake_vault);
@@ -1140,7 +1169,10 @@ fn tag87_end_to_end_from_a_real_trade_fee_with_no_seeding() {
         withdrawn_after, accrued_after,
         "the whole earned leg is now marked paid, because it was fully paid"
     );
-    assert!(withdrawn_after <= accrued_after, "invariant: withdrawn <= accrued");
+    assert!(
+        withdrawn_after <= accrued_after,
+        "invariant: withdrawn <= accrued"
+    );
     println!(
         "EVIDENCE real-accrual crank: stake_vault_spl {stake_before} -> {stake_after}, \
          market_vault_spl {market_vault_before} -> {market_vault_after}"
@@ -1255,7 +1287,10 @@ fn tag87_rejects_a_caller_supplied_destination() {
         "and the real stake vault must be untouched by the failed attempt"
     );
     let (_, withdrawn) = env.reserve_counters();
-    assert_eq!(withdrawn, 0, "a rejected redirect must not mark anything paid");
+    assert_eq!(
+        withdrawn, 0,
+        "a rejected redirect must not mark anything paid"
+    );
 }
 
 /// SECURITY: the same, one step subtler — a token account whose SPL owner IS
@@ -1875,7 +1910,9 @@ fn tag88_rejects_a_non_marketauth_signer_with_unauthorized() {
     let mut env = FeeEnv::new(1_000_000);
 
     let interloper = Keypair::new();
-    env.svm.airdrop(&interloper.pubkey(), 1_000_000_000).unwrap();
+    env.svm
+        .airdrop(&interloper.pubkey(), 1_000_000_000)
+        .unwrap();
 
     assert_custom(
         env.set_maintenance_fee_per_slot_as(&interloper, 7_777),
@@ -2064,7 +2101,9 @@ fn tag86_rejects_a_non_marketauth_signer_with_unauthorized() {
     let mut env = FeeEnv::new(1_000_000);
 
     let interloper = Keypair::new();
-    env.svm.airdrop(&interloper.pubkey(), 1_000_000_000).unwrap();
+    env.svm
+        .airdrop(&interloper.pubkey(), 1_000_000_000)
+        .unwrap();
 
     assert_custom(
         env.set_fee_split_as(&interloper, 1600, 4800, 1600),

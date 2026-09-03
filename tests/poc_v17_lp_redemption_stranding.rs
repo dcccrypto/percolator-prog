@@ -113,7 +113,10 @@ const MINTED: u128 = DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY;
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
-    assert!(p.exists(), "wrapper BPF missing — cargo build-sbf --no-default-features");
+    assert!(
+        p.exists(),
+        "wrapper BPF missing — cargo build-sbf --no-default-features"
+    );
     p
 }
 
@@ -126,7 +129,10 @@ fn spl_token_program_path() -> PathBuf {
             h
         });
     for reg in std::fs::read_dir(cargo_home.join("registry/src")).expect("registry/src") {
-        let cand = reg.expect("entry").path().join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
+        let cand = reg
+            .expect("entry")
+            .path()
+            .join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
         if cand.exists() {
             return cand;
         }
@@ -170,9 +176,15 @@ fn make_token_data(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
 }
 
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -181,7 +193,13 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
 fn set_token(svm: &mut LiteSVM, key: Pubkey, mint: Pubkey, owner: Pubkey, amount: u64) {
     svm.set_account(
         key,
-        Account { lamports: 1_000_000_000, data: make_token_data(mint, owner, amount), owner: spl_token::ID, executable: false, rent_epoch: 0 },
+        Account {
+            lamports: 1_000_000_000,
+            data: make_token_data(mint, owner, amount),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
     )
     .unwrap();
 }
@@ -201,29 +219,60 @@ struct Env {
     vault_authority: Pubkey,
 }
 
-fn send(svm: &mut LiteSVM, program_id: Pubkey, payer: &Keypair, ixs: Vec<(ProgInstruction, Vec<AccountMeta>)>, extra: &[&Keypair]) -> Result<(), String> {
+fn send(
+    svm: &mut LiteSVM,
+    program_id: Pubkey,
+    payer: &Keypair,
+    ixs: Vec<(ProgInstruction, Vec<AccountMeta>)>,
+    extra: &[&Keypair],
+) -> Result<(), String> {
     let mut instructions = vec![
         ComputeBudgetInstruction::request_heap_frame(128 * 1024),
         ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
     ];
     for (ix, accounts) in ixs {
-        instructions.push(Instruction { program_id, accounts, data: ix.encode() });
+        instructions.push(Instruction {
+            program_id,
+            accounts,
+            data: ix.encode(),
+        });
     }
     let mut signers = vec![payer];
     signers.extend_from_slice(extra);
-    let tx = Transaction::new_signed_with_payer(&instructions, Some(&payer.pubkey()), &signers, svm.latest_blockhash());
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&payer.pubkey()),
+        &signers,
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 fn init_market_ix() -> ProgInstruction {
     ProgInstruction::InitMarket {
-        max_portfolio_assets: MAX_PORTFOLIO_ASSETS, h_min: 0, h_max: 10, initial_price: 100,
-        min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 10_000,
-        initial_margin_bps: 10_000, max_trading_fee_bps: 10_000, trade_fee_base_bps: 0,
-        liquidation_fee_bps: 0, liquidation_fee_cap: 0, min_liquidation_abs: 0,
-        max_price_move_bps_per_slot: 10_000, max_accrual_dt_slots: 1, max_abs_funding_e9_per_slot: 0,
-        min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1, max_bankrupt_close_chunks: 1,
-        max_bankrupt_close_lifetime_slots: 100, public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+        max_portfolio_assets: MAX_PORTFOLIO_ASSETS,
+        h_min: 0,
+        h_max: 10,
+        initial_price: 100,
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
+        maintenance_margin_bps: 10_000,
+        initial_margin_bps: 10_000,
+        max_trading_fee_bps: 10_000,
+        trade_fee_base_bps: 0,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: 0,
+        min_liquidation_abs: 0,
+        max_price_move_bps_per_slot: 10_000,
+        max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 0,
+        min_funding_lifetime_slots: 1,
+        max_account_b_settlement_chunks: 1,
+        max_bankrupt_close_chunks: 1,
+        max_bankrupt_close_lifetime_slots: 100,
+        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }
@@ -233,8 +282,14 @@ fn init_market_ix() -> ProgInstruction {
 fn setup_vault(cooldown_slots: u64) -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
-    svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
-    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("token BPF"));
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("wrapper BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("token BPF"),
+    );
 
     let payer = Keypair::new();
     let admin = Keypair::new();
@@ -242,44 +297,123 @@ fn setup_vault(cooldown_slots: u64) -> Env {
     let collateral_mint = Pubkey::new_unique();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 100_000_000_000).unwrap();
-    svm.set_account(collateral_mint, Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
-    svm.set_account(market, Account { lamports: 1_000_000_000, data: vec![0u8; state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()], owner: program_id, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        collateral_mint,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_mint_data(),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0u8;
+                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                    .unwrap()
+            ],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    send(&mut svm, program_id, &payer, vec![(init_market_ix(), vec![
-        AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new(market, false),
-        AccountMeta::new_readonly(collateral_mint, false),
-    ])], &[&admin]).expect("init market");
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            init_market_ix(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("init market");
 
     let (registry, _) = derive_lp_vault_registry(&program_id, &market);
     let (lp_mint, _) = derive_lp_vault_mint(&program_id, &market);
     let (ledger, _) = derive_lp_backing_ledger(&program_id, &market, DOMAIN);
     let (escrow, _) = derive_lp_escrow(&program_id, &market);
-    let (vault_authority, _) = Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
+    let (vault_authority, _) =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
     let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
 
     // Append asset 1 with registry as backing authority, then create vault.
-    send(&mut svm, program_id, &payer, vec![(ProgInstruction::UpdateAssetLifecycle {
-        action: ASSET_ACTION_ACTIVATE, asset_index: APPEND_ASSET_INDEX, now_slot: 1, initial_price: 100,
-        insurance_authority: admin.pubkey().to_bytes(), insurance_operator: admin.pubkey().to_bytes(),
-        backing_bucket_authority: registry.to_bytes(), oracle_authority: admin.pubkey().to_bytes(),
-    }, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)])], &[&admin]).expect("append asset 1");
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            ProgInstruction::UpdateAssetLifecycle {
+                action: ASSET_ACTION_ACTIVATE,
+                asset_index: APPEND_ASSET_INDEX,
+                now_slot: 1,
+                initial_price: 100,
+                insurance_authority: admin.pubkey().to_bytes(),
+                insurance_operator: admin.pubkey().to_bytes(),
+                backing_bucket_authority: registry.to_bytes(),
+                oracle_authority: admin.pubkey().to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("append asset 1");
 
-    send(&mut svm, program_id, &payer, vec![(ProgInstruction::CreateLpVault {
-        fee_share_bps: 5_000, redemption_cooldown_slots: cooldown_slots, oi_reservation_threshold_bps: 0, domain: DOMAIN,
-    }, vec![
-        AccountMeta::new(admin.pubkey(), true),
-        // FIND-1 fix: market must be writable — CreateLpVault now writes
-        // backing_bucket_authority = registry PDA into the asset's oracle profile.
-        AccountMeta::new(market, false),
-        AccountMeta::new(registry, false),
-        AccountMeta::new(lp_mint, false),
-        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-    ])], &[&admin]).expect("create lp vault");
+    send(
+        &mut svm,
+        program_id,
+        &payer,
+        vec![(
+            ProgInstruction::CreateLpVault {
+                fee_share_bps: 5_000,
+                redemption_cooldown_slots: cooldown_slots,
+                oi_reservation_threshold_bps: 0,
+                domain: DOMAIN,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                // FIND-1 fix: market must be writable — CreateLpVault now writes
+                // backing_bucket_authority = registry PDA into the asset's oracle profile.
+                AccountMeta::new(market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new(lp_mint, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("create lp vault");
 
-    Env { svm, program_id, payer, admin, market, collateral_mint, vault_token, registry, lp_mint, ledger, escrow, vault_authority }
+    Env {
+        svm,
+        program_id,
+        payer,
+        admin,
+        market,
+        collateral_mint,
+        vault_token,
+        registry,
+        lp_mint,
+        ledger,
+        escrow,
+        vault_authority,
+    }
 }
 
 /// A depositor with a funded source + LP ATA who has deposited `amount`.
@@ -293,7 +427,12 @@ struct Depositor {
     redemption: Pubkey,
 }
 
-fn deposit_accounts(env: &Env, lp_ata: Pubkey, source: Pubkey, depositor: Pubkey) -> Vec<AccountMeta> {
+fn deposit_accounts(
+    env: &Env,
+    lp_ata: Pubkey,
+    source: Pubkey,
+    depositor: Pubkey,
+) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(depositor, true),
         AccountMeta::new(env.market, false),
@@ -316,7 +455,13 @@ fn new_depositor(env: &mut Env, amount: u128) -> Depositor {
     let kp = Keypair::new();
     env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        kp.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
     let dest = Pubkey::new_unique();
@@ -327,9 +472,28 @@ fn new_depositor(env: &mut Env, amount: u128) -> Depositor {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = deposit_accounts(env, lp_ata, source, kp.pubkey());
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount, domain: DOMAIN }, accts)], &[&kp]).expect("deposit");
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::DepositToLpVault {
+                amount,
+                domain: DOMAIN,
+            },
+            accts,
+        )],
+        &[&kp],
+    )
+    .expect("deposit");
     let _ = market;
-    Depositor { kp, source, lp_ata, dest, redemption }
+    Depositor {
+        kp,
+        source,
+        lp_ata,
+        dest,
+        redemption,
+    }
 }
 
 fn request_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
@@ -367,7 +531,9 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
 }
 
 fn tok(svm: &LiteSVM, key: Pubkey) -> u64 {
-    TokenAccount::unpack(&svm.get_account(&key).expect("acct").data).expect("decode").amount
+    TokenAccount::unpack(&svm.get_account(&key).expect("acct").data)
+        .expect("decode")
+        .amount
 }
 
 fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> {
@@ -376,14 +542,29 @@ fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> 
     let kp = d.kp.insecure_clone();
     let accts = request_accounts(env, d);
     // v17 CHANGE: field renamed from lp_amount → shares.
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::RequestRedeemLpShares { shares: lp_amount }, accts)], &[&kp])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::RequestRedeemLpShares { shares: lp_amount },
+            accts,
+        )],
+        &[&kp],
+    )
 }
 
 fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let accts = execute_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)],
+        &[],
+    )
 }
 
 // ── PoC-only additions ──────────────────────────────────────────────────────
@@ -397,16 +578,28 @@ fn resolve_market(env: &mut Env) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ResolveMarket, vec![
-        AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new(env.market, false),
-    ])], &[&admin])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::ResolveMarket,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+        )],
+        &[&admin],
+    )
 }
 
 /// Read the live market mode (modeled on tests/v16_wrapper.rs:
 /// `state::read_market(..).unwrap().1.mode`).
 fn market_mode(env: &Env) -> MarketModeV16 {
-    state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.mode
+    state::read_market(&env.svm.get_account(&env.market).unwrap().data)
+        .unwrap()
+        .1
+        .mode
 }
 
 /// CloseLpVault (tag 80): account list modeled on tests/v16_fork_lp_vault_admin.rs
@@ -417,12 +610,21 @@ fn close_vault(env: &mut Env) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CloseLpVault, vec![
-        AccountMeta::new(admin.pubkey(), true),
-        AccountMeta::new_readonly(env.market, false),
-        AccountMeta::new(env.registry, false),
-        AccountMeta::new_readonly(env.lp_mint, false),
-    ])], &[&admin])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::CloseLpVault,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(env.market, false),
+                AccountMeta::new(env.registry, false),
+                AccountMeta::new_readonly(env.lp_mint, false),
+            ],
+        )],
+        &[&admin],
+    )
 }
 
 fn reg(env: &Env) -> state::LpVaultRegistryV16 {
@@ -433,12 +635,12 @@ fn reg(env: &Env) -> state::LpVaultRegistryV16 {
 /// [redeemer(signer,writable), registry, redemption, lp_mint, redeemer_lp_ata, escrow, token].
 fn cancel_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
     vec![
-        AccountMeta::new(d.kp.pubkey(), true),           // 0 redeemer (signer, rent dest)
-        AccountMeta::new(env.registry, false),           // 1 registry
-        AccountMeta::new(d.redemption, false),           // 2 redemption PDA (consumed)
-        AccountMeta::new(env.lp_mint, false),            // 3 lp mint
-        AccountMeta::new(d.lp_ata, false),               // 4 redeemer LP ATA (dest)
-        AccountMeta::new(env.escrow, false),             // 5 escrow (source)
+        AccountMeta::new(d.kp.pubkey(), true), // 0 redeemer (signer, rent dest)
+        AccountMeta::new(env.registry, false), // 1 registry
+        AccountMeta::new(d.redemption, false), // 2 redemption PDA (consumed)
+        AccountMeta::new(env.lp_mint, false),  // 3 lp mint
+        AccountMeta::new(d.lp_ata, false),     // 4 redeemer LP ATA (dest)
+        AccountMeta::new(env.escrow, false),   // 5 escrow (source)
         AccountMeta::new_readonly(spl_token::ID, false), // 6 token program
     ]
 }
@@ -448,7 +650,13 @@ fn cancel(env: &mut Env, d: &Depositor) -> Result<(), String> {
     let payer = env.payer.insecure_clone();
     let kp = d.kp.insecure_clone();
     let accts = cancel_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CancelRedemption, accts)], &[&kp])
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::CancelRedemption, accts)],
+        &[&kp],
+    )
 }
 
 /// HEADLINE PoC — an in-flight redemption is permanently stranded when the market
@@ -469,29 +677,63 @@ fn redemption_executes_in_terminal_flat_resolved() {
     // BUG-2 / N7: genesis deposit mints MINTED (DEPOSIT - LP_VAULT_MINIMUM_LIQUIDITY)
     // to the depositor; registry.total_lp_shares_outstanding still counts the FULL
     // DEPOSIT (the dead-share floor is permanently unminted, not un-tracked).
-    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "depositor holds LP shares pre-request");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT, "shares outstanding after deposit");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        MINTED as u64,
+        "depositor holds LP shares pre-request"
+    );
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        DEPOSIT,
+        "shares outstanding after deposit"
+    );
 
     // ── 2. RequestRedeemLpShares: shares escrowed, total_outstanding UNCHANGED. ──
     request(&mut env, &d, MINTED).expect("request");
     // (a) redeemer's LP ATA drained to 0 — they no longer hold the shares.
-    assert_eq!(tok(&env.svm, d.lp_ata), 0, "PROOF(2a): redeemer LP ATA drained — shares escrowed out");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        0,
+        "PROOF(2a): redeemer LP ATA drained — shares escrowed out"
+    );
     // (b) escrow now holds exactly the escrowed shares.
-    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "PROOF(2b): escrow holds the redeemer's shares");
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        MINTED as u64,
+        "PROOF(2b): escrow holds the redeemer's shares"
+    );
     // (c) the LpRedemption request PDA exists.
     let pending = state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data)
         .expect("PROOF(2c): LpRedemption PDA written — request is pending");
-    assert_eq!(pending.shares, MINTED, "pending request records the escrowed share count");
-    assert_eq!(pending.redeemer, d.kp.pubkey().to_bytes(), "pending request bound to the redeemer");
+    assert_eq!(
+        pending.shares, MINTED,
+        "pending request records the escrowed share count"
+    );
+    assert_eq!(
+        pending.redeemer,
+        d.kp.pubkey().to_bytes(),
+        "pending request bound to the redeemer"
+    );
     // (d) total_lp_shares_outstanding UNCHANGED by the request (shares escrowed, not burned).
-    assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT,
-        "PROOF(2d): total_lp_shares_outstanding UNCHANGED by request");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        DEPOSIT,
+        "PROOF(2d): total_lp_shares_outstanding UNCHANGED by request"
+    );
 
     // ── 3. Move the market OUT of Live (admin ResolveMarket). ──
     env.svm.expire_blockhash();
     resolve_market(&mut env).expect("resolve market");
-    assert_ne!(market_mode(&env), MarketModeV16::Live, "PROOF(3): market is no longer Live");
-    assert_eq!(market_mode(&env), MarketModeV16::Resolved, "market resolved");
+    assert_ne!(
+        market_mode(&env),
+        MarketModeV16::Live,
+        "PROOF(3): market is no longer Live"
+    );
+    assert_eq!(
+        market_mode(&env),
+        MarketModeV16::Resolved,
+        "market resolved"
+    );
 
     // ── 4. ExecuteRedemption now SUCCEEDS in the terminal-flat Resolved state. ──
     // #377/#378: an LP holding shares at resolution must be able to redeem its
@@ -505,20 +747,31 @@ fn redemption_executes_in_terminal_flat_resolved() {
 
     // ── 5. The redeemer is made whole and the vault can wind down. ──
     // (a) The redeemer received pro-rata collateral.
-    assert!(tok(&env.svm, d.dest) > 0,
-        "PROOF(5a): redeemer received pro-rata collateral on execute");
+    assert!(
+        tok(&env.svm, d.dest) > 0,
+        "PROOF(5a): redeemer received pro-rata collateral on execute"
+    );
     // (b) The escrow was drained — the escrowed shares were consumed.
-    assert_eq!(tok(&env.svm, env.escrow), 0, "PROOF(5b): escrow drained on execute");
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        0,
+        "PROOF(5b): escrow drained on execute"
+    );
     // (c) total_lp_shares_outstanding burned back down to the LP_VAULT_MINIMUM_LIQUIDITY
     // dead-share floor (this was the sole real depositor; BUG-2 / N7: the floor
     // was counted at genesis but never minted to anyone, so it can never burn
     // below that — see handle_close_lp_vault's matching `> LP_VAULT_MINIMUM_LIQUIDITY`
     // gate below).
-    assert_eq!(reg(&env).total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
-        "PROOF(5c): shares burned on execute — outstanding == dead-share floor");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        LP_VAULT_MINIMUM_LIQUIDITY,
+        "PROOF(5c): shares burned on execute — outstanding == dead-share floor"
+    );
     // (d) The pending request PDA is consumed by execute.
-    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
-        "PROOF(5d): LpRedemption PDA consumed by execute");
+    assert!(
+        state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
+        "PROOF(5d): LpRedemption PDA consumed by execute"
+    );
     // (e) CloseLpVault can now run — outstanding is at (not above) the dead-share
     //     floor and the stub-credit teardown (#359/#381) leaves no un-owned
     //     residual, so the vault winds down cleanly instead of being stuck forever.
@@ -541,8 +794,16 @@ fn control_redemption_executes_while_market_stays_live() {
 
     request(&mut env, &d, MINTED).expect("request");
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares escrowed");
-    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "escrow holds shares");
-    assert_eq!(market_mode(&env), MarketModeV16::Live, "market still Live (no resolve)");
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        MINTED as u64,
+        "escrow holds shares"
+    );
+    assert_eq!(
+        market_mode(&env),
+        MarketModeV16::Live,
+        "market still Live (no resolve)"
+    );
 
     env.svm.expire_blockhash();
     execute(&mut env, &d).expect("execute succeeds while Live");
@@ -550,12 +811,21 @@ fn control_redemption_executes_while_market_stays_live() {
     // Redeemer paid 1:1 (no earnings) for the shares they actually held (MINTED,
     // not DEPOSIT — BUG-2 / N7 dead-share floor); escrow burned to 0; outstanding
     // -> the dead-share floor, not 0.
-    assert_eq!(tok(&env.svm, d.dest), MINTED as u64, "redeemer paid pro-rata");
+    assert_eq!(
+        tok(&env.svm, d.dest),
+        MINTED as u64,
+        "redeemer paid pro-rata"
+    );
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow burned to zero");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, LP_VAULT_MINIMUM_LIQUIDITY,
-        "outstanding back to the dead-share floor");
-    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
-        "redemption PDA consumed on successful execute");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        LP_VAULT_MINIMUM_LIQUIDITY,
+        "outstanding back to the dead-share floor"
+    );
+    assert!(
+        state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
+        "redemption PDA consumed on successful execute"
+    );
 }
 
 // ── Regression tests for the CancelRedemption fix (tag 81) ───────────────────
@@ -570,7 +840,11 @@ fn cancel_recovers_stranded_redemption() {
     let d = new_depositor(&mut env, DEPOSIT);
     request(&mut env, &d, MINTED).expect("request");
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares escrowed");
-    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "escrow holds shares");
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        MINTED as u64,
+        "escrow holds shares"
+    );
 
     // Resolve the market. (Post-#377/#378, ExecuteRedemption would now SUCCEED here
     // in the terminal-flat state — that path is covered by the headline test. This
@@ -582,12 +856,21 @@ fn cancel_recovers_stranded_redemption() {
     // CancelRedemption recovers the shares regardless of market mode.
     env.svm.expire_blockhash();
     cancel(&mut env, &d).expect("cancel must succeed when not Live");
-    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "exact shares returned to redeemer");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        MINTED as u64,
+        "exact shares returned to redeemer"
+    );
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow drained");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT,
-        "total_lp_shares_outstanding UNCHANGED by cancel");
-    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
-        "redemption PDA consumed by cancel");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        DEPOSIT,
+        "total_lp_shares_outstanding UNCHANGED by cancel"
+    );
+    assert!(
+        state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
+        "redemption PDA consumed by cancel"
+    );
 }
 
 /// A second cancel is rejected — the consumed redemption PDA prevents double-return.
@@ -597,11 +880,18 @@ fn cancel_twice_second_rejects() {
     let d = new_depositor(&mut env, DEPOSIT);
     request(&mut env, &d, MINTED).expect("request");
     cancel(&mut env, &d).expect("first cancel");
-    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "first cancel returned the shares");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        MINTED as u64,
+        "first cancel returned the shares"
+    );
 
     env.svm.expire_blockhash();
     let res = cancel(&mut env, &d);
-    assert!(res.is_err(), "second cancel MUST reject (redemption PDA already consumed): {res:?}");
+    assert!(
+        res.is_err(),
+        "second cancel MUST reject (redemption PDA already consumed): {res:?}"
+    );
     assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "no double-return");
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow stays drained");
 }
@@ -616,9 +906,17 @@ fn cancel_while_live_succeeds() {
     assert_eq!(market_mode(&env), MarketModeV16::Live, "market Live");
 
     cancel(&mut env, &d).expect("cancel while Live must succeed");
-    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "shares returned to redeemer while Live");
+    assert_eq!(
+        tok(&env.svm, d.lp_ata),
+        MINTED as u64,
+        "shares returned to redeemer while Live"
+    );
     assert_eq!(tok(&env.svm, env.escrow), 0, "escrow drained");
-    assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT, "outstanding unchanged");
+    assert_eq!(
+        reg(&env).total_lp_shares_outstanding,
+        DEPOSIT,
+        "outstanding unchanged"
+    );
 }
 
 /// Only the recorded redeemer can cancel — a different signer is rejected and the
@@ -635,7 +933,20 @@ fn cancel_wrong_signer_rejected() {
     accts[0] = AccountMeta::new(attacker.pubkey(), true); // attacker signs, victim's redemption PDA
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
-    let res = send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CancelRedemption, accts)], &[&attacker]);
-    assert!(res.is_err(), "a non-redeemer signer must not be able to cancel: {res:?}");
-    assert_eq!(tok(&env.svm, env.escrow), MINTED as u64, "escrow untouched by the rejected cancel");
+    let res = send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::CancelRedemption, accts)],
+        &[&attacker],
+    );
+    assert!(
+        res.is_err(),
+        "a non-redeemer signer must not be able to cancel: {res:?}"
+    );
+    assert_eq!(
+        tok(&env.svm, env.escrow),
+        MINTED as u64,
+        "escrow untouched by the rejected cancel"
+    );
 }

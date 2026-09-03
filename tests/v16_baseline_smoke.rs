@@ -115,7 +115,10 @@ fn smoke_engine_a9_fee_policy_update_struct_is_visible() {
 fn smoke_engine_a6_stress_envelope_trigger_is_conservative() {
     // 1e20 — chosen so existing baseline tests do not trip the gate on a
     // single price move. See A-6 design doc rationale.
-    assert_eq!(STRESS_ENVELOPE_TRIGGER_BPS_E9, 100_000_000_000_000_000_000u128);
+    assert_eq!(
+        STRESS_ENVELOPE_TRIGGER_BPS_E9,
+        100_000_000_000_000_000_000u128
+    );
 }
 
 /// Smoke 5 (A-10): the `MAX_MARGIN_BPS` constant that A-10 uses as the

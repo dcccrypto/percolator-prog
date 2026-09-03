@@ -66,8 +66,8 @@ use percolator::{
 };
 use percolator_prog::{
     constants::{
-        HEADER_LEN, KIND_NFT_REGISTRY, MAGIC, NFT_MINT_AUTHORITY_SEED,
-        NFT_REGISTRY_VERSION, TAG_SET_NFT_PROGRAM_ID, TAG_TRANSFER_PORTFOLIO_OWNERSHIP, VERSION,
+        HEADER_LEN, KIND_NFT_REGISTRY, MAGIC, NFT_MINT_AUTHORITY_SEED, NFT_REGISTRY_VERSION,
+        TAG_SET_NFT_PROGRAM_ID, TAG_TRANSFER_PORTFOLIO_OWNERSHIP, VERSION,
     },
     ix::Instruction as ProgInstruction,
     state::{
@@ -81,7 +81,11 @@ use solana_program::pubkey::Pubkey;
 
 /// Build a minimal valid `PortfolioAccountV16Account` POD with one active leg
 /// at `asset_index = 0`, owned by `owner`.
-fn make_portfolio(owner: [u8; 32], market_group: [u8; 32], key: [u8; 32]) -> PortfolioAccountV16Account {
+fn make_portfolio(
+    owner: [u8; 32],
+    market_group: [u8; 32],
+    key: [u8; 32],
+) -> PortfolioAccountV16Account {
     let mut p = PortfolioAccountV16Account::default();
     // Provenance header: V16_LAYOUT_DISCRIMINATOR = 16, V16_ACCOUNT_VERSION = 1.
     p.provenance_header = ProvenanceHeaderV16Account {
@@ -190,7 +194,10 @@ fn nft_registry_zero_program_id_rejects() {
     data[8..10].copy_from_slice(&VERSION.to_le_bytes());
     data[10] = KIND_NFT_REGISTRY;
     data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(&reg));
-    assert!(read_nft_registry(&data).is_err(), "zero nft_program_id must be rejected");
+    assert!(
+        read_nft_registry(&data).is_err(),
+        "zero nft_program_id must be rejected"
+    );
 }
 
 #[test]
@@ -205,7 +212,10 @@ fn nft_registry_wrong_version_rejects() {
     data[8..10].copy_from_slice(&VERSION.to_le_bytes());
     data[10] = KIND_NFT_REGISTRY;
     data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(&reg));
-    assert!(read_nft_registry(&data).is_err(), "wrong version must be rejected");
+    assert!(
+        read_nft_registry(&data).is_err(),
+        "wrong version must be rejected"
+    );
 }
 
 #[test]
@@ -220,7 +230,10 @@ fn nft_registry_nonzero_padding_rejects() {
     data[8..10].copy_from_slice(&VERSION.to_le_bytes());
     data[10] = KIND_NFT_REGISTRY;
     data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(&reg));
-    assert!(read_nft_registry(&data).is_err(), "dirty padding must be rejected");
+    assert!(
+        read_nft_registry(&data).is_err(),
+        "dirty padding must be rejected"
+    );
 }
 
 // ── PDA derivation tests ──────────────────────────────────────────────────────
@@ -260,7 +273,10 @@ fn nft_mint_authority_pda_distinct_per_program() {
     let p2 = Pubkey::new_unique();
     let (a, _) = derive_nft_mint_authority(&p1);
     let (b, _) = derive_nft_mint_authority(&p2);
-    assert_ne!(a, b, "different nft programs must give different mint-auth PDAs");
+    assert_ne!(
+        a, b,
+        "different nft programs must give different mint-auth PDAs"
+    );
 }
 
 /// SEED-CONTRACT GUARD: the wrapper's `derive_nft_mint_authority(pid)` must
@@ -290,7 +306,10 @@ fn nft_tags_are_correct() {
 fn transfer_ownership_encode_decode_roundtrip() {
     let new_owner = [0xABu8; 32];
     let asset_index = 7u16;
-    let ix = ProgInstruction::TransferPortfolioOwnership { new_owner, asset_index };
+    let ix = ProgInstruction::TransferPortfolioOwnership {
+        new_owner,
+        asset_index,
+    };
     let encoded = ix.encode();
     assert_eq!(encoded[0], 72);
     assert_eq!(&encoded[1..33], &new_owner);
@@ -334,8 +353,7 @@ fn b3_happy_dual_write() {
         "provenance_header.owner must be updated"
     );
     assert_eq!(
-        p.owner,
-        p.provenance_header.owner,
+        p.owner, p.provenance_header.owner,
         "dual-write invariant: both fields must be equal"
     );
 
@@ -425,7 +443,10 @@ fn b3_rejects_resolved_payout() {
     let mut p = make_portfolio(old_owner, [3u8; 32], [4u8; 32]);
     p.resolved_payout_receipt.present = 1;
     let result = b3_check_and_rewrite_owner(&mut p, [2u8; 32], 0);
-    assert!(result.is_err(), "resolved_payout_receipt.present must block transfer");
+    assert!(
+        result.is_err(),
+        "resolved_payout_receipt.present must block transfer"
+    );
     assert_eq!(p.owner, old_owner);
 }
 
@@ -449,7 +470,10 @@ fn b3_rejects_mid_close_different_asset() {
     p.close_progress.active = 1;
     p.close_progress.asset_index = V16PodU32::new(99); // different asset
     let result = b3_check_and_rewrite_owner(&mut p, new_owner, 0);
-    assert!(result.is_ok(), "close on different asset must not block transfer");
+    assert!(
+        result.is_ok(),
+        "close on different asset must not block transfer"
+    );
     assert_eq!(p.owner, new_owner);
 }
 
@@ -497,7 +521,10 @@ fn unwrap_happy_dual_write_and_conservation() {
     unwrap_check_and_rewrite_owner(&mut p, holder, ESCROW_PDA)
         .expect("release of an escrowed portfolio must succeed");
 
-    assert_eq!(p.owner, holder, "top-level owner must be released to holder");
+    assert_eq!(
+        p.owner, holder,
+        "top-level owner must be released to holder"
+    );
     assert_eq!(p.provenance_header.owner, holder, "provenance owner too");
     assert_eq!(p.owner, p.provenance_header.owner, "dual-write invariant");
 
@@ -510,7 +537,11 @@ fn unwrap_happy_dual_write_and_conservation() {
         let in_prov = i >= prov_owner_off && i < prov_owner_off + 32;
         let in_top = i >= top_owner_off && i < top_owner_off + 32;
         if !in_prov && !in_top {
-            assert_eq!(b, a, "conservation: byte {} changed outside owner fields", i);
+            assert_eq!(
+                b, a,
+                "conservation: byte {} changed outside owner fields",
+                i
+            );
         }
     }
 }
@@ -541,7 +572,7 @@ fn unwrap_succeeds_with_no_active_leg() {
     let holder = [2u8; 32];
     let mut p = make_portfolio(ESCROW_PDA, [3u8; 32], [4u8; 32]);
     p.legs[0].active = 0; // position closed
-    // Sanity: B-3 would block this exact state...
+                          // Sanity: B-3 would block this exact state...
     assert!(
         b3_check_and_rewrite_owner(&mut p, holder, 0).is_err(),
         "precondition: B-3 blocks a closed position"
@@ -621,7 +652,10 @@ mod litesvm_tests {
     use super::*;
     use litesvm::LiteSVM;
     use percolator_prog::{
-        constants::{HEADER_LEN as PROG_HEADER_LEN, KIND_PORTFOLIO, MAGIC as PROG_MAGIC, VERSION as PROG_VERSION},
+        constants::{
+            HEADER_LEN as PROG_HEADER_LEN, KIND_PORTFOLIO, MAGIC as PROG_MAGIC,
+            VERSION as PROG_VERSION,
+        },
         state::{self, derive_nft_registry},
     };
     use solana_sdk::{
@@ -640,7 +674,10 @@ mod litesvm_tests {
     fn program_path() -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("target/deploy/percolator_prog.so");
-        assert!(p.exists(), "wrapper BPF missing — run `cargo build-sbf` first");
+        assert!(
+            p.exists(),
+            "wrapper BPF missing — run `cargo build-sbf` first"
+        );
         p
     }
 
@@ -652,7 +689,11 @@ mod litesvm_tests {
         accounts: Vec<AccountMeta>,
         extra: &[&Keypair],
     ) -> Result<(), String> {
-        let instruction = Instruction { program_id: pid, accounts, data };
+        let instruction = Instruction {
+            program_id: pid,
+            accounts,
+            data,
+        };
         let mut signers = vec![payer];
         signers.extend_from_slice(extra);
         let tx = Transaction::new_signed_with_payer(
@@ -665,7 +706,9 @@ mod litesvm_tests {
             &signers,
             svm.latest_blockhash(),
         );
-        svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+        svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
     }
 
     fn init_market_ix() -> ProgInstruction {
@@ -776,7 +819,13 @@ mod litesvm_tests {
         )
         .expect("init market");
 
-        Env { svm, program_id, payer, admin, market }
+        Env {
+            svm,
+            program_id,
+            payer,
+            admin,
+            market,
+        }
     }
 
     // ── SetNftProgramId (tag 73) ──────────────────────────────────────────────
@@ -784,7 +833,13 @@ mod litesvm_tests {
     #[test]
     fn set_nft_program_id_create() {
         let env = setup();
-        let Env { mut svm, program_id, payer, admin, market } = env;
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin,
+            market,
+        } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
         let nft_prog = [0xABu8; 32];
 
@@ -792,7 +847,10 @@ mod litesvm_tests {
             &mut svm,
             program_id,
             &payer,
-            ProgInstruction::SetNftProgramId { nft_program_id: nft_prog }.encode(),
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: nft_prog,
+            }
+            .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new_readonly(market, false),
@@ -801,7 +859,11 @@ mod litesvm_tests {
             ],
             &[&admin],
         );
-        assert!(result.is_ok(), "SetNftProgramId create must succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "SetNftProgramId create must succeed: {:?}",
+            result
+        );
 
         // Verify the registry was written.
         let reg_data = svm.get_account(&registry).expect("registry account").data;
@@ -814,7 +876,13 @@ mod litesvm_tests {
     #[test]
     fn set_nft_program_id_reject_update_set_once() {
         let env = setup();
-        let Env { mut svm, program_id, payer, admin, market } = env;
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin,
+            market,
+        } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
         let nft_prog_v1 = [0x11u8; 32];
         let nft_prog_v2 = [0x22u8; 32];
@@ -824,7 +892,10 @@ mod litesvm_tests {
             &mut svm,
             program_id,
             &payer,
-            ProgInstruction::SetNftProgramId { nft_program_id: nft_prog_v1 }.encode(),
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: nft_prog_v1,
+            }
+            .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new_readonly(market, false),
@@ -841,7 +912,10 @@ mod litesvm_tests {
             &mut svm,
             program_id,
             &payer,
-            ProgInstruction::SetNftProgramId { nft_program_id: nft_prog_v2 }.encode(),
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: nft_prog_v2,
+            }
+            .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new_readonly(market, false),
@@ -867,7 +941,13 @@ mod litesvm_tests {
     #[test]
     fn set_nft_program_id_non_admin_rejects() {
         let env = setup();
-        let Env { mut svm, program_id, payer, admin: _, market } = env;
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin: _,
+            market,
+        } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
         let impostor = Keypair::new();
         svm.airdrop(&impostor.pubkey(), 100_000_000_000).unwrap();
@@ -876,7 +956,10 @@ mod litesvm_tests {
             &mut svm,
             program_id,
             &payer,
-            ProgInstruction::SetNftProgramId { nft_program_id: [0x55u8; 32] }.encode(),
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: [0x55u8; 32],
+            }
+            .encode(),
             vec![
                 AccountMeta::new(impostor.pubkey(), true),
                 AccountMeta::new_readonly(market, false),
@@ -891,14 +974,23 @@ mod litesvm_tests {
     #[test]
     fn set_nft_program_id_zero_program_id_rejects() {
         let env = setup();
-        let Env { mut svm, program_id, payer, admin, market } = env;
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin,
+            market,
+        } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
 
         let result = send(
             &mut svm,
             program_id,
             &payer,
-            ProgInstruction::SetNftProgramId { nft_program_id: [0u8; 32] }.encode(),
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: [0u8; 32],
+            }
+            .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new_readonly(market, false),
@@ -944,8 +1036,7 @@ mod litesvm_tests {
         data[0..8].copy_from_slice(&PROG_MAGIC.to_le_bytes());
         data[8..10].copy_from_slice(&PROG_VERSION.to_le_bytes());
         data[10] = KIND_PORTFOLIO;
-        data[PROG_HEADER_LEN..PROG_HEADER_LEN + pod_len]
-            .copy_from_slice(bytemuck::bytes_of(&p));
+        data[PROG_HEADER_LEN..PROG_HEADER_LEN + pod_len].copy_from_slice(bytemuck::bytes_of(&p));
 
         svm.set_account(
             portfolio_key,
@@ -969,7 +1060,13 @@ mod litesvm_tests {
     #[test]
     fn b3_wrong_signer_rejects() {
         let env = setup();
-        let Env { mut svm, program_id, payer, admin, market } = env;
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin,
+            market,
+        } = env;
 
         // Create the NFT registry.
         let (registry, _) = derive_nft_registry(&program_id, &market);
@@ -978,7 +1075,10 @@ mod litesvm_tests {
             &mut svm,
             program_id,
             &payer,
-            ProgInstruction::SetNftProgramId { nft_program_id: nft_prog }.encode(),
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: nft_prog,
+            }
+            .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new_readonly(market, false),
@@ -992,7 +1092,13 @@ mod litesvm_tests {
         // Create a portfolio.
         let portfolio_key = Pubkey::new_unique();
         let owner = [0x01u8; 32];
-        make_onchain_portfolio(&mut svm, program_id, portfolio_key, owner, market.to_bytes());
+        make_onchain_portfolio(
+            &mut svm,
+            program_id,
+            portfolio_key,
+            owner,
+            market.to_bytes(),
+        );
 
         // Use a random keypair as the "mint_authority" signer — it will NOT equal
         // the derived PDA for the registered nft_program_id.
@@ -1035,7 +1141,13 @@ mod litesvm_tests {
     #[test]
     fn b3_fail_closed_uninitialized_registry() {
         let env = setup();
-        let Env { mut svm, program_id, payer, admin: _, market } = env;
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin: _,
+            market,
+        } = env;
 
         // Derive registry address but do NOT initialize it.
         let (registry, _) = derive_nft_registry(&program_id, &market);
@@ -1043,7 +1155,13 @@ mod litesvm_tests {
         // Create a portfolio.
         let portfolio_key = Pubkey::new_unique();
         let owner = [0x01u8; 32];
-        make_onchain_portfolio(&mut svm, program_id, portfolio_key, owner, market.to_bytes());
+        make_onchain_portfolio(
+            &mut svm,
+            program_id,
+            portfolio_key,
+            owner,
+            market.to_bytes(),
+        );
 
         // Fund the registry address with a system account (no program data).
         svm.set_account(
@@ -1105,20 +1223,50 @@ fn accept() -> bool {
 
 #[test]
 fn e2_auth_accepts_valid_holder() {
-    assert!(accept(), "valid bound-NFT holder of an escrowed position must authorize");
+    assert!(
+        accept(),
+        "valid bound-NFT holder of an escrowed position must authorize"
+    );
 }
 
 #[test]
 fn e2_auth_each_gate_is_load_bearing() {
     // Flip exactly one gate from the accepting baseline → must reject. Proves every
     // conjunct matters (not a constant-true predicate ignoring some check).
-    assert!(!nft_holder_auth_decision(A, X, true, PK, PK, true, MT, MT, SG, SG, 1, true), "not escrowed");
-    assert!(!nft_holder_auth_decision(A, A, false, PK, PK, true, MT, MT, SG, SG, 1, true), "fake PDA owner");
-    assert!(!nft_holder_auth_decision(A, A, true, X, PK, true, MT, MT, SG, SG, 1, true), "PDA binds other portfolio");
-    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, false, MT, MT, SG, SG, 1, true), "non-canonical PDA");
-    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, X, SG, SG, 1, true), "wrong mint");
-    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, X, 1, true), "ATA not owned by signer");
-    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 0, true), "amount 0");
-    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 2, true), "amount 2 (fungible)");
-    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 1, false), "uninitialized ATA");
+    assert!(
+        !nft_holder_auth_decision(A, X, true, PK, PK, true, MT, MT, SG, SG, 1, true),
+        "not escrowed"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, false, PK, PK, true, MT, MT, SG, SG, 1, true),
+        "fake PDA owner"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, X, PK, true, MT, MT, SG, SG, 1, true),
+        "PDA binds other portfolio"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, false, MT, MT, SG, SG, 1, true),
+        "non-canonical PDA"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, X, SG, SG, 1, true),
+        "wrong mint"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, X, 1, true),
+        "ATA not owned by signer"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 0, true),
+        "amount 0"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 2, true),
+        "amount 2 (fungible)"
+    );
+    assert!(
+        !nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 1, false),
+        "uninitialized ATA"
+    );
 }

@@ -222,7 +222,9 @@ pub fn assert_custom(res: Result<(), TransactionError>, code: u32, label: &str) 
                 "{label}: expected operative Custom({code}), got Custom({c})"
             );
         }
-        Err(other) => panic!("{label}: expected operative Custom({code}), got non-Custom {other:?}"),
+        Err(other) => {
+            panic!("{label}: expected operative Custom({code}), got non-Custom {other:?}")
+        }
         Ok(()) => panic!("{label}: expected operative Custom({code}), but the tx SUCCEEDED"),
     }
 }
@@ -254,7 +256,9 @@ pub fn assert_instruction_error(
                 "{label}: expected program InstructionError {expected:?}, got {got:?}"
             );
         }
-        Err(other) => panic!("{label}: expected a program InstructionError, got tx-level {other:?}"),
+        Err(other) => {
+            panic!("{label}: expected a program InstructionError, got tx-level {other:?}")
+        }
         Ok(()) => panic!("{label}: expected a program InstructionError, but the tx SUCCEEDED"),
     }
 }

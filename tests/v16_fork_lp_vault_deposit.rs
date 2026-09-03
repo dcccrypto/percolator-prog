@@ -52,7 +52,10 @@ const DEPOSIT: u128 = 1_000_000;
 fn program_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
-    assert!(p.exists(), "wrapper BPF missing — cargo build-sbf --no-default-features");
+    assert!(
+        p.exists(),
+        "wrapper BPF missing — cargo build-sbf --no-default-features"
+    );
     p
 }
 
@@ -65,7 +68,10 @@ fn spl_token_program_path() -> PathBuf {
             h
         });
     for reg in std::fs::read_dir(cargo_home.join("registry/src")).expect("registry/src") {
-        let cand = reg.expect("entry").path().join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
+        let cand = reg
+            .expect("entry")
+            .path()
+            .join("litesvm-0.1.0/src/spl/programs/spl_token-3.5.0.so");
         if cand.exists() {
             return cand;
         }
@@ -140,7 +146,11 @@ fn send(
     accounts: Vec<AccountMeta>,
     extra: &[&Keypair],
 ) -> Result<(), String> {
-    let instruction = Instruction { program_id, accounts, data: ix.encode() };
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: ix.encode(),
+    };
     let mut signers = vec![payer];
     signers.extend_from_slice(extra);
     let tx = Transaction::new_signed_with_payer(
@@ -153,7 +163,9 @@ fn send(
         &signers,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 fn init_market_ix() -> ProgInstruction {
@@ -204,8 +216,14 @@ fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstructio
 fn setup() -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
-    svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
-    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("token BPF"));
+    svm.add_program(
+        program_id,
+        &std::fs::read(program_path()).expect("wrapper BPF"),
+    );
+    svm.add_program(
+        spl_token::ID,
+        &std::fs::read(spl_token_program_path()).expect("token BPF"),
+    );
 
     let payer = Keypair::new();
     let admin = Keypair::new();
@@ -228,7 +246,11 @@ fn setup() -> Env {
         market,
         Account {
             lamports: 1_000_000_000,
-            data: vec![0u8; state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize).unwrap()],
+            data: vec![
+                0u8;
+                state::market_account_len_for_capacity(MAX_PORTFOLIO_ASSETS as usize)
+                    .unwrap()
+            ],
             owner: program_id,
             executable: false,
             rent_epoch: 0,
@@ -254,7 +276,15 @@ fn setup() -> Env {
     let vault_token = canonical_vault_ata(&vault_authority, &collateral_mint);
     set_token(&mut svm, vault_token, collateral_mint, vault_authority, 0);
 
-    Env { svm, program_id, payer, admin, market, collateral_mint, vault_token }
+    Env {
+        svm,
+        program_id,
+        payer,
+        admin,
+        market,
+        collateral_mint,
+        vault_token,
+    }
 }
 
 fn create_lp_vault(env: &mut Env, registry: Pubkey, mint: Pubkey) {
@@ -339,9 +369,17 @@ fn ready_vault(env: &mut Env) -> (Pubkey, Pubkey, Pubkey, Keypair, Pubkey, Pubke
     create_lp_vault(env, registry, mint);
 
     let depositor = Keypair::new();
-    env.svm.airdrop(&depositor.pubkey(), 100_000_000_000).unwrap();
+    env.svm
+        .airdrop(&depositor.pubkey(), 100_000_000_000)
+        .unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, depositor.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        depositor.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, mint, depositor.pubkey(), 0);
     (registry, mint, ledger, depositor, lp_ata, source)
@@ -349,7 +387,9 @@ fn ready_vault(env: &mut Env) -> (Pubkey, Pubkey, Pubkey, Keypair, Pubkey, Pubke
 
 fn token_amount(svm: &LiteSVM, key: Pubkey) -> u64 {
     let acct = svm.get_account(&key).expect("token account");
-    TokenAccount::unpack(&acct.data).expect("token decode").amount
+    TokenAccount::unpack(&acct.data)
+        .expect("token decode")
+        .amount
 }
 
 /// FIND-1 regression test: DepositToLpVault must succeed immediately after
@@ -395,9 +435,17 @@ fn create_lp_vault_then_deposit_immediately_no_authority_step() {
     }
 
     let depositor = Keypair::new();
-    env.svm.airdrop(&depositor.pubkey(), 100_000_000_000).unwrap();
+    env.svm
+        .airdrop(&depositor.pubkey(), 100_000_000_000)
+        .unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, depositor.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        depositor.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, mint, depositor.pubkey(), 0);
 
@@ -406,14 +454,33 @@ fn create_lp_vault_then_deposit_immediately_no_authority_step() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     )
     .expect("deposit must succeed immediately after CreateLpVault, no separate authority step");
 
-    assert!(token_amount(&env.svm, lp_ata) > 0, "depositor received LP shares");
-    assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64, "vault received collateral");
+    assert!(
+        token_amount(&env.svm, lp_ata) > 0,
+        "depositor received LP shares"
+    );
+    assert_eq!(
+        token_amount(&env.svm, env.vault_token),
+        DEPOSIT as u64,
+        "vault received collateral"
+    );
 }
 
 #[test]
@@ -430,8 +497,20 @@ fn deposit_happy_first_mints_amount_minus_dead_shares() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     )
     .expect("deposit");
@@ -447,8 +526,16 @@ fn deposit_happy_first_mints_amount_minus_dead_shares() {
     );
     // Collateral moved into the vault (full amount — the dead-share floor is a
     // share-accounting concept only, it doesn't reduce the collateral taken).
-    assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64, "vault received collateral");
-    assert_eq!(token_amount(&env.svm, source), 10_000_000 - DEPOSIT as u64, "source debited");
+    assert_eq!(
+        token_amount(&env.svm, env.vault_token),
+        DEPOSIT as u64,
+        "vault received collateral"
+    );
+    assert_eq!(
+        token_amount(&env.svm, source),
+        10_000_000 - DEPOSIT as u64,
+        "source debited"
+    );
 
     // Registry outstanding-shares counts the FULL amount (dead shares included) —
     // the mint's on-chain supply (expected_minted) is now permanently LESS than
@@ -468,7 +555,8 @@ fn deposit_happy_first_mints_amount_minus_dead_shares() {
 
     // Backing ledger recorded the FULL principal — the dead-share lock affects
     // share accounting only, never the collateral/backing side.
-    let led = state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    let led =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
     assert_eq!(led.total_principal_atoms, DEPOSIT);
     assert_eq!(led.total_deposited_atoms, DEPOSIT);
 }
@@ -494,40 +582,97 @@ fn deposit_genesis_at_or_below_minimum_liquidity_is_rejected() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: MINIMUM_LIQUIDITY,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     );
-    assert!(res_exact.is_err(), "genesis deposit == MINIMUM_LIQUIDITY must be rejected: {res_exact:?}");
+    assert!(
+        res_exact.is_err(),
+        "genesis deposit == MINIMUM_LIQUIDITY must be rejected: {res_exact:?}"
+    );
 
     // Below the floor: checked_sub underflows — must also be rejected, not panic.
     let res_below = send(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY - 1, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: MINIMUM_LIQUIDITY - 1,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     );
-    assert!(res_below.is_err(), "genesis deposit < MINIMUM_LIQUIDITY must be rejected: {res_below:?}");
+    assert!(
+        res_below.is_err(),
+        "genesis deposit < MINIMUM_LIQUIDITY must be rejected: {res_below:?}"
+    );
 
     // No shares minted, no collateral taken, no dust left behind by the reject.
-    assert_eq!(token_amount(&env.svm, lp_ata), 0, "rejected deposit mints nothing");
-    assert_eq!(token_amount(&env.svm, source), 10_000_000, "rejected deposit takes no collateral");
+    assert_eq!(
+        token_amount(&env.svm, lp_ata),
+        0,
+        "rejected deposit mints nothing"
+    );
+    assert_eq!(
+        token_amount(&env.svm, source),
+        10_000_000,
+        "rejected deposit takes no collateral"
+    );
     let reg = state::read_lp_vault_registry(&env.svm.get_account(&registry).unwrap().data).unwrap();
-    assert_eq!(reg.total_lp_shares_outstanding, 0, "registry untouched by a rejected genesis deposit");
+    assert_eq!(
+        reg.total_lp_shares_outstanding, 0,
+        "registry untouched by a rejected genesis deposit"
+    );
 
     // A deposit just ABOVE the floor succeeds and mints exactly 1 real share.
     send(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: MINIMUM_LIQUIDITY + 1, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: MINIMUM_LIQUIDITY + 1,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     )
     .expect("genesis deposit of MINIMUM_LIQUIDITY + 1 must succeed, minting 1 real share");
-    assert_eq!(token_amount(&env.svm, lp_ata), 1, "MINIMUM_LIQUIDITY + 1 mints exactly 1 real share");
+    assert_eq!(
+        token_amount(&env.svm, lp_ata),
+        1,
+        "MINIMUM_LIQUIDITY + 1 mints exactly 1 real share"
+    );
 }
 
 #[test]
@@ -538,8 +683,20 @@ fn deposit_rejects_zero_amount() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: 0, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: 0,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     );
     assert!(res.is_err(), "zero-amount deposit must reject: {res:?}");
@@ -569,9 +726,17 @@ fn deposit_succeeds_with_no_separate_authority_handover() {
     create_lp_vault(&mut env, registry, mint);
 
     let depositor = Keypair::new();
-    env.svm.airdrop(&depositor.pubkey(), 100_000_000_000).unwrap();
+    env.svm
+        .airdrop(&depositor.pubkey(), 100_000_000_000)
+        .unwrap();
     let source = Pubkey::new_unique();
-    set_token(&mut env.svm, source, env.collateral_mint, depositor.pubkey(), 10_000_000);
+    set_token(
+        &mut env.svm,
+        source,
+        env.collateral_mint,
+        depositor.pubkey(),
+        10_000_000,
+    );
     let lp_ata = Pubkey::new_unique();
     set_token(&mut env.svm, lp_ata, mint, depositor.pubkey(), 0);
 
@@ -579,13 +744,29 @@ fn deposit_succeeds_with_no_separate_authority_handover() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
-        deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            registry,
+            mint,
+            lp_ata,
+            source,
+            ledger,
+            depositor.pubkey(),
+        ),
         &[&depositor],
     );
-    assert!(res.is_ok(), "FIND-1: deposit must succeed with no separate authority handover: {res:?}");
+    assert!(
+        res.is_ok(),
+        "FIND-1: deposit must succeed with no separate authority handover: {res:?}"
+    );
     assert_eq!(
-        token_amount(&env.svm, env.vault_token), DEPOSIT as u64,
+        token_amount(&env.svm, env.vault_token),
+        DEPOSIT as u64,
         "collateral moved on the now-successful deposit"
     );
 }
@@ -603,8 +784,20 @@ fn lp_deposit_twice_no_expiry_overflow() {
             &mut env.svm,
             env.program_id,
             &env.payer,
-            ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
-            deposit_accounts(env.market, env.vault_token, registry, mint, lp_ata, source, ledger, depositor.pubkey()),
+            ProgInstruction::DepositToLpVault {
+                amount: DEPOSIT,
+                domain: DOMAIN,
+            },
+            deposit_accounts(
+                env.market,
+                env.vault_token,
+                registry,
+                mint,
+                lp_ata,
+                source,
+                ledger,
+                depositor.pubkey(),
+            ),
             &[&depositor],
         )
         .expect("deposit (no expiry overflow)");
@@ -617,8 +810,12 @@ fn lp_deposit_twice_no_expiry_overflow() {
     // shares outstanding is already nonzero), so it mints 1:1 with no carve-out.
     // Total minted == 2*DEPOSIT - MINIMUM_LIQUIDITY, not 2*DEPOSIT.
     const MINIMUM_LIQUIDITY: u64 = 1_000;
-    assert_eq!(token_amount(&env.svm, lp_ata), 2 * DEPOSIT as u64 - MINIMUM_LIQUIDITY);
-    let led = state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    assert_eq!(
+        token_amount(&env.svm, lp_ata),
+        2 * DEPOSIT as u64 - MINIMUM_LIQUIDITY
+    );
+    let led =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
     assert_eq!(led.total_principal_atoms, 2 * DEPOSIT);
 }
 
@@ -637,26 +834,39 @@ fn lp_deposit_backing_state_matches_top_up() {
     activate(&mut env_a, admin_a.pubkey()).expect("activate A (admin authority)");
     // admin's source funds + a client-managed ledger account.
     let source_a = Pubkey::new_unique();
-    set_token(&mut env_a.svm, source_a, env_a.collateral_mint, admin_a.pubkey(), 10_000_000);
+    set_token(
+        &mut env_a.svm,
+        source_a,
+        env_a.collateral_mint,
+        admin_a.pubkey(),
+        10_000_000,
+    );
     // #433: the ledger is now pinned to its PDA on TopUpBackingBucket too, so a random
     // address is refused. This test wants a working top-up to compare against LpDeposit,
     // not a substitution check — derive the canonical one.
     let (ledger_a, _) = state::derive_lp_backing_ledger(&env_a.program_id, &env_a.market, DOMAIN);
-    env_a.svm.set_account(
-        ledger_a,
-        Account {
-            lamports: 1_000_000_000,
-            data: vec![0u8; state::backing_domain_ledger_account_len()],
-            owner: env_a.program_id,
-            executable: false,
-            rent_epoch: 0,
-        },
-    ).unwrap();
+    env_a
+        .svm
+        .set_account(
+            ledger_a,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; state::backing_domain_ledger_account_len()],
+                owner: env_a.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     send(
         &mut env_a.svm,
         env_a.program_id,
         &env_a.payer,
-        ProgInstruction::TopUpBackingBucket { domain: DOMAIN, amount: DEPOSIT, expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT },
+        ProgInstruction::TopUpBackingBucket {
+            domain: DOMAIN,
+            amount: DEPOSIT,
+            expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT,
+        },
         vec![
             AccountMeta::new(admin_a.pubkey(), true),
             AccountMeta::new(env_a.market, false),
@@ -671,8 +881,10 @@ fn lp_deposit_backing_state_matches_top_up() {
         &[&admin_a],
     )
     .expect("top up backing bucket");
-    let led_a = state::read_backing_domain_ledger(&env_a.svm.get_account(&ledger_a).unwrap().data).unwrap();
-    let (_, group_a) = state::read_market(&env_a.svm.get_account(&env_a.market).unwrap().data).unwrap();
+    let led_a =
+        state::read_backing_domain_ledger(&env_a.svm.get_account(&ledger_a).unwrap().data).unwrap();
+    let (_, group_a) =
+        state::read_market(&env_a.svm.get_account(&env_a.market).unwrap().data).unwrap();
     let vault_a = group_a.vault;
 
     // ── Path B: LpDeposit on a vault whose backing authority = registry PDA. ──
@@ -682,37 +894,87 @@ fn lp_deposit_backing_state_matches_top_up() {
         &mut env_b.svm,
         env_b.program_id,
         &env_b.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
-        deposit_accounts(env_b.market, env_b.vault_token, registry_b, mint_b, lp_ata_b, source_b, ledger_b, depositor_b.pubkey()),
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
+        deposit_accounts(
+            env_b.market,
+            env_b.vault_token,
+            registry_b,
+            mint_b,
+            lp_ata_b,
+            source_b,
+            ledger_b,
+            depositor_b.pubkey(),
+        ),
         &[&depositor_b],
     )
     .expect("lp deposit");
-    let led_b = state::read_backing_domain_ledger(&env_b.svm.get_account(&ledger_b).unwrap().data).unwrap();
-    let (_, group_b) = state::read_market(&env_b.svm.get_account(&env_b.market).unwrap().data).unwrap();
+    let led_b =
+        state::read_backing_domain_ledger(&env_b.svm.get_account(&ledger_b).unwrap().data).unwrap();
+    let (_, group_b) =
+        state::read_market(&env_b.svm.get_account(&env_b.market).unwrap().data).unwrap();
     let vault_b = group_b.vault;
 
     // Value counters identical (drift detector).
-    assert_eq!(led_a.total_principal_atoms, led_b.total_principal_atoms, "principal drift");
-    assert_eq!(led_a.total_deposited_atoms, led_b.total_deposited_atoms, "deposited drift");
-    assert_eq!(led_a.total_principal_withdrawn_atoms, led_b.total_principal_withdrawn_atoms);
-    assert_eq!(led_a.total_earnings_atoms, led_b.total_earnings_atoms, "earnings drift");
-    assert_eq!(led_a.total_earnings_withdrawn_atoms, led_b.total_earnings_withdrawn_atoms);
-    assert_eq!(led_a.cumulative_loss_atoms, led_b.cumulative_loss_atoms, "loss drift");
-    assert_eq!(led_a.cumulative_recovery_atoms, led_b.cumulative_recovery_atoms, "recovery drift");
-    assert_eq!(led_a.last_observed_bucket_earnings_atoms, led_b.last_observed_bucket_earnings_atoms);
-    assert_eq!(led_a.last_observed_unavailable_principal_atoms, led_b.last_observed_unavailable_principal_atoms);
+    assert_eq!(
+        led_a.total_principal_atoms, led_b.total_principal_atoms,
+        "principal drift"
+    );
+    assert_eq!(
+        led_a.total_deposited_atoms, led_b.total_deposited_atoms,
+        "deposited drift"
+    );
+    assert_eq!(
+        led_a.total_principal_withdrawn_atoms,
+        led_b.total_principal_withdrawn_atoms
+    );
+    assert_eq!(
+        led_a.total_earnings_atoms, led_b.total_earnings_atoms,
+        "earnings drift"
+    );
+    assert_eq!(
+        led_a.total_earnings_withdrawn_atoms,
+        led_b.total_earnings_withdrawn_atoms
+    );
+    assert_eq!(
+        led_a.cumulative_loss_atoms, led_b.cumulative_loss_atoms,
+        "loss drift"
+    );
+    assert_eq!(
+        led_a.cumulative_recovery_atoms, led_b.cumulative_recovery_atoms,
+        "recovery drift"
+    );
+    assert_eq!(
+        led_a.last_observed_bucket_earnings_atoms,
+        led_b.last_observed_bucket_earnings_atoms
+    );
+    assert_eq!(
+        led_a.last_observed_unavailable_principal_atoms,
+        led_b.last_observed_unavailable_principal_atoms
+    );
     assert_eq!(led_a.domain, led_b.domain, "domain");
     // Market vault total identical (the backing-bucket collateral effect).
-    assert_eq!(vault_a, vault_b, "market vault total drift between TopUp and LpDeposit");
+    assert_eq!(
+        vault_a, vault_b,
+        "market vault total drift between TopUp and LpDeposit"
+    );
 }
 
 // W3 (canonical-ATA): mirror of v16_program::processor::canonical_vault_address — the SPL
 // Associated Token Account of the vault_authority PDA for this mint. Kept byte-in-lock-step with
 // the program so vault fixtures satisfy the F-VAULT-FRAG pin (a green test == the derivation matches).
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+    let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        .parse()
+        .unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -777,7 +1039,10 @@ fn live_lp_vault_backing_authority_cannot_be_rotated_by_asset_admin() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
         deposit_accounts(
             env.market,
             env.vault_token,
@@ -792,14 +1057,25 @@ fn live_lp_vault_backing_authority_cannot_be_rotated_by_asset_admin() {
     )
     .expect("deposit");
     assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64);
-    assert_eq!(backing_authority_of(&env, APPEND_ASSET_INDEX as usize), registry.to_bytes());
+    assert_eq!(
+        backing_authority_of(&env, APPEND_ASSET_INDEX as usize),
+        registry.to_bytes()
+    );
 
     let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 100_000_000_000).unwrap();
+    env.svm
+        .airdrop(&attacker.pubkey(), 100_000_000_000)
+        .unwrap();
 
     // With the registry account supplied, the guard sees a live vault and refuses.
-    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &admin, &attacker, Some(registry))
-        .expect_err("rotation away from a live LP vault must be rejected");
+    try_rotate_backing_authority(
+        &mut env,
+        APPEND_ASSET_INDEX,
+        &admin,
+        &attacker,
+        Some(registry),
+    )
+    .expect_err("rotation away from a live LP vault must be rejected");
 
     // Omitting it must also fail — the guard rejects on absence rather than
     // skipping, so it cannot be sidestepped by sending fewer accounts.
@@ -831,7 +1107,10 @@ fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN },
+        ProgInstruction::DepositToLpVault {
+            amount: DEPOSIT,
+            domain: DOMAIN,
+        },
         deposit_accounts(
             env.market,
             env.vault_token,
@@ -866,10 +1145,19 @@ fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
     )
     .expect("delegate asset_admin");
 
-    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &manager, &manager, Some(registry))
-        .expect_err("delegated asset_admin must not seize a live vault's backing authority");
+    try_rotate_backing_authority(
+        &mut env,
+        APPEND_ASSET_INDEX,
+        &manager,
+        &manager,
+        Some(registry),
+    )
+    .expect_err("delegated asset_admin must not seize a live vault's backing authority");
 
-    assert_eq!(backing_authority_of(&env, APPEND_ASSET_INDEX as usize), registry.to_bytes());
+    assert_eq!(
+        backing_authority_of(&env, APPEND_ASSET_INDEX as usize),
+        registry.to_bytes()
+    );
     assert_eq!(token_amount(&env.svm, env.vault_token), DEPOSIT as u64);
 }
 
@@ -889,12 +1177,21 @@ fn backing_authority_rotation_is_allowed_when_no_lp_vault_registry_exists() {
     // Activate the asset with the registry PDA as its backing authority, but
     // never create the vault — the registry account stays uninitialised.
     activate(&mut env, registry).expect("append asset 1 with registry authority");
-    assert_eq!(backing_authority_of(&env, APPEND_ASSET_INDEX as usize), registry.to_bytes());
+    assert_eq!(
+        backing_authority_of(&env, APPEND_ASSET_INDEX as usize),
+        registry.to_bytes()
+    );
 
     let rescue = Keypair::new();
     env.svm.airdrop(&rescue.pubkey(), 100_000_000_000).unwrap();
-    try_rotate_backing_authority(&mut env, APPEND_ASSET_INDEX, &admin, &rescue, Some(registry))
-        .expect("rotation must remain possible when no LP vault is bound");
+    try_rotate_backing_authority(
+        &mut env,
+        APPEND_ASSET_INDEX,
+        &admin,
+        &rescue,
+        Some(registry),
+    )
+    .expect("rotation must remain possible when no LP vault is bound");
 
     assert_eq!(
         backing_authority_of(&env, APPEND_ASSET_INDEX as usize),
