@@ -171,7 +171,10 @@ fn main() {
     // ── Proof of life ────────────────────────────────────────────────────────
     // A silent empty emit, or one missing the tags nobody would look twice at,
     // reads as "parity OK" forever.
-    assert!(!live.is_empty(), "no live tags decoded — the probe is broken");
+    assert!(
+        !live.is_empty(),
+        "no live tags decoded — the probe is broken"
+    );
     // Tag 0 is InitMarket, the LARGEST instruction body in the program. If
     // MAX_PAYLOAD ever falls below it, this is the first thing that breaks — and
     // it breaks loudly, rather than quietly moving tag 0 into `gaps`.

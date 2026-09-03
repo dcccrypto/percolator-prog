@@ -1710,7 +1710,10 @@ fn kani_lp_vault_redemption_fee_share_split_preserved() {
     );
 
     // gross_consumed never exceeds net_earnings (earnings <= lpb <= net*fee/DENOM => gc <= net).
-    assert!(gc <= net_earnings, "gross_consumed never exceeds net_earnings");
+    assert!(
+        gc <= net_earnings,
+        "gross_consumed never exceeds net_earnings"
+    );
 
     let net_after = net_earnings - gc;
 
@@ -1784,8 +1787,14 @@ fn kani_e2_auth_accept_when_all_gates_hold() {
     let ok = nft_holder_auth_decision(
         owner, owner, true, pkey, pkey, true, mint, mint, signer, signer, 1, true,
     );
-    assert!(ok, "a genuine bound-NFT holder of an escrowed position must authorize");
-    kani::cover!(ok, "NFT-holder accept path is reachable (anti-vacuity witness)");
+    assert!(
+        ok,
+        "a genuine bound-NFT holder of an escrowed position must authorize"
+    );
+    kani::cover!(
+        ok,
+        "NFT-holder accept path is reachable (anti-vacuity witness)"
+    );
 }
 
 /// SOUNDNESS: authorize ⟹ every gate held (no path authorizes with a gate false).
@@ -1804,7 +1813,10 @@ fn kani_e2_auth_accept_implies_all_gates() {
     let amt: u64 = kani::any();
     let init: bool = kani::any();
     if nft_holder_auth_decision(po, ema, pob, ppa, pk, can, bm, am, sg, ao, amt, init) {
-        assert!(po == ema, "authorized ⟹ portfolio escrowed under this NFT program");
+        assert!(
+            po == ema,
+            "authorized ⟹ portfolio escrowed under this NFT program"
+        );
         assert!(pob, "authorized ⟹ PositionNft PDA is NFT-program-owned");
         assert!(ppa == pk, "authorized ⟹ PDA binds THIS portfolio");
         assert!(can, "authorized ⟹ PDA is canonical");
@@ -1823,8 +1835,18 @@ fn kani_e2_auth_reject_not_escrowed() {
     let ema: [u8; 32] = kani::any();
     kani::assume(po != ema);
     let ok = nft_holder_auth_decision(
-        po, ema, kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        po,
+        ema,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
     );
     assert!(!ok, "non-escrowed (owner != mint-auth PDA) must reject");
 }
@@ -1832,10 +1854,23 @@ fn kani_e2_auth_reject_not_escrowed() {
 #[kani::proof]
 fn kani_e2_auth_reject_fake_pda_owner() {
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), false, kani::any(), kani::any(), kani::any(),
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(),
+        kani::any(),
+        false,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
     );
-    assert!(!ok, "PositionNft PDA not owned by the NFT program must reject");
+    assert!(
+        !ok,
+        "PositionNft PDA not owned by the NFT program must reject"
+    );
 }
 
 #[kani::proof]
@@ -1844,8 +1879,18 @@ fn kani_e2_auth_reject_wrong_portfolio() {
     let pk: [u8; 32] = kani::any();
     kani::assume(ppa != pk);
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), kani::any(), ppa, pk, kani::any(), kani::any(),
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        ppa,
+        pk,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
     );
     assert!(!ok, "an NFT bound to a DIFFERENT portfolio must reject");
 }
@@ -1853,8 +1898,18 @@ fn kani_e2_auth_reject_wrong_portfolio() {
 #[kani::proof]
 fn kani_e2_auth_reject_noncanonical_pda() {
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), false,
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        false,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
     );
     assert!(!ok, "a non-canonical PositionNft PDA must reject");
 }
@@ -1865,10 +1920,23 @@ fn kani_e2_auth_reject_wrong_mint() {
     let am: [u8; 32] = kani::any();
     kani::assume(am != bm);
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
-        bm, am, kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        bm,
+        am,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
     );
-    assert!(!ok, "holding a DIFFERENT mint (not the bound NFT) must reject");
+    assert!(
+        !ok,
+        "holding a DIFFERENT mint (not the bound NFT) must reject"
+    );
 }
 
 #[kani::proof]
@@ -1877,8 +1945,18 @@ fn kani_e2_auth_reject_wrong_ata_owner() {
     let ao: [u8; 32] = kani::any();
     kani::assume(ao != sg);
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
-        kani::any(), kani::any(), sg, ao, kani::any(), kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        sg,
+        ao,
+        kani::any(),
+        kani::any(),
     );
     assert!(!ok, "a token account NOT owned by the signer must reject");
 }
@@ -1888,8 +1966,18 @@ fn kani_e2_auth_reject_amount_not_one() {
     let amt: u64 = kani::any();
     kani::assume(amt != 1);
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
-        kani::any(), kani::any(), kani::any(), kani::any(), amt, kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        amt,
+        kani::any(),
     );
     assert!(!ok, "amount != 1 (zero, or a fungible balance) must reject");
 }
@@ -1897,8 +1985,18 @@ fn kani_e2_auth_reject_amount_not_one() {
 #[kani::proof]
 fn kani_e2_auth_reject_uninitialized_ata() {
     let ok = nft_holder_auth_decision(
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
-        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), false,
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        kani::any(),
+        false,
     );
     assert!(!ok, "an uninitialized token account must reject");
 }
@@ -1920,12 +2018,12 @@ fn kani_f1_insurance_withdraw_cooldown_gate() {
         assert!(res.is_ok());
     } else {
         match last.checked_add(cooldown) {
-            None => assert!(res.is_err()),          // overflow ⇒ rejected (never panics)
+            None => assert!(res.is_err()), // overflow ⇒ rejected (never panics)
             Some(earliest) => {
                 if now < earliest {
-                    assert!(res.is_err());          // window not elapsed ⇒ cooldown active
+                    assert!(res.is_err()); // window not elapsed ⇒ cooldown active
                 } else {
-                    assert!(res.is_ok());           // window elapsed ⇒ allowed (boundary inclusive)
+                    assert!(res.is_ok()); // window elapsed ⇒ allowed (boundary inclusive)
                 }
             }
         }
@@ -1983,14 +2081,23 @@ fn kani_protocol_skim_conserves_total_fee() {
     let protocol_cut_a = percolator_prog::processor::fee_share_floor(fee_a, protocol_fee_bps);
     let protocol_cut_b = percolator_prog::processor::fee_share_floor(fee_b, protocol_fee_bps);
 
-    kani::cover!(fee_a > 0, "skim conservation covers a nonzero taker-side fee");
-    kani::cover!(fee_a == 0, "skim conservation covers the maker side's zero fee (taker-only)");
+    kani::cover!(
+        fee_a > 0,
+        "skim conservation covers a nonzero taker-side fee"
+    );
+    kani::cover!(
+        fee_a == 0,
+        "skim conservation covers the maker side's zero fee (taker-only)"
+    );
 
     if let Ok(protocol_cut_a) = protocol_cut_a {
         // No atom created or destroyed by the skim split: what's left after
         // the protocol's cut is exactly the taker-domain's credit.
         let domain_fee_a = fee_a.checked_sub(protocol_cut_a);
-        assert!(domain_fee_a.is_some(), "protocol cut must never exceed the fee it was skimmed from");
+        assert!(
+            domain_fee_a.is_some(),
+            "protocol cut must never exceed the fee it was skimmed from"
+        );
         assert_eq!(domain_fee_a.unwrap() + protocol_cut_a, fee_a);
     }
     if let Ok(protocol_cut_b) = protocol_cut_b {
@@ -2021,8 +2128,14 @@ fn kani_protocol_skim_never_exceeds_fee_share_bps() {
     let share_bps: u16 = kani::any();
     let res = percolator_prog::processor::fee_share_floor(fee, share_bps);
 
-    kani::cover!(res.is_ok() && matches!(res, Ok(v) if v > 0), "skim floor covers a nonzero cut");
-    kani::cover!(fee == 0 || share_bps == 0, "skim floor covers the zero-fee/zero-bps short-circuit");
+    kani::cover!(
+        res.is_ok() && matches!(res, Ok(v) if v > 0),
+        "skim floor covers a nonzero cut"
+    );
+    kani::cover!(
+        fee == 0 || share_bps == 0,
+        "skim floor covers the zero-fee/zero-bps short-circuit"
+    );
     kani::cover!(
         share_bps as u128 == 10_000 && fee > 0,
         "skim floor covers a full-bps (100%) share still floor-dividing correctly"
@@ -2032,7 +2145,10 @@ fn kani_protocol_skim_never_exceeds_fee_share_bps() {
         assert_eq!(res, Ok(0));
     } else {
         match fee.checked_mul(share_bps as u128) {
-            None => assert!(res.is_err(), "overflow must be rejected, never wrap/truncate"),
+            None => assert!(
+                res.is_err(),
+                "overflow must be rejected, never wrap/truncate"
+            ),
             Some(scaled) => {
                 let expected = scaled / 10_000;
                 assert_eq!(res, Ok(expected));
@@ -2042,7 +2158,10 @@ fn kani_protocol_skim_never_exceeds_fee_share_bps() {
                 // configures `PROTOCOL_FEE_BPS` to) it can never exceed `fee`
                 // itself -- the protocol never over-collects.
                 if share_bps as u128 <= 10_000 {
-                    assert!(expected <= fee, "skim must never exceed the fee it was taken from");
+                    assert!(
+                        expected <= fee,
+                        "skim must never exceed the fee it was taken from"
+                    );
                 }
             }
         }
@@ -2094,9 +2213,15 @@ fn kani_protocol_claim_never_exceeds_accrued() {
         );
         assert!(transfer_amount <= engine_available);
         assert!(transfer_amount <= vault);
-        assert!(transfer_amount > 0, "a zero transfer must be rejected, not silently succeed");
+        assert!(
+            transfer_amount > 0,
+            "a zero transfer must be rejected, not silently succeed"
+        );
         assert_eq!(next_withdrawn, withdrawn + transfer_amount);
-        assert!(next_withdrawn <= accrued, "cumulative withdrawn can never exceed cumulative accrued");
+        assert!(
+            next_withdrawn <= accrued,
+            "cumulative withdrawn can never exceed cumulative accrued"
+        );
     }
 }
 
@@ -2131,19 +2256,27 @@ fn kani_protocol_fee_reserve_never_starved_by_cranker_reward() {
     // 100_00 == 1000%, i.e. no narrower than production).
     let protocol_owed = accrued - withdrawn;
 
-    let reward = percolator_prog::processor::maintenance_cranker_reward(charged, cranker_fee_share_bps);
-    kani::cover!(reward.is_ok() && matches!(reward, Ok(r) if r > 0), "reserve property covers a nonzero cranker reward");
+    let reward =
+        percolator_prog::processor::maintenance_cranker_reward(charged, cranker_fee_share_bps);
+    kani::cover!(
+        reward.is_ok() && matches!(reward, Ok(r) if r > 0),
+        "reserve property covers a nonzero cranker reward"
+    );
 
     if let Ok(reward) = reward {
-        let credit_result = percolator::MarketGroupV16ViewMut::<u64>::kani_credit_account_from_insurance_delta(
-            insurance,
-            budget_remaining,
-            protocol_owed,
-            c_tot,
-            capital,
-            reward,
+        let credit_result =
+            percolator::MarketGroupV16ViewMut::<u64>::kani_credit_account_from_insurance_delta(
+                insurance,
+                budget_remaining,
+                protocol_owed,
+                c_tot,
+                capital,
+                reward,
+            );
+        kani::cover!(
+            credit_result.is_ok(),
+            "reserve property covers a credit that succeeds while a reservation is in effect"
         );
-        kani::cover!(credit_result.is_ok(), "reserve property covers a credit that succeeds while a reservation is in effect");
         kani::cover!(
             credit_result.is_err() && protocol_owed > 0,
             "reserve property covers the reserve actually blocking a draw"
@@ -2180,10 +2313,22 @@ fn kani_set_protocol_fee_authority_requires_upgrade_authority() {
 
     let parsed = percolator_prog::processor::parse_program_data_upgrade_authority_bytes(&data);
 
-    kani::cover!(discriminant != 3, "upgrade-authority gate covers a non-ProgramData account (rejected)");
-    kani::cover!(discriminant == 3 && option_tag == 0, "upgrade-authority gate covers a finalized/immutable program (None)");
-    kani::cover!(discriminant == 3 && option_tag == 1, "upgrade-authority gate covers a live upgrade authority (Some)");
-    kani::cover!(discriminant == 3 && option_tag > 1, "upgrade-authority gate covers a malformed Option tag (rejected)");
+    kani::cover!(
+        discriminant != 3,
+        "upgrade-authority gate covers a non-ProgramData account (rejected)"
+    );
+    kani::cover!(
+        discriminant == 3 && option_tag == 0,
+        "upgrade-authority gate covers a finalized/immutable program (None)"
+    );
+    kani::cover!(
+        discriminant == 3 && option_tag == 1,
+        "upgrade-authority gate covers a live upgrade authority (Some)"
+    );
+    kani::cover!(
+        discriminant == 3 && option_tag > 1,
+        "upgrade-authority gate covers a malformed Option tag (rejected)"
+    );
 
     // Decode fidelity: matches the on-chain `UpgradeableLoaderState::ProgramData`
     // layout exactly (§ read_program_data_upgrade_authority's own doc comment).
@@ -2206,13 +2351,25 @@ fn kani_set_protocol_fee_authority_requires_upgrade_authority() {
     // rotation.
     let signer = solana_program::pubkey::Pubkey::new_from_array(signer_bytes);
     let would_authorize = matches!(&parsed, Ok(Some(a)) if *a == signer);
-    kani::cover!(would_authorize, "upgrade-authority gate covers the accept path (exact signer match)");
-    kani::cover!(!would_authorize, "upgrade-authority gate covers a reject path (mismatch, None, or parse error)");
+    kani::cover!(
+        would_authorize,
+        "upgrade-authority gate covers the accept path (exact signer match)"
+    );
+    kani::cover!(
+        !would_authorize,
+        "upgrade-authority gate covers a reject path (mismatch, None, or parse error)"
+    );
     if option_tag == 0 && discriminant == 3 {
-        assert!(!would_authorize, "an immutable/finalized program can never satisfy the gate");
+        assert!(
+            !would_authorize,
+            "an immutable/finalized program can never satisfy the gate"
+        );
     }
     if discriminant == 3 && option_tag == 1 && authority_bytes != signer_bytes {
-        assert!(!would_authorize, "a non-upgrade-authority signer must never satisfy the gate");
+        assert!(
+            !would_authorize,
+            "a non-upgrade-authority signer must never satisfy the gate"
+        );
     }
 }
 
@@ -2370,11 +2527,8 @@ fn kani_RETIRED_fee_split_floor_ok_matches_tolerant_percentage_floors() {
     kani::assume(backing_fee_bps <= 48);
     kani::assume(insurance_share_bps <= 10_000);
 
-    let accepted = policy_v16::fee_split_floor_ok(
-        trade_fee_base_bps,
-        backing_fee_bps,
-        insurance_share_bps,
-    );
+    let accepted =
+        policy_v16::fee_split_floor_ok(trade_fee_base_bps, backing_fee_bps, insurance_share_bps);
 
     kani::cover!(accepted, "fee_split_floor_ok covers an accepted split");
     kani::cover!(!accepted, "fee_split_floor_ok covers a rejected split");
@@ -2388,7 +2542,10 @@ fn kani_RETIRED_fee_split_floor_ok_matches_tolerant_percentage_floors() {
     );
 
     if backing_fee_bps == 0 {
-        assert!(accepted, "backing_fee_bps==0 must always skip the floor check");
+        assert!(
+            accepted,
+            "backing_fee_bps==0 must always skip the floor check"
+        );
         return;
     }
 
@@ -2421,7 +2578,10 @@ fn kani_RETIRED_fee_split_floor_ok_matches_tolerant_percentage_floors() {
     // Wizard-default example (T=20bps, creatorPct=20/lpPct=60/insurancePct=20):
     // tfb=4, bf=16, isb=2500 -- must always be accepted.
     if trade_fee_base_bps == 4 && backing_fee_bps == 16 && insurance_share_bps == 2_500 {
-        assert!(accepted, "the wizard's default 20/60/20 split must be accepted");
+        assert!(
+            accepted,
+            "the wizard's default 20/60/20 split must be accepted"
+        );
     }
 }
 
@@ -2503,8 +2663,8 @@ fn kani_batch_leg_fee_uses_ceil_notional_not_floor() {
     // `proof_v16_trade_fee_notional_ceil_strictly_exceeds_floor_when_unaligned` proves for
     // `trade_fee_notional_ceil` vs `trade_notional_floor`; batch_leg_fee must compute the same
     // ceil-notional internally.
-    let fee_notional = (product / percolator::POS_SCALE)
-        + u128::from(product % percolator::POS_SCALE != 0);
+    let fee_notional =
+        (product / percolator::POS_SCALE) + u128::from(product % percolator::POS_SCALE != 0);
     if unaligned_notional {
         assert!(
             fee_notional > floor_notional,
@@ -2524,8 +2684,14 @@ fn kani_batch_leg_fee_uses_ceil_notional_not_floor() {
     // genuinely is strictly greater (0 -> 1). Proves this harness's `ceil_fee >= floor_fee` is
     // not vacuously satisfied by an identity function -- it is sensitive to the actual fix.
     if abs_size_q == 100 && exec_price == 100 && fee_bps == 1 {
-        assert_eq!(floor_fee, 0, "pre-fix reconstruction silently drops this leg's fee to zero");
-        assert_eq!(ceil_fee, 1, "the fix must reconstruct the engine's real ceil-notional fee");
+        assert_eq!(
+            floor_fee, 0,
+            "pre-fix reconstruction silently drops this leg's fee to zero"
+        );
+        assert_eq!(
+            ceil_fee, 1,
+            "the fix must reconstruct the engine's real ceil-notional fee"
+        );
         assert!(ceil_fee > floor_fee);
     }
 }
@@ -2557,7 +2723,11 @@ fn kani_fee_split_conserves() {
     let insurance_bps: u16 = 8_000 - creator_bps - lp_bps;
 
     let parts = percolator_prog::policy_v16::split_trade_fee(
-        fee as u128, 2_000, creator_bps, lp_bps, insurance_bps,
+        fee as u128,
+        2_000,
+        creator_bps,
+        lp_bps,
+        insurance_bps,
     )
     .unwrap();
 
@@ -2569,10 +2739,9 @@ fn kani_fee_split_conserves() {
 #[kani::proof]
 fn kani_fee_split_no_leg_exceeds_fee() {
     let fee: u64 = kani::any();
-    let parts = percolator_prog::policy_v16::split_trade_fee(
-        fee as u128, 2_000, 1_600, 4_800, 1_600,
-    )
-    .unwrap();
+    let parts =
+        percolator_prog::policy_v16::split_trade_fee(fee as u128, 2_000, 1_600, 4_800, 1_600)
+            .unwrap();
     assert!(parts.protocol <= fee as u128);
     assert!(parts.creator <= fee as u128);
     assert!(parts.lp <= fee as u128);

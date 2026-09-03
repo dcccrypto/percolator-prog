@@ -165,10 +165,7 @@ impl EnvelopeEnv {
     }
 }
 
-fn init_market_with(
-    max_price_move_bps_per_slot: u64,
-    initial_margin_bps: u64,
-) -> ProgInstruction {
+fn init_market_with(max_price_move_bps_per_slot: u64, initial_margin_bps: u64) -> ProgInstruction {
     ProgInstruction::InitMarket {
         max_portfolio_assets: FIXTURE_MAX_PORTFOLIO_ASSETS,
         h_min: 0,
