@@ -12895,6 +12895,52 @@ pub mod processor {
             }
             cfg
         };
+
+        // ── GH#451: the OLD vault must be empty before its mint is switched away ──
+        //
+        // The header counters above (vault / c_tot / insurance) are the engine's
+        // accounting. They can all read zero while the SPL token account still
+        // holds a balance — tokens that arrived outside the accounted paths, or a
+        // residue the counters no longer track. Switching the mint then orphans
+        // those atoms: the vault authority still owns them, but no instruction
+        // references that mint any more, so nothing can move them out.
+        //
+        // Upstream checks this and our port dropped it. Ported here, keeping our
+        // stricter canonical-address pin.
+        //
+        // Only the mints that actually CHANGE are checked, and the account indices
+        // are conditional on that — matching upstream exactly, so a caller
+        // switching only the secondary passes four accounts plus one, not two.
+        // A no-op call (both mints unchanged) requires no extra accounts at all,
+        // which keeps the common re-assert cheap.
+        let previous_primary_mint = primary_collateral_mint(&cfg);
+        let previous_secondary_mint = if cfg.secondary_collateral_mint == [0u8; 32] {
+            None
+        } else {
+            Some(Pubkey::new_from_array(cfg.secondary_collateral_mint))
+        };
+        let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+        let mut old_vault_account_index = 4usize;
+        if previous_primary_mint != primary_key {
+            let old_primary_vault = account(accounts, old_vault_account_index)?;
+            old_vault_account_index += 1;
+            require_empty_vault_token_account(
+                old_primary_vault,
+                &vault_authority,
+                &previous_primary_mint,
+            )?;
+        }
+        if let Some(previous_secondary_mint) = previous_secondary_mint {
+            if previous_secondary_mint != secondary_key {
+                let old_secondary_vault = account(accounts, old_vault_account_index)?;
+                require_empty_vault_token_account(
+                    old_secondary_vault,
+                    &vault_authority,
+                    &previous_secondary_mint,
+                )?;
+            }
+        }
+
         cfg.collateral_mint = primary_mint;
         cfg.secondary_collateral_mint = secondary_mint;
         state::write_wrapper_config(&mut data, &cfg)
@@ -19106,6 +19152,29 @@ pub mod processor {
             || *token_ai.key != canonical_vault_address(expected_owner, expected_mint)
         {
             return Err(PercolatorError::InvalidVaultAccount.into());
+        }
+        Ok(())
+    }
+
+    /// GH#451: the vault for a mint being switched away from must be EMPTY.
+    ///
+    /// Ported from upstream's `require_empty_vault_token_account`. Our
+    /// `verify_vault_token_account` returns `()` rather than the balance, so the
+    /// amount is read here instead of testing a return value — same obligation,
+    /// and it keeps our stricter canonical-address pin (F-VAULT-FRAG), which
+    /// upstream's variant does not carry.
+    ///
+    /// `EngineLockActive` matches upstream's error for this, and matches the
+    /// header-counter check in the same handler, so a caller sees one code for
+    /// "the market is not empty enough to do this".
+    fn require_empty_vault_token_account(
+        token_ai: &AccountInfo,
+        expected_owner: &Pubkey,
+        expected_mint: &Pubkey,
+    ) -> Result<(), ProgramError> {
+        verify_vault_token_account(token_ai, expected_owner, expected_mint)?;
+        if unpack_token_account(token_ai)?.amount != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
         }
         Ok(())
     }

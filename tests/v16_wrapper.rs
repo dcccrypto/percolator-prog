@@ -873,19 +873,56 @@ fn init_market_with_ix(
     mint_key
 }
 
+/// GH#451: builds the call INCLUDING the conditional old-vault accounts.
+///
+/// `UpdateBaseUnitMints` now requires the vault of any mint being switched AWAY
+/// from, and requires it to be empty, so orphaning a residual token balance is
+/// impossible. The account indices are conditional — only the mints that actually
+/// change contribute one — so this helper reads the market's CURRENT config and
+/// appends exactly what the handler will ask for.
+///
+/// Deriving them here rather than at each call site is deliberate: eight callers
+/// pass different before/after mint combinations, and hand-computing which of them
+/// needs one account, two, or none is exactly the sort of bookkeeping that gets
+/// quietly wrong. The helper mirrors the handler's own branch structure.
+///
+/// Every vault is created EMPTY, which is the passing case. A test that wants to
+/// prove a non-empty vault is rejected should build the call directly with a
+/// funded `vault_token_account`.
 fn configure_base_unit_mints(
     authority: &mut TestAccount,
     market: &mut TestAccount,
     primary_mint: &mut TestAccount,
     secondary_mint: &mut TestAccount,
 ) -> Result<(), ProgramError> {
-    run_ix(
-        Instruction::UpdateBaseUnitMints {
-            primary_mint: primary_mint.key.to_bytes(),
-            secondary_mint: secondary_mint.key.to_bytes(),
-        },
-        &mut [authority, market, primary_mint, secondary_mint],
-    )
+    let (cfg, _) = state::read_market(&market.data).expect("market must be initialised");
+    let previous_primary = Pubkey::new_from_array(cfg.collateral_mint);
+    let previous_secondary = if cfg.secondary_collateral_mint == [0u8; 32] {
+        None
+    } else {
+        Some(Pubkey::new_from_array(cfg.secondary_collateral_mint))
+    };
+
+    let mut old_vaults: Vec<TestAccount> = Vec::new();
+    if previous_primary != primary_mint.key {
+        old_vaults.push(vault_token_account(market, previous_primary, 0));
+    }
+    if let Some(prev_sec) = previous_secondary {
+        if prev_sec != secondary_mint.key {
+            old_vaults.push(vault_token_account(market, prev_sec, 0));
+        }
+    }
+
+    // Read the keys BEFORE the mutable borrows below.
+    let ix = Instruction::UpdateBaseUnitMints {
+        primary_mint: primary_mint.key.to_bytes(),
+        secondary_mint: secondary_mint.key.to_bytes(),
+    };
+    let mut accounts: Vec<&mut TestAccount> = vec![authority, market, primary_mint, secondary_mint];
+    for v in old_vaults.iter_mut() {
+        accounts.push(v);
+    }
+    run_ix(ix, &mut accounts)
 }
 
 fn update_asset_lifecycle(
@@ -21412,11 +21449,88 @@ fn mint_account_with_decimals(decimals: u8) -> TestAccount {
 /// base units, so mismatched decimals silently rescale every secondary-mint deposit
 /// and withdrawal. Upstream rejects it; our port dropped the check by calling
 /// `verify_mint`, which unpacks the mint and discards it.
+/// GH#451: switching a mint away from a vault that still holds tokens is REFUSED.
+///
+/// The header counters (`vault` / `c_tot` / `insurance`) are the engine's
+/// accounting and can all read zero while the SPL token account still holds a
+/// balance — tokens that arrived outside the accounted paths, or a residue the
+/// counters no longer track. Switching the mint then ORPHANS those atoms: the
+/// vault authority still owns them, but no instruction references that mint any
+/// more, so nothing can move them out.
+///
+/// Upstream checks this; our port had dropped it.
+///
+/// Both halves are asserted. The rejection alone would pass against a handler
+/// that rejected the call for any reason at all, so the same call with an EMPTY
+/// vault must succeed.
+#[test]
+fn v16_wrapper_update_base_unit_mints_rejects_a_nonempty_old_vault() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let init_mint = init_market_with_ix(&mut admin, &mut market, init_market_ix_with(|_| {}));
+
+    let mut new_primary = mint_account_with_decimals(6);
+    let mut new_secondary = mint_account_with_decimals(6);
+
+    // The old primary vault still holds one atom.
+    let before = market.data.clone();
+    let mut funded_old_vault = vault_token_account(&market, init_mint, 1);
+    let rejected = run_ix(
+        Instruction::UpdateBaseUnitMints {
+            primary_mint: new_primary.key.to_bytes(),
+            secondary_mint: new_secondary.key.to_bytes(),
+        },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut new_primary,
+            &mut new_secondary,
+            &mut funded_old_vault,
+        ],
+    );
+    assert!(
+        rejected.is_err(),
+        "#451: a non-empty old vault must block the mint switch"
+    );
+    assert_eq!(
+        market.data, before,
+        "#451: the rejected call must leave the market config untouched"
+    );
+
+    // POSITIVE CONTROL: identical call, empty vault, must succeed — otherwise the
+    // rejection above proves nothing about emptiness specifically.
+    let mut empty_old_vault = vault_token_account(&market, init_mint, 0);
+    let accepted = run_ix(
+        Instruction::UpdateBaseUnitMints {
+            primary_mint: new_primary.key.to_bytes(),
+            secondary_mint: new_secondary.key.to_bytes(),
+        },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut new_primary,
+            &mut new_secondary,
+            &mut empty_old_vault,
+        ],
+    );
+    assert!(
+        accepted.is_ok(),
+        "an EMPTY old vault must still be accepted: {accepted:?}"
+    );
+    let (cfg, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg.collateral_mint,
+        new_primary.key.to_bytes(),
+        "the switch must actually have been applied"
+    );
+}
 #[test]
 fn v16_wrapper_update_base_unit_mints_rejects_mismatched_decimals() {
     let mut admin = signer();
     let mut market = market_account();
-    init_market_with_ix(&mut admin, &mut market, init_market_ix_with(|_| {}));
+    // GH#451: capture the market's original collateral mint — switching the
+    // primary away from it now requires its (empty) vault as account 4.
+    let init_mint = init_market_with_ix(&mut admin, &mut market, init_market_ix_with(|_| {}));
 
     let mut primary = mint_account_with_decimals(6);
     let mut mismatched = mint_account_with_decimals(9);
@@ -21433,12 +21547,23 @@ fn v16_wrapper_update_base_unit_mints_rejects_mismatched_decimals() {
     );
 
     let mut matched = mint_account_with_decimals(6);
+    // GH#451: the primary IS changing here (init_mint -> primary), so the old
+    // primary vault must be presented and must be empty. The mismatched-decimals
+    // call above needs no such account: it is rejected on decimals, before the
+    // vault check is reached.
+    let mut old_primary_vault = vault_token_account(&market, init_mint, 0);
     let accepted = run_ix(
         Instruction::UpdateBaseUnitMints {
             primary_mint: primary.key.to_bytes(),
             secondary_mint: matched.key.to_bytes(),
         },
-        &mut [&mut admin, &mut market, &mut primary, &mut matched],
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut primary,
+            &mut matched,
+            &mut old_primary_vault,
+        ],
     );
     assert!(
         accepted.is_ok(),
