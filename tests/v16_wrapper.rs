@@ -384,6 +384,17 @@ fn vault_authority(market: &TestAccount) -> Pubkey {
     Pubkey::find_program_address(&[b"vault", market.key.as_ref()], &program_id()).0
 }
 
+/// GH#420: this asset's unclaimed creator fees.
+///
+/// The counter moved from the market-wide `WrapperConfigV16` to each asset's own
+/// `AssetOracleProfileV16`, because one global pot could only ever be paid out to
+/// one admin — asset 0's — while every asset's trades fed it.
+fn creator_claimable(market: &TestAccount, asset_index: usize) -> u64 {
+    state::read_asset_oracle_profile(&market.data, asset_index)
+        .unwrap()
+        .creator_fee_claimable_atoms
+}
+
 fn vault_token_account(market: &TestAccount, mint: Pubkey, amount: u64) -> TestAccount {
     TestAccount::new_with_data(
         canonical_vault_ata(&vault_authority(market), &mint),
@@ -2041,7 +2052,8 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
         "the fixture must produce a nonzero creator leg, or the assertions below are no-ops"
     );
     assert_eq!(
-        cfg_after_trade.creator_fee_claimable_atoms, expected_creator_cut as u64,
+        creator_claimable(&market, 0),
+        expected_creator_cut as u64,
         "the non-main asset's creator leg accrues to the claimable counter"
     );
     assert_eq!(
@@ -2141,7 +2153,8 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
         "the whole fee stays in insurance, unreachable through the domain-budget exit"
     );
     assert_eq!(
-        cfg_end.creator_fee_claimable_atoms, expected_creator_cut as u64,
+        creator_claimable(&market, 0),
+        expected_creator_cut as u64,
         "and the creator's leg is still sitting on its own counter, claimable only via tag 90"
     );
 }
@@ -9748,6 +9761,7 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         oracle_leg_feeds: [[0u8; 32]; ORACLE_LEG_CAP],
         oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
         oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
+        creator_fee_claimable_atoms: 0,
     };
     assert!(
         state::validate_asset_oracle_profile(&profile).is_err(),
@@ -17785,6 +17799,7 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             backing_bucket_authority: admin.key.to_bytes(),
             oracle_authority: admin.key.to_bytes(),
             asset_admin: admin.key.to_bytes(),
+            creator_fee_claimable_atoms: 0,
             max_staleness_secs: 0,
             hybrid_soft_stale_slots: 0,
             mark_ewma_e6: 100,
@@ -18001,6 +18016,7 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             backing_bucket_authority: admin.key.to_bytes(),
             oracle_authority: admin.key.to_bytes(),
             asset_admin: admin.key.to_bytes(),
+            creator_fee_claimable_atoms: 0,
             max_staleness_secs: 0,
             hybrid_soft_stale_slots: 0,
             mark_ewma_e6: 100,
@@ -18365,6 +18381,7 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     );
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    let creator_before = creator_claimable(&market, 0);
     assert_eq!(cfg_before.protocol_fee_accrued_atoms, 0);
 
     // account_a (long_owner/long_account) is the taker; size_q > 0 puts it in
@@ -18417,7 +18434,7 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
         "fixture must produce a nonzero creator leg"
     );
     assert_eq!(
-        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        creator_claimable(&market, 0) - creator_before,
         expected_creator_cut as u64,
         "creator accrues exactly split_a.creator + split_b.creator into the claimable counter"
     );
@@ -18451,7 +18468,7 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     // double-counted by the re-route.
     assert_eq!(
         expected_protocol_cut
-            + cfg_after.creator_fee_claimable_atoms as u128
+            + creator_claimable(&market, 0) as u128
             + expected_lp_cut
             + expected_insurance_cut,
         total_fee,
@@ -18476,6 +18493,7 @@ fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_accrues_creator_leg_off_the
     deposit(&mut owner_b, &mut market, &mut account_b, 10_000_000);
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    let creator_before = creator_claimable(&market, 0);
 
     // TradeCpi delegates to handle_trade_nocpi_zero_copy; account_a is always
     // the taker regardless of the matcher fill's sign convention.
@@ -18514,7 +18532,7 @@ fn v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_accrues_creator_leg_off_the
         "fixture must produce a nonzero creator leg"
     );
     assert_eq!(
-        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        creator_claimable(&market, 0) - creator_before,
         expected_creator_cut as u64,
         "creator accrues its configured share into the claimable counter on the CPI path too"
     );
@@ -18564,6 +18582,7 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_
     );
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    let creator_before = creator_claimable(&market, 0);
 
     run_ix(
         Instruction::BatchTradeNoCpi {
@@ -18616,7 +18635,7 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_
         "fixture must produce a nonzero creator leg"
     );
     assert_eq!(
-        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        creator_claimable(&market, 0) - creator_before,
         expected_creator_cut as u64,
         "batch loop must fold creator_cut_running_total into the claimable counter"
     );
@@ -18724,6 +18743,7 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
     .unwrap();
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    let creator_before = creator_claimable(&market, 0);
     let req_id = state::next_market_matcher_req_id(&market.data).unwrap();
     let lp_account_id = {
         let bytes = delegate.key.to_bytes();
@@ -18776,7 +18796,7 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
     // budget entirely). Kept current so un-ignoring this test, once a real
     // BPF/LiteSVM harness exists, does not start from a false expectation.
     assert_eq!(
-        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        creator_claimable(&market, 0) - creator_before,
         expected_creator_cut as u64,
         "batch-CPI must accrue the creator leg to the claimable counter"
     );
@@ -19163,7 +19183,10 @@ fn withdraw_creator_fee(
     amount: u128,
 ) -> Result<(), ProgramError> {
     run_ix(
-        Instruction::WithdrawCreatorFee { amount },
+        Instruction::WithdrawCreatorFee {
+            amount,
+            asset_index: 0,
+        },
         &mut [authority, market, dest, vault, vault_auth, token_program],
     )
 }
@@ -19187,7 +19210,10 @@ fn withdraw_creator_fee_no_rollback(
     amount: u128,
 ) -> Result<(), ProgramError> {
     run_ix_no_rollback(
-        Instruction::WithdrawCreatorFee { amount },
+        Instruction::WithdrawCreatorFee {
+            amount,
+            asset_index: 0,
+        },
         &mut [authority, market, dest, vault, vault_auth, token_program],
     )
 }
@@ -19265,8 +19291,17 @@ fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulate
 
     // Raw slot in the market account: 16-byte header + 568-byte config prefix.
     const CLAIMABLE_OFF: usize = 16 + 568;
+    // GH#420: the counter moved from the market-wide config (bytes 568..776) to
+    // each asset's own profile, so this reads asset 0's.
+    //
+    // The test's point is preserved: `read_asset_oracle_profile` parses out of
+    // `market.data`, the RAW account bytes, so a missed write-back still reads
+    // back as 0/stale here exactly as it did before. What changed is WHERE the
+    // bytes live, not whether this proves they were persisted.
     let raw_counter = |data: &[u8]| -> u64 {
-        u64::from_le_bytes(data[CLAIMABLE_OFF..CLAIMABLE_OFF + 8].try_into().unwrap())
+        state::read_asset_oracle_profile(data, 0)
+            .unwrap()
+            .creator_fee_claimable_atoms
     };
 
     for expected_trades in 1..=2u128 {
@@ -19295,7 +19330,8 @@ fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulate
         );
         let (cfg_now, _) = state::read_market(&market.data).unwrap();
         assert_eq!(
-            cfg_now.creator_fee_claimable_atoms, expected,
+            creator_claimable(&market, 0),
+            expected,
             "the parsed view must agree with the raw bytes"
         );
     }
@@ -19326,9 +19362,13 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
         10_000_000,
     );
     {
-        let (mut cfg, group) = state::read_market(&market.data).unwrap();
-        cfg.creator_fee_claimable_atoms = u64::MAX;
-        state::write_market(&mut market.data, &cfg, &group).unwrap();
+        // GH#420: saturate ASSET 0's counter, which is where the accrual now
+        // lands. Seeding the config counter would leave the asset counter at 0,
+        // the add would succeed, and this test would silently stop testing
+        // overflow at all.
+        let mut profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+        profile.creator_fee_claimable_atoms = u64::MAX;
+        state::write_asset_oracle_profile(&mut market.data, 0, &profile).unwrap();
     }
 
     let before = market.data.clone();
@@ -19356,9 +19396,8 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
         market.data, before,
         "the rejected trade must not mutate the market"
     );
-    let (cfg_after, _) = state::read_market(&market.data).unwrap();
     assert_eq!(
-        cfg_after.creator_fee_claimable_atoms,
+        creator_claimable(&market, 0),
         u64::MAX,
         "the counter must be exactly u64::MAX still -- not wrapped to a small value"
     );
@@ -19387,9 +19426,13 @@ fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_w
         10_000_000,
     );
     {
-        let (mut cfg, group) = state::read_market(&market.data).unwrap();
-        cfg.creator_fee_claimable_atoms = u64::MAX;
-        state::write_market(&mut market.data, &cfg, &group).unwrap();
+        // GH#420: saturate ASSET 0's counter, which is where the accrual now
+        // lands. Seeding the config counter would leave the asset counter at 0,
+        // the add would succeed, and this test would silently stop testing
+        // overflow at all.
+        let mut profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+        profile.creator_fee_claimable_atoms = u64::MAX;
+        state::write_asset_oracle_profile(&mut market.data, 0, &profile).unwrap();
     }
 
     let before = market.data.clone();
@@ -19419,8 +19462,8 @@ fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_w
         market.data, before,
         "the rejected batch must not mutate the market"
     );
-    let (cfg_after, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg_after.creator_fee_claimable_atoms, u64::MAX);
+    // GH#420: the saturated counter is asset 0's, not the config's.
+    assert_eq!(creator_claimable(&market, 0), u64::MAX);
 }
 
 /// A claim BELOW capacity pays out and decrements by exactly `amount`, and the
@@ -19966,7 +20009,8 @@ fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_
     let earned = total_fee * cfg_before.creator_share_bps as u128 / 10_000;
     assert_ne!(earned, 0);
     let (cfg_accrued, _) = state::read_market(&market.data).unwrap();
-    assert_eq!(cfg_accrued.creator_fee_claimable_atoms as u128, earned);
+    // GH#420: the accrual now lands in asset 0's own profile, not the config.
+    assert_eq!(creator_claimable(&market, 0) as u128, earned);
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault = vault_token_account(&market, mint, 1_000_000);
@@ -20450,6 +20494,7 @@ fn v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg() {
     );
 
     let (cfg_before, group_before) = state::read_market(&market.data).unwrap();
+    let creator_before = creator_claimable(&market, 0);
     assert_eq!(cfg_before.creator_fee_claimable_atoms, 0);
 
     // Unequal sizes => unequal per-leg creator cuts => the SUM is distinguishable
@@ -20506,10 +20551,27 @@ fn v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg() {
          this test exists to catch"
     );
 
+    // GH#420: the legs are on DIFFERENT assets, so each asset's creator gets its
+    // own leg's cut. That is the whole point of the change — one shared pot could
+    // only ever be paid out to asset 0's admin, so asset 1's creator earned
+    // `creator_leg1` and could never claim it.
     assert_eq!(
-        cfg_after.creator_fee_claimable_atoms - cfg_before.creator_fee_claimable_atoms,
+        creator_claimable(&market, 0) - creator_before,
+        creator_leg0 as u64,
+        "asset 0 must receive exactly ITS leg's creator cut"
+    );
+    assert_eq!(
+        creator_claimable(&market, 1),
+        creator_leg1 as u64,
+        "asset 1 must receive exactly ITS leg's creator cut — the bug was that this \
+         landed in asset 0's pot"
+    );
+    // CONSERVATION, kept from the original assertion: nothing is created or lost
+    // by splitting the pot, so the two assets together still hold the batch total.
+    assert_eq!(
+        (creator_claimable(&market, 0) - creator_before) + creator_claimable(&market, 1),
         creator_sum as u64,
-        "the batch fold must credit the SUM of every leg's creator cut, not just one leg"
+        "the per-asset credits must still sum to every leg's creator cut"
     );
     // The other three legs are folded the same way, so pin them on the same
     // multi-leg batch: a mis-folded running total in any of them is the same bug.

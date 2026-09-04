@@ -286,6 +286,7 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
 
     let encoded = Instruction::WithdrawCreatorFee {
         amount: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+        asset_index: 0x1234,
     }
     .encode();
     assert_eq!(
@@ -293,10 +294,20 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
         "WithdrawCreatorFee must encode as dispatch tag 90 — the SDK, the keeper \
          and any pre-signed transaction all hard-code this byte"
     );
+    // GH#420: 17 -> 19 bytes. This IS a wire break, and a deliberate one — the
+    // creator claim now names WHICH asset's fees it is claiming, because a single
+    // market-wide counter could only ever pay one admin. `asset_index` is appended
+    // AFTER `amount`, so the tag byte and the u128 keep their offsets and an old
+    // 17-byte caller fails to DECODE rather than being silently read as asset 0.
     assert_eq!(
         encoded.len(),
-        1 + 16,
-        "tag byte + a u128 amount; a length change is also a wire break"
+        1 + 16 + 2,
+        "tag byte + u128 amount + u16 asset_index; a length change is a wire break"
+    );
+    assert_eq!(
+        &encoded[17..19],
+        &0x1234u16.to_le_bytes(),
+        "asset_index is a little-endian u16 immediately after the amount"
     );
     assert_eq!(
         &encoded[1..17],
@@ -307,10 +318,24 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
     // Decode direction, built from the literal byte rather than from encode().
     let mut wire = vec![90u8];
     wire.extend_from_slice(&7u128.to_le_bytes());
+    wire.extend_from_slice(&3u16.to_le_bytes());
     assert_eq!(
         Instruction::decode(&wire),
-        Ok(Instruction::WithdrawCreatorFee { amount: 7 }),
+        Ok(Instruction::WithdrawCreatorFee {
+            amount: 7,
+            asset_index: 3
+        }),
         "byte 90 must dispatch to WithdrawCreatorFee"
+    );
+
+    // GH#420: the OLD 17-byte form must be REFUSED, not silently accepted as
+    // asset 0. A stale caller claiming against the wrong asset's pot is exactly
+    // the confusion this change exists to end.
+    let mut stale = vec![90u8];
+    stale.extend_from_slice(&7u128.to_le_bytes());
+    assert!(
+        Instruction::decode(&stale).is_err(),
+        "the pre-GH#420 17-byte payload must fail to decode"
     );
 
     // And 90 must not have been taken from a neighbour: pin the two adjacent
