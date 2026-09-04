@@ -12650,3 +12650,311 @@ fn v16_bpf_legacy_ledgerless_nonzero_topup_does_not_book_refill_as_recovery() {
     );
     assert_eq!(synced.last_observed_unavailable_principal_atoms, 20);
 }
+
+#[test]
+fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
+    const DOMAIN: u16 = 1;
+
+    let mut env = V16CuEnv::new();
+    let ledger =
+        state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
+
+    // Recreate a legacy funded domain whose canonical ledger never existed.
+    seed_legacy_ledgerless_consumed_backing(
+        &mut env,
+        DOMAIN as usize,
+        60,
+        40,
+    );
+
+    // Historical provider earnings also existed before the ledger did.
+    env.mutate_market(|_cfg, group| {
+        group.source_backing_buckets[DOMAIN as usize].utilization_fee_earnings = 30;
+        group.vault = group
+            .vault
+            .checked_add(30)
+            .expect("#433 legacy earnings vault overflow");
+    });
+
+    env.set_token_account_amount(
+        env.vault,
+        env.mint,
+        env.vault_authority,
+        130,
+    );
+
+    assert!(
+        env.svm.get_account(&ledger).is_none(),
+        "legacy earnings fixture must start without a canonical ledger"
+    );
+
+    let admin = env.admin.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let pid = env.program_id;
+    let market = env.market;
+    let vault = env.vault;
+    let vault_authority = env.vault_authority;
+    let zero_source = env.token_account(admin.pubkey(), 0);
+
+    // Migration must snapshot BOTH principal/loss and already-outstanding
+    // provider earnings.
+    send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpBackingBucket {
+            domain: DOMAIN,
+            amount: 0,
+            expiry_slot: 10,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(zero_source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[&admin],
+    )
+    .expect("#433 migration must reconcile outstanding legacy backing earnings");
+
+    let ledger_account = env
+        .svm
+        .get_account(&ledger)
+        .expect("migration must create the canonical ledger");
+    let migrated =
+        state::read_backing_domain_ledger(&ledger_account.data).unwrap();
+
+    assert_eq!(migrated.total_principal_atoms, 100);
+    assert_eq!(migrated.cumulative_loss_atoms, 40);
+
+    assert_eq!(
+        migrated.total_earnings_atoms, 30,
+        "outstanding pre-ledger earnings must become the migration baseline"
+    );
+    assert_eq!(
+        migrated.total_earnings_withdrawn_atoms, 0,
+        "migration must not invent historical earnings withdrawals"
+    );
+    assert_eq!(
+        migrated.last_observed_bucket_earnings_atoms, 30,
+        "earnings watermark must match the same migration snapshot"
+    );
+
+    // Prove those migrated earnings can subsequently be withdrawn without
+    // making withdrawn earnings exceed recognized earnings.
+    env.svm.expire_blockhash();
+    let dest = env.token_account(admin.pubkey(), 0);
+
+    send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::WithdrawBackingBucketEarnings {
+            domain: DOMAIN,
+            amount: 20,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(ledger, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&admin],
+    )
+    .expect("migrated historical backing earnings must remain withdrawable");
+
+    assert_eq!(env.token_amount(dest), 20);
+    assert_eq!(env.token_amount(vault), 110);
+
+    let ledger_after = env.svm.get_account(&ledger).unwrap();
+    let ledger_after =
+        state::read_backing_domain_ledger(&ledger_after.data).unwrap();
+
+    assert_eq!(ledger_after.total_earnings_atoms, 30);
+    assert_eq!(ledger_after.total_earnings_withdrawn_atoms, 20);
+    assert_eq!(ledger_after.last_observed_bucket_earnings_atoms, 10);
+
+    let (_, group_after) = env.market_state();
+    assert_eq!(
+        group_after.source_backing_buckets[DOMAIN as usize].utilization_fee_earnings,
+        10
+    );
+}
+
+#[test]
+fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_deposits() {
+    const DOMAIN: u16 = 1;
+
+    let mut env = V16CuEnv::new();
+    let ledger =
+        state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
+
+    // Legacy backing exists, but the canonical ledger does not.
+    seed_legacy_ledgerless_consumed_backing(
+        &mut env,
+        DOMAIN as usize,
+        100,
+        0,
+    );
+
+    assert!(
+        env.svm.get_account(&ledger).is_none(),
+        "resolved migration fixture must begin ledgerless"
+    );
+
+    // Enter the normal terminal wind-down state.
+    env.resolve();
+
+    let (_, resolved) = env.market_state();
+
+    assert_eq!(
+        resolved.mode,
+        percolator::MarketModeV16::Resolved,
+        "fixture must actually be resolved"
+    );
+    assert_eq!(
+        resolved.materialized_portfolio_count, 0,
+        "resolved migration requires full user wind-down"
+    );
+    assert_eq!(
+        resolved.c_tot, 0,
+        "resolved migration requires zero remaining user capital"
+    );
+
+    let admin = env.admin.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let pid = env.program_id;
+    let market = env.market;
+    let vault = env.vault;
+    let vault_authority = env.vault_authority;
+
+    // Negative control: allowing reconciliation must NOT reopen real deposits.
+    let source = env.token_account(admin.pubkey(), 1);
+    let vault_before = env.token_amount(vault);
+
+    let nonzero = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpBackingBucket {
+            domain: DOMAIN,
+            amount: 1,
+            expiry_slot: 20,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[&admin],
+    );
+
+    assert!(
+        nonzero.is_err(),
+        "resolved migration exception must never reopen non-zero backing deposits"
+    );
+    assert_eq!(env.token_amount(source), 1);
+    assert_eq!(env.token_amount(vault), vault_before);
+    assert!(
+        env.svm.get_account(&ledger).is_none(),
+        "failed non-zero resolved top-up must not leave the ledger PDA behind"
+    );
+
+    // Positive case: amount == 0 is accounting migration only.
+    env.svm.expire_blockhash();
+
+    send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpBackingBucket {
+            domain: DOMAIN,
+            amount: 0,
+            expiry_slot: 20,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[&admin],
+    )
+    .expect(
+        "#433 resolved zero-capital migration must create the missing canonical ledger",
+    );
+
+    assert_eq!(
+        env.token_amount(source), 1,
+        "zero-capital migration must not consume source tokens"
+    );
+    assert_eq!(
+        env.token_amount(vault), vault_before,
+        "zero-capital migration must not change vault balance"
+    );
+
+    let ledger_account = env
+        .svm
+        .get_account(&ledger)
+        .expect("resolved migration must create the canonical ledger");
+
+    let migrated =
+        state::read_backing_domain_ledger(&ledger_account.data).unwrap();
+
+    assert_eq!(migrated.total_principal_atoms, 100);
+    assert_eq!(migrated.cumulative_loss_atoms, 0);
+    assert_eq!(migrated.cumulative_recovery_atoms, 0);
+    assert_eq!(
+        migrated.total_deposited_atoms, 0,
+        "migration must not fabricate historical deposit flow"
+    );
+
+    // Existing resolved backing withdrawal must work after reconciliation.
+    env.svm.expire_blockhash();
+
+    let dest = env.token_account(admin.pubkey(), 0);
+
+    send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::WithdrawBackingBucket {
+            domain: DOMAIN,
+            amount: 40,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ],
+        &[&admin],
+    )
+    .expect("reconciled resolved legacy backing must be withdrawable");
+
+    assert_eq!(env.token_amount(dest), 40);
+    assert_eq!(env.token_amount(vault), vault_before - 40);
+
+    let ledger_after = env.svm.get_account(&ledger).unwrap();
+    let ledger_after =
+        state::read_backing_domain_ledger(&ledger_after.data).unwrap();
+
+    assert_eq!(ledger_after.total_principal_atoms, 60);
+    assert_eq!(ledger_after.total_principal_withdrawn_atoms, 40);
+}

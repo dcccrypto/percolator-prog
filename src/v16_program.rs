@@ -10214,6 +10214,14 @@ pub mod processor {
         //
         // available = principal - (loss - recovery)
         ledger.total_principal_atoms = gross_principal_atoms;
+
+        // Legacy buckets may already have outstanding provider earnings when
+        // the canonical ledger is created. Seed that outstanding balance into
+        // the migration baseline before pinning the observation watermark;
+        // otherwise pre-ledger earnings would never be recognized by sync.
+        ledger.total_earnings_atoms = bucket.utilization_fee_earnings;
+        ledger.last_observed_bucket_earnings_atoms = bucket.utilization_fee_earnings;
+
         ledger.cumulative_loss_atoms = unavailable_atoms;
         ledger.cumulative_recovery_atoms = 0;
 
@@ -10659,13 +10667,35 @@ pub mod processor {
             let (cfg, group) = state::market_view_mut(&mut market_data)?;
             let configured_slots = group.header.config.max_market_slots.get() as usize;
             let asset_index = domain_usize / 2;
-            if group.header.mode != 0
-                || domain_usize >= configured_slots.saturating_mul(2)
+            if domain_usize >= configured_slots.saturating_mul(2)
                 || asset_index >= configured_slots
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            require_domain_accepts_live_topup_view(&group, domain_usize)?;
+
+            match group.header.mode {
+                // Normal backing deposits remain strictly Live-only.
+                0 => {
+                    require_domain_accepts_live_topup_view(&group, domain_usize)?;
+                }
+
+                // #433 migration-only exception: a fully wound-down Resolved
+                // market may still contain backing funded before canonical
+                // BackingDomainLedger creation became mandatory.
+                //
+                // amount == 0 performs accounting reconciliation only. It must
+                // not reopen backing deposits or mutate engine backing.
+                1 if amount == 0 => {
+                    if group.header.materialized_portfolio_count.get() != 0
+                        || group.header.c_tot.get() != 0
+                    {
+                        return Err(PercolatorError::EngineLockActive.into());
+                    }
+                }
+
+                // Non-zero top-ups remain forbidden after resolution.
+                _ => return Err(PercolatorError::EngineLockActive.into()),
+            }
             let profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
             let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
             (cfg, authorities)
