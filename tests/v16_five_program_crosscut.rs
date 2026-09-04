@@ -1097,6 +1097,9 @@ impl CrosscutEnv {
                     .0,
                     false,
                 ),
+                // GH#412 (account 12): the redeemer's own SOL account. The
+                // redemption PDA's rent returns here rather than to the cranker.
+                AccountMeta::new(depositor.pubkey(), false),
             ],
             data: ProgInstruction::ExecuteRedemption {
                 domain: CROSSCUT_DOMAIN,

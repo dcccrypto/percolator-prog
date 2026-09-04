@@ -461,6 +461,9 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
             derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
             false,
         ),
+        // GH#412 (account 12): the redeemer's own SOL account. The redemption PDA's
+        // rent returns here rather than to the cranker, matching CancelRedemption.
+        AccountMeta::new(d.kp.pubkey(), false),
     ]
 }
 

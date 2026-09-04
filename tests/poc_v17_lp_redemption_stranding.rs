@@ -527,6 +527,10 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
             derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN ^ 1).0,
             false,
         ),
+        // GH#412 (account 12): the redeemer's own SOL account. The redemption
+        // PDA's rent is returned here rather than to the cranker, matching what
+        // CancelRedemption already did.
+        AccountMeta::new(d.kp.pubkey(), false),
     ]
 }
 
@@ -825,6 +829,84 @@ fn control_redemption_executes_while_market_stays_live() {
     assert!(
         state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
         "redemption PDA consumed on successful execute"
+    );
+}
+
+/// GH#412: the redemption PDA's rent goes to the REDEEMER on execute, not to the
+/// cranker.
+///
+/// It used to go to whoever cranked, while `CancelRedemption` returned it to the
+/// redeemer — the same lamports, two different recipients depending on how the
+/// request ended. The rent was the redeemer's money either way.
+///
+/// Asserts BOTH sides of the transfer, not just that the redeemer gained. A test
+/// that only checked the credit would still pass if the lamports had been minted
+/// from nowhere or taken from the wrong account.
+#[test]
+fn execute_returns_redemption_rent_to_the_redeemer_not_the_cranker() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+
+    request(&mut env, &d, MINTED).expect("request");
+
+    let pda_rent = env
+        .svm
+        .get_account(&d.redemption)
+        .expect("redemption PDA")
+        .lamports;
+    assert!(
+        pda_rent > 0,
+        "the redemption PDA must actually hold rent, or this proves nothing"
+    );
+
+    let redeemer_before = env
+        .svm
+        .get_account(&d.kp.pubkey())
+        .expect("redeemer")
+        .lamports;
+    let cranker_before = env
+        .svm
+        .get_account(&env.payer.pubkey())
+        .expect("cranker")
+        .lamports;
+
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("execute succeeds while Live");
+
+    let redeemer_after = env
+        .svm
+        .get_account(&d.kp.pubkey())
+        .expect("redeemer")
+        .lamports;
+
+    // The redeemer receives exactly the PDA's rent. They sign nothing here and pay
+    // no fee, so the delta is the reclaim and nothing else.
+    assert_eq!(
+        redeemer_after - redeemer_before,
+        pda_rent,
+        "redeemer must receive exactly the redemption PDA's rent"
+    );
+
+    // And the cranker does NOT receive it. They pay the tx fee, so their balance
+    // falls; the point is that it does not RISE by the rent.
+    let cranker_after = env
+        .svm
+        .get_account(&env.payer.pubkey())
+        .expect("cranker")
+        .lamports;
+    assert!(
+        cranker_after < cranker_before + pda_rent,
+        "cranker must not collect the redeemer's rent"
+    );
+
+    // The PDA is drained, so the lamports came from where we think they did.
+    assert!(
+        env.svm
+            .get_account(&d.redemption)
+            .map(|a| a.lamports)
+            .unwrap_or(0)
+            == 0,
+        "redemption PDA must be drained to zero"
     );
 }
 
