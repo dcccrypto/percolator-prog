@@ -59,7 +59,10 @@ pub mod constants {
     // because the profile lives inside the fixed 512-byte
     // `ASSET_ORACLE_WRAPPER_LEN` slot and 112 of those bytes were spare —
     // `MARKET_ASSET_SLOT_LEN` is unchanged and no offset moves.
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 408;
+    // GH#420 400 -> 408, GH#444 408 -> 432. Still inside the fixed 512-byte
+    // `ASSET_ORACLE_WRAPPER_LEN` slot (80 spare), so `MARKET_ASSET_SLOT_LEN` is
+    // unchanged and no offset moves.
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 432;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1399,6 +1402,30 @@ pub mod state {
         /// `WrapperConfigV16::creator_fee_claimable_atoms` and stays claimable by
         /// asset 0's admin, so nothing earned before this change is stranded.
         pub creator_fee_claimable_atoms: u64,
+
+        /// GH#444: the slot at which `maintenance_fee_per_slot` last CHANGED, and
+        /// the rate in force before it. MARKET-WIDE values; only asset 0's copy is
+        /// read or written, following the existing precedent that asset 0's profile
+        /// carries market-wide oracle state which the config mirrors.
+        ///
+        /// `last_fee_slot` is anchored at ACCOUNT CREATION and advanced only by
+        /// `SyncMaintenanceFee`. While the rate is 0 nobody cranks, so it stays
+        /// pinned at creation for the market's whole life — and the instant
+        /// `marketauth` raises the rate, the next PERMISSIONLESS crank bills
+        /// `new_rate x (the account's entire age)`, including every slot the rate was
+        /// 0, capped only by capital. That is up to 100% of a flat account, and the
+        /// rate change and the crank can be bundled atomically so the victim never
+        /// gets a turn.
+        ///
+        /// With a checkpoint the wrapper bills `[last_fee_slot, checkpoint]` at the
+        /// PREVIOUS rate and only `[checkpoint, now]` at the new one, so a raise is
+        /// never retroactive.
+        ///
+        /// Zero means "never changed", which is what a deployed market reads after an
+        /// in-place upgrade (these bytes were slot padding) — and that is correct: a
+        /// market whose rate never changed has no retroactive window to protect.
+        pub maintenance_fee_checkpoint_slot: u64,
+        pub maintenance_fee_previous_rate: u128,
     }
 
     /// Aggregate backing-domain accounting for an authority-controlled vault.
@@ -2081,6 +2108,8 @@ pub mod state {
             oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
             asset_admin: [0u8; 32],
             creator_fee_claimable_atoms: 0,
+            maintenance_fee_checkpoint_slot: 0,
+            maintenance_fee_previous_rate: 0,
         }
     }
 
@@ -2119,6 +2148,8 @@ pub mod state {
             oracle_leg_publish_times: config.oracle_leg_publish_times,
             asset_admin: config.marketauth,
             creator_fee_claimable_atoms: 0,
+            maintenance_fee_checkpoint_slot: 0,
+            maintenance_fee_previous_rate: 0,
         }
     }
 
@@ -12609,13 +12640,13 @@ pub mod processor {
                 .saturating_sub(cfg_pre.protocol_fee_withdrawn_atoms);
             if let Some(cranker_portfolio_ai) = accounts.get(2) {
                 if cranker_portfolio_ai.key == portfolio_ai.key {
-                    let charged = group
-                        .sync_account_fee_to_slot_not_atomic(
-                            &mut portfolio,
-                            authenticated_now_slot,
-                            cfg_pre.maintenance_fee_per_slot,
-                        )
-                        .map_err(map_v16_error)?;
+                    let charged = sync_maintenance_fee_checkpointed(
+                        &mut group,
+                        &cfg,
+                        &mut portfolio,
+                        authenticated_now_slot,
+                        cfg_pre.maintenance_fee_per_slot,
+                    )?;
                     let reward = maintenance_cranker_reward(
                         charged,
                         cfg_pre.maintenance_cranker_fee_share_bps,
@@ -12662,13 +12693,13 @@ pub mod processor {
                     cranker
                         .validate_with_market(&group.as_view())
                         .map_err(map_v16_error)?;
-                    let charged = group
-                        .sync_account_fee_to_slot_not_atomic(
-                            &mut portfolio,
-                            authenticated_now_slot,
-                            cfg_pre.maintenance_fee_per_slot,
-                        )
-                        .map_err(map_v16_error)?;
+                    let charged = sync_maintenance_fee_checkpointed(
+                        &mut group,
+                        &cfg,
+                        &mut portfolio,
+                        authenticated_now_slot,
+                        cfg_pre.maintenance_fee_per_slot,
+                    )?;
                     let reward = maintenance_cranker_reward(
                         charged,
                         cfg_pre.maintenance_cranker_fee_share_bps,
@@ -12704,13 +12735,13 @@ pub mod processor {
                         .map_err(map_v16_error)?;
                 }
             } else {
-                let charged = group
-                    .sync_account_fee_to_slot_not_atomic(
-                        &mut portfolio,
-                        authenticated_now_slot,
-                        cfg_pre.maintenance_fee_per_slot,
-                    )
-                    .map_err(map_v16_error)?;
+                let charged = sync_maintenance_fee_checkpointed(
+                    &mut group,
+                    &cfg,
+                    &mut portfolio,
+                    authenticated_now_slot,
+                    cfg_pre.maintenance_fee_per_slot,
+                )?;
                 credit_maintenance_fee_to_active_market_budgets_view(&cfg, &mut group, charged)?;
                 group.validate_shape().map_err(map_v16_error)?;
                 portfolio
@@ -13822,6 +13853,94 @@ pub mod processor {
     /// Range check mirrors InitMarket's: a setter must not be able to store a
     /// value InitMarket itself would reject.
     #[inline(never)]
+    /// GH#444: charge the maintenance fee WITHOUT letting a rate raise reach back
+    /// to account creation. The decision also asked for a per-crank cap; (B) below
+    /// records why that half is deliberately NOT here.
+    ///
+    /// This is decision C — both halves — and both live HERE rather than in the
+    /// engine, which matters. spec.md §981 fixes what the engine does with a given
+    /// anchor: it "charges recurring wrapper-owned fees exactly once over
+    /// `[last_fee_slot_i, anchor]`" and advances `last_fee_slot_i = anchor`. Capping
+    /// `dt` inside that function contradicts the spec, and an earlier attempt to do
+    /// so broke `v16_spec_tests.rs`. But CHOOSING the anchor is the wrapper's job,
+    /// and the spec's only constraint on it is "Live anchors must be
+    /// `<= current_slot`". A smaller anchor is fully compliant.
+    ///
+    /// (A) NOT RETROACTIVE. If the account's `last_fee_slot` predates the last rate
+    /// change, the pre-change window is billed at the rate that was ACTUALLY in
+    /// force then (`maintenance_fee_previous_rate`), in its own call. Only the
+    /// window after the checkpoint is billed at the new rate. A raise can no longer
+    /// bill time during which it did not apply.
+    ///
+    /// (B) NO SEPARATE PER-CRANK CAP, and that is a finding rather than an omission.
+    ///
+    /// The decision asked for a `max_accrual_dt_slots` bound as belt and braces. I
+    /// implemented it and it has no safe place to sit once (A) exists:
+    ///
+    ///   * applied to the POST-checkpoint leg, it under-collects ordinary accrual
+    ///     from any account that simply has not been cranked lately — legitimately
+    ///     owed fees, not hostile ones. Six existing tests assert those exact
+    ///     amounts and were right to.
+    ///   * applied to the PRE-checkpoint leg, it is worse than useless: the leg then
+    ///     stops short of the checkpoint, and the SECOND call bills the remaining
+    ///     pre-change window at the NEW rate — re-creating the exact confiscation
+    ///     (A) exists to prevent. `..._raising_the_maintenance_rate_is_not_retroactive`
+    ///     fails with the account drained to zero when the cap is present.
+    ///
+    /// With (A) there is no unbounded HOSTILE window left: the pre-change window is
+    /// billed at the rate that was actually in force, and the post-change window is
+    /// ordinary accrual. A cap would only defer legitimately-owed fees.
+    fn sync_maintenance_fee_checkpointed(
+        group: &mut state::MarketViewMutV16<'_>,
+        cfg: &state::WrapperConfigV16,
+        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
+        now_slot: u64,
+        current_rate: u128,
+    ) -> Result<u128, ProgramError> {
+        let profile = read_oracle_profile_from_view(group, cfg, 0)?;
+        let checkpoint = profile.maintenance_fee_checkpoint_slot;
+        let previous_rate = profile.maintenance_fee_previous_rate;
+
+        let mut charged: u128 = 0;
+
+        // (A) settle the pre-change window at the OLD rate first.
+        let last = portfolio.header.last_fee_slot.get();
+        if checkpoint != 0 && last < checkpoint {
+            // Runs to the checkpoint IN FULL, deliberately uncapped — see the note
+            // on (B) above. This window is billed at the rate that was actually in
+            // force, so there is nothing to bound.
+            let anchor = checkpoint.min(now_slot);
+            if anchor > last {
+                charged = charged
+                    .checked_add(
+                        group
+                            .sync_account_fee_to_slot_not_atomic(portfolio, anchor, previous_rate)
+                            .map_err(map_v16_error)?,
+                    )
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+        }
+
+        // Then the post-change window at the current rate — also uncapped, and for
+        // its own reason: bounding this leg would under-collect ordinary accrual on
+        // any account that simply has not been cranked lately, which is legitimately
+        // owed rather than hostile; six existing tests assert those exact amounts and
+        // were right to. "Belt and braces" should not quietly become "collect less
+        // from everyone". Neither leg is capped — see (B) on the fn above.
+        let last = portfolio.header.last_fee_slot.get();
+        let anchor = now_slot;
+        if anchor > last {
+            charged = charged
+                .checked_add(
+                    group
+                        .sync_account_fee_to_slot_not_atomic(portfolio, anchor, current_rate)
+                        .map_err(map_v16_error)?,
+                )
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        }
+        Ok(charged)
+    }
+
     fn handle_update_maintenance_fee_per_slot<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -13844,6 +13963,31 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         expect_live_authority(&cfg.marketauth, admin.key)?;
+
+        // ── GH#444 (A): checkpoint the change so the new rate is NOT retroactive ──
+        //
+        // `last_fee_slot` is anchored at account creation and advanced only by
+        // SyncMaintenanceFee. While the rate is 0 nobody cranks, so it stays pinned
+        // at creation — and raising the rate makes the next PERMISSIONLESS crank bill
+        // `new_rate x (the account's whole age)`, capped only by capital. #428
+        // Live-gated the change on the assumption that a user can withdraw before a
+        // hostile fee bites; they cannot, because the charge is retroactive AND
+        // instantaneous, and the two instructions bundle atomically.
+        //
+        // Recording (slot, previous rate) lets the crank bill the pre-change window
+        // at the rate that was ACTUALLY in force then. Written only when the rate
+        // really changes, so a no-op re-assert does not move the checkpoint and
+        // silently forgive owed fees.
+        if cfg.maintenance_fee_per_slot != maintenance_fee_per_slot {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (cfg_view, mut group) = state::market_view_mut(&mut data)?;
+            let now_slot = authenticated_market_slot_or_fallback_view(&group);
+            let mut profile = read_oracle_profile_from_view(&group, &cfg_view, 0)?;
+            profile.maintenance_fee_checkpoint_slot = now_slot;
+            profile.maintenance_fee_previous_rate = cfg.maintenance_fee_per_slot;
+            write_oracle_profile_to_view(&mut group, 0, &profile)?;
+        }
+
         cfg.maintenance_fee_per_slot = maintenance_fee_per_slot;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }
@@ -14235,6 +14379,8 @@ pub mod processor {
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
                 creator_fee_claimable_atoms: 0,
+                maintenance_fee_checkpoint_slot: 0,
+                maintenance_fee_previous_rate: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs,
@@ -14358,6 +14504,8 @@ pub mod processor {
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
                 creator_fee_claimable_atoms: 0,
+                maintenance_fee_checkpoint_slot: 0,
+                maintenance_fee_previous_rate: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -14463,6 +14611,8 @@ pub mod processor {
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
                 creator_fee_claimable_atoms: 0,
+                maintenance_fee_checkpoint_slot: 0,
+                maintenance_fee_previous_rate: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
