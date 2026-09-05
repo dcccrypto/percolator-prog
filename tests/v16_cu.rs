@@ -12958,3 +12958,191 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     assert_eq!(ledger_after.total_principal_atoms, 60);
     assert_eq!(ledger_after.total_principal_withdrawn_atoms, 40);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// GH#453 — a spent backing-domain ledger must not brick the domain
+//
+// Post-#433, TopUpBackingBucket CREATES the domain ledger stamped with the
+// current `backing_bucket_authority`, and WithdrawBackingBucket never closes
+// it. So a fully-withdrawn domain keeps an initialized PDA carrying a stale
+// authority and zero principal.
+//
+// Rotating the domain's authority after that — which CreateLpVault does
+// unconditionally, its born-dead guard having looked only at the BUCKET —
+// used to make every subsequent read of that ledger fail `Unauthorized`,
+// permanently. The reported exit was CloseLpVault, which forfeits the
+// market's LP-vault capability for good.
+//
+// These use UpdateAssetAuthority (tag 65) rather than CreateLpVault to rotate.
+// It is the same rotation reaching the same code with far less scaffolding,
+// and it also covers the plain market-maker handover case, which has the same
+// defect and no LP vault in sight.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Rotate `backing_bucket_authority` for `asset_index`. The incoming authority
+/// co-signs — the program requires it, to prove control of the destination key.
+fn rotate_backing_authority(env: &mut V16CuEnv, asset_index: u16, new_authority: &Keypair) {
+    let admin = env.admin.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let pid = env.program_id;
+    let market = env.market;
+    env.ensure_signer_account(new_authority.pubkey());
+    send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index,
+            kind: 3, // ASSET_AUTH_BACKING_BUCKET
+            new_pubkey: new_authority.pubkey().to_bytes(),
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(new_authority.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        &[&admin, new_authority],
+    )
+    .expect("rotate backing_bucket_authority (tag 65)");
+}
+
+#[test]
+fn v16_bpf_spent_backing_ledger_is_adopted_by_the_next_authority() {
+    let mut env = V16CuEnv::new();
+    let ledger = state::derive_lp_backing_ledger(&env.program_id, &env.market, 1).0;
+
+    // PROOF OF LIFE — if the ledger already existed, the adoption below would
+    // prove nothing about the leftover-ledger path.
+    assert!(
+        env.svm.get_account(&ledger).is_none(),
+        "the ledger PDA must not exist before the first top-up"
+    );
+
+    // (a) The original provider funds the domain. This CREATES the ledger,
+    //     stamped with the admin as backing_bucket_authority.
+    let admin = env.admin.insecure_clone();
+    env.top_up_backing_bucket(1, 100, 10);
+    let stamped =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    assert_eq!(
+        stamped.authority,
+        admin.pubkey().to_bytes(),
+        "the ledger must be stamped with the funding authority"
+    );
+
+    // (b) They withdraw everything. The bucket empties; the ledger PERSISTS.
+    env.svm.expire_blockhash();
+    let dest = env.token_account(admin.pubkey(), 0);
+    env.withdraw_backing_bucket_to_admin_token_with_cu(dest, 1, 100);
+    let spent =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    assert_eq!(spent.total_principal_atoms, 0, "principal fully withdrawn");
+    assert_eq!(
+        spent.authority,
+        admin.pubkey().to_bytes(),
+        "the stale authority is exactly the problem: the account outlives its owner"
+    );
+
+    // (c) The domain's authority is rotated — what CreateLpVault does to the
+    //     registry PDA, and what a plain market-maker handover does too.
+    let successor = Keypair::new();
+    env.svm.expire_blockhash();
+    rotate_backing_authority(&mut env, 0, &successor);
+
+    // (d) The successor funds the domain. This is the call that used to fail
+    //     Unauthorized forever.
+    env.svm.expire_blockhash();
+    env.top_up_backing_bucket_with_authority(&successor, 1, 50, 20);
+
+    let adopted =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    assert_eq!(
+        adopted.authority,
+        successor.pubkey().to_bytes(),
+        "#453: the spent ledger must be adopted by the new authority"
+    );
+    assert_eq!(adopted.total_principal_atoms, 50, "the new deposit is booked");
+
+    // Adoption RE-SEEDS. Inheriting the predecessor's withdrawal history would
+    // import their numbers into the successor's accounting, and total_earnings
+    // feeds lp_vault_nav_atoms — a mispricing, not just an untidy record.
+    assert_eq!(
+        adopted.total_principal_withdrawn_atoms, 0,
+        "#453: the predecessor's 100-atom withdrawal must not follow the successor"
+    );
+    assert_eq!(adopted.cumulative_loss_atoms, 0);
+    assert_eq!(adopted.cumulative_recovery_atoms, 0);
+}
+
+#[test]
+fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
+    // The other half, and the reason adoption is gated on being SPENT rather
+    // than applied to any mismatch. A ledger with principal still on it
+    // represents a claim; re-keying that would strand it. Without this the fix
+    // would be "the authority check no longer applies", which is not a fix.
+    let mut env = V16CuEnv::new();
+    let ledger = state::derive_lp_backing_ledger(&env.program_id, &env.market, 1).0;
+
+    env.top_up_backing_bucket(1, 100, 10);
+    env.svm.expire_blockhash();
+    // Withdraw only PART of it — the ledger keeps 60 atoms of principal.
+    let admin_dest = env.admin.pubkey();
+    let dest = env.token_account(admin_dest, 0);
+    env.withdraw_backing_bucket_to_admin_token_with_cu(dest, 1, 40);
+    let partial =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    assert_eq!(partial.total_principal_atoms, 60, "value remains on the ledger");
+
+    let successor = Keypair::new();
+    env.svm.expire_blockhash();
+    rotate_backing_authority(&mut env, 0, &successor);
+
+    env.svm.expire_blockhash();
+    env.ensure_signer_account(successor.pubkey());
+    let source = env.token_account(successor.pubkey(), 50);
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let market = env.market;
+    let vault = env.vault;
+    // expiry_slot MUST match the bucket's existing expiry (10). An earlier version
+    // of this test used 20, and the engine refused the top-up because a non-empty
+    // Fresh bucket cannot take a deposit at a different expiry — so the assertion
+    // below passed while proving nothing about the authority guard. The negative
+    // control caught it: removing the guard entirely left this test green.
+    let err = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpBackingBucket {
+            domain: 1,
+            amount: 50,
+            expiry_slot: 10,
+        },
+        vec![
+            AccountMeta::new(successor.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[&successor],
+    );
+    // Assert the SPECIFIC refusal. `is_err()` alone is what let the expiry
+    // mismatch above masquerade as an authorization failure.
+    let msg = err.expect_err(
+        "#453: a ledger still carrying principal must NOT be adopted — the \
+         predecessor's claim would be silently transferred",
+    );
+    assert!(
+        msg.contains("Custom(8)"),
+        "expected Unauthorized (Custom(8)), got: {msg}"
+    );
+
+    // And it must be a true refusal, not a partial write.
+    let after =
+        state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
+    assert_eq!(after.total_principal_atoms, 60);
+    assert_eq!(after.authority, env.admin.pubkey().to_bytes());
+}

@@ -10467,11 +10467,67 @@ pub mod processor {
     ) -> Result<(state::BackingDomainLedgerAccountV16, bool), ProgramError> {
         if state::is_initialized(data) {
             let ledger = state::read_backing_domain_ledger(data)?;
-            if ledger.market_group != market_group
-                || ledger.authority != authority
-                || ledger.domain != domain
-            {
+            if ledger.market_group != market_group || ledger.domain != domain {
                 return Err(PercolatorError::Unauthorized.into());
+            }
+            if ledger.authority != authority {
+                // GH#453. A domain ledger outlives the authority that opened it.
+                // Post-#433 `TopUpBackingBucket` creates one stamped with the
+                // market-maker's `backing_bucket_authority`, and
+                // `WithdrawBackingBucket` never closes it — so after a full
+                // withdrawal the PDA persists with zero principal and a stale
+                // authority. `CreateLpVault` then rotates the domain to the
+                // registry PDA, its born-dead guard having looked only at the
+                // BUCKET, and every subsequent `DepositToLpVault` died here with
+                // `Unauthorized`, permanently. The only exit was `CloseLpVault`,
+                // which forfeits the market's LP-vault capability for good.
+                //
+                // A SPENT ledger is adopted rather than refused. "Spent" is not a
+                // judgement call — it means the account holds no value and owes
+                // nobody anything:
+                //
+                //   * no principal, and none of it merely withdrawn-on-paper: the
+                //     BUCKET is checked too, so the engine agrees it is empty;
+                //   * no unclaimed earnings.
+                //
+                // Adoption RE-SEEDS rather than re-keys. Inheriting the previous
+                // provider's `cumulative_loss_atoms` would import their impairment
+                // history into the new authority's NAV, which is a mispricing, not
+                // a permission question.
+                //
+                // This cannot be steered by a caller: `authority` is always read
+                // from the asset profile (`domain_authorities_from_profile`), never
+                // taken from the instruction, so no one can present themselves as
+                // the adopter. And a ledger with ANY value left still refuses —
+                // rotating a funded ledger away from its provider would strand
+                // their claim, which is the thing the check exists to prevent.
+                let has_principal = ledger.total_principal_atoms != 0;
+                let has_unclaimed_earnings =
+                    ledger.total_earnings_atoms > ledger.total_earnings_withdrawn_atoms;
+                let bucket_holds_backing = bucket.fresh_unliened_backing_num != 0
+                    || bucket.valid_liened_backing_num != 0
+                    || bucket.consumed_liened_backing_num != 0
+                    || bucket.impaired_liened_backing_num != 0;
+                if has_principal || has_unclaimed_earnings || bucket_holds_backing {
+                    return Err(PercolatorError::Unauthorized.into());
+                }
+                let adopted = state::BackingDomainLedgerAccountV16 {
+                    market_group,
+                    authority,
+                    total_principal_atoms: 0,
+                    total_deposited_atoms: 0,
+                    total_principal_withdrawn_atoms: 0,
+                    total_earnings_atoms: 0,
+                    total_earnings_withdrawn_atoms: 0,
+                    last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
+                    cumulative_loss_atoms: 0,
+                    cumulative_recovery_atoms: 0,
+                    last_observed_unavailable_principal_atoms:
+                        backing_unavailable_principal_atoms(bucket)?,
+                    domain,
+                    _padding: [0u8; 14],
+                };
+                return Ok((adopted, true));
             }
             Ok((ledger, true))
         } else {
