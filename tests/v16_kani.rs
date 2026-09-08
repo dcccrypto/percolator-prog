@@ -2087,7 +2087,7 @@ fn kani_protocol_skim_conserves_total_fee() {
     );
     kani::cover!(
         fee_a == 0,
-        "skim conservation covers the maker side's zero fee (taker-only)"
+        "skim conservation covers a zero fee on one leg"
     );
 
     if let Ok(protocol_cut_a) = protocol_cut_a {
@@ -2105,9 +2105,13 @@ fn kani_protocol_skim_conserves_total_fee() {
         assert!(domain_fee_b.is_some());
         assert_eq!(domain_fee_b.unwrap() + protocol_cut_b, fee_b);
     }
-    // Taker-only (§1A): the maker leg's fee is always 0, so skimming 20% of
-    // 0 must be 0 -- the maker's domain gets exactly the 0 credit it should,
-    // no special-casing needed at the skim site.
+    // Skimming 20% of 0 must be 0, so a leg charged nothing gets exactly the
+    // 0 credit it should -- no special-casing needed at the skim site.
+    //
+    // This is stated per-leg on purpose. Since engine GH#133 the maker
+    // fallback fires on a taker SHORTFALL, not only on a zero payment, so
+    // both legs can carry a nonzero fee on the same fill; `fee_a`/`fee_b`
+    // are independently symbolic above and the proof covers that case.
     if fee_a == 0 {
         assert_eq!(protocol_cut_a, Ok(0));
     }

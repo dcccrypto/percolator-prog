@@ -8282,10 +8282,24 @@ pub mod processor {
                 } else {
                     0
                 };
-            // Four-way split (2026-07-19 design). Taker-only (§1A) guarantees
-            // exactly one of outcome.fee_a/fee_b is nonzero, so splitting 0 is
-            // all-zeros and the maker's domain gets exactly the 0 credit it
-            // should -- no special-casing needed.
+            // Four-way split (2026-07-19 design). Both legs are split
+            // independently and every downstream leg is summed additively, so
+            // this site is correct whether one or both of outcome.fee_a/fee_b
+            // is nonzero.
+            //
+            // It previously documented a stronger guarantee -- that taker-only
+            // (§1A) makes exactly one of the two nonzero. That has NOT held
+            // since engine GH#133: the maker fallback fires on a taker
+            // SHORTFALL rather than only on a zero payment, so a taker who can
+            // afford part of the fee pays what it can and the maker is charged
+            // the remainder. Both legs are then nonzero on the same fill.
+            //
+            // Nothing here had to change, because `split_trade_fee` assigns
+            // residual dust to insurance and therefore conserves its input
+            // exactly: splitting `fee` as two parts credits the same total as
+            // splitting it once. The comment is corrected so that a future
+            // change does not rely on an exclusivity guarantee the engine no
+            // longer provides.
             let split_a = policy_v16::split_trade_fee(
                 outcome.fee_a,
                 constants::PROTOCOL_FEE_BPS,
