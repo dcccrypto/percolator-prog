@@ -14867,6 +14867,36 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineStale.into());
             }
+
+            // GH#2354 — bound how far one push may move the mark.
+            //
+            // Until now this handler checked the authority and the absolute range
+            // (0 < mark <= MAX_ORACLE_PRICE), then wrote whatever it was given. A
+            // compromised or fat-fingered oracle authority could relocate the
+            // settlement mark arbitrarily in a single instruction.
+            //
+            // Deliberately REUSES `max_price_move_bps_per_slot`, which is already
+            // per-market, admin-configured and validated at init (v16.rs:2355-2359
+            // rejects 0 and anything above MAX_MARGIN_BPS). A second independent bound
+            // would repeat the mistake that left the confirm-trips floor on one keeper
+            // and not the other: one property, one rule.
+            //
+            // Scaled by elapsed slots, matching the engine's own budget formula
+            // (`price_budget_bps = max_price_move_bps_per_slot * dt_slots`, v16.rs:2149
+            // and :2416). That scaling is what stops this bricking a market — after an
+            // outage the permitted move grows with the gap, so a keeper that has been
+            // down can still re-price when it returns.
+            //
+            // Exempt: the first push for an asset, which has no baseline to deviate from.
+            if !auth_mark_move_within_budget(
+                profile.mark_ewma_e6,
+                mark_e6,
+                group.header.config.max_price_move_bps_per_slot.get(),
+                authenticated_slot.saturating_sub(profile.mark_ewma_last_slot),
+            ) {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+
             profile.mark_ewma_e6 = mark_e6;
             profile.mark_ewma_last_slot = authenticated_slot;
             profile.oracle_target_price_e6 = mark_e6;
@@ -20356,4 +20386,98 @@ pub mod entrypoint {
 
 pub mod risk {
     pub use percolator::*;
+}
+
+/// GH#2354 — is a proposed AuthMark move inside the market's configured budget?
+///
+/// Extracted as a pure function so it can be tested against the REAL code the handler
+/// runs, rather than a copy of it. A unit test that re-implements the arithmetic
+/// inline proves only that the test agrees with itself.
+///
+/// `prev_mark == 0` means no baseline (first push for the asset) and is always allowed.
+/// `elapsed_slots` is floored at 1 so a same-slot correction still gets one slot of
+/// budget rather than zero.
+pub(crate) fn auth_mark_move_within_budget(
+    prev_mark: u64,
+    new_mark: u64,
+    max_price_move_bps_per_slot: u64,
+    elapsed_slots: u64,
+) -> bool {
+    if prev_mark == 0 {
+        return true;
+    }
+    let budget_bps = (max_price_move_bps_per_slot as u128)
+        .saturating_mul(elapsed_slots.max(1) as u128);
+    let delta = (new_mark as u128).abs_diff(prev_mark as u128);
+    // delta/prev <= budget/10_000, cross-multiplied to stay in integers.
+    delta.saturating_mul(10_000) <= budget_bps.saturating_mul(prev_mark as u128)
+}
+
+#[cfg(test)]
+mod auth_mark_budget_tests {
+    use super::auth_mark_move_within_budget;
+
+    /// The market default is 10_000 bps/slot (v16.rs:1923).
+    const DEFAULT_BPS_PER_SLOT: u64 = 10_000;
+
+    #[test]
+    fn first_push_is_always_allowed_there_is_no_baseline() {
+        assert!(auth_mark_move_within_budget(0, u64::MAX, 1, 0));
+    }
+
+    #[test]
+    fn a_move_inside_one_slot_of_budget_is_allowed() {
+        // 1 bps/slot, 1 slot -> 0.01% of 1_000_000 is 100.
+        assert!(auth_mark_move_within_budget(1_000_000, 1_000_100, 1, 1));
+    }
+
+    #[test]
+    fn a_move_beyond_the_budget_is_REJECTED() {
+        assert!(!auth_mark_move_within_budget(1_000_000, 1_000_101, 1, 1));
+    }
+
+    #[test]
+    fn the_bound_is_symmetric_down_moves_are_bounded_too() {
+        assert!(auth_mark_move_within_budget(1_000_000, 999_900, 1, 1));
+        assert!(!auth_mark_move_within_budget(1_000_000, 999_899, 1, 1));
+    }
+
+    #[test]
+    fn budget_scales_with_elapsed_slots_so_an_outage_does_not_brick_the_market() {
+        // The same 1% move that one slot refuses is accepted after 100 slots.
+        let one_percent_up = 1_010_000;
+        assert!(!auth_mark_move_within_budget(1_000_000, one_percent_up, 1, 1));
+        assert!(auth_mark_move_within_budget(1_000_000, one_percent_up, 1, 100));
+    }
+
+    #[test]
+    fn a_long_outage_permits_a_large_re_price() {
+        // The keeper was down 19 days (#108). At ~2.5 slots/s that is ~4.1M slots;
+        // the budget must be wide enough that returning does not brick the market.
+        let slots_19_days = 4_100_000u64;
+        assert!(auth_mark_move_within_budget(
+            1_000_000,
+            50_000_000, // a 50x re-price
+            DEFAULT_BPS_PER_SLOT,
+            slots_19_days,
+        ));
+    }
+
+    #[test]
+    fn same_slot_push_still_gets_one_slot_of_budget_not_zero() {
+        // elapsed 0 must floor to 1, otherwise every same-slot correction reverts.
+        assert!(auth_mark_move_within_budget(1_000_000, 1_000_100, 1, 0));
+        assert!(!auth_mark_move_within_budget(1_000_000, 1_000_101, 1, 0));
+    }
+
+    #[test]
+    fn an_unchanged_mark_is_always_allowed() {
+        assert!(auth_mark_move_within_budget(1_000_000, 1_000_000, 1, 1));
+    }
+
+    #[test]
+    fn saturating_arithmetic_does_not_panic_at_the_extremes() {
+        assert!(auth_mark_move_within_budget(u64::MAX, 1, u64::MAX, u64::MAX));
+        assert!(!auth_mark_move_within_budget(1, u64::MAX, 0, 1));
+    }
 }
