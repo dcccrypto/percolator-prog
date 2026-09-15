@@ -12,7 +12,7 @@ extern crate std;
 
 use alloc::vec::Vec;
 use percolator::{
-    v16_domain_count_for_market_slots, BackingBucketStatusV16, MarketModeV16,
+    v16_domain_count_for_market_slots, AutoCrankWorkV16, BackingBucketStatusV16, MarketModeV16,
     PermissionlessCrankActionV16, PermissionlessCrankRequestV16, RebalanceRequestV16, SideV16,
     SourceCreditStateV16, TradeRequestV16, V16Config, V16Error, BOUND_SCALE,
 };
@@ -15189,6 +15189,50 @@ pub mod processor {
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // FIX F-05 (register row C-W-04): a market in Recovery has exactly ONE
+            // bounded public step left -- release the remaining obligation, then the
+            // value-neutral transition to Resolved. The engine's escalation valve
+            // (`permissionless_auto_crank_not_atomic`, engine 2c38570a:src/v16.rs:15171,
+            // Recovery arm :15181-15210) is the ONLY writer of `Resolved` that a
+            // permissionless caller can reach: the admin `ResolveMarket` (tag 19,
+            // :12880) and `ResolveStalePermissionless` (tag 44, :14368) both refuse
+            // unless `mode == 0`, and `permissionless_crank_not_atomic` rejects every
+            // non-`Recover` action outside Live (engine :15436-15440). Without this
+            // branch Recovery is ABSORBING: every account's capital is locked in the
+            // market forever, with no admin exit.
+            //
+            // Shape copied from upstream `aeyakovenko/percolator-prog`
+            // `src/v16_program.rs:13668-13684` (`handle_permissionless_crank_zero_copy`),
+            // including its reason for passing NO observations: Recovery work is
+            // entirely committed-state work, and stale Live-mode oracle hints can land
+            // after another cranker declares Recovery. We therefore take this branch
+            // BEFORE any oracle read/write, so a stale feed cannot block the only exit.
+            //
+            // The caller-supplied `action` / `asset_index` are deliberately IGNORED
+            // here (they are validated above, so the ABI is unchanged): the engine
+            // self-classifies the step and its asset. The Live path below is untouched.
+            if group.header.mode == 2 {
+                let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+                let mut portfolio = state::portfolio_view_mut_for_market_slots(
+                    &mut portfolio_data,
+                    max_market_slots,
+                )?;
+                expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                group
+                    .permissionless_auto_crank_not_atomic(
+                        &mut portfolio,
+                        AutoCrankWorkV16 {
+                            now_slot: authenticated_now_slot,
+                            observations: &[],
+                            resolved_close_fee_rate_per_slot: 0,
+                        },
+                    )
+                    .map_err(map_v16_error)?;
+                group.validate_shape().map_err(map_v16_error)?;
+                // `cfg` is untouched on this path, so there is nothing to write back
+                // (upstream returns here the same way).
+                return Ok(());
             }
             let crank_action = match action {
                 0 => PermissionlessCrankActionV16::Refresh,

@@ -22371,3 +22371,669 @@ fn b4_batch_guard_site_enumeration() {
         "the reconstructed-total cross-check is untouched"
     );
 }
+
+// ===========================================================================
+// VERIFY-LOOP PoC BLOCK -- C-W-04
+// "tag 43 ForfeitRecoveryLeg with a budget that principal + insurance cannot
+//  cover reaches ForfeitResidualStepV16::CommitRecovery, flips the MARKET mode
+//  to Recovery and returns Ok."
+//
+// Appended to tests/v16_wrapper.rs in a throwaway percolator-prog worktree at
+// origin/main (480e23a0) whose `percolator` path dep points at an engine
+// worktree at 2c38570a (candidate) / at e8acd708 x 9483ee90 (deployed).
+// The file's own fixture helpers are reused verbatim.
+//
+// THE STATE UNDER TEST (2c38570a:src/v16.rs:8489-8503, source-verified):
+//   "a Recovery asset whose OPPOSITE side has already completed terminal
+//    wind-down holds a real position on one side and nothing on the other,
+//    with both obligation counts at 0 -- the very state
+//    forfeit_recovery_leg_not_atomic's CommitRecovery arm exists for."
+// The MARKET stays Live throughout; only the ASSET lifecycle is Recovery, which
+// is what `leg_is_dead_for_forfeit` (:21134-21145) accepts.
+// ===========================================================================
+
+/// 10e21 B-index units of LONG-domain social loss already booked against the
+/// asset while this leg's own `b_snap` is still 0.
+const CW04_DEBT_B: u128 = 10 * percolator::SOCIAL_LOSS_DEN;
+/// The same debt expressed in COLLATERAL ATOMS at `loss_weight == POS_SCALE`:
+/// 10e21 * 1e6 / 1e21 = 10_000_000.
+const CW04_DEBT_ATOMS: u128 = 10_000_000;
+/// Principal behind the dead leg. Strictly less than CW04_DEBT_ATOMS, so a
+/// terminal forfeit leaves a residual that principal cannot cover.
+const CW04_PRINCIPAL: u128 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cw04Snap {
+    mode: MarketModeV16,
+    recovery_reason: Option<PermissionlessRecoveryReasonV16>,
+    capital: u128,
+    pnl: i128,
+    b_snap: u128,
+    leg_active: bool,
+    residual_remaining: u128,
+    insurance: u128,
+}
+
+fn cw04_snap(market: &TestAccount, portfolio: &TestAccount) -> Cw04Snap {
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    let leg = account
+        .legs
+        .iter()
+        .copied()
+        .find(|l| l.active && l.asset_index as usize == 0);
+    Cw04Snap {
+        mode: group.mode,
+        recovery_reason: group.recovery_reason,
+        capital: account.capital,
+        pnl: account.pnl,
+        b_snap: leg.map(|l| l.b_snap).unwrap_or(0),
+        leg_active: leg.is_some(),
+        residual_remaining: account.close_progress.residual_remaining,
+        insurance: group.insurance,
+    }
+}
+
+struct Cw04Fixture {
+    admin: TestAccount,
+    market: TestAccount,
+    victim_owner: TestAccount,
+    victim: TestAccount,
+    cp_owner: TestAccount,
+    cp: TestAccount,
+    ba_owner: TestAccount,
+    ba: TestAccount,
+    bb_owner: TestAccount,
+    bb: TestAccount,
+}
+
+/// TWO assets in ONE market group:
+///   asset 0 -- the dead Recovery-lifecycle asset the victim's LONG leg sits on
+///   asset 1 -- a completely healthy matched pair between two BYSTANDERS who
+///              have nothing to do with asset 0.
+/// `absorbing_side_empty = false` builds the deployed-representable variant
+/// (short side still populated, so validate_shape's Live symmetry rule holds at
+/// 9483ee90 too).
+fn cw04_fixture(absorbing_side_empty: bool) -> Cw04Fixture {
+    cw04_fixture_with(absorbing_side_empty, CW04_PRINCIPAL, CW04_DEBT_B)
+}
+
+fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) -> Cw04Fixture {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                // pre-configures asset slots 0 and 1 as Active
+                *max_portfolio_assets = 2;
+            }
+        }),
+    );
+
+    let mut victim_owner = signer();
+    let mut cp_owner = signer();
+    let mut ba_owner = signer();
+    let mut bb_owner = signer();
+    let mut victim = portfolio_account();
+    let mut cp = portfolio_account();
+    let mut ba = portfolio_account();
+    let mut bb = portfolio_account();
+    init_portfolio(&mut victim_owner, &mut market, &mut victim);
+    init_portfolio(&mut cp_owner, &mut market, &mut cp);
+    init_portfolio(&mut ba_owner, &mut market, &mut ba);
+    init_portfolio(&mut bb_owner, &mut market, &mut bb);
+    deposit(&mut victim_owner, &mut market, &mut victim, principal);
+    deposit(&mut cp_owner, &mut market, &mut cp, 10_000_000);
+    deposit(&mut ba_owner, &mut market, &mut ba, 10_000_000);
+    deposit(&mut bb_owner, &mut market, &mut bb, 10_000_000);
+
+    // asset 0: victim LONG 1 unit @100 against the counterparty
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut victim_owner,
+            &mut cp_owner,
+            &mut market,
+            &mut victim,
+            &mut cp,
+        ],
+    )
+    .unwrap();
+    // asset 1: two UNRELATED bystanders hold a matched, healthy pair
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut ba_owner,
+            &mut bb_owner,
+            &mut market,
+            &mut ba,
+            &mut bb,
+        ],
+    )
+    .unwrap();
+
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        // Asset 0 enters Recovery LIFECYCLE. The MARKET mode stays Live.
+        group.assets[0].lifecycle = AssetLifecycleV16::Recovery;
+        // A real outstanding LONG-domain B debt: b_target_for_leg reports
+        // b_remaining = CW04_DEBT_B for a Long leg whose own b_snap is 0.
+        group.assets[0].b_long_num = debt_b;
+        if absorbing_side_empty {
+            // The ABSORBING (short) side has completed terminal wind-down.
+            group.assets[0].oi_eff_short_q = 0;
+            group.assets[0].loss_weight_sum_short = 0;
+            group.assets[0].stored_pos_count_short = 0;
+        }
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    if absorbing_side_empty {
+        // Retire the counterparty's short leg with its side, so no account
+        // still claims a position the asset no longer counts.
+        let mut account = state::read_portfolio(&cp.data).unwrap();
+        for leg in account.legs.iter_mut() {
+            if leg.asset_index as usize == 0 {
+                leg.active = false;
+            }
+        }
+        account.active_bitmap = active_bitmap_with(&[]);
+        state::write_portfolio(&mut cp.data, &account).unwrap();
+    }
+
+    Cw04Fixture {
+        admin,
+        market,
+        victim_owner,
+        victim,
+        cp_owner,
+        cp,
+        ba_owner,
+        ba,
+        bb_owner,
+        bb,
+    }
+}
+
+fn cw04_forfeit(f: &mut Cw04Fixture, budget: u128) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 0,
+            b_delta_budget: budget,
+        },
+        &mut [&mut f.victim_owner, &mut f.market, &mut f.victim],
+    )
+}
+
+
+// ===========================================================================
+// F-05 REGRESSION BLOCK -- register row C-W-04
+//
+// Defect (verifier verdict, verify/items/C-W-04.md §6): our wrapper exposed the
+// engine's only Recovery -> Resolved route NOWHERE, so once any declarer flipped
+// `MarketGroup.mode` to Recovery the market was ABSORBING: admin `ResolveMarket`
+// (tag 19), `ResolveStalePermissionless` (tag 44) and every permissionless crank
+// arm all returned Custom(21), and no bystander could ever withdraw again.
+//
+// Fix: `handle_permissionless_crank_zero_copy` now routes `group.header.mode == 2`
+// into `permissionless_auto_crank_not_atomic` (engine 2c38570a:src/v16.rs:15171,
+// Recovery arm :15181-15210), the shape upstream's wrapper uses at
+// `aeyakovenko/percolator-prog:src/v16_program.rs:13668-13684`.
+//
+// These tests EXTEND `verify/poc/C-W-04/`: the fixture helpers above are the PoC's,
+// verbatim; the assertions below are the FIXED behaviour. The old lock assertions
+// are kept verbatim in `f05_old_c_w_04_lock_assertions_must_now_fail`, wrapped in
+// `#[should_panic]` so that reverting the wiring turns that test red again.
+// ===========================================================================
+
+/// `PercolatorError::EngineLockActive` -- ordinal 21 in `error::PercolatorError`.
+const F05_LOCK_ACTIVE: u32 = 21;
+
+/// One permissionless crank (tag 5) by an unrelated STRANGER (no signature, no
+/// portfolio of their own) against `portfolio`. `action`/`asset_index` are the
+/// wire fields the Recovery branch deliberately ignores.
+fn f05_stranger_crank(
+    market: &mut TestAccount,
+    portfolio: &mut TestAccount,
+    now_slot: u64,
+) -> Result<(), ProgramError> {
+    let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+    run_ix(
+        Instruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+        &mut [&mut stranger, market, portfolio],
+    )
+}
+
+fn f05_mode(market: &TestAccount) -> MarketModeV16 {
+    state::read_market(&market.data).unwrap().1.mode
+}
+
+// ---------------------------------------------------------------------------
+// (1) THE FLIP: after the tag-43 CommitRecovery flip, the newly wired
+//     permissionless route advances the market to Resolved, and the bystanders
+//     get their capital out -- with NO admin instruction anywhere in the test.
+// ---------------------------------------------------------------------------
+#[test]
+fn f05_permissionless_crank_advances_recovery_to_resolved_and_unlocks_bystanders() {
+    let mut f = cw04_fixture(true);
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Live);
+
+    // The C-W-04 flip, unchanged: owner-signed tag 43 on the dead Recovery-lifecycle
+    // leg with a budget principal + insurance cannot cover -> CommitRecovery.
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("the flipping call returns Ok");
+    assert_eq!(
+        f05_mode(&f.market),
+        MarketModeV16::Recovery,
+        "precondition: the market is in the absorbing state C-W-04 measured"
+    );
+    let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+
+    // THE FIX: a stranger's tag-5 crank, cranked over the BYSTANDER's portfolio.
+    // No signer, no admin, no owner. One instruction per bounded step; loop a
+    // small bounded number of times and record every step.
+    let mut steps: Vec<Result<(), ProgramError>> = Vec::new();
+    for i in 0..4u64 {
+        if f05_mode(&f.market) == MarketModeV16::Resolved {
+            break;
+        }
+        let r = f05_stranger_crank(&mut f.market, &mut f.ba, slot + 1 + i);
+        println!(
+            "F-05 step {i}: stranger tag5 crank -> {r:?} mode={:?}",
+            f05_mode(&f.market)
+        );
+        steps.push(r);
+    }
+    assert!(
+        steps.iter().any(|r| r.is_ok()),
+        "at least one permissionless step must succeed"
+    );
+    assert_eq!(
+        f05_mode(&f.market),
+        MarketModeV16::Resolved,
+        "F-05: Recovery must no longer be absorbing -- a permissionless crank reaches Resolved"
+    );
+
+    // And the bystanders can now actually get out. `CloseResolved` is the terminal
+    // exit that returned Custom(21) for everyone in the C-W-04 measurement.
+    let mint = Pubkey::new_from_array(state::read_market(&f.market.data).unwrap().0.collateral_mint);
+    let payout = state::read_portfolio(&f.ba.data).unwrap().capital;
+    let payout_u64 = u64::try_from(payout).unwrap_or(0);
+    let mut dest_token = user_token_account(f.ba_owner.key, mint, 0);
+    let mut vault_token = vault_token_account(&f.market, mint, payout_u64.max(1));
+    let mut vault_auth = vault_authority_account(&f.market);
+    let mut token_program = token_program_account();
+    let close_resolved = run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut f.ba_owner,
+            &mut f.market,
+            &mut f.ba,
+            &mut dest_token,
+            &mut vault_token,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    println!(
+        "F-05 bystander CloseResolved after the permissionless finalisation = {close_resolved:?} \
+         (capital was {payout})"
+    );
+    assert!(
+        close_resolved.is_ok(),
+        "F-05: a bystander must be able to take the resolved exit without any admin action"
+    );
+    assert_ne!(
+        close_resolved,
+        Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+        "F-05: the C-W-04 lock must be gone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (1b) The old lock assertions, VERBATIM from
+//      verify/poc/C-W-04/verify_C-W-04_exit_routes_appended_to_v16_wrapper.rs
+//      (`verify_c_w_04_who_can_advance_the_market_out_of_recovery`). They asserted
+//      that NOTHING moves the market out of Recovery. With the fix wired they must
+//      FAIL -- the permissionless crank now moves it -- so the test is wrapped in
+//      `#[should_panic]`. Revert the wiring and this test goes red with
+//      "test did not panic as expected": that is the F-05 negative control.
+// ---------------------------------------------------------------------------
+#[test]
+#[should_panic(expected = "nothing above moved the market out of Recovery")]
+fn f05_old_c_w_04_lock_assertions_must_now_fail() {
+    let mut f = cw04_fixture(true);
+    assert_eq!(cw04_snap(&f.market, &f.victim).mode, MarketModeV16::Live);
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("the flipping call returns Ok");
+    assert_eq!(
+        cw04_snap(&f.market, &f.victim).mode,
+        MarketModeV16::Recovery
+    );
+
+    // (a) the MARKET AUTHORITY's own ResolveMarket (tag 19).
+    let admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut f.admin, &mut f.market]);
+    let m1 = cw04_snap(&f.market, &f.victim).mode;
+    println!("F-05/old exit(a) admin ResolveMarket (tag 19)   = {admin_resolve:?} mode={m1:?}");
+
+    // (b) the PERMISSIONLESS stale resolve (tag 44), far past any maturity.
+    let perm_resolve = run_ix(
+        Instruction::ResolveStalePermissionless {
+            now_slot: 900_000_000,
+        },
+        &mut [&mut f.market],
+    );
+    let m2 = cw04_snap(&f.market, &f.victim).mode;
+    println!("F-05/old exit(b) ResolveStalePermissionless     = {perm_resolve:?} mode={m2:?}");
+
+    // (c) every permissionless-crank arm, on the HEALTHY asset 1, by a stranger.
+    for (label, action) in [
+        ("Refresh", 0u8),
+        ("Liquidate", 1u8),
+        ("SettleB", 2u8),
+        ("Recover", 3u8),
+    ] {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action,
+                asset_index: 1,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        let m = cw04_snap(&f.market, &f.victim).mode;
+        println!(
+            "F-05/old exit(c) tag5 action={action} ({label:>9}) on HEALTHY asset 1 = {res:?} mode={m:?}"
+        );
+    }
+
+    assert_eq!(
+        cw04_snap(&f.market, &f.victim).mode,
+        MarketModeV16::Recovery,
+        "nothing above moved the market out of Recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (2) F-02 NON-REGRESSION. The wired Recovery arm reaches
+//     `forfeit_recovery_leg_not_atomic` (engine :15189), which opens a close
+//     ledger at `:21493`. The F-02 route-3 lock -- `begin_close_progress_ledger`
+//     `:16955` `if !current.close_slot_available() { LockActive }` -- must STILL
+//     bite through the new public route, i.e. wiring the crank must not hand a
+//     public caller a way past an already-open close ledger on someone else's
+//     account. Shape mirrors verify/poc/F-02/poc_F02.rs
+//     `route3_recovery_forfeit_meeting_a_pending_ledger_is_refused_at_
+//      begin_close_progress_ledger`, driven through the WRAPPER instead of the
+//     engine API.
+// ---------------------------------------------------------------------------
+/// Case A -- the ledger the C-W-04 flip itself leaves behind: OPEN with a
+/// PENDING RESIDUAL. The engine's own step selector refuses to pick the forfeit
+/// for such an account at all (`release_allowed = !has_pending_residual()`,
+/// engine 2c38570a:src/v16.rs:15051-15055), so the wired crank can never carry a
+/// booking into it. Measured: the ledger is byte-unchanged across the crank.
+#[test]
+fn f05_f02_pending_residual_ledger_is_never_booked_through_the_wired_crank() {
+    let mut f = cw04_fixture(true);
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("flip");
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Recovery);
+
+    let before = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    println!(
+        "F-05/F-02 (A) victim ledger before: active={} finalized={} residual_remaining={} \
+         b_loss_booked={} explicit_loss_assigned={}",
+        before.active,
+        before.finalized,
+        before.residual_remaining,
+        before.b_loss_booked,
+        before.explicit_loss_assigned
+    );
+    assert!(
+        before.active && !before.finalized && before.residual_remaining != 0,
+        "precondition: an open, non-finalized close ledger with a pending residual"
+    );
+
+    let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+    let res = f05_stranger_crank(&mut f.market, &mut f.victim, slot + 1);
+    let after = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    println!(
+        "F-05/F-02 (A) stranger tag5 crank over the OPEN-LEDGER account -> {res:?} \
+         after: residual_remaining={} b_loss_booked={} explicit_loss_assigned={} \
+         support_consumed={} insurance_spent={}",
+        after.residual_remaining,
+        after.b_loss_booked,
+        after.explicit_loss_assigned,
+        after.support_consumed,
+        after.insurance_spent
+    );
+    assert_eq!(after.residual_remaining, before.residual_remaining);
+    assert_eq!(after.b_loss_booked, before.b_loss_booked);
+    assert_eq!(after.explicit_loss_assigned, before.explicit_loss_assigned);
+    assert_eq!(after.support_consumed, before.support_consumed);
+    assert_eq!(after.insurance_spent, before.insurance_spent);
+}
+
+/// Case B -- the decisive one: the shape that gets PAST the selector and must be
+/// stopped by the F-02 lock itself. An OPEN, non-finalized ledger whose residual
+/// is already 0 satisfies `!has_pending_residual()` (engine :5589-5591) so the
+/// crank DOES select the forfeit, but it fails `close_slot_available()`
+/// (`:5623-5625`, `active && !is_finalized_inert()`), so
+/// `begin_close_progress_ledger` must refuse at `:16955` -> `LockActive`.
+/// Same structural refusal as verify/poc/F-02/poc_F02.rs
+/// `route3_recovery_forfeit_meeting_a_pending_ledger_is_refused_at_
+///  begin_close_progress_ledger`, driven through the WIRED WRAPPER CRANK
+/// instead of the engine API.
+#[test]
+fn f05_f02_route3_open_ledger_still_hits_lock_active_through_the_wired_crank() {
+    let mut f = cw04_fixture(true);
+    cw04_forfeit(&mut f, CW04_DEBT_ATOMS).expect("flip");
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Recovery);
+
+    // Make the victim's leg a ZERO-BASIS leg that still carries a loss
+    // obligation -- the exact shape the auto-crank's Recovery arm routes through
+    // `forfeit_recovery_leg_not_atomic` (engine :15186-15193, :15099-15108) --
+    // and empty its ledger's residual while leaving the ledger OPEN.
+    {
+        let (cfg, mut group) = state::read_market(&f.market.data).unwrap();
+        group.assets[0].oi_eff_long_q = 0;
+        state::write_market(&mut f.market.data, &cfg, &group).unwrap();
+
+        let mut account = state::read_portfolio(&f.victim.data).unwrap();
+        for leg in account.legs.iter_mut() {
+            if leg.active && leg.asset_index as usize == 0 {
+                leg.basis_pos_q = 0;
+            }
+        }
+        // Zero BOTH, or `validate_close_progress_ledger_with_market` (engine
+        // :5367) rejects the craft with InvalidLeg before anything under test runs.
+        account.close_progress.gross_loss_at_close_start = 0;
+        account.close_progress.residual_remaining = 0;
+        assert!(account.close_progress.active && !account.close_progress.finalized);
+        state::write_portfolio(&mut f.victim.data, &account).unwrap();
+    }
+    let before = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    println!(
+        "F-05/F-02 (B) crafted ledger: active={} finalized={} canceled={} residual_remaining={} \
+         -> has_pending_residual=false, close_slot_available=false",
+        before.active, before.finalized, before.canceled, before.residual_remaining
+    );
+
+    let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+    let res = f05_stranger_crank(&mut f.market, &mut f.victim, slot + 1);
+    println!("F-05/F-02 (B) stranger tag5 crank over the OPEN zero-residual ledger -> {res:?}");
+    assert_eq!(
+        res,
+        Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+        "F-02 :16955 LockActive must still refuse a forfeit reached through the wired crank"
+    );
+
+    let after = state::read_portfolio(&f.victim.data)
+        .unwrap()
+        .close_progress;
+    assert_eq!(after.b_loss_booked, before.b_loss_booked);
+    assert_eq!(after.explicit_loss_assigned, before.explicit_loss_assigned);
+    assert_eq!(after.residual_remaining, before.residual_remaining);
+    assert_eq!(
+        f05_mode(&f.market),
+        MarketModeV16::Recovery,
+        "the refused crank finalized nothing either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (3) LIVE-MODE BYTE-IDENTITY. Every tag-5 behaviour in a Live market must be
+//     unchanged: the new branch is gated on `mode == 2` only. This pins the
+//     argument validation and the Live dispatch outcomes the C-W-04 PoC recorded.
+// ---------------------------------------------------------------------------
+#[test]
+fn f05_live_mode_permissionless_crank_behaviour_is_unchanged() {
+    let mut f = cw04_fixture(true);
+    assert_eq!(f05_mode(&f.market), MarketModeV16::Live);
+
+    // Argument validation ahead of the branch is untouched.
+    for (label, action, recovery_reason) in [
+        ("action=3", 3u8, 0u8),
+        ("action=8", 8u8, 0u8),
+        ("recovery_reason=1", 0u8, 1u8),
+    ] {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action,
+                asset_index: 1,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason,
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        println!("F-05 live-mode reject {label} -> {res:?}");
+        assert_eq!(
+            res,
+            Err(ProgramError::Custom(9)),
+            "InvalidInstruction (Custom(9)) is unchanged for {label}"
+        );
+    }
+
+    // And the Live dispatch still runs the ordinary arms over a healthy asset.
+    for action in [0u8, 1u8, 2u8] {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                action,
+                asset_index: 1,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        println!("F-05 live-mode action={action} on healthy asset 1 -> {res:?} mode={:?}", f05_mode(&f.market));
+        assert_eq!(
+            f05_mode(&f.market),
+            MarketModeV16::Live,
+            "a Live crank never changes the mode"
+        );
+    }
+}
+
+/// Case C -- the `:16955` refusal ISOLATED. Case (B) proves the crank is refused,
+/// but its fixture also carries the pending domain-loss barrier the flip itself
+/// installed, and `begin_close_progress_ledger`'s SECOND gate (`:16959`, barrier
+/// count != 0) raises the same `LockActive` (measured: with the ledger removed,
+/// that fixture still returns Custom(21)). This case never flips, so no barrier
+/// exists and only `:16955` can fire: the market is put in Recovery directly and
+/// the account is given the OPEN, zero-loss, non-finalized ledger. The `ledger
+/// removed` control in the same test must then get PAST the gate.
+#[test]
+fn f05_f02_lock_is_the_close_slot_available_gate_16955() {
+    for (label, open_ledger) in [("open-ledger", true), ("no-ledger(control)", false)] {
+        let mut f = cw04_fixture(true);
+        let (cfg, mut group) = state::read_market(&f.market.data).unwrap();
+        let market_id = group.assets[0].market_id;
+        // Recovery WITHOUT the tag-43 flip: no close ledger was ever opened on
+        // this market, so `pending_domain_loss_barrier_short(asset 0) == 0` and
+        // `:16959` cannot be the refusal.
+        group.mode = MarketModeV16::Recovery;
+        group.recovery_reason =
+            Some(PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress);
+        group.assets[0].oi_eff_long_q = 0;
+        state::write_market(&mut f.market.data, &cfg, &group).unwrap();
+
+        let mut account = state::read_portfolio(&f.victim.data).unwrap();
+        for leg in account.legs.iter_mut() {
+            if leg.active && leg.asset_index as usize == 0 {
+                leg.basis_pos_q = 0; // zero-basis leg carrying a loss obligation
+                leg.b_snap = CW04_DEBT_B; // B already settled: no chunk work left
+            }
+        }
+        account.capital = 0;
+        account.pnl = -(CW04_DEBT_ATOMS as i128); // -> gross_close_loss != 0 at :21489
+        account.close_progress = if open_ledger {
+            CloseProgressLedgerV16 {
+                active: true,
+                finalized: false,
+                canceled: false,
+                close_id: 1,
+                asset_index: 0,
+                market_id,
+                domain_side: SideV16::Short, // opposite_side(Long), per :5381
+                gross_loss_at_close_start: 0,
+                drift_reference_slot: 0,
+                max_close_slot: 100,
+                residual_remaining: 0,
+                ..CloseProgressLedgerV16::EMPTY
+            }
+        } else {
+            CloseProgressLedgerV16::EMPTY
+        };
+        state::write_portfolio(&mut f.victim.data, &account).unwrap();
+
+        let slot = state::read_market(&f.market.data).unwrap().1.current_slot;
+        let res = f05_stranger_crank(&mut f.market, &mut f.victim, slot + 1);
+        println!("F-05/F-02 (C) {label:<19} stranger tag5 crank -> {res:?}");
+        if open_ledger {
+            assert_eq!(
+                res,
+                Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+                "an OPEN non-inert ledger must refuse at :16955 close_slot_available()"
+            );
+        } else {
+            assert_ne!(
+                res,
+                Err(ProgramError::Custom(F05_LOCK_ACTIVE)),
+                "control: with no ledger open the SAME call gets past :16955, so the \
+                 refusal above is the close-ledger lock and not the barrier at :16959"
+            );
+        }
+    }
+}
