@@ -21794,3 +21794,612 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
         "#446: a blocked reduce must not mutate market state"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W-22 regression — `CreateLpVault`'s born-dead guard reads the SIBLING domain too.
+//
+// Fixture helpers below (`WSIB_*`, `wsib_*`, `WsibEnv`) are COPIED VERBATIM from
+// `verify/poc/W-SIB/poc_W-SIB_appended_to_v16_wrapper.rs:44-421`, so the regression
+// runs on exactly the state the PoC measured. The `w22_*` tests underneath assert the
+// FIXED behaviour; `w22_old_*` carries the PoC's original defect assertion under
+// `#[should_panic]`.
+// ═══════════════════════════════════════════════════════════════════════════
+// byte is changed for the PASS runs (only for the negative control).
+//
+// HARNESS NOTE (true of every test in this binary): `sol_invoke_signed` is the
+// default no-op stub, so SPL-token CPIs move no bytes. Token-account balances
+// are therefore fixtures, and every "moved / did not move" assertion below is
+// made against the ENGINE counters the handler itself writes
+// (`header.vault`, the bucket, the `BackingDomainLedger`), never against an ATA.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// asset 1 LONG — the SIBLING domain: the third-party provider's bucket.
+const WSIB_PROVIDER_DOMAIN: u16 = 2;
+/// asset 1 SHORT — `registry.domain`: the LP vault's own pot.
+const WSIB_VAULT_DOMAIN: u16 = 3;
+/// the provider's unliened principal U
+const WSIB_U_ATOMS: u128 = 97_376;
+const WSIB_FINITE_EXPIRY: u64 = 20;
+const WSIB_LAPSED_SLOT: u64 = 21;
+const WSIB_FEE_SHARE_BPS: u16 = 10_000;
+
+const WSIB_ERR_UNAUTHORIZED: u32 = 8;
+const WSIB_ERR_ENGINE_LOCK_ACTIVE: u32 = 21;
+const WSIB_ERR_LP_VAULT_AUTHORITY_MISMATCH: u32 = 40;
+const WSIB_ERR_LP_VAULT_BACKING_BUCKET_NOT_EMPTY: u32 = 63;
+
+struct WsibEnv {
+    admin: TestAccount,
+    provider: TestAccount,
+    cranker: TestAccount,
+    market: TestAccount,
+    provider_ledger: TestAccount,
+    vault_ledger: TestAccount,
+    registry: TestAccount,
+    sysprog: TestAccount,
+    token_program: TestAccount,
+    vault: TestAccount,
+    vault_auth: TestAccount,
+    provider_dest: TestAccount,
+    admin_dest: TestAccount,
+    mint: Pubkey,
+    registry_pda: Pubkey,
+}
+
+fn wsib_signer_writable() -> TestAccount {
+    TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0)
+        .signer()
+        .writable()
+}
+
+fn wsib_group(market: &TestAccount) -> MarketGroupV16 {
+    state::read_market(&market.data).unwrap().1
+}
+
+fn wsib_bucket(market: &TestAccount, domain: u16) -> percolator::BackingBucketV16 {
+    wsib_group(market).source_backing_buckets[domain as usize]
+}
+
+fn wsib_set_slot(market: &mut TestAccount, slot: u64) {
+    let (cfg, mut group) = state::read_market(&market.data).unwrap();
+    group.current_slot = slot;
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+/// The junior residual pool, transcribed from `percolator:src/v16.rs:8770-8779`
+/// (`residual()`, a private fn) over the public host mirror fields.
+fn wsib_residual(group: &MarketGroupV16) -> u128 {
+    group.vault.saturating_sub(
+        group
+            .c_tot
+            .saturating_add(group.insurance)
+            .saturating_add(group.backing_provider_earnings_total)
+            .saturating_add(group.source_fresh_backing_total_num / BOUND_SCALE),
+    )
+}
+
+fn wsib_principal(l: &TestAccount) -> u128 {
+    state::read_backing_domain_ledger(&l.data)
+        .map(|x| x.total_principal_atoms)
+        .unwrap_or(0)
+}
+
+fn wsib_ledger_authority(l: &TestAccount) -> [u8; 32] {
+    state::read_backing_domain_ledger(&l.data)
+        .map(|x| x.authority)
+        .unwrap_or([0u8; 32])
+}
+
+/// Exactly what `handle_deposit_to_lp_vault` (`:15566`) and
+/// `handle_execute_redemption` (`:16324`) price a share against, per domain:
+/// `lp_vault_domain_nav_atoms` (`:10300-10326`).
+fn wsib_nav(l: &TestAccount) -> u128 {
+    let Ok(ledger) = state::read_backing_domain_ledger(&l.data) else {
+        return 0;
+    };
+    percolator::lp_vault::lp_vault_nav_atoms(
+        ledger.total_principal_atoms,
+        ledger.total_earnings_atoms,
+        ledger.total_earnings_withdrawn_atoms,
+        ledger.cumulative_loss_atoms,
+        ledger.cumulative_recovery_atoms,
+        WSIB_FEE_SHARE_BPS,
+    )
+    .unwrap()
+}
+
+fn wsib_backing_authority(market: &TestAccount) -> [u8; 32] {
+    state::read_asset_oracle_profile(&market.data, 1)
+        .unwrap()
+        .backing_bucket_authority
+}
+
+fn wsib_asset_admin(market: &TestAccount) -> [u8; 32] {
+    state::read_asset_oracle_profile(&market.data, 1)
+        .unwrap()
+        .asset_admin
+}
+
+/// `handle_create_lp_vault`'s FIND-1 binding, transcribed VERBATIM from
+/// `percolator-prog origin/main:src/v16_program.rs:15478-15484`:
+///
+/// ```ignore
+/// let asset_index = domain as usize / 2;
+/// let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
+/// profile.backing_bucket_authority = registry_pda.to_bytes();
+/// state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
+/// ```
+///
+/// Transcribed rather than executed because `CreateLpVault` creates two PDAs and
+/// initializes an SPL mint by CPI, and this harness's `sol_invoke_signed` is the
+/// no-op stub. `poc_wsib_create_lp_vault_*` below runs the REAL instruction up
+/// to and including both gates that precede this write, so the only untested
+/// step is the four-line write quoted above.
+fn wsib_bind_backing_authority(market: &mut TestAccount, authority: [u8; 32]) {
+    let mut profile = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+    profile.backing_bucket_authority = authority;
+    state::write_asset_oracle_profile(&mut market.data, 1, &profile).unwrap();
+}
+
+/// The world BEFORE any LP vault: asset 1 active with a signable
+/// `backing_bucket_authority` (the provider), who funds domain 2 at a FINITE
+/// expiry through the real tag 50. The LP-vault registry account exists (domain
+/// 3) but the FIND-1 binding has NOT been applied.
+fn wsib_env_unbound() -> WsibEnv {
+    let mut admin = signer();
+    let provider = signer();
+    let cranker = wsib_signer_writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let mut provider_ledger = canonical_backing_ledger_account(&market, WSIB_PROVIDER_DOMAIN);
+    let vault_ledger = canonical_backing_ledger_account(&market, WSIB_VAULT_DOMAIN);
+    let mut sysprog = system_program_account();
+    let mut token_program = token_program_account();
+    // Funded to U: the top-up's token CPI is the no-op stub, so the ATA must
+    // already carry the balance the engine counter will claim.
+    let mut vault = vault_token_account(&market, mint, WSIB_U_ATOMS as u64);
+    let vault_auth = vault_authority_account(&market);
+    let mut source = user_token_account(provider.key, mint, WSIB_U_ATOMS as u64);
+    let provider_dest = user_token_account(provider.key, mint, 0);
+    let admin_dest = user_token_account(admin.key, mint, 0);
+
+    let mut provider_signing = TestAccount::new(provider.key, provider.owner, 0).signer();
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: WSIB_PROVIDER_DOMAIN,
+            amount: WSIB_U_ATOMS,
+            expiry_slot: WSIB_FINITE_EXPIRY,
+        },
+        &mut [
+            &mut provider_signing,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+            &mut provider_ledger,
+            &mut sysprog,
+        ],
+    )
+    .expect("finite-expiry provider top-up must fund the sibling domain");
+
+    let (registry_pda, registry_bump) = state::derive_lp_vault_registry(&program_id(), &market.key);
+    let mut registry = TestAccount::new(
+        registry_pda,
+        program_id(),
+        state::lp_vault_registry_account_len(),
+    )
+    .writable();
+    let reg = state::LpVaultRegistryV16 {
+        market_group: market.key.to_bytes(),
+        lp_mint: mint.to_bytes(),
+        fee_share_bps: WSIB_FEE_SHARE_BPS,
+        domain: WSIB_VAULT_DOMAIN,
+        paused: 0,
+        version: percolator_prog::constants::LP_VAULT_VERSION,
+        bump: registry_bump,
+        ..Default::default()
+    };
+    state::init_lp_vault_registry(&mut registry.data, &reg).unwrap();
+
+    WsibEnv {
+        admin,
+        provider,
+        cranker,
+        market,
+        provider_ledger,
+        vault_ledger,
+        registry,
+        sysprog,
+        token_program,
+        vault,
+        vault_auth,
+        provider_dest,
+        admin_dest,
+        mint,
+        registry_pda,
+    }
+}
+
+/// Same world AFTER `CreateLpVault` on domain 3 — i.e. with the FIND-1 binding.
+fn wsib_env() -> WsibEnv {
+    let mut e = wsib_env_unbound();
+    let a = e.registry_pda.to_bytes();
+    wsib_bind_backing_authority(&mut e.market, a);
+    e
+}
+
+/// Tag 50 `WithdrawBackingBucket` on the provider's own domain, signed by `who`,
+/// paying into `dest`. `run_ix_no_rollback` so "must not mutate" is falsifiable.
+fn wsib_withdraw_no_rollback(
+    e: &mut WsibEnv,
+    who_key: Pubkey,
+    who_owner: Pubkey,
+    dest_is_admin: bool,
+    amount: u128,
+) -> Result<(), ProgramError> {
+    let mut who = TestAccount::new(who_key, who_owner, 0).signer();
+    let dest: &mut TestAccount = if dest_is_admin {
+        &mut e.admin_dest
+    } else {
+        &mut e.provider_dest
+    };
+    run_ix_no_rollback(
+        Instruction::WithdrawBackingBucket {
+            domain: WSIB_PROVIDER_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut who,
+            &mut e.market,
+            dest,
+            &mut e.vault,
+            &mut e.vault_auth,
+            &mut e.token_program,
+            &mut e.provider_ledger,
+        ],
+    )
+}
+
+fn wsib_provider_withdraw(e: &mut WsibEnv, amount: u128) -> Result<(), ProgramError> {
+    let (k, o) = (e.provider.key, e.provider.owner);
+    wsib_withdraw_no_rollback(e, k, o, false, amount)
+}
+
+/// The REAL tag 74 `CreateLpVault`, run as far as this harness allows. Both
+/// gates that matter (`:15423-15424` marketauth, `:15443-15449` born-dead)
+/// precede every CPI, so their verdicts are executed, not argued.
+/// `bogus_registry = true` passes a non-PDA registry account, so a run that gets
+/// past the born-dead guard dies at `expect_key` (`:15455`) with
+/// `ProgramError::InvalidArgument` — a marker distinct from every `Custom(n)`.
+fn wsib_create_lp_vault(
+    e: &mut WsibEnv,
+    signer_key: Pubkey,
+    signer_owner: Pubkey,
+    domain: u16,
+    bogus_registry: bool,
+) -> Result<(), ProgramError> {
+    let mut who = TestAccount::new(signer_key, signer_owner, 0)
+        .signer()
+        .writable();
+    let mut registry_ai = if bogus_registry {
+        TestAccount::new(Pubkey::new_unique(), solana_program::system_program::ID, 0).writable()
+    } else {
+        TestAccount::new(e.registry_pda, solana_program::system_program::ID, 0).writable()
+    };
+    let (mint_pda, _) = state::derive_lp_vault_mint(&program_id(), &e.market.key);
+    let mut mint_ai =
+        TestAccount::new(mint_pda, solana_program::system_program::ID, 0).writable();
+    run_ix_no_rollback(
+        Instruction::CreateLpVault {
+            fee_share_bps: WSIB_FEE_SHARE_BPS,
+            redemption_cooldown_slots: 0,
+            oi_reservation_threshold_bps: 0,
+            domain,
+        },
+        &mut [
+            &mut who,
+            &mut e.market,
+            &mut registry_ai,
+            &mut mint_ai,
+            &mut e.sysprog,
+            &mut e.token_program,
+        ],
+    )
+}
+
+fn wsib_expire(e: &mut WsibEnv, domain: u16) -> Result<(), ProgramError> {
+    // Account 0 and ONLY account 0 (`:10867`). No signer anywhere.
+    run_ix(
+        Instruction::ExpireBackingBucket { domain },
+        &mut [&mut e.market],
+    )
+}
+
+fn wsib_rebalance(e: &mut WsibEnv, amount: u128) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: WSIB_PROVIDER_DOMAIN,
+            to_domain: WSIB_VAULT_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.provider_ledger,
+            &mut e.vault_ledger,
+            &mut e.sysprog,
+        ],
+    )
+}
+
+/// Tag 65 `UpdateAssetAuthority`, rotating `backing_bucket_authority` back to a
+/// signable key. `registry_live = false` zeroes the registry account, which is
+/// the state `CloseLpVault` (`:17512-17518`) leaves behind.
+fn wsib_rotate_backing_authority(
+    e: &mut WsibEnv,
+    new_key: Pubkey,
+    new_owner: Pubkey,
+    registry_live: bool,
+) -> Result<(), ProgramError> {
+    let admin_key = e.admin.key;
+    let admin_owner = e.admin.owner;
+    let mut current = TestAccount::new(admin_key, admin_owner, 0).signer();
+    let mut new_authority = TestAccount::new(new_key, new_owner, 0).signer();
+    let mut registry_ai = if registry_live {
+        TestAccount::new_with_data(e.registry_pda, program_id(), e.registry.data.clone())
+    } else {
+        TestAccount::new(e.registry_pda, program_id(), e.registry.data.len())
+    };
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 1,
+            kind: ASSET_AUTH_BACKING_BUCKET,
+            new_pubkey: new_key.to_bytes(),
+        },
+        &mut [
+            &mut current,
+            &mut new_authority,
+            &mut e.market,
+            &mut registry_ai,
+        ],
+    )
+}
+
+
+/// `wsib_env_unbound` with the provider top-up SKIPPED: both domains of asset 1
+/// are Empty, which is the shape an LP vault is meant to be created over.
+fn w22_env_unfunded() -> WsibEnv {
+    let mut admin = signer();
+    let provider = signer();
+    let cranker = wsib_signer_writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let provider_ledger = canonical_backing_ledger_account(&market, WSIB_PROVIDER_DOMAIN);
+    let vault_ledger = canonical_backing_ledger_account(&market, WSIB_VAULT_DOMAIN);
+    let sysprog = system_program_account();
+    let token_program = token_program_account();
+    let vault = vault_token_account(&market, mint, WSIB_U_ATOMS as u64);
+    let vault_auth = vault_authority_account(&market);
+    let provider_dest = user_token_account(provider.key, mint, 0);
+    let admin_dest = user_token_account(admin.key, mint, 0);
+
+    let (registry_pda, registry_bump) = state::derive_lp_vault_registry(&program_id(), &market.key);
+    let mut registry = TestAccount::new(
+        registry_pda,
+        program_id(),
+        state::lp_vault_registry_account_len(),
+    )
+    .writable();
+    let reg = state::LpVaultRegistryV16 {
+        market_group: market.key.to_bytes(),
+        lp_mint: mint.to_bytes(),
+        fee_share_bps: WSIB_FEE_SHARE_BPS,
+        domain: WSIB_VAULT_DOMAIN,
+        paused: 0,
+        version: percolator_prog::constants::LP_VAULT_VERSION,
+        bump: registry_bump,
+        ..Default::default()
+    };
+    state::init_lp_vault_registry(&mut registry.data, &reg).unwrap();
+
+    WsibEnv {
+        admin,
+        provider,
+        cranker,
+        market,
+        provider_ledger,
+        vault_ledger,
+        registry,
+        sysprog,
+        token_program,
+        vault,
+        vault_auth,
+        provider_dest,
+        admin_dest,
+        mint,
+        registry_pda,
+    }
+}
+
+#[test]
+fn w22_create_lp_vault_refuses_over_a_funded_sibling_and_the_provider_keeps_their_exit() {
+    let mut e = wsib_env_unbound();
+    let provider_key = e.provider.key.to_bytes();
+    assert_eq!(
+        wsib_backing_authority(&e.market),
+        provider_key,
+        "fixture: the provider holds backing_bucket_authority before any vault"
+    );
+    let market_before = e.market.data.clone();
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+
+    // (a) the FUNDED domain — refused before and after W-22.
+    let r_funded = wsib_create_lp_vault(&mut e, ak, ao, WSIB_PROVIDER_DOMAIN, true);
+    println!("[w22] marketauth CreateLpVault(domain=2, the FUNDED one) -> {r_funded:?}");
+    assert_eq!(
+        r_funded,
+        Err(ProgramError::Custom(
+            WSIB_ERR_LP_VAULT_BACKING_BUCKET_NOT_EMPTY
+        ))
+    );
+
+    // (b) THE FLIPPED CASE — its SIBLING. Was Err(InvalidArgument) (the expect_key
+    //     marker: the guard had passed and the FIND-1 binding would have run).
+    let r_sibling = wsib_create_lp_vault(&mut e, ak, ao, WSIB_VAULT_DOMAIN, true);
+    println!(
+        "[w22] marketauth CreateLpVault(domain=3, sibling of the funded 2) -> {r_sibling:?}   (was InvalidArgument: the guard did not bite)"
+    );
+    assert_eq!(
+        r_sibling,
+        Err(ProgramError::Custom(
+            WSIB_ERR_LP_VAULT_BACKING_BUCKET_NOT_EMPTY
+        )),
+        "W-22: the guard now reads sibling_domain(domain) too, and refuses BEFORE any binding"
+    );
+
+    // Nothing was taken: no partial write, and the authority is still the provider's.
+    assert_eq!(
+        e.market.data, market_before,
+        "a refused CreateLpVault must not touch the market (run_ix_no_rollback: no harness restore)"
+    );
+    assert_eq!(
+        wsib_backing_authority(&e.market),
+        provider_key,
+        "the refusal leaves the bucket's owner intact (:15438)"
+    );
+
+    // …so the provider's exit still works: the whole W-SIB loss is gone.
+    let vault_before = wsib_group(&e.market).vault;
+    let w = wsib_provider_withdraw(&mut e, WSIB_U_ATOMS);
+    println!(
+        "[w22] provider tag50 withdraw(U={WSIB_U_ATOMS}) -> {w:?} | header.vault {vault_before} -> {} | ledger.principal -> {}",
+        wsib_group(&e.market).vault,
+        wsib_principal(&e.provider_ledger)
+    );
+    assert_eq!(w, Ok(()), "the provider is no longer stranded");
+    assert_eq!(wsib_group(&e.market).vault, 0);
+    assert_eq!(wsib_principal(&e.provider_ledger), 0);
+}
+
+#[test]
+fn w22_create_lp_vault_still_passes_the_guard_when_both_domains_are_empty() {
+    // The legitimate case must be untouched. Same marker logic as the PoC:
+    // reaching `expect_key` (`:15455`, the first fallible statement after the
+    // guard block) proves the guard did NOT refuse.
+    let mut e = w22_env_unfunded();
+    for d in [WSIB_PROVIDER_DOMAIN, WSIB_VAULT_DOMAIN] {
+        let b = wsib_bucket(&e.market, d);
+        println!(
+            "[w22-ok] bucket{d} status={:?} fresh_unliened={} valid={} consumed={} impaired={}",
+            b.status,
+            b.fresh_unliened_backing_num,
+            b.valid_liened_backing_num,
+            b.consumed_liened_backing_num,
+            b.impaired_liened_backing_num
+        );
+        assert_eq!(b.status, BackingBucketStatusV16::Empty);
+    }
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+    for d in [WSIB_PROVIDER_DOMAIN, WSIB_VAULT_DOMAIN] {
+        let r = wsib_create_lp_vault(&mut e, ak, ao, d, true);
+        println!("[w22-ok] marketauth CreateLpVault(domain={d}) over EMPTY buckets -> {r:?}   (PAST the guard, died at expect_key :15455)");
+        assert_eq!(
+            r,
+            Err(ProgramError::InvalidArgument),
+            "W-22 must not refuse a vault over two empty domains"
+        );
+    }
+}
+
+#[test]
+fn w22_gh453_spent_ledger_adoption_path_is_unaffected() {
+    // GH#453's shape: the provider funded a domain and withdrew it ALL, so the
+    // canonical ledger PDA persists with a stale authority and zero principal
+    // while the BUCKET is empty. `read_or_new_backing_domain_ledger:10474-10483`
+    // adopts exactly that. W-22 reads BUCKETS, so it must not refuse here — the
+    // guard is widened over the sibling, not over spent history.
+    let mut e = wsib_env_unbound();
+    let w = wsib_provider_withdraw(&mut e, WSIB_U_ATOMS);
+    assert_eq!(w, Ok(()), "the provider empties their own domain first");
+    let b2 = wsib_bucket(&e.market, WSIB_PROVIDER_DOMAIN);
+    println!(
+        "[w22-453] after a FULL withdrawal: bucket2 status={:?} fresh_unliened={} valid={} consumed={} impaired={} | ledger.authority==provider: {} principal={} earnings={}",
+        b2.status,
+        b2.fresh_unliened_backing_num,
+        b2.valid_liened_backing_num,
+        b2.consumed_liened_backing_num,
+        b2.impaired_liened_backing_num,
+        wsib_ledger_authority(&e.provider_ledger) == e.provider.key.to_bytes(),
+        wsib_principal(&e.provider_ledger),
+        state::read_backing_domain_ledger(&e.provider_ledger.data)
+            .unwrap()
+            .total_earnings_atoms
+    );
+    assert_eq!(b2.status, BackingBucketStatusV16::Empty);
+    assert_eq!(wsib_principal(&e.provider_ledger), 0);
+    assert_eq!(
+        wsib_ledger_authority(&e.provider_ledger),
+        e.provider.key.to_bytes(),
+        "the SPENT ledger keeps its stale authority — that is #453's whole premise"
+    );
+
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+    let r = wsib_create_lp_vault(&mut e, ak, ao, WSIB_VAULT_DOMAIN, true);
+    println!("[w22-453] marketauth CreateLpVault(domain=3) over a SPENT sibling ledger -> {r:?}   (PAST the guard)");
+    assert_eq!(
+        r,
+        Err(ProgramError::InvalidArgument),
+        "#453's adoption path stays reachable: W-22 refuses on VALUE in the bucket, not on a spent ledger"
+    );
+}
+
+/// `verify/poc/W-SIB/poc_W-SIB_appended_to_v16_wrapper.rs`'s §1 case (c)
+/// assertion, verbatim. It must now PANIC.
+#[test]
+#[should_panic(expected = "must be the expect_key marker, NOT Custom(63): the guard did not bite on the sibling")]
+fn w22_old_wsib_sibling_assertion_must_now_fail() {
+    let mut e = wsib_env_unbound();
+    let (ak, ao) = (e.admin.key, e.admin.owner);
+    let r_sibling = wsib_create_lp_vault(&mut e, ak, ao, WSIB_VAULT_DOMAIN, true);
+    println!(
+        "[w22-old] marketauth CreateLpVault(domain=3, sibling of the funded 2) -> {r_sibling:?}"
+    );
+    assert_eq!(
+        r_sibling,
+        Err(ProgramError::InvalidArgument),
+        "must be the expect_key marker, NOT Custom(63): the guard did not bite on the sibling"
+    );
+}

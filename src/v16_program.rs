@@ -15436,16 +15436,43 @@ pub mod processor {
         // which permanently forfeits this market's ability to ever have an LP vault.
         //
         // Checked BEFORE the authority is taken, so a refusal leaves the bucket's owner intact.
+        //
+        // W-22 / W-SIB: the guard must have the SAME GRANULARITY AS THE WRITE IT GUARDS.
+        // The FIND-1 binding below is written on the per-ASSET oracle profile
+        // (`asset_index = domain / 2`), so it takes `domain` AND `sibling_domain(domain)`
+        // — `sibling_domain`'s own doc says as much ("The LP vault is authorised over
+        // both"), NAV is `own + sibling`, and tag 91 moves principal between them. This
+        // guard read `registry.domain` alone, so naming the FUNDED side refused safely
+        // with LpVaultBackingBucketNotEmpty while naming its SIBLING silently succeeded
+        // and stranded the provider: their tag 50 then returns Unauthorized
+        // (`verify_domain_withdrawal_preflight`), their principal exits only by a
+        // permissionless tag-89 expiry into the junior residual pool, and the new vault
+        // is itself bricked because both pricing paths read the sibling ledger with the
+        // registry PDA as authority. Those two choices are indistinguishable to the
+        // creator, so the guard — not the operator — has to know.
+        //
+        // "Funded" is widened to the SAME predicate GH#453 uses one layer down
+        // (`read_or_new_backing_domain_ledger`, `bucket_holds_backing`): any of the four
+        // backing classes, not just `fresh_unliened`. That is the ledger-side reading of
+        // "bind only EMPTY ledgers" expressed on the accounts this instruction actually
+        // has — post-#433 a funded bucket implies a ledger, and #453 adopts a foreign
+        // ledger only when the bucket agrees it is spent. Refusing here makes the
+        // stranding state unreachable in the first place, which is the stronger fix.
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_cfg_r, group) = state::market_view_mut(&mut market_data)?;
-            let (_, bucket) = backing_domain_parts_view(&group, domain as usize)?;
-            let already_funded = bucket.status != percolator::BackingBucketStatusV16::Empty
-                || bucket.fresh_unliened_backing_num > 0;
-            if already_funded
-                && bucket.expiry_slot != crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
-            {
-                return Err(PercolatorError::LpVaultBackingBucketNotEmpty.into());
+            for d in [domain, sibling_domain(domain)] {
+                let (_, bucket) = backing_domain_parts_view(&group, d as usize)?;
+                let already_funded = bucket.status != percolator::BackingBucketStatusV16::Empty
+                    || bucket.fresh_unliened_backing_num > 0
+                    || bucket.valid_liened_backing_num > 0
+                    || bucket.consumed_liened_backing_num > 0
+                    || bucket.impaired_liened_backing_num > 0;
+                if already_funded
+                    && bucket.expiry_slot != crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                {
+                    return Err(PercolatorError::LpVaultBackingBucketNotEmpty.into());
+                }
             }
         }
 
