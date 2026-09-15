@@ -47,25 +47,25 @@ pub mod constants {
                                                   // (additive at the tail). Bump VERSION so `check_header` fail-closed
                                                   // rejects any pre-existing (old-layout) account rather than misparsing
                                                   // it -- this forces the explicitly-allowed devnet re-seed.
-    //
-    // 17 -> 18 (W-19). The same policy, applied to the v17 engine layout bump:
-    // `percolator::V16_LAYOUT_DISCRIMINATOR` moved 16 -> 18 and
-    // `PortfolioAccountV16Account` grew 9227 -> 9419 B, so every account the
-    // DEPLOYED wrapper stamped (VERSION 17, discriminator 16) is a different
-    // layout under this build. Leaving VERSION at 17 left `check_header`
-    // passing those images through to the ENGINE's provenance check, so the
-    // refusal was the engine's `Custom(16)` and only on the routes that decode
-    // provenance. At 18 the wrapper's own gate refuses first with
-    // `InvalidVersion` = `Custom(1)`, uniformly, on every KIND_* account and
-    // every route that touches one. It creates NO new exit: the refusal is
-    // relabelled and made earlier, never relaxed. Consequence, deliberate: a
-    // PARTIAL re-seed hard-fails, because the gate is generic over all seven
-    // kinds (market, portfolio, backing ledger, insurance ledger, LP registry,
-    // LP redemption, NFT registry) -- the deploy path is a FULL re-seed.
-    // Cross-program: percolator-nft vendors this constant
-    // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
-    // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
-    // so the nft MUST bump to 18 and redeploy in the same flag day.
+                                                  //
+                                                  // 17 -> 18 (W-19). The same policy, applied to the v17 engine layout bump:
+                                                  // `percolator::V16_LAYOUT_DISCRIMINATOR` moved 16 -> 18 and
+                                                  // `PortfolioAccountV16Account` grew 9227 -> 9419 B, so every account the
+                                                  // DEPLOYED wrapper stamped (VERSION 17, discriminator 16) is a different
+                                                  // layout under this build. Leaving VERSION at 17 left `check_header`
+                                                  // passing those images through to the ENGINE's provenance check, so the
+                                                  // refusal was the engine's `Custom(16)` and only on the routes that decode
+                                                  // provenance. At 18 the wrapper's own gate refuses first with
+                                                  // `InvalidVersion` = `Custom(1)`, uniformly, on every KIND_* account and
+                                                  // every route that touches one. It creates NO new exit: the refusal is
+                                                  // relabelled and made earlier, never relaxed. Consequence, deliberate: a
+                                                  // PARTIAL re-seed hard-fails, because the gate is generic over all seven
+                                                  // kinds (market, portfolio, backing ledger, insurance ledger, LP registry,
+                                                  // LP redemption, NFT registry) -- the deploy path is a FULL re-seed.
+                                                  // Cross-program: percolator-nft vendors this constant
+                                                  // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
+                                                  // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
+                                                  // so the nft MUST bump to 18 and redeploy in the same flag day.
     pub const VERSION: u16 = 18;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
