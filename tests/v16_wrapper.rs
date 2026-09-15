@@ -23783,3 +23783,626 @@ fn cw03_old_name_and_stale_comment_are_gone_from_the_repo() {
     );
     println!("[cw03] rename complete; W-18 comment repointed");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W-21 regression — the lapsed-bucket refusal, tag 50 + tag 91.
+//
+// Fixture helpers below (`W91_*`, `w91_*`, `W91Env`) are COPIED VERBATIM from
+// `verify/poc/W-91/poc_W-91_appended_to_v16_wrapper.rs:44-309` so the regression
+// runs on exactly the state the PoC measured. The `w21_*` tests underneath assert
+// the FIXED behaviour; `w21_old_*` carry the PoC's original defect assertions
+// under `#[should_panic]`.
+// ═══════════════════════════════════════════════════════════════════════════
+/// asset 1 LONG — the THIRD-PARTY provider's finite-expiry bucket (domain = asset*2 + side)
+const W91_FROM_DOMAIN: u16 = 2;
+/// asset 1 SHORT — the LP vault's own pot (`registry.domain`)
+const W91_TO_DOMAIN: u16 = 3;
+/// unliened principal, mirroring C-S-20b's measured `[cap] PRE = 97_376e12`
+const W91_U_ATOMS: u128 = 97_376;
+/// liened principal, mirroring C-S-20b's `lien = 2_624e12` (97_376 + 2_624 = 100_000)
+const W91_L_ATOMS: u128 = 2_624;
+const W91_FINITE_EXPIRY: u64 = 20;
+const W91_FEE_SHARE_BPS: u16 = 10_000;
+
+fn w91_signer_writable() -> TestAccount {
+    TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0)
+        .signer()
+        .writable()
+}
+
+/// Exactly what `handle_deposit_to_lp_vault` (`:15566`) and
+/// `handle_execute_redemption` (`:16324`) price a share against, per domain:
+/// `lp_vault_domain_nav_atoms` (`:10300-10326`). An uninitialised ledger
+/// contributes 0, exactly as that function documents.
+fn w91_nav(l: &TestAccount) -> u128 {
+    let Ok(ledger) = state::read_backing_domain_ledger(&l.data) else {
+        return 0;
+    };
+    percolator::lp_vault::lp_vault_nav_atoms(
+        ledger.total_principal_atoms,
+        ledger.total_earnings_atoms,
+        ledger.total_earnings_withdrawn_atoms,
+        ledger.cumulative_loss_atoms,
+        ledger.cumulative_recovery_atoms,
+        W91_FEE_SHARE_BPS,
+    )
+    .unwrap()
+}
+
+fn w91_principal(l: &TestAccount) -> u128 {
+    state::read_backing_domain_ledger(&l.data)
+        .map(|x| x.total_principal_atoms)
+        .unwrap_or(0)
+}
+
+/// The junior residual pool, transcribed from `percolator:src/v16.rs:8770-8779`
+/// (`residual()`, private) over the public host mirror fields.
+fn w91_residual(group: &MarketGroupV16) -> u128 {
+    group.vault.saturating_sub(
+        group
+            .c_tot
+            .saturating_add(group.insurance)
+            .saturating_add(group.backing_provider_earnings_total)
+            .saturating_add(group.source_fresh_backing_total_num / BOUND_SCALE),
+    )
+}
+
+fn w91_set_slot(market: &mut TestAccount, slot: u64) {
+    let (cfg, mut group) = state::read_market(&market.data).unwrap();
+    group.current_slot = slot;
+    state::write_market(&mut market.data, &cfg, &group).unwrap();
+}
+
+fn w91_group(market: &TestAccount) -> MarketGroupV16 {
+    state::read_market(&market.data).unwrap().1
+}
+
+fn w91_bucket(market: &TestAccount, domain: u16) -> percolator::BackingBucketV16 {
+    w91_group(market).source_backing_buckets[domain as usize]
+}
+
+struct W91Env {
+    admin: TestAccount,
+    provider: TestAccount,
+    cranker: TestAccount,
+    market: TestAccount,
+    from_ledger: TestAccount,
+    to_ledger: TestAccount,
+    registry: TestAccount,
+    sysprog: TestAccount,
+    token_program: TestAccount,
+    vault: TestAccount,
+    mint: Pubkey,
+    registry_pda: Pubkey,
+}
+
+/// `handle_create_lp_vault`'s FIND-1 binding, transcribed VERBATIM from
+/// `percolator-prog origin/main:src/v16_program.rs:15478-15484`:
+///
+/// ```ignore
+/// let asset_index = domain as usize / 2;
+/// let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
+/// profile.backing_bucket_authority = registry_pda.to_bytes();
+/// state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
+/// ```
+///
+/// It is per-ASSET, so it takes BOTH domains of the asset away from whoever
+/// funded them — which `:15430-15436`'s own comment states outright ("the
+/// provider who funded the bucket can no longer withdraw because the authority
+/// they held is gone"). The `already_funded` guard at `:15443-15449` inspects
+/// ONLY `registry.domain`; a finite-expiry bucket on the SIBLING domain passes
+/// CreateLpVault untouched. Touches no engine counter.
+fn w91_bind_backing_authority(market: &mut TestAccount, asset_index: usize, authority: [u8; 32]) {
+    let mut profile = state::read_asset_oracle_profile(&market.data, asset_index).unwrap();
+    profile.backing_bucket_authority = authority;
+    state::write_asset_oracle_profile(&mut market.data, asset_index, &profile).unwrap();
+}
+
+/// Fixture: asset 1 active, a THIRD-PARTY provider's FINITE-expiry bucket on
+/// domain 2 funded through the real tag 50 `TopUpBackingBucket`, then the LP
+/// vault welded to domain 3 (registry created, FIND-1 binding applied).
+fn w91_env() -> W91Env {
+    let mut admin = signer();
+    let mut provider = signer();
+    let cranker = w91_signer_writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    // The PRE-vault world: a normal, signable backing authority for asset 1.
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let mut from_ledger = canonical_backing_ledger_account(&market, W91_FROM_DOMAIN);
+    let to_ledger = canonical_backing_ledger_account(&market, W91_TO_DOMAIN);
+    let mut sysprog = system_program_account();
+    let mut token_program = token_program_account();
+    let mut vault = vault_token_account(&market, mint, 0);
+    let mut source = user_token_account(provider.key, mint, W91_U_ATOMS as u64);
+
+    // Real tag 50: the provider funds domain 2 at a FINITE expiry.
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: W91_FROM_DOMAIN,
+            amount: W91_U_ATOMS,
+            expiry_slot: W91_FINITE_EXPIRY,
+        },
+        &mut [
+            &mut provider,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+            &mut from_ledger,
+            &mut sysprog,
+        ],
+    )
+    .expect("finite-expiry provider top-up must fund domain 2");
+
+    // The LP vault is created afterwards on the SIBLING domain (3).
+    let (registry_pda, registry_bump) = state::derive_lp_vault_registry(&program_id(), &market.key);
+    let mut registry = TestAccount::new(
+        registry_pda,
+        program_id(),
+        state::lp_vault_registry_account_len(),
+    )
+    .writable();
+    let reg = state::LpVaultRegistryV16 {
+        market_group: market.key.to_bytes(),
+        lp_mint: mint.to_bytes(),
+        fee_share_bps: W91_FEE_SHARE_BPS,
+        domain: W91_TO_DOMAIN,
+        paused: 0,
+        version: percolator_prog::constants::LP_VAULT_VERSION,
+        bump: registry_bump,
+        ..Default::default()
+    };
+    state::init_lp_vault_registry(&mut registry.data, &reg).unwrap();
+    // CreateLpVault :15478-15484 — takes BOTH domains of asset 1.
+    w91_bind_backing_authority(&mut market, 1, registry_pda.to_bytes());
+
+    W91Env {
+        admin,
+        provider,
+        cranker,
+        market,
+        from_ledger,
+        to_ledger,
+        registry,
+        sysprog,
+        token_program,
+        vault,
+        mint,
+        registry_pda,
+    }
+}
+
+/// COUNTERFACTUAL ONLY — re-stamp the source ledger's `authority` field with the
+/// registry PDA, which is what makes `read_or_new_backing_domain_ledger`
+/// (:16199-16205 -> :10470-10513) pass. NOT a reachable state: see
+/// `poc_w91_reachability_*` below. Used solely to isolate the gate at :16207.
+fn w91_forge_ledger_authority_to_registry(e: &mut W91Env) {
+    let a = e.registry_pda.to_bytes();
+    w91_stamp_ledger_authority(&mut e.from_ledger, a);
+}
+
+fn w91_stamp_ledger_authority(ledger: &mut TestAccount, authority: [u8; 32]) {
+    let mut l = state::read_backing_domain_ledger(&ledger.data).unwrap();
+    l.authority = authority;
+    state::write_backing_domain_ledger(&mut ledger.data, &l).unwrap();
+}
+
+fn w91_rebalance(e: &mut W91Env, amount: u128) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: W91_FROM_DOMAIN,
+            to_domain: W91_TO_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.from_ledger,
+            &mut e.to_ledger,
+            &mut e.sysprog,
+        ],
+    )
+}
+
+/// Same call WITHOUT the harness's on-Err snapshot/restore, so a
+/// "must not mutate" assertion is falsifiable.
+fn w91_rebalance_no_rollback(e: &mut W91Env, amount: u128) -> Result<(), ProgramError> {
+    run_ix_no_rollback(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: W91_FROM_DOMAIN,
+            to_domain: W91_TO_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.from_ledger,
+            &mut e.to_ledger,
+            &mut e.sysprog,
+        ],
+    )
+}
+
+fn w91_expire(e: &mut W91Env, domain: u16) -> Result<(), ProgramError> {
+    run_ix(
+        Instruction::ExpireBackingBucket { domain },
+        &mut [&mut e.market],
+    )
+}
+
+fn w91_resolve_with_open_trader(e: &mut W91Env) {
+    let mut trader = signer();
+    let mut portfolio = portfolio_account_for_market_slots(2);
+    init_portfolio(&mut trader, &mut e.market, &mut portfolio);
+    deposit(&mut trader, &mut e.market, &mut portfolio, 500);
+    run_ix(
+        Instruction::ResolveMarket,
+        &mut [&mut e.admin, &mut e.market],
+    )
+    .expect("admin resolve");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W-21 (a) — tag 50 `WithdrawBackingBucket` on a LAPSED Fresh bucket.
+//
+// Defect (`verify/items/C-S-10b.md`, `verify/poc/C-S-10/` part (c); wrapper-side
+// realization measured by the W-91 verifier): the engine's withdrawal gate
+// `prepare_counterparty_backing_withdraw_delta` (`2c38570a:src/v16.rs:2815-2819`)
+// tests `status != Fresh` only, so between `expiry_slot` and the next tag-89 crank
+// the provider withdraws principal the expiry rule forfeits into the junior pool.
+// Fix: the wrapper refuses first, on upstream's predicate.
+// ───────────────────────────────────────────────────────────────────────────
+
+struct W21Tag50Env {
+    provider: TestAccount,
+    market: TestAccount,
+    ledger: TestAccount,
+    token_program: TestAccount,
+    admin: TestAccount,
+    mint: Pubkey,
+}
+
+/// A third-party provider funding domain 2 through the REAL tag 50
+/// `TopUpBackingBucket`, at a finite expiry. No LP vault anywhere: the provider
+/// still holds `backing_bucket_authority`, so nothing but the clock is in play.
+fn w21_tag50_env(expiry_slot: u64) -> W21Tag50Env {
+    let mut admin = signer();
+    let mut provider = signer();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+    let admin_key = admin.key.to_bytes();
+    let provider_key = provider.key.to_bytes();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        admin_key,
+        admin_key,
+        provider_key,
+    )
+    .unwrap();
+
+    let mut ledger = canonical_backing_ledger_account(&market, W91_FROM_DOMAIN);
+    let mut sysprog = system_program_account();
+    let mut token_program = token_program_account();
+    let mut vault = vault_token_account(&market, mint, 0);
+    let mut source = user_token_account(provider.key, mint, W91_U_ATOMS as u64);
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: W91_FROM_DOMAIN,
+            amount: W91_U_ATOMS,
+            expiry_slot,
+        },
+        &mut [
+            &mut provider,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+            &mut ledger,
+            &mut sysprog,
+        ],
+    )
+    .expect("finite-expiry provider top-up must fund domain 2");
+
+    W21Tag50Env {
+        provider,
+        market,
+        ledger,
+        token_program,
+        admin,
+        mint,
+    }
+}
+
+/// `run_ix_no_rollback`, so "0 atoms moved" is a real assertion and not a
+/// harness restore.
+fn w21_tag50_withdraw(e: &mut W21Tag50Env, amount: u128) -> Result<(), ProgramError> {
+    let mut dest = user_token_account(e.provider.key, e.mint, 0);
+    let mut vault = vault_token_account(&e.market, e.mint, W91_U_ATOMS as u64);
+    let mut vault_auth = vault_authority_account(&e.market);
+    run_ix_no_rollback(
+        Instruction::WithdrawBackingBucket {
+            domain: W91_FROM_DOMAIN,
+            amount,
+        },
+        &mut [
+            &mut e.provider,
+            &mut e.market,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut e.token_program,
+            &mut e.ledger,
+        ],
+    )
+}
+
+#[test]
+fn w21_tag50_refuses_a_lapsed_fresh_bucket_and_pays_an_unexpired_one() {
+    // ── (1) LAPSED: now == expiry_slot + 1. Refused, nothing moves. ──
+    let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    let g0 = w91_group(&e.market);
+    let b0 = g0.source_backing_buckets[W91_FROM_DOMAIN as usize];
+    let market_before = e.market.data.clone();
+    let ledger_before = e.ledger.data.clone();
+    println!(
+        "[w21-50] LAPSED  bucket status={:?} expiry={} now={} fresh_unliened={} | vault={} principal={}",
+        b0.status,
+        b0.expiry_slot,
+        g0.current_slot,
+        b0.fresh_unliened_backing_num,
+        g0.vault,
+        w91_principal(&e.ledger)
+    );
+    assert_eq!(b0.status, BackingBucketStatusV16::Fresh);
+    assert!(b0.expiry_slot <= g0.current_slot, "the bucket IS lapsed");
+
+    let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
+    println!("[w21-50] LAPSED  provider tag50 withdraw(U={W91_U_ATOMS}) -> {r:?}   (was Ok(()) before W-21)");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineStale.into()),
+        "W-21: the lapsed-bucket refusal, upstream 2b1d025c:10561-10567"
+    );
+    let g1 = w91_group(&e.market);
+    println!(
+        "[w21-50] LAPSED  0 atoms moved: vault {} (flat), ledger.principal {} (flat), fresh_unliened {} (flat)",
+        g1.vault,
+        w91_principal(&e.ledger),
+        g1.source_backing_buckets[W91_FROM_DOMAIN as usize].fresh_unliened_backing_num
+    );
+    assert_eq!(e.market.data, market_before, "no byte of the market moved");
+    assert_eq!(e.ledger.data, ledger_before, "no byte of the ledger moved");
+
+    // …and the canonical transition is still available: tag 89 forfeits it.
+    let mut market_only = [&mut e.market];
+    let x = run_ix(
+        Instruction::ExpireBackingBucket {
+            domain: W91_FROM_DOMAIN,
+        },
+        &mut market_only,
+    );
+    println!("[w21-50] LAPSED  tag89 ExpireBackingBucket -> {x:?}   (the rule W-21 stops the provider front-running)");
+    assert_eq!(x, Ok(()));
+    assert_eq!(
+        w91_group(&e.market).source_backing_buckets[W91_FROM_DOMAIN as usize].status,
+        BackingBucketStatusV16::Expired
+    );
+
+    // ── (2) UNEXPIRED: now < expiry_slot. Unchanged — still pays out. ──
+    let mut u = w21_tag50_env(W91_FINITE_EXPIRY);
+    w91_set_slot(&mut u.market, W91_FINITE_EXPIRY - 1);
+    let vault_pre = w91_group(&u.market).vault;
+    let ok = w21_tag50_withdraw(&mut u, W91_U_ATOMS);
+    let gu = w91_group(&u.market);
+    println!(
+        "[w21-50] UNEXPIRED now={} < expiry={} provider tag50 withdraw(U={W91_U_ATOMS}) -> {ok:?} | vault {vault_pre} -> {} | ledger.principal -> {}",
+        W91_FINITE_EXPIRY - 1,
+        W91_FINITE_EXPIRY,
+        gu.vault,
+        w91_principal(&u.ledger)
+    );
+    assert_eq!(ok, Ok(()), "W-21 must not touch an unexpired withdrawal");
+    assert_eq!(gu.vault, vault_pre - W91_U_ATOMS);
+    assert_eq!(w91_principal(&u.ledger), 0);
+}
+
+#[test]
+fn w21_tag50_refuses_a_lapsed_bucket_in_terminal_flat_resolved_too() {
+    // The shape the W-91 verifier measured paying out: Resolved, no materialized
+    // portfolios, c_tot == 0, bucket Fresh but lapsed. It paid `header.vault
+    // 97376 -> 0`; it must now refuse.
+    let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
+    run_ix(
+        Instruction::ResolveMarket,
+        &mut [&mut e.admin, &mut e.market],
+    )
+    .expect("admin resolve on an empty market");
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    let g0 = w91_group(&e.market);
+    println!(
+        "[w21-50R] mode={:?} materialized={} c_tot={} | bucket status={:?} expiry={} now={} | vault={}",
+        g0.mode,
+        g0.materialized_portfolio_count,
+        g0.c_tot,
+        g0.source_backing_buckets[W91_FROM_DOMAIN as usize].status,
+        g0.source_backing_buckets[W91_FROM_DOMAIN as usize].expiry_slot,
+        g0.current_slot,
+        g0.vault
+    );
+    assert_eq!(g0.mode, MarketModeV16::Resolved);
+    assert_eq!(g0.materialized_portfolio_count, 0);
+    assert_eq!(g0.c_tot, 0);
+
+    let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
+    println!("[w21-50R] terminal-flat Resolved, provider tag50 on the LAPSED bucket -> {r:?}   (was Ok(()), vault 97376 -> 0)");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineStale.into())
+    );
+    assert_eq!(
+        w91_group(&e.market).vault,
+        g0.vault,
+        "header.vault is flat — the atoms did not leave"
+    );
+}
+
+/// The original defect assertion, in the form the wrapper-side C-S-10b claim
+/// takes: a lapsed Fresh bucket pays the provider. It must now PANIC.
+#[test]
+#[should_panic(expected = "PRE-W-21: a lapsed Fresh bucket still pays the provider")]
+fn w21_old_tag50_lapsed_payout_assertion_must_now_fail() {
+    let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
+    println!("[w21-old50] provider tag50 on the LAPSED bucket -> {r:?}");
+    assert_eq!(r, Ok(()), "PRE-W-21: a lapsed Fresh bucket still pays the provider");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W-21 (b) — tag 91 `RebalanceLpVaultBacking`'s inline gate (`:16207`).
+//
+// `verify/poc/W-91/` is DEFEATED one gate earlier (the ledger-authority bind),
+// so these use the PoC's own counterfactual — `w91_forge_ledger_authority_to_registry`
+// — to isolate `:16207`, exactly as the PoC and its negative control do.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn w21_tag91_refuses_a_lapsed_bucket_and_the_two_orderings_converge() {
+    // ORDERING B (rebalance first) is now refused, so the only transition left is
+    // the canonical expiry — which is ORDERING A. The race is gone.
+    let mut e = w91_env();
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    w91_forge_ledger_authority_to_registry(&mut e);
+    let residual_pre = w91_residual(&w91_group(&e.market));
+
+    let r = w91_rebalance(&mut e, W91_U_ATOMS);
+    println!("[w21-91] tag91 on the LAPSED bucket -> {r:?}   (was Ok(()) before W-21)");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into()),
+        "W-21: :16207 now carries the expiry test"
+    );
+    assert_eq!(w91_principal(&e.to_ledger), 0, "nothing moved into the LP pot");
+
+    w91_expire(&mut e, W91_FROM_DOMAIN).expect("the canonical transition still runs");
+    let g = w91_group(&e.market);
+    println!(
+        "[w21-91] then tag89 -> bucket{}={:?}; junior residual {residual_pre} -> {} (+{})",
+        W91_FROM_DOMAIN,
+        g.source_backing_buckets[W91_FROM_DOMAIN as usize].status,
+        w91_residual(&g),
+        w91_residual(&g) - residual_pre
+    );
+    assert_eq!(
+        w91_residual(&g) - residual_pre,
+        W91_U_ATOMS,
+        "ORDERINGS CONVERGE: both land exactly U in the junior residual pool"
+    );
+
+    // ORDERING A, run separately, for the same endpoint.
+    let mut a = w91_env();
+    w91_set_slot(&mut a.market, W91_FINITE_EXPIRY + 1);
+    w91_forge_ledger_authority_to_registry(&mut a);
+    let res_a_pre = w91_residual(&w91_group(&a.market));
+    w91_expire(&mut a, W91_FROM_DOMAIN).expect("a lapsed Fresh bucket must expire");
+    let ra = w91_rebalance(&mut a, W91_U_ATOMS);
+    println!(
+        "[w21-91] ORDERING A: tag89 then tag91 -> {ra:?} | junior residual +{}",
+        w91_residual(&w91_group(&a.market)) - res_a_pre
+    );
+    assert_eq!(
+        ra,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into())
+    );
+    assert_eq!(
+        w91_residual(&w91_group(&a.market)) - res_a_pre,
+        W91_U_ATOMS
+    );
+}
+
+#[test]
+fn w21_tag91_still_rebalances_an_unexpired_bucket_and_the_sentinel_pot() {
+    // (1) UNEXPIRED finite bucket — the ordinary case, untouched.
+    let mut e = w91_env();
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY - 1);
+    w91_forge_ledger_authority_to_registry(&mut e);
+    let r = w91_rebalance(&mut e, W91_U_ATOMS);
+    let g = w91_group(&e.market);
+    println!(
+        "[w21-91ok] UNEXPIRED now={} < expiry={} tag91 -> {r:?} | to.principal={} to.expiry={}",
+        W91_FINITE_EXPIRY - 1,
+        W91_FINITE_EXPIRY,
+        w91_principal(&e.to_ledger),
+        g.source_backing_buckets[W91_TO_DOMAIN as usize].expiry_slot
+    );
+    assert_eq!(r, Ok(()), "W-21 must not break a live rebalance");
+    assert_eq!(w91_principal(&e.to_ledger), W91_U_ATOMS);
+
+    // (2) …and the LP vault's OWN pot, which sits at LP_VAULT_BACKING_EXPIRY_SLOT
+    //     (= u64::MAX/2), is never lapsed for any reachable slot: rebalancing back
+    //     out of it still works at a far-future slot.
+    let sentinel = percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT;
+    w91_set_slot(&mut e.market, 10_000_000_000u64);
+    let back = run_ix(
+        Instruction::RebalanceLpVaultBacking {
+            from_domain: W91_TO_DOMAIN,
+            to_domain: W91_FROM_DOMAIN,
+            amount: W91_U_ATOMS,
+        },
+        &mut [
+            &mut e.cranker,
+            &mut e.market,
+            &mut e.registry,
+            &mut e.to_ledger,
+            &mut e.from_ledger,
+            &mut e.sysprog,
+        ],
+    );
+    println!(
+        "[w21-91ok] SENTINEL pot (expiry={sentinel}) rebalanced back at slot 10_000_000_000 -> {back:?}"
+    );
+    assert_eq!(
+        back,
+        Ok(()),
+        "the sentinel expiry must stay above every reachable slot"
+    );
+}
+
+/// `verify/poc/W-91/poc_W-91_appended_to_v16_wrapper.rs`'s counterfactual
+/// assertion (LIVE, ORDERING B), verbatim. It must now PANIC.
+#[test]
+#[should_panic(
+    expected = "the gate at :16207-16212 tests `status != Fresh` only — a lapsed Fresh bucket passes"
+)]
+fn w21_old_w91_counterfactual_assertion_must_now_fail() {
+    let mut e = w91_env();
+    w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
+    w91_forge_ledger_authority_to_registry(&mut e);
+    let r = w91_rebalance(&mut e, W91_U_ATOMS);
+    println!("[w21-old91] LIVE tag91 on the LAPSED bucket -> {r:?}");
+    r.expect("the gate at :16207-16212 tests `status != Fresh` only — a lapsed Fresh bucket passes");
+}

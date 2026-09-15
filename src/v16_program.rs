@@ -6607,6 +6607,27 @@ pub mod policy_v16 {
         }
         Ok(())
     }
+
+    /// W-21 / C-S-10b. Ported byte-for-byte from upstream
+    /// `aeyakovenko/percolator-prog` `2b1d025c:src/v16_program.rs:5461-5466`.
+    ///
+    /// A backing bucket that has reached `expiry_slot` is LAPSED: the expiry rule
+    /// (`ExpireBackingBucket`, tag 89) will forfeit its unliened principal into the
+    /// junior residual pool, and the whole lien family already tests the clock —
+    /// lien-create (`percolator:2748-2753`) and lien-release (`:2849`) both refuse a
+    /// lapsed bucket. Only the engine's principal-withdrawal gate
+    /// (`prepare_counterparty_backing_withdraw_delta`, `2c38570a:src/v16.rs:2815-2819`)
+    /// tests `status != Fresh` alone, so between `expiry_slot` and the next crank a
+    /// provider can withdraw principal the expiry rule is about to forfeit. That is a
+    /// race the wrapper decides, so the wrapper refuses it — upstream does the same in
+    /// its own `handle_withdraw_backing_bucket` (`2b1d025c:10561-10567`).
+    ///
+    /// The engine-side half (adding `now_slot < expiry_slot` to `:2815-2819`) is
+    /// tracked separately as engine row Q2 / `fix/Q`; the two are complementary, and
+    /// this predicate stays correct whether or not the engine gate is tightened.
+    pub fn backing_principal_withdrawal_is_fresh(expiry_slot: u64, authenticated_slot: u64) -> bool {
+        authenticated_slot < expiry_slot
+    }
 }
 
 pub mod processor {
@@ -11147,6 +11168,23 @@ pub mod processor {
             };
 
             let (_, bucket) = backing_domain_parts_view(&group, domain_usize)?;
+            // W-21 / C-S-10b — adopt upstream's lapsed-bucket refusal
+            // (`2b1d025c:src/v16_program.rs:10561-10567`), in the same position:
+            // after the bucket is read, before the ledger is touched or the engine is
+            // called. A Fresh bucket whose `expiry_slot` has been reached is going to
+            // be forfeited into the junior residual pool by the next tag-89
+            // `ExpireBackingBucket`, which is permissionless; the engine's own
+            // withdrawal gate (`2c38570a:src/v16.rs:2815-2819`) tests `status != Fresh`
+            // only, so without this the provider wins that race and takes principal the
+            // expiry rule has already earmarked. Refusing here is not a new
+            // authorization: the provider's own remedy is to re-fund the bucket at a
+            // later expiry (tag 50 top-up), which the bucket family already supports.
+            if !policy_v16::backing_principal_withdrawal_is_fresh(
+                bucket.expiry_slot,
+                authenticated_market_slot_or_fallback_view(&group),
+            ) {
+                return Err(PercolatorError::EngineStale.into());
+            }
             {
                 let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
                 let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
@@ -16399,7 +16437,19 @@ pub mod processor {
                 &from_bucket,
             )?;
             sync_backing_domain_ledger(&mut from_ledger, &from_bucket)?;
+            // W-21 — the same lapsed-bucket refusal as tag 50, on the same predicate
+            // (`policy_v16::backing_principal_withdrawal_is_fresh`, upstream
+            // `2b1d025c:5461-5466`). This gate is tag 50's inline twin: it is the
+            // wrapper's own re-statement of the engine's withdrawability rule, and it
+            // inherited the same blind spot — `status != Fresh` with no clock test. A
+            // rebalance out of a lapsed bucket re-homes principal that tag 89 would
+            // otherwise forfeit, so WHICH instruction lands first decides where the
+            // atoms end up. With the test, expire-first and rebalance-first converge.
             if from_bucket.status != BackingBucketStatusV16::Fresh
+                || !policy_v16::backing_principal_withdrawal_is_fresh(
+                    from_bucket.expiry_slot,
+                    authenticated_market_slot_or_fallback_view(&group),
+                )
                 || from_bucket.fresh_unliened_backing_num < backing_num
                 || from_source.fresh_reserved_backing_num < backing_num
             {
