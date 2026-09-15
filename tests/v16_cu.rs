@@ -10032,12 +10032,65 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
 
     // Lapse past the bucket expiry (slot 2), resolve, then A closes (drains valid_liened to 0 via
     // its release + the shared-bucket expire).
+    //
+    // BOUNDED CONTINUATION. Since engine a0ed48a8 (our port of upstream
+    // aeyakovenko/percolator@e57296cd, "fix: prepare lapsed source before resolved settlement"),
+    // a resolved close of an account whose source domain holds a LAPSED backing bucket first
+    // normalises exactly ONE lapsed source domain per call and returns
+    // `ResolvedCloseOutcomeV16::ProgressOnly`; the close therefore takes more than one
+    // instruction and the caller is expected to loop. The wrapper LIBRARY already loops on
+    // ProgressOnly — this TEST hard-coded a single CloseResolved and asserted the payout on it,
+    // which is what made it red. The engine's own twin,
+    // `tests/backing_double_claim_fuzz.rs::terminal_close_with_expired_backing_does_not_strand`,
+    // was adapted by that same commit (`while steps < 8`, `assert!(steps >= 2)`); this is the
+    // identical adaptation. The property under test is unchanged: both co-tenants of the shared
+    // bucket must still be paid, and the domain must still wind down to zero residue. Only the
+    // number of CloseResolved instructions it takes is different.
     env.svm.warp_to_slot(5);
     env.resolve();
-    let dest_a = env.close_resolved(&owner_a, a);
+    let dest_a = env.token_account(owner_a.pubkey(), 0);
+    let mut steps_a = 0usize;
+    for i in 0..8 {
+        env.svm.expire_blockhash();
+        let result_a = env.send(
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new_readonly(owner_a.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(a, false),
+                AccountMeta::new(dest_a, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[],
+        );
+        steps_a = i + 1;
+        eprintln!(
+            "A-CLOSE step {i}: {result_a:?}  | A dest token = {}",
+            env.token_amount(dest_a)
+        );
+        assert!(
+            result_a.is_ok(),
+            "A's CloseResolved step {i} must succeed — a bounded continuation never reverts; got {result_a:?}"
+        );
+        if env.token_amount(dest_a) > 0 {
+            break;
+        }
+    }
     assert!(
         env.token_amount(dest_a) > 0,
         "A (first winner) closes and is paid"
+    );
+    // Discriminator, so the loop does not turn this test into one that cannot fail: against a
+    // pre-a0ed48a8 engine the FIRST CloseResolved already returns Closed{payout} (the lapsed
+    // source domain is never normalised as its own bounded step) and this assertion fires.
+    assert!(
+        steps_a >= 2,
+        "A must take the bounded-continuation path (>= 2 CloseResolved steps, the first returning \
+         ProgressOnly); took {steps_a}"
     );
     let (_, g_after_a) = env.market_state();
     eprintln!(
@@ -10048,23 +10101,39 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
         g_after_a.source_credit[1].impaired_liened_backing_num,
     );
 
-    // B's CloseResolved — STRANDED.
+    // B's CloseResolved — the co-tenant that this test exists to prove is NOT stranded. Same
+    // bounded continuation as A: loop, never accept a revert, assert the payout after the loop.
     let dest_b = env.token_account(owner_b.pubkey(), 0);
-    let result_b = env.send(
-        ProgInstruction::CloseResolved {
-            fee_rate_per_slot: 0,
-        },
-        vec![
-            AccountMeta::new_readonly(owner_b.pubkey(), false),
-            AccountMeta::new(env.market, false),
-            AccountMeta::new(b, false),
-            AccountMeta::new(dest_b, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(env.vault_authority, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        &[],
-    );
+    let mut steps_b = 0usize;
+    let mut result_b: Result<u64, String> = Err("B's CloseResolved was never sent".to_string());
+    for i in 0..8 {
+        env.svm.expire_blockhash();
+        result_b = env.send(
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new_readonly(owner_b.pubkey(), false),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(b, false),
+                AccountMeta::new(dest_b, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[],
+        );
+        steps_b = i + 1;
+        eprintln!(
+            "B-CLOSE step {i}: {result_b:?}  | B dest token = {}",
+            env.token_amount(dest_b)
+        );
+        // Stop on the first revert so the `result_b.is_ok()` guard below sees it (every
+        // intermediate result is therefore asserted Ok too), or as soon as B has been paid.
+        if result_b.is_err() || env.token_amount(dest_b) > 0 {
+            break;
+        }
+    }
     eprintln!(
         "B-CLOSE result: {result_b:?}  | B dest token = {}",
         env.token_amount(dest_b)
@@ -10079,6 +10148,12 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
     assert!(
         env.token_amount(dest_b) > 0,
         "B (second winner) is paid its resolved claim — no longer stranded"
+    );
+    // Same discriminator as A's: B's close also goes through at least one ProgressOnly step.
+    assert!(
+        steps_b >= 2,
+        "B must take the bounded-continuation path (>= 2 CloseResolved steps, the first returning \
+         ProgressOnly); took {steps_b}"
     );
     // The shared domain is fully wound down — no valid or impaired residue left behind.
     let (_, g_final) = env.market_state();
