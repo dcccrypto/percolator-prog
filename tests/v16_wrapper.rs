@@ -21797,3 +21797,295 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
         "#446: a blocked reduce must not mutate market state"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// W-19 regression — `constants::VERSION` 17 -> 18.
+//
+// These are the FIX-SIDE form of `verify/poc/F-01/poc_F-01.rs`
+// (`poc_f01_layout16_portfolio_is_refused_fail_closed_by_every_route`). That
+// PoC asserted, as its W-19 line, that the wrapper's OWN header gate does NOT
+// refuse a pre-layout-18 image:
+//
+//     assert_eq!(state::check_portfolio_kind(&portfolio.data), Ok(()),
+//                "W-19: VERSION is still 17, ...")
+//
+// With VERSION at 18 that line is `Err(Custom(1))` = `InvalidVersion`, and it
+// fires in `check_header` (`src/v16_program.rs:1546`) BEFORE the engine's
+// provenance check (`Custom(16)` = `EngineProvenanceMismatch`) can be reached.
+// `f01_w19_old_f01_assertion_must_now_fail` below pins that flip directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `V16_LAYOUT_DISCRIMINATOR` at the deployed engine `9483ee90` (`src/v16.rs:29`).
+const F01W19_PRE18_LAYOUT_DISCRIMINATOR: u16 = 16;
+/// wrapper `VERSION` at the deployed wrapper `e8acd708` and at `origin/main`
+/// `480e23a0` before this fix (`src/v16_program.rs:50`).
+const F01W19_PRE18_WRAPPER_VERSION: u16 = 17;
+/// `layout_discriminator` sits at +98 inside `ProvenanceHeaderV16Account`
+/// (32 market_group_id + 32 portfolio_account_id + 32 owner + 2 version), and the
+/// provenance header is the FIRST field of `PortfolioAccountV16Account`, which
+/// starts at `HEADER_LEN`. Neither offset moved 16 -> 18.
+const F01W19_DISC_OFF: usize = HEADER_LEN + 98;
+
+fn f01_w19_read_disc(data: &[u8]) -> u16 {
+    u16::from_le_bytes([data[F01W19_DISC_OFF], data[F01W19_DISC_OFF + 1]])
+}
+
+fn f01_w19_read_header_version(data: &[u8]) -> u16 {
+    u16::from_le_bytes([data[8], data[9]])
+}
+
+fn f01_w19_set_header_version(data: &mut [u8], version: u16) {
+    data[8..10].copy_from_slice(&version.to_le_bytes());
+}
+
+fn f01_w19_set_disc(data: &mut [u8], disc: u16) {
+    data[F01W19_DISC_OFF..F01W19_DISC_OFF + 2].copy_from_slice(&disc.to_le_bytes());
+}
+
+/// Exactly what the DEPLOYED wrapper+engine pair stamped: header VERSION 17,
+/// provenance layout discriminator 16.
+fn f01_w19_stamp_pre18(data: &mut [u8]) {
+    f01_w19_set_disc(data, F01W19_PRE18_LAYOUT_DISCRIMINATOR);
+    f01_w19_set_header_version(data, F01W19_PRE18_WRAPPER_VERSION);
+}
+
+/// A healthy, freshly-seeded portfolio under THIS build, plus its market.
+fn f01_w19_fixture() -> (TestAccount, TestAccount, TestAccount, TestAccount, Pubkey) {
+    let mut admin = signer();
+    // ClosePortfolio's closer must be writable (`expect_writable(closer)`).
+    let mut owner = signer().writable();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+    )
+    .unwrap();
+    let mut portfolio = portfolio_account_for_market_slots(2);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 10_000);
+    (admin, owner, market, portfolio, mint)
+}
+
+#[test]
+fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
+    assert_eq!(
+        percolator_prog::constants::VERSION,
+        18,
+        "W-19: src/v16_program.rs:50"
+    );
+    assert_eq!(
+        percolator::V16_LAYOUT_DISCRIMINATOR,
+        18,
+        "engine 2c38570a:src/v16.rs — the layout bump this VERSION tracks"
+    );
+
+    let (_admin, _owner, market, portfolio, _mint) = f01_w19_fixture();
+
+    // `write_header` is generic over KIND_*: one constant stamps every account
+    // the wrapper creates, which is why a PARTIAL re-seed hard-fails.
+    assert_eq!(
+        f01_w19_read_header_version(&market.data),
+        18,
+        "KIND_MARKET header stamped with the new VERSION"
+    );
+    assert_eq!(
+        f01_w19_read_header_version(&portfolio.data),
+        18,
+        "KIND_PORTFOLIO header stamped with the new VERSION"
+    );
+    assert_eq!(market.data[10], percolator_prog::constants::KIND_MARKET);
+    assert_eq!(portfolio.data[10], percolator_prog::constants::KIND_PORTFOLIO);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
+    println!(
+        "[w19] fresh accounts: market version={} kind={} | portfolio version={} kind={} disc={}",
+        f01_w19_read_header_version(&market.data),
+        market.data[10],
+        f01_w19_read_header_version(&portfolio.data),
+        portfolio.data[10],
+        f01_w19_read_disc(&portfolio.data),
+    );
+
+    // The bump does not break the accounts this build seeds itself.
+    assert_eq!(state::check_portfolio_kind(&portfolio.data), Ok(()));
+}
+
+#[test]
+fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
+    let (_admin, mut owner, mut market, mut portfolio, mint) = f01_w19_fixture();
+    let healthy = portfolio.data.clone();
+
+    // The on-chain shape: the old account after
+    // `ensure_portfolio_storage_for_market_slots` grew it 9347 -> 9539.
+    f01_w19_stamp_pre18(&mut portfolio.data);
+    assert_eq!(portfolio.data.len(), PORTFOLIO_ACCOUNT_LEN);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), 16);
+    assert_eq!(f01_w19_read_header_version(&portfolio.data), 17);
+    let stamped = portfolio.data.clone();
+
+    // ── THE FLIPPED LINE. Was `Ok(())` at VERSION 17 (verify/poc/F-01). ──
+    let own_check = state::check_portfolio_kind(&portfolio.data);
+    println!("[w19] check_portfolio_kind(disc=16, VERSION=17 image) -> {own_check:?}");
+    assert_eq!(
+        own_check,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+        "W-19: the wrapper's OWN gate (check_header :1546) now refuses the \
+         pre-layout-18 image with Custom(1) — it no longer falls through to the engine"
+    );
+
+    // Every mutating route inherits it, because
+    // `portfolio_view_mut_for_market_slots` (:3234) calls `check_header` first.
+    // `run_ix_no_rollback` does not restore on Err, so "no partial write" is real.
+    let market_before = market.data.clone();
+    let mut dest_token = user_token_account(owner.key, mint, 0);
+    let dest_before = dest_token.data.clone();
+    let mut vault_token = vault_token_account(&market, mint, 10_000);
+    let vault_before = vault_token.data.clone();
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let w = run_ix_no_rollback(
+        Instruction::Withdraw { amount: 1 },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut dest_token,
+            &mut vault_token,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    println!("[w19] Withdraw on the pre-18 image -> {w:?}   (was Custom(16) at VERSION 17)");
+    assert_eq!(
+        w,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+        "the wrapper header gate now refuses BEFORE the engine's provenance check"
+    );
+    assert_eq!(market.data, market_before, "no partial write to the market");
+    assert_eq!(dest_token.data, dest_before, "no tokens moved to the owner");
+    assert_eq!(vault_token.data, vault_before, "no tokens left the vault");
+    assert_eq!(portfolio.data, stamped, "no partial write to the portfolio");
+
+    let c = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19] ClosePortfolio on the pre-18 image -> {c:?}   (was Custom(16) at VERSION 17)");
+    assert_eq!(
+        c,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+    );
+    assert_eq!(market.data, market_before);
+    assert_eq!(portfolio.data, stamped);
+
+    // NO NEW EXIT. `is_initialized` reads MAGIC only, so the re-init escape is
+    // still shut — the bump relabels the refusal, it does not relax anything.
+    let i = run_ix_no_rollback(
+        Instruction::InitPortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19] InitPortfolio (re-seed in place) on the pre-18 image -> {i:?}");
+    assert_eq!(
+        i,
+        Err(percolator_prog::error::PercolatorError::AlreadyInitialized.into()),
+        "VERSION 18 must not open an in-place re-seed"
+    );
+    assert_eq!(portfolio.data, stamped);
+
+    // And the healthy image under THIS build still withdraws.
+    portfolio.data = healthy;
+    let ok = run_ix_no_rollback(
+        Instruction::Withdraw { amount: 1 },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio,
+            &mut dest_token,
+            &mut vault_token,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    println!("[w19] Withdraw on a VERSION-18 image -> {ok:?}");
+    assert_eq!(ok, Ok(()), "the bump must not break freshly-seeded accounts");
+}
+
+#[test]
+fn f01_w19_custom1_fires_before_the_engine_custom16() {
+    // The two halves are independent, so the ORDER is observable: craft an image
+    // that trips only ONE of the two gates and read which error comes back.
+    let (_admin, mut owner, mut market, mut portfolio, _mint) = f01_w19_fixture();
+    let healthy = portfolio.data.clone();
+
+    // (a) wrapper VERSION stale, engine layout CURRENT -> only the wrapper gate
+    //     can object, and it does. At VERSION 17 this image was fully accepted.
+    portfolio.data = healthy.clone();
+    f01_w19_set_header_version(&mut portfolio.data, F01W19_PRE18_WRAPPER_VERSION);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
+    let a = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19-order] (a) VERSION=17, disc=18 -> {a:?}   (wrapper gate only)");
+    assert_eq!(
+        a,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+    );
+
+    // (b) wrapper VERSION current, engine layout STALE -> the wrapper gate is
+    //     satisfied and the refusal is the ENGINE's provenance check, Custom(16).
+    portfolio.data = healthy.clone();
+    f01_w19_set_disc(&mut portfolio.data, F01W19_PRE18_LAYOUT_DISCRIMINATOR);
+    assert_eq!(f01_w19_read_header_version(&portfolio.data), 18);
+    assert_eq!(
+        state::check_portfolio_kind(&portfolio.data),
+        Ok(()),
+        "the wrapper gate reads MAGIC/VERSION/kind only — it cannot see the discriminator"
+    );
+    let b = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19-order] (b) VERSION=18, disc=16 -> {b:?}   (engine gate only)");
+    assert_eq!(
+        b,
+        Err(percolator_prog::error::PercolatorError::EngineProvenanceMismatch.into()),
+    );
+
+    // (c) BOTH stale — the real deployed image. Custom(1) wins, so the wrapper
+    //     gate is strictly first and the engine check is never reached.
+    portfolio.data = healthy;
+    f01_w19_stamp_pre18(&mut portfolio.data);
+    let c = run_ix_no_rollback(
+        Instruction::ClosePortfolio,
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    println!("[w19-order] (c) VERSION=17, disc=16 -> {c:?}   (BOTH stale: Custom(1) wins)");
+    assert_eq!(
+        c,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+        "Custom(1) precedes Custom(16)"
+    );
+}
+
+/// `verify/poc/F-01/poc_F-01.rs`'s W-19 assertion, verbatim, as it stood at
+/// `origin/main` 480e23a0. It must now PANIC.
+#[test]
+#[should_panic(expected = "W-19: VERSION is still 17")]
+fn f01_w19_old_f01_assertion_must_now_fail() {
+    let (_admin, _owner, _market, mut portfolio, _mint) = f01_w19_fixture();
+    f01_w19_stamp_pre18(&mut portfolio.data);
+    let own_check = state::check_portfolio_kind(&portfolio.data);
+    println!("[w19-old] wrapper check_portfolio_kind(disc=16, VERSION=17 image) -> {own_check:?}");
+    assert_eq!(
+        own_check,
+        Ok(()),
+        "W-19: VERSION is still 17, so the wrapper's own gate does NOT refuse the old layout \
+         — the refusal below is the ENGINE's discriminator check, not wrapper policy. \
+         (Under the negative control, VERSION=18, this line is what flips.)"
+    );
+}
