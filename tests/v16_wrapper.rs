@@ -21899,7 +21899,10 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
         "KIND_PORTFOLIO header stamped with the new VERSION"
     );
     assert_eq!(market.data[10], percolator_prog::constants::KIND_MARKET);
-    assert_eq!(portfolio.data[10], percolator_prog::constants::KIND_PORTFOLIO);
+    assert_eq!(
+        portfolio.data[10],
+        percolator_prog::constants::KIND_PORTFOLIO
+    );
     assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
     println!(
         "[w19] fresh accounts: market version={} kind={} | portfolio version={} kind={} disc={}",
@@ -22011,7 +22014,11 @@ fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
         ],
     );
     println!("[w19] Withdraw on a VERSION-18 image -> {ok:?}");
-    assert_eq!(ok, Ok(()), "the bump must not break freshly-seeded accounts");
+    assert_eq!(
+        ok,
+        Ok(()),
+        "the bump must not break freshly-seeded accounts"
+    );
 }
 
 #[test]
