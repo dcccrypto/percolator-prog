@@ -1209,23 +1209,38 @@ impl V16CuEnv {
                     .asset
                     .raw_oracle_target_price = percolator::V16PodU64::new(95);
             }
-            // v17 convergence matrix row: v17-cert-epoch-stale-seeding
-            // accrue_asset_to_not_atomic advances oracle_epoch, making the health cert
-            // issued by execute_trade_with_fee_loss_stale_scoped_not_atomic stale.
-            // Clear active_bitmap_at_cert on both portfolios so the wrapper's pre-trade
-            // staleness check short-circuits via active_bitmap_is_empty (line 12859 of
-            // v16_program.rs). The BPF engine recertifies during the actual trade.
-            // This only affects host-side benchmark seeding; no live invariant is weakened.
-            for word in long.header.health_cert.active_bitmap_at_cert.iter_mut() {
-                *word = percolator::V16PodU64::new(0);
-            }
-            for word in short.header.health_cert.active_bitmap_at_cert.iter_mut() {
-                *word = percolator::V16PodU64::new(0);
-            }
+            // FIX E-CU-R: this used to zero `active_bitmap_at_cert` on both portfolios so the
+            // wrapper's pre-trade currentness gate would short-circuit and the seeded stale
+            // portfolio would reach the engine's 2N stale-leg refresh. That made the fixture
+            // measure a shape the shipping wrapper refuses -- the CU number it produced was not a
+            // statement about any transaction that can land on chain. Upstream's own
+            // `seed_n_leg_position_for_benchmark` never did it. The two crank benchmarks that
+            // also use this seeder (`..._refresh_crank_...`, `..._liquidation_crank_...`) do not
+            // go through the trade gate and are unaffected; the trade benchmark now asserts the
+            // refusal instead (`v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff`).
         }
         self.svm.set_account(self.market, market_account).unwrap();
         self.svm.set_account(long_account, long_data).unwrap();
         self.svm.set_account(short_account, short_data).unwrap();
+    }
+
+    /// Accrue ONE asset to `now_slot` at `price` without touching any portfolio. Used by the
+    /// fresh-asset E-CU-R regression so the asset the trade opens is exactly as current as the
+    /// assets the stale legs sit on -- the refusal then has to be about the portfolio's
+    /// staleness and nothing else.
+    fn accrue_asset_for_benchmark(&mut self, asset_index: usize, now_slot: u64, price: u64) {
+        let mut market_account = self.svm.get_account(&self.market).expect("market account");
+        {
+            let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+            group
+                .accrue_asset_to_not_atomic(asset_index, now_slot, price, 0, true)
+                .unwrap();
+            group.markets[asset_index]
+                .engine
+                .asset
+                .raw_oracle_target_price = percolator::V16PodU64::new(price);
+        }
+        self.svm.set_account(self.market, market_account).unwrap();
     }
 
     fn seed_current_n_leg_position_for_benchmark(
@@ -7025,8 +7040,42 @@ fn v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit() {
     assert_eq!(short.legs[0].basis_pos_q, -((9 * POS_SCALE) as i128));
 }
 
+/// Pulls the `consumed <N> of <M>` figure out of a litesvm failure string so a refusal can be
+/// reported with the compute it actually cost. Returns `"?"` when the string carries no meter
+/// line (which itself is diagnostic).
+fn cu_consumed_from_err(err: &str) -> String {
+    match err.split("consumed ").nth(1) {
+        Some(rest) => rest
+            .split(' ')
+            .next()
+            .unwrap_or("?")
+            .replace(',', "")
+            .to_string(),
+        None => "?".to_string(),
+    }
+}
+
+// FIX E-CU-R. This test was `v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit` and asserted
+// `trade_cu <= 1_400_000` for a 14-leg stale `TradeNoCpi`. It reached that path only because
+// `seed_n_leg_position_for_benchmark` zeroed `active_bitmap_at_cert` on both portfolios, which
+// disabled `ensure_trade_portfolio_current_for_requests_view` -- the guard that exists to stop
+// exactly this. With the fixture honest, the shipping wrapper refuses the transaction with
+// `EngineStale` (`Custom(19)`) at ~108k CU instead of dying at the 1,400,000 CU ceiling with
+// `ProgramFailedToComplete`. That is upstream's contract for this shape: upstream renamed its own
+// copy to `..._rejects_before_cu_cliff` in `c6a68501` (2026-06-04), the same commit that
+// introduced the guard, and never budgeted CU for the stale path.
+//
+// This is not a weakened assertion. The old one was a CU bound on a shape no on-chain transaction
+// can take; the new one is that a real on-chain transaction fails CLOSED with a named error a
+// client can act on ("crank first") rather than running out of compute, which a client cannot tell
+// apart from any other compute failure. The CU watermarks that do describe reachable transactions
+// are untouched and still asserted:
+//   * `v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit`   <= 1,150,000
+//   * `v16_bpf_full_14_leg_refresh_crank_is_under_tx_limit`        <=   900,000
+//   * `v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit`    <= 1,375,000
+// and the refresh crank is the bounded second instruction this refusal points the client at.
 #[test]
-fn v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit() {
+fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -7036,34 +7085,369 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit() {
     env.deposit(&short_owner, short_account, 100_000);
     env.seed_n_leg_position_for_benchmark(long_account, short_account, 14);
     env.svm.warp_to_slot(16);
-    let trade_cu = env.trade_with_cu(
-        &long_owner,
-        long_account,
-        &short_owner,
-        short_account,
-        -(POS_SCALE as i128),
-        95,
-        0,
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let long_before = env.svm.get_account(&long_account).unwrap();
+    let short_before = env.svm.get_account(&short_account).unwrap();
+
+    let stale_err = env
+        .try_trade_asset_with_cu(
+            0,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            -(POS_SCALE as i128),
+            95,
+            0,
+        )
+        .expect_err("stale active accounts must pre-crank before trading");
+    println!(
+        "v16 stale full-14-leg TradeNoCpi (existing asset) refused at CU: {}",
+        cu_consumed_from_err(&stale_err)
     );
-    println!("v16 stale full-14-leg TradeNoCpi CU: {trade_cu}");
     assert!(
-        trade_cu <= 1_400_000,
-        "stale full-14-leg TradeNoCpi CU {} exceeded limit {}",
-        trade_cu,
-        1_400_000
+        stale_err.contains("Custom(19)") || stale_err.contains("custom program error: 0x13"),
+        "stale active trade should reject as EngineStale, got: {stale_err}"
+    );
+    assert!(
+        !stale_err.contains("exceeded CUs"),
+        "stale active trade must reject before the CU cliff: {stale_err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "refused stale trade leaves market bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_account).unwrap(),
+        long_before,
+        "refused stale trade leaves the long portfolio bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&short_account).unwrap(),
+        short_before,
+        "refused stale trade leaves the short portfolio bytes unchanged"
     );
 
-    let long_data = env.svm.get_account(&long_account).unwrap().data;
-    let short_data = env.svm.get_account(&short_account).unwrap().data;
-    let long = state::read_portfolio(&long_data).unwrap();
-    let short = state::read_portfolio(&short_data).unwrap();
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    let short = state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data).unwrap();
     assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
     assert_eq!(
         percolator::active_bitmap_count_ones(short.active_bitmap),
         14
     );
-    assert_eq!(long.legs[0].basis_pos_q, (9 * POS_SCALE) as i128);
-    assert_eq!(short.legs[0].basis_pos_q, -((9 * POS_SCALE) as i128));
+    assert_eq!(long.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
+    assert_eq!(short.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
+}
+
+// FIX E-CU-R, the route the guard did NOT cover and upstream still does not: a portfolio with 13
+// stale legs OPENING A FRESH ASSET. `ensure_trade_portfolio_current_for_requests_view` used to
+// return `Ok(())` before it read the cert at all whenever no request touched an asset the
+// portfolio already held (`touches_existing_asset == false`), so this shape walked straight into
+// the same 2N stale-leg refresh the 14-leg case above is refused for. Measured on prog
+// `origin/fix/W-19` at engine `a90fb27f` AND on `aeyakovenko/percolator-prog upstream/main`
+// `2b1d025c` at engine `394fd0bf`: `consumed 1,399,676 of 1,399,700 compute units ... exceeded CUs
+// meter`, `ProgramFailedToComplete`. Upstream shipped a fix for this
+// (`cfb78578`, test `v16_attack_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff`)
+// on 2026-06-24 for the `TradeCpi` route only, and reverted it in full on 2026-06-27 (`13b0a2cf`,
+// no reason recorded); `TradeNoCpi` was never covered even while that fix was in.
+#[test]
+fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 20_000);
+    env.deposit(&short_owner, short_account, 100_000);
+    // 13 legs on assets 0..12; all 14 assets accrued to slot 16, so asset 13 is a FRESH asset the
+    // portfolio has no leg on.
+    env.seed_n_leg_position_for_benchmark(long_account, short_account, 13);
+    env.accrue_asset_for_benchmark(13, 16, 95);
+    env.svm.warp_to_slot(16);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let long_before = env.svm.get_account(&long_account).unwrap();
+    let short_before = env.svm.get_account(&short_account).unwrap();
+
+    let fresh_err = env
+        .try_trade_asset_with_cu(
+            13,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            95,
+            0,
+        )
+        .expect_err("a 13-leg stale portfolio must pre-crank before opening a fresh asset");
+    println!(
+        "v16 stale 13-leg TradeNoCpi (fresh asset) refused at CU: {}",
+        cu_consumed_from_err(&fresh_err)
+    );
+    assert!(
+        fresh_err.contains("Custom(19)") || fresh_err.contains("custom program error: 0x13"),
+        "stale fresh-asset trade should reject as EngineStale, got: {fresh_err}"
+    );
+    assert!(
+        !fresh_err.contains("exceeded CUs"),
+        "stale fresh-asset trade must reject before the CU cliff: {fresh_err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "refused fresh-asset trade leaves market bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_account).unwrap(),
+        long_before,
+        "refused fresh-asset trade leaves the taker portfolio bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&short_account).unwrap(),
+        short_before,
+        "refused fresh-asset trade leaves the counterparty portfolio bytes unchanged"
+    );
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    assert!(
+        !has_active_leg_for_asset(&long, 13),
+        "the refused trade must not have opened the fresh asset"
+    );
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 13);
+}
+
+/// Builds a 14-asset market with a REAL `percolator-match` matcher registered on the LP portfolio
+/// and returns everything a `TradeCpi` needs. Shared by the CPI tests below.
+#[allow(clippy::type_complexity)]
+fn ecu_cpi_env() -> (V16CuEnv, Pubkey, Keypair, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 20_000);
+    env.deposit(&lp, lp_account, 100_000);
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+    (
+        env,
+        matcher_program,
+        taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ecu_send_trade_cpi(
+    env: &mut V16CuEnv,
+    matcher_program: Pubkey,
+    taker: &Keypair,
+    taker_account: Pubkey,
+    lp_account: Pubkey,
+    ctx: Pubkey,
+    delegate: Pubkey,
+    asset_index: u16,
+    size_q: i128,
+) -> Result<u64, String> {
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::TradeCpi {
+            asset_index,
+            size_q,
+            fee_bps: 0,
+            limit_price: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[taker],
+    )
+}
+
+// FIX E-CU-R on the CPI route -- upstream `cfb78578`'s own shape, whose test was named
+// `v16_attack_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff`. Upstream landed it
+// on 2026-06-24 and reverted it in full on 2026-06-27 (`13b0a2cf`; the companion `BatchTradeCpi`
+// fix `897d4edb` went the same way in `847f2414`). Neither revert records a reason beyond "This
+// reverts commit ...". Measured on prog `origin/fix/W-19` at engine `a90fb27f` before this fix:
+// the untrusted matcher is invoked (`invoke [2]` in the logs) and the instruction then dies with
+// `exceeded CUs meter`.
+#[test]
+fn v16_bpf_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff() {
+    let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
+    env.seed_n_leg_position_for_benchmark(taker_account, lp_account, 13);
+    env.accrue_asset_for_benchmark(13, 16, 95);
+    env.svm.warp_to_slot(16);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+    let cpi_err = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        13,
+        POS_SCALE as i128,
+    )
+    .expect_err("a 13-leg stale portfolio must pre-crank before a fresh-asset matcher-CPI trade");
+    println!(
+        "v16 stale 13-leg TradeCpi (fresh asset) refused at CU: {}",
+        cu_consumed_from_err(&cpi_err)
+    );
+    assert!(
+        cpi_err.contains("Custom(19)") || cpi_err.contains("custom program error: 0x13"),
+        "stale fresh-asset CPI trade should reject as EngineStale, got: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("exceeded CUs"),
+        "stale fresh-asset CPI trade must reject before the CU cliff: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("invoke [2]"),
+        "stale fresh-asset CPI trade must reject BEFORE the matcher CPI: {cpi_err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
+}
+
+// FIX E-CU-C, the fork-only half: our CPI trade routes ran upstream's per-asset lifecycle gate but
+// not its currentness gate. Upstream's `ensure_cpi_trade_portfolios_current_before_matcher`
+// (`upstream/main:src/v16_program.rs:14560`) runs both before invoking the matcher -- it added the
+// currentness half on 2026-06-15 in `ba1e8d5f` "Reject active-stale CPI trades before matcher" --
+// but our `3a189159` (2026-07-16) adopted only the lifecycle half.
+//
+// For an asset the portfolio ALREADY HOLDS this is NOT a CU cliff. Measured on `origin/fix/W-19`
+// at engine `a90fb27f`: refused `Custom(19)` at 315,221 CU. What it is, is a free CPI into an
+// arbitrary LP-registered matcher program for a trade that is already known to be refused -- the
+// log carries `invoke [2]`, i.e. the untrusted matcher ran and burned its own CU before the engine
+// rejected the fill. That is exactly the argument our own `3a189159` made for adopting the
+// lifecycle half. The `invoke [2]` assertion is what makes this test non-vacuous: a failed
+// transaction is rolled back, so "accounts unchanged" alone would hold either way.
+#[test]
+fn v16_bpf_stale_thirteen_leg_existing_asset_tradecpi_rejects_before_matcher_cpi() {
+    let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
+    env.seed_n_leg_position_for_benchmark(taker_account, lp_account, 13);
+    env.svm.warp_to_slot(16);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    let cpi_err = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        0,
+        -(POS_SCALE as i128),
+    )
+    .expect_err("a 13-leg stale portfolio must pre-crank before a matcher-CPI trade");
+    println!(
+        "v16 stale 13-leg TradeCpi (existing asset) refused at CU: {}",
+        cu_consumed_from_err(&cpi_err)
+    );
+    assert!(
+        cpi_err.contains("Custom(19)") || cpi_err.contains("custom program error: 0x13"),
+        "stale CPI trade should reject as EngineStale, got: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("exceeded CUs"),
+        "stale CPI trade must reject before the CU cliff: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("invoke [2]"),
+        "stale CPI trade must reject BEFORE the untrusted matcher is invoked: {cpi_err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
+}
+
+// THE CONTROL THAT KEEPS THE THREE TESTS ABOVE FROM BEING A REFUSE-EVERYTHING GATE. The gate now
+// counts the portfolio's LIVE active legs, so a 13-leg portfolio is over the `>= 8` threshold on
+// EVERY trade it makes, fresh asset or not. It must still be allowed to trade when it is CURRENT.
+// Both routes are driven, because the fix gates both: `TradeNoCpi` through
+// `ensure_trade_portfolios_current_for_requests_view` and `TradeCpi` through
+// `ensure_cpi_trade_portfolios_current_before_matcher`. Measured at `origin/fix/W-19` with engine
+// `a90fb27f` BEFORE the fix, the CPI leg of this control already filled (716,909 CU) -- so a
+// failure here is the fix refusing a trade that used to work, which is the thing to catch.
+#[test]
+fn v16_bpf_current_thirteen_leg_fresh_asset_trade_still_fills_on_both_routes() {
+    // (a) TradeNoCpi.
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 20_000);
+    env.deposit(&short_owner, short_account, 100_000);
+    env.seed_current_n_leg_position_for_benchmark(long_account, short_account, 13);
+    let nocpi_cu = env
+        .try_trade_asset_with_cu(
+            13,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            100,
+            0,
+        )
+        .expect("a CURRENT 13-leg portfolio must still open a fresh asset (TradeNoCpi)");
+    println!("v16 current 13-leg TradeNoCpi (fresh asset) filled at CU: {nocpi_cu}");
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    assert!(
+        has_active_leg_for_asset(&long, 13),
+        "the fresh asset must actually be open on the taker"
+    );
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
+
+    // (b) TradeCpi, through the real matcher.
+    let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
+    env.seed_current_n_leg_position_for_benchmark(taker_account, lp_account, 13);
+    let cpi_cu = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        13,
+        POS_SCALE as i128,
+    )
+    .expect("a CURRENT 13-leg portfolio must still open a fresh asset (TradeCpi)");
+    println!("v16 current 13-leg TradeCpi (fresh asset) filled at CU: {cpi_cu}");
+    let taker_after =
+        state::read_portfolio(&env.svm.get_account(&taker_account).unwrap().data).unwrap();
+    assert!(
+        has_active_leg_for_asset(&taker_after, 13),
+        "the fresh asset must actually be open on the taker through the CPI route"
+    );
+    assert_eq!(
+        percolator::active_bitmap_count_ones(taker_after.active_bitmap),
+        14
+    );
 }
 
 #[test]

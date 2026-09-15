@@ -9252,7 +9252,7 @@ pub mod processor {
         let lp_account_id = matcher_lp_account_id(&delegate);
         let (_, _, max_market_slots_pre, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+        ensure_cpi_trade_portfolios_current_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
@@ -9802,7 +9802,7 @@ pub mod processor {
         }
         let (_, _, max_market_slots_pre, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+        ensure_cpi_trade_portfolios_current_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
@@ -18425,23 +18425,50 @@ pub mod processor {
         Ok(false)
     }
 
+    /// FIX E-CU-R / E-CU-C: the `>= 8`-leg currentness gate keys off the portfolio's **live**
+    /// active-leg count, and runs on **every** trade route, not only when a request happens to
+    /// touch an asset the portfolio already holds.
+    ///
+    /// The work the engine is about to do is `2N` stale-leg settlement over the portfolio's own
+    /// live legs. It is not a function of which asset the request names, so neither is the gate.
+    /// Before this change three short-circuits stood in front of it and two of them were
+    /// properties of something other than that work:
+    ///
+    /// * `touches_existing_asset` -- a portfolio with 13 stale legs opening a **fresh** asset
+    ///   returned `Ok(())` here and then died at the compute ceiling inside the engine:
+    ///   measured `consumed 1,399,676 of 1,399,700 ... exceeded CUs meter`,
+    ///   `ProgramFailedToComplete`, against `108,585` CU for the `EngineStale` refusal the same
+    ///   portfolio gets when it touches an asset it already holds. The caller could not tell that
+    ///   compute failure apart from any other, so it had no way to learn it must crank first.
+    /// * the cert-empty / zero-requirement short-circuit -- a property of the health cert, not of
+    ///   the legs that have to be settled. A portfolio whose cert bitmap is empty while its live
+    ///   bitmap carries 14 legs pays the full cliff.
+    ///
+    /// The live-bitmap-empty short-circuit is kept (and hoisted above the cert decode): with no
+    /// live legs there is no settlement work, and it saves the cert `try_to_runtime` on the
+    /// first-open path.
+    ///
+    /// This is upstream's own `force_high_stale_current` shape (aeyakovenko/percolator-prog
+    /// `cfb78578` "[codex] Reject stale fresh-asset TradeCpi CU cliff (#161)", 2026-06-24), with
+    /// one difference: upstream passed `true` on the single `TradeCpi` route only and left
+    /// `TradeNoCpi` and `BatchTradeCpi` on the old shape, then reverted the whole commit three
+    /// days later in `13b0a2cf` (and its `BatchTradeCpi` companion `897d4edb` in `847f2414`).
+    /// Neither revert records a reason beyond "This reverts commit ...", so the revert is not
+    /// evidence of a defect in the gate -- but it is the reason upstream is still exposed here.
+    /// Here the gate is unconditional, so there is no flag to pass and no route left uncovered.
+    ///
+    /// `_requests` is retained so the signature stays on upstream's line for re-sync; the gate
+    /// deliberately does not read it.
     fn ensure_trade_portfolio_current_for_requests_view(
         group: &state::MarketViewMutV16<'_>,
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
-        requests: &[TradeRequestV16],
+        _requests: &[TradeRequestV16],
     ) -> ProgramResult {
         let active_bitmap = portfolio
             .header
             .active_bitmap
             .map(percolator::V16PodU64::get);
-        let mut touches_existing_asset = false;
-        for request in requests {
-            if portfolio_has_active_asset_view(group, portfolio, request.asset_index)? {
-                touches_existing_asset = true;
-                break;
-            }
-        }
-        if !touches_existing_asset {
+        if percolator::active_bitmap_is_empty(active_bitmap) {
             return Ok(());
         }
         let cert = portfolio
@@ -18449,17 +18476,10 @@ pub mod processor {
             .health_cert
             .try_to_runtime()
             .map_err(map_v16_error)?;
-        if percolator::active_bitmap_is_empty(cert.active_bitmap_at_cert)
-            || (cert.certified_initial_req == 0
-                && cert.certified_maintenance_req == 0
-                && cert.certified_worst_case_loss == 0)
-        {
-            return Ok(());
-        }
         // Avoid the pathological 2N stale-leg settlement cliff. Smaller stale
         // portfolios remain engine-handled so first-open and normal UX are not
         // blocked by conservative wrapper currentness heuristics.
-        if percolator::active_bitmap_count_ones(cert.active_bitmap_at_cert) < 8 {
+        if percolator::active_bitmap_count_ones(active_bitmap) < 8 {
             return Ok(());
         }
         if portfolio.header.b_stale_state != 0 {
@@ -18559,10 +18579,22 @@ pub mod processor {
         Ok(())
     }
 
-    /// Account-borrowing wrapper for `ensure_cpi_trade_asset_lifecycle_before_matcher` --
-    /// builds the market + both portfolio views, runs the lifecycle gate, then drops every
-    /// borrow before returning so the caller is free to CPI into the matcher immediately after.
-    fn ensure_cpi_trade_asset_lifecycle_before_matcher_from_accounts(
+    /// Account-borrowing wrapper for the two pre-matcher gates -- builds the market + both
+    /// portfolio views, runs the per-asset lifecycle gate AND the currentness gate, then drops
+    /// every borrow before returning so the caller is free to CPI into the matcher immediately
+    /// after.
+    ///
+    /// FIX E-CU-C: the currentness half is restored here. Upstream runs both gates before the
+    /// matcher CPI -- `ensure_cpi_trade_portfolios_current_before_matcher`
+    /// (`aeyakovenko/percolator-prog upstream/main:src/v16_program.rs:14560`) calls the lifecycle
+    /// gate at `:14586` and `ensure_trade_portfolios_current_for_requests_view` at `:14592`, from
+    /// `handle_trade_cpi` and the batch-CPI route. Upstream added the currentness half on
+    /// 2026-06-15 in `ba1e8d5f` "Reject active-stale CPI trades before matcher". Our `3a189159`
+    /// (2026-07-16, upstream #147 + #160) adopted only the lifecycle half, so until now
+    /// `TradeCpi`/`BatchTradeCpi` reached the 2N stale-leg settlement cliff even for an asset the
+    /// portfolio already holds -- the case the `TradeNoCpi` route has refused since `9cc574ea`.
+    /// The function is renamed to upstream's name so `git log -S` finds it on both trees.
+    fn ensure_cpi_trade_portfolios_current_before_matcher(
         market_ai: &AccountInfo<'_>,
         account_a_ai: &AccountInfo<'_>,
         account_b_ai: &AccountInfo<'_>,
@@ -18571,6 +18603,15 @@ pub mod processor {
     ) -> ProgramResult {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
+        let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(cpi_requests.len());
+        for &(asset_index, _) in cpi_requests {
+            requests.push(TradeRequestV16 {
+                asset_index: asset_index as usize,
+                size_q: 1,
+                exec_price: 1,
+                fee_bps: 0,
+            });
+        }
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (_cfg, group) = state::market_view_mut(&mut market_data)?;
         let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
@@ -18584,7 +18625,8 @@ pub mod processor {
             &account_a,
             &account_b,
             cpi_requests,
-        )
+        )?;
+        ensure_trade_portfolios_current_for_requests_view(&group, &account_a, &account_b, &requests)
     }
 
     fn ensure_trade_portfolios_current_for_requests_view(
