@@ -8342,10 +8342,15 @@ pub mod processor {
                 } else {
                     0
                 };
-            // Four-way split (2026-07-19 design). Taker-only (§1A) guarantees
-            // exactly one of outcome.fee_a/fee_b is nonzero, so splitting 0 is
-            // all-zeros and the maker's domain gets exactly the 0 credit it
-            // should -- no special-casing needed.
+            // Four-way split (2026-07-19 design). Both aggregates are split and the two
+            // results are added leg by leg below, so this site is correct whether the taker
+            // paid the whole fee, the maker paid it under the N1 fallback, or -- since engine
+            // #160 (`percolator 2c38570a:src/v16.rs:18224-18230`) -- the taker paid part and
+            // the maker the remainder. Splitting 0 is all-zeros, so a side that paid nothing
+            // gets exactly the 0 credit it should and no special-casing is needed. (This
+            // comment used to claim taker-only guarantees exactly one of the two is nonzero;
+            // that guarantee, and the proof it rested on, are gone at the linked engine -- see
+            // `batch_fee_charge_within_owed`. The arithmetic here never depended on it.)
             let split_a = policy_v16::split_trade_fee(
                 outcome.fee_a,
                 constants::PROTOCOL_FEE_BPS,
@@ -8505,6 +8510,44 @@ pub mod processor {
         Ok((product / den) + u128::from(product % den != 0))
     }
 
+    /// B-4 (wrapper impact W-14) — the batch-aggregate fee invariant the engine ACTUALLY
+    /// guarantees, replacing the exclusivity guard this wrapper used to enforce.
+    ///
+    /// The old guard refused any batch whose outcome had both `fee_a > 0` and `fee_b > 0`,
+    /// citing `proof_v16_taker_only_charges_exactly_one_side`. That harness does not exist at
+    /// the engine this wrapper builds against (`percolator 2c38570a`, `git grep -c` over the
+    /// tree -> 0): engine #160 retired it and replaced it with
+    /// `proof_v16_taker_only_never_overcharges_and_maker_pays_only_shortfall`
+    /// (`2c38570a:tests/proofs_v16.rs:14466`), because the charge shape changed. The taker is
+    /// charged first and, on a SHORTFALL rather than only on a zero payment, the solvent maker
+    /// is charged the REMAINDER `fee - taker_fee`, bounded by `min(fee, C_m)`
+    /// (`2c38570a:src/v16.rs:18213`, `:18224-18227`, `:19306`). The engine says so itself at
+    /// `2c38570a:src/v16.rs:18229-18230`: "Second, BOTH return values can now be non-zero --
+    /// previously exactly one was."
+    ///
+    /// So exclusivity is not an invariant of the linked engine; the AMOUNT is. Across the whole
+    /// batch the two aggregates together never exceed the fee the batch owes: the maker is only
+    /// ever asked for what the taker did not pay, and a remainder neither side can pay is
+    /// FORGIVEN, never over-collected from the other side or socialized
+    /// (`percolator:src/v16.rs` `uncollectible_fees_forgiven_not_socialized`; `av:spec.md:61`
+    /// §0 #26 "No fee seniority"). "The maker is charged only when the taker fell short"
+    /// (`fee_b > 0` implies `fee_a < fee_owed`) is a CONSEQUENCE of this bound, not a separate
+    /// test: with `fee_a + fee_b <= fee_owed`, any nonzero `fee_b` forces `fee_a < fee_owed`.
+    ///
+    /// This is the wrapper's cross-ABI distrust check, kept in the same place the exclusivity
+    /// guard sat: before any per-asset fee accounting or mark movement. The post-pass
+    /// `reconstructed_total != engine_total` cross-check is STRICTER still (it pins the sum
+    /// exactly) and is unchanged; this bound is the named invariant, stated where an
+    /// over-collecting engine is caught before the wrapper credits anything.
+    ///
+    /// Returns false on overflow: an aggregate pair that cannot even be summed is refused.
+    pub fn batch_fee_charge_within_owed(fee_a: u128, fee_b: u128, fee_owed: u128) -> bool {
+        match fee_a.checked_add(fee_b) {
+            Some(total) => total <= fee_owed,
+            None => false,
+        }
+    }
+
     /// Atomic multi-leg batch trade. `account_a` (taker) is the long side, `account_b` (LP) the
     /// short side; each leg's SIGNED `size_q` decides that leg's direction, so one batch can carry
     /// a mixed long/short spread. The engine settles both accounts ONCE, applies every leg, then
@@ -8590,8 +8633,7 @@ pub mod processor {
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
             let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(legs.len());
-            // (asset_index, oracle_profile, reported_exec_price, fee_basis_price, fee_bps_eff,
-            // abs_size).
+            // (asset_index, oracle_profile, reported_exec_price, fee_leg).
             //
             // A 7th element, `leg_size_q` (the raw signed per-leg size), used to
             // be carried through so the taker-only post-pass could pick the
@@ -8599,8 +8641,17 @@ pub mod processor {
             // credit. The creator-fee-claim change (2026-07-23) routes that leg
             // to `cfg.creator_fee_claimable_atoms` instead of a domain budget,
             // so no per-leg domain is selected any more and the field is gone.
-            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u64, u64, u128)> =
+            //
+            // B-4: `fee_basis_price` / `fee_bps_eff` / `abs_size` used to be carried so the
+            // post-pass could call `batch_leg_fee`. The per-leg fee is now reconstructed HERE,
+            // once, because the aggregate bound `batch_fee_charge_within_owed` needs the fee
+            // the batch owes BEFORE the engine's aggregates are inspected. The post-pass reads
+            // the cached value, so `batch_leg_fee` still runs exactly once per leg.
+            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u128)> =
                 Vec::with_capacity(legs.len());
+            // The fee this batch owes in total, reconstructed leg by leg. This is the ceiling
+            // the engine's two aggregates must respect (see `batch_fee_charge_within_owed`).
+            let mut fee_owed_total: u128 = 0;
             for leg in legs {
                 let asset_index = leg.asset_index as usize;
                 if requests.iter().any(|r| r.asset_index == asset_index) {
@@ -8636,14 +8687,11 @@ pub mod processor {
                     exec_price: fee_basis_price,
                     fee_bps: fee_bps_eff,
                 });
-                leg_ctx.push((
-                    asset_index,
-                    oracle_profile,
-                    leg.exec_price,
-                    fee_basis_price,
-                    fee_bps_eff,
-                    abs_size,
-                ));
+                let fee_leg = batch_leg_fee(abs_size, fee_basis_price, fee_bps_eff)?;
+                fee_owed_total = fee_owed_total
+                    .checked_add(fee_leg)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                leg_ctx.push((asset_index, oracle_profile, leg.exec_price, fee_leg));
             }
             ensure_trade_portfolios_current_for_requests_view(
                 &group, &account_a, &account_b, &requests,
@@ -8666,23 +8714,24 @@ pub mod processor {
                 )
                 .map_err(map_v16_error)?;
 
-            // Taker-only + N1 (design §1A.3/§1A.4): within one batch call,
-            // exactly one physical account pays across the WHOLE batch --
-            // pnl (the only thing `charge_account_fee_current_not_atomic`'s
-            // waiver reads) is invariant across legs within a single call
-            // (only capital changes as fees are charged; nothing in the
-            // per-leg loop -- position-delta application, residual-reward
-            // transfer, recertification -- touches pnl), so it is never a
-            // per-leg mix. `outcome.fee_a`/`outcome.fee_b` are the engine's
-            // AGGREGATE totals across all legs; whichever is nonzero
-            // identifies the uniform payer for this whole batch.
-            let taker_paid = outcome.fee_a > 0;
-            let maker_paid = outcome.fee_b > 0;
-            if taker_paid && maker_paid {
-                // Unreachable given the engine's taker-only charge shape
-                // (see proof_v16_taker_only_charges_exactly_one_side in
-                // percolator/tests/proofs_v16.rs), but the wrapper does not
-                // trust that invariant blindly across the ABI boundary.
+            // Taker-only + N1 (design §1A.3/§1A.4). `outcome.fee_a`/`outcome.fee_b` are the
+            // engine's AGGREGATE totals across all legs.
+            //
+            // B-4 (W-14): this used to refuse `fee_a > 0 && fee_b > 0` outright, on the ground
+            // that exactly one physical account pays across the whole batch. Engine #160 makes
+            // that state LEGITIMATE: a batch runs several fills against a RUNNING capital, and
+            // a taker that can pay one leg's fee in full but the next only in part is charged
+            // what it has while the solvent maker is charged the REMAINDER through the N1
+            // fallback (`percolator 2c38570a:src/v16.rs:18172-18178`, `:18213`, `:18224-18227`,
+            // and `:18229-18230` "BOTH return values can now be non-zero"). The proof the old
+            // comment cited, `proof_v16_taker_only_charges_exactly_one_side`, no longer exists
+            // at that ref. Refusing the state would block exactly the batches the engine fix
+            // was written to make chargeable.
+            //
+            // The wrapper still does not trust the ABI blindly -- it checks the invariant that
+            // DOES hold, in the same position, before any fee is credited or any mark moved:
+            // the two aggregates together never exceed the fee this batch owes.
+            if !batch_fee_charge_within_owed(outcome.fee_a, outcome.fee_b, fee_owed_total) {
                 return Err(PercolatorError::EngineArithmeticOverflow.into());
             }
 
@@ -8701,16 +8750,8 @@ pub mod processor {
             let mut lp_cut_running_total: u128 = 0;
             let mut insurance_cut_running_total: u128 = 0;
             let mut creator_cut_running_total: u128 = 0;
-            for (
-                asset_index,
-                oracle_profile,
-                reported_price,
-                fee_basis_price,
-                fee_bps_eff,
-                abs_size,
-            ) in leg_ctx.iter_mut()
-            {
-                let fee_leg = batch_leg_fee(*abs_size, *fee_basis_price, *fee_bps_eff)?;
+            for (asset_index, oracle_profile, reported_price, fee_leg) in leg_ctx.iter_mut() {
+                let fee_leg = *fee_leg;
                 if fee_leg != 0 {
                     let split_leg = policy_v16::split_trade_fee(
                         fee_leg,

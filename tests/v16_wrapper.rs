@@ -22107,3 +22107,267 @@ fn f01_w19_old_f01_assertion_must_now_fail() {
          (Under the negative control, VERSION=18, this line is what flips.)"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// B-4 (wrapper impact W-14) — the batch path refused the both-sides-charged
+// state that engine #160 makes legitimate.
+//
+// Before: `handle_batch_execute_zero_copy` returned `EngineArithmeticOverflow`
+// whenever `outcome.fee_a > 0 && outcome.fee_b > 0`, citing the Kani harness
+// `proof_v16_taker_only_charges_exactly_one_side`. That harness does not exist
+// at the engine this wrapper builds against (`percolator 2c38570a`); #160
+// replaced it with
+// `proof_v16_taker_only_never_overcharges_and_maker_pays_only_shortfall`
+// (`2c38570a:tests/proofs_v16.rs:14466`) because the charge shape changed: the
+// taker is charged what it can pay and the SOLVENT MAKER is charged the
+// REMAINDER (`2c38570a:src/v16.rs:18172-18178`, `:18213`, `:18224-18227`), and
+// "BOTH return values can now be non-zero -- previously exactly one was"
+// (`:18229-18230`).
+//
+// A batch is several fills against a RUNNING capital, so a taker that covers
+// leg 0's fee in full and leg 1's only in part produces exactly that state on
+// one batch. The fixture below is `sync/artifacts/b4_batch_guard_probe_test.rs`
+// (the 2026-09-14 design probe) turned into a regression test.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Open two legs, then leave the taker with `fee_leg + 1` atoms of capital and
+/// send a two-leg strict reduction. Returns
+/// `(result, fee_leg, taker_capital_before, taker_capital_after, maker_capital_before,
+///   maker_capital_after)`.
+fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128, u128, u128) {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 2;
+            }
+        }),
+    );
+    set_trade_fee_base_bps(&mut market, 1_000);
+
+    let mut taker_owner = signer();
+    let mut maker_owner = signer();
+    let mut taker = portfolio_account();
+    let mut maker = portfolio_account();
+    init_portfolio(&mut taker_owner, &mut market, &mut taker);
+    init_portfolio(&mut maker_owner, &mut market, &mut maker);
+    deposit(&mut taker_owner, &mut market, &mut taker, 10_000_000);
+    deposit(&mut maker_owner, &mut market, &mut maker, 10_000_000);
+
+    // Open a position on each asset (taker long, maker short) with ample capital.
+    let size = 10 * POS_SCALE;
+    let open = |asset_index: u16| percolator_prog::ix::BatchTradeLeg {
+        asset_index,
+        size_q: size as i128,
+        exec_price: 100,
+        fee_bps: 1_000,
+    };
+    run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![open(0), open(1)],
+        },
+        &mut [
+            &mut taker_owner,
+            &mut maker_owner,
+            &mut market,
+            &mut taker,
+            &mut maker,
+        ],
+    )
+    .expect("opening batch must execute");
+
+    // Arrange the taker's capital so ONE leg's fee is covered and the second is
+    // not: capital = fee_leg + 1 atom. The surgery mirrors a withdrawal so
+    // `c_tot` / `vault` stay consistent with Σ capital (`validate_shape`).
+    let fee_leg = taker_only_fee(size, 100, 1_000);
+    assert!(fee_leg > 1, "fixture needs a multi-atom fee");
+    let target_capital = fee_leg + 1;
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        let mut acct = state::read_portfolio(&taker.data).unwrap();
+        let drop = acct.capital - target_capital;
+        acct.capital = target_capital;
+        acct.health_cert.valid = false;
+        group.c_tot -= drop;
+        group.vault -= drop;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut taker.data, &acct).unwrap();
+    }
+
+    let taker_before = state::read_portfolio(&taker.data).unwrap().capital;
+    let maker_before = state::read_portfolio(&maker.data).unwrap().capital;
+
+    // A two-leg STRICT REDUCTION (exempt from the final IM gate), so an
+    // under-margin taker may execute it. Leg 0: the taker pays `fee_leg` in
+    // full, leaving 1 atom. Leg 1: the taker can pay 1 atom of `fee_leg`, and
+    // the N1 fallback asks the solvent maker for the remainder.
+    let reduce = |asset_index: u16| percolator_prog::ix::BatchTradeLeg {
+        asset_index,
+        size_q: -(size as i128),
+        exec_price: 100,
+        fee_bps: 1_000,
+    };
+    let res = run_ix(
+        Instruction::BatchTradeNoCpi {
+            legs: vec![reduce(0), reduce(1)],
+        },
+        &mut [
+            &mut taker_owner,
+            &mut maker_owner,
+            &mut market,
+            &mut taker,
+            &mut maker,
+        ],
+    );
+    let taker_after = state::read_portfolio(&taker.data).unwrap().capital;
+    let maker_after = state::read_portfolio(&maker.data).unwrap().capital;
+    (
+        res,
+        fee_leg,
+        taker_before,
+        taker_after,
+        maker_before,
+        maker_after,
+    )
+}
+
+/// THE REGRESSION. A batch whose taker runs out of capital between two legs is
+/// charged on both sides by the engine and must now EXECUTE, with the maker
+/// paying exactly the taker's shortfall and nothing more.
+#[test]
+fn b4_batch_with_taker_shortfall_and_maker_remainder_executes() {
+    let (res, fee_leg, taker_before, taker_after, maker_before, maker_after) =
+        b4_mid_batch_shortfall_batch();
+    println!("[b4] fee_leg={fee_leg} (per leg, 2 legs) -> batch owes {}", 2 * fee_leg);
+    println!("[b4] two-leg reduction with a mid-batch taker shortfall -> {res:?}");
+    assert_eq!(
+        res,
+        Ok(()),
+        "engine #160 makes the both-sides-charged batch legitimate; the wrapper must execute it"
+    );
+
+    let taker_paid = taker_before - taker_after;
+    let maker_paid = maker_before - maker_after;
+    println!(
+        "[b4] taker capital {taker_before} -> {taker_after} (paid {taker_paid}); \
+maker capital {maker_before} -> {maker_after} (paid {maker_paid})"
+    );
+    assert_eq!(
+        taker_paid, taker_before,
+        "the taker pays every atom it has: fee_leg in full on leg 0, its last atom on leg 1"
+    );
+    assert_eq!(
+        taker_paid,
+        fee_leg + 1,
+        "which is exactly the capital the fixture left it"
+    );
+    assert_eq!(
+        maker_paid,
+        fee_leg - 1,
+        "the maker pays the REMAINDER (fee - taker_fee), not the whole leg fee"
+    );
+    assert_eq!(
+        taker_paid + maker_paid,
+        2 * fee_leg,
+        "fee_a + fee_b == the fee the batch owes: nothing over-collected, nothing lost"
+    );
+    assert!(
+        taker_paid > 0 && maker_paid > 0,
+        "both aggregates are nonzero -- the state the pre-B-4 guard refused"
+    );
+}
+
+/// The pre-fix guard's decision, asserted as it stood. `EngineArithmeticOverflow`
+/// on this legitimate state is what B-4 removes, so this assertion MUST FAIL now;
+/// on a revert of `src/v16_program.rs` it passes again and this test goes red.
+#[test]
+#[should_panic(expected = "PRE-B-4")]
+fn b4_old_guard_refusal_of_the_legitimate_state_no_longer_happens() {
+    let (res, _fee_leg, _tb, _ta, _mb, _ma) = b4_mid_batch_shortfall_batch();
+    println!("[b4-old] mid-batch-shortfall batch -> {res:?}");
+    assert_eq!(
+        res,
+        Err(percolator_prog::error::PercolatorError::EngineArithmeticOverflow.into()),
+        "PRE-B-4: the `taker_paid && maker_paid` guard refused the batch engine #160 legitimises"
+    );
+}
+
+/// The invariant that REPLACED the exclusivity guard, exercised directly. The
+/// handler calls this predicate at the guard's old position with the fee the
+/// batch owes, so an engine that over-collects is still refused — which is the
+/// half of the old guard's job that was real.
+#[test]
+fn b4_aggregate_bound_admits_every_legitimate_split_and_refuses_over_collection() {
+    use percolator_prog::processor::batch_fee_charge_within_owed as within;
+    let owed: u128 = 1_000;
+
+    // Legitimate shapes at 2c38570a.
+    assert!(within(owed, 0, owed), "taker pays the whole fee");
+    assert!(within(0, owed, owed), "N1: the taker paid nothing, the maker pays it all");
+    assert!(within(600, 400, owed), "#160: taker pays part, maker pays the REMAINDER");
+    assert!(within(999, 1, owed), "a one-atom shortfall handed to the maker");
+    assert!(
+        within(1, 0, owed),
+        "an uncollectible remainder is FORGIVEN, not over-collected (av:spec.md:61 #26); the \
+         stricter reconstructed_total == engine_total cross-check is what pins the sum exactly"
+    );
+    assert!(within(0, 0, 0), "a zero-fee batch");
+
+    // Over-collection — refused, which is what the guard site is for.
+    assert!(!within(owed, 1, owed), "one atom MORE than the batch owes");
+    assert!(!within(owed, owed, owed), "both sides charged the full fee (upstream's engine shape)");
+    assert!(!within(1, 0, 0), "a fee on a zero-fee batch");
+    assert!(!within(u128::MAX, 1, u128::MAX), "an aggregate pair that cannot even be summed");
+
+    // The consequence the item asks for, restated: under this bound a nonzero
+    // maker charge forces the taker to have fallen short of the total owed.
+    for (a, b) in [(600u128, 400u128), (0, 1_000), (999, 1)] {
+        assert!(within(a, b, owed));
+        if b > 0 {
+            assert!(a < owed, "maker charged => taker fell short: fee_a={a} < owed={owed}");
+        }
+    }
+}
+
+/// Anti-rot: the refusal that B-4 removes must not come back, and the invariant
+/// that replaced it must still be wired into the batch handler.
+#[test]
+fn b4_batch_guard_site_enumeration() {
+    let src = include_str!("../src/v16_program.rs");
+    let exclusivity: Vec<usize> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("taker_paid && maker_paid"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    let bound: Vec<usize> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("batch_fee_charge_within_owed(outcome.fee_a"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    println!("[b4] `taker_paid && maker_paid` refusals: {exclusivity:?}");
+    println!("[b4] `batch_fee_charge_within_owed` call sites: {bound:?}");
+    assert!(
+        exclusivity.is_empty(),
+        "the exclusivity refusal is gone: engine #160 makes the state legitimate"
+    );
+    assert_eq!(
+        bound.len(),
+        1,
+        "and the aggregate bound is called exactly once, at the guard's old position"
+    );
+    // The total-integrity cross-check B-4 keeps, byte-identical.
+    assert_eq!(
+        src.matches("if reconstructed_total != engine_total {").count(),
+        1,
+        "the reconstructed-total cross-check is untouched"
+    );
+}
