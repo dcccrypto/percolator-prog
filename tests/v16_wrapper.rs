@@ -22089,3 +22089,570 @@ fn f01_w19_old_f01_assertion_must_now_fail() {
          (Under the negative control, VERSION=18, this line is what flips.)"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// W-GEN-L — the asset GENERATION stamp on `BackingDomainLedgerAccountV16`.
+//
+// The ledger PDA is keyed `(market_group, domain)` only, so it survives a
+// retire + re-activate of the asset slot — and tag 40's
+// `permissionless_reuse_target` lets any caller who pays the market-init fee
+// perform that re-activation. Before this fix `read_or_new_backing_domain_ledger`
+// compared only `market_group` / `authority` / `domain`, so the NEW market
+// inherited the OLD market's `total_deposited_atoms`,
+// `total_principal_withdrawn_atoms`, `cumulative_loss_atoms` (==
+// `residual_received_atoms()`, the deterministic LP-farm reward counter) and
+// `last_observed_unavailable_principal_atoms`.
+//
+// Measured as W-GEN PoC attempt 2b
+// (`verify/poc/W-GEN/poc_W-GEN.rs::poc_wgen_2b_backing_domain_ledger_counters_survive_the_generation_flip`),
+// which asserted the DEFECT: 700 atoms deposited under generation M1 plus 300
+// under M2 reported as a single `total_deposited_atoms = 1_000`. The port below
+// asserts the FIXED behaviour on the same staging.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A second signing handle on the SAME key (W-GEN PoC helper: instructions that
+/// want the incoming authority to co-sign alongside the caller).
+fn wgenl_co_signer(key: Pubkey) -> TestAccount {
+    TestAccount::new(key, Pubkey::new_unique(), 0).signer()
+}
+
+fn wgenl_lifecycle_ix(
+    action: u8,
+    asset_index: u16,
+    now_slot: u64,
+    initial_price: u64,
+    auth: [u8; 32],
+) -> Instruction {
+    Instruction::UpdateAssetLifecycle {
+        action,
+        asset_index,
+        now_slot,
+        initial_price,
+        insurance_authority: auth,
+        insurance_operator: auth,
+        backing_bucket_authority: auth,
+        oracle_authority: auth,
+    }
+}
+
+fn wgenl_group_of(market: &TestAccount) -> MarketGroupV16 {
+    state::read_market(&market.data).unwrap().1
+}
+
+/// Stage the W-GEN attempt-2b world up to (but not including) the generation
+/// flip: a market whose slot 1 is activated with `victim` as every domain
+/// authority, and 700 atoms deposited into domain 2 then fully withdrawn so the
+/// slot can retire.
+struct WgenlStage {
+    admin: TestAccount,
+    attacker: TestAccount,
+    victim_key: Pubkey,
+    market: TestAccount,
+    mint: Pubkey,
+    ledger: TestAccount,
+    token_program: TestAccount,
+    sysprog: TestAccount,
+    old_market_id: u64,
+}
+
+fn wgenl_stage_generation_one() -> WgenlStage {
+    let mut admin = signer();
+    let attacker = signer();
+    let victim = signer();
+    let mut market = market_account_with_capacity(4);
+    let mint = init_market(&mut admin, &mut market);
+    run_ix(
+        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    run_ix(
+        wgenl_lifecycle_ix(
+            processor::ASSET_ACTION_ACTIVATE,
+            1,
+            1,
+            101,
+            victim.key.to_bytes(),
+        ),
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    let old_market_id = wgenl_group_of(&market).assets[1].market_id;
+    assert_ne!(old_market_id, 0, "a live asset never carries market_id 0");
+
+    let mut ledger = canonical_backing_ledger_account(&market, 2);
+    let mut token_program = token_program_account();
+    let mut sysprog = system_program_account();
+    {
+        let mut victim_co = wgenl_co_signer(victim.key);
+        let mut source = user_token_account(victim.key, mint, 700);
+        let mut vault = vault_token_account(&market, mint, 0);
+        run_ix(
+            Instruction::TopUpBackingBucket {
+                domain: 2,
+                amount: 700,
+                expiry_slot: 10_000,
+            },
+            &mut [
+                &mut victim_co,
+                &mut market,
+                &mut source,
+                &mut vault,
+                &mut token_program,
+                &mut ledger,
+                &mut sysprog,
+            ],
+        )
+        .unwrap();
+        // Take it back out so the slot can retire.
+        let mut dest = user_token_account(victim.key, mint, 0);
+        let mut vault = vault_token_account(&market, mint, 700);
+        let mut vault_auth = vault_authority_account(&market);
+        run_ix(
+            Instruction::WithdrawBackingBucket {
+                domain: 2,
+                amount: 700,
+            },
+            &mut [
+                &mut victim_co,
+                &mut market,
+                &mut dest,
+                &mut vault,
+                &mut vault_auth,
+                &mut token_program,
+                &mut ledger,
+            ],
+        )
+        .unwrap();
+    }
+    WgenlStage {
+        admin,
+        attacker,
+        victim_key: victim.key,
+        market,
+        mint,
+        ledger,
+        token_program,
+        sysprog,
+        old_market_id,
+    }
+}
+
+/// Retire slot 1 and re-activate it through the PERMISSIONLESS reuse branch
+/// (attacker pays the 50-atom init fee, keeps the victim as backing authority).
+/// Returns the freshly minted generation.
+fn wgenl_flip_generation(s: &mut WgenlStage) -> u64 {
+    run_ix(
+        wgenl_lifecycle_ix(processor::ASSET_ACTION_RETIRE, 1, 3, 0, [0u8; 32]),
+        &mut [&mut s.admin, &mut s.market],
+    )
+    .unwrap();
+    let mut reuse_source = user_token_account(s.attacker.key, s.mint, 50);
+    let mut reuse_vault = vault_token_account(&s.market, s.mint, 0);
+    let victim_bytes = s.victim_key.to_bytes();
+    let attacker_bytes = s.attacker.key.to_bytes();
+    run_ix(
+        Instruction::UpdateAssetLifecycle {
+            action: processor::ASSET_ACTION_ACTIVATE,
+            asset_index: 1,
+            now_slot: 4,
+            initial_price: 201,
+            insurance_authority: attacker_bytes,
+            insurance_operator: attacker_bytes,
+            backing_bucket_authority: victim_bytes,
+            oracle_authority: attacker_bytes,
+        },
+        &mut [
+            &mut s.attacker,
+            &mut s.market,
+            &mut reuse_source,
+            &mut reuse_vault,
+            &mut s.token_program,
+        ],
+    )
+    .unwrap();
+    let new_market_id = wgenl_group_of(&s.market).assets[1].market_id;
+    assert!(
+        new_market_id > s.old_market_id,
+        "the engine must mint a fresh generation on re-activation"
+    );
+    new_market_id
+}
+
+fn wgenl_topup(s: &mut WgenlStage, amount: u128) -> Result<(), ProgramError> {
+    let mut victim_co = wgenl_co_signer(s.victim_key);
+    let mut source = user_token_account(s.victim_key, s.mint, amount as u64);
+    let mut vault = vault_token_account(&s.market, s.mint, 0);
+    run_ix(
+        Instruction::TopUpBackingBucket {
+            domain: 2,
+            amount,
+            expiry_slot: 10_000,
+        },
+        &mut [
+            &mut victim_co,
+            &mut s.market,
+            &mut source,
+            &mut vault,
+            &mut s.token_program,
+            &mut s.ledger,
+            &mut s.sysprog,
+        ],
+    )
+}
+
+// ───────────────────────── layout pins (zero ABI: 224 bytes, unchanged) ──────
+
+/// `market_id` occupies bytes 216..224 — the only 8-aligned slot in the old
+/// `_padding: [u8; 14]` — so the record and therefore
+/// `backing_domain_ledger_account_len()` do not move. Same shape (and same
+/// reason) as the creator-fee counter pinned in `tests/v16_fee_split.rs`.
+#[test]
+fn wgenl_ledger_layout_market_id_is_in_the_old_padding_tail() {
+    use percolator_prog::state::BackingDomainLedgerAccountV16;
+
+    assert_eq!(core::mem::size_of::<BackingDomainLedgerAccountV16>(), 224);
+    // Host only: `u128` is 16-aligned here and 8-aligned on BPF. The size and the
+    // offsets are target-independent and are ALSO pinned by `const _` asserts in
+    // `src/v16_program.rs`, which `cargo build-sbf` evaluates on the BPF target.
+    assert_eq!(core::mem::align_of::<BackingDomainLedgerAccountV16>(), 16);
+    assert_eq!(
+        core::mem::align_of::<BackingDomainLedgerAccountV16>(),
+        core::mem::align_of::<u128>()
+    );
+    assert_eq!(
+        core::mem::offset_of!(BackingDomainLedgerAccountV16, domain),
+        208
+    );
+    assert_eq!(
+        core::mem::offset_of!(BackingDomainLedgerAccountV16, _padding),
+        210
+    );
+    assert_eq!(
+        core::mem::offset_of!(BackingDomainLedgerAccountV16, market_id),
+        216,
+        "market_id must start at byte 216 — the 8-aligned tail of the old 14-byte pad"
+    );
+    assert_eq!(
+        state::backing_domain_ledger_account_len(),
+        HEADER_LEN + 224,
+        "the ACCOUNT length must not move: existing ledger PDAs are already this size"
+    );
+
+    let ledger = BackingDomainLedgerAccountV16 {
+        domain: 0x1122,
+        last_observed_unavailable_principal_atoms: 0x0a0b_0c0d_0e0f_1011,
+        market_id: 0x0102_0304_0506_0708,
+        ..Default::default()
+    };
+
+    let bytes = bytemuck::bytes_of(&ledger);
+    assert_eq!(bytes.len(), 224);
+    assert_eq!(
+        &bytes[208..210],
+        &0x1122u16.to_le_bytes(),
+        "domain must still read at 208..210"
+    );
+    assert_eq!(
+        &bytes[210..216],
+        &[0u8; 6],
+        "the 6-byte remnant of _padding must stay zero, not absorb market_id bytes"
+    );
+    assert_eq!(
+        &bytes[216..224],
+        &0x0102_0304_0506_0708u64.to_le_bytes(),
+        "market_id must occupy bytes 216..224, little-endian"
+    );
+
+    let reparsed: BackingDomainLedgerAccountV16 = bytemuck::pod_read_unaligned(bytes);
+    assert_eq!(reparsed.market_id, 0x0102_0304_0506_0708);
+    assert_eq!(reparsed.domain, 0x1122);
+    assert_eq!(
+        reparsed.last_observed_unavailable_principal_atoms,
+        0x0a0b_0c0d_0e0f_1011
+    );
+}
+
+/// Every ledger a previous build wrote has the whole 14-byte pad zeroed
+/// (`validate_backing_domain_ledger` refused non-zero padding), so it parses as
+/// `market_id == 0` — "unstamped", never a live generation: the engine's
+/// `next_market_id` starts at 1.
+#[test]
+fn wgenl_legacy_zeroed_padding_tail_parses_as_unstamped_market_id_zero() {
+    use percolator_prog::state::BackingDomainLedgerAccountV16;
+
+    let ledger = BackingDomainLedgerAccountV16 {
+        domain: 2,
+        total_deposited_atoms: 700,
+        cumulative_loss_atoms: 41,
+        market_id: u64::MAX, // zeroed below
+        ..Default::default()
+    };
+
+    let mut bytes = bytemuck::bytes_of(&ledger).to_vec();
+    for b in bytes[210..224].iter_mut() {
+        *b = 0;
+    }
+    let parsed: BackingDomainLedgerAccountV16 = bytemuck::pod_read_unaligned(&bytes);
+    assert_eq!(
+        parsed.market_id, 0,
+        "an old ledger's zeroed pad tail must read as an UNSTAMPED generation"
+    );
+    assert_eq!(parsed.domain, 2, "domain must survive the zeroed tail");
+    assert_eq!(parsed.total_deposited_atoms, 700);
+    assert_eq!(parsed.cumulative_loss_atoms, 41);
+}
+
+// ───────────────────────── the PoC flip (W-GEN attempt 2b) ───────────────────
+
+/// **W-GEN PoC attempt 2b, flipped.** Identical staging to
+/// `poc_wgen_2b_backing_domain_ledger_counters_survive_the_generation_flip`,
+/// which measured `total_deposited_atoms == 1_000` across the flip (defect).
+/// With the generation stamp the new market's ledger starts at zero.
+#[test]
+fn wgenl_poc_2b_generation_flip_starts_the_new_ledger_at_zero() {
+    let mut s = wgenl_stage_generation_one();
+
+    let gen1 = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(gen1.total_deposited_atoms, 700);
+    assert_eq!(gen1.total_principal_withdrawn_atoms, 700);
+    assert_eq!(gen1.total_principal_atoms, 0);
+    assert_eq!(
+        gen1.market_id, s.old_market_id,
+        "the generation-1 ledger must be stamped with generation 1"
+    );
+
+    let new_market_id = wgenl_flip_generation(&mut s);
+    wgenl_topup(&mut s, 300).unwrap();
+
+    let gen2 = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    // The COUNTERS are asserted before the stamp on purpose: this line is the one
+    // the PoC measured at 1_000, so it is the line a negative control must break.
+    assert_eq!(
+        gen2.total_deposited_atoms, 300,
+        "W-GEN 2b: generation {new_market_id} must NOT inherit generation {}'s \
+         700 atoms (the defect reported 1_000)",
+        s.old_market_id
+    );
+    assert_eq!(
+        gen2.total_principal_withdrawn_atoms, 0,
+        "the previous market's withdrawal history must not carry over"
+    );
+    assert_eq!(gen2.total_principal_atoms, 300);
+    assert_eq!(
+        gen2.cumulative_loss_atoms, 0,
+        "residual_received (the LP-farm reward counter) must start at zero"
+    );
+    assert_eq!(gen2.residual_received_atoms(), 0);
+    assert_eq!(gen2.cumulative_recovery_atoms, 0);
+    assert_eq!(gen2.total_earnings_atoms, 0);
+    assert_eq!(gen2.total_earnings_withdrawn_atoms, 0);
+    assert_eq!(
+        gen2.market_id, new_market_id,
+        "the ledger must be re-stamped with the new generation"
+    );
+}
+
+/// The old totals are not merely overwritten by coincidence — they are not READ.
+/// Plant a large, distinctive generation-1 history (including a non-zero
+/// `residual_received`), flip, and show every counter starts from zero.
+#[test]
+fn wgenl_old_generation_totals_are_not_read_by_the_new_generation() {
+    let mut s = wgenl_stage_generation_one();
+
+    // Plant generation-1 history directly in the ledger account, keeping its
+    // generation-1 stamp. (Wrapper-owned account; the engine never reads it.)
+    let mut planted = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    planted.total_deposited_atoms = 1_000_000;
+    planted.total_principal_withdrawn_atoms = 999_999;
+    planted.cumulative_loss_atoms = 777;
+    planted.cumulative_recovery_atoms = 13;
+    planted.total_earnings_atoms = 4_242;
+    planted.total_earnings_withdrawn_atoms = 4_242;
+    assert_eq!(planted.market_id, s.old_market_id);
+    state::write_backing_domain_ledger(&mut s.ledger.data, &planted).unwrap();
+
+    let new_market_id = wgenl_flip_generation(&mut s);
+    wgenl_topup(&mut s, 300).unwrap();
+
+    let gen2 = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        gen2.total_deposited_atoms, 300,
+        "generation 1's planted 1_000_000 must not be read"
+    );
+    assert_eq!(gen2.total_principal_withdrawn_atoms, 0);
+    assert_eq!(gen2.total_principal_atoms, 300);
+    assert_eq!(
+        gen2.cumulative_loss_atoms, 0,
+        "generation 1's 777 atoms of impairment must not price generation 2's rewards"
+    );
+    assert_eq!(gen2.residual_received_atoms(), 0);
+    assert_eq!(gen2.cumulative_recovery_atoms, 0);
+    assert_eq!(gen2.total_earnings_atoms, 0);
+    assert_eq!(gen2.total_earnings_withdrawn_atoms, 0);
+    assert_eq!(gen2.authority, s.victim_key.to_bytes());
+    assert_eq!(gen2.domain, 2);
+    assert_eq!(gen2.market_id, new_market_id);
+}
+
+// ───────────────────────── the no-op case ────────────────────────────────────
+
+/// SAME generation: the ledger PERSISTS across calls. The stamp must not turn
+/// every instruction into a re-seed — that would silently zero a live provider's
+/// accounting on every top-up.
+#[test]
+fn wgenl_same_generation_ledger_persists_across_calls() {
+    let mut s = wgenl_stage_generation_one();
+    let after_stage = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(after_stage.total_deposited_atoms, 700);
+    assert_eq!(after_stage.market_id, s.old_market_id);
+
+    // Three more top-ups in the SAME generation accumulate.
+    wgenl_topup(&mut s, 300).unwrap();
+    wgenl_topup(&mut s, 25).unwrap();
+    wgenl_topup(&mut s, 1).unwrap();
+
+    let after = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        after.total_deposited_atoms, 1_026,
+        "700 + 300 + 25 + 1, all under generation {}",
+        s.old_market_id
+    );
+    assert_eq!(after.total_principal_atoms, 326);
+    assert_eq!(after.total_principal_withdrawn_atoms, 700);
+    assert_eq!(
+        after.market_id, s.old_market_id,
+        "the stamp must be stable while the generation is"
+    );
+
+    // A pure read path (SyncBackingDomainLedger) must also leave it alone.
+    let victim_key = s.victim_key;
+    let mut victim_co = wgenl_co_signer(victim_key);
+    run_ix(
+        Instruction::SyncBackingDomainLedger { domain: 2 },
+        &mut [&mut victim_co, &mut s.market, &mut s.ledger],
+    )
+    .unwrap();
+    let after_sync = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(after_sync.total_deposited_atoms, 1_026);
+    assert_eq!(after_sync.total_principal_atoms, 326);
+    assert_eq!(after_sync.market_id, s.old_market_id);
+}
+
+// ───────────────────────── the legacy (unstamped) decision ───────────────────
+
+/// LEGACY DECISION: `market_id == 0` means "written before this change", so the
+/// record is STAMPED and its counters KEPT — never zeroed. Zeroing would, on the
+/// flag day, wipe a live market's provider/LP accounting the first time anyone
+/// touched it.
+#[test]
+fn wgenl_legacy_unstamped_ledger_is_stamped_not_zeroed() {
+    let mut s = wgenl_stage_generation_one();
+
+    // Reproduce the on-chain shape of a ledger written by the OLD program: the
+    // whole 14-byte pad region zero, i.e. market_id == 0, counters intact.
+    let mut legacy = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    legacy.market_id = 0;
+    state::write_backing_domain_ledger(&mut s.ledger.data, &legacy).unwrap();
+    let before = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(before.market_id, 0);
+    assert_eq!(before.total_deposited_atoms, 700);
+    assert_eq!(before.total_principal_withdrawn_atoms, 700);
+
+    // Touch it in the SAME (live) generation.
+    wgenl_topup(&mut s, 300).unwrap();
+
+    let after = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        after.market_id, s.old_market_id,
+        "an unstamped legacy ledger must be stamped with the CURRENT generation"
+    );
+    assert_eq!(
+        after.total_deposited_atoms, 1_000,
+        "and its counters must be KEPT (700 legacy + 300 now), not zeroed"
+    );
+    assert_eq!(after.total_principal_withdrawn_atoms, 700);
+    assert_eq!(after.total_principal_atoms, 300);
+}
+
+/// …and once stamped, the very next generation flip IS caught. This is the whole
+/// safety argument for accepting 0: nothing is destroyed, and the gap closes from
+/// the first write onward.
+#[test]
+fn wgenl_legacy_ledger_is_protected_from_the_next_flip_once_stamped() {
+    let mut s = wgenl_stage_generation_one();
+    let mut legacy = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    legacy.market_id = 0;
+    state::write_backing_domain_ledger(&mut s.ledger.data, &legacy).unwrap();
+
+    wgenl_topup(&mut s, 300).unwrap(); // stamps generation 1, keeps 700 + 300
+    assert_eq!(
+        state::read_backing_domain_ledger(&s.ledger.data)
+            .unwrap()
+            .total_deposited_atoms,
+        1_000
+    );
+
+    // Withdraw so the slot can retire, then flip.
+    {
+        let victim_key = s.victim_key;
+        let mut victim_co = wgenl_co_signer(victim_key);
+        let mut dest = user_token_account(victim_key, s.mint, 0);
+        let mut vault = vault_token_account(&s.market, s.mint, 300);
+        let mut vault_auth = vault_authority_account(&s.market);
+        run_ix(
+            Instruction::WithdrawBackingBucket {
+                domain: 2,
+                amount: 300,
+            },
+            &mut [
+                &mut victim_co,
+                &mut s.market,
+                &mut dest,
+                &mut vault,
+                &mut vault_auth,
+                &mut s.token_program,
+                &mut s.ledger,
+            ],
+        )
+        .unwrap();
+    }
+    let new_market_id = wgenl_flip_generation(&mut s);
+    wgenl_topup(&mut s, 11).unwrap();
+
+    let after = state::read_backing_domain_ledger(&s.ledger.data).unwrap();
+    assert_eq!(
+        after.total_deposited_atoms, 11,
+        "the once-legacy ledger is now stamped, so THIS flip re-seeds"
+    );
+    assert_eq!(after.total_principal_withdrawn_atoms, 0);
+    assert_eq!(after.cumulative_loss_atoms, 0);
+    assert_eq!(after.market_id, new_market_id);
+}
+
+/// Why the legacy branch does not matter in production: W-19 bumped the account
+/// header `VERSION` 17 -> 18, and `read_backing_domain_ledger` -> `check_header`
+/// refuses a version-17 ledger with `InvalidVersion` BEFORE
+/// `read_or_new_backing_domain_ledger` can look at the generation. Every ledger
+/// the deployed wrapper (`e8acd708`) created is therefore unreadable under this
+/// build and must be re-created by the F-01 re-seed — already stamped.
+#[test]
+fn wgenl_w19_version18_refuses_a_version17_ledger_before_the_generation_branch() {
+    let s = wgenl_stage_generation_one();
+    // Sanity: it reads at VERSION 18.
+    assert!(state::read_backing_domain_ledger(&s.ledger.data).is_ok());
+    assert_eq!(
+        u16::from_le_bytes([s.ledger.data[8], s.ledger.data[9]]),
+        18,
+        "W-19 header version"
+    );
+
+    let mut old_image = s.ledger.data.clone();
+    old_image[8..10].copy_from_slice(&17u16.to_le_bytes());
+    assert_eq!(
+        state::read_backing_domain_ledger(&old_image),
+        Err(ProgramError::Custom(1)),
+        "a VERSION-17 ledger is InvalidVersion — the legacy market_id == 0 branch \
+         is unreachable for any account the deployed wrapper wrote"
+    );
+}

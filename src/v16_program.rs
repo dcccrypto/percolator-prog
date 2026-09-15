@@ -1465,8 +1465,52 @@ pub mod state {
         pub cumulative_recovery_atoms: u128,
         pub last_observed_unavailable_principal_atoms: u128,
         pub domain: u16,
-        pub _padding: [u8; 14],
+        pub _padding: [u8; 6],
+        /// W-GEN-L: the asset GENERATION these counters belong to — the engine's
+        /// `AssetStateV16::market_id` for `domain / 2` at the time the ledger was
+        /// seeded.
+        ///
+        /// Without it the account is keyed only by `(market_group, domain)`, and a
+        /// slot that is retired and re-activated (permissionlessly, via tag 40's
+        /// `permissionless_reuse_target`) gets a FRESH engine generation while this
+        /// ledger keeps the previous market's `total_deposited_atoms`,
+        /// `cumulative_loss_atoms` and `residual_received_atoms` — so one market's
+        /// impairment history prices the next market's LP-farm rewards and NAV.
+        /// Measured as W-GEN PoC attempt 2b (700 atoms from generation M1 + 300 from
+        /// M2 reported as a single `total_deposited_atoms = 1_000`).
+        ///
+        /// It is carved out of the 8 top bytes of the old `_padding: [u8; 14]`, at
+        /// offset 216..224 of an unchanged 224-byte record — see the layout pins
+        /// immediately below and `wgenl_*` in `tests/v16_wrapper.rs`. Every ledger
+        /// written by an earlier build has those bytes zeroed (`validate_backing_
+        /// domain_ledger` refused non-zero padding), so `market_id == 0` means
+        /// "unstamped legacy record", never a live generation: the engine's
+        /// `next_market_id` starts at 1 and an asset with `market_id == 0` is
+        /// rejected outright (`percolator::v16` `activate_empty_market_slot_not_
+        /// atomic` / `validate_market_id_binding`).
+        pub market_id: u64,
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // W-GEN-L layout pins. `market_id` was squeezed into the ONLY 8-aligned slot
+    // of the pre-existing 14-byte `_padding`, precisely so that
+    // `backing_domain_ledger_account_len()` does not move under ledgers the
+    // deployed program already created. A reorder or a re-typing that grew the
+    // record would silently change the account length and brick every existing
+    // ledger at read time; these break the build instead.
+    // ══════════════════════════════════════════════════════════════════════════
+    const _: () = assert!(core::mem::size_of::<BackingDomainLedgerAccountV16>() == 224);
+    // `u128` is 16-aligned on the host and 8-aligned on the BPF target, so the
+    // record's ALIGNMENT is target-dependent (16 host / 8 solana) while its size and
+    // every offset below are not. Pinning it to `align_of::<u128>()` keeps the guard
+    // meaningful on both — a literal `== 16` fails `cargo build-sbf`, which is how
+    // this was found.
+    const _: () = assert!(
+        core::mem::align_of::<BackingDomainLedgerAccountV16>() == core::mem::align_of::<u128>()
+    );
+    const _: () = assert!(core::mem::offset_of!(BackingDomainLedgerAccountV16, domain) == 208);
+    const _: () = assert!(core::mem::offset_of!(BackingDomainLedgerAccountV16, _padding) == 210);
+    const _: () = assert!(core::mem::offset_of!(BackingDomainLedgerAccountV16, market_id) == 216);
 
     impl BackingDomainLedgerAccountV16 {
         /// Farm-facing deterministic reward counter for this backing authority/domain.
@@ -1691,7 +1735,7 @@ pub mod state {
     ) -> Result<(), ProgramError> {
         if ledger.market_group == [0u8; 32]
             || ledger.authority == [0u8; 32]
-            || ledger._padding != [0u8; 14]
+            || ledger._padding != [0u8; 6]
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -10477,6 +10521,44 @@ pub mod processor {
             .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
     }
 
+    /// W-GEN-L: a zeroed ledger record for `(market_group, authority, domain)`
+    /// stamped with the CURRENT asset generation, its observation watermarks pinned
+    /// to `bucket` so the `sync_backing_domain_ledger` that every caller runs next
+    /// is a no-op rather than a phantom loss or a phantom earning.
+    ///
+    /// Shared by all three seed paths (fresh account, GH#453 SPENT-authority
+    /// adoption, W-GEN-L generation re-seed) so they cannot drift apart.
+    fn new_backing_domain_ledger(
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        bucket: &percolator::BackingBucketV16,
+    ) -> Result<state::BackingDomainLedgerAccountV16, ProgramError> {
+        Ok(state::BackingDomainLedgerAccountV16 {
+            market_group,
+            authority,
+            total_principal_atoms: 0,
+            total_deposited_atoms: 0,
+            total_principal_withdrawn_atoms: 0,
+            total_earnings_atoms: 0,
+            total_earnings_withdrawn_atoms: 0,
+            last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
+            cumulative_loss_atoms: 0,
+            cumulative_recovery_atoms: 0,
+            last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(bucket)?,
+            domain,
+            _padding: [0u8; 6],
+            // The bucket IS the generation: the engine keeps
+            // `backing_{long,short}.market_id == asset.market_id` and refuses any
+            // slot where it does not (`EngineAssetSlotV16Account::
+            // validate_market_id_binding` -> `InvalidConfig`), re-checking it on the
+            // retired slot before a new id is assigned. Every call site reads
+            // `bucket` from `backing_domain_parts_view(&group, domain)` for this same
+            // domain, so no caller can present a bucket from elsewhere.
+            market_id: bucket.market_id,
+        })
+    }
+
     fn read_or_new_backing_domain_ledger(
         data: &[u8],
         market_group: [u8; 32],
@@ -10488,6 +10570,49 @@ pub mod processor {
             let ledger = state::read_backing_domain_ledger(data)?;
             if ledger.market_group != market_group || ledger.domain != domain {
                 return Err(PercolatorError::Unauthorized.into());
+            }
+            // ── W-GEN-L: the asset GENERATION gate, checked BEFORE the authority
+            // gate below. ───────────────────────────────────────────────────────
+            //
+            // The account is a PDA of `(market_group, domain)` only, so it survives
+            // a retire + re-activate of the asset slot — and tag 40's
+            // `permissionless_reuse_target` lets ANY caller who pays
+            // `permissionless_market_init_fee` perform that re-activation. The
+            // engine then stamps a fresh `market_id` and hands the domain a bucket
+            // that is `empty_for_market(new_id)`. This ledger's counters, however,
+            // describe the PREVIOUS market: W-GEN PoC attempt 2b measures 700 atoms
+            // deposited under generation M1 and 300 under M2 reported as a single
+            // `total_deposited_atoms = 1_000`, and the same record carries
+            // `cumulative_loss_atoms` (== `residual_received_atoms()`, the
+            // deterministic LP-farm reward counter) and
+            // `last_observed_unavailable_principal_atoms`, so an unrelated market's
+            // impairment history prices the new market's rewards and NAV.
+            //
+            // A stale generation is therefore treated as ABSENT and re-seeded,
+            // exactly as a SPENT authority is below. This destroys no payable claim:
+            // the engine will not mint a new generation until the bucket is provably
+            // value-free — `activate_empty_market_slot_not_atomic` requires
+            // `backing_{long,short}.is_empty_amount_shape()`, which demands zero
+            // fresh/valid/consumed/impaired backing AND zero
+            // `utilization_fee_earnings` AND `status == Empty`; the restart path
+            // (`restart_empty_asset_preserving_insurance_budget_not_atomic`) rebuilds
+            // the whole slot from `empty_for_market(market_id)`. Whatever the old
+            // ledger still claimed on paper was already unpayable from the new
+            // bucket the moment the generation changed; keeping the number only
+            // mis-prices the new market.
+            //
+            // Not caller-steerable: `domain` comes from the instruction but is
+            // range-checked and pinned into the PDA, and the generation compared
+            // against is read from engine state for that same domain, never from the
+            // payload.
+            //
+            // `market_id == 0` is the LEGACY case, not a generation — see the
+            // `stamp` branch below.
+            if ledger.market_id != 0 && ledger.market_id != bucket.market_id {
+                return Ok((
+                    new_backing_domain_ledger(market_group, authority, domain, bucket)?,
+                    true,
+                ));
             }
             if ledger.authority != authority {
                 // GH#453. A domain ledger outlives the authority that opened it.
@@ -10530,44 +10655,41 @@ pub mod processor {
                 if has_principal || has_unclaimed_earnings || bucket_holds_backing {
                     return Err(PercolatorError::Unauthorized.into());
                 }
-                let adopted = state::BackingDomainLedgerAccountV16 {
-                    market_group,
-                    authority,
-                    total_principal_atoms: 0,
-                    total_deposited_atoms: 0,
-                    total_principal_withdrawn_atoms: 0,
-                    total_earnings_atoms: 0,
-                    total_earnings_withdrawn_atoms: 0,
-                    last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
-                    cumulative_loss_atoms: 0,
-                    cumulative_recovery_atoms: 0,
-                    last_observed_unavailable_principal_atoms:
-                        backing_unavailable_principal_atoms(bucket)?,
-                    domain,
-                    _padding: [0u8; 14],
-                };
+                let adopted = new_backing_domain_ledger(market_group, authority, domain, bucket)?;
                 return Ok((adopted, true));
+            }
+            // W-GEN-L legacy: a ledger written by a build before this change has all
+            // 14 old padding bytes zero (`validate_backing_domain_ledger` refused any
+            // non-zero padding), so it reads back as `market_id == 0`. That is not a
+            // generation — the engine's `next_market_id` starts at 1 and an asset with
+            // `market_id == 0` is refused — so it means "unstamped".
+            //
+            // Such a record is STAMPED, not re-seeded: its counters are kept and the
+            // current generation is written in. The alternative (treat 0 as stale and
+            // zero the record) would, on the flag day, wipe the `total_principal_atoms`
+            // / `total_earnings_atoms` / `cumulative_loss_atoms` of every LIVE market's
+            // provider and LP vault the first time anyone touched them — destroying
+            // real claims to close a gap that only opens on a generation FLIP. Keeping
+            // the counters loses nothing: the one flip that could straddle the upgrade
+            // is the flip that happened before it, and no stamp could have caught that
+            // one either. Every flip after this write is caught.
+            //
+            // Post-W-19 this branch is unreachable in production anyway: W-19 bumped
+            // the account header `VERSION` 17 -> 18, and `read_backing_domain_ledger`
+            // -> `check_header` refuses any account carrying the old version with
+            // `InvalidVersion` BEFORE this function sees it, which is exactly the F-01
+            // full re-seed. It is kept as the fail-safe for any path that reaches a
+            // version-18 record with an unstamped tail (a ledger created by this build
+            // is always stamped).
+            if ledger.market_id == 0 {
+                let mut stamped = ledger;
+                stamped.market_id = bucket.market_id;
+                return Ok((stamped, true));
             }
             Ok((ledger, true))
         } else {
             Ok((
-                state::BackingDomainLedgerAccountV16 {
-                    market_group,
-                    authority,
-                    total_principal_atoms: 0,
-                    total_deposited_atoms: 0,
-                    total_principal_withdrawn_atoms: 0,
-                    total_earnings_atoms: 0,
-                    total_earnings_withdrawn_atoms: 0,
-                    last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
-                    cumulative_loss_atoms: 0,
-                    cumulative_recovery_atoms: 0,
-                    last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(
-                        bucket,
-                    )?,
-                    domain,
-                    _padding: [0u8; 14],
-                },
+                new_backing_domain_ledger(market_group, authority, domain, bucket)?,
                 false,
             ))
         }
