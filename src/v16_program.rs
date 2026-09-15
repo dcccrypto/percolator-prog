@@ -9007,44 +9007,48 @@ pub mod processor {
         if leg_a.side == leg_b.side {
             return Err(PercolatorError::EngineInvalidLeg.into());
         }
-        let close_q = close_q
-            .min(leg_a.basis_pos_q.unsigned_abs())
-            .min(leg_b.basis_pos_q.unsigned_abs());
-        if close_q == 0 {
-            return Err(PercolatorError::EngineNonProgress.into());
-        }
-        let req = TradeRequestV16 {
-            asset_index: asset_index_usize,
-            // signed size_q; force-close direction is carried by the long/short orientation
-            // selected just below, so pass the positive close magnitude here.
-            size_q: close_q as i128,
-            exec_price: frozen_mark,
-            fee_bps: 0,
-        };
-        // Taker-only: this path always trades at fee_bps: 0 (a cranker-driven
-        // forced close, not a fee-bearing trade), so `taker_is_long_account`
-        // is a documented no-op here -- `charge_account_fee_current_not_atomic`
-        // short-circuits on `requested_fee == 0` regardless of which side is
-        // nominally "taker" (design §1A.4).
-        if leg_a.side == SideV16::Short {
-            group
-                .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-                    &mut account_a,
-                    &mut account_b,
-                    req,
-                    true,
-                )
-                .map_err(map_v16_error)?;
-        } else {
-            group
-                .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-                    &mut account_b,
-                    &mut account_a,
-                    req,
-                    true,
-                )
-                .map_err(map_v16_error)?;
-        }
+        // C-W-02 / B-3 — size the close through the ENGINE primitive, not a raw-basis clamp.
+        //
+        // This used to clamp the caller's budget with
+        // `close_q.min(|leg_a.basis_pos_q|).min(|leg_b.basis_pos_q|)` and hand the result to
+        // `execute_trade_with_fee_loss_stale_scoped_not_atomic` itself. On a Recovery pair that
+        // has taken an ADL haircut the RAW basis exceeds the EFFECTIVE quantity, so the clamp
+        // asked to close more than the position that exists; the route then classified as a
+        // sign flip (`percolator 2c38570a:spec.md:1215`), `kernel_position_route_requires_unit_adl`
+        // fired and `require_asset_risk_change_allowed` refused the whole call with
+        // `LockActive` -> `Custom(21)`. Measured on an ADL'd pair: raw 1_990_000 / 1_989_949 vs
+        // effective 1_980_000 on both sides, and tag 64 with the documented "pass the full size"
+        // budget was unclosable.
+        //
+        // The spec draws the line at the QUANTITY, not the instruction: "liquidation sizing,
+        // full-close detection ... all use `effective_pos_q`; raw basis remains only for K/F
+        // settlement and social-loss weight accounting" (`av:spec.md:108-112`).
+        // `force_close_recovery_pair_not_atomic` (`2c38570a:src/v16.rs:18542`) is the engine's
+        // own implementation of that rule -- it clamps
+        // `close_request_q.min(effective_a).min(effective_b).min(oi_eff_long_q).min(oi_eff_short_q)`
+        // (`:18565-18571`), settles at the same frozen mark (`asset.effective_price`, `:18581`)
+        // with `fee_bps: 0` and the same `taker_is_long_account: true` selector in both
+        // orientations (`:18586-18594`), and returns the quantity it landed. This fork shipped
+        // that primitive with NO caller; upstream's wrapper calls it
+        // (`percolator-prog upstream/main:src/v16_program.rs:9078-9085`). Adopting the call is
+        // B-3: the caller's `close_q` stays a work BUDGET, and the engine decides the size.
+        //
+        // NOT adopted from upstream: its preceding one-sided-residue branch
+        // (`upstream/main:9037-9077`), which routes a pair with one zero-position side through
+        // `forfeit_recovery_leg_not_atomic` under this PERMISSIONLESS instruction. See the
+        // `cw02_` tests and `verify/fixes/C-W-02.md` for the measurements behind that decision:
+        // it would pass a POSITION quantity into an engine parameter that is a collateral-ATOM
+        // budget (`b_loss_atom_budget`, `2c38570a:src/v16.rs:21391`), letting any cranker spend
+        // an owner's principal. Our fork keeps that case on the owner-signed tag 43
+        // `ForfeitRecoveryLeg`.
+        group
+            .force_close_recovery_pair_not_atomic(
+                &mut account_a,
+                &mut account_b,
+                asset_index_usize,
+                close_q,
+            )
+            .map_err(map_v16_error)?;
         group.validate_shape().map_err(map_v16_error)?;
         account_a
             .validate_with_market(&group.as_view())
