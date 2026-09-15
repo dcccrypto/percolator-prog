@@ -79,9 +79,9 @@ jobs:
       # The wrapper compiles the engine through `path = "../percolator"`, and mounts
       # the matcher / nft / stake .so for its cross-program suites. All four must sit
       # as siblings or large parts of the suite silently do not execute.
-      - name: checkout engine (path dependency)
+      - name: checkout engine (path dependency, pinned to ENGINE_CI_SIBLING)
         uses: actions/checkout@v4
-        with: { repository: dcccrypto/percolator, path: percolator, token: '${{ secrets.GITHUB_TOKEN }}' }
+        with: { repository: dcccrypto/percolator, path: percolator, ref: '${{ steps.refs.outputs.ENGINE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
       # Sibling PROGRAMS are pinned to their DEPLOYED commits, not main. They are
       # separate on-chain programs that keep running their deployed build after we
       # upgrade the wrapper, so the wrapper must be tested against those bytes. Using
@@ -90,8 +90,32 @@ jobs:
       # (33e1185, BUG-001) that deployed 585f492 does not have, which alone caused 11
       # spurious v16_cu failures.
       #
-      # The ENGINE is deliberately NOT pinned: it compiles into the wrapper, so main
-      # is exactly what we are shipping and what these tests must cover.
+      # THE ENGINE IS NOW PINNED TOO -- ENGINE_CI_SIBLING in ci/deployed-refs.env.
+      #
+      # It used to be deliberately unpinned, on the argument that the engine compiles
+      # into the wrapper so "main is exactly what we are shipping". That argument only
+      # holds while engine main is compatible with this tree, and the engine is a
+      # SEPARATE REPOSITORY with its own merge queue. On 2026-09-09 engine main took
+      # bf2fda46 ("Adopt upstream 92ed4a1a ... (layout 18)"), which added a field to
+      # PortfolioLegV16. Every prog PR from that moment on failed `build + test` at
+      # `error[E0063]: missing field kf_epoch_snap` -- in a test file none of those PRs
+      # touched -- and the last green run on this repo was 2026-09-05. An unpinned
+      # cross-repo dependency does not make CI test "what we ship"; it makes every PR's
+      # verdict a function of what some other repo merged that hour, so a red job says
+      # nothing about the PR and a green one is luck.
+      #
+      # ENGINE_CI_SIBLING is the engine the wrapper SHIPS AGAINST, i.e. the engine this
+      # tree is written to compile and pass against. It is NOT a deployed ref and does
+      # NOT belong with the *_DEPLOYED values: what is on chain is recorded separately
+      # (ENGINE_DEPLOYED, and ~/percolator-ops/ledger/deployments.md). Moving it is a
+      # deliberate, reviewable commit that runs the suite against the new engine --
+      # which is the engine bump showing up as a diff instead of as a mystery.
+      #
+      # Upstream (aeyakovenko/percolator-prog) solves the same problem the other way:
+      # it consumes the engine as a git dependency with an explicit
+      # `rev = 394fd0bf2cb7d73df425eb3754dc3be1a0c44336` in Cargo.toml, so its engine is
+      # pinned in-tree and it needs no CI pin. Our fork uses `path = "../percolator"`
+      # (so the engine can be edited in lockstep), which moves that pin here.
       # NOTE on the nft pin: the DEPLOYED nft commit f18da24 existed only locally -- no
       # branch on dcccrypto/percolator-nft contained it, so GitHub could not serve it and the
       # checkout failed. It is now preserved as the branch `deployed/nft-f18da24`, which also
@@ -117,12 +141,30 @@ jobs:
       # `fix` = f18da24, preserved on the remote as branch `deployed/nft-f18da24`; it was the
       # PREVIOUSLY deployed nft and carries ce6b051 (accept wrapper VERSION 17) and 58911ab
       # (allowlist the DhSkE7u wrapper), neither of which was ever merged to nft main.
-      - name: checkout nft (pinned to the deployed commit)
+      #
+      # 2026-09-15: this step mounts NFT_CI_SIBLING, not NFT_DEPLOYED, for the duration of
+      # the layout-18 flag day. The wrapper's portfolio account is 9,539 B under the
+      # layout-18 engine; the deployed nft 215842e vendors a 9,227-B mirror and its
+      # `decode_portfolio` length gate rejects the account before it ever reads VERSION.
+      # Mounting those two together does not test a mix that can exist -- the pair is
+      # incompatible by construction until the nft deploy -- it just produces 7 failures
+      # that say "the flag day has not happened yet", measured: 5 in v16_nft_e2e and 2 in
+      # v16_five_program_crosscut, all of which pass against nft 74293a2e.
+      #
+      # NFT_DEPLOYED keeps its meaning (the bytes on chain) and keeps driving
+      # scripts/parity-check.sh's DEPLOYED rows, which is why the pin is NOT simply moved:
+      # bumping NFT_DEPLOYED to an undeployed commit was measured to turn the `parity` job
+      # red on `DEPLOYED nft.header_version` (wrapper 15eb8b0c stamps 17, nft 74293a2e wants
+      # 18) and would also be a false statement about the chain.
+      #
+      # The two pins converge again -- and this override is deleted -- when the nft and the
+      # wrapper are deployed together and NFT_DEPLOYED moves to that commit.
+      - name: checkout nft (pinned to the CI sibling the wrapper ships against)
         uses: actions/checkout@v4
         with:
           repository: dcccrypto/percolator-nft
           path: percolator-nft
-          ref: ${{ steps.refs.outputs.NFT_DEPLOYED }}
+          ref: ${{ steps.refs.outputs.NFT_CI_SIBLING }}
           token: '${{ secrets.GITHUB_TOKEN }}'
       # Stake likewise, and for an extra reason: main carries the 408-byte StakePool
       # layout that is deliberately NOT deployed (25 live pools are 392 bytes).
@@ -141,5 +183,5 @@ jobs:
       - name: run suite and diff against the allowlist
         working-directory: percolator-prog
         env:
-          NFT_PIN: deployed
+          NFT_PIN: ci_sibling
         run: ./scripts/ci-test.sh

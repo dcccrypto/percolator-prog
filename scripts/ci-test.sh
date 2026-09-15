@@ -54,10 +54,16 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+#   ci_sibling  The nft sibling is NFT_CI_SIBLING: the nft commit this wrapper source is
+#             written to run against, which during a flag day is NOT the one on chain. Added
+#             2026-09-15 for the layout-18 flag day (nft main 74293a2e vs deployed 215842e).
+#             The rule is the same EXACT MATCH as `deployed`; nothing is relaxed. What this
+#             value does NOT do is move NFT_DEPLOYED, which still states what is on chain and
+#             still drives scripts/parity-check.sh's DEPLOYED rows.
 NFT_PIN="${NFT_PIN:-deployed}"
 case "$NFT_PIN" in
-  fix|deployed) ;;
-  *) echo "FATAL: NFT_PIN must be 'fix' or 'deployed', got '${NFT_PIN}'"; exit 1;;
+  fix|deployed|ci_sibling) ;;
+  *) echo "FATAL: NFT_PIN must be 'fix', 'deployed' or 'ci_sibling', got '${NFT_PIN}'"; exit 1;;
 esac
 
 # --- PROOF OF LIFE: the nft sibling really is the ref this run claims -------------------
@@ -69,8 +75,9 @@ REFS_FILE="$ROOT/ci/deployed-refs.env"
 # shellcheck disable=SC1090
 set -a; . "$REFS_FILE"; set +a
 case "$NFT_PIN" in
-  fix)      want_nft="$NFT_FIX";;
-  deployed) want_nft="$NFT_DEPLOYED";;
+  fix)        want_nft="$NFT_FIX";;
+  deployed)   want_nft="$NFT_DEPLOYED";;
+  ci_sibling) want_nft="$NFT_CI_SIBLING";;
 esac
 have_nft="$(git -C ../percolator-nft rev-parse HEAD 2>/dev/null || true)"
 if [ -z "$have_nft" ]; then
@@ -82,6 +89,32 @@ if [ "$have_nft" != "$want_nft" ]; then
   exit 1
 fi
 echo "nft sibling verified: NFT_PIN=${NFT_PIN} -> ${have_nft}"
+
+# --- PROOF OF LIFE: the ENGINE sibling too ---------------------------------------------
+# Same argument as the nft check above, and it is not hypothetical. The engine is a path
+# dependency (`percolator = { path = "../percolator" }`) and ci.yml checked it out UNPINNED
+# until 2026-09-15, so every prog PR silently rebuilt against whatever dcccrypto/percolator
+# main was that hour. When engine main took bf2fda46 (layout 18) on 2026-09-09, `build +
+# test` went red on every PR at `error[E0063]: missing field kf_epoch_snap` and stayed red;
+# nothing in this script could say which engine had produced the verdict, because nothing
+# recorded it. Now ci.yml pins ENGINE_CI_SIBLING and this asserts the pin actually took.
+#
+# Set ENGINE_CI_SIBLING= (empty) to run against an arbitrary local engine worktree; the
+# result is then a local experiment and not the CI verdict, and this says so.
+have_engine="$(git -C ../percolator rev-parse HEAD 2>/dev/null || true)"
+if [ -z "$have_engine" ]; then
+  echo "FATAL: ../percolator is not a git checkout — the wrapper's path dependency has no identifiable source"; exit 1
+fi
+if [ -z "${ENGINE_CI_SIBLING:-}" ]; then
+  echo "WARNING: ENGINE_CI_SIBLING is empty — running against engine ${have_engine} unpinned; this is a local experiment, not the CI verdict"
+elif [ "$have_engine" != "$ENGINE_CI_SIBLING" ]; then
+  echo "FATAL: ENGINE_CI_SIBLING is ${ENGINE_CI_SIBLING} but ../percolator is at ${have_engine}."
+  echo "       Refusing to run: the allowlist below was measured against the pinned engine, so the"
+  echo "       verdict would be attributing another repo's commits to this pull request."
+  exit 1
+else
+  echo "engine sibling verified: ENGINE_CI_SIBLING -> ${have_engine}"
+fi
 
 echo "::group::build sibling program BPFs"
 for sib in percolator-match percolator-nft percolator-stake; do
@@ -178,6 +211,6 @@ if [ -n "$new_failures" ]; then
   echo "$new_failures" | sed 's/^/    /'
   rc=1
 fi
-[ $rc -eq 0 ] && echo "OK: failing set matches the allowlist exactly (nft pinned to the deployed ${NFT_DEPLOYED})"
+[ $rc -eq 0 ] && echo "OK: failing set matches the allowlist exactly (NFT_PIN=${NFT_PIN} -> nft ${want_nft}, engine ${have_engine})"
 
 exit $rc
