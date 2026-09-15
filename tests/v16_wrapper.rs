@@ -23037,3 +23037,450 @@ fn f05_f02_lock_is_the_close_slot_available_gate_16955() {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C-W-02 / B-3 — tag 64 `ForceCloseAbandonedAsset` sized its close from the RAW
+// basis while the engine routes on the EFFECTIVE quantity.
+//
+// Fixture and measurements are the C-W-02 PoC (`verify/poc/C-W-02/poc_C-W-02.rs`),
+// re-asserted against the FIXED handler: what the PoC recorded as a refusal
+// (`Custom(21)` `EngineLockActive`) is now the close the instruction exists to
+// perform.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn cw02_effective_ceil(raw_abs_q: u128, a_basis: u128, current_a: u128) -> u128 {
+    assert!(a_basis != 0);
+    if current_a >= a_basis {
+        return raw_abs_q;
+    }
+    let num = raw_abs_q
+        .checked_mul(current_a)
+        .expect("fixture stays inside u128");
+    num.div_ceil(a_basis)
+}
+
+/// Build a Recovery pair whose raw basis exceeds its effective quantity on BOTH
+/// sides (`a_long`/`a_short` < ADL_ONE), with `force_close_delay_slots` elapsed.
+/// Returns `(market, long_account, short_account, cranker, long_owner, wrapper_clamped_q,
+/// engine_clamped_q)`.
+fn cw02_adl_recovery_pair() -> (
+    TestAccount,
+    TestAccount,
+    TestAccount,
+    TestAccount,
+    TestAccount,
+    u128,
+    u128,
+) {
+    let mut admin = signer();
+    let cranker = signer();
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut market = market_account_with_capacity(2);
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+    let _mint = init_market(&mut admin, &mut market);
+
+    run_ix(
+        Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 9000,
+            force_close_delay_slots: 5,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+    )
+    .unwrap();
+
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 1,
+            size_q: (POS_SCALE * 2) as i128,
+            exec_price: 150,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    // The A-scaling event: an owner-signed partial risk reduction on each side,
+    // i.e. the engine's own ADL/A-scaling path (`rebalance_reduce_position_not_atomic`),
+    // the same one the engine spec test
+    // `v16_recovery_pair_close_clamps_stale_work_to_dual_adl_effective_oi`
+    // (2c38570a:tests/v16_spec_tests.rs:2509) uses to make raw > effective.
+    let reduce_q = POS_SCALE / 100;
+    run_ix(
+        Instruction::RebalanceReduce {
+            asset_index: 1,
+            reduce_q,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    )
+    .unwrap();
+    run_ix(
+        Instruction::RebalanceReduce {
+            asset_index: 1,
+            reduce_q,
+        },
+        &mut [&mut short_owner, &mut market, &mut short_account],
+    )
+    .unwrap();
+
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_SHUTDOWN,
+        1,
+        2,
+        0,
+    )
+    .unwrap();
+
+    let (_, g) = state::read_market(&market.data).unwrap();
+    let asset = g.assets[1];
+    assert_eq!(asset.lifecycle, AssetLifecycleV16::Recovery);
+    assert!(
+        asset.a_long < percolator::ADL_ONE,
+        "long side took an A haircut"
+    );
+    assert!(
+        asset.a_short < percolator::ADL_ONE,
+        "short side took an A haircut"
+    );
+
+    let long_leg = active_leg_for_asset(&state::read_portfolio(&long_account.data).unwrap(), 1);
+    let short_leg = active_leg_for_asset(&state::read_portfolio(&short_account.data).unwrap(), 1);
+    let raw_long = long_leg.basis_pos_q.unsigned_abs();
+    let raw_short = short_leg.basis_pos_q.unsigned_abs();
+    // effective_pos_q = ceil(|raw_basis| * current_A_side / leg_a_basis)
+    // (av:spec.md:103-106). The engine's kernel is `pub(crate)`, so the definition is
+    // restated and cross-checked against the engine-maintained `oi_eff_*_q` below.
+    let eff_long = cw02_effective_ceil(raw_long, long_leg.a_basis, asset.a_long);
+    let eff_short = cw02_effective_ceil(raw_short, short_leg.a_basis, asset.a_short);
+    assert_eq!(
+        eff_long, asset.oi_eff_long_q,
+        "restated ceil == engine oi_eff_long_q"
+    );
+    assert_eq!(
+        eff_short, asset.oi_eff_short_q,
+        "restated ceil == engine oi_eff_short_q"
+    );
+    assert!(raw_long > eff_long, "long raw basis exceeds its effective");
+    assert!(raw_short > eff_short, "short raw basis exceeds its effective");
+
+    //   OLD wrapper clamp, origin/main:9010-9012 : close_q.min(|raw_a|).min(|raw_b|)
+    //   engine clamp,      2c38570a:18565-18571  : q.min(eff_a).min(eff_b).min(oi_eff_long).min(oi_eff_short)
+    let wrapper_clamped = u128::MAX.min(raw_long).min(raw_short);
+    let engine_clamped = u128::MAX
+        .min(eff_long)
+        .min(eff_short)
+        .min(asset.oi_eff_long_q)
+        .min(asset.oi_eff_short_q);
+    println!(
+        "(cw02) raw_long={raw_long} raw_short={raw_short} eff_long={eff_long} eff_short={eff_short} \
+oi_eff_long={} oi_eff_short={} | old_wrapper_clamp={wrapper_clamped} engine_clamp={engine_clamped}",
+        asset.oi_eff_long_q, asset.oi_eff_short_q
+    );
+    assert!(
+        wrapper_clamped > engine_clamped,
+        "the raw clamp asks for MORE than the effective position"
+    );
+
+    (
+        market,
+        long_account,
+        short_account,
+        cranker,
+        long_owner,
+        wrapper_clamped,
+        engine_clamped,
+    )
+}
+
+/// THE REGRESSION. The documented "pass the full size" call (`u128::MAX`) now closes
+/// the ADL'd Recovery pair exactly, instead of being refused with `Custom(21)`.
+#[test]
+fn cw02_tag64_full_size_closes_the_adl_pair_exactly() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, raw_q, eff_q) =
+        cw02_adl_recovery_pair();
+    println!(
+        "(cw02) old_wrapper_clamp={raw_q} engine_clamp={eff_q} delta={}",
+        raw_q - eff_q
+    );
+
+    let r = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    );
+    println!("(cw02) tag 64, close_q=u128::MAX (full size) -> {r:?}");
+    assert_eq!(
+        r,
+        Ok(()),
+        "the engine primitive clamps the budget to the EFFECTIVE position and closes it"
+    );
+    let (_, g_after) = state::read_market(&market.data).unwrap();
+    println!(
+        "(cw02) after: oi_eff_long={} oi_eff_short={}",
+        g_after.assets[1].oi_eff_long_q, g_after.assets[1].oi_eff_short_q
+    );
+    assert_eq!(
+        g_after.assets[1].oi_eff_long_q, 0,
+        "effective OI fully closed"
+    );
+    assert_eq!(g_after.assets[1].oi_eff_short_q, 0);
+}
+
+/// The other natural "full size" — the raw basis itself — is now also fine: the
+/// engine clamps it down instead of classifying the over-sized request as a flip.
+#[test]
+fn cw02_tag64_raw_basis_budget_is_clamped_not_refused() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, raw_q, eff_q) =
+        cw02_adl_recovery_pair();
+    let r = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        raw_q,
+    );
+    println!("(cw02) tag 64, close_q=old_wrapper_clamp(min raw basis)={raw_q} -> {r:?}");
+    assert_eq!(r, Ok(()));
+    let (_, g_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(g_after.assets[1].oi_eff_long_q, 0);
+    assert_eq!(g_after.assets[1].oi_eff_short_q, 0);
+
+    // And the already-correct call still behaves: a second close has nothing left to do.
+    let again = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        eff_q,
+    );
+    println!("(cw02) tag 64 again on the closed pair -> {again:?}");
+    assert!(
+        again.is_err(),
+        "nothing left to close: the engine refuses rather than re-trading"
+    );
+}
+
+/// The ORIGINAL DEFECT ASSERTION, as the PoC wrote it. It must FAIL now; reverting
+/// `src/v16_program.rs` makes it pass again and turns this test red.
+#[test]
+#[should_panic(expected = "PRE-C-W-02")]
+fn cw02_old_defect_tag64_refuses_the_full_size_close() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, _raw_q, _eff_q) =
+        cw02_adl_recovery_pair();
+    let r = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    );
+    println!("(cw02-old) tag 64, close_q=u128::MAX -> {r:?}");
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into()),
+        "PRE-C-W-02: the raw-clamped size exceeds the effective position, the route classifies \
+         as a FLIP and require_asset_risk_change_allowed refuses with LockActive -> Custom(21)"
+    );
+}
+
+/// Site enumeration, re-pinned. Before B-3 there were FOUR `basis_pos_q.unsigned_abs()`
+/// occurrences: the two tag-64 clamp lines and two signed-position READS. The clamp is
+/// gone, so only the reads remain.
+#[test]
+fn cw02_basis_clamp_site_enumeration_is_reads_only() {
+    let src = include_str!("../src/v16_program.rs");
+    let hits: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("basis_pos_q.unsigned_abs()"))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    for (line, text) in &hits {
+        println!("(cw02) v16_program.rs:{line}: {text}");
+    }
+    assert_eq!(
+        hits.len(),
+        2,
+        "only the two signed-position reads in signed_position_for_asset_view survive"
+    );
+    for (_, text) in &hits {
+        assert!(
+            text.contains("SideV16::"),
+            "each survivor is a signed-position read, not a clamp: {text}"
+        );
+    }
+    assert_eq!(
+        src.matches(".force_close_recovery_pair_not_atomic(").count(),
+        1,
+        "and the engine primitive now has exactly one caller (it had none)"
+    );
+}
+
+/// Non-regression (4): the owner's independent dead-leg exit, tag 43
+/// `ForfeitRecoveryLeg`, still works on the very fixture B-3 changes. This is the
+/// route that keeps the one-sided residue case owner-signed in this fork -- see the
+/// decision recorded in `verify/fixes/C-W-02.md`.
+#[test]
+fn cw02_tag43_owner_forfeit_still_works_on_the_adl_recovery_leg() {
+    let (mut market, mut long_account, _short_account, _cranker, mut long_owner, _raw_q, _eff_q) =
+        cw02_adl_recovery_pair();
+    let long_before = state::read_portfolio(&long_account.data).unwrap();
+    assert!(has_active_leg_for_asset(&long_before, 1));
+
+    let r = run_ix(
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 1,
+            b_delta_budget: 1,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    );
+    println!("(cw02) tag 43 owner forfeit on the ADL'd Recovery leg -> {r:?}");
+    assert_eq!(r, Ok(()), "the owner-signed dead-leg exit is untouched by B-3");
+}
+
+/// The state upstream's extra branch (`upstream/main:9037-9077`) exists for, chased
+/// rather than assumed: close the ADL'd pair with tag 64 and look at what the pair is
+/// left holding. MEASURED HERE — the engine primitive leaves NO one-sided raw residue
+/// on this route (both legs detach, both `oi_eff` reach 0), and a second tag 64 is
+/// refused with `EngineInvalidLeg` rather than forfeiting anything on a cranker's
+/// say-so. This test records the decision NOT to adopt upstream's branch; the
+/// reasoning is in `verify/fixes/C-W-02.md`.
+#[test]
+fn cw02_engine_primitive_leaves_no_one_sided_residue_for_a_cranker_to_forfeit() {
+    let (mut market, mut long_account, mut short_account, mut cranker, _long_owner, _raw_q, eff_q) =
+        cw02_adl_recovery_pair();
+    force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    )
+    .expect("the pair closes");
+
+    let (_, g) = state::read_market(&market.data).unwrap();
+    let long = state::read_portfolio(&long_account.data).unwrap();
+    let short = state::read_portfolio(&short_account.data).unwrap();
+    let long_active = has_active_leg_for_asset(&long, 1);
+    let short_active = has_active_leg_for_asset(&short, 1);
+    let long_raw = if long_active {
+        active_leg_for_asset(&long, 1).basis_pos_q
+    } else {
+        0
+    };
+    let short_raw = if short_active {
+        active_leg_for_asset(&short, 1).basis_pos_q
+    } else {
+        0
+    };
+    println!(
+        "(cw02-1s) after a full close (landed {eff_q}): long_raw={long_raw} short_raw={short_raw} \
+long_leg_active={long_active} short_leg_active={short_active} oi_eff_long={} oi_eff_short={}",
+        g.assets[1].oi_eff_long_q, g.assets[1].oi_eff_short_q
+    );
+    assert_eq!(g.assets[1].oi_eff_long_q, 0);
+    assert_eq!(g.assets[1].oi_eff_short_q, 0);
+    assert_eq!(long_raw, 0, "no raw residue is left behind on the long side");
+    assert_eq!(short_raw, 0, "nor on the short side");
+
+    // With nothing left, tag 64 refuses. It does NOT fall through to a permissionless
+    // forfeit of one side's leftovers, which is what upstream's branch would do.
+    let residual_call = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        1,
+        7,
+        u128::MAX,
+    );
+    println!("(cw02-1s) tag 64 again -> {residual_call:?}");
+    assert_eq!(
+        residual_call,
+        Err(percolator_prog::error::PercolatorError::EngineInvalidLeg.into()),
+        "no active leg pair to close; the owner-signed tag 43 remains the exit for anything left"
+    );
+}
+/// THE DECISION, measured. Upstream's extra branch routes a one-sided pair through
+/// `forfeit_recovery_leg_not_atomic` under this PERMISSIONLESS instruction, i.e. it
+/// lets a cranker substitute a FORFEIT for a CLOSE. The two are not the same outcome
+/// for the account holder, and this test shows the difference on one fixture: the
+/// close settles the position at the frozen mark and leaves the capital, the forfeit
+/// gives the leg up. Recorded here so the choice not to adopt the branch is evidence,
+/// not preference — `verify/fixes/C-W-02.md`.
+#[test]
+fn cw02_forfeit_is_not_the_same_outcome_as_a_close_for_the_holder() {
+    // (a) the close, through the fixed tag 64.
+    let (mut market_c, mut long_c, mut short_c, mut cranker, _o, _raw, _eff) =
+        cw02_adl_recovery_pair();
+    let before = state::read_portfolio(&long_c.data).unwrap();
+    force_close_abandoned_asset(&mut cranker, &mut market_c, &mut long_c, &mut short_c, 1, 7, u128::MAX)
+        .expect("the pair closes");
+    let closed = state::read_portfolio(&long_c.data).unwrap();
+
+    // (b) the forfeit, through the owner-signed tag 43, on the same fixture.
+    let (mut market_f, mut long_f, _short_f, _cranker2, mut long_owner, _raw2, _eff2) =
+        cw02_adl_recovery_pair();
+    run_ix(
+        Instruction::ForfeitRecoveryLeg { asset_index: 1, b_delta_budget: u128::MAX },
+        &mut [&mut long_owner, &mut market_f, &mut long_f],
+    )
+    .expect("the owner may forfeit");
+    let forfeited = state::read_portfolio(&long_f.data).unwrap();
+
+    println!(
+        "(cw02-dec) before      capital={} pnl={} leg_active={}",
+        before.capital, before.pnl, has_active_leg_for_asset(&before, 1)
+    );
+    println!(
+        "(cw02-dec) tag64 close capital={} pnl={} leg_active={}",
+        closed.capital, closed.pnl, has_active_leg_for_asset(&closed, 1)
+    );
+    println!(
+        "(cw02-dec) tag43 forfeit capital={} pnl={} leg_active={}",
+        forfeited.capital, forfeited.pnl, has_active_leg_for_asset(&forfeited, 1)
+    );
+    assert!(
+        !has_active_leg_for_asset(&closed, 1),
+        "the close settles the pair at the frozen mark and RETIRES the leg"
+    );
+    assert!(
+        has_active_leg_for_asset(&forfeited, 1),
+        "the forfeit at the same budget settles the B debt (none here) and leaves the leg \
+         ATTACHED -- it is a different operation, not a slower close"
+    );
+}
