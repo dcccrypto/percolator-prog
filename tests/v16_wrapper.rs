@@ -5051,7 +5051,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 2,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut short_owner, &mut market, &mut short_account],
     )
@@ -5565,7 +5565,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 1,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut short_owner, &mut market, &mut short_account],
     )
@@ -5884,7 +5884,7 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     let forfeit_stale = run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: last_asset,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut long_owner, &mut market, &mut long_account],
     );
@@ -15809,7 +15809,7 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     let unauthorized = run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 0,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut attacker, &mut market, &mut long_account],
     );
@@ -15819,7 +15819,7 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     run_ix(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 0,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         &mut [&mut long_owner, &mut market, &mut long_account],
     )
@@ -21793,4 +21793,303 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
         market.data, before,
         "#446: a blocked reduce must not mutate market state"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C-W-03 — tag 43's wire field carries COLLATERAL ATOMS, not a B-index delta.
+//
+// The engine parameter it lands in has been `b_loss_atom_budget` /
+// `endpoint_loss_atom_budget` since engine `2c38570a` ("Both limits are collateral
+// atoms", `src/v16.rs:14149-14150`); the wrapper's field still carried its old
+// B-delta name, which is what the DEPLOYED engine `9483ee90` actually bounded.
+// Same bytes, same layout, different meaning — the rename makes the unit visible.
+//
+// These tests re-assert the C-W-03 PoC (`verify/poc/C-W-03/`) under the new name:
+// the atom semantics are unchanged (this is a clarity fix, not a behaviour fix),
+// and the WIRE LAYOUT is proven byte-identical so the rename cannot be an ABI break.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy)]
+struct Cw03Forfeit {
+    delta_b: u128,
+    loss_booked_atoms: u128,
+    capital_consumed: u128,
+    detached: bool,
+    loss_weight: u128,
+    b_debt: u128,
+    public_b_chunk_atoms: u128,
+}
+
+fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    // Recovery market + a REAL outstanding B debt on the long leg: `b_target_for_leg`
+    // reads `asset.b_long_num` for a Long leg whose b_epoch_snap matches the side epoch,
+    // and the leg's own `b_snap` is still 0, so `b_remaining == b_debt`. Seeding committed
+    // state is the technique this file's own `seed_cancellable_close_progress` uses.
+    let b_debt: u128 = 4 * percolator::SOCIAL_LOSS_DEN; // 4e21 B-index units
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        group.mode = MarketModeV16::Recovery;
+        group.recovery_reason = Some(PermissionlessRecoveryReasonV16::BelowProgressFloor);
+        group.assets[0].b_long_num = b_debt;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before_a = state::read_portfolio(&long_account.data).unwrap();
+    let before_leg = active_leg_for_asset(&before_a, 0);
+    let result = run_ix(
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 0,
+            b_loss_atom_budget: budget,
+        },
+        &mut [&mut long_owner, &mut market, &mut long_account],
+    );
+    let after_a = state::read_portfolio(&long_account.data).unwrap();
+    let detached = percolator::active_bitmap_is_empty(after_a.active_bitmap);
+    let after_b_snap = if detached {
+        b_debt
+    } else {
+        active_leg_for_asset(&after_a, 0).b_snap
+    };
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let out = Cw03Forfeit {
+        delta_b: after_b_snap,
+        loss_booked_atoms: (before_a.pnl - after_a.pnl).unsigned_abs()
+            + before_a.capital.saturating_sub(after_a.capital),
+        capital_consumed: before_a.capital.saturating_sub(after_a.capital),
+        detached,
+        loss_weight: before_leg.loss_weight,
+        b_debt,
+        public_b_chunk_atoms: group.config.public_b_chunk_atoms,
+    };
+    (result, out)
+}
+
+/// THE REGRESSION. The PoC's four wire values, re-measured under the new field
+/// name: the semantics are ATOMS and they are unchanged by the rename.
+#[test]
+fn cw03_tag43_budget_is_collateral_atoms_under_the_new_name() {
+    let mut rows = Vec::new();
+    for (label, budget) in [
+        ("1", 1u128),
+        ("POS_SCALE", POS_SCALE),
+        // The whole outstanding debt expressed in ATOMS (4e21 B-index units at
+        // loss_weight == POS_SCALE == 1e6 is 4e6 collateral atoms). A legacy caller
+        // passing this as a B-INDEX delta means "settle 4 million B-units, a 4e-15
+        // fraction of the debt"; this engine reads it as "settle four million atoms"
+        // -- the entire debt, terminally.
+        ("debt_atoms", 4_000_000u128),
+        ("u128::MAX", u128::MAX),
+    ] {
+        let (res, f) = cw03_run(budget);
+        println!("[cw03] b_loss_atom_budget={label:>9} ({budget}) -> res={res:?} {f:?}");
+        assert!(res.is_ok(), "tag 43 must be accepted for budget {label}: {res:?}");
+        rows.push(f);
+    }
+    let one = rows[0];
+    let pos = rows[1];
+    let debt = rows[2];
+    let max = rows[3];
+
+    assert_eq!(
+        one.loss_weight, POS_SCALE,
+        "fixture assumption: leg loss_weight == POS_SCALE"
+    );
+    assert_eq!(
+        one.loss_booked_atoms, 1,
+        "budget=1 is read as ONE COLLATERAL ATOM: exactly 1 atom of loss is booked"
+    );
+    assert_eq!(
+        pos.loss_booked_atoms, POS_SCALE,
+        "budget=POS_SCALE is read as 1_000_000 COLLATERAL ATOMS"
+    );
+    assert_eq!(
+        pos.loss_booked_atoms,
+        one.loss_booked_atoms * POS_SCALE,
+        "the wire value scales the FORFEIT one-for-one in atoms"
+    );
+    assert!(
+        !one.detached && !pos.detached,
+        "a bounded atom budget leaves the leg attached"
+    );
+    assert!(
+        debt.detached,
+        "budget == the debt IN ATOMS terminally forfeits the leg in one call -- the hazard \
+         the new name and the README now spell out for a legacy B-index-scale caller"
+    );
+    assert_eq!(
+        debt.capital_consumed, 4_000_000,
+        "the whole debt is taken out of principal"
+    );
+    assert!(max.detached);
+    assert_eq!(
+        max.delta_b, max.b_debt,
+        "u128::MAX collapses to public_b_chunk_atoms and settles the whole debt in one call"
+    );
+    assert!(
+        max.loss_booked_atoms >= 4_000_000,
+        "the whole 4e21 B debt at loss_weight=POS_SCALE is 4_000_000 atoms of loss"
+    );
+    println!(
+        "[cw03] public_b_chunk_atoms={} -- the budget only ever enters through a min(), so \
+nothing settles beyond min(public_b_chunk_atoms, b_remaining)",
+        max.public_b_chunk_atoms
+    );
+}
+
+/// The rename must be a RENAME: the encoded instruction is byte-identical to the
+/// layout tag 43 has always had — `[43][asset_index: u16 LE][budget: u128 LE]` —
+/// and it round-trips through `decode`. No ABI break, so no tag bump.
+#[test]
+fn cw03_tag43_wire_layout_is_byte_identical_after_the_rename() {
+    for (asset_index, budget) in [
+        (0u16, 0u128),
+        (1, 1),
+        (7, 4_000_000),
+        (u16::MAX, u128::MAX),
+    ] {
+        let encoded = Instruction::ForfeitRecoveryLeg {
+            asset_index,
+            b_loss_atom_budget: budget,
+        }
+        .encode();
+        let mut expected = Vec::with_capacity(19);
+        expected.push(43u8);
+        expected.extend_from_slice(&asset_index.to_le_bytes());
+        expected.extend_from_slice(&budget.to_le_bytes());
+        assert_eq!(
+            encoded, expected,
+            "tag 43 is [43][u16 LE asset_index][u128 LE budget]; the rename moves no bytes"
+        );
+        assert_eq!(encoded.len(), 19, "1 + 2 + 16");
+        match Instruction::decode(&encoded).expect("round-trips") {
+            Instruction::ForfeitRecoveryLeg {
+                asset_index: got_asset,
+                b_loss_atom_budget: got_budget,
+            } => {
+                assert_eq!(got_asset, asset_index);
+                assert_eq!(got_budget, budget);
+            }
+            other => panic!("decoded to the wrong variant: {other:?}"),
+        }
+    }
+    println!("[cw03] tag 43 wire layout unchanged: 19 bytes, [43][u16][u128], round-trips");
+}
+
+/// Anti-rot: the old name is gone from source, tests and the README, and the
+/// README documents the unit. W-18's stale rationale comment is gone too.
+#[test]
+fn cw03_old_name_and_stale_comment_are_gone_from_the_repo() {
+    let src = include_str!("../src/v16_program.rs");
+    let readme = include_str!("../README.md");
+    let this_test_file = include_str!("../tests/v16_wrapper.rs");
+
+    // Built at runtime so this test file does not match its own needle.
+    let old_name = concat!("b_delta", "_budget");
+    let code_hits: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(old_name))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    for (line, text) in &code_hits {
+        println!("[cw03] v16_program.rs:{line}: {text}");
+    }
+    for (line, text) in &code_hits {
+        assert!(
+            text.starts_with("///") || text.starts_with("//"),
+            "the old name survives only as a legacy-alias COMMENT, never as code \
+             (v16_program.rs:{line}: {text})"
+        );
+    }
+    assert_eq!(
+        code_hits.len(),
+        2,
+        "two comment mentions: the unit-change note and the upstream-still-calls-it note"
+    );
+    assert_eq!(
+        this_test_file.matches(old_name).count(),
+        0,
+        "and the old name is gone from this test file"
+    );
+    assert!(
+        src.matches("b_loss_atom_budget").count() >= 8,
+        "the new name is carried through variant, decode, encode, dispatch and handler"
+    );
+    assert_eq!(
+        readme.matches("B-delta budget").count(),
+        0,
+        "README no longer documents tag 43 with the stale unit"
+    );
+    assert!(
+        readme.contains("collateral-atom loss budget"),
+        "README names the unit"
+    );
+    assert!(
+        readme.contains("legacy B-index-scale value now forfeits that many ATOMS"),
+        "README states the legacy-value hazard"
+    );
+
+    // W-18 — three rationale comments named a function the linked engine no longer has
+    // (grep count 4 -> 0 between 9483ee90 and 2c38570a). WRAPPER_IMPACT W-18 lists only
+    // the one in handle_expire_backing_bucket; the other two (:4409, :13913) were found by
+    // grepping and are corrected in the same commit. Each surviving mention must say the
+    // symbol was REMOVED and name what replaced it.
+    let gone = "realize_source_backed_claims_for_resolved_close_not_atomic";
+    let stale: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(gone))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    for (line, text) in &stale {
+        println!("[cw03] W-18 mention v16_program.rs:{line}: {text}");
+    }
+    assert_eq!(stale.len(), 3, "the three mentions, all now historical");
+    let src_lines: Vec<&str> = src.lines().collect();
+    for (line, text) in &stale {
+        assert!(
+            text.starts_with("///") || text.starts_with("//"),
+            "comment only (v16_program.rs:{line})"
+        );
+        let window = src_lines[line.saturating_sub(4)..*line].join("\n");
+        assert!(
+            window.contains("W-18"),
+            "each mention sits under the W-18 correction note (v16_program.rs:{line}: {text})"
+        );
+    }
+    assert!(
+        src.contains("realize_one_source_domain_for_resolved_close_not_atomic")
+            && src.contains("prepare_one_source_domain_for_resolved_close_not_atomic"),
+        "the comments now point at the bounded per-domain pair that replaced it"
+    );
+    println!("[cw03] rename complete; W-18 comment repointed");
 }

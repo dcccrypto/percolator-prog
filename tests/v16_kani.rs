@@ -225,23 +225,23 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
 fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
     let asset_index: u16 = kani::any();
     let side: u8 = kani::any();
-    let b_delta_budget: u128 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
     let reduce_q: u128 = kani::any();
     let close_q: u128 = kani::any();
     let now_slot: u64 = kani::any();
 
     let forfeit = Instruction::ForfeitRecoveryLeg {
         asset_index,
-        b_delta_budget,
+        b_loss_atom_budget,
     }
     .encode();
     match Instruction::decode(&forfeit).unwrap() {
         Instruction::ForfeitRecoveryLeg {
             asset_index: got_asset,
-            b_delta_budget: got_budget,
+            b_loss_atom_budget: got_budget,
         } => {
             assert_eq!(got_asset, asset_index);
-            assert_eq!(got_budget, b_delta_budget);
+            assert_eq!(got_budget, b_loss_atom_budget);
         }
         _ => unreachable!(),
     }
@@ -1287,7 +1287,7 @@ fn kani_v16_resolved_recovery_payloads_reject_trailing_byte() {
     assert_rejects_trailing_byte(
         Instruction::ForfeitRecoveryLeg {
             asset_index: 0,
-            b_delta_budget: 1,
+            b_loss_atom_budget: 1,
         },
         extra,
     );
