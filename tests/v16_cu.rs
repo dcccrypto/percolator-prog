@@ -2866,12 +2866,12 @@ impl V16CuEnv {
         owner: &Keypair,
         portfolio: Pubkey,
         asset_index: u16,
-        b_delta_budget: u128,
+        b_loss_atom_budget: u128,
     ) -> u64 {
         self.send(
             ProgInstruction::ForfeitRecoveryLeg {
                 asset_index,
-                b_delta_budget,
+                b_loss_atom_budget,
             },
             vec![
                 AccountMeta::new(owner.pubkey(), true),

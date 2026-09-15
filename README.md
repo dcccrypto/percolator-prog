@@ -205,7 +205,9 @@ This section describes intent and operational ordering, not argument-by-argument
 - **CureAndCancelClose** (tag 42)
   - owner-signed close recovery path; optional deposit is transferred first, then the engine cancels the pending close if the cure succeeds
 - **ForfeitRecoveryLeg** (tag 43)
-  - owner-signed recovery-leg forfeit for a selected asset and bounded B-delta budget
+  - owner-signed recovery-leg forfeit for a selected asset and a bounded **collateral-atom loss budget** (`b_loss_atom_budget`)
+  - the budget is the maximum loss IN ACCOUNT ATOMS this call may settle; the engine min's it with `public_b_chunk_atoms` and converts it to a B-index delta exactly once, so nothing settles beyond `min(public_b_chunk_atoms, b_remaining)`
+  - **unit change, unchanged wire layout:** the field was `b_delta_budget` and against the deployed engine (`9483ee90`) the same bytes bounded the B-index *delta*. A legacy B-index-scale value now forfeits that many ATOMS — larger by `SOCIAL_LOSS_DEN / loss_weight` — which can turn a bounded chunk into a terminal forfeit that spends principal and detaches the leg. Re-derive every off-repo caller in atoms.
 - **RebalanceReduce** (tag 44)
   - owner-signed risk-reducing rebalance against the wrapper-authenticated effective price vector
 - **ClaimResolvedPayoutTopup** (tag 46)

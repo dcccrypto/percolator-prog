@@ -4210,9 +4210,34 @@ pub mod ix {
         CureAndCancelClose {
             optional_deposit: u128,
         },
+        /// Tag 43 — owner-signed dead-leg forfeit.
+        ///
+        /// `b_loss_atom_budget` is a **collateral-atom** budget: the maximum loss, in
+        /// account atoms, that this call may settle out of the leg's outstanding B debt.
+        /// It is min'd with the market's `public_b_chunk_atoms` and converted to a B-index
+        /// delta exactly once, inside the engine
+        /// (`percolator 2c38570a:src/v16.rs:14149-14166`, "Both limits are collateral
+        /// atoms"), so nothing is ever settled beyond `min(public_b_chunk_atoms,
+        /// b_remaining)`.
+        ///
+        /// UNIT CHANGE — the field was called `b_delta_budget` and, against the deployed
+        /// engine (`9483ee90`), the same wire bytes bounded the **B-index delta** instead.
+        /// The byte layout is unchanged (tag 43, `u16`, `u128`), so a legacy caller's value
+        /// still decodes — and now means something else. A LEGACY B-INDEX-SCALE VALUE
+        /// FORFEITS THAT MANY **ATOMS**: it is scaled by `SOCIAL_LOSS_DEN / loss_weight`
+        /// relative to its old meaning (`1e15` for a leg whose `loss_weight == POS_SCALE`),
+        /// which turns a bounded chunk into a terminal forfeit that can spend the owner's
+        /// principal and detach the leg in one call. Measured in
+        /// `verify/items/C-W-03.md`: the wire value `4_000_000` moves 0 atoms at `9483ee90`
+        /// and settles a whole `4e21` debt for `4_000_000` atoms of principal at
+        /// `2c38570a`. Re-derive every off-repo caller in atoms before shipping.
+        ///
+        /// Upstream still calls this field `b_delta_budget`
+        /// (`percolator-prog upstream/main:src/v16_program.rs:3255`) with the same
+        /// atom-reading engine; this rename is ours, and the layout is identical to theirs.
         ForfeitRecoveryLeg {
             asset_index: u16,
-            b_delta_budget: u128,
+            b_loss_atom_budget: u128,
         },
         RebalanceReduce {
             asset_index: u16,
@@ -4400,11 +4425,15 @@ pub mod ix {
         ///     same arm. The bucket cannot even be paid to come back.
         ///
         /// The engine already owns the escape — `expire_source_backing_bucket_not_atomic`
-        /// — and uses it itself in `realize_source_backed_claims_for_resolved_close_not_atomic`,
-        /// whose comment states that without it a lapsed bucket "would
-        /// otherwise return Stale and strand the winner's close". That sweep
-        /// only runs on the RESOLVED path; nothing in this wrapper ever reached
-        /// the transition on a LIVE market. This tag is that missing call site.
+        /// — and uses it itself on the resolved-close path, whose comment states that
+        /// without it a lapsed bucket "would otherwise return Stale and strand the
+        /// winner's close". W-18: that used to be the one-shot sweep
+        /// `realize_source_backed_claims_for_resolved_close_not_atomic`, REMOVED at engine
+        /// `2c38570a`; the escape now lives in the bounded per-domain
+        /// `prepare_one_source_domain_for_resolved_close_not_atomic`
+        /// (`percolator 2c38570a:src/v16.rs:20451`, `:20499`). Either way it only runs on
+        /// the RESOLVED path; nothing in this wrapper ever reached the transition on a
+        /// LIVE market. This tag is that missing call site.
         ///
         /// PERMISSIONLESS BY DESIGN: a bricked market must be recoverable by
         /// any keeper, not only by an authority that may be a cold key or a
@@ -4687,7 +4716,7 @@ pub mod ix {
                 },
                 43 => Self::ForfeitRecoveryLeg {
                     asset_index: read_u16(&mut rest)?,
-                    b_delta_budget: read_u128(&mut rest)?,
+                    b_loss_atom_budget: read_u128(&mut rest)?,
                 },
                 44 => Self::RebalanceReduce {
                     asset_index: read_u16(&mut rest)?,
@@ -5187,11 +5216,11 @@ pub mod ix {
                 }
                 Self::ForfeitRecoveryLeg {
                     asset_index,
-                    b_delta_budget,
+                    b_loss_atom_budget,
                 } => {
                     out.push(43);
                     push_u16(&mut out, asset_index);
-                    push_u128(&mut out, b_delta_budget);
+                    push_u128(&mut out, b_loss_atom_budget);
                 }
                 Self::RebalanceReduce {
                     asset_index,
@@ -7714,8 +7743,8 @@ pub mod processor {
             }
             Instruction::ForfeitRecoveryLeg {
                 asset_index,
-                b_delta_budget,
-            } => handle_forfeit_recovery_leg(program_id, accounts, asset_index, b_delta_budget),
+                b_loss_atom_budget,
+            } => handle_forfeit_recovery_leg(program_id, accounts, asset_index, b_loss_atom_budget),
             Instruction::RebalanceReduce {
                 asset_index,
                 reduce_q,
@@ -10978,10 +11007,18 @@ pub mod processor {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             // Live-only. A resolved/wound-down market already reaches the
-            // transition through the engine's own resolved-close sweep
-            // (`realize_source_backed_claims_for_resolved_close_not_atomic`),
-            // so re-entering it from outside would be a second, unsequenced
+            // transition through the engine's own resolved-close path, so
+            // re-entering it from outside would be a second, unsequenced
             // mutation of a terminal ledger.
+            //
+            // W-18: this used to name `realize_source_backed_claims_for_resolved_close_not_atomic`.
+            // That function is GONE at the linked engine (`percolator 2c38570a`, grep count
+            // 1 -> 0 since `9483ee90`); upstream `a0e27950` / #239 replaced the unbounded sweep
+            // with the bounded per-domain pair
+            // `prepare_one_source_domain_for_resolved_close_not_atomic` (`2c38570a:src/v16.rs:20399`)
+            // and `realize_one_source_domain_for_resolved_close_not_atomic` (`:20277`), driven from
+            // `close_resolved_account_not_atomic` (`:20597`). The gate below is unchanged and still
+            // correct; only its stated reason was pointing at a missing symbol.
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -12719,19 +12756,25 @@ pub mod processor {
         Ok(())
     }
 
+    /// Tag 43 `ForfeitRecoveryLeg`. `b_loss_atom_budget` is a COLLATERAL-ATOM loss budget
+    /// and is passed to the engine verbatim; see the doc on `ix::Instruction::ForfeitRecoveryLeg`
+    /// for the unit, its bound, and the legacy-value hazard (a B-index-scale number forfeits
+    /// that many ATOMS). The handler validates only that the budget is nonzero — scale is the
+    /// caller's to get right, and the engine caps the settled amount at
+    /// `min(public_b_chunk_atoms, b_remaining)`.
     #[inline(never)]
     fn handle_forfeit_recovery_leg<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
-        b_delta_budget: u128,
+        b_loss_atom_budget: u128,
     ) -> ProgramResult {
-        if b_delta_budget == 0 {
+        if b_loss_atom_budget == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         with_one_portfolio_view(program_id, accounts, true, |group, portfolio, _cfg| {
             group
-                .forfeit_recovery_leg_not_atomic(portfolio, asset_index as usize, b_delta_budget)
+                .forfeit_recovery_leg_not_atomic(portfolio, asset_index as usize, b_loss_atom_budget)
                 .map(|_| ())
         })
     }
@@ -13975,10 +14018,13 @@ pub mod processor {
         // below outstanding winner claims and permanently strand them (close_resolved →
         // RecoveryRequired). No correct static floor exists: source-backed realization
         // already reduces the reserve with no tracked quantity to distinguish a malicious
-        // further decrease. The ONLY accounting-faithful refinement is the INTERNAL one in
-        // `realize_source_backed_claims_for_resolved_close_not_atomic` (engine
-        // `refine_resolved_unreceipted_bound_not_atomic`, clamped to realized face as
-        // receipts realize), which is a direct engine call and is unaffected. Reject the
+        // further decrease. The ONLY accounting-faithful refinement is the INTERNAL engine
+        // call `refine_resolved_unreceipted_bound_not_atomic` (clamped to realized face as
+        // receipts realize). W-18: it used to be reached from
+        // `realize_source_backed_claims_for_resolved_close_not_atomic`, REMOVED at engine
+        // `2c38570a`; it is now called from the bounded per-domain
+        // `realize_one_source_domain_for_resolved_close_not_atomic`
+        // (`percolator 2c38570a:src/v16.rs:20380`). Unaffected either way. Reject the
         // external entry point. Do NOT re-enable without a per-claim outstanding-obligation floor.
         Err(PercolatorError::InvalidInstruction.into())
     }
