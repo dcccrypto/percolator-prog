@@ -9182,7 +9182,19 @@ fn v16_attack_live_insurance_withdraw_rejects_while_stressed_or_hlocked() {
     env.svm.expire_blockhash();
     env.try_withdraw_insurance_asset_with_authority(&admin, 0, 100)
         .expect("flat healthy live insurance withdrawal must succeed");
-    // Each engine "insurance still protecting loss" flag must independently block the withdrawal.
+    // Each engine "insurance still protecting loss" state must independently block the withdrawal.
+    //
+    // E-LSA-W reconciliation: `loss_stale_active` is a market-wide HEADER BYTE that the engine
+    // documents (percolator src/v16.rs:14740-14743) as a summary of only the LAST-TOUCHED asset,
+    // and Kani harness `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+    // (percolator tests/proofs_v16.rs:9424) pins it to 1 on an on-clock asset with an open cohort.
+    // The per-asset custody gate `live_domain_withdraw_health_or_shutdown_view` therefore no longer
+    // reads that byte; it tests the WITHDRAW-TARGET asset's own K/F settlement cohort asset-locally.
+    // The security invariant is UNCHANGED — insurance must stay protected while the asset is
+    // absorbing loss — and in this single-asset market the asset's open K/F cohort is exactly that
+    // condition, so this case now establishes it via asset-0's cohort counter instead of the raw
+    // byte (which, post-fix, can be set market-wide by an UNRELATED asset and must not freeze this
+    // asset's custody — see v16_bpf_elsa_market_wide_loss_stale_does_not_block_clean_target_withdraw).
     let cases: [(&str, fn(&mut MarketGroupV16, bool)); 3] = [
         ("bankruptcy_hlock_active", |g, v| {
             g.bankruptcy_hlock_active = v
@@ -9190,7 +9202,9 @@ fn v16_attack_live_insurance_withdraw_rejects_while_stressed_or_hlocked() {
         ("threshold_stress_active", |g, v| {
             g.threshold_stress_active = v
         }),
-        ("loss_stale_active", |g, v| g.loss_stale_active = v),
+        ("asset-0 open K/F loss-stale cohort", |g, v| {
+            g.assets[0].stale_account_count_long = u64::from(v)
+        }),
     ];
     for (label, set) in cases {
         env.mutate_market(|_cfg, group| set(group, true));
@@ -13145,4 +13159,157 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
         state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
     assert_eq!(after.total_principal_atoms, 60);
     assert_eq!(after.authority, env.admin.pubkey().to_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// E-LSA-W regression — the per-domain backing/insurance custody gate
+// `live_domain_withdraw_health_or_shutdown_view` must test the WITHDRAW-TARGET
+// asset's own K/F settlement cohort asset-locally, NOT the market-wide
+// `loss_stale_active` header byte. The engine documents that byte as a summary
+// of only the LAST-TOUCHED asset (percolator src/v16.rs:14740-14743) and pins it
+// to `1` on an on-clock asset with an open cohort in Kani harness
+// `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+// (percolator tests/proofs_v16.rs:9424) — so the engine byte CONFORMS and the fix
+// is in this consumer. See verify/fixes/E-LSA-W.md.
+// ---------------------------------------------------------------------------
+
+const ELSA_BACKING_DOMAIN: u16 = 1; // asset 0 (domain / 2 == 0), short side
+const ELSA_TOPUP: u128 = 150;
+const ELSA_WITHDRAW: u128 = 50;
+
+// A default Live market with the withdraw-target asset's (asset 0) backing bucket
+// funded, so that an ALLOWED gate leads to a real successful withdrawal and an Err
+// therefore means the gate itself refused — not a funding/authority failure.
+fn elsa_env_with_funded_backing() -> V16CuEnv {
+    let mut env = V16CuEnv::new();
+    env.top_up_backing_bucket(ELSA_BACKING_DOMAIN, ELSA_TOPUP, 100);
+    env
+}
+
+#[test]
+fn v16_bpf_elsa_market_wide_loss_stale_does_not_block_clean_target_withdraw() {
+    // Scenario (a): the market-wide `loss_stale_active` byte is set (as an unrelated
+    // asset's open K/F cohort would set it), but the WITHDRAW-TARGET asset (asset 0)
+    // is clean and on the clock. Before the fix the market-wide byte froze this clean
+    // withdrawal with Custom(21); after the fix the gate reads only asset 0's own cohort.
+    let mut env = elsa_env_with_funded_backing();
+    env.mutate_market(|_cfg, group| {
+        group.current_slot = 5;
+        group.loss_stale_active = true; // set market-wide by SOME asset's cohort
+        let a0 = &mut group.assets[0];
+        a0.slot_last = 5; // on the clock
+        a0.stale_account_count_long = 0; // target asset's OWN cohort is clear
+        a0.stale_account_count_short = 0;
+        a0.oi_eff_long_q = 0; // no exposed target/effective lag
+        a0.oi_eff_short_q = 0;
+    });
+    // Prove the state we depend on actually persisted through write_market -> BPF read.
+    let (_, g) = env.market_state();
+    assert!(
+        g.loss_stale_active,
+        "market-wide loss_stale_active must be set"
+    );
+    assert_eq!(g.assets[0].stale_account_count_long, 0);
+    assert_eq!(g.assets[0].stale_account_count_short, 0);
+    assert_eq!(g.assets[0].slot_last, 5);
+    assert_eq!(g.current_slot, 5);
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let res = env.try_withdraw_backing_bucket_to_admin_token_with_cu(
+        dest,
+        ELSA_BACKING_DOMAIN,
+        ELSA_WITHDRAW,
+    );
+    assert!(
+        res.is_ok(),
+        "a clean, on-clock withdraw-target asset must not be frozen by the market-wide \
+         loss_stale_active byte (finding E-LSA); got: {res:?}"
+    );
+}
+
+#[test]
+fn v16_bpf_elsa_clock_lagged_target_asset_is_still_refused() {
+    // Scenario (b): the WITHDRAW-TARGET asset itself lags the clock and holds a
+    // position — genuinely loss-stale. That is caught asset-locally by
+    // `asset_local_loss_stale_view` (unchanged by the fix), so it must stay refused
+    // with Custom(21) both before and after — even with the market-wide byte cleared,
+    // which isolates the asset-local check as the reason.
+    let mut env = elsa_env_with_funded_backing();
+    env.mutate_market(|_cfg, group| {
+        group.current_slot = 6;
+        group.loss_stale_active = false;
+        let a0 = &mut group.assets[0];
+        a0.slot_last = 5; // lags the clock
+        a0.stale_account_count_long = 0;
+        a0.stale_account_count_short = 0;
+        a0.stored_pos_count_long = 1; // a live position -> has_position_or_loss_state
+        a0.oi_eff_long_q = 0; // keep the exposed target/effective-lag check inert
+        a0.oi_eff_short_q = 0;
+    });
+    let (_, g) = env.market_state();
+    assert!(!g.loss_stale_active);
+    assert_eq!(g.assets[0].slot_last, 5);
+    assert_eq!(g.current_slot, 6);
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let res = env.try_withdraw_backing_bucket_to_admin_token_with_cu(
+        dest,
+        ELSA_BACKING_DOMAIN,
+        ELSA_WITHDRAW,
+    );
+    let msg =
+        res.expect_err("a clock-lagged withdraw-target asset with a position must be refused");
+    assert!(
+        msg.contains("Custom(21)"),
+        "expected EngineLockActive Custom(21), got: {msg}"
+    );
+}
+
+#[test]
+fn v16_bpf_elsa_open_cohort_on_target_asset_is_refused_narrow_not_delete() {
+    // Scenario (b'): the WITHDRAW-TARGET asset carries an OPEN K/F settlement cohort
+    // while ON the clock, and the market-wide byte is CLEAR (as it is when a different,
+    // clean asset was the last one touched). `asset_local_loss_stale_view` conjoins the
+    // clock lag and so does NOT catch this; only the new asset-local cohort disjunct
+    // does. This is the "narrow, do not delete" guarantee: a bare deletion of the
+    // market-wide disjunct would leave this genuinely-stale target unprotected — which,
+    // measured, is exactly base (W-19) behaviour here.
+    let mut env = elsa_env_with_funded_backing();
+    env.mutate_market(|_cfg, group| {
+        group.current_slot = 5;
+        group.loss_stale_active = false; // last-touched asset was clean
+        let a0 = &mut group.assets[0];
+        a0.slot_last = 5; // on the clock -> clock-lag clause is false
+        a0.stored_pos_count_long = 1; // respect the engine's stale <= stored shape
+        a0.stale_account_count_long = 1; // target asset's OWN open K/F cohort
+        a0.stale_account_count_short = 0;
+        a0.oi_eff_long_q = 0;
+        a0.oi_eff_short_q = 0;
+    });
+    let (_, g) = env.market_state();
+    assert!(
+        !g.loss_stale_active,
+        "market-wide byte is clear in this scenario"
+    );
+    assert_eq!(
+        g.assets[0].stale_account_count_long, 1,
+        "target asset must carry an open cohort"
+    );
+    assert_eq!(g.assets[0].slot_last, 5);
+    assert_eq!(g.current_slot, 5);
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let res = env.try_withdraw_backing_bucket_to_admin_token_with_cu(
+        dest,
+        ELSA_BACKING_DOMAIN,
+        ELSA_WITHDRAW,
+    );
+    let msg = res.expect_err(
+        "an on-clock withdraw-target asset with its own open K/F cohort must be refused \
+         asset-locally (narrow, not delete)",
+    );
+    assert!(
+        msg.contains("Custom(21)"),
+        "expected EngineLockActive Custom(21), got: {msg}"
+    );
 }

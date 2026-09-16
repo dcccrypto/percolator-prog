@@ -6820,9 +6820,23 @@ pub mod processor {
             return Ok(true);
         }
         reject_permissionless_resolve_matured_live_view(cfg, group)?;
+        // E-LSA: `group.header.loss_stale_active` is a market-wide byte that the engine
+        // documents (percolator src/v16.rs:14740-14743) as a summary of ONLY the LAST-TOUCHED
+        // asset — "`slot_last` and `loss_stale_active` summarize only the touched asset; safety
+        // gates use account/asset-local stale checks." Reading it in this per-domain custody gate
+        // froze a clean, on-clock withdraw-target asset whenever some UNRELATED asset carried an
+        // open K/F settlement cohort. Kani harness
+        // `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+        // (percolator tests/proofs_v16.rs:9424) pins `loss_stale_active == 1` on an on-clock asset
+        // with an open cohort, so the engine byte CONFORMS; the fix narrows the disjunct to the
+        // WITHDRAW-TARGET asset's own K/F cohort (`asset_local_open_kf_cohort_view`, the cohort
+        // clause of the engine's `asset_is_loss_stale_at_slot`). Its clock-lag clause is already
+        // enforced asset-locally by `asset_local_loss_stale_view` immediately below; together they
+        // are the engine predicate `asset_is_loss_stale_at_slot` evaluated on the target asset, so
+        // a genuinely stale target is still refused and an unrelated asset's cohort no longer bites.
         if group.header.bankruptcy_hlock_active != 0
             || group.header.threshold_stress_active != 0
-            || group.header.loss_stale_active != 0
+            || asset_local_open_kf_cohort_view(group, asset_index)
             || group
                 .header
                 .recovery_reason
@@ -6837,6 +6851,33 @@ pub mod processor {
         }
         reject_exposed_target_effective_lag_view(group, asset_index)?;
         Ok(false)
+    }
+
+    /// Asset-local mirror of the K/F settlement-cohort clause of the engine's
+    /// `asset_is_loss_stale_at_slot` (percolator src/v16.rs:7558 @ 3c71bdc3):
+    /// `asset.stale_account_count_long != 0 || asset.stale_account_count_short != 0`.
+    ///
+    /// The market header byte `loss_stale_active` summarizes only the LAST-TOUCHED asset
+    /// (percolator src/v16.rs:14740-14743), so a market-wide read of it in a per-asset custody
+    /// gate blocks a clean withdraw-target asset on an unrelated asset's open cohort (finding
+    /// E-LSA). The custody gate must instead test the target asset asset-locally. The engine byte
+    /// is CONFORMING — Kani harness
+    /// `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+    /// (percolator tests/proofs_v16.rs:9424) asserts `loss_stale_active == 1` on an on-clock asset
+    /// with an open cohort — so the fix lives here in the consumer, not in the engine predicate.
+    ///
+    /// Fails closed (`true`) for an out-of-range index, matching `asset_local_loss_stale_view`.
+    fn asset_local_open_kf_cohort_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> bool {
+        if asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return true;
+        }
+        let asset = &group.markets[asset_index].engine.asset;
+        asset.stale_account_count_long.get() != 0 || asset.stale_account_count_short.get() != 0
     }
 
     fn asset_local_loss_stale_view(
