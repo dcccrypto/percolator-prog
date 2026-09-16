@@ -7869,10 +7869,21 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     assert!(zero.is_err());
 
     let topped_up = market.data.clone();
+    // E-LSA-W reconciliation: `loss_stale_active` is a market-wide HEADER BYTE the engine documents
+    // as a summary of only the LAST-TOUCHED asset (percolator src/v16.rs:14740-14743), and Kani
+    // harness proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment
+    // (percolator tests/proofs_v16.rs:9424) pins it to 1 on an on-clock asset with an open cohort.
+    // The per-asset custody gate `live_domain_withdraw_health_or_shutdown_view` therefore no longer
+    // reads that byte; it tests the WITHDRAW-TARGET asset's own K/F settlement cohort asset-locally.
+    // The invariant is UNCHANGED — a backing withdraw is refused while its asset is absorbing loss —
+    // and in this single-asset market (domain 1 -> asset 0) the asset's open K/F cohort is exactly
+    // that condition, so this case establishes it via asset-0's cohort counter instead of the raw
+    // byte (which, post-fix, an UNRELATED asset can set market-wide and must NOT freeze this asset —
+    // see v16_bpf_elsa_market_wide_loss_stale_does_not_block_clean_target_withdraw).
     let stress_cases: &[fn(&mut MarketGroupV16)] = &[
         |group| group.bankruptcy_hlock_active = true,
         |group| group.threshold_stress_active = true,
-        |group| group.loss_stale_active = true,
+        |group| group.assets[0].stale_account_count_long = 1,
         |group| group.recovery_reason = Some(PermissionlessRecoveryReasonV16::BelowProgressFloor),
     ];
     for set_stress in stress_cases {
