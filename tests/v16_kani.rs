@@ -1367,6 +1367,8 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
     kani::assume(tag != 77); // ExecuteRedemption
     kani::assume(tag != 78); // LpVaultCrankFees
     kani::assume(tag != 80); // CloseLpVault
+    kani::assume(tag != 81); // CancelRedemption (zero-payload; P-K81)
+    kani::assume(tag != 87); // WithdrawInsuranceReserveToStake (zero-payload; P-K81)
     assert!(Instruction::decode(&[tag]).is_err());
 
     let deposit_tag_only = [3u8];
