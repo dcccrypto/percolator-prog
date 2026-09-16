@@ -6820,9 +6820,47 @@ pub mod processor {
             return Ok(true);
         }
         reject_permissionless_resolve_matured_live_view(cfg, group)?;
+        // FIX E-LSA-W: `group.header.loss_stale_active` is NOT a market-wide loss-staleness
+        // aggregate and must not be used as one by a PER-ASSET custody gate. This function is
+        // per-asset by construction (`asset_index = domain / 2`; every caller — tags
+        // WithdrawBackingBucket, WithdrawBackingBucketEarnings and the live insurance-domain
+        // path — names one domain), so the loss-stale question it has to ask is about the
+        // WITHDRAW-TARGET asset, and `asset_local_loss_stale_view(group, asset_index)` below
+        // is exactly that question. The header byte answers a different one:
+        //
+        //   * The engine states the contract at its own write site
+        //     (percolator src/v16.rs:14740-14743, byte-identical at aeyakovenko/percolator
+        //     8eb7142a:src/v16.rs:14301-14304): "Hot paths are asset-local: scanning all
+        //     markets here makes every crank/trade depend on total dynamic asset count.
+        //     `slot_last` and `loss_stale_active` summarize only the touched asset; safety
+        //     gates use account/asset-local stale checks." The byte is a summary of the LAST
+        //     TOUCHED asset, so it can be 1 because some OTHER asset lags and 0 while another
+        //     asset lags — an approximation this gate is told, in that comment, not to use.
+        //
+        //   * Since engine 92ed4a1a (our bf2fda46, "track K/F settlement cohorts by
+        //     generation", layout 18) the summary also carries open K/F settlement-cohort
+        //     membership, which is true of every asset for the whole interval between a price
+        //     or funding move and the last account's crank. Kani harness
+        //     `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+        //     (percolator tests/proofs_v16.rs:9424, which arrived with that same commit) pins
+        //     that semantics — it asserts `header.loss_stale_active == 1` over a symbolic
+        //     `now_slot in 2..=4`, i.e. INCLUDING the slot at which the asset is exactly on
+        //     the clock — so the byte cannot be narrowed engine-side without changing a proved
+        //     invariant. The defect is here, in the consumer.
+        //
+        // Consequence before this fix: a clean, on-the-clock withdraw-target asset was refused
+        // with EngineLockActive because a DIFFERENT asset had an open cohort — LP backing, LP
+        // backing earnings and live insurance custody frozen group-wide until a third party
+        // cranked somebody else's portfolio, and re-frozen by the next price move on any asset.
+        //
+        // NOT weakened: the per-asset refusal still fires, from `asset_local_loss_stale_view`
+        // below (same error, `PercolatorError::EngineLockActive`), which keeps the cohort term
+        // — it reads `stale_account_count_*` through `asset_local_has_position_or_loss_state_view`
+        // — for the asset being withdrawn from. Risk-increase gating is unaffected: it lives in
+        // the engine on the asset-local/account-local predicates (`trade_preflight_risk_gate`,
+        // `h_lock_lane`), never on this byte.
         if group.header.bankruptcy_hlock_active != 0
             || group.header.threshold_stress_active != 0
-            || group.header.loss_stale_active != 0
             || group
                 .header
                 .recovery_reason

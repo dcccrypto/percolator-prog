@@ -10881,6 +10881,230 @@ fn v16_attack_unrelated_refresh_cannot_mask_loss_stale_insurance_gate() {
     );
 }
 
+// FIX E-LSA-W: `group.header.loss_stale_active` is NOT a market-wide loss-staleness aggregate.
+// The engine says so at its own write site (percolator src/v16.rs:14740-14743): "`slot_last` and
+// `loss_stale_active` summarize only the touched asset; safety gates use account/asset-local
+// stale checks." Since engine 92ed4a1a (our bf2fda46, layout 18) that summary ALSO carries open
+// K/F settlement-cohort membership, which is true of every asset for the whole interval between
+// a price or funding move and the last account's crank -- and Kani harness
+// `proof_v16_equity_active_accrual_with_progress_commits_one_bounded_segment`
+// (percolator tests/proofs_v16.rs:9424) pins exactly that, over a symbolic `now_slot in 2..=4`
+// that includes the slot at which the asset is on the clock. So the byte cannot be narrowed
+// engine-side; the defect was in this consumer.
+//
+// `live_domain_withdraw_health_or_shutdown_view` is a PER-ASSET custody gate (asset_index =
+// domain / 2) and used to refuse on that byte, so ANOTHER asset's open cohort froze
+// WithdrawBackingBucket / WithdrawBackingBucketEarnings / live insurance-domain custody
+// group-wide with Custom(21), until some third party cranked somebody else's portfolio -- and
+// re-froze it on the next price move on any asset.
+//
+// This test drives that exact state through the real BPF instruction: asset 0 (the withdraw
+// target) is Active, sits exactly on the market clock and carries no open cohort, while asset 1
+// still has one un-cranked leg, which is what sets the header byte. The withdrawal must succeed.
+#[test]
+fn v16_fix_e_lsa_w_unrelated_asset_open_cohort_does_not_freeze_backing_custody() {
+    const INITIAL_PRICE: u64 = 100;
+    const ASSET0_MARK: u64 = 105;
+    const ASSET1_MARK: u64 = 95;
+    const ASSET0_SIZE_Q: i128 = 20 * POS_SCALE as i128;
+    const ASSET1_SIZE_Q: i128 = 10 * POS_SCALE as i128;
+    const DEPOSIT: u128 = 313;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 1_000, 1_000, 500);
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_for_asset_as_admin(0, 1, INITIAL_PRICE);
+    env.configure_auth_mark_for_asset_as_admin(1, 1, INITIAL_PRICE);
+
+    let cross_owner = Keypair::new();
+    let counterparty_owner = Keypair::new();
+    let cross_account = env.create_portfolio(&cross_owner);
+    let counterparty_account = env.create_portfolio(&counterparty_owner);
+    env.deposit(&cross_owner, cross_account, DEPOSIT);
+    env.deposit(&counterparty_owner, counterparty_account, 1_000);
+    // domain 1 = asset 0, short side: the withdraw target, and the asset that is clean and
+    // exactly on the clock at the moment of the withdrawal.
+    env.top_up_backing_bucket(1, 150, 10);
+
+    env.trade_asset_with_cu(
+        0,
+        &cross_owner,
+        cross_account,
+        &counterparty_owner,
+        counterparty_account,
+        ASSET0_SIZE_Q,
+        INITIAL_PRICE,
+        0,
+    );
+    env.trade_asset_with_cu(
+        1,
+        &cross_owner,
+        cross_account,
+        &counterparty_owner,
+        counterparty_account,
+        ASSET1_SIZE_Q,
+        INITIAL_PRICE,
+        0,
+    );
+
+    env.svm.warp_to_slot(2);
+    env.push_auth_mark_for_asset_as_admin(0, 2, ASSET0_MARK);
+    env.push_auth_mark_for_asset_as_admin(1, 2, ASSET1_MARK);
+    // Settle asset 0's whole K/F cohort (both accounts) and leave ONE of asset 1's legs
+    // un-cranked. Cranking asset 1 last is what makes the header byte a statement about asset 1.
+    for (portfolio, asset_index) in [
+        (counterparty_account, 0),
+        (cross_account, 0),
+        (counterparty_account, 1),
+    ] {
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank {
+                action: 0,
+                asset_index,
+                now_slot: 2,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+        );
+    }
+
+    // Discriminators: without these the test could pass for the wrong reason (a clear byte, or a
+    // withdraw-target asset that is not actually clean).
+    let (_, group) = env.market_state();
+    assert!(
+        group.loss_stale_active,
+        "the market-wide header byte must be SET here, or this test proves nothing"
+    );
+    assert_eq!(
+        group.assets[0].slot_last, group.current_slot,
+        "withdraw-target asset 0 must sit exactly on the market clock"
+    );
+    assert_eq!(group.assets[0].stale_account_count_long, 0);
+    assert_eq!(
+        group.assets[0].stale_account_count_short, 0,
+        "withdraw-target asset 0 must carry no open K/F cohort"
+    );
+    assert!(
+        group.assets[1].stale_account_count_long != 0
+            || group.assets[1].stale_account_count_short != 0,
+        "asset 1 must still carry the open K/F cohort that sets the header byte"
+    );
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let withdraw = env.try_withdraw_backing_bucket_to_admin_token_with_cu(dest, 1, 50);
+    assert!(
+        withdraw.is_ok(),
+        "a clean, on-the-clock withdraw-target asset must not be frozen by ANOTHER asset's open \
+         K/F settlement cohort: {withdraw:?}"
+    );
+
+    // The withdrawal really happened -- not an Ok that moved nothing.
+    let (_, after) = env.market_state();
+    assert_eq!(
+        after.source_credit[1].fresh_reserved_backing_num,
+        group.source_credit[1].fresh_reserved_backing_num - 50 * BOUND_SCALE,
+        "the accepted withdrawal must lower the domain-1 encumbrance watermark by the amount"
+    );
+    // And the audit fact the fix must NOT hide is still on the books.
+    assert!(
+        after.assets[1].stale_account_count_long != 0
+            || after.assets[1].stale_account_count_short != 0,
+        "asset 1's open K/F cohort must survive the withdrawal -- the fix narrows a GATE, it does \
+         not clear engine state"
+    );
+}
+
+// FIX E-LSA-W, the non-weakening guard. The per-asset refusal must survive: when the
+// WITHDRAW-TARGET asset is itself genuinely loss-stale -- Active, lagging the market clock, with
+// open exposure -- `WithdrawBackingBucket` must still be refused with EngineLockActive, Custom(21).
+//
+// The discriminator is `assert!(!group.loss_stale_active)`: the market-wide header byte is CLEAR
+// at the moment of the attempt (asset 0, the last-cranked asset, is empty and caught up), so the
+// group-level disjunct cannot be what refuses. The only thing that can is
+// `asset_local_loss_stale_view(group, asset_index)` -- which is exactly the check the fix leans
+// on. This test is therefore green at BOTH the base and the fix (it is not what changed), and it
+// goes red if anyone removes the asset-local check as well.
+//
+// Same shape as v16_attack_unrelated_refresh_cannot_mask_loss_stale_insurance_gate above, on the
+// backing-bucket custody path instead of the insurance one.
+#[test]
+fn v16_fix_e_lsa_w_clock_lagged_withdraw_target_asset_is_still_refused() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 1_000, 1_000, 500);
+    // domain 2 = asset 1, long side: the withdraw target, and the asset that will lag the clock.
+    env.top_up_backing_bucket(2, 150, 10);
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000_000);
+    env.deposit(&short_owner, short_account, 1_000_000_000);
+    env.trade_asset_with_cu(
+        1,
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (10 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+
+    let cranker_owner = Keypair::new();
+    let cranker = env.create_portfolio(&cranker_owner);
+    env.svm.warp_to_slot(3);
+    // One crank advances one bounded segment. Asset 1 gets a single crank and stays behind the
+    // clock; asset 0 (empty) is cranked to the clock LAST, so the header byte summarises asset 0
+    // and is clear.
+    for (asset_index, times) in [(1u16, 1), (0u16, 3)] {
+        for _ in 0..times {
+            env.svm.expire_blockhash();
+            env.crank(
+                cranker,
+                ProgInstruction::PermissionlessCrank {
+                    action: 0,
+                    asset_index,
+                    now_slot: 3,
+                    funding_rate_e9: 0,
+                    recovery_reason: 0,
+                },
+            );
+        }
+    }
+
+    let (_, group) = env.market_state();
+    assert!(
+        !group.loss_stale_active,
+        "the market-wide header byte must be CLEAR here, or the group-level disjunct -- not the \
+         asset-local check -- could be what refuses and this guard would prove nothing"
+    );
+    assert!(
+        group.assets[1].slot_last < group.current_slot,
+        "withdraw-target asset 1 must genuinely lag the market clock"
+    );
+    assert_eq!(
+        group.assets[0].slot_last, group.current_slot,
+        "asset 0 must be caught up, so nothing but asset 1's own staleness is in play"
+    );
+
+    let dest = env.token_account(env.admin.pubkey(), 0);
+    let withdraw = env.try_withdraw_backing_bucket_to_admin_token_with_cu(dest, 2, 50);
+    let err = withdraw.expect_err(
+        "a clock-lagged withdraw-target asset with open exposure must still refuse the withdrawal",
+    );
+    assert!(
+        err.contains("Custom(21)"),
+        "the refusal must stay EngineLockActive(21), got {err}"
+    );
+
+    let (_, after) = env.market_state();
+    assert_eq!(
+        after.source_credit[2].fresh_reserved_backing_num,
+        group.source_credit[2].fresh_reserved_backing_num,
+        "a refused withdrawal must move nothing"
+    );
+}
+
 // FIX W1 (upstream 4b8bb9fa, #152, CRITICAL): validate_matcher_tail rejected key-aliasing
 // tail accounts but never checked `is_signer`, so a hostile matcher received tail AccountInfos
 // with the caller's own is_signer flags forwarded verbatim -- letting a malicious LP-registered
