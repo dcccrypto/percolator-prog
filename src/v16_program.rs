@@ -10623,8 +10623,9 @@ pub mod processor {
                     last_observed_bucket_earnings_atoms: bucket.utilization_fee_earnings,
                     cumulative_loss_atoms: 0,
                     cumulative_recovery_atoms: 0,
-                    last_observed_unavailable_principal_atoms:
-                        backing_unavailable_principal_atoms(bucket)?,
+                    last_observed_unavailable_principal_atoms: backing_unavailable_principal_atoms(
+                        bucket,
+                    )?,
                     domain,
                     _padding: [0u8; 14],
                 };
@@ -10824,8 +10825,7 @@ pub mod processor {
             let (cfg, group) = state::market_view_mut(&mut market_data)?;
             let configured_slots = group.header.config.max_market_slots.get() as usize;
             let asset_index = domain_usize / 2;
-            if domain_usize >= configured_slots.saturating_mul(2)
-                || asset_index >= configured_slots
+            if domain_usize >= configured_slots.saturating_mul(2) || asset_index >= configured_slots
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }

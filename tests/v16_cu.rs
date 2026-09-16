@@ -6211,8 +6211,111 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
     );
 }
 
+// ── P-SR (2026-09-16) ─────────────────────────────────────────────────────────────────────────
+// Engine `7b703710` ports upstream `aeyakovenko/percolator@f06a04a7` ("keep strict trade
+// reductions open below initial margin", on `av/master`, byte-identical here): a strictly
+// risk-reducing trade — including a full close to flat — now SKIPS `ensure_initial_margin`,
+// `ensure_no_positive_credit_initial_margin` and `create_initial_margin_source_lien_if_needed`
+// (`trade_account_requires_initial_margin(current, next) = |next| >= |current|` is false for a
+// full close). That gate was the ONLY thing refusing a bilateral trade against a counterparty
+// with `certified_equity < 0`, so the five probes below — which asserted `close.is_err()` plus
+// byte-equality of every account touched — now assert the PRE-`f06a04a7` over-refusal, which
+// upstream has deliberately and irreversibly removed (ruled DESIGN-QUESTION, upstream-shared,
+// not a fork defect: `~/percolator-ops/sync/security-review/verify/items/E-SR.md`). The
+// "off_mark" framing in the old names measured nothing either: `exec_price` only ever reaches
+// `trade_notional_floor` / `trade_fee_notional_ceil` (v16 has no exec-vs-mark slippage transfer),
+// so exec 100/300/500/1,000,000 are economically identical — what the probes actually pinned was
+// "a bankrupt counterparty may not be a bilateral trade counterparty at all", not a price.
+//
+// Independently re-measured at the CURRENT engine (`origin/main` `c141d47f`, descendant of the
+// `dc01e542` ref the E-SR item used — `finish_trade_checks_not_atomic`,
+// `trade_account_requires_initial_margin` and `terminal_trade_residual_asset_before_refresh` are
+// byte-identical between the two): the closer realizes EXACTLY the same amount on the newly
+// permitted bilateral close as it would on the honest liquidation path (101,000 atoms either way
+// in the item's own fixture; `EXTRACTED = 0`, re-run in this task at `c141d47f` with identical
+// numbers to the item's `dc01e542` run — `verify/security-review/fixes/P-SR.md`). So this is NOT
+// a fund-extraction regression. What is real, and what these five probes must now protect
+// instead of the vanished refusal, is the invariant the engine's own liquidation path enforces
+// but the bilateral-close path does not:
+//
+//   after a strict-reduction close takes a certified-equity-negative counterparty flat —
+//     1. it is left with NO dangling exposure — the closed leg is fully unwound, not stranded
+//        half-open and unbacked (av spec.md:59 req 24: "basis, OI, PnL and side weights for
+//        bankrupt close MUST NOT be freed until residuals are booked, backed, explicitly
+//        assigned, or recovered" — here the exposure IS freed, so the "recovered" alternative
+//        must hold on the one field that survives: `pnl`);
+//     2. its residual debt is NOT silently forgiven — `pnl` remains a durable, visible negative
+//        balance rather than being reset to zero for free. `close_progress.b_loss_booked` stays
+//        0 on this path (E-SR item, test C) — the debt is not BOOKED to a domain — but `pnl`
+//        itself is the one place it still survives; erasing that too would be forgiveness with
+//        no trace at all, strictly worse than the bug `f06a04a7` removed;
+//     3. NO value is manufactured — the close itself must not move `vault` or `c_tot`. A
+//        bilateral trade is a zero-sum repricing between two portfolios, never a transfer of
+//        real backing (this is what "no dollar left the building" reduces to at the wrapper
+//        level; the deposit/withdraw simulation that proves `EXTRACTED = 0` end-to-end lives in
+//        the engine PoC — `verify/poc/E-SR/poc_E-SR.rs` test E — not here).
+//
+// A "fix" that lets the close silently zero the debt (2) or move real backing (3) would pass the
+// OLD `close.is_err()` assertion trivially — there is no error path left to check — while being a
+// strictly worse bug. That is what this helper exists to catch.
+#[track_caller]
+fn assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+    env: &V16CuEnv,
+    probe: Pubkey,
+    vault_before: u128,
+    c_tot_before: u128,
+    insurance_before: u128,
+) {
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    let probe_data = env.svm.get_account(&probe).unwrap().data;
+    let (_, group) = state::read_market(&market_data).unwrap();
+    let probe_state = state::read_portfolio(&probe_data).unwrap();
+
+    // 1. no dangling exposure: the closed counterparty's leg is fully unwound, not left half-open.
+    assert!(
+        !probe_state.legs[0].active,
+        "P-SR invariant #1: the closed counterparty must not be left with a dangling open leg \
+         (an unbacked position); got active={}",
+        probe_state.legs[0].active
+    );
+    assert_eq!(
+        probe_state.legs[0].basis_pos_q, 0,
+        "P-SR invariant #1: the closed counterparty's basis must be fully unwound, got {}",
+        probe_state.legs[0].basis_pos_q
+    );
+
+    // 2. the residual is not silently forgiven: the debt survives as a durable negative pnl.
+    assert!(
+        probe_state.pnl < 0,
+        "P-SR invariant #2: a bankrupt counterparty's post-close debt must remain a durable, \
+         visible negative pnl balance, not be silently forgiven for free; got pnl={}",
+        probe_state.pnl
+    );
+
+    // 3. no value is manufactured: the trade itself must not move vault, c_tot or insurance.
+    assert_eq!(
+        group.vault, vault_before,
+        "P-SR invariant #3: the bilateral close must not move real backing (vault); \
+         before={vault_before} after={}",
+        group.vault
+    );
+    assert_eq!(
+        group.c_tot, c_tot_before,
+        "P-SR invariant #3: the bilateral close must not manufacture or destroy capital \
+         (c_tot); before={c_tot_before} after={}",
+        group.c_tot
+    );
+    assert_eq!(
+        group.insurance, insurance_before,
+        "P-SR invariant #3: the bilateral close must not touch insurance; \
+         before={insurance_before} after={}",
+        group.insurance
+    );
+}
+
 #[test]
-fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
+fn v16_bpf_tradenocpi_closes_liquidatable_counterparty_without_forgiving_debt_or_dangling_exposure()
+{
     let mut env = V16CuEnv::new();
     env.top_up_insurance(1_000_000);
     env.svm.warp_to_slot(1);
@@ -6258,14 +6361,13 @@ fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         },
     );
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
-    let before_probe = env.svm.get_account(&probe).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
     assert_eq!(before_group.insurance, 1_000_000);
+    let before_probe = env.svm.get_account(&probe).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert!(
         before_probe_state.health_cert.certified_liq_deficit != 0,
-        "probe must be liquidatable before the attempted recycling trade"
+        "probe must be liquidatable before the close"
     );
 
     let close = env.try_trade_asset_with_cu(
@@ -6279,22 +6381,21 @@ fn v16_bpf_tradenocpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         0,
     );
     assert!(
-        close.is_err(),
-        "liquidatable probe must not recycle an unsettled deficit through an off-mark close"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a liquidatable counterparty; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
 }
 
 #[test]
-fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
+fn v16_bpf_tradecpi_closes_liquidatable_counterparty_without_forgiving_debt_or_dangling_exposure() {
     let mut env = V16CuEnv::new();
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
@@ -6350,13 +6451,12 @@ fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         9_000,
     );
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
-    let before_matcher = env.svm.get_account(&matcher_ctx).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert!(
         before_probe_state.health_cert.certified_liq_deficit != 0,
-        "probe must be liquidatable before the attempted matcher recycling trade"
+        "probe must be liquidatable before the matcher close"
     );
 
     let close = env.try_trade_cpi_with_cu_on_asset(
@@ -6372,26 +6472,22 @@ fn v16_bpf_tradecpi_rejects_off_mark_recycle_when_deficit_cannot_settle() {
         0,
     );
     assert!(
-        close.is_err(),
-        "liquidatable probe must not recycle an unsettled deficit through an off-mark matcher fill"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a liquidatable counterparty through the matcher route \
+         too; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
-    );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
-    assert_eq!(
-        env.svm.get_account(&matcher_ctx).unwrap().data,
-        before_matcher.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
 }
 
 #[test]
-fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
+fn v16_bpf_tradenocpi_closes_bankrupt_counterparty_without_forgiving_debt_or_dangling_exposure() {
     let mut env = V16CuEnv::new();
     env.top_up_insurance(1_000_000);
 
@@ -6423,18 +6519,18 @@ fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
     );
 
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert_eq!(before_probe_state.capital, 0);
     assert!(
         before_probe_state.pnl < 0,
-        "probe must start bankrupt before the attempted recycling trade"
+        "probe must start bankrupt before the close"
     );
     assert!(before_probe_state.health_cert.valid);
     assert!(
         before_probe_state.health_cert.certified_equity < 0,
-        "refreshed probe certificate must confirm negative equity before the attempted trade"
+        "refreshed probe certificate must confirm negative equity before the close"
     );
 
     let close = env.try_trade_asset_with_cu(
@@ -6448,22 +6544,21 @@ fn v16_bpf_tradenocpi_rejects_when_counterparty_starts_bankrupt() {
         0,
     );
     assert!(
-        close.is_err(),
-        "bankrupt probe must not use an off-mark close as a normal bilateral trade"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a bankrupt counterparty; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
 }
 
 #[test]
-fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
+fn v16_bpf_tradecpi_closes_bankrupt_counterparty_without_forgiving_debt_or_dangling_exposure() {
     let mut env = V16CuEnv::new();
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
@@ -6505,19 +6600,18 @@ fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
     );
 
     let before_market = env.svm.get_account(&env.market).unwrap();
-    let before_extractor = env.svm.get_account(&extractor).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
-    let before_matcher = env.svm.get_account(&matcher_ctx).unwrap();
     let before_probe_state = state::read_portfolio(&before_probe.data).unwrap();
     assert_eq!(before_probe_state.capital, 0);
     assert!(
         before_probe_state.pnl < 0,
-        "probe must start bankrupt before the attempted matcher recycling trade"
+        "probe must start bankrupt before the matcher close"
     );
     assert!(before_probe_state.health_cert.valid);
     assert!(
         before_probe_state.health_cert.certified_equity < 0,
-        "refreshed probe certificate must confirm negative equity before the attempted matcher trade"
+        "refreshed probe certificate must confirm negative equity before the matcher close"
     );
 
     let close = env.try_trade_cpi_with_cu_on_asset(
@@ -6533,26 +6627,23 @@ fn v16_bpf_tradecpi_rejects_when_counterparty_starts_bankrupt() {
         0,
     );
     assert!(
-        close.is_err(),
-        "bankrupt probe must not use an off-mark matcher fill as a normal bilateral trade"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets a strict reduction close a bankrupt counterparty through the matcher route too; \
+         got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
-    );
-    assert_eq!(
-        env.svm.get_account(&extractor).unwrap().data,
-        before_extractor.data
-    );
-    assert_eq!(env.svm.get_account(&probe).unwrap().data, before_probe.data);
-    assert_eq!(
-        env.svm.get_account(&matcher_ctx).unwrap().data,
-        before_matcher.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        probe,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
 }
 
 #[test]
-fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
+fn v16_bpf_tradenocpi_closes_both_bankrupt_counterparties_without_forgiving_debt_or_dangling_exposure(
+) {
     let mut env = V16CuEnv::new();
     env.top_up_insurance(1_000_000);
 
@@ -6595,6 +6686,7 @@ fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
     );
 
     let before_market = env.svm.get_account(&env.market).unwrap();
+    let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_long = env.svm.get_account(&long_account).unwrap();
     let before_short = env.svm.get_account(&short_account).unwrap();
     let before_long_state = state::read_portfolio(&before_long.data).unwrap();
@@ -6615,20 +6707,25 @@ fn v16_bpf_tradenocpi_rejects_when_both_counterparties_start_bankrupt() {
         0,
     );
     assert!(
-        close.is_err(),
-        "two bankrupt counterparties must not use TradeNoCpi as a bankruptcy close"
+        close.is_ok(),
+        "P-SR: engine 7b703710 (upstream f06a04a7, DESIGN-QUESTION, EXTRACTED=0) deliberately \
+         lets TWO simultaneously-bankrupt counterparties close against each other via \
+         TradeNoCpi; got {close:?}"
     );
-    assert_eq!(
-        env.svm.get_account(&env.market).unwrap().data,
-        before_market.data
+    // both sides end flat with a pre-existing deficit; the invariant must hold for both.
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        long_account,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
-    assert_eq!(
-        env.svm.get_account(&long_account).unwrap().data,
-        before_long.data
-    );
-    assert_eq!(
-        env.svm.get_account(&short_account).unwrap().data,
-        before_short.data
+    assert_bankrupt_close_left_no_dangling_exposure_or_forgiven_debt(
+        &env,
+        short_account,
+        before_group.vault,
+        before_group.c_tot,
+        before_group.insurance,
     );
 }
 
@@ -13129,16 +13226,10 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
     const DOMAIN: u16 = 1;
 
     let mut env = V16CuEnv::new();
-    let ledger =
-        state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
+    let ledger = state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
 
     // Recreate a legacy funded domain whose canonical ledger never existed.
-    seed_legacy_ledgerless_consumed_backing(
-        &mut env,
-        DOMAIN as usize,
-        60,
-        40,
-    );
+    seed_legacy_ledgerless_consumed_backing(&mut env, DOMAIN as usize, 60, 40);
 
     // Historical provider earnings also existed before the ledger did.
     env.mutate_market(|_cfg, group| {
@@ -13149,12 +13240,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
             .expect("#433 legacy earnings vault overflow");
     });
 
-    env.set_token_account_amount(
-        env.vault,
-        env.mint,
-        env.vault_authority,
-        130,
-    );
+    env.set_token_account_amount(env.vault, env.mint, env.vault_authority, 130);
 
     assert!(
         env.svm.get_account(&ledger).is_none(),
@@ -13197,8 +13283,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
         .svm
         .get_account(&ledger)
         .expect("migration must create the canonical ledger");
-    let migrated =
-        state::read_backing_domain_ledger(&ledger_account.data).unwrap();
+    let migrated = state::read_backing_domain_ledger(&ledger_account.data).unwrap();
 
     assert_eq!(migrated.total_principal_atoms, 100);
     assert_eq!(migrated.cumulative_loss_atoms, 40);
@@ -13246,8 +13331,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
     assert_eq!(env.token_amount(vault), 110);
 
     let ledger_after = env.svm.get_account(&ledger).unwrap();
-    let ledger_after =
-        state::read_backing_domain_ledger(&ledger_after.data).unwrap();
+    let ledger_after = state::read_backing_domain_ledger(&ledger_after.data).unwrap();
 
     assert_eq!(ledger_after.total_earnings_atoms, 30);
     assert_eq!(ledger_after.total_earnings_withdrawn_atoms, 20);
@@ -13265,16 +13349,10 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     const DOMAIN: u16 = 1;
 
     let mut env = V16CuEnv::new();
-    let ledger =
-        state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
+    let ledger = state::derive_lp_backing_ledger(&env.program_id, &env.market, DOMAIN).0;
 
     // Legacy backing exists, but the canonical ledger does not.
-    seed_legacy_ledgerless_consumed_backing(
-        &mut env,
-        DOMAIN as usize,
-        100,
-        0,
-    );
+    seed_legacy_ledgerless_consumed_backing(&mut env, DOMAIN as usize, 100, 0);
 
     assert!(
         env.svm.get_account(&ledger).is_none(),
@@ -13366,16 +13444,16 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         ],
         &[&admin],
     )
-    .expect(
-        "#433 resolved zero-capital migration must create the missing canonical ledger",
-    );
+    .expect("#433 resolved zero-capital migration must create the missing canonical ledger");
 
     assert_eq!(
-        env.token_amount(source), 1,
+        env.token_amount(source),
+        1,
         "zero-capital migration must not consume source tokens"
     );
     assert_eq!(
-        env.token_amount(vault), vault_before,
+        env.token_amount(vault),
+        vault_before,
         "zero-capital migration must not change vault balance"
     );
 
@@ -13384,8 +13462,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         .get_account(&ledger)
         .expect("resolved migration must create the canonical ledger");
 
-    let migrated =
-        state::read_backing_domain_ledger(&ledger_account.data).unwrap();
+    let migrated = state::read_backing_domain_ledger(&ledger_account.data).unwrap();
 
     assert_eq!(migrated.total_principal_atoms, 100);
     assert_eq!(migrated.cumulative_loss_atoms, 0);
@@ -13425,8 +13502,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     assert_eq!(env.token_amount(vault), vault_before - 40);
 
     let ledger_after = env.svm.get_account(&ledger).unwrap();
-    let ledger_after =
-        state::read_backing_domain_ledger(&ledger_after.data).unwrap();
+    let ledger_after = state::read_backing_domain_ledger(&ledger_after.data).unwrap();
 
     assert_eq!(ledger_after.total_principal_atoms, 60);
     assert_eq!(ledger_after.total_principal_withdrawn_atoms, 40);
@@ -13534,7 +13610,10 @@ fn v16_bpf_spent_backing_ledger_is_adopted_by_the_next_authority() {
         successor.pubkey().to_bytes(),
         "#453: the spent ledger must be adopted by the new authority"
     );
-    assert_eq!(adopted.total_principal_atoms, 50, "the new deposit is booked");
+    assert_eq!(
+        adopted.total_principal_atoms, 50,
+        "the new deposit is booked"
+    );
 
     // Adoption RE-SEEDS. Inheriting the predecessor's withdrawal history would
     // import their numbers into the successor's accounting, and total_earnings
@@ -13564,7 +13643,10 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
     env.withdraw_backing_bucket_to_admin_token_with_cu(dest, 1, 40);
     let partial =
         state::read_backing_domain_ledger(&env.svm.get_account(&ledger).unwrap().data).unwrap();
-    assert_eq!(partial.total_principal_atoms, 60, "value remains on the ledger");
+    assert_eq!(
+        partial.total_principal_atoms, 60,
+        "value remains on the ledger"
+    );
 
     let successor = Keypair::new();
     env.svm.expire_blockhash();
