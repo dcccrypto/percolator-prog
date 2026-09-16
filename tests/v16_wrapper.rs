@@ -21810,6 +21810,152 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// W-23 regression block.
+//
+// (a) `ForceCloseAbandonedAsset` (tag 64) never carried
+//     `reject_permissionless_resolve_matured_live_view`, unlike every other
+//     Live-mode mutation path in this file (upstream
+//     `percolator-prog upstream/main:src/v16_program.rs:9083`, 13 other call
+//     sites in ours). PRE-FIX: a cranker force-close reaches the engine and
+//     closes the pair even though the market has already matured into a
+//     permissionless resolve. POST-FIX: `OracleStale`.
+//
+// (b) `ForfeitRecoveryLeg` (tag 43) never got the same maturity gate #446
+//     already restored on the sibling `RebalanceReduce` (tag 44) path
+//     (upstream `percolator-prog upstream/main:src/v16_program.rs:11519-11520`).
+//     PRE-FIX: an owner-signed forfeit still settles once the market has
+//     matured. POST-FIX: `EngineLockActive`.
+//
+// Both tests assert the FIXED (blocked) behaviour, so reverting either gate
+// turns the matching test red (the branch's negative control).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// W-23(a) — see block comment above.
+#[test]
+fn v16_wrapper_force_close_abandoned_asset_is_blocked_once_resolve_has_matured() {
+    let mut admin = signer();
+    let mut cranker = signer();
+    let mut market = market_account();
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account();
+    let mut short_account = portfolio_account();
+
+    init_market_with_ix(&mut admin, &mut market, init_market_ix_with(|_| {}));
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
+    run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+
+    // Push asset 0 into Recovery lifecycle with a shutdown slot, configure a
+    // nonzero force-close delay, and separately drive the MARKET into a
+    // matured permissionless resolve -- all while mode stays Live(0), which is
+    // exactly the precondition `reject_permissionless_resolve_matured_live_view`
+    // gates on. The per-asset shutdown delay (profile.last_good_oracle_slot,
+    // read via `authenticated_slot_or_fallback(now_slot)`) and the market's
+    // global maturity (`group.current_slot`, read via
+    // `authenticated_market_slot_or_fallback_view`) are independent fields, so
+    // both can be satisfied simultaneously without one defeating the other.
+    {
+        let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+        cfg.force_close_delay_slots = 5;
+        cfg.permissionless_resolve_stale_slots = 9_000;
+        cfg.last_good_oracle_slot = 0;
+        group.assets[0].lifecycle = AssetLifecycleV16::Recovery;
+        group.current_slot = 20_000;
+        assert_eq!(
+            group.mode,
+            MarketModeV16::Live,
+            "must still be Live for this gate"
+        );
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+
+        let mut profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+        profile.last_good_oracle_slot = 2;
+        state::write_asset_oracle_profile(&mut market.data, 0, &profile).unwrap();
+    }
+
+    let before = market.data.clone();
+    // now_slot=7 satisfies the per-asset shutdown delay on its own
+    // (shutdown_slot=2, force_close_delay_slots=5: 7-2==5) -- pre-fix this call
+    // is admitted purely on that gate, ignoring the market's separately
+    // matured global resolve.
+    let blocked = force_close_abandoned_asset(
+        &mut cranker,
+        &mut market,
+        &mut long_account,
+        &mut short_account,
+        0,
+        7,
+        POS_SCALE,
+    );
+    assert!(
+        blocked.is_err(),
+        "W-23(a): force-close-abandoned-asset must be blocked once the resolve has matured"
+    );
+    assert_eq!(
+        market.data, before,
+        "W-23(a): a blocked force-close must not mutate market state"
+    );
+}
+
+/// W-23(b, maturity half) — see block comment above. Reuses the `cw04_*`
+/// fixture (defined further below in this file) verbatim: it drives asset 0
+/// into a real Recovery-lifecycle B debt that a forfeit call settles, exactly
+/// the state `handle_forfeit_recovery_leg` is meant to act on.
+#[test]
+fn v16_wrapper_forfeit_recovery_leg_is_blocked_once_resolve_has_matured() {
+    let mut f = cw04_fixture(true);
+
+    // Drive the market into a MATURED permissionless resolve while still mode
+    // 0 (Live), same recipe as the #446 / W-23(a) tests above.
+    {
+        let (mut cfg, mut group) = state::read_market(&f.market.data).unwrap();
+        cfg.permissionless_resolve_stale_slots = 9_000;
+        cfg.last_good_oracle_slot = 0;
+        group.current_slot = 20_000;
+        assert_eq!(
+            group.mode,
+            MarketModeV16::Live,
+            "must still be Live for this gate"
+        );
+        state::write_market(&mut f.market.data, &cfg, &group).unwrap();
+    }
+
+    let before = f.market.data.clone();
+    let blocked = cw04_forfeit(&mut f, CW04_DEBT_ATOMS);
+    assert!(
+        blocked.is_err(),
+        "W-23(b): forfeit-recovery-leg must be blocked once the resolve has matured"
+    );
+    assert_eq!(
+        f.market.data, before,
+        "W-23(b): a blocked forfeit must not mutate market state"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // W-19 regression — `constants::VERSION` 17 -> 18.
 //
 // These are the FIX-SIDE form of `verify/poc/F-01/poc_F-01.rs`

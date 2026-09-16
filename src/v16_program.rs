@@ -9166,6 +9166,14 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineLockActive.into());
         }
+        // W-23(a): restore the upstream maturity gate missing from this handler. Once
+        // a Live market has matured into a permissionless resolve, a cranker-driven
+        // force-close must not still mutate positions — the same gate guards every
+        // other Live-mode mutation path in this file (13 other call sites); this
+        // handler is the one place it was never wired, in upstream's position
+        // (`percolator-prog upstream/main:src/v16_program.rs:9083`, right after the
+        // mode/config early-return and before the asset lifecycle check).
+        reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
         let asset = group.markets[asset_index_usize].engine.asset;
         if asset.lifecycle != ASSET_LIFECYCLE_RECOVERY {
             return Err(PercolatorError::EngineLockActive.into());
@@ -12931,9 +12939,22 @@ pub mod processor {
         if b_loss_atom_budget == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, _cfg| {
+        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, cfg| {
+            // W-23(b, maturity half): restore the upstream maturity gate dropped in
+            // our port. Once a market has matured into a permissionless resolve, an
+            // owner-signed forfeit must not still mutate positions — the same gate
+            // was already restored on the sibling `RebalanceReduce` (tag 44) path by
+            // #446. Upstream carries this exact check in `handle_forfeit_recovery_leg`
+            // (`percolator-prog upstream/main:src/v16_program.rs:11519-11520`).
+            if group.header.mode == 0 && permissionless_resolve_matured_now_view(cfg, group) {
+                return Err(V16Error::LockActive);
+            }
             group
-                .forfeit_recovery_leg_not_atomic(portfolio, asset_index as usize, b_loss_atom_budget)
+                .forfeit_recovery_leg_not_atomic(
+                    portfolio,
+                    asset_index as usize,
+                    b_loss_atom_budget,
+                )
                 .map(|_| ())
         })
     }
