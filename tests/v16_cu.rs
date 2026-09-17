@@ -7006,6 +7006,285 @@ fn v16_bpf_cranker_reward_liquidation_rejects_invalid_shape_without_paying_rewar
     );
 }
 
+// ── FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward provenance") ──────────────
+// Regression coverage for a confirmed live self-dealing hole (Wave-1 subsystem #5,
+// ADOPT_HYBRID_REWARD_RECLAIM.md): `handle_permissionless_crank_zero_copy` paid the
+// liquidation-cranker reward to a caller-supplied `cranker_portfolio_ai` UNCONDITIONALLY
+// (share cap up to 100% via `liquidation_cranker_fee_share_bps`), in both Hybrid and
+// EWMA_MARK oracle modes, with no check on whether the mark that made the account
+// liquidatable was itself moved by a trade. An attacker can push a trade that moves
+// `mark_ewma_e6` past a victim's liquidation threshold -- paying only the bounded
+// `dynamic_fee_bps_with_externality_floor` externality tax -- then self-crank the
+// liquidation naming their OWN portfolio as reward recipient, capturing up to 100% of the
+// victim's penalty.
+//
+// Both cases below reuse `production_risk_params()`'s economics (maintenance/initial
+// margin = 5%, `liquidation_fee_bps: 5`, `max_price_move_bps_per_slot: 24`,
+// `max_accrual_dt_slots: 20`) rather than this file's plain 100%-margin defaults: the
+// engine's `validate_exact_solvency_envelope` proves, over every possible notional, that
+// `loss_budget + liquidation_fee <= maintenance_margin_bps * notional` -- at 100%
+// maintenance margin with a 100%-per-slot price-move cap that budget is already fully
+// consumed by the price-move loss alone, so ANY nonzero `liquidation_fee_bps` is
+// unsatisfiable and `InitMarket`/`write_market` reject it outright (confirmed empirically:
+// `V16CuMarketParams::default()` with `liquidation_fee_bps` set to anything nonzero fails
+// account decode with `V16Error::InvalidConfig`, independent of this fix). The short
+// deposits EXACTLY its initial-margin requirement (zero headroom at entry, at
+// `initial_margin_bps == maintenance_margin_bps == 500`), so ANY move against it at all
+// makes it liquidatable while still solvent -- this keeps `retained_fee` (the insurance
+// credit the reward is carved from) strictly positive regardless of the fix, so these
+// tests cannot pass vacuously against unpatched source (loop gate 3: "a test green
+// against unpatched source is not a test").
+
+#[test]
+fn v16_bpf_ewma_mark_liquidation_reward_never_reclaimable_by_self_cranked_attacker() {
+    let mut env = V16CuEnv::new_with_init_params(production_risk_params());
+    env.update_liquidation_fee_policy_with_cu(10_000);
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let attacker_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    let attacker_account = env.create_portfolio(&attacker_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    // Exactly the initial-margin minimum for a 1-unit position at entry price 1_000_000
+    // (initial_margin_bps=500 -- no leverage headroom): 1_000_000 * 500 / 10_000 = 50_000.
+    env.deposit(&short_owner, short_account, 50_000);
+    env.configure_ewma_mark_with_cu(0, 1_000_000, 1, 0);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        1_000_000,
+        0,
+    );
+
+    // Push the EWMA mark up by 1% via an ADMIN-authenticated push -- since
+    // initial_margin_bps == maintenance_margin_bps here, ANY move against the short at
+    // all makes it liquidatable while remaining solvent (equity ~40_000 > 0 at this
+    // price). Note this is representative of the WHOLE EWMA_MARK exposure, not just this
+    // one push: our fork's `update_hybrid_mark_after_trade_view` lets an ordinary TRADE
+    // move this exact same `mark_ewma_e6` field under the exact same clamp, so an
+    // attacker's own trade (paying only the bounded externality tax) is an equally valid
+    // way to reach this state. `liquidation_penalty_reclaimable_from_profile_view` in the
+    // fixed source treats EWMA_MARK as unconditionally trade-reachable -- the reward is
+    // never reclaimable in this mode regardless of provenance -- which is exactly what
+    // this test asserts.
+    env.svm.warp_to_slot(25);
+    env.push_ewma_mark_with_cu(25, 1_010_000);
+
+    let short_before = env.portfolio_state(short_account);
+    assert!(
+        short_before.pnl == 0 && short_before.capital == 50_000,
+        "position must still be open going into the liquidation crank"
+    );
+    let (_, market_before) = env.market_state();
+    let attacker_before = env.portfolio_state(attacker_account);
+
+    // Attacker self-cranks the liquidation, naming their OWN portfolio as the reward
+    // recipient -- this is the exact permissionless shape a real attacker would send
+    // (no relationship between `attacker_account` and the liquidated `short_account`).
+    let liq_cu = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::PermissionlessCrank {
+            action: 1,
+            asset_index: 0,
+            now_slot: 25,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+        vec![
+            AccountMeta::new(attacker_owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(short_account, false),
+            AccountMeta::new(attacker_account, false),
+        ],
+        &[&attacker_owner],
+    )
+    .expect("self-cranked EWMA liquidation with attacker-supplied reward portfolio");
+    println!("v16 EWMA self-cranked liquidation-reward-reclaim CU: {liq_cu}");
+
+    let (_, market_after) = env.market_state();
+    let attacker_after = env.portfolio_state(attacker_account);
+    let short_after = env.portfolio_state(short_account);
+    // Ordered deliberately: (1) prove the crank did real liquidation work at all (so a
+    // vacuous no-op crank cannot make assertion (2) pass trivially), THEN (2) the core
+    // security assertion, THEN (3) the secondary "value not silently lost" sanity check.
+    // This ordering is also what makes the negative control (loop gate 3) legible: with
+    // the src fix hunk reverted, THIS test fails at (2) -- attacker capital visibly
+    // increases by the captured reward -- rather than at an oblique insurance-accounting
+    // symptom.
+    assert!(
+        !percolator::active_bitmap_is_empty(short_before.active_bitmap)
+            && (percolator::active_bitmap_is_empty(short_after.active_bitmap)
+                || short_after.capital < short_before.capital),
+        "the crank must have actually liquidated the short leg"
+    );
+    assert_eq!(
+        attacker_after.capital, attacker_before.capital,
+        "FIX (ADOPT 01ec6161): an EWMA_MARK liquidation penalty must NEVER be payable to a \
+         caller-supplied reward portfolio -- trades can always move this mode's mark, so \
+         `liquidation_penalty_reclaimable_from_profile_view` must be permanently closed for \
+         it. Attacker capital before={} after={}",
+        attacker_before.capital,
+        attacker_after.capital
+    );
+    assert!(
+        market_after.insurance > market_before.insurance,
+        "the liquidation must retain a nonzero penalty into insurance (retained_fee > 0), \
+         or this test cannot distinguish the fix from a no-op liquidation; before={} after={}",
+        market_before.insurance,
+        market_after.insurance
+    );
+}
+
+#[test]
+fn v16_bpf_hybrid_trade_driven_liquidation_reward_is_not_reclaimable_by_self_cranked_attacker() {
+    let mut env = V16CuEnv::new_with_init_params(production_risk_params());
+    env.update_liquidation_fee_policy_with_cu(10_000);
+    env.svm.warp_to_slot(1);
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.unix_timestamp = 100;
+    env.svm.set_sysvar(&clock);
+
+    // Single-leg Hybrid oracle (no divide legs): the composite price equals the one
+    // feed's e6 price directly (`read_pyth_price_e6`'s `scale = exponent + 6`, so
+    // exponent=-6 makes the e6-scaled leg price equal the raw literal). `initial_price`
+    // matches `production_risk_params()` (1_000_000). `hybrid_soft_stale_slots = 1` so
+    // the after-hours (trade-driven) fallback matures quickly.
+    let feed = [0xa5u8; 32];
+    let leg0 = env.set_pyth_price(&feed, 1_000_000, -6, 100);
+    env.try_configure_hybrid_asset_with_cu(
+        0,
+        1,
+        0,
+        [feed, [0u8; 32], [0u8; 32]],
+        &[leg0],
+        1,
+        100,
+        0,
+        0,
+        1,
+    )
+    .expect("configure single-leg hybrid oracle");
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let attacker_owner = Keypair::new();
+    let attacker2_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    let attacker_account = env.create_portfolio(&attacker_owner);
+    let attacker2_account = env.create_portfolio(&attacker2_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    // Exactly the initial-margin minimum for a 1-unit position at entry price 1_000_000.
+    env.deposit(&short_owner, short_account, 50_000);
+    env.deposit(&attacker_owner, attacker_account, 10_000_000);
+    env.deposit(&attacker2_owner, attacker2_account, 10_000_000);
+
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        1_000_000,
+        0,
+    );
+
+    // now_slot(25) - last_good_oracle_slot(1) = 24 > hybrid_soft_stale_slots(1): the
+    // Hybrid oracle is soft-stale-matured, so (per `update_hybrid_mark_after_trade_view`)
+    // an ordinary trade -- between two accounts entirely UNRELATED to the victim short --
+    // now moves `mark_ewma_e6`. The attacker pays only the bounded
+    // `dynamic_fee_bps_with_externality_floor` externality tax on this trade (`fee_bps:
+    // 0` caller-supplied baseline, matching the after-hours pattern in
+    // `v16_bpf_hybrid_mark_uses_ewma_after_hours_then_oracle_when_fresh` above, which
+    // asserts a nonzero dynamic fee is still charged). Since `initial_margin_bps ==
+    // maintenance_margin_bps` here, even the single-trade clamp
+    // (`clamp_toward_engine_dt` with a hardcoded dt=1, capped at
+    // `max_price_move_bps_per_slot=24` -> at most a 0.24% move from the current engine
+    // price) is more than enough to push the short's mark above its entry price and make
+    // it liquidatable while it stays solvent.
+    env.svm.warp_to_slot(25);
+    env.trade_with_cu(
+        &attacker_owner,
+        attacker_account,
+        &attacker2_owner,
+        attacker2_account,
+        POS_SCALE as i128,
+        2_000_000,
+        0,
+    );
+    let (attacker_move_cfg, _) = env.market_state();
+    assert!(
+        attacker_move_cfg.mark_ewma_e6 > 1_000_000,
+        "the attacker's own trade must have moved the after-hours Hybrid mark, got {}",
+        attacker_move_cfg.mark_ewma_e6
+    );
+
+    let short_before = env.portfolio_state(short_account);
+    let (_, market_before) = env.market_state();
+    let attacker_before = env.portfolio_state(attacker_account);
+
+    // Attacker immediately self-cranks the victim's liquidation in the SAME soft-stale
+    // window, naming their own portfolio as reward recipient, and WITHOUT supplying any
+    // oracle-leg accounts -- the permissionless crank's soft-stale fallback branch
+    // accepts this (matching every existing soft-stale crank call in this file), and
+    // critically this means the crank takes the STALE fallback path, not the
+    // fresh-oracle-read path that would otherwise clear the trade-driven taint.
+    let liq_cu = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::PermissionlessCrank {
+            action: 1,
+            asset_index: 0,
+            now_slot: 25,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+        vec![
+            AccountMeta::new(attacker_owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(short_account, false),
+            AccountMeta::new(attacker_account, false),
+        ],
+        &[&attacker_owner],
+    )
+    .expect("self-cranked Hybrid liquidation with attacker-supplied reward portfolio");
+    println!("v16 Hybrid trade-driven liquidation-reward-reclaim CU: {liq_cu}");
+
+    let (_, market_after) = env.market_state();
+    let attacker_after = env.portfolio_state(attacker_account);
+    let short_after = env.portfolio_state(short_account);
+    // Ordered deliberately -- see the EWMA test above for why.
+    assert!(
+        !percolator::active_bitmap_is_empty(short_before.active_bitmap)
+            && (percolator::active_bitmap_is_empty(short_after.active_bitmap)
+                || short_after.capital < short_before.capital),
+        "the crank must have actually liquidated the short leg"
+    );
+    assert_eq!(
+        attacker_after.capital, attacker_before.capital,
+        "FIX (ADOPT 01ec6161): a liquidation penalty whose price trace includes a \
+         trade-driven Hybrid mark move must NEVER be payable to the mover's own \
+         self-cranked reward portfolio. Attacker capital before={} after={}",
+        attacker_before.capital,
+        attacker_after.capital
+    );
+    assert!(
+        market_after.insurance > market_before.insurance,
+        "the liquidation must retain a nonzero penalty into insurance (retained_fee > 0), \
+         or this test cannot distinguish the fix from a no-op liquidation; before={} after={}",
+        market_before.insurance,
+        market_after.insurance
+    );
+}
+
 #[test]
 fn v16_bpf_full_14_leg_refresh_crank_is_under_tx_limit() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);

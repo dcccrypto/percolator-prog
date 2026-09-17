@@ -107,6 +107,11 @@ pub mod constants {
     pub const ORACLE_MODE_HYBRID_AFTER_HOURS: u8 = 1;
     pub const ORACLE_MODE_EWMA_MARK: u8 = 2;
     pub const ORACLE_MODE_AUTH_MARK: u8 = 3;
+    // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
+    // provenance", adapted): `AssetOracleProfileV16::effective_price_provenance`
+    // states.
+    pub const EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED: u8 = 0;
+    pub const EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN: u8 = 1;
     pub const ORACLE_LEG_FLAG_DIVIDE_LEG2: u8 = 1 << 0;
     pub const ORACLE_LEG_FLAG_DIVIDE_LEG3: u8 = 1 << 1;
     pub const ORACLE_LEG_FLAGS_MASK: u8 = ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3;
@@ -698,7 +703,8 @@ pub mod error {
 pub mod state {
     use crate::{
         constants::{
-            ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, HEADER_LEN,
+            ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+            EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN, HEADER_LEN,
             KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET, KIND_PORTFOLIO, MAGIC,
             MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
             ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
@@ -1376,7 +1382,16 @@ pub mod state {
         pub backing_trade_fee_bps_short: u16,
         pub backing_trade_fee_insurance_share_bps_long: u16,
         pub backing_trade_fee_insurance_share_bps_short: u16,
-        pub _padding0: [u8; 6],
+        /// FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
+        /// provenance", adapted): whether the current effective-price path still
+        /// includes a trade-driven mark move. Carved from one byte of the former
+        /// six-byte padding lane at the same offset -- the deployed account size
+        /// and every later field offset are unchanged (`_padding0` shrinks
+        /// `[u8; 6]` -> `[u8; 5]`, `ASSET_ORACLE_PROFILE_LEN` stays 432). See
+        /// `liquidation_penalty_reclaimable_from_profile_view` for how this gates
+        /// the permissionless-crank liquidation reward.
+        pub effective_price_provenance: u8,
+        pub _padding0: [u8; 5],
         pub insurance_authority: [u8; 32],
         pub insurance_operator: [u8; 32],
         pub backing_bucket_authority: [u8; 32],
@@ -1446,6 +1461,16 @@ pub mod state {
         pub maintenance_fee_checkpoint_slot: u64,
         pub maintenance_fee_previous_rate: u128,
     }
+
+    // Compile-time guard (ABI_LANDMINE_REGISTRY.md W0-1: "our fork's build will NOT
+    // fail if AssetOracleProfileV16's shape drifts from ASSET_ORACLE_PROFILE_LEN" --
+    // upstream has had this guard since `v16_program.rs:638`, we did not). Mirrors
+    // the `WrapperConfigV16` guard immediately above: a future field addition/removal
+    // that forgets to keep the struct's actual size in lockstep with
+    // `ASSET_ORACLE_PROFILE_LEN` now fails the build instead of silently desyncing
+    // the fixed-offset zero-copy layout inside the 512-byte `ASSET_ORACLE_WRAPPER_LEN`
+    // slot.
+    const _: () = assert!(core::mem::size_of::<AssetOracleProfileV16>() == ASSET_ORACLE_PROFILE_LEN);
 
     /// Aggregate backing-domain accounting for an authority-controlled vault.
     /// This intentionally contains no per-depositor state; external authority
@@ -2057,7 +2082,18 @@ pub mod state {
                 profile.backing_trade_fee_insurance_share_bps_short,
             )
             || profile.invert > 1
-            || profile._padding0 != [0u8; 6]
+            // FIX (ADOPT upstream 01ec6161, adapted): bound the carved provenance
+            // byte, and -- widened from upstream's Hybrid-only exemption, since our
+            // fork's `update_hybrid_mark_after_trade_view` taints EWMA_MARK profiles
+            // identically to stale-matured Hybrid ones (see
+            // `liquidation_penalty_reclaimable_from_profile_view`) -- require
+            // AUTHENTICATED for every mode that can never legitimately be
+            // trade-tainted.
+            || profile.effective_price_provenance > EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN
+            || (profile.oracle_mode != ORACLE_MODE_HYBRID_AFTER_HOURS
+                && profile.oracle_mode != ORACLE_MODE_EWMA_MARK
+                && profile.effective_price_provenance != EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED)
+            || profile._padding0 != [0u8; 5]
             || profile.oracle_leg_count as usize > ORACLE_LEG_CAP
             || (profile.oracle_leg_flags & !ORACLE_LEG_FLAGS_MASK) != 0
         {
@@ -2152,7 +2188,8 @@ pub mod state {
             backing_trade_fee_bps_short: 0,
             backing_trade_fee_insurance_share_bps_long: 0,
             backing_trade_fee_insurance_share_bps_short: 0,
-            _padding0: [0u8; 6],
+            effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+            _padding0: [0u8; 5],
             insurance_authority: [0u8; 32],
             insurance_operator: [0u8; 32],
             backing_bucket_authority: [0u8; 32],
@@ -2190,7 +2227,8 @@ pub mod state {
                 .backing_trade_fee_insurance_share_bps_long,
             backing_trade_fee_insurance_share_bps_short: config
                 .backing_trade_fee_insurance_share_bps_short,
-            _padding0: [0u8; 6],
+            effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+            _padding0: [0u8; 5],
             // At InitMarket the market key bootstraps asset 0 exactly like an activator bootstraps a
             // permissionless asset 1..N: it is asset 0's cold-storage admin and all its sub-authorities.
             insurance_authority: config.marketauth,
@@ -14791,7 +14829,8 @@ pub mod processor {
                     .backing_trade_fee_insurance_share_bps_long,
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
-                _padding0: [0u8; 6],
+                effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+                _padding0: [0u8; 5],
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -14916,7 +14955,8 @@ pub mod processor {
                     .backing_trade_fee_insurance_share_bps_long,
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
-                _padding0: [0u8; 6],
+                effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+                _padding0: [0u8; 5],
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -15023,7 +15063,8 @@ pub mod processor {
                     .backing_trade_fee_insurance_share_bps_long,
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
-                _padding0: [0u8; 6],
+                effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+                _padding0: [0u8; 5],
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -15561,6 +15602,30 @@ pub mod processor {
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             let insurance_before = group.header.insurance.get();
             let is_liquidation = matches!(crank_action, PermissionlessCrankActionV16::Liquidate(_));
+            // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
+            // provenance", adapted -- confirmed live hole, ADOPT_HYBRID_REWARD_RECLAIM.md):
+            // a caller-supplied `cranker_portfolio_ai` reward recipient was paid up to
+            // `liquidation_cranker_fee_share_bps` (validated only <= 100%) of the
+            // liquidation penalty UNCONDITIONALLY, in both Hybrid and EWMA oracle
+            // modes -- with no check on whether the mark that made the account
+            // liquidatable was itself trade-driven. An attacker could push a trade
+            // that moves `mark_ewma_e6` past a victim's liquidation threshold (paying
+            // only the bounded `dynamic_fee_bps_with_externality_floor` externality
+            // tax), then self-crank the liquidation naming their own portfolio as
+            // reward recipient, capturing up to 100% of the victim's penalty. This
+            // reads `oracle_profile` as already updated by
+            // `hybrid_effective_price_for_crank_view` above (including any
+            // provenance reset this crank call itself earned), matching upstream's
+            // ordering (the reclaim decision uses the SAME crank's fresh oracle
+            // state, not the pre-crank one).
+            let liquidation_penalty_reclaimable = if is_liquidation {
+                liquidation_penalty_reclaimable_from_profile_view(
+                    &oracle_profile,
+                    authenticated_now_slot,
+                )
+            } else {
+                false
+            };
             if let Some(cranker_ai) = cranker_portfolio_ai {
                 let mut cranker_data = cranker_ai.try_borrow_mut_data()?;
                 let mut cranker = state::portfolio_view_mut_for_market_slots(
@@ -15604,11 +15669,24 @@ pub mod processor {
                     .insurance
                     .get()
                     .saturating_sub(insurance_before);
-                let reward = maintenance_cranker_reward(
-                    retained_fee,
-                    cfg.liquidation_cranker_fee_share_bps,
-                )?;
-                let reward = core::cmp::min(reward, retained_fee);
+                // FIX (ADOPT upstream 01ec6161, adapted): a liquidation whose penalty
+                // is not reclaimable pays NO cranker reward at all -- the mover and a
+                // later self-cranker cannot be identity-separated, so a trade-driven
+                // mark move must not be able to unlock a payout back to a
+                // caller-supplied portfolio. The full `retained_fee` still flows to
+                // `credit_market_fee_split_across_domains_view` below unchanged (matches
+                // this function's own no-cranker-account `else` branch, which always
+                // routes the full amount there with no reward leg) -- the penalty is
+                // not lost, it simply cannot be privately claimed.
+                let reward = if is_liquidation && !liquidation_penalty_reclaimable {
+                    0
+                } else {
+                    let reward = maintenance_cranker_reward(
+                        retained_fee,
+                        cfg.liquidation_cranker_fee_share_bps,
+                    )?;
+                    core::cmp::min(reward, retained_fee)
+                };
                 if reward != 0 {
                     // Protocol-fee RESERVE amendment: same reservation
                     // threading as SyncMaintenanceFee above -- this
@@ -19535,6 +19613,17 @@ pub mod processor {
                 exposed,
             );
             profile.oracle_target_price_e6 = target;
+            // FIX (ADOPT upstream 01ec6161, adapted): a crank that reads the
+            // authenticated EWMA/auth-mark target directly (no external oracle
+            // staleness concept applies to these modes) always clears any
+            // trade-driven taint. This is a no-op for reclaimability on an
+            // EWMA_MARK profile (`profile_updates_mark_from_trade_view` is
+            // unconditionally true for that mode, so the liquidation reward is
+            // never reclaimable there regardless of this bit -- see
+            // `liquidation_penalty_reclaimable_from_profile_view`), and keeps the
+            // stored provenance meaningful rather than permanently poisoned by one
+            // past trade.
+            profile.effective_price_provenance = constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
             return Ok(price);
         }
         if !oracle_v16::profile_is_hybrid(profile) {
@@ -19561,6 +19650,9 @@ pub mod processor {
         } else {
             Err(ProgramError::NotEnoughAccountKeys)
         };
+        // FIX (ADOPT upstream 01ec6161, adapted): remembered for the provenance
+        // reset below -- `read` is consumed by the `match` immediately after.
+        let fresh_oracle_read = read.is_ok();
         let target = match read {
             Ok((price, publish_time, advanced)) => {
                 profile.oracle_target_price_e6 = price;
@@ -19594,11 +19686,57 @@ pub mod processor {
             exposed,
         );
         profile.oracle_target_price_e6 = target;
+        // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
+        // provenance", adapted): our fork has no `canonical_accrual_path_for_target_view`
+        // (upstream's home for this hunk -- subsystem (2), which we lack entirely per
+        // ADOPT_HYBRID_REWARD_RECLAIM.md); this is the structurally equivalent site on
+        // our fork's own crank-price path. Clear the trade-driven taint only once we
+        // took a genuinely FRESH oracle read (not the soft-stale EWMA fallback below)
+        // AND the engine's effective price has fully walked all the way to that fresh
+        // target -- a partial catch-up (clamped by `max_price_move_bps_per_slot`/
+        // `max_accrual_dt_slots`) must NOT re-enable the reward while the position that
+        // gets liquidated is still being evaluated against a price that has not fully
+        // caught up to the authenticated feed.
+        if fresh_oracle_read && price == target {
+            profile.effective_price_provenance = constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
+        }
         if !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot) {
             profile.mark_ewma_e6 = price;
             profile.mark_ewma_last_slot = now_slot;
         }
         Ok(price)
+    }
+
+    /// FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
+    /// provenance", adapted): a mark mover can use a fresh cranker key, and one paid
+    /// mark move can render many portfolios liquidatable. A liquidation penalty whose
+    /// price trace includes a trade-driven EWMA/Hybrid mark move must not be payable
+    /// back through the public permissionless-crank reward, or the mover recovers
+    /// more than the bounded externality fee (`dynamic_fee_bps_with_externality_floor`)
+    /// it paid to move the mark in the first place -- see
+    /// `liquidation_penalty_reclaimable_from_profile_view`, used at the crank-reward
+    /// site in `handle_permissionless_crank_zero_copy`.
+    ///
+    /// Ported fresh (not cherry-picked): our fork never had upstream's baseline
+    /// `profile_updates_mark_from_trade_view` predicate at all (see
+    /// ADOPT_HYBRID_REWARD_RECLAIM.md §2) -- this function and the one below
+    /// reconstruct it, byte-identical in behavior to upstream's version.
+    fn profile_updates_mark_from_trade_view(
+        profile: &state::AssetOracleProfileV16,
+        now_slot: u64,
+    ) -> bool {
+        oracle_v16::profile_is_ewma_mark(profile)
+            || (oracle_v16::profile_is_hybrid(profile)
+                && oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot))
+    }
+
+    fn liquidation_penalty_reclaimable_from_profile_view(
+        profile: &state::AssetOracleProfileV16,
+        now_slot: u64,
+    ) -> bool {
+        !profile_updates_mark_from_trade_view(profile, now_slot)
+            && profile.effective_price_provenance
+                == constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED
     }
 
     fn permissionless_funding_rate_e9_view(
@@ -19671,6 +19809,19 @@ pub mod processor {
         if new_mark != 0 && new_mark != old {
             profile.mark_ewma_e6 = new_mark;
             profile.mark_ewma_last_slot = now_slot;
+            // FIX (ADOPT upstream 01ec6161, adapted): taint the provenance bit
+            // whenever THIS function actually moved the mark. Scoped to the same
+            // `ewma_updates_from_trade` condition that gated the whole function
+            // (EWMA_MARK unconditionally, or Hybrid only once soft-stale-matured) --
+            // NOT narrowed to Hybrid-only like upstream's literal diff, since our
+            // fork's EWMA_MARK mode is equally exposed to trade-driven mark moves
+            // (ADOPT_HYBRID_REWARD_RECLAIM.md §2/§5) and the compile-time shape
+            // check above was widened to match. This is a no-op for reclaimability
+            // on EWMA_MARK specifically (see `profile_updates_mark_from_trade_view`),
+            // but keeps the field an accurate record of "trade touched this mark"
+            // rather than silently under-reporting on the mode that needs the
+            // strongest bookkeeping.
+            profile.effective_price_provenance = constants::EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN;
         }
         Ok(())
     }

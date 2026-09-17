@@ -15,8 +15,8 @@
 use percolator::MAX_ORACLE_PRICE;
 use percolator_prog::{
     constants::{
-        DEFAULT_MARK_EWMA_HALFLIFE_SLOTS, MAX_ORACLE_STALENESS_SECS, ORACLE_LEG_CAP,
-        ORACLE_MODE_HYBRID_AFTER_HOURS,
+        DEFAULT_MARK_EWMA_HALFLIFE_SLOTS, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+        MAX_ORACLE_STALENESS_SECS, ORACLE_LEG_CAP, ORACLE_MODE_HYBRID_AFTER_HOURS,
     },
     state::{validate_asset_oracle_profile, AssetOracleProfileV16},
 };
@@ -35,7 +35,8 @@ fn hybrid_profile(max_staleness_secs: u64) -> AssetOracleProfileV16 {
         backing_trade_fee_bps_short: 0,
         backing_trade_fee_insurance_share_bps_long: 0,
         backing_trade_fee_insurance_share_bps_short: 0,
-        _padding0: [0u8; 6],
+        effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+        _padding0: [0u8; 5],
         insurance_authority: [0u8; 32],
         insurance_operator: [0u8; 32],
         backing_bucket_authority: [0u8; 32],

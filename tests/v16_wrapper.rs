@@ -9,12 +9,12 @@ use percolator::{
 };
 use percolator_prog::{
     constants::{
-        ASSET_ORACLE_WRAPPER_LEN, DEFAULT_MARKET_SLOT_CAPACITY, HEADER_LEN, MARKET_ACCOUNT_LEN,
-        MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, ORACLE_LEG_CAP, ORACLE_LEG_FLAG_DIVIDE_LEG2,
-        ORACLE_LEG_FLAG_DIVIDE_LEG3, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
-        ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
-        PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN, PORTFOLIO_STATE_LEN,
-        WRAPPER_CONFIG_LEN,
+        ASSET_ORACLE_WRAPPER_LEN, DEFAULT_MARKET_SLOT_CAPACITY, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+        HEADER_LEN, MARKET_ACCOUNT_LEN, MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, ORACLE_LEG_CAP,
+        ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, ORACLE_MODE_AUTH_MARK,
+        ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL,
+        PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN,
+        PORTFOLIO_STATE_LEN, WRAPPER_CONFIG_LEN,
     },
     ix::Instruction,
     oracle_v16, policy_v16, processor,
@@ -9841,7 +9841,8 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         backing_trade_fee_bps_short: 0,
         backing_trade_fee_insurance_share_bps_long: 0,
         backing_trade_fee_insurance_share_bps_short: 0,
-        _padding0: [0u8; 6],
+        effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+        _padding0: [0u8; 5],
         insurance_authority: [1u8; 32],
         insurance_operator: [1u8; 32],
         backing_bucket_authority: [1u8; 32],
@@ -15062,22 +15063,40 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     );
     assert_eq!(
         expected_cranker_reward, 41,
-        "fixture assumption: 40% of the derived {expected_fee}-atom liquidation fee floors to a \
-         nonzero, easy-to-distinguish-from-the-remainder cranker reward"
+        "fixture assumption: 40% of the derived {expected_fee}-atom liquidation fee would have \
+         floored to a nonzero, easy-to-distinguish-from-the-remainder cranker reward -- this is \
+         the amount an attacker who moved the EWMA mark could have self-cranked away before the \
+         FIX below; it is deliberately still computed and printed in the assertions so the two \
+         numbers ({expected_fee} vs {expected_cranker_reward}) stay legible even though the split \
+         itself no longer happens"
     );
+    // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward provenance",
+    // Wave-1 subsystem #5): this fixture's PRICE MOVE is an admin-authenticated
+    // `push_base_ewma_mark`, not a trade -- but `liquidation_penalty_reclaimable_from_profile_view`
+    // treats EVERY EWMA_MARK-mode liquidation as never-reclaimable, unconditionally,
+    // regardless of whether THIS SPECIFIC mark update came from a push or a trade. That is
+    // a deliberate, byte-identical port of upstream's own baseline predicate
+    // (`profile_updates_mark_from_trade_view` is `true` for `profile_is_ewma_mark`
+    // unconditionally): an EWMA_MARK profile's mark can ALWAYS be moved by an ordinary
+    // trade too (see `v16_bpf_ewma_mark_liquidation_reward_never_reclaimable_by_self_cranked_attacker`
+    // in tests/v16_cu.rs), so the cranker-reward gate cannot distinguish "this particular
+    // mark move happened to be an admin push" from "an attacker's trade could have produced
+    // the identical state" -- and must therefore refuse to pay the reward for either. This
+    // fixture's old assumption (a real, nonzero cranker split on an EWMA_MARK liquidation)
+    // is exactly the self-dealing hole the fix closes; it is superseded here, not broken.
     assert_eq!(
-        cranker.capital, expected_cranker_reward,
-        "cranker reward is credited as Percolator account capital, floor(fee * cranker_share_bps \
-         / MAX_MARGIN_BPS) of the derived liquidation fee -- not more (would siphon insurance \
-         beyond the configured share) and not less (would starve the cranker incentive)"
+        cranker.capital, 0,
+        "FIX (ADOPT 01ec6161): an EWMA_MARK liquidation penalty must never be payable to the \
+         permissionless-crank reward portfolio -- the {expected_cranker_reward}-atom reward that \
+         would have been paid pre-fix must instead be zero"
     );
     assert_eq!(
         group.insurance,
-        insurance_before + expected_fee - expected_cranker_reward,
-        "1% liquidation fee on the landed notional is charged in full; the {cranker_share_bps}bps \
-         retained-fee share pays {expected_cranker_reward} to the cranker and the remainder stays \
-         in insurance -- not the whole fee (would mean the split was skipped) and not less than \
-         the remainder (would mean rounding is accumulating beyond the engine's guarantee)"
+        insurance_before + expected_fee,
+        "the full liquidation fee stays in insurance -- FIX (ADOPT 01ec6161) routes the entire \
+         retained fee through the domain-budget split with zero cranker reward, matching this \
+         wrapper's own no-cranker-account path, rather than skimming {cranker_share_bps}bps to a \
+         caller-supplied portfolio"
     );
     assert_eq!(
         group.vault, vault_before,
@@ -17893,7 +17912,8 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             backing_trade_fee_bps_short: 0,
             backing_trade_fee_insurance_share_bps_long: 0,
             backing_trade_fee_insurance_share_bps_short: 0,
-            _padding0: [0u8; 6],
+            effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+            _padding0: [0u8; 5],
             insurance_authority: admin.key.to_bytes(),
             insurance_operator: admin.key.to_bytes(),
             backing_bucket_authority: admin.key.to_bytes(),
@@ -18112,7 +18132,8 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             backing_trade_fee_bps_short: 0,
             backing_trade_fee_insurance_share_bps_long: 0,
             backing_trade_fee_insurance_share_bps_short: 0,
-            _padding0: [0u8; 6],
+            effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+            _padding0: [0u8; 5],
             insurance_authority: admin.key.to_bytes(),
             insurance_operator: admin.key.to_bytes(),
             backing_bucket_authority: admin.key.to_bytes(),
