@@ -8228,6 +8228,67 @@ fn v16_bpf_configure_hybrid_oracle_uses_authenticated_unix_time_not_caller_time(
     );
 }
 
+#[test]
+fn v16_bpf_composite_oracle_rounds_once_not_per_leg() {
+    // Regression for upstream percolator-prog b97a36f8 ("round composite oracle prices once").
+    //
+    // A 3-leg composite oracle with DIVIDE_LEG2 | DIVIDE_LEG3 computes leg0 / leg1 / leg2 in
+    // E6 units. The pre-fix implementation rounded at EACH intermediate leg via
+    // `compose(acc, leg, divide)` (integer division per leg), instead of carrying an exact
+    // rational through all legs and rounding once at the end. That per-leg truncation lets a
+    // multi-leg composite oracle accumulate a rounding-direction bias that an adversary
+    // controlling one leg's feed can steer.
+    //
+    // These three leg prices are chosen so the two strategies produce a DIFFERENT composed
+    // price:
+    //   per-leg (buggy):   floor(floor(p0*1e6/p1) * 1e6/p2)   = 47_618
+    //   round-once (fixed): floor(p0*1e12 / (p1*p2))          = 47_619
+    let mut env = V16CuEnv::new();
+    set_test_clock(&mut env, 1, 100);
+
+    let feeds = [[0xb1u8; 32], [0xb2u8; 32], [0xb3u8; 32]];
+    let p0: i64 = 1_000_000; // 1.000000
+    let p1: i64 = 3_000_001; // 3.000001
+    let p2: i64 = 7_000_001; // 7.000001
+    let leg0 = env.set_pyth_price(&feeds[0], p0, -6, 100);
+    let leg1 = env.set_pyth_price(&feeds[1], p1, -6, 100);
+    let leg2 = env.set_pyth_price(&feeds[2], p2, -6, 100);
+
+    env.try_configure_hybrid_with_cu(
+        3,
+        ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3,
+        feeds,
+        &[leg0, leg1, leg2],
+        1,
+        100,
+        0,
+        0,
+        3,
+    )
+    .expect("configure hybrid oracle");
+
+    let (cfg, _group) = env.market_state();
+
+    let per_leg_rounded = {
+        let acc1 = (p0 as u128 * 1_000_000) / p1 as u128;
+        (acc1 * 1_000_000) / p2 as u128
+    };
+    let round_once = (p0 as u128 * 1_000_000_000_000) / (p1 as u128 * p2 as u128);
+    assert_ne!(
+        per_leg_rounded, round_once,
+        "test vector must actually distinguish per-leg rounding from round-once rounding"
+    );
+
+    assert_eq!(
+        cfg.oracle_target_price_e6 as u128, round_once,
+        "composite oracle price must round once (exact rational), not per intermediate leg"
+    );
+    assert_ne!(
+        cfg.oracle_target_price_e6 as u128, per_leg_rounded,
+        "composite oracle price must NOT match the per-leg-rounded (biased) result"
+    );
+}
+
 fn set_test_clock(env: &mut V16CuEnv, slot: u64, unix_timestamp: i64) {
     env.svm.warp_to_slot(slot);
     let mut clock = env.svm.get_sysvar::<Clock>();

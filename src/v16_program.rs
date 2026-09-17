@@ -5760,22 +5760,6 @@ pub mod oracle_v16 {
         feeds[2] != [0u8; 32] && feeds[2] != feeds[0] && feeds[2] != feeds[1]
     }
 
-    fn leg_divides(config: &WrapperConfigV16, idx: usize) -> bool {
-        match idx {
-            1 => (config.oracle_leg_flags & ORACLE_LEG_FLAG_DIVIDE_LEG2) != 0,
-            2 => (config.oracle_leg_flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0,
-            _ => false,
-        }
-    }
-
-    fn profile_leg_divides(profile: &AssetOracleProfileV16, idx: usize) -> bool {
-        match idx {
-            1 => (profile.oracle_leg_flags & ORACLE_LEG_FLAG_DIVIDE_LEG2) != 0,
-            2 => (profile.oracle_leg_flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0,
-            _ => false,
-        }
-    }
-
     pub fn read_pyth_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
@@ -6016,48 +6000,85 @@ pub mod oracle_v16 {
         }
     }
 
-    fn apply_transform(raw_price: u64, invert: u8, unit_scale: u32) -> Result<u64, ProgramError> {
-        let mut price = raw_price;
-        // Guard zero BEFORE the invert divide: a multi-leg `compose` with a divide leg can floor the
-        // accumulator to 0, and `1e12 / 0` would panic. A zero price is always OracleInvalid anyway
-        // (the post-transform check below already rejects it), so this only converts the panic into
-        // the same graceful error — no valid behavior changes (valid oracle prices are nonzero).
-        if price == 0 {
+    // Compose the exact checked rational across all configured legs and round to E6 exactly
+    // once at the end, instead of truncating at each intermediate leg. Per-leg rounding lets a
+    // multi-leg (2-3 leg) composite oracle accumulate a rounding-direction bias across legs,
+    // which a manipulator can steer; carrying an exact numerator/denominator through and
+    // rounding once removes that accumulation. Ported from upstream percolator-prog b97a36f8
+    // ("round composite oracle prices once").
+    fn compose_price_e6(
+        prices_e6: &[u64],
+        flags: u8,
+        invert: u8,
+        unit_scale: u32,
+    ) -> Result<u64, ProgramError> {
+        if prices_e6.is_empty()
+            || prices_e6.len() > ORACLE_LEG_CAP
+            || invert > 1
+            || (flags & !ORACLE_LEG_FLAGS_MASK) != 0
+            || (prices_e6.len() == 1 && flags != 0)
+            || (prices_e6.len() == 2 && (flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0)
+        {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        if prices_e6
+            .iter()
+            .any(|price| *price == 0 || *price > percolator::MAX_ORACLE_PRICE)
+        {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        if invert != 0 {
-            price = (1_000_000_000_000u128 / price as u128)
-                .try_into()
-                .map_err(|_| PercolatorError::OracleInvalid)?;
-        }
-        if unit_scale > 1 {
-            price /= unit_scale as u64;
-        }
-        if price == 0 || price > percolator::MAX_ORACLE_PRICE {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-        Ok(price)
-    }
 
-    fn compose(acc_e6: u64, leg_e6: u64, divide: bool) -> Result<u64, ProgramError> {
-        if leg_e6 == 0 {
+        // Keep the exact checked rational through all configured legs. At the three-leg cap,
+        // MAX_ORACLE_PRICE-bounded products fit in u128.
+        let mut numerator = prices_e6[0] as u128;
+        let mut denominator = 1u128;
+        let mut i = 1usize;
+        while i < prices_e6.len() {
+            let divides = match i {
+                1 => (flags & ORACLE_LEG_FLAG_DIVIDE_LEG2) != 0,
+                2 => (flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0,
+                _ => false,
+            };
+            if divides {
+                numerator = numerator
+                    .checked_mul(1_000_000)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                denominator = denominator
+                    .checked_mul(prices_e6[i] as u128)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            } else {
+                numerator = numerator
+                    .checked_mul(prices_e6[i] as u128)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                denominator = denominator
+                    .checked_mul(1_000_000)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+
+            // Preserve the old per-leg range gate without feeding its rounded value into the next
+            // leg. Only the final quotient becomes the published E6 price.
+            let intermediate = numerator / denominator;
+            if intermediate == 0 || intermediate > percolator::MAX_ORACLE_PRICE as u128 {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            i += 1;
+        }
+
+        if invert != 0 {
+            let inverted_numerator = denominator
+                .checked_mul(1_000_000_000_000)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            denominator = numerator;
+            numerator = inverted_numerator;
+        }
+        let mut price = numerator / denominator;
+        if unit_scale > 1 {
+            price /= unit_scale as u128;
+        }
+        if price == 0 || price > percolator::MAX_ORACLE_PRICE as u128 {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        let next = if divide {
-            (acc_e6 as u128)
-                .checked_mul(1_000_000)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                / leg_e6 as u128
-        } else {
-            (acc_e6 as u128)
-                .checked_mul(leg_e6 as u128)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                / 1_000_000
-        };
-        if next == 0 || next > percolator::MAX_ORACLE_PRICE as u128 {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-        Ok(next as u64)
+        Ok(price as u64)
     }
 
     pub fn read_external_price_e6(
@@ -6079,7 +6100,7 @@ pub mod oracle_v16 {
         ) {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        let mut acc = 0u64;
+        let mut prices = [0u64; ORACLE_LEG_CAP];
         let mut advanced = false;
         let mut max_publish_time = i64::MIN;
         let mut i = 0usize;
@@ -6107,15 +6128,16 @@ pub mod oracle_v16 {
                 advanced = true;
             }
             max_publish_time = core::cmp::max(max_publish_time, publish_time);
-            acc = if i == 0 {
-                price
-            } else {
-                compose(acc, price, leg_divides(config, i))?
-            };
+            prices[i] = price;
             i += 1;
         }
         Ok((
-            apply_transform(acc, config.invert, config.unit_scale)?,
+            compose_price_e6(
+                &prices[..count],
+                config.oracle_leg_flags,
+                config.invert,
+                config.unit_scale,
+            )?,
             max_publish_time,
             advanced,
         ))
@@ -6140,7 +6162,7 @@ pub mod oracle_v16 {
         ) {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        let mut acc = 0u64;
+        let mut prices = [0u64; ORACLE_LEG_CAP];
         let mut advanced = false;
         let mut max_publish_time = i64::MIN;
         let mut i = 0usize;
@@ -6168,15 +6190,16 @@ pub mod oracle_v16 {
                 advanced = true;
             }
             max_publish_time = core::cmp::max(max_publish_time, publish_time);
-            acc = if i == 0 {
-                price
-            } else {
-                compose(acc, price, profile_leg_divides(profile, i))?
-            };
+            prices[i] = price;
             i += 1;
         }
         Ok((
-            apply_transform(acc, profile.invert, profile.unit_scale)?,
+            compose_price_e6(
+                &prices[..count],
+                profile.oracle_leg_flags,
+                profile.invert,
+                profile.unit_scale,
+            )?,
             max_publish_time,
             advanced,
         ))
