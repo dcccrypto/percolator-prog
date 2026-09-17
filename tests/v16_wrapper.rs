@@ -5448,7 +5448,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -5464,7 +5464,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -5480,7 +5480,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
             asset_index: 2,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 250,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -10091,7 +10091,7 @@ fn v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_orac
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -10175,7 +10175,7 @@ fn v16_wrapper_auth_mark_trade_cannot_update_authority_mark() {
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -12870,7 +12870,7 @@ fn v16_wrapper_hybrid_fresh_crank_tracks_external_composite_then_after_hours_tra
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -12962,7 +12962,7 @@ fn v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_ora
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -13063,7 +13063,7 @@ fn v16_wrapper_hybrid_after_hours_downward_mark_moves_effective_price() {
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -13186,7 +13186,7 @@ fn v16_wrapper_hybrid_after_hours_fee_floor_scales_with_next_crank_segment_budge
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -13277,7 +13277,7 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: initial_price,
-            fee_bps: 0,
+            fee_bps: 1,
         },
         &mut [
             &mut long_owner,
@@ -13386,7 +13386,7 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
-            fee_bps: 0,
+            fee_bps: 100,
         },
         &mut [
             &mut long_owner,
@@ -13401,8 +13401,10 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
     let (_, group) = state::read_market(&market.data).unwrap();
     assert_eq!(
         group.insurance, 10,
-        "W1 (fee-on-mark): zero caller fee still pays the 100 bps base fee, billed on the mark (100) \
-         not exec_price (150) — notional=1000 @ 100bps = 10 (taker-only, one side)"
+        "W1 (fee-on-mark): a caller consenting to (>=) the 100 bps base fee pays it, billed on \
+         the mark (100) not exec_price (150) — notional=1000 @ 100bps = 10 (taker-only, one \
+         side). Security fix (upstream 93dd8719/7f319c6b): a caller signing BELOW the live base \
+         fee is now REJECTED rather than silently floored up to it without consent."
     );
 }
 
@@ -13912,7 +13914,7 @@ fn v16_wrapper_tradecpi_hybrid_regular_and_after_hours_follow_mark_policy() {
         size_q as i128,
         size_q as i128,
         regular_exec_price,
-        0,
+        1,
         0,
     )
     .unwrap();
@@ -13961,7 +13963,7 @@ fn v16_wrapper_tradecpi_hybrid_regular_and_after_hours_follow_mark_policy() {
         size_q as i128,
         size_q as i128,
         stale_exec_price,
-        0,
+        1,
         0,
     )
     .unwrap();
@@ -14043,7 +14045,7 @@ fn v16_wrapper_tradecpi_ewma_mark_trade_moves_mark_without_refreshing_liveness()
         size_q as i128,
         size_q as i128,
         exec_price,
-        0,
+        1,
         0,
     )
     .unwrap();

@@ -8745,10 +8745,18 @@ pub mod processor {
         if account_a_ai.key == account_b_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let (_cfg_pre, mode_pre, max_market_slots, _) =
+        let (cfg_pre, mode_pre, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
+        }
+        // Both owners sign every leg. Treat that value as their ceiling for the mutable base-fee
+        // policy so a retained transaction cannot be charged a fee floor installed after signing.
+        if legs
+            .iter()
+            .any(|leg| cfg_pre.trade_fee_base_bps > leg.fee_bps)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
         }
         handle_batch_execute_zero_copy(
             program_id,
@@ -9071,10 +9079,15 @@ pub mod processor {
         if account_a_ai.key == account_b_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let (_cfg_pre, mode_pre, max_market_slots, _) =
+        let (cfg_pre, mode_pre, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
+        }
+        // Both owners sign `fee_bps`; a later policy update cannot increase either owner's base
+        // fee. Dynamic mark-movement fees remain derived by the shared trade path.
+        if cfg_pre.trade_fee_base_bps > fee_bps {
+            return Err(PercolatorError::InvalidInstruction.into());
         }
         handle_trade_nocpi_zero_copy(
             program_id,
@@ -9452,6 +9465,10 @@ pub mod processor {
         );
         if stale_matured {
             return Err(PercolatorError::OracleStale.into());
+        }
+        // The taker signs fee_bps independently of the LP's matcher capability cap.
+        if cfg_pre.trade_fee_base_bps > fee_bps {
+            return Err(PercolatorError::InvalidInstruction.into());
         }
         let fee_floor_pre = core::cmp::max(fee_bps, cfg_pre.trade_fee_base_bps);
         if fee_floor_pre > max_trading_fee_bps {

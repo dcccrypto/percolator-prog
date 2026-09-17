@@ -4457,6 +4457,168 @@ fn v16_bpf_tradenocpi_fee_is_billed_on_mark_not_exec_price() {
 }
 
 #[test]
+fn v16_attack_batch_trade_nocpi_requires_signed_base_fee_consent() {
+    // Security regression (adopts upstream 93dd8719's second call site,
+    // `handle_batch_trade_nocpi`): same consent bug as the single-trade bilateral path, but for
+    // BatchTradeNoCpi's per-leg `fee_bps`. Any leg whose signed fee_bps is below the live
+    // trade_fee_base_bps must reject the WHOLE batch, not silently clamp that leg's charge up.
+    let mut env = V16CuEnv::new();
+    env.update_trade_fee_policy_with_cu(500); // config base fee = 5%
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let ta = env.create_portfolio(&taker);
+    let la = env.create_portfolio(&lp);
+    env.deposit(&taker, ta, 1_000_000);
+    env.deposit(&lp, la, 1_000_000);
+    let ins0 = env.market_state().1.insurance;
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let ta_before = env.svm.get_account(&ta).unwrap();
+    let la_before = env.svm.get_account(&la).unwrap();
+
+    env.svm.expire_blockhash();
+    let batch = env.send(
+        ProgInstruction::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: POS_SCALE as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }],
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(ta, false),
+            AccountMeta::new(la, false),
+        ],
+        &[&taker, &lp],
+    );
+    assert!(
+        batch.is_err(),
+        "a leg signed below the live trade_fee_base_bps must reject the whole batch, not \
+         silently overcharge to the new floor: {batch:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected batch must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&ta).unwrap(),
+        ta_before,
+        "a rejected batch must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&la).unwrap(),
+        la_before,
+        "a rejected batch must not mutate the LP's portfolio"
+    );
+
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: POS_SCALE as i128,
+                exec_price: 100,
+                fee_bps: 500,
+            }],
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(ta, false),
+            AccountMeta::new(la, false),
+        ],
+        &[&taker, &lp],
+    )
+    .expect("batch trade at the consented base fee");
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a leg that signs at least the configured base fee must still be charged; \
+         insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the consented base-fee batch"
+    );
+}
+
+#[test]
+fn v16_attack_trade_nocpi_requires_signed_base_fee_consent() {
+    // Security regression (adopts upstream 93dd8719 "bind bilateral trades to live base fee
+    // consent"): a bilateral TradeNoCpi's `fee_bps` is what BOTH owners sign. Before this fix,
+    // handle_trade_nocpi/handle_batch_trade_nocpi read `cfg_pre.trade_fee_base_bps` but never
+    // compared it against the signed `fee_bps`; the shared settlement path
+    // (`hybrid_trade_fee_bps_view`) then computed `base = max(caller_fee_bps,
+    // cfg.trade_fee_base_bps)`, silently CLAMPING the charge up to whatever the market
+    // authority had raised trade_fee_base_bps to between signing and landing. That let an
+    // authority overcharge a taker beyond consent just by racing UpdateTradeFeePolicy ahead of
+    // a stale-but-still-valid signed trade. The fix REJECTS instead of clamping: if
+    // `cfg_pre.trade_fee_base_bps > fee_bps`, the trade must fail.
+    let mut env = V16CuEnv::new();
+    env.update_trade_fee_policy_with_cu(500); // config base fee = 5%
+    let la = Keypair::new();
+    let lb = Keypair::new();
+    let pa = env.create_portfolio(&la);
+    let pb = env.create_portfolio(&lb);
+    env.deposit(&la, pa, 1_000_000);
+    env.deposit(&lb, pb, 1_000_000);
+    let ins0 = env.market_state().1.insurance;
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let a_before = env.svm.get_account(&pa).unwrap();
+    let b_before = env.svm.get_account(&pb).unwrap();
+
+    // Taker signed fee_bps=0 (below the live base of 500) -- must be REJECTED, not silently
+    // floored up to 500 and charged without consent.
+    env.svm.expire_blockhash();
+    let r = env.try_trade_asset_with_cu(0, &la, pa, &lb, pb, POS_SCALE as i128, 100, 0);
+    assert!(
+        r.is_err(),
+        "fee_bps below the live trade_fee_base_bps must reject rather than silently \
+         overcharge to the new floor: {r:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected trade must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&pa).unwrap(),
+        a_before,
+        "a rejected trade must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&pb).unwrap(),
+        b_before,
+        "a rejected trade must not mutate the maker's portfolio"
+    );
+
+    // Signing at (or above) the live base fee is accepted and charges normally.
+    env.svm.expire_blockhash();
+    env.trade_asset_with_cu(0, &la, pa, &lb, pb, POS_SCALE as i128, 100, 500);
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a trade that signs at least the configured base fee must still be charged; \
+         insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the consented base-fee trade"
+    );
+}
+
+#[test]
 fn v16_bpf_tradenocpi_rejects_invalid_final_market_shape() {
     let mut env = V16CuEnv::new();
     let long_owner = Keypair::new();
@@ -6072,6 +6234,102 @@ fn v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded() {
         "matcher must echo the requested asset index in the v3 return slot"
     );
     assert_eq!(group.c_tot + group.insurance, group.vault);
+}
+
+#[test]
+fn v16_attack_trade_cpi_requires_signed_base_fee_consent() {
+    // Security regression (adopts upstream 7f319c6b "enforce retained single-CPI taker
+    // base-fee consent"): TradeCpi's `fee_bps` is what the taker signs; the LP's matcher
+    // capability cap is a separate, independent bound. Before this fix, `handle_trade_cpi`
+    // read `cfg_pre.trade_fee_base_bps` and fed it straight into
+    // `fee_floor_pre = max(fee_bps, cfg_pre.trade_fee_base_bps)`, silently clamping the
+    // taker's charge up to whatever the market authority had raised trade_fee_base_bps to
+    // between signing and landing -- the same consent-violation bug as the no-CPI path, but
+    // reachable through the matcher-CPI route. The fix REJECTS instead of clamping.
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    env.update_trade_fee_policy_with_cu(500); // config base fee = 5%
+
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let maker_account = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker_account, 1_000_000);
+    env.deposit(&maker_owner, maker_account, 1_000_000);
+
+    let (matcher_ctx, matcher_delegate, _) =
+        env.init_matcher_context(&maker_owner, matcher_program, maker_account);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let maker_before = env.svm.get_account(&maker_account).unwrap();
+
+    // Taker signed fee_bps=0 (below the live base of 500) -- must be REJECTED, not silently
+    // floored up to 500 by the matcher-CPI path either.
+    env.svm.expire_blockhash();
+    let r = env.try_trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        (10 * POS_SCALE) as i128,
+        0,
+    );
+    assert!(
+        r.is_err(),
+        "TradeCpi fee_bps below the live trade_fee_base_bps must reject rather than silently \
+         overcharge to the new floor: {r:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected TradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected TradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&maker_account).unwrap(),
+        maker_before,
+        "a rejected TradeCpi must not mutate the maker's portfolio"
+    );
+
+    // Signing at (or above) the live base fee is accepted and charges normally.
+    let ins0 = env.market_state().1.insurance;
+    env.svm.expire_blockhash();
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        (10 * POS_SCALE) as i128,
+        500,
+    );
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a TradeCpi that signs at least the configured base fee must still be charged; \
+         insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the consented base-fee TradeCpi"
+    );
 }
 
 #[test]
