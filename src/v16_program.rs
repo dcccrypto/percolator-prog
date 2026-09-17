@@ -8794,6 +8794,10 @@ pub mod processor {
                     )
                     .map_err(map_v16_error)?
             };
+            // FIX (ADOPT upstream 3496acf0, "enforce side OI caps"): checked immediately
+            // after the engine mutates OI on this trade, before any other post-trade
+            // check, so an over-cap post-state aborts the instruction.
+            ensure_trade_side_oi_cap_view(&group, asset_index as usize)?;
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
             // counterparty-backed liens need this landing-time check; insurance-backed liens
@@ -9307,6 +9311,13 @@ pub mod processor {
                     true,
                 )
                 .map_err(map_v16_error)?;
+            // FIX (ADOPT upstream 3496acf0, "enforce side OI caps"): checked per-leg
+            // immediately after the engine mutates OI on this batch, before any other
+            // post-trade check, so an over-cap post-state on ANY leg's asset aborts the
+            // whole batch atomically.
+            for request in &requests {
+                ensure_trade_side_oi_cap_view(&group, request.asset_index)?;
+            }
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
             // counterparty-backed liens need this landing-time check; insurance-backed liens
@@ -19999,6 +20010,35 @@ pub mod processor {
             cpi_requests,
         )?;
         ensure_trade_portfolios_current_for_requests_view(&group, &account_a, &account_b, &requests)
+    }
+
+    // FIX (ADOPT upstream 3496acf0, "enforce side OI caps with generated public
+    // conformance" -- Wave-1 Track-A). The engine's `validate_asset_shape_for_view`
+    // asserts `oi_eff_long_q`/`oi_eff_short_q` against `MAX_OI_SIDE_Q`, but that
+    // shape check is `#[cfg(any(test, kani, feature = "audit-scan"))]` -- it never
+    // runs on a production (target_os = "solana") build. Without a wrapper-side
+    // runtime check, a production trade or batch-trade that pushes a side's
+    // effective OI past the cap is silently admitted. This re-checks the SAME
+    // existing engine state (no new field, no ABI/wire change) immediately after
+    // the engine mutates it, so an over-cap post-state aborts the whole
+    // instruction atomically.
+    fn ensure_trade_side_oi_cap_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> ProgramResult {
+        let asset = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::EngineInvalidLeg)?
+            .engine
+            .asset;
+        // Enforce the aggregate post-state bound for both attachments and resizes.
+        if asset.oi_eff_long_q.get() > percolator::MAX_OI_SIDE_Q
+            || asset.oi_eff_short_q.get() > percolator::MAX_OI_SIDE_Q
+        {
+            return Err(PercolatorError::EngineInvalidLeg.into());
+        }
+        Ok(())
     }
 
     fn ensure_trade_portfolios_current_for_requests_view(

@@ -4691,6 +4691,152 @@ fn v16_bpf_tradenocpi_rejects_invalid_final_market_shape() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// ADOPT upstream 3496acf0 ("enforce side OI caps with generated public
+// conformance", Wave-1 Track-A unit A-3496acf0). The engine's own
+// `MAX_OI_SIDE_Q` bound (`validate_asset_shape_for_view`,
+// `percolator src/v16.rs:8551`) is `#[cfg(any(test, kani, feature =
+// "audit-scan"))]` -- it never runs inside the deployed production BPF
+// program (this V16CuEnv harness loads the prebuilt .so, so this test
+// exercises exactly that production path). Before this fix, a trade whose
+// post-state pushed a side's effective OI past `MAX_OI_SIDE_Q` was silently
+// admitted on-chain. `ensure_trade_side_oi_cap_view` re-checks the SAME
+// existing `oi_eff_long_q`/`oi_eff_short_q` engine fields in the wrapper
+// immediately after the trade executes -- no new field, no ABI/wire change.
+// ---------------------------------------------------------------------------
+#[test]
+fn v16_bpf_tradenocpi_rejects_trade_exceeding_side_oi_cap() {
+    let mut env = V16CuEnv::new();
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    env.deposit(&short_owner, short_account, 1_000_000);
+
+    // Doctor asset 0's pre-existing side OI to sit exactly AT the cap (not
+    // over it) -- any further increase on either side must now be refused.
+    env.mutate_market(|_, group| {
+        group.assets[0].oi_eff_long_q = percolator::MAX_OI_SIDE_Q;
+        group.assets[0].oi_eff_short_q = percolator::MAX_OI_SIDE_Q;
+    });
+    let before_market = env.svm.get_account(&env.market).unwrap().data;
+    let before_long = env.svm.get_account(&long_account).unwrap().data;
+    let before_short = env.svm.get_account(&short_account).unwrap().data;
+
+    // A fresh 2-unit open between two flat accounts increases BOTH
+    // oi_eff_long_q and oi_eff_short_q by 2*POS_SCALE (see
+    // v16_bpf_tradenocpi_fresh_open_on_base_and_added_asset_is_bounded /
+    // multi-asset OI assertions elsewhere in this file for the same
+    // fresh-open-adds-full-quantity behavior), pushing the already-at-cap
+    // asset 1 unit over MAX_OI_SIDE_Q on both sides.
+    let result = env.try_trade_asset_with_cu(
+        0,
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (2 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+
+    let msg = result.expect_err(
+        "TradeNoCpi must reject a trade whose post-state pushes a side's effective OI \
+         past MAX_OI_SIDE_Q (side OI cap must be enforced in production, not just in \
+         test/kani/audit-scan builds)",
+    );
+    assert!(
+        msg.contains("Custom(18)"),
+        "expected EngineInvalidLeg (Custom(18)) from the side-OI-cap check, got: {msg}"
+    );
+
+    // And it must be a true refusal, not a partial write.
+    let after_market = env.svm.get_account(&env.market).unwrap().data;
+    let after_long = env.svm.get_account(&long_account).unwrap().data;
+    let after_short = env.svm.get_account(&short_account).unwrap().data;
+    assert_eq!(
+        after_market, before_market,
+        "rejected over-cap trade must roll back market data"
+    );
+    assert_eq!(
+        after_long, before_long,
+        "rejected over-cap trade must roll back the long portfolio"
+    );
+    assert_eq!(
+        after_short, before_short,
+        "rejected over-cap trade must roll back the short portfolio"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADOPT upstream 3496acf0, batch path. `BatchTradeNoCpi` checks the side OI
+// cap per-leg (`for request in &requests { ensure_trade_side_oi_cap_view(...) }`)
+// so an over-cap post-state on ANY leg's asset aborts the whole batch.
+// ---------------------------------------------------------------------------
+#[test]
+fn v16_bpf_batchtradenocpi_rejects_trade_exceeding_side_oi_cap() {
+    let mut env = V16CuEnv::new();
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let ta = env.create_portfolio(&taker);
+    let la = env.create_portfolio(&lp);
+    env.deposit(&taker, ta, 1_000_000);
+    env.deposit(&lp, la, 1_000_000);
+
+    // Doctor asset 0's pre-existing side OI to sit exactly AT the cap.
+    env.mutate_market(|_, group| {
+        group.assets[0].oi_eff_long_q = percolator::MAX_OI_SIDE_Q;
+        group.assets[0].oi_eff_short_q = percolator::MAX_OI_SIDE_Q;
+    });
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let ta_before = env.svm.get_account(&ta).unwrap();
+    let la_before = env.svm.get_account(&la).unwrap();
+
+    let result = env.send(
+        ProgInstruction::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: (2 * POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }],
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(ta, false),
+            AccountMeta::new(la, false),
+        ],
+        &[&taker, &lp],
+    );
+
+    let msg = result.expect_err(
+        "BatchTradeNoCpi must reject a batch whose post-state pushes a leg's side OI \
+         past MAX_OI_SIDE_Q",
+    );
+    assert!(
+        msg.contains("Custom(18)"),
+        "expected EngineInvalidLeg (Custom(18)) from the side-OI-cap check, got: {msg}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "rejected over-cap batch must roll back market data"
+    );
+    assert_eq!(
+        env.svm.get_account(&ta).unwrap(),
+        ta_before,
+        "rejected over-cap batch must roll back the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&la).unwrap(),
+        la_before,
+        "rejected over-cap batch must roll back the LP's portfolio"
+    );
+}
+
 #[test]
 fn v16_bpf_tradenocpi_fresh_open_on_base_and_added_asset_is_bounded() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 1_000, 1_000, 500);
