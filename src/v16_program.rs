@@ -150,6 +150,15 @@ pub mod constants {
     // usable through separate portfolios.
     pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 14;
 
+    // Sync unit w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`, "reserve latent domains of
+    // surviving positions at admission"): the wrapper's own self-imposed cap on how many
+    // distinct `source_domains` slots one trade-admission pass is allowed to newly reserve
+    // across BOTH accounts touched by the trade/batch. Deliberately tighter than the
+    // engine's hard `PORTFOLIO_SOURCE_DOMAIN_CAP` (32) array bound -- this is a wrapper
+    // liveness guard, not the engine's own overflow backstop. Byte-identical value to
+    // upstream's `WRAPPER_MAX_PORTFOLIO_ASSETS * 2` (14 * 2 = 28 on both forks).
+    pub const WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS: usize = WRAPPER_MAX_PORTFOLIO_ASSETS as usize * 2;
+
     // ── Protocol-fee program change ─────────────────────────────────────
     // See ~/v17/PROTOCOL-FEE-DESIGN.md §0/§2. `PROTOCOL_FEE_BPS` is the
     // rate applied via `fee_share_floor` to 100% of every trade-fee credit
@@ -8422,6 +8431,12 @@ pub mod processor {
             } else {
                 size_q.unsigned_abs()
             };
+            // w1-s3: current signed position on the traded asset, needed below to decide
+            // whether this trade's delta can newly touch a source domain.
+            let account_a_position =
+                signed_position_for_asset_view(&group, &account_a, asset_index as usize)?;
+            let account_b_position =
+                signed_position_for_asset_view(&group, &account_b, asset_index as usize)?;
             // F-TRADENOCPI-FEE: the position enters/settles at the asset mark (effective_price), NOT at
             // the caller-supplied exec_price. The engine uses request.exec_price ONLY as the fee notional
             // basis (fee = size_q*exec_price/POS_SCALE * fee_bps), so without pinning it two cooperating
@@ -8460,6 +8475,41 @@ pub mod processor {
                 &account_b,
                 core::slice::from_ref(&req),
             )?;
+            // w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`): reserve latent domains of surviving,
+            // untouched legs before the engine's own trade-application primitive runs, so this
+            // trade cannot fill either account's source-domain table and starve a sibling leg's
+            // later liquidation/ADL/force-close of the slot it will need. Only pays the O(active
+            // legs) snapshot cost when this trade's own delta could newly touch a domain.
+            let account_a_needs_source_capacity =
+                trade_delta_may_require_source_domain_capacity(account_a_position, size_q)?;
+            let account_b_needs_source_capacity =
+                trade_delta_may_require_source_domain_capacity(account_b_position, -size_q)?;
+            if account_a_needs_source_capacity || account_b_needs_source_capacity {
+                let mut admitted_source_domains_a = reserved_source_domains_snapshot_for_trade_view(
+                    &group,
+                    &account_a,
+                    core::slice::from_ref(&req),
+                    size_q < 0,
+                )?;
+                let mut admitted_source_domains_b = reserved_source_domains_snapshot_for_trade_view(
+                    &group,
+                    &account_b,
+                    core::slice::from_ref(&req),
+                    size_q > 0,
+                )?;
+                ensure_trade_delta_source_domain_capacity_view(
+                    &mut admitted_source_domains_a,
+                    asset_index as usize,
+                    account_a_position,
+                    size_q,
+                )?;
+                ensure_trade_delta_source_domain_capacity_view(
+                    &mut admitted_source_domains_b,
+                    asset_index as usize,
+                    account_b_position,
+                    -size_q,
+                )?;
+            }
             let backing_before = if cfg.backing_trade_fee_policy_count == 0 {
                 None
             } else {
@@ -8632,6 +8682,18 @@ pub mod processor {
                 source_lien_after_a.as_ref(),
                 source_lien_before_b.as_ref(),
                 source_lien_after_b.as_ref(),
+            )?;
+            // w1-s3: independent post-hoc backstop -- the trade that just ran must not leave
+            // either account occupying more source-domain slots than the wrapper's own bound
+            // allows, regardless of whether the pre-trade admission check above already covered
+            // the reason why (defense in depth, not a substitute for it).
+            ensure_source_domain_growth_within_wrapper_bound(
+                source_lien_before_a.len(),
+                source_lien_after_a.len(),
+            )?;
+            ensure_source_domain_growth_within_wrapper_bound(
+                source_lien_before_b.len(),
+                source_lien_after_b.len(),
             )?;
         }
         if let Some(cfg) = cfg_after {
@@ -8815,11 +8877,18 @@ pub mod processor {
             // once, because the aggregate bound `batch_fee_charge_within_owed` needs the fee
             // the batch owes BEFORE the engine's aggregates are inspected. The post-pass reads
             // the cached value, so `batch_leg_fee` still runs exactly once per leg.
-            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u128)> =
+            // w1-s3: two trailing `i128` fields carry each leg's PRE-trade signed position on
+            // both accounts (account_a's, account_b's), needed by the source-domain admission
+            // gate below without re-reading the legs a second time.
+            let mut leg_ctx: Vec<(usize, state::AssetOracleProfileV16, u64, u128, i128, i128)> =
                 Vec::with_capacity(legs.len());
             // The fee this batch owes in total, reconstructed leg by leg. This is the ceiling
             // the engine's two aggregates must respect (see `batch_fee_charge_within_owed`).
             let mut fee_owed_total: u128 = 0;
+            // w1-s3: whether ANY leg in this batch could newly touch a source domain on either
+            // account -- gates whether the O(active legs) admission snapshot below is built at
+            // all.
+            let mut needs_source_domain_capacity = false;
             for leg in legs {
                 let asset_index = leg.asset_index as usize;
                 if requests.iter().any(|r| r.asset_index == asset_index) {
@@ -8859,11 +8928,64 @@ pub mod processor {
                 fee_owed_total = fee_owed_total
                     .checked_add(fee_leg)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                leg_ctx.push((asset_index, oracle_profile, leg.exec_price, fee_leg));
+                // w1-s3: this leg's PRE-trade signed position on each account, and whether its
+                // signed delta could newly touch either account's source-domain table.
+                let account_a_position =
+                    signed_position_for_asset_view(&group, &account_a, asset_index)?;
+                let account_b_position =
+                    signed_position_for_asset_view(&group, &account_b, asset_index)?;
+                needs_source_domain_capacity |= trade_delta_may_require_source_domain_capacity(
+                    account_a_position,
+                    leg.size_q,
+                )? || trade_delta_may_require_source_domain_capacity(
+                    account_b_position,
+                    -leg.size_q,
+                )?;
+                leg_ctx.push((
+                    asset_index,
+                    oracle_profile,
+                    leg.exec_price,
+                    fee_leg,
+                    account_a_position,
+                    account_b_position,
+                ));
             }
             ensure_trade_portfolios_current_for_requests_view(
                 &group, &account_a, &account_b, &requests,
             )?;
+            // w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`): reserve latent domains of surviving,
+            // untouched legs before the engine's own batch-application primitive runs, using the
+            // WHOLE leg request set so a leg that fully closes within this same batch correctly
+            // releases its latent pair while a leg only touched (not closed) keeps both reserved
+            // -- a per-leg-in-isolation check cannot make that distinction within one batch.
+            if needs_source_domain_capacity {
+                let mut admitted_source_domains_a = reserved_source_domains_snapshot_for_trade_view(
+                    &group, &account_a, &requests, false,
+                )?;
+                let mut admitted_source_domains_b = reserved_source_domains_snapshot_for_trade_view(
+                    &group, &account_b, &requests, true,
+                )?;
+                for (asset_index, _oracle_profile, _reported_price, _fee_leg, account_a_position, account_b_position) in
+                    leg_ctx.iter()
+                {
+                    let request = requests
+                        .iter()
+                        .find(|request| request.asset_index == *asset_index)
+                        .ok_or(PercolatorError::InvalidInstruction)?;
+                    ensure_trade_delta_source_domain_capacity_view(
+                        &mut admitted_source_domains_a,
+                        *asset_index,
+                        *account_a_position,
+                        request.size_q,
+                    )?;
+                    ensure_trade_delta_source_domain_capacity_view(
+                        &mut admitted_source_domains_b,
+                        *asset_index,
+                        *account_b_position,
+                        -request.size_q,
+                    )?;
+                }
+            }
 
             let source_lien_before_a =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
@@ -8918,7 +9040,9 @@ pub mod processor {
             let mut lp_cut_running_total: u128 = 0;
             let mut insurance_cut_running_total: u128 = 0;
             let mut creator_cut_running_total: u128 = 0;
-            for (asset_index, oracle_profile, reported_price, fee_leg) in leg_ctx.iter_mut() {
+            for (asset_index, oracle_profile, reported_price, fee_leg, _account_a_position, _account_b_position) in
+                leg_ctx.iter_mut()
+            {
                 let fee_leg = *fee_leg;
                 if fee_leg != 0 {
                     let split_leg = policy_v16::split_trade_fee(
@@ -9038,6 +9162,15 @@ pub mod processor {
                 source_lien_after_a.as_ref(),
                 source_lien_before_b.as_ref(),
                 source_lien_after_b.as_ref(),
+            )?;
+            // w1-s3: independent post-hoc backstop, mirroring the single-trade site.
+            ensure_source_domain_growth_within_wrapper_bound(
+                source_lien_before_a.len(),
+                source_lien_after_a.len(),
+            )?;
+            ensure_source_domain_growth_within_wrapper_bound(
+                source_lien_before_b.len(),
+                source_lien_after_b.len(),
             )?;
         }
         if let Some(cfg) = cfg_after {
@@ -9198,6 +9331,163 @@ pub mod processor {
         }
         Ok(out.into_boxed_slice())
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Sync unit w1-s3 (upstream `cf0ce5d3` + `7a3a6f30`, "reserve latent domains of surviving
+    // positions at admission"): the engine's own `source_domain_slot_or_insert` is a hard
+    // fail-closed backstop (`V16Error::LockActive`) if a portfolio tries to claim a
+    // `source_domains` slot beyond its fixed `PORTFOLIO_SOURCE_DOMAIN_CAP` array, so an
+    // over-full table always reverts atomically, with or without this gate. What this gate buys
+    // is correctness of *when* and *for whom* that revert happens: without it, an admission
+    // check that only asks "does *this* trade's delta need a new domain slot?" can admit a
+    // trade that fills the account's slot table with domains for the legs it touches, while
+    // failing to reserve the LATENT (currently-unoccupied) domain of *other*, untouched, still-
+    // open legs on the same portfolio. Those other legs may later need that latent domain (flip
+    // side, force-close, ADL, backing-expiry crank) and by then the table can be full, so *that*
+    // liveness-critical operation is the one that hits `LockActive`, not the trade that actually
+    // caused the exhaustion. Wrapper-local, zero engine change, zero wire/ABI change (operates
+    // entirely on the already-shared `PortfolioAccountV16Account.source_domains` array). Worst-
+    // case regression from a botched port is an over-eager reject on a legitimate trade (a
+    // liveness regression, not a fund-safety issue) -- the engine's own hard backstop is
+    // unchanged either way. See ABI_LANDMINE_REGISTRY.md: this struct/const are fresh names,
+    // zero collisions with any tracked wrapper struct.
+    struct SourceDomainAdmissionSnapshot {
+        domains: [u32; percolator::PORTFOLIO_SOURCE_DOMAIN_CAP],
+        len: usize,
+    }
+
+    impl SourceDomainAdmissionSnapshot {
+        fn contains(&self, domain: u32) -> bool {
+            let mut i = 0usize;
+            while i < self.len {
+                if self.domains[i] == domain {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+
+        fn push_reserved(&mut self, domain: u32) -> ProgramResult {
+            if self.contains(domain) {
+                return Ok(());
+            }
+            if self.len >= constants::WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            if self.len >= self.domains.len() {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            self.domains[self.len] = domain;
+            self.len += 1;
+            Ok(())
+        }
+    }
+
+    /// Builds the admission snapshot for one account ahead of a trade/batch: every domain the
+    /// account already OCCUPIES, plus -- for every OTHER active leg not being fully closed by
+    /// this trade's own request set -- BOTH of that leg's (long, short) domains, reserved as
+    /// latent even though the leg currently occupies only one. `requests` is the full leg
+    /// request set for this instruction (one element for a single trade, N for a batch);
+    /// `invert_requests` flips the sign of each request's `size_q` before comparing it to the
+    /// account's current signed position, since a single-trade request is expressed relative to
+    /// account_a and must be negated to evaluate account_b's side of the same trade.
+    fn reserved_source_domains_snapshot_for_trade_view(
+        group: &state::MarketViewMutV16<'_>,
+        account: &percolator::PortfolioV16ViewMut<'_>,
+        requests: &[TradeRequestV16],
+        invert_requests: bool,
+    ) -> Result<SourceDomainAdmissionSnapshot, ProgramError> {
+        let mut out = SourceDomainAdmissionSnapshot {
+            domains: [0u32; percolator::PORTFOLIO_SOURCE_DOMAIN_CAP],
+            len: 0,
+        };
+        for slot in account.header.source_domains.iter() {
+            if slot.is_occupied() {
+                if out.len >= out.domains.len() {
+                    return Err(PercolatorError::InvalidInstruction.into());
+                }
+                out.domains[out.len] = slot.domain.get();
+                out.len += 1;
+            }
+        }
+        // Other active legs retain both future settlement domains. A leg fully closed
+        // by this trade can release its latent pair, but never its occupied claims.
+        for pod in &account.header.legs {
+            let leg = pod.try_to_runtime().map_err(map_v16_error)?;
+            if !leg.active {
+                continue;
+            }
+            let asset_index = leg.asset_index as usize;
+            if let Some(request) = requests.iter().find(|r| r.asset_index == asset_index) {
+                let current_q = signed_position_for_asset_view(group, account, asset_index)?;
+                let delta = if invert_requests {
+                    -request.size_q
+                } else {
+                    request.size_q
+                };
+                if current_q.checked_add(delta) == Some(0) {
+                    continue;
+                }
+            }
+            let (long_domain, short_domain) =
+                percolator::v16_domain_pair_for_asset_index(asset_index).map_err(map_v16_error)?;
+            out.push_reserved(long_domain as u32)?;
+            out.push_reserved(short_domain as u32)?;
+        }
+        Ok(out)
+    }
+
+    fn ensure_trade_delta_source_domain_capacity_view(
+        occupied_domains: &mut SourceDomainAdmissionSnapshot,
+        asset_index: usize,
+        current_q: i128,
+        delta_q: i128,
+    ) -> ProgramResult {
+        if !trade_delta_may_require_source_domain_capacity(current_q, delta_q)? {
+            return Ok(());
+        }
+        if occupied_domains.len > constants::WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (long_domain, short_domain) =
+            percolator::v16_domain_pair_for_asset_index(asset_index).map_err(map_v16_error)?;
+        for domain in [long_domain as u32, short_domain as u32] {
+            if occupied_domains.contains(domain) {
+                continue;
+            }
+            occupied_domains.push_reserved(domain)?;
+        }
+        Ok(())
+    }
+
+    fn trade_delta_may_require_source_domain_capacity(
+        current_q: i128,
+        delta_q: i128,
+    ) -> Result<bool, ProgramError> {
+        let post_q = current_q
+            .checked_add(delta_q)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if current_q == 0 {
+            return Ok(delta_q != 0);
+        }
+        if current_q > 0 {
+            return Ok(delta_q > 0 || post_q < 0);
+        }
+        Ok(delta_q < 0 || post_q > 0)
+    }
+
+    fn ensure_source_domain_growth_within_wrapper_bound(
+        before_count: usize,
+        after_count: usize,
+    ) -> ProgramResult {
+        if after_count > before_count && after_count > constants::WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(())
+    }
+    // ---------------------------------------------------------------------------------------
 
     #[inline(never)]
     fn handle_force_close_abandoned_asset<'a>(

@@ -928,6 +928,42 @@ impl V16CuEnv {
         self.svm.set_account(self.market, account).unwrap();
     }
 
+    // Test-harness-only workaround for a LiteSVM/solana-bpf-loader-program realloc
+    // limitation on accounts injected directly via `svm.set_account()` (rather than a
+    // real on-chain `CreateAccount`): such accounts cannot be grown past roughly
+    // `MAX_PERMITTED_DATA_INCREASE` (10,240) total bytes through the BPF program's own
+    // `AccountInfo::realloc()` call, no matter how small the requested delta is or
+    // whether the growth is a single jump or a sequence of smaller steps -- this is an
+    // absolute ceiling on the resulting length for THIS test environment, not a real
+    // Solana/mainnet constraint (a genuinely-created account gets the runtime's usual
+    // realloc headroom). `ActivateAsset`'s own on-chain realloc (`market_ai.realloc`,
+    // used only when `asset_index >= capacity_pre`) hits exactly this wall once a
+    // market's total account size crosses that threshold, which any market with more
+    // than a handful of assets already does.
+    //
+    // This helper grows the market account's raw byte buffer directly through the test
+    // harness's own account-injection path (no on-chain realloc involved, so the
+    // ceiling above never applies) to the capacity the NEXT `activate_asset` call will
+    // need, zero-padding the new tail exactly like a real realloc would. This only
+    // changes the account's raw length (`capacity_pre`, derived purely from
+    // `data.len()`); it does not touch `configured_slots`/`free_market_slot_count` or
+    // any other engine/wrapper bookkeeping, so `ActivateAsset`'s own append-detection
+    // (`asset_index == configured_slots_pre`) still fires normally and the instruction
+    // still performs every one of its usual checks and writes -- it simply finds
+    // `asset_index < capacity_pre` already true and skips its own (here-unusable)
+    // realloc call. The resulting account state is byte-identical to what a real
+    // devnet/mainnet `ActivateAsset` append would produce.
+    fn grow_market_capacity_for_test(&mut self, new_capacity: usize) {
+        let target_len = state::market_account_len_for_capacity(new_capacity).unwrap();
+        let mut market_account = self.svm.get_account(&self.market).expect("market account");
+        assert!(
+            target_len >= market_account.data.len(),
+            "grow_market_capacity_for_test must not shrink the market account"
+        );
+        market_account.data.resize(target_len, 0u8);
+        self.svm.set_account(self.market, market_account).unwrap();
+    }
+
     fn add_source_positive_pnl(&mut self, portfolio: Pubkey, domain: usize, amount: u128) {
         let mut market_account = self.svm.get_account(&self.market).expect("market account");
         let mut portfolio_account = self.svm.get_account(&portfolio).expect("portfolio account");
@@ -10532,6 +10568,201 @@ fn v16_bpf_batch_trade_nocpi_subatom_leg_charges_fee_on_ceil_notional() {
         1,
         "the reconstructed 1-atom fee must be credited somewhere (domain budget, protocol cut, \
          lp, or insurance reserve), not silently dropped"
+    );
+}
+
+// Sync unit w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`, "reserve latent domains of surviving
+// positions at admission"): at trade admission, the wrapper must reserve capacity for the
+// LATENT (currently-unoccupied) domain of every OTHER open, untouched leg on a portfolio -- not
+// just the domains the trade being admitted itself touches -- so that a trade cannot fill a
+// portfolio's `source_domains` table while starving a sibling leg of the slot it will later need
+// (flip side, force-close, ADL, backing-expiry crank). The engine's own `source_domains` array
+// is fail-closed regardless (`V16Error::LockActive` on overflow); what this gate changes is
+// WHEN and for WHOM that failure fires -- catching the greedy admission itself, rather than
+// letting some unrelated later operation on a starved sibling leg be the one that hits the wall.
+//
+// Reachability: `is_occupied()` (percolator engine) requires a NONZERO claim/lien value, not
+// merely an active leg -- an ordinary flat-price open/close never writes one. So the "other
+// active legs" this fix protects are ordinary open legs (Loop 2 of
+// `reserved_source_domains_snapshot_for_trade_view`, keyed off `account.header.legs`, independent
+// of `is_occupied()`), while genuinely REACHING the wrapper's 28-slot bound also needs a domain
+// that stays occupied with NO corresponding active leg -- e.g. a historical claim surviving past
+// its leg's close (upstream's own `inv_028_generation_capacity_admission.rs` reaches this via a
+// retire/reuse cycle on a real traded position; this test reaches the identical end state more
+// directly via the engine's own `add_account_source_positive_pnl_not_atomic` test hook, which is
+// exactly the mechanism `add_source_positive_pnl`/`top_up_backing_bucket` already exercise
+// elsewhere in this file -- injecting a real, backed positive-PnL claim on a domain with NO
+// active leg is indistinguishable, from this fix's point of view, from a genuine historical claim
+// left behind by a closed/retired position; both are "some other domain slot the account still
+// occupies" that `reserved_source_domains_snapshot_for_trade_view`'s first (occupied-domains) loop
+// must count as pre-existing per `PortfolioSourceDomainV16Account::is_occupied()`).
+//
+// Construction: the taker (account_a) opens ordinary ACTIVE legs on 13 assets (0-12) -- 26
+// domains via Loop 2 alone, no injection needed for these. A 14th, distinct asset (13) gets a
+// real, solvent, backed positive-PnL claim on its LONG domain (26) via the engine test hook, with
+// NO active leg there (H=1, counted by Loop 1 instead of Loop 2). The market is grown by exactly
+// one asset beyond the wrapper's own per-portfolio leg cap (asset 14, mirroring upstream's own
+// `History::with_market_capacity(ASSETS + 1)` fixture) so a single ordinary trade can then open a
+// 15th leg, from flat, needing BOTH of asset 14's domains. Total: 26 (13 untouched legs) + 1
+// (asset 13's injected claim) + 2 (asset 14's fresh pair) = 29, one over
+// `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS` (28) -- and the taker's active-leg count stays at 14
+// throughout (13 existing + 1 new), never touching the engine's own, unrelated, per-portfolio
+// active-leg-slot cap, so the source-domain gate is the only thing that can reject this trade.
+// Without the fix (pre-`cf0ce5d3` shape, which only ever counted domains ALREADY occupied plus
+// the trade's own touched asset): 1 (asset 13's claim) + 2 (asset 14's pair) = 3, nowhere near 28,
+// so the SAME trade is wrongly ADMITTED -- the exact negative control: reverting this unit's
+// source hunk flips this test's `is_err()` assertion to false (the trade succeeds instead).
+#[test]
+fn v16_bpf_source_domain_admission_reserves_latent_capacity_of_sibling_legs() {
+    let max_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
+    let other_legs = max_assets - 1; // 13: legs on assets 0..other_legs
+    let historical_asset = other_legs; // 13: injected claim, no active leg
+    let new_asset = max_assets; // 14: brand-new, freshly-grown asset
+
+    let mut env =
+        V16CuEnv::new_with_market_params_and_price_move(max_assets, 10_000, 10_000, 10_000);
+
+    // Grow the market by exactly one asset beyond the wrapper's own per-portfolio leg cap, via
+    // the ordinary asset-authority (admin) activation path -- no fee required since the admin IS
+    // this market's `marketauth`. `grow_market_capacity_for_test` pre-extends the account's raw
+    // byte buffer through the test harness (see its doc comment): LiteSVM cannot grow a
+    // `svm.set_account()`-injected account past ~10,240 bytes via the wrapper's own on-chain
+    // realloc, and this test's 15-asset market is well past that on any engine revision whose
+    // per-asset stride isn't tiny -- an environment ceiling, not a real Solana constraint, and
+    // orthogonal to the admission gate under test. `ActivateAsset` still performs every one of
+    // its normal checks and writes; it only skips its own (here-unusable) realloc call because it
+    // finds `asset_index < capacity_pre` already true.
+    env.svm.warp_to_slot(1);
+    env.grow_market_capacity_for_test((new_asset + 1) as usize);
+    env.activate_asset(new_asset, 1, 100);
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 10_000_000_000);
+    env.deposit(&lp, lp_account, 10_000_000_000);
+
+    // A real, solvent, backed positive-PnL claim on `historical_asset`'s LONG domain, with NO
+    // active leg on that asset -- occupies one more `source_domains` slot the same way a
+    // historical claim surviving a closed/retired position would (see the comment above). Done
+    // BEFORE the 13 ordinary legs below: `add_account_source_positive_pnl_not_atomic` invalidates
+    // the account's health cert as a side effect, and this fork's `E-CU-W` currentness gate only
+    // starts enforcing cert validity once the account's active-leg count reaches 8 -- injecting
+    // while the portfolio is still empty, then trading normally afterward (each successful trade
+    // re-certifies the account as part of its own settlement), avoids that gate entirely rather
+    // than fighting it.
+    let (historical_long_domain, _historical_short_domain) =
+        percolator::v16_domain_pair_for_asset_index(historical_asset as usize).unwrap();
+    env.top_up_backing_bucket(historical_long_domain as u16, 1_000, 1_000_000);
+    env.add_source_positive_pnl(taker_account, historical_long_domain, 500);
+
+    // Open one ordinary leg per asset on 0..other_legs (taker long, lp short): 13 concurrently
+    // active legs, comfortably within the wrapper's 28-slot bound on their own (26 needed).
+    for asset_index in 0..other_legs {
+        env.trade_asset_with_cu(
+            asset_index,
+            &taker,
+            taker_account,
+            &lp,
+            lp_account,
+            POS_SCALE as i128,
+            100,
+            0,
+        );
+    }
+
+    let taker_before = env.svm.get_account(&taker_account).unwrap().data;
+    let lp_before = env.svm.get_account(&lp_account).unwrap().data;
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+
+    // The 14th ordinary leg: opens `new_asset` from flat. Active-leg count becomes 14 (13
+    // existing + this one) -- never touches the engine's own leg-slot cap.
+    env.svm.expire_blockhash();
+    let trade = env.try_trade_asset_with_cu(
+        new_asset,
+        &taker,
+        taker_account,
+        &lp,
+        lp_account,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+
+    assert!(
+        trade.is_err(),
+        "a trade that would need to reserve 29 source domains (13 untouched sibling legs' \
+         latent pairs = 26, plus one historical claim with no active leg = 1, plus the \
+         newly-opened asset's own pair = 2) against the wrapper's \
+         WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS=28 bound must be rejected, but it was admitted: \
+         {trade:?}"
+    );
+    let err = trade.unwrap_err();
+    assert!(
+        err.contains("Custom(9)"),
+        "expected PercolatorError::InvalidInstruction (Custom(9)) from the source-domain \
+         admission gate, got: {err}"
+    );
+    // Atomicity: a rejected instruction must leave every account byte-for-byte unchanged.
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap().data,
+        taker_before,
+        "rejected admission must leave the taker portfolio byte-unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&lp_account).unwrap().data,
+        lp_before,
+        "rejected admission must leave the LP portfolio byte-unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        market_before,
+        "rejected admission must leave the market byte-unchanged"
+    );
+
+    // Positive control / non-degeneracy: the IDENTICAL setup MINUS the historical claim (only 13
+    // untouched legs' 26 domains + the new asset's 2 = 28, exactly at the bound, not over it)
+    // must still succeed -- proving the rejection above is caused specifically by the injected
+    // 29th domain, not some unconditional rejection of a 14th concurrently-active leg.
+    let mut control_env =
+        V16CuEnv::new_with_market_params_and_price_move(max_assets, 10_000, 10_000, 10_000);
+    control_env.svm.warp_to_slot(1);
+    control_env.grow_market_capacity_for_test((new_asset + 1) as usize);
+    control_env.activate_asset(new_asset, 1, 100);
+    let control_taker = Keypair::new();
+    let control_lp = Keypair::new();
+    let control_taker_account = control_env.create_portfolio(&control_taker);
+    let control_lp_account = control_env.create_portfolio(&control_lp);
+    control_env.deposit(&control_taker, control_taker_account, 10_000_000_000);
+    control_env.deposit(&control_lp, control_lp_account, 10_000_000_000);
+    for asset_index in 0..other_legs {
+        control_env.trade_asset_with_cu(
+            asset_index,
+            &control_taker,
+            control_taker_account,
+            &control_lp,
+            control_lp_account,
+            POS_SCALE as i128,
+            100,
+            0,
+        );
+    }
+    control_env.svm.expire_blockhash();
+    let control_trade = control_env.try_trade_asset_with_cu(
+        new_asset,
+        &control_taker,
+        control_taker_account,
+        &control_lp,
+        control_lp_account,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+    assert!(
+        control_trade.is_ok(),
+        "the identical 14th-leg-opening trade must still succeed when the domain count it needs \
+         (28, exactly at the bound) does not exceed it: {control_trade:?}"
     );
 }
 
