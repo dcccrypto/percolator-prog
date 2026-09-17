@@ -3429,7 +3429,11 @@ pub mod state {
         let required = HEADER_LEN
             .checked_add(PORTFOLIO_STATE_LEN)
             .ok_or(PercolatorError::InvalidAccountLen)?;
-        if data.len() < required {
+        // ADOPT upstream 2c8c5ba3 (LENGTH half only, "enforce canonical portfolio
+        // account length"): reject an oversized portfolio account, not just an
+        // undersized one. Bounds the account to [engine-only, engine+matcher-tail]
+        // instead of leaving any excess trailing bytes silently unvalidated.
+        if data.len() < required || data.len() > PORTFOLIO_ACCOUNT_LEN {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         let portfolio_bytes = data
@@ -3637,7 +3641,9 @@ pub mod state {
         data: &mut [u8],
         account: &PortfolioAccountV16,
     ) -> Result<(), ProgramError> {
-        if data.len() < PORTFOLIO_ACCOUNT_LEN {
+        // ADOPT upstream 2c8c5ba3 (LENGTH half only): exact canonical length, not
+        // just a floor -- an oversized account must not be accepted.
+        if data.len() != PORTFOLIO_ACCOUNT_LEN {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         if is_initialized(data) {
@@ -3659,7 +3665,11 @@ pub mod state {
         max_market_slots: usize,
     ) -> Result<(), ProgramError> {
         let required = portfolio_account_len_for_market_slots(max_market_slots)?;
-        if data.len() < required {
+        // ADOPT upstream 2c8c5ba3 (LENGTH half only): exact canonical length, not
+        // just a floor. The caller (`handle_init_portfolio`) canonicalizes an
+        // oversized, uninitialized account via realloc before reaching this check,
+        // so this never rejects a legitimate public InitPortfolio.
+        if data.len() != required {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
         if is_initialized(data) {
@@ -8405,7 +8415,12 @@ pub mod processor {
             v16_domain_count_for_market_slots(max_market_slots as u32).map_err(map_v16_error)?;
         let required_portfolio_len =
             state::portfolio_account_len_for_market_slots(max_market_slots)?;
-        if portfolio_ai.data_len() < required_portfolio_len {
+        // ADOPT upstream 2c8c5ba3 (LENGTH half only): InitPortfolio is the one
+        // instruction allowed to canonicalize storage -- an oversized, still-
+        // uninitialized System-Program-created account is shrunk to the exact
+        // canonical length here (realloc both grows AND shrinks), rather than
+        // being left oversized to accumulate ambiguous trailing bytes.
+        if portfolio_ai.data_len() != required_portfolio_len {
             portfolio_ai.realloc(required_portfolio_len, true)?;
         }
         {
@@ -10281,10 +10296,11 @@ pub mod processor {
         {
             return Err(PercolatorError::Unauthorized.into());
         }
-        let required_len = state::portfolio_account_len_for_market_slots(0)?;
-        if lp_portfolio_ai.data_len() < required_len {
-            lp_portfolio_ai.realloc(required_len, true)?;
-        }
+        // ADOPT upstream 2c8c5ba3 (LENGTH half only): consolidate onto the shared
+        // `ensure_portfolio_storage_for_market_slots` helper instead of a bespoke
+        // grow-only check, so this call site also picks up the oversized-account
+        // rejection added there.
+        ensure_portfolio_storage_for_market_slots(lp_portfolio_ai, 0)?;
         let cfg = if enabled == 0 {
             state::PortfolioMatcherConfigV16::default()
         } else {
@@ -20079,6 +20095,23 @@ pub mod processor {
         max_market_slots: usize,
     ) -> ProgramResult {
         let required = state::portfolio_account_len_for_market_slots(max_market_slots)?;
+        // ADOPT upstream 2c8c5ba3 (LENGTH half only, "enforce canonical portfolio
+        // account length"): unlike `handle_init_portfolio` (the one instruction
+        // allowed to canonicalize a still-uninitialized System-Program-created
+        // account by shrinking it), every OTHER caller of this shared helper
+        // reaches it for an account that must already be live/initialized -- our
+        // fork's portfolio layout is fixed-size (`portfolio_account_len_for_market_slots`
+        // is constant regardless of slot count; see v16_wrapper.rs's
+        // `v16_wrapper_market_account_capacity_is_declared_by_account_length` and
+        // the O(1)-portfolio `deposit`/`init_portfolio` tests), so no fork path
+        // legitimately presents an oversized live portfolio here. Reject instead
+        // of silently reallocating one down, which could otherwise truncate real
+        // financial state. The pre-existing grow branch (undersized -> realloc up)
+        // is untouched: it still carries forward older, pre-matcher-tail-schema
+        // portfolios that predate a canonical length bump.
+        if portfolio_ai.data_len() > required {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
         if portfolio_ai.data_len() < required {
             portfolio_ai.realloc(required, true)?;
         }

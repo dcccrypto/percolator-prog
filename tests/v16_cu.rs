@@ -16311,3 +16311,89 @@ fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
         "no partial write over the garbage on a rejected instruction"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Upstream 2c8c5ba3 parity (LENGTH half only) — "enforce canonical portfolio
+// account length".
+//
+// Before this fix, the shared `ensure_portfolio_storage_for_market_slots`
+// helper (used by deposit/withdraw/trade/close/matcher-config/etc, ~19 call
+// sites) only checked `portfolio_ai.data_len() < required` (an AT-LEAST
+// check), so an already-initialized portfolio account one byte OVER the
+// canonical `PORTFOLIO_ACCOUNT_LEN` was silently accepted and left oversized,
+// with an unvalidated trailing byte. `portfolio_view_mut_for_market_slots`,
+// `init_portfolio_account`, and `init_portfolio_account_zero_copy` had the
+// same at-least gap.
+//
+// This ports only the LENGTH-equality tightening: an explicit `> required`
+// guard ahead of the existing grow branch in the shared realloc helper
+// (`handle_init_portfolio` remains the one caller allowed to
+// canonicalize/shrink a still-uninitialized System-Program-created account,
+// via its own `!=` realloc gate), plus `!=`/upper-bound checks on the
+// init/view helpers. The portfolio-IDENTITY half of upstream's 2c8c5ba3
+// (portfolio_id threading) is Track-B and is NOT part of this port — our fork
+// lacks that infra.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v16_bpf_oversized_portfolio_account_is_rejected() {
+    let mut env = V16CuEnv::new();
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+
+    // Grow the already-initialized, canonical-length portfolio account by one
+    // byte -- exactly the shape the pre-fix `data.len() < required` check
+    // waved through as valid on every subsequent instruction touching
+    // portfolio storage.
+    let mut account = env.svm.get_account(&portfolio).unwrap();
+    assert_eq!(account.data.len(), env.portfolio_account_len);
+    account.data.push(0);
+    env.svm.set_account(portfolio, account).unwrap();
+
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, owner.pubkey(), 100),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let market = env.market;
+    let vault = env.vault;
+    let res = env.send(
+        ProgInstruction::Deposit { amount: 50 },
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&owner],
+    );
+    let msg = res.expect_err(
+        "2c8c5ba3 (length half): an oversized, already-initialized portfolio \
+         account must be rejected, not silently accepted as canonical (pre-fix \
+         `data.len() < required` treated any longer account as valid)",
+    );
+    assert!(
+        msg.contains("Custom(5)") || msg.contains("custom program error: 0x5"),
+        "expected InvalidAccountLen (Custom(5)), got: {msg}"
+    );
+
+    // No partial write / no silent realloc-down: a rejected instruction must
+    // not mutate the account at all.
+    let after = env.svm.get_account(&portfolio).unwrap();
+    assert_eq!(
+        after.data.len(),
+        env.portfolio_account_len + 1,
+        "a rejected instruction must not change the account's length"
+    );
+}
