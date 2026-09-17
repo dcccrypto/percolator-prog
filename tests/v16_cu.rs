@@ -14950,6 +14950,202 @@ fn v16_bpf_elsa_open_cohort_on_target_asset_is_refused_narrow_not_delete() {
     );
 }
 
+// ── sync/w1-abacking: adopt upstream 5314c05f ("authenticate backing top-up
+// expiry") + 57d04a7d ("reject newly backed liens after expiry") ─────────────
+//
+// Both close the same hole from two ends. 5314c05f stops a caller from ever
+// FUNDING a bucket whose `expiry_slot` is already <= the authenticated slot
+// (a "fresh" bucket that can never back a single lien). 57d04a7d stops a
+// trade from DRAWING a NEW counterparty-backed lien against a bucket that is
+// Fresh only because the ENGINE's own cached `current_slot` (advanced solely
+// by cranking) has fallen behind the real, authenticated slot -- the
+// engine's own `bucket.expiry_slot > current_slot` gate inside
+// `create_source_credit_lien_backing_not_atomic` trusts that cached slot,
+// so a market that has not been cranked in a while can keep minting NEW
+// liens against a bucket that is, by wall-clock time, already expired.
+//
+// TopUpBackingBucket (tag 76) — regression test for 5314c05f.
+#[test]
+fn v16_bpf_topup_backing_bucket_rejects_expiry_at_or_before_now() {
+    let mut env = V16CuEnv::new();
+    // The engine's cached current_slot starts at 0 and nothing cranks it here;
+    // warp the REAL (authenticated) clock forward so `expiry_slot: 10` is
+    // already in the past by wall-clock time.
+    env.svm.warp_to_slot(50);
+    let ledger = env.canonical_backing_domain_ledger_account(1);
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    let vault = env.vault;
+    let err = env
+        .send(
+            ProgInstruction::TopUpBackingBucket {
+                domain: 1,
+                amount: 1_000,
+                expiry_slot: 10,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect_err(
+            "a non-zero top-up whose expiry_slot is already <= the authenticated slot must be \
+             rejected -- pre-fix (5314c05f absent) this funded a bucket that could never back a \
+             single lien for its own provider",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::InvalidInstruction as u32),
+        "expected InvalidInstruction; got {err}"
+    );
+    // No capital moved and no bucket was created by the refused top-up.
+    let (_, g) = env.market_state();
+    assert_eq!(g.vault, 0, "a refused top-up must not move any tokens");
+    assert_eq!(
+        g.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Empty,
+        "a refused top-up must not open the bucket"
+    );
+}
+
+/// Real-trade setup shared by the two 57d04a7d regressions below: fund domain 1's
+/// backing bucket, credit account A an unliened source claim against it (so the
+/// engine's initial-margin path can draw a NEW lien from that domain), then leave
+/// the market un-cranked (`current_slot` stays 0) and warp the REAL clock past the
+/// bucket's `expiry_slot`. Returns (env, owner_a, a, owner_b, b).
+fn setup_stale_cached_slot_fresh_bucket_scenario() -> (V16CuEnv, Keypair, Pubkey, Keypair, Pubkey) {
+    let mut env = V16CuEnv::new();
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    let a = env.create_portfolio(&owner_a);
+    let b = env.create_portfolio(&owner_b);
+    // Account A's own capital (100) is far short of the 100%-initial-margin
+    // requirement for the trade below, so the engine must draw the shortfall as a
+    // NEW counterparty-backed lien from domain 1 -- account B is capitalized well
+    // beyond what it needs so only A's side exercises the lien path.
+    env.deposit(&owner_a, a, 100);
+    env.deposit(&owner_b, b, 1_000_000);
+
+    // Fund domain 1 (asset 0, short side) with a bucket Fresh until slot 20.
+    env.top_up_backing_bucket(1, 1_000_000, 20);
+    // Give account A an unliened source claim against domain 1 so the initial-margin
+    // path is entitled to draw a lien from it (real engine call, not a stub).
+    env.add_source_positive_pnl(a, 1, 500_000);
+
+    let (_, g0) = env.market_state();
+    assert_eq!(
+        g0.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Fresh
+    );
+    assert_eq!(g0.source_backing_buckets[1].expiry_slot, 20);
+    assert_eq!(
+        g0.current_slot, 0,
+        "the market's cached current_slot must stay behind the real clock -- nothing here cranks it"
+    );
+
+    // The engine's OWN `bucket.expiry_slot > current_slot` gate compares against
+    // this cached slot (still 0), so it would happily treat the bucket as fresh.
+    // Warp the REAL/authenticated slot well past expiry_slot=20 without cranking.
+    env.svm.warp_to_slot(50);
+
+    (env, owner_a, a, owner_b, b)
+}
+
+// TradeNoCpi (tag 8) — regression test for 57d04a7d, single-trade path
+// (`handle_trade_nocpi_zero_copy`).
+#[test]
+fn v16_bpf_trade_nocpi_rejects_new_counterparty_lien_after_backing_expiry() {
+    let (mut env, owner_a, a, owner_b, b) = setup_stale_cached_slot_fresh_bucket_scenario();
+    let owner_a2 = owner_a.insecure_clone();
+    let owner_b2 = owner_b.insecure_clone();
+    let err = env
+        .try_trade_asset_with_cu(0, &owner_a2, a, &owner_b2, b, 3 * POS_SCALE as i128, 100, 0)
+        .expect_err(
+            "a trade that must draw a NEW counterparty-backed lien from a bucket that is \
+             Fresh only per the engine's STALE cached current_slot -- but already expired by \
+             the real authenticated slot -- must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    // The refused trade must not have landed any lien or moved any capital.
+    let pa = env.portfolio_state(a);
+    assert_eq!(pa.capital, 100, "a refused trade must not move capital");
+    assert_eq!(
+        pa.source_lien_counterparty_backing_num[1], 0,
+        "a refused trade must not create the new counterparty-backed lien"
+    );
+}
+
+// BatchTradeNoCpi (tag 83) — regression test for 57d04a7d, batch-trade path
+// (`handle_batch_trade_nocpi`, our fork's analogue of upstream's
+// `handle_batch_execute_zero_copy`). A separate code path from TradeNoCpi above
+// (different engine entrypoint, `execute_batch_with_fee_loss_stale_scoped_not_atomic`),
+// so it needs -- and, ported here, gets -- its own copy of the same freshness check.
+#[test]
+fn v16_bpf_batch_trade_nocpi_rejects_new_counterparty_lien_after_backing_expiry() {
+    let (mut env, owner_a, a, owner_b, b) = setup_stale_cached_slot_fresh_bucket_scenario();
+    let owner_a2 = owner_a.insecure_clone();
+    let owner_b2 = owner_b.insecure_clone();
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::BatchTradeNoCpi {
+                legs: vec![percolator_prog::ix::BatchTradeLeg {
+                    asset_index: 0,
+                    size_q: 3 * POS_SCALE as i128,
+                    exec_price: 100,
+                    fee_bps: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(owner_a2.pubkey(), true),
+                AccountMeta::new(owner_b2.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(a, false),
+                AccountMeta::new(b, false),
+            ],
+            &[&owner_a2, &owner_b2],
+        )
+        .expect_err(
+            "a batch trade that must draw a NEW counterparty-backed lien from a bucket that is \
+             Fresh only per the engine's STALE cached current_slot -- but already expired by \
+             the real authenticated slot -- must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    let pa = env.portfolio_state(a);
+    assert_eq!(pa.capital, 100, "a refused batch trade must not move capital");
+    assert_eq!(
+        pa.source_lien_counterparty_backing_num[1], 0,
+        "a refused batch trade must not create the new counterparty-backed lien"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Upstream caf1cc2a parity — "enforce canonical auxiliary ledger layouts".
 //

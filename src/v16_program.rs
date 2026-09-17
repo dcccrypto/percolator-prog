@@ -8561,14 +8561,15 @@ pub mod processor {
                     -size_q,
                 )?;
             }
-            let backing_before = if cfg.backing_trade_fee_policy_count == 0 {
-                None
-            } else {
-                Some((
-                    source_counterparty_backing_snapshot_view(&account_a)?,
-                    source_counterparty_backing_snapshot_view(&account_b)?,
-                ))
-            };
+            // sync/w1-abacking (adopt upstream 57d04a7d, "reject newly backed liens after
+            // expiry"): these snapshots used to be gated on `backing_trade_fee_policy_count`
+            // (they only existed to drive the fee split below). The freshness check right
+            // after the engine call needs them unconditionally -- a domain can back a NEW
+            // counterparty-backed lien via this trade even when no backing-domain FEE policy
+            // is configured for it, and a lien landing after that domain's signed backing
+            // expiry must still be rejected.
+            let backing_before_a = source_counterparty_backing_snapshot_view(&account_a)?;
+            let backing_before_b = source_counterparty_backing_snapshot_view(&account_b)?;
             let source_lien_before_a =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
@@ -8598,19 +8599,30 @@ pub mod processor {
                     )
                     .map_err(map_v16_error)?
             };
-            let backing_domain_fee =
-                if let Some((backing_before_a, backing_before_b)) = backing_before {
-                    apply_backing_domain_fees_after_trade_view(
-                        &cfg,
-                        &mut group,
-                        &mut account_a,
-                        backing_before_a.as_ref(),
-                        &mut account_b,
-                        backing_before_b.as_ref(),
-                    )?
-                } else {
-                    0
-                };
+            // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
+            // cached slot and a provider's signed backing expiry. Only newly-created
+            // counterparty-backed liens need this landing-time check; insurance-backed liens
+            // and trades that do not increase a lien remain live.
+            ensure_new_counterparty_backed_liens_fresh_for_trade_view(
+                &group,
+                authenticated_market_slot_or_fallback_view(&group),
+                backing_before_a.as_ref(),
+                &account_a,
+                backing_before_b.as_ref(),
+                &account_b,
+            )?;
+            let backing_domain_fee = if cfg.backing_trade_fee_policy_count == 0 {
+                0
+            } else {
+                apply_backing_domain_fees_after_trade_view(
+                    &cfg,
+                    &mut group,
+                    &mut account_a,
+                    backing_before_a.as_ref(),
+                    &mut account_b,
+                    backing_before_b.as_ref(),
+                )?
+            };
             // Four-way split (2026-07-19 design). Both aggregates are split and the two
             // results are added leg by leg below, so this site is correct whether the taker
             // paid the whole fee, the maker paid it under the N1 fallback, or -- since engine
@@ -9046,6 +9058,13 @@ pub mod processor {
                 }
             }
 
+            // sync/w1-abacking (57d04a7d): the wrapper's per-leg backing-domain FEE policy is
+            // already refused above when configured (`v1 scope` guard), but a source domain can
+            // still back a NEW counterparty-backed lien through this batch independent of that
+            // fee policy, so the landing-time freshness check below needs these snapshots
+            // regardless.
+            let backing_before_a = source_counterparty_backing_snapshot_view(&account_a)?;
+            let backing_before_b = source_counterparty_backing_snapshot_view(&account_b)?;
             let source_lien_before_a =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
@@ -9062,6 +9081,18 @@ pub mod processor {
                     true,
                 )
                 .map_err(map_v16_error)?;
+            // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
+            // cached slot and a provider's signed backing expiry. Only newly-created
+            // counterparty-backed liens need this landing-time check; insurance-backed liens
+            // and legs that do not increase a lien remain live.
+            ensure_new_counterparty_backed_liens_fresh_for_trade_view(
+                &group,
+                authenticated_market_slot_or_fallback_view(&group),
+                backing_before_a.as_ref(),
+                &account_a,
+                backing_before_b.as_ref(),
+                &account_b,
+            )?;
 
             // Taker-only + N1 (design §1A.3/§1A.4). `outcome.fee_a`/`outcome.fee_b` are the
             // engine's AGGREGATE totals across all legs.
@@ -9366,6 +9397,40 @@ pub mod processor {
                     ensure_source_credit_full_rate_for_domain_view(group, domain as usize)?;
                 }
                 i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// sync/w1-abacking (adopt upstream 57d04a7d, "reject newly backed liens after expiry").
+    ///
+    /// A retained transaction can land after the engine's cached slot and a provider's signed
+    /// backing expiry. Only newly-created counterparty-backed liens need this landing-time
+    /// check; insurance-backed liens and trades that do not increase a lien remain live.
+    fn ensure_new_counterparty_backed_liens_fresh_for_trade_view(
+        group: &state::MarketViewMutV16<'_>,
+        authenticated_slot: u64,
+        before_a: &[(u32, u128)],
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        before_b: &[(u32, u128)],
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> ProgramResult {
+        for (account, before) in [(account_a, before_a), (account_b, before_b)] {
+            for source in account.header.source_domains.iter() {
+                if !source.is_occupied() {
+                    continue;
+                }
+                let domain = source.domain.get();
+                let after = source.source_lien_counterparty_backing_num.get();
+                if after <= sparse_domain_value_lookup(before, domain) {
+                    continue;
+                }
+                let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
+                if bucket.status != percolator::BackingBucketStatusV16::Fresh
+                    || bucket.expiry_slot <= authenticated_slot
+                {
+                    return Err(PercolatorError::EngineStale.into());
+                }
             }
         }
         Ok(())
@@ -11468,6 +11533,17 @@ pub mod processor {
             match group.header.mode {
                 // Normal backing deposits remain strictly Live-only.
                 0 => {
+                    // sync/w1-abacking (adopt upstream 5314c05f, "authenticate backing top-up
+                    // expiry"): a provider-signed `expiry_slot` that is already <= now would
+                    // create a bucket the very next crank can advance straight to Expired --
+                    // funding a "fresh" backing bucket that never backs a single lien for its
+                    // provider, while callers relying on `require_domain_accepts_live_topup_view`
+                    // above still treat the deposit as accepted.
+                    if amount != 0
+                        && expiry_slot <= authenticated_market_slot_or_fallback_view(&group)
+                    {
+                        return Err(PercolatorError::InvalidInstruction.into());
+                    }
                     require_domain_accepts_live_topup_view(&group, domain_usize)?;
                 }
 
@@ -11504,6 +11580,13 @@ pub mod processor {
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
+            }
+            // sync/w1-abacking (5314c05f): re-authenticate the expiry against THIS borrow's
+            // slot, not just the preflight borrow's -- a stale-slot retained transaction that
+            // slipped past the preflight check above must still be rejected here, against the
+            // freshest available slot, before any capital moves.
+            if expiry_slot <= authenticated_market_slot_or_fallback_view(&group) {
+                return Err(PercolatorError::InvalidInstruction.into());
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             require_domain_accepts_live_topup_view(&group, domain_usize)?;
