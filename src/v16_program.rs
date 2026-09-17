@@ -7666,6 +7666,70 @@ pub mod processor {
         credit_market_insurance_budget_view(group, 0, amount)
     }
 
+    /// FIX (ADOPT upstream `a84b45dd` "collect maintenance before value debits", FOLDED with
+    /// `d1bff017` "crystallize flat first-risk fees" to their combined final shape): crystallize
+    /// every maintenance fee currently collectible from a portfolio's capital BEFORE a public
+    /// route can debit or transfer that capital, and before a liquidation reward is computed
+    /// from the insurance delta the same action produces.
+    ///
+    /// Without this, an account could Withdraw, Trade, or be force-closed in a way that dodges
+    /// the maintenance fee accrued since its last sync -- an ongoing insurance-funding leak.
+    /// Before this fix `collect_maintenance_fee_before_trade_view` /
+    /// `_before_value_debit_view` had zero call sites in this fork; fee crystallization only
+    /// ever happened via the explicit `SyncMaintenanceFee` crank, `CloseResolved`, or as a side
+    /// effect of `permissionless_auto_crank`, none of which a Withdraw/Trade caller is obligated
+    /// to invoke first.
+    ///
+    /// The engine (`sync_account_fee_to_slot_not_atomic`) remains the source of truth for fee
+    /// anchoring, side-effect settlement, and the junior-value cap; the wrapper only enforces
+    /// ordering here and attributes the collected amount to the canonical maintenance-fee
+    /// destination (asset-0 insurance budget, FIX #113 —
+    /// `credit_maintenance_fee_to_active_market_budgets_view` above).
+    ///
+    /// `now_slot` uses the existing anti-spoofing `authenticated_market_slot_or_fallback_view`
+    /// pattern (never a bare `Clock::get()?`), so this is safe to call from every native-harness
+    /// call site that already relies on that fallback.
+    fn collect_maintenance_fee_to_slot_before_value_debit_view(
+        cfg: &WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
+        now_slot: u64,
+    ) -> Result<u128, ProgramError> {
+        if group.header.mode != 0 || cfg.maintenance_fee_per_slot == 0 {
+            return Ok(0);
+        }
+        let charged = group
+            .sync_account_fee_to_slot_not_atomic(portfolio, now_slot, cfg.maintenance_fee_per_slot)
+            .map_err(map_v16_error)?;
+        credit_maintenance_fee_to_active_market_budgets_view(cfg, group, charged)?;
+        Ok(charged)
+    }
+
+    fn collect_maintenance_fee_before_value_debit_view(
+        cfg: &WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<u128, ProgramError> {
+        let now_slot = authenticated_market_slot_or_fallback_view(group);
+        collect_maintenance_fee_to_slot_before_value_debit_view(cfg, group, portfolio, now_slot)
+    }
+
+    /// Trade-path name for `collect_maintenance_fee_before_value_debit_view`. Upstream originally
+    /// shipped this (`a84b45dd`) as a separate function with a flat-account short-circuit ("opening
+    /// a first leg does not debit an existing exposure"); `d1bff017` ("crystallize flat first-risk
+    /// fees") removed that short-circuit after it proved to mis-anchor a first-risk-admission
+    /// account's fee cursor. This fork adopts the two commits FOLDED to that final combined shape
+    /// directly, so the short-circuit never existed here and this body is identical to
+    /// `_before_value_debit_view`. The name is kept distinct (matching upstream) to mark the trade
+    /// call sites for anyone diffing against it.
+    fn collect_maintenance_fee_before_trade_view(
+        cfg: &WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<u128, ProgramError> {
+        collect_maintenance_fee_before_value_debit_view(cfg, group, portfolio)
+    }
+
     fn require_asset_active_for_oracle_reconfiguration_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
@@ -8475,11 +8539,17 @@ pub mod processor {
             &vault_authority,
             &cfg,
         )?;
-        let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(vault_token, amount_u64)?;
+        // FIX (ADOPT upstream a84b45dd, folded with d1bff017): the balance check below moves
+        // past the fee-crystallization block and is re-derived from the ACTUAL withdrawn
+        // amount, not the caller-submitted one -- see `withdrawn_amount` below for why those
+        // can differ.
+        if amount == 0 {
+            return Ok(());
+        }
+        amount_to_u64(amount)?;
 
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
-        {
+        let withdrawn_amount = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
@@ -8502,10 +8572,32 @@ pub mod processor {
                 nft,
                 program_id,
             )?;
+            // FIX (ADOPT upstream a84b45dd/d1bff017, "collect maintenance before value
+            // debits"): crystallize this account's accrued maintenance fee against its
+            // capital BEFORE the withdraw below debits that same capital. Without this a
+            // Withdraw could dodge every maintenance fee accrued since the account's last
+            // sync -- an ongoing insurance-funding leak. A revert here (including
+            // `EngineBStale`) is acceptable: this is a user-initiated action, and the caller
+            // can crank the account current and retry.
+            let capital_before_fee = portfolio.header.capital.get();
+            collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)?;
+            // Preserve an atomic withdraw-all path when the submitted balance became stale
+            // only because this instruction just crystallized its fee: a caller who asked to
+            // withdraw exactly their pre-fee capital still gets everything left after the
+            // fee, in one instruction, instead of hitting `EngineLockActive` because `amount`
+            // now exceeds the freshly-reduced capital. Partial withdrawals remain exact.
+            let withdrawn_amount = if amount == capital_before_fee {
+                portfolio.header.capital.get()
+            } else {
+                amount
+            };
             group
-                .withdraw_not_atomic(&mut portfolio, amount)
+                .withdraw_not_atomic(&mut portfolio, withdrawn_amount)
                 .map_err(map_v16_error)?;
-        }
+            withdrawn_amount
+        };
+        let amount_u64 = amount_to_u64(withdrawn_amount)?;
+        require_token_balance(vault_token, amount_u64)?;
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
         transfer_tokens_signed(
@@ -8620,6 +8712,15 @@ pub mod processor {
                 &account_b,
                 core::slice::from_ref(&req),
             )?;
+            // FIX (ADOPT upstream a84b45dd/d1bff017, "collect maintenance before value
+            // debits"): crystallize each account's accrued maintenance fee BEFORE the trade
+            // below can move capital/positions, so a trade cannot dodge fee accrued since the
+            // account's last sync. Ordered before the w1-s3 admission snapshot immediately
+            // below, so that snapshot (and the value debit further down) reflect
+            // post-fee-crystallization state; a revert here (including `EngineBStale`) is
+            // acceptable on this user-initiated path -- the caller cranks first, then retries.
+            collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_a)?;
+            collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_b)?;
             // w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`): reserve latent domains of surviving,
             // untouched legs before the engine's own trade-application primitive runs, so this
             // trade cannot fill either account's source-domain table and starve a sibling leg's
@@ -9139,6 +9240,16 @@ pub mod processor {
             ensure_trade_portfolios_current_for_requests_view(
                 &group, &account_a, &account_b, &requests,
             )?;
+            // FIX (ADOPT upstream a84b45dd/d1bff017, "collect maintenance before value
+            // debits"): crystallize each account's accrued maintenance fee BEFORE the batch
+            // below can move capital/positions, so a batch trade cannot dodge fee accrued
+            // since the account's last sync. Shared by BatchTradeNoCpi and BatchTradeCpi (both
+            // funnel through this helper). Ordered before the w1-s3 admission snapshot
+            // immediately below for the same reason as the single-trade path; a revert here
+            // (including `EngineBStale`) is acceptable on this user-initiated path -- the
+            // caller cranks first, then retries.
+            collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_a)?;
+            collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_b)?;
             // w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`): reserve latent domains of surviving,
             // untouched legs before the engine's own batch-application primitive runs, using the
             // WHOLE leg request set so a leg that fully closes within this same batch correctly
@@ -9813,6 +9924,15 @@ pub mod processor {
         account_b
             .validate_with_market(&group.as_view())
             .map_err(map_v16_error)?;
+        // FIX (ADOPT upstream a84b45dd/d1bff017, "collect maintenance before value debits"):
+        // crystallize each account's accrued maintenance fee BEFORE this force-close can move
+        // capital/positions, so an abandoned-asset force-close cannot dodge fee accrued since
+        // either account's last sync. A revert here (including `EngineBStale`) is acceptable:
+        // this permissionless force-close path is retried after a plain crank makes the
+        // account current again, unlike the crank handler itself which must never revert on
+        // this specific error (see `handle_permissionless_crank_zero_copy`).
+        collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut account_a)?;
+        collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut account_b)?;
         let leg_a = active_leg_for_asset_view(&account_a, asset_index_usize)?;
         let leg_b = active_leg_for_asset_view(&account_b, asset_index_usize)?;
         if leg_a.side == leg_b.side {
@@ -16309,6 +16429,64 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+            // FIX (ADOPT upstream a84b45dd, "collect maintenance before value debits",
+            // adapted to this fork's action-based crank shape): maintenance collection is
+            // senior to a liquidation reward -- crystallize the fee BEFORE snapshotting
+            // `insurance_before` below, so the reward computed from
+            // `insurance_after - insurance_before` reflects only this crank/liquidation's own
+            // insurance movement, never the account's separately-owed maintenance obligation.
+            // Without this reorder, a permissionless crank/liquidation could dodge the fee
+            // accrued since the account's last sync (or, worse, let a cranker's reward silently
+            // include it).
+            //
+            // LIVELOCK FIX (w1-aa84b45dd-v2, replaces the prior branch's
+            // `b_stale_state == 0`-gated call, gate-2-REJECTED for a real livelock): gating
+            // entry on the account's PRE-call `b_stale_state` misses the "becomes B-stale
+            // DURING this call" case. `collect_maintenance_fee_before_value_debit_view` ->
+            // engine `sync_account_fee_to_slot_not_atomic` (percolator `src/v16.rs:20356`)
+            // calls `settle_account_side_effects_not_atomic`, which for a B-backlog exceeding
+            // one `public_b_chunk_atoms` chunk MUTATES the account in place (marks the leg
+            // B-stale, consumes one bounded chunk) and returns `Ok(AccountBChunk(_))` --
+            // but `sync_account_fee_to_slot_not_atomic` then converts that `Ok` into
+            // `Err(V16Error::BStale)` (`src/v16.rs:20386-20394`) rather than returning the
+            // partial-progress outcome. The OLD code let that `Err` propagate via `?`, which
+            // reverts this WHOLE instruction -- discarding the chunk progress and
+            // `b_stale_state` mutation that had already been applied to this zero-copy view,
+            // since Solana rolls back every account touched by a failed instruction. Every
+            // subsequent Refresh(0)/Liquidate(1)/SettleB(2) call therefore re-enters with
+            // `b_stale_state` still 0, re-hits the identical `BStale` error at this same call
+            // site, and reverts again: a PERMANENT LIVELOCK on any account whose B-backlog
+            // exceeds one chunk -- reachable whenever `public_b_chunk_atoms` (an admin knob
+            // with no minimum validation) is bounded below the backlog. An underwater account
+            // stuck this way can never be liquidated.
+            //
+            // FIX: handle `EngineBStale` from THIS call site gracefully instead of propagating
+            // it -- skip fee collection for this call and let the instruction return `Ok(())`
+            // as usual. Any chunk progress `sync_account_fee_to_slot_not_atomic` already
+            // applied before returning `BStale` (the `mark_leg_b_stale` write and the one
+            // `settle_account_b_chunk` step) stays applied, because it lands on the same
+            // zero-copy view the rest of this handler mutates and the instruction as a whole
+            // now succeeds. The crank's OWN engine-level path just below
+            // (`liquidate_account_not_atomic` / `permissionless_crank_not_atomic`, which are
+            // already chunk-tolerant of B-staleness -- that is what SettleB(2) exists to
+            // drive) proceeds normally afterward in the same instruction, and durably advances
+            // the account's B-settlement over however many subsequent calls the backlog needs.
+            // This subsumes the old entry-state gate: an account that is ALREADY b-stale on
+            // entry also takes this `Err` arm (fee collection is skipped exactly the same
+            // way), so one graceful match handles both "already b-stale" and "becoming
+            // b-stale this call" uniformly, and a genuinely bounded chunk budget still
+            // eventually clears the backlog because each call consumes one more chunk.
+            match collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)
+            {
+                Ok(_) => {}
+                Err(e) if e == ProgramError::from(PercolatorError::EngineBStale) => {
+                    // Becoming (or already) B-stale: skip fee collection for this call only.
+                    // The crank's chunk-tolerant liquidate/crank path below still runs and
+                    // makes progress; a later call (once the account is current again) will
+                    // collect the fee this call deferred.
+                }
+                Err(e) => return Err(e),
+            }
             let insurance_before = group.header.insurance.get();
             let is_liquidation = matches!(crank_action, PermissionlessCrankActionV16::Liquidate(_));
             // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward

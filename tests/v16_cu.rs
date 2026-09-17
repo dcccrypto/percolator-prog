@@ -6326,6 +6326,498 @@ fn v16_bpf_underfunded_flat_sync_sweeps_remaining_capital_once() {
     );
 }
 
+// ── w1-aa84b45dd-v2: ADOPT upstream a84b45dd "collect maintenance before value debits", FOLDED
+// with d1bff017 "crystallize flat first-risk fees" ──
+//
+// Before this fix, `collect_maintenance_fee_before_trade_view` /
+// `_before_value_debit_view` had ZERO call sites in this fork: Withdraw, TradeNoCpi/
+// BatchTradeNoCpi/TradeCpi, and the abandoned-asset force-close handler all moved an account's
+// capital/positions WITHOUT first crystallizing the maintenance fee accrued since that account's
+// last sync. A user could therefore Withdraw or Trade to dodge that fee entirely -- an ongoing
+// insurance-funding leak, since the only prior fee-collection paths (SyncMaintenanceFee,
+// CloseResolved, the Recovery-mode permissionless_auto_crank sweep) are never obligatory before
+// a Withdraw or Trade.
+//
+// The two tests below reproduce the dodge on the withdraw path and the trade path respectively
+// (the task's required "trade path and one other"), asserting the fee is now crystallized into
+// insurance and the account's `last_fee_slot` cursor BEFORE the value-debiting action lands.
+
+#[test]
+fn v16_bpf_withdraw_crystallizes_maintenance_fee_before_debiting_capital() {
+    // FIX regression (ADOPT a84b45dd/d1bff017): before the fix, `handle_withdraw` never called
+    // maintenance-fee collection, so a flat account that sat idle after deposit (never synced)
+    // could Withdraw its full stale capital and dodge every maintenance fee accrued since
+    // InitPortfolio -- this is the dodge the fix closes.
+    let fee_per_slot: u128 = 7;
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1, 10_000, 10_000, 10_000, fee_per_slot,
+    );
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let deposit_amount: u128 = 100_000;
+    env.deposit(&owner, portfolio, deposit_amount);
+
+    let last_fee_slot_at_deposit = env.portfolio_state(portfolio).last_fee_slot;
+    let target_slot = last_fee_slot_at_deposit + 50;
+    env.svm.warp_to_slot(target_slot);
+
+    // Withdraw the account's full PRE-fee capital in one instruction, without ever calling
+    // SyncMaintenanceFee first -- exactly the dodge path the fix closes. The atomic
+    // withdraw-all preservation (submitted amount == pre-fee capital) must still drain the
+    // account fully, net of the fee just crystallized.
+    let dest = env.withdraw(&owner, portfolio, deposit_amount);
+
+    let dt = target_slot - last_fee_slot_at_deposit;
+    let expected_fee = fee_per_slot * dt as u128;
+    let received = env.token_amount(dest) as u128;
+    let (_, group_after) = env.market_state();
+    let portfolio_after = env.portfolio_state(portfolio);
+
+    assert!(expected_fee > 0, "test setup: elapsed time must accrue a nonzero fee");
+    assert_eq!(
+        received,
+        deposit_amount - expected_fee,
+        "FIX regression: Withdraw must crystallize the accrued maintenance fee BEFORE debiting \
+         capital -- the payout must be net of the fee, not the full stale (pre-fee) capital"
+    );
+    assert_eq!(
+        group_after.insurance, expected_fee,
+        "the crystallized fee must be credited to insurance before the withdraw pays out"
+    );
+    assert_eq!(
+        portfolio_after.capital, 0,
+        "the atomic withdraw-all preservation must still drain the account fully post-fee"
+    );
+    assert_eq!(
+        portfolio_after.last_fee_slot, target_slot,
+        "the fee cursor must advance to the withdraw's authenticated slot"
+    );
+}
+
+#[test]
+fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
+    // FIX regression (ADOPT a84b45dd/d1bff017): before the fix, TradeNoCpi never called
+    // maintenance-fee collection at all. This specifically exercises the d1bff017 FOLD: both
+    // accounts here are FLAT, about to open their FIRST leg via this trade -- exactly the case
+    // upstream's original a84b45dd short-circuit ("opening a first leg does not debit an
+    // existing exposure") used to skip, and which d1bff017 removed because it mis-anchored a
+    // first-risk-admission account's fee cursor. Adopting the two commits pre-folded means this
+    // fork never had that short-circuit, so a first-leg trade must still crystallize the fee
+    // accrued since deposit for BOTH sides.
+    let fee_per_slot: u128 = 7;
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1, 10_000, 10_000, 10_000, fee_per_slot,
+    );
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    env.deposit(&short_owner, short_account, 1_000_000);
+
+    let last_fee_slot_at_deposit = env.portfolio_state(long_account).last_fee_slot;
+    assert_eq!(
+        last_fee_slot_at_deposit,
+        env.portfolio_state(short_account).last_fee_slot,
+        "test setup: both accounts must start from the same fee cursor"
+    );
+    let trade_slot = last_fee_slot_at_deposit + 40;
+    env.svm.warp_to_slot(trade_slot);
+
+    // fee_bps = 0 isolates the maintenance fee from the ordinary trading fee.
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (10 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+
+    let dt = trade_slot - last_fee_slot_at_deposit;
+    let expected_fee_per_account = fee_per_slot * dt as u128;
+    let (_, group) = env.market_state();
+    let long = env.portfolio_state(long_account);
+    let short = env.portfolio_state(short_account);
+
+    assert!(
+        expected_fee_per_account > 0,
+        "test setup: elapsed time must accrue a nonzero fee"
+    );
+    assert_eq!(
+        group.insurance,
+        expected_fee_per_account * 2,
+        "FIX regression: TradeNoCpi must crystallize BOTH accounts' accrued maintenance fee \
+         before the trade opens their first leg -- opening a first-risk position must not let \
+         either side dodge the fee owed since its last sync"
+    );
+    assert_eq!(
+        long.last_fee_slot, trade_slot,
+        "the long leg's fee cursor must advance to the trade's authenticated slot"
+    );
+    assert_eq!(
+        short.last_fee_slot, trade_slot,
+        "the short leg's fee cursor must advance to the trade's authenticated slot"
+    );
+}
+
+// ── w1-aa84b45dd-v2: LIVELOCK REGRESSION (gate-2 REJECTED the prior branch e652eca7 for this) ──
+//
+// The prior branch gated the crank's fee collection on `portfolio.header.b_stale_state == 0`
+// (the account's state ON ENTRY to the instruction). That misses the "becomes B-stale DURING
+// this call" case: `collect_maintenance_fee_before_value_debit_view` -> engine
+// `sync_account_fee_to_slot_not_atomic` (percolator `src/v16.rs:20356`) calls
+// `settle_account_side_effects_not_atomic`, which for a B-backlog exceeding one bounded
+// `public_b_chunk_atoms` chunk computes `Ok(AccountBChunk(_))` -- durably marking the account
+// B-stale and consuming one chunk on the SAME zero-copy view the rest of the instruction uses --
+// but then CONVERTS that outcome into `Err(V16Error::BStale)` (`src/v16.rs:20386-20394`) instead
+// of returning it. The prior code let that `Err` propagate via `?`, reverting the WHOLE
+// instruction: Solana discards every account mutation a failed instruction made, including the
+// chunk progress and the B-stale mark that had already landed. Every subsequent
+// Refresh(0)/Liquidate(1)/SettleB(2) call therefore re-enters with `b_stale_state` still 0,
+// re-hits the identical error, and reverts again -- a PERMANENT LIVELOCK reachable whenever
+// `public_b_chunk_atoms` (an admin knob with no minimum validation) is bounded below an
+// account's B-backlog. An underwater account stuck this way could never be liquidated, because
+// even the crank's own designated remedy action, SettleB(2), was blocked by this SAME shared
+// fee-collection preamble on its very first call.
+//
+// The fix (see `handle_permissionless_crank_zero_copy`) handles `EngineBStale` from the
+// fee-collection call site gracefully: skip fee collection for this call only, let the
+// instruction return `Ok(())`, and let the crank's own already chunk-tolerant Refresh/SettleB
+// engine paths (`permissionless_crank_not_atomic`) proceed and make real, durable progress.
+//
+// This test must FAIL (an `Err` from the very first crank call) on the pre-fix
+// `b_stale_state == 0`-gated-and-propagated code, and PASS (every call `Ok`, the backlog fully
+// drains, and a genuinely liquidatable account can still be liquidated afterward) with the fix.
+#[test]
+fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() {
+    // Bounded (NOT `MAX_VAULT_TVL`/u128::MAX) per-call atom budget -- an admin could plausibly
+    // configure a small value like this, and it is exactly the case the old code livelocked on.
+    const CHUNK_ATOMS: u128 = 2;
+    // A LONG/SHORT-domain B-index debt that needs several `CHUNK_ATOMS`-sized chunks to fully
+    // settle (>1 chunk is the whole point -- a single-chunk backlog never diverges between the
+    // old and new code, since `settle_account_side_effects_not_atomic` only returns
+    // `AccountBChunk` when `remaining_after != 0` after one chunk).
+    const DEBT_B: u128 = 7_000_000_000_000_000;
+    const MAX_PROGRESS_CALLS: usize = 12;
+
+    // ---- Phase 1: Refresh(0) progresses a b_stale_state==0, backlog-exceeding account
+    // instead of reverting on every call. ----
+    {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            max_portfolio_assets: 1,
+            public_b_chunk_atoms: CHUNK_ATOMS,
+            maintenance_fee_per_slot: 1,
+            ..V16CuMarketParams::default()
+        });
+        let victim_owner = Keypair::new();
+        let cp_owner = Keypair::new();
+        let victim = env.create_portfolio(&victim_owner);
+        let cp = env.create_portfolio(&cp_owner);
+        env.deposit(&victim_owner, victim, 1_000_000);
+        env.deposit(&cp_owner, cp, 1_000_000);
+        // victim LONG 1 unit @ 100 against cp (SHORT).
+        env.trade_with_cu(&victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+        let last_fee_slot_at_deposit = env.portfolio_state(victim).last_fee_slot;
+        // Pre-advance the asset's own `slot_last` past `last_fee_slot` via a real engine
+        // accrual (price unchanged), BEFORE seeding the backlog or running any crank. This is
+        // load-bearing for reproducing the exact bug: `sync_account_fee_to_slot_not_atomic`'s
+        // `fee_anchor` is capped at `min(now_slot, asset.slot_last)`
+        // (`account_fee_anchor_for_loss_currentness`, `src/v16.rs:16614`), so on a truly FRESH
+        // leg (`asset.slot_last` still at trade time) the first crank call's OWN fee-collection
+        // sync would short-circuit on `fee_anchor <= last_fee_slot` BEFORE ever reaching the
+        // B-check -- the crank_action's OWN independent (already-tolerant) B-check would then
+        // be the first to mark the account b-stale, which the old `b_stale_state == 0` gate
+        // handles correctly by coincidence (b_stale_state is already 1 by the NEXT call). With
+        // `slot_last` pre-advanced, the FIRST crank call's fee-collection sync itself reaches
+        // the B-check while `b_stale_state` is still 0 entering -- the exact "becomes B-stale
+        // DURING this call" scenario the fix targets.
+        let accrual_slot = last_fee_slot_at_deposit + 1;
+        env.mutate_market(|_cfg, group| {
+            group.accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true).unwrap();
+        });
+        // Seed a real, outstanding LONG-domain B debt exceeding one chunk (mirrors the CW04
+        // fixture in tests/v16_wrapper.rs): `b_target_for_leg` reports `b_remaining = DEBT_B`
+        // for the victim's Long leg whose own `b_snap` is still 0.
+        env.mutate_market(|_cfg, group| {
+            group.assets[0].b_long_num = DEBT_B;
+        });
+        assert!(
+            !env.portfolio_state(victim).b_stale_state,
+            "fixture setup: victim must enter b_stale_state==0"
+        );
+
+        let mut cleared = false;
+        for i in 0..MAX_PROGRESS_CALLS {
+            let slot = accrual_slot + i as u64;
+            env.svm.warp_to_slot(slot);
+            let result = env.send(
+                ProgInstruction::PermissionlessCrank {
+                    action: 0,
+                    asset_index: 0,
+                    now_slot: slot,
+                    funding_rate_e9: 0,
+                    recovery_reason: 0,
+                },
+                vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(victim, false),
+                ],
+                &[],
+            );
+            assert!(
+                result.is_ok(),
+                "FIX regression (livelock): PermissionlessCrank Refresh(0) call #{i} against a \
+                 B-backlog exceeding one chunk must return Ok (graceful EngineBStale skip), not \
+                 revert -- got {result:?}"
+            );
+            if !env.portfolio_state(victim).b_stale_state {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(
+            cleared,
+            "Refresh(0) must fully clear the B-backlog within {MAX_PROGRESS_CALLS} calls \
+             instead of livelocking"
+        );
+        assert_eq!(
+            env.portfolio_state(victim).legs[0].b_snap, DEBT_B,
+            "the leg's b_snap must reach the full seeded backlog once settlement completes"
+        );
+    }
+
+    // ---- Phase 2: SettleB(2) -- the crank's own designated remedy action for a B-stale
+    // account -- must ALSO progress rather than revert on the very first call. Under the old
+    // `b_stale_state == 0` gate this was blocked identically to Refresh/Liquidate, because the
+    // gate runs BEFORE the crank_action dispatch for every action. ----
+    {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            max_portfolio_assets: 1,
+            public_b_chunk_atoms: CHUNK_ATOMS,
+            maintenance_fee_per_slot: 1,
+            ..V16CuMarketParams::default()
+        });
+        let victim_owner = Keypair::new();
+        let cp_owner = Keypair::new();
+        let victim = env.create_portfolio(&victim_owner);
+        let cp = env.create_portfolio(&cp_owner);
+        env.deposit(&victim_owner, victim, 1_000_000);
+        env.deposit(&cp_owner, cp, 1_000_000);
+        env.trade_with_cu(&victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+        let last_fee_slot_at_deposit = env.portfolio_state(victim).last_fee_slot;
+        // See Phase 1's comment: pre-advance `asset.slot_last` so the FIRST crank call's own
+        // fee-collection sync (not just the crank_action's independent B-check) is the one that
+        // discovers the backlog while `b_stale_state` is still 0 entering.
+        let accrual_slot = last_fee_slot_at_deposit + 1;
+        env.mutate_market(|_cfg, group| {
+            group.accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true).unwrap();
+        });
+        env.mutate_market(|_cfg, group| {
+            group.assets[0].b_long_num = DEBT_B;
+        });
+        assert!(!env.portfolio_state(victim).b_stale_state);
+
+        let mut cleared = false;
+        for i in 0..MAX_PROGRESS_CALLS {
+            let slot = accrual_slot + i as u64;
+            env.svm.warp_to_slot(slot);
+            let result = env.send(
+                ProgInstruction::PermissionlessCrank {
+                    action: 2,
+                    asset_index: 0,
+                    now_slot: slot,
+                    funding_rate_e9: 0,
+                    recovery_reason: 0,
+                },
+                vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(victim, false),
+                ],
+                &[],
+            );
+            assert!(
+                result.is_ok(),
+                "FIX regression (livelock): PermissionlessCrank SettleB(2) call #{i} against a \
+                 B-backlog exceeding one chunk must return Ok, not revert -- got {result:?}"
+            );
+            if !env.portfolio_state(victim).b_stale_state {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(
+            cleared,
+            "SettleB(2) must fully clear the B-backlog within {MAX_PROGRESS_CALLS} calls \
+             instead of livelocking"
+        );
+    }
+
+    // ---- Phase 3: a liquidatable account CAN be liquidated. Drains a B-backlog on the SHORT
+    // domain while the account is still solvent (proving the crank doesn't livelock even on an
+    // account this test goes on to liquidate), THEN drives it deeply bankrupt via a direct pnl
+    // write (isolating "does the crank's Liquidate action still work post-fix" from the K/F
+    // funding-basis accounting a real multi-step price crash would additionally exercise -- not
+    // this regression's subject), and asserts Liquidate(1) still succeeds and fully closes the
+    // leg instead of being permanently blocked. ----
+    {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            max_portfolio_assets: 1,
+            public_b_chunk_atoms: CHUNK_ATOMS,
+            maintenance_fee_per_slot: 1,
+            ..V16CuMarketParams::default()
+        });
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long_account = env.create_portfolio(&long_owner);
+        let short_account = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long_account, 1_000_000);
+        env.deposit(&short_owner, short_account, 1_000_000);
+        env.trade_with_cu(
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            100,
+            0,
+        );
+        let last_fee_slot_at_deposit = env.portfolio_state(short_account).last_fee_slot;
+        // See Phase 1's comment: pre-advance `asset.slot_last` so the FIRST crank call's own
+        // fee-collection sync (not just the crank_action's independent B-check) is the one that
+        // discovers the backlog while `b_stale_state` is still 0 entering.
+        let accrual_slot = last_fee_slot_at_deposit + 1;
+        env.mutate_market(|_cfg, group| {
+            group.accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true).unwrap();
+        });
+        // Seed a real, outstanding SHORT-domain B debt on the victim's leg, exceeding one
+        // chunk.
+        env.mutate_market(|_cfg, group| {
+            group.assets[0].b_short_num = DEBT_B;
+        });
+        assert!(
+            !env.portfolio_state(short_account).b_stale_state,
+            "fixture setup: victim must enter b_stale_state==0"
+        );
+
+        let mut cleared = false;
+        let mut drain_calls = 0u64;
+        for i in 0..MAX_PROGRESS_CALLS {
+            let slot = accrual_slot + i as u64;
+            drain_calls = slot;
+            env.svm.warp_to_slot(slot);
+            let result = env.send(
+                ProgInstruction::PermissionlessCrank {
+                    action: 0,
+                    asset_index: 0,
+                    now_slot: slot,
+                    funding_rate_e9: 0,
+                    recovery_reason: 0,
+                },
+                vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(short_account, false),
+                ],
+                &[],
+            );
+            assert!(
+                result.is_ok(),
+                "FIX regression (livelock): Refresh(0) draining call #{i} on the eventually-\
+                 liquidated account must return Ok, not revert -- got {result:?}"
+            );
+            if !env.portfolio_state(short_account).b_stale_state {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(
+            cleared,
+            "the B-backlog must fully clear within {MAX_PROGRESS_CALLS} calls before this \
+             account can be meaningfully liquidated"
+        );
+
+        // Restore `public_b_chunk_atoms` to its unbounded default before driving the account
+        // bankrupt and liquidating it. A BOUNDED chunk budget is exactly what this phase needed
+        // above to prove the crank drains a real backlog without livelocking; it is orthogonal
+        // to (and, empirically, a confound for) the liquidation-sizing math this phase exercises
+        // next -- with no outstanding B-backlog left (`cleared` above), nothing here still
+        // depends on the bound, so restoring it isolates "does Liquidate(1) still work post-fix"
+        // from that unrelated interaction.
+        env.mutate_market(|_cfg, group| {
+            group.config.public_b_chunk_atoms = percolator::MAX_VAULT_TVL;
+        });
+
+        // Drive the account genuinely bankrupt via a SECOND, much larger B-domain debt (same
+        // engine-native settlement path already proven above, not a raw pnl/capital write): with
+        // `public_b_chunk_atoms` now unbounded, this settles fully in one crank call and
+        // realizes real, conservation-safe loss into pnl via
+        // `set_account_pnl_after_domain_first_source_claim_burn` -- unlike a direct pnl poke,
+        // this keeps `c_tot` and the domain/insurance ledgers internally consistent, which a raw
+        // write does not (a raw pnl write reproducibly hit `EngineCounterUnderflow` deeper in
+        // `liquidate_account_not_atomic`'s residual-booking path during development of this
+        // test). `BANKRUPTCY_DEBT_B` is scaled so the realized loss (`loss_weight * delta_b /
+        // SOCIAL_LOSS_DEN`) is comfortably larger than the account's ~1_000_000-atom deposit.
+        const BANKRUPTCY_DEBT_B: u128 = 10 * 1_000_000_000_000_000_000_000; // 10 * SOCIAL_LOSS_DEN
+        env.mutate_market(|_cfg, group| {
+            group.assets[0].b_short_num = group
+                .assets[0]
+                .b_short_num
+                .checked_add(BANKRUPTCY_DEBT_B)
+                .expect("test setup: BANKRUPTCY_DEBT_B must not overflow b_short_num");
+        });
+        let liq_slot = drain_calls + 1;
+        env.svm.warp_to_slot(liq_slot);
+        env.crank(
+            short_account,
+            ProgInstruction::PermissionlessCrank {
+                action: 0,
+                asset_index: 0,
+                now_slot: liq_slot,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+        );
+        assert!(
+            env.portfolio_state(short_account).health_cert.certified_equity < 0,
+            "test setup: settling BANKRUPTCY_DEBT_B must certify as genuinely bankrupt"
+        );
+        assert!(
+            !percolator::active_bitmap_is_empty(env.portfolio_state(short_account).active_bitmap),
+            "victim must still hold the short leg going into liquidation"
+        );
+
+        let liq_result = env.send(
+            ProgInstruction::PermissionlessCrank {
+                action: 1,
+                asset_index: 0,
+                now_slot: liq_slot,
+                funding_rate_e9: 0,
+                recovery_reason: 0,
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(short_account, false),
+            ],
+            &[],
+        );
+        assert!(
+            liq_result.is_ok(),
+            "a liquidatable account CAN be liquidated: Liquidate(1) on a now-current, \
+             genuinely bankrupt account must succeed -- got {liq_result:?}"
+        );
+        assert!(
+            percolator::active_bitmap_is_empty(env.portfolio_state(short_account).active_bitmap),
+            "a genuinely bankrupt account must be fully closed by the liquidation, not left \
+             with a dangling partial position"
+        );
+    }
+}
+
 #[test]
 fn v16_bpf_nonflat_fee_sync_settles_hidden_loss_before_sweeping_fee() {
     let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
