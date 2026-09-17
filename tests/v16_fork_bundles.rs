@@ -66,6 +66,7 @@ fn hybrid_profile(max_staleness_secs: u64) -> AssetOracleProfileV16 {
         funding_mark_pending_e6: 0,
         funding_mark_pending_slot: 0,
         _padding1: [0u8; 8],
+        terminal_slab_scan_progress: 0,
     }
 }
 

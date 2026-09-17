@@ -14,7 +14,8 @@ use alloc::vec::Vec;
 use percolator::{
     v16_domain_count_for_market_slots, AutoCrankWorkV16, BackingBucketStatusV16, MarketModeV16,
     PermissionlessCrankActionV16, PermissionlessCrankRequestV16, RebalanceRequestV16, SideV16,
-    SourceCreditStateV16, TradeRequestV16, V16Config, V16Error, BOUND_SCALE,
+    SourceCreditStateV16, TerminalSlabOutcomeV16, TradeRequestV16, V16Config, V16Error,
+    BOUND_SCALE,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -111,7 +112,20 @@ pub mod constants {
     // upgrade -- the legacy-sentinel semantics `advance_funding_mark_
     // checkpoint_view` already gives zero ("not yet initialized, backfill from
     // mark_ewma_e6") mean no migration instruction is needed.
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 464;
+    //
+    // FIX (ADOPT upstream `547847ed` + `d134c64d`, adapted): 464 -> 480 for
+    // `terminal_slab_scan_progress: u128` (16 bytes), the CloseSlab windowed
+    // terminal-slab-scan cursor. Upstream stores this in `WrapperConfigV16` at
+    // offset 160, which collides byte-exact with our LIVE
+    // `insurance_withdraw_deposit_remaining` (KL-FIELD-01) -- so it is APPENDED
+    // here instead, at our own tail (464), never at upstream's literal offset.
+    // 464 is already a multiple of 16, so no additional explicit padding is
+    // needed to keep the layout Pod-safe. Still inside the fixed 512-byte
+    // `ASSET_ORACLE_WRAPPER_LEN` slot (32 spare after this), so
+    // `MARKET_ASSET_SLOT_LEN` is unchanged and no offset moves. Deployed asset-0
+    // slots read this as zero after an in-place upgrade, which correctly means
+    // "full rescan from asset 0" -- no migration instruction is needed.
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 480;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1526,6 +1540,32 @@ pub mod state {
         /// always-zero (checked in `validate_asset_oracle_profile`) rather than
         /// implicit.
         pub _padding1: [u8; 8],
+
+        /// FIX (ADOPT upstream `547847ed` "invalidate terminal scan prefix after
+        /// backing expiry" + its neighbour test `d134c64d`, adapted --
+        /// ABI_LANDMINE_REGISTRY.md / adopt_terminal_slab.md): the `CloseSlab`
+        /// windowed terminal-slab scan's persisted continuation cursor (an
+        /// encoded next-asset-index; 0 means "start of scan"). Activates the
+        /// already-merged engine I2/K fix (#258, `first_terminal_claim_free_
+        /// recredit_asset` re-check) from dormant to load-bearing -- see
+        /// `handle_close_slab`.
+        ///
+        /// Upstream stores this as `WrapperConfigV16::terminal_slab_scan_progress`
+        /// at byte offset 160, but that offset is already LIVE on our fork as
+        /// `insurance_withdraw_deposit_remaining` (KL-FIELD-01) -- a same-offset,
+        /// same-type, different-meaning collision, not free dead space. Carved
+        /// here instead, into asset-0's spare tail, following the GH#420/GH#444
+        /// precedent that asset 0's profile carries market-wide state the config
+        /// mirrors. Only asset 0's copy is read or written.
+        ///
+        /// `ASSET_ORACLE_PROFILE_LEN` grows 464 -> 480 (see the constant's own
+        /// doc comment). 464 is already a multiple of 16, so this 16-byte `u128`
+        /// append needs no additional explicit padding to stay Pod-safe. Still
+        /// inside the fixed 512-byte `ASSET_ORACLE_WRAPPER_LEN` slot (32 bytes
+        /// spare afterward). Deployed asset-0 slots read this as zero after an
+        /// in-place upgrade, which correctly means "full rescan from asset 0" --
+        /// no migration instruction is needed.
+        pub terminal_slab_scan_progress: u128,
     }
 
     // Compile-time guard (ABI_LANDMINE_REGISTRY.md W0-1: "our fork's build will NOT
@@ -2293,6 +2333,7 @@ pub mod state {
             funding_mark_pending_e6: 0,
             funding_mark_pending_slot: 0,
             _padding1: [0u8; 8],
+            terminal_slab_scan_progress: 0,
         }
     }
 
@@ -2338,6 +2379,7 @@ pub mod state {
             funding_mark_pending_e6: 0,
             funding_mark_pending_slot: 0,
             _padding1: [0u8; 8],
+            terminal_slab_scan_progress: 0,
         }
     }
 
@@ -13466,6 +13508,42 @@ pub mod processor {
         )
     }
 
+    /// ADOPT upstream `547847ed`'s base mechanism (ported near-verbatim; ~15
+    /// lines): decode the persisted cursor into a scan-start asset index. `0`
+    /// (fresh/never-scanned) always means "start of scan" regardless of
+    /// `configured_assets`.
+    fn terminal_slab_scan_start(
+        encoded: u128,
+        configured_assets: usize,
+    ) -> Result<usize, ProgramError> {
+        if encoded == 0 {
+            return Ok(0);
+        }
+        let next_asset = usize::try_from(
+            u64::try_from(encoded).map_err(|_| PercolatorError::InvalidInstruction)?,
+        )
+        .map_err(|_| PercolatorError::InvalidInstruction)?;
+        if next_asset >= configured_assets {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(next_asset)
+    }
+
+    /// ADOPT upstream `547847ed`'s base mechanism (ported near-verbatim): encode
+    /// a scan continuation index for persistence in
+    /// `AssetOracleProfileV16::terminal_slab_scan_progress`.
+    fn encode_terminal_slab_scan_progress(
+        next_asset_index: usize,
+        configured_assets: usize,
+    ) -> Result<u128, ProgramError> {
+        if next_asset_index >= configured_assets {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let next_asset =
+            u64::try_from(next_asset_index).map_err(|_| PercolatorError::InvalidInstruction)?;
+        Ok(u128::from(next_asset))
+    }
+
     #[inline(never)]
     fn handle_close_slab<'a>(
         program_id: &Pubkey,
@@ -13481,67 +13559,236 @@ pub mod processor {
         expect_writable(admin_dest)?;
         expect_writable(market_ai)?;
         expect_writable(vault_token)?;
+        // ADOPT upstream `547847ed` context (base windowed-scan handler): burning
+        // unbudgeted residue below requires `dest_token` to also receive the
+        // ordinary sweep amount, so it must be writable too -- our pre-port
+        // handler never wrote to it, only read it for the mint/owner check.
+        expect_writable(dest_token)?;
         if admin_dest.key == market_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         expect_owner(market_ai, program_id)?;
         verify_token_program(token_program)?;
 
-        let cfg_pre = {
+        let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+
+        // ADOPT-WITH-ADAPTATION upstream `547847ed` "invalidate terminal scan
+        // prefix after backing expiry" (+ neighbour test `d134c64d`): replaces the
+        // old unconditional "vault and insurance must already be zero" precondition
+        // with upstream's permissionless WINDOWED terminal-slab scan. This
+        // activates the engine's `advance_terminal_slab_not_atomic` (already
+        // carrying our I2/K fix, PR #258, previously dormant because nothing
+        // called it) and its recredit/expiry bookkeeping.
+        //
+        // NOT ported: upstream's `expected_authority_epoch` parameter /
+        // `require_authority_epoch_view` call on this tag (Track-B AE binding,
+        // ABI_OVERHAUL_SCOPE.md §1) -- logically orthogonal to the scan mechanism,
+        // deliberately deferred so this stays a wire-compatible, non-Track-B unit.
+        // Tag 13 (`CloseSlab`) keeps its existing bare, payload-free wire shape.
+        //
+        // NOT ported: upstream `236b4f85` "retire native booked residue without
+        // burn" (a LATER, separate fix for markets whose primary collateral is
+        // wrapped SOL, which can't be `burn`ed) -- out of scope for this unit; the
+        // burn below matches upstream's OWN shape as of `547847ed`, before that
+        // follow-up landed. A market whose primary collateral is the native mint
+        // will fail this burn CPI if it ever accumulates unbudgeted terminal
+        // residue -- flagged for a follow-up sync unit, not silently dropped.
+        //
+        // OPTION-(B) SCOPE GATE (this unit, NOT upstream): preserves the existing
+        // "CloseSlab permanently blocked by the LP-vault dead-share floor"
+        // guarantee that `tests/v16_fork_lp_vault_redeem.rs`'s
+        // `lp_shares_held_at_resolution_can_redeem_and_teardown_vault` and
+        // `lpvault359_redemption_stub_tracked_and_teardown_completes` assert by
+        // design (LP_VAULT_MINIMUM_LIQUIDITY dead-share floor -- Uniswap-V2 /
+        // ERC4626 style permanent minimum-liquidity trade-off).
+        //
+        // REJECTED FIRST DRAFT (recorded for the next reader): gating on
+        // `source_fresh_backing_total_num != 0` alone is WRONG -- it is also
+        // nonzero for an ORDINARY market with a live, not-yet-lapsed backing
+        // bucket, and a bare pre-scan check on it would block the scan from ever
+        // running the `Expire` step that is the ONLY thing that can bring that
+        // counter back to zero. That would brick the general (non-LP-vault) case
+        // this unit is supposed to activate, not just the LP-vault one.
+        //
+        // THE ACTUAL SIGNAL: an LP-vault-owned backing bucket is created with
+        // `constants::LP_VAULT_BACKING_EXPIRY_SLOT` (`u64::MAX / 2`) as its
+        // `expiry_slot` -- a sentinel meaning "never expires", already relied on
+        // elsewhere in this file (`handle_deposit_to_lp_vault`'s already-funded
+        // guard) to recognize an LP-vault-bound domain. Confirmed empirically
+        // (diagnostic run against `lp_shares_held_at_resolution_can_redeem_and_
+        // teardown_vault`'s market state): its dead-share-floor domain sits at
+        // `status: Fresh, expiry_slot: 9223372036854775807 (== u64::MAX / 2)`,
+        // which can NEVER satisfy `kernel_terminal_slab_asset_step`'s
+        // `long_expiry_slot <= authenticated_slot` `Expire` condition for any
+        // slot this chain will ever reach -- so the scan can only ever return
+        // `Wait` / `ScanProgress` for it, not `BackingExpired`, and
+        // `source_fresh_backing_total_num` for that domain can never reach zero
+        // by any path (the LP-vault registry PDA also cannot sign a generic
+        // `WithdrawBackingBucket` outside the vault's own instruction-scoped
+        // `invoke_signed` calls). A market carrying such a domain must therefore
+        // stay blocked UNCONDITIONALLY, on every call, not just once parked --
+        // which a bare `source_fresh_backing_total_num` check does not achieve
+        // either (the observed failure was the scan returning `Ok`/`ScanProgress`
+        // on the very first call, before the cursor ever parks).
+        //
+        // This is a narrow, same-sentinel mirror of the existing
+        // `handle_deposit_to_lp_vault` already-funded guard, not a new concept:
+        // scan every domain for "funded AND stamped with the permanent LP-vault
+        // sentinel", and refuse outright if any is found. An ordinary market
+        // never sets this sentinel, so this never fires for -- and never blocks
+        // scan progress on -- the general non-LP-vault case.
+        let lp_vault_dead_share_floor_present = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let configured_domains = v16_domain_count_for_market_slots(
+                group.header.config.max_market_slots.get(),
+            )
+            .map_err(map_v16_error)?;
+            let mut found = false;
+            for domain in 0..configured_domains {
+                let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+                let funded = bucket.status != BackingBucketStatusV16::Empty
+                    || bucket.fresh_unliened_backing_num > 0
+                    || bucket.valid_liened_backing_num > 0
+                    || bucket.consumed_liened_backing_num > 0
+                    || bucket.impaired_liened_backing_num > 0;
+                if funded && bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if lp_vault_dead_share_floor_present {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+
+        let (cfg_pre, retired_unbudgeted_insurance, vault_balance, secondary_close) = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             expect_live_authority(&cfg.marketauth, admin_dest.key)?;
             if group.header.mode != 1 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            if group.header.vault.get() != 0
-                || group.header.insurance.get() != 0
-                || group.header.c_tot.get() != 0
-                || group.header.materialized_portfolio_count.get() != 0
+            if group.header.c_tot.get() != 0 || group.header.materialized_portfolio_count.get() != 0
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            cfg
+            let primary_mint = primary_collateral_mint(&cfg);
+            verify_vault_token_account(vault_token, &vault_authority, &primary_mint)?;
+            let vault_balance = unpack_token_account(vault_token)?.amount;
+            verify_user_token_account(dest_token, admin_dest.key, &primary_mint)?;
+            let secondary_close = if cfg.secondary_collateral_mint != [0u8; 32] {
+                let secondary_vault_token = account(accounts, 6)?;
+                let secondary_dest_token = account(accounts, 7)?;
+                expect_writable(secondary_vault_token)?;
+                expect_writable(secondary_dest_token)?;
+                if secondary_vault_token.key == vault_token.key
+                    || secondary_dest_token.key == dest_token.key
+                {
+                    return Err(PercolatorError::InvalidVaultAccount.into());
+                }
+                let secondary_mint = secondary_collateral_mint(&cfg)?;
+                verify_vault_token_account(secondary_vault_token, &vault_authority, &secondary_mint)?;
+                let secondary_vault_balance = unpack_token_account(secondary_vault_token)?.amount;
+                verify_user_token_account(secondary_dest_token, admin_dest.key, &secondary_mint)?;
+                Some((
+                    secondary_vault_token,
+                    secondary_dest_token,
+                    secondary_vault_balance,
+                ))
+            } else {
+                None
+            };
+
+            // Cursor storage: carved into asset-0's `AssetOracleProfileV16` spare
+            // tail (`terminal_slab_scan_progress`), NOT `WrapperConfigV16` --
+            // upstream's offset-160 field collides byte-exact with our LIVE
+            // `insurance_withdraw_deposit_remaining` (KL-FIELD-01). Writing via
+            // `write_oracle_profile_to_view` mutates `group`'s own backing bytes
+            // directly (zero-copy), so no separate `write_wrapper_config` call is
+            // needed the way upstream's cfg-based cursor requires.
+            let authenticated_slot = authenticated_market_slot_or_fallback_view(&group);
+            let configured_assets = group.header.config.max_market_slots.get() as usize;
+            let mut cursor_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
+            let scan_start = terminal_slab_scan_start(
+                cursor_profile.terminal_slab_scan_progress,
+                configured_assets,
+            )?;
+            // FORK-only engine 3rd parameter (`35ac35c4`/`0efa8f22`, "terminal
+            // retirement fails closed on a protocol-fee reserve" -- absent
+            // upstream, whose call site takes only 2 args). Pass 0: this wrapper
+            // does not reserve a protocol fee out of terminal retirement, so this
+            // is upstream-equivalent behavior (see the engine's own doc comment
+            // on `advance_terminal_slab_not_atomic`: "Pass `0` for upstream
+            // behavior").
+            let retired = match group
+                .advance_terminal_slab_not_atomic(authenticated_slot, scan_start, 0)
+                .map_err(map_v16_error)?
+            {
+                TerminalSlabOutcomeV16::ScanProgress { next_asset_index } => {
+                    cursor_profile.terminal_slab_scan_progress =
+                        encode_terminal_slab_scan_progress(next_asset_index, configured_assets)?;
+                    write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+                    return Ok(());
+                }
+                TerminalSlabOutcomeV16::BackingExpired { .. } => {
+                    // ADOPT upstream `547847ed`: reset to 0 (full rescan) rather
+                    // than resuming at `domain / 2`. Expiring a backing bucket can
+                    // retroactively make a LOWER-indexed, already-scanned-past
+                    // asset newly recreditable; resuming above it would silently
+                    // skip it forever. Covered by `d134c64d`'s
+                    // `inv_070_terminal_scan_recredit` test (ported below as
+                    // `terminal_scan_prefix_invalidated_after_backing_expiry`).
+                    cursor_profile.terminal_slab_scan_progress = 0;
+                    write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+                    return Ok(());
+                }
+                TerminalSlabOutcomeV16::InsuranceRecredited { asset_index, .. } => {
+                    cursor_profile.terminal_slab_scan_progress =
+                        encode_terminal_slab_scan_progress(asset_index, configured_assets)?;
+                    write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+                    return Ok(());
+                }
+                TerminalSlabOutcomeV16::ReadyToClose { retired } => {
+                    retired
+                }
+            };
+            cursor_profile.terminal_slab_scan_progress = 0;
+            write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+            (cfg, retired, vault_balance, secondary_close)
         };
 
-        let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
-        expect_key(vault_authority_ai, &vault_authority)?;
         let primary_mint = primary_collateral_mint(&cfg_pre);
-        verify_vault_token_account(vault_token, &vault_authority, &primary_mint)?;
-        let vault_account = unpack_token_account(vault_token)?;
-        verify_user_token_account(dest_token, admin_dest.key, &primary_mint)?;
+        let retired_u64 = amount_to_u64(retired_unbudgeted_insurance)?;
+        let primary_sweep_amount = vault_balance
+            .checked_sub(retired_u64)
+            .ok_or(PercolatorError::InvalidTokenAccount)?;
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
-        let secondary_close = if cfg_pre.secondary_collateral_mint != [0u8; 32] {
-            let secondary_vault_token = account(accounts, 6)?;
-            let secondary_dest_token = account(accounts, 7)?;
-            expect_writable(secondary_vault_token)?;
-            expect_writable(secondary_dest_token)?;
-            if secondary_vault_token.key == vault_token.key
-                || secondary_dest_token.key == dest_token.key
-            {
-                return Err(PercolatorError::InvalidVaultAccount.into());
-            }
-            let secondary_mint = secondary_collateral_mint(&cfg_pre)?;
-            verify_vault_token_account(secondary_vault_token, &vault_authority, &secondary_mint)?;
-            let secondary_vault_account = unpack_token_account(secondary_vault_token)?;
-            verify_user_token_account(secondary_dest_token, admin_dest.key, &secondary_mint)?;
-            Some((
-                secondary_vault_token,
-                secondary_dest_token,
-                secondary_vault_account.amount,
-            ))
-        } else {
-            None
-        };
-
-        if vault_account.amount > 0 {
+        if retired_u64 != 0 {
+            let primary_mint_index = if secondary_close.is_some() { 8 } else { 6 };
+            let primary_mint_ai = account(accounts, primary_mint_index)?;
+            expect_writable(primary_mint_ai)?;
+            expect_key(primary_mint_ai, &primary_mint)?;
+            verify_mint(primary_mint_ai)?;
+            burn_tokens_signed(
+                token_program,
+                vault_token,
+                primary_mint_ai,
+                vault_authority_ai,
+                retired_u64,
+                signer_seeds,
+            )?;
+        }
+        if primary_sweep_amount > 0 {
             transfer_tokens_signed(
                 token_program,
                 vault_token,
                 dest_token,
                 vault_authority_ai,
-                vault_account.amount,
+                primary_sweep_amount,
                 signer_seeds,
             )?;
         }
@@ -15623,6 +15870,7 @@ pub mod processor {
                 funding_mark_pending_e6: 0,
                 funding_mark_pending_slot: 0,
                 _padding1: [0u8; 8],
+                terminal_slab_scan_progress: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs,
@@ -15759,6 +16007,7 @@ pub mod processor {
                 funding_mark_pending_e6: 0,
                 funding_mark_pending_slot: 0,
                 _padding1: [0u8; 8],
+                terminal_slab_scan_progress: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -15875,6 +16124,7 @@ pub mod processor {
                 funding_mark_pending_e6: 0,
                 funding_mark_pending_slot: 0,
                 _padding1: [0u8; 8],
+                terminal_slab_scan_progress: 0,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -21533,6 +21783,44 @@ pub mod processor {
             &[
                 source.clone(),
                 dest.clone(),
+                authority.clone(),
+                token_program.clone(),
+            ],
+            signer_seeds,
+        )
+    }
+
+    /// ADOPT upstream (ported verbatim, `handle_close_slab`'s windowed
+    /// terminal-slab-scan retirement burns the market's unbudgeted terminal
+    /// insurance residue rather than transferring it to anyone -- there is no
+    /// remaining claimant once every portfolio, PnL claim, and per-domain budget
+    /// is empty). Absent from our fork before this port (`ABI_LANDMINE_REGISTRY.md`
+    /// / `adopt_terminal_slab.md` §1 step 5 flags it as a small, previously-unused
+    /// SPL-burn-CPI wrapper).
+    fn burn_tokens_signed<'a>(
+        token_program: &AccountInfo<'a>,
+        source: &AccountInfo<'a>,
+        mint: &AccountInfo<'a>,
+        authority: &AccountInfo<'a>,
+        amount: u64,
+        signer_seeds: &[&[&[u8]]],
+    ) -> Result<(), ProgramError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let ix = spl_token::instruction::burn(
+            token_program.key,
+            source.key,
+            mint.key,
+            authority.key,
+            &[],
+            amount,
+        )?;
+        invoke_signed(
+            &ix,
+            &[
+                source.clone(),
+                mint.clone(),
                 authority.clone(),
                 token_program.clone(),
             ],
