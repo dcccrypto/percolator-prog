@@ -14133,3 +14133,147 @@ fn v16_bpf_elsa_open_cohort_on_target_asset_is_refused_narrow_not_delete() {
         "expected EngineLockActive Custom(21), got: {msg}"
     );
 }
+
+// Adopt upstream ae78ea33 (percolator-prog) "require rent-exempt portfolio initialization".
+//
+// `InitPortfolio` reallocs an undersized portfolio account up to its canonical fixed
+// size (`state::portfolio_account_len_for_market_slots`, currently `PORTFOLIO_ACCOUNT_LEN`
+// regardless of market slot count) and then registers it as materialized custody with the
+// market. Pre-fix, nothing checked that the account's lamports still covered rent exemption
+// at that final size, so an underfunded caller (or an attacker deliberately starving the
+// account) could get a portfolio grown and registered while remaining eligible for
+// AccountsDb purge / rent collection once the epoch turns over — a phantom registration the
+// engine believes is live custody. The fix adds a `Rent::is_exempt` check, immediately after
+// the conditional realloc and before any state is written, returning the new
+// `RentExemptRequired` (Custom(64)) error.
+#[test]
+fn v16_program_init_portfolio_rejects_underfunded_rent_exemption() {
+    let mut env = V16CuEnv::new();
+    let owner = Keypair::new();
+    env.ensure_signer_account(owner.pubkey());
+
+    let required_len = env.portfolio_account_len;
+    let exempt_min = env.svm.minimum_balance_for_rent_exemption(required_len);
+    assert!(
+        exempt_min > 0,
+        "sanity: rent exemption minimum for the canonical portfolio size must be nonzero"
+    );
+
+    // Undersized data (0 bytes) forces InitPortfolio's realloc-to-canonical-size branch,
+    // and lamports are one below the exemption minimum AT THE FINAL (post-realloc) size.
+    // Pre-fix: realloc succeeds, no rent check follows, and the portfolio is registered
+    // underfunded. Post-fix: this must be rejected.
+    let portfolio = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: exempt_min - 1,
+                data: vec![0u8; 0],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let res = env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[&owner],
+    );
+    let msg = res.expect_err(
+        "InitPortfolio must reject a portfolio account that is one lamport short of rent \
+         exemption at its canonical realloc'd size",
+    );
+    assert!(
+        msg.contains("Custom(64)"),
+        "expected RentExemptRequired Custom(64), got: {msg}"
+    );
+
+    // Boundary control: EXACTLY rent-exempt at the final size must still succeed. This
+    // guards against an off-by-one over-reject hiding behind the negative case above.
+    let portfolio_ok = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            portfolio_ok,
+            Account {
+                lamports: exempt_min,
+                data: vec![0u8; 0],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio_ok, false),
+        ],
+        &[&owner],
+    )
+    .expect("exactly-rent-exempt portfolio init must remain live (not an over-reject)");
+}
+
+// Companion to the test above, isolating the EXACT gap upstream's fix closes rather than a
+// gap the SVM's own post-instruction rent-transition check would have caught anyway.
+//
+// The account here is ALREADY at the final canonical size and its lamports/size do not
+// change during the instruction at all (InitPortfolio only writes data content here; it
+// never transfers lamports and the realloc branch is not taken since data_len is already
+// `required_len`). Solana's runtime only disallows a WRITABLE account ENDING a transaction
+// non-rent-exempt when its lamports or data length CHANGED during that transaction
+// ("rent-paying transition" check) — an account that was already short of rent exemption
+// at an unchanged size/balance is grandfathered through untouched. That is precisely the
+// route the upstream fix closes: without an explicit application-level check, an
+// already-underfunded-but-correctly-sized portfolio account sails through registration
+// with the market silently, with no runtime backstop to catch it.
+#[test]
+fn v16_program_init_portfolio_rejects_preexisting_underfunded_final_size() {
+    let mut env = V16CuEnv::new();
+    let owner = Keypair::new();
+    env.ensure_signer_account(owner.pubkey());
+
+    let required_len = env.portfolio_account_len;
+    let exempt_min = env.svm.minimum_balance_for_rent_exemption(required_len);
+
+    let portfolio = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: exempt_min - 1,
+                data: vec![0u8; required_len],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let res = env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[&owner],
+    );
+    let msg = res.expect_err(
+        "InitPortfolio must reject a portfolio account that is already the canonical size \
+         but one lamport short of rent exemption, even though neither its size nor its \
+         lamports change during this instruction",
+    );
+    assert!(
+        msg.contains("Custom(64)"),
+        "expected RentExemptRequired Custom(64), got: {msg}"
+    );
+}

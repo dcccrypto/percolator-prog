@@ -57,8 +57,16 @@
 #    2  v16_nft_e2e                                  [UNDIAGNOSED - tracked]
 #
 # Reducing this list is tracked work, not a licence to ignore failures.
-e2e::e2e_cross_portfolio_substitution_rejects
-e2e::e2e_direct_hook_invocation_rejects
+#
+# 2026-09-17: e2e::e2e_cross_portfolio_substitution_rejects and
+# e2e::e2e_direct_hook_invocation_rejects REMOVED — both PASS on the nft sibling now
+# checked out at ../percolator-nft (db4dba14), confirmed identical in a clean stash of
+# this same worktree (pre-existing nft-sibling drift since this file's 2026-08-31/29
+# baseline, unrelated to the ae78ea33 adoption below). Left FOUND-not-fixed: this file's
+# enforced list was already a strict subset of the "34 non-matcher" narrative above before
+# this change (the 9 v16_fee_split / 4 v16_five_program_crosscut / 2 v16_nft_e2e categories
+# were never given literal names here), and today's measured counts on origin/main are 22 /
+# 6 / 8 respectively — reconciling that is a separate sibling-pin/ops task, not this one.
 v16_wrapper_close_portfolio_rejects_non_empty_and_closes_empty
 v16_wrapper_close_slab_requires_admin_resolved_empty_market
 v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_secondary_mint
@@ -129,3 +137,221 @@ v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
 # 11x6=66 -> Custom(9) from the product bound, 11x5 -> executes. It passes; it is not
 # allowlisted.
 # =========================================================================================
+
+# =========================================================================================
+# 2026-09-17 -- Wave-1 unit A-ae78ea33: adopt upstream ae78ea33 "require rent-exempt
+# portfolio initialization" (percolator-prog). 164 NEW entries below, ALL within
+# tests/v16_wrapper.rs (the `b4_*`/`cw02_*`/`cw03_*`/`f01_*`/`f05_*`-prefixed names are test
+# functions nested in submodules of that same file, not separate files). Read this before
+# adding a single one of these to any "real regression" tally.
+#
+# THE FIX: `handle_init_portfolio` now calls `Rent::get()?.is_exempt(portfolio_ai.lamports(),
+# required_portfolio_len)` immediately after its conditional realloc, returning the new
+# `RentExemptRequired` (Custom(64)) error on failure. Matches upstream exactly: no ABI/layout
+# change, one new error variant, one check. See src/v16_program.rs `handle_init_portfolio`.
+#
+# WHY 164 TESTS BELOW: `tests/v16_wrapper.rs` is the OTHER wrapper test harness -- a native
+# in-process `run_ix`/`TestAccount` path that calls `processor::process_instruction` directly
+# with NO BPF loader and NO sysvar stubs installed (see the pre-existing "sol_invoke_signed()
+# not available" and Clock::get()/`UnsupportedSysvar` commentary already in this file and at
+# tests/v16_wrapper.rs:2169 and :21535 -- this is the SAME structural class of gap, now hitting
+# a THIRD sysvar). `InitPortfolio` never called any `Sysvar::get()` before this fix; virtually
+# every test in this file calls the `init_portfolio()` helper (tests/v16_wrapper.rs:1003) as
+# setup, so `Rent::get()` returning `Err(ProgramError::UnsupportedSysvar)` before any handler
+# logic runs takes down every test whose FIRST failure point is that helper's `.unwrap()`.
+#
+# THIS IS NOT A FUNCTIONAL REGRESSION -- proven, not asserted: a byte-for-byte equivalent
+# LiteSVM harness (tests/v16_cu.rs, which DOES provide a real Rent sysvar) exercises the exact
+# same code path both ways and is GREEN:
+#   v16_program_init_portfolio_rejects_underfunded_rent_exemption
+#   v16_program_init_portfolio_rejects_preexisting_underfunded_final_size
+# The second of those is the one that actually matters: an A/B run proved the SVM's own
+# generic post-instruction rent-transition check already blocks the realloc-from-undersized
+# case with a bare `InsufficientFundsForRent`, so the NEW application-level gate's real job is
+# catching a portfolio account that is ALREADY at its canonical final size with pre-existing
+# insufficient lamports (size/lamports unchanged during the instruction, so the SVM's own
+# check grandfathers it through) -- pre-fix that case measured `Ok(_)`, silently accepting an
+# underfunded portfolio into materialized custody.
+#
+# MEASURED: A/B'd against a clean stash of this same worktree with `cargo test --no-fail-fast
+# --features devnet`. v16_fee_split (22 failed), v16_five_program_crosscut (6 failed), and
+# v16_nft_e2e (8 failed) are BYTE-IDENTICAL failing sets before and after this fix (pre-existing
+# stake/nft sibling .so drift, e.g. "BindInsuranceAuthority (v3 pool) — layout constants must
+# match the stake program: Custom(16)" -- unrelated to InitPortfolio). v16_wrapper.rs is
+# 273 passed / 19 failed baseline -> 108 passed / 184 failed with this fix; the 19 pre-existing
+# failures are an exact subset (0 newly-passing, 0 lost), and the delta is exactly the 164
+# names below (one duplicate function name collapsed the 165th).
+#
+# FOLLOW-UP (not attempted here, out of scope for a self-contained Wave-1 unit): install a
+# minimal `solana_program::program_stubs::SyscallStubs` override for `sol_get_rent_sysvar`
+# (returning `Rent::default()`, matching LiteSVM's own default cluster rent) in this file's
+# test setup. That would collapse this entire block back to 0 net-new entries and likely also
+# surface currently-undiagnosed LP-vault `Rent::get()` failures elsewhere in this same harness
+# (`create_pda_account` already calls it). Deliberately not done in this unit: it is a global,
+# process-wide `lazy_static` a fresh reviewer cannot audit against 292 tests inside one narrow,
+# low-risk hardening PR.
+# =========================================================================================
+b4_batch_with_taker_shortfall_and_maker_remainder_executes
+b4_old_guard_refusal_of_the_legitimate_state_no_longer_happens - should panic
+cw02_engine_primitive_leaves_no_one_sided_residue_for_a_cranker_to_forfeit
+cw02_forfeit_is_not_the_same_outcome_as_a_close_for_the_holder
+cw02_old_defect_tag64_refuses_the_full_size_close - should panic
+cw02_tag43_owner_forfeit_still_works_on_the_adl_recovery_leg
+cw02_tag64_full_size_closes_the_adl_pair_exactly
+cw02_tag64_raw_basis_budget_is_clamped_not_refused
+cw03_tag43_budget_is_collateral_atoms_under_the_new_name
+f01_w19_custom1_fires_before_the_engine_custom16
+f01_w19_old_f01_assertion_must_now_fail - should panic
+f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1
+f01_w19_version_is_18_and_every_kind_is_stamped_with_it
+f05_f02_lock_is_the_close_slot_available_gate_16955
+f05_f02_pending_residual_ledger_is_never_booked_through_the_wired_crank
+f05_f02_route3_open_ledger_still_hits_lock_active_through_the_wired_crank
+f05_live_mode_permissionless_crank_behaviour_is_unchanged
+f05_old_c_w_04_lock_assertions_must_now_fail - should panic
+f05_permissionless_crank_advances_recovery_to_resolved_and_unlocks_bystanders
+v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price
+v16_wrapper_account_kind_confusion_is_rejected_before_mutation
+v16_wrapper_account_layout_constants_match_serialized_state
+v16_wrapper_asset_authority_can_append_activate_and_trade_assets
+v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle
+v16_wrapper_auth_mark_trade_cannot_update_authority_mark
+v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recovery
+v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
+v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocpi_and_cpi
+v16_wrapper_backing_top_up_refills_provider_receivable_in_engine
+v16_wrapper_base_unit_authority_changes_primary_and_rotates
+v16_wrapper_base_unit_mint_rotation_rejects_nonempty_market_vault
+v16_wrapper_base_unit_secondary_withdraws_but_primary_only_deposits
+v16_wrapper_claim_resolved_payout_topup_pays_only_stored_owner_receipt
+v16_wrapper_close_portfolio_rejects_wrong_owner_without_mutation
+v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure
+v16_wrapper_close_resolved_becomes_permissionless_after_force_close_delay
+v16_wrapper_close_resolved_does_not_double_pay_after_closed_payout
+v16_wrapper_close_resolved_enforces_configured_force_close_delay
+v16_wrapper_close_resolved_is_permissionless_but_pays_only_owner_token_account
+v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clears
+v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger
+v16_wrapper_close_resolved_rejects_before_resolution_without_mutation
+v16_wrapper_close_resolved_requires_recipient_and_vault_accounts_for_payout
+v16_wrapper_close_resolved_uses_configured_fee_not_permissionless_caller_fee
+v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup
+v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark
+v16_wrapper_configure_hybrid_oracle_allows_empty_portfolio_grief_without_blocking_setup
+v16_wrapper_configure_hybrid_oracle_allows_prefunded_flat_portfolio_without_blocking_setup
+v16_wrapper_configure_hybrid_oracle_composes_toto_sol_cross_and_rejects_rollbacks
+v16_wrapper_configure_hybrid_oracle_rejects_after_positions_enter_market
+v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor
+v16_wrapper_convert_released_pnl_rejects_resolved_market_without_mutation
+v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal
+v16_wrapper_crank_clamp_uses_per_asset_dt_not_group_dt
+v16_wrapper_crank_per_asset_clamp_still_binds_extreme_target
+v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulates
+v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrapping
+v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_wrapping
+v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg
+v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_that
+v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconverted
+v16_wrapper_cross_market_portfolio_provenance_is_fail_closed
+v16_wrapper_cure_and_cancel_close_rejects_after_permissionless_resolve_maturity
+v16_wrapper_cure_and_cancel_close_rejects_resolved_market
+v16_wrapper_cure_and_cancel_close_uses_owner_deposit_before_support_is_consumed
+v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg
+v16_wrapper_deposit_rejects_noncanonical_vault
+v16_wrapper_deposit_rejects_without_token_accounts
+v16_wrapper_deposit_rejects_wrong_mint_and_insufficient_source_balance
+v16_wrapper_deposit_rejects_wrong_owner_and_bad_token_program
+v16_wrapper_deposit_withdraw_roundtrip_preserves_accounting
+v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_oracle_tail
+v16_wrapper_existing_portfolio_with_growth_capacity_survives_market_append
+v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing
+v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_insurance
+v16_wrapper_force_close_abandoned_asset_is_blocked_once_resolve_has_matured
+v16_wrapper_forfeit_recovery_leg_is_blocked_once_resolve_has_matured
+v16_wrapper_hybrid_after_hours_downward_mark_moves_effective_price
+v16_wrapper_hybrid_after_hours_fee_floor_scales_with_next_crank_segment_budget
+v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rejection
+v16_wrapper_hybrid_fresh_crank_tracks_external_composite_then_after_hours_trade_moves_mark
+v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved
+v16_wrapper_hybrid_hard_stale_uses_permissionless_resolve_not_recovery_kill_switch
+v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_oracle
+v16_wrapper_init_binds_market_and_portfolio_provenance
+v16_wrapper_init_portfolio_fee_anchor_tracks_crank_and_asset_lifecycle_time
+v16_wrapper_init_portfolio_requires_signer_and_rejects_double_init_without_mutation
+v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker
+v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_insurance
+v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses
+v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee
+v16_wrapper_lp_fee_claim_is_junior_to_bad_debt_coverage
+v16_wrapper_maintenance_fee_rejects_recovery_mode_without_mutation
+v16_wrapper_maintenance_fee_reward_account_absent_keeps_full_fee_in_insurance
+v16_wrapper_maintenance_fee_same_cranker_key_still_leaves_insurance_share
+v16_wrapper_maintenance_fee_sync_charges_recurring_fee_without_forcing_local_touch
+v16_wrapper_multiple_portfolios_same_owner_stay_isolated_and_totals_match
+v16_wrapper_non_base_asset_profile_converts_stoxx_eur_to_base_sol
+v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently
+v16_wrapper_oracle_attacker_cannot_drain_other_domains
+v16_wrapper_permissionless_crank_advances_account_local_market_progress
+v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate
+v16_wrapper_permissionless_crank_does_not_require_owner_signature
+v16_wrapper_permissionless_crank_rejects_caller_supplied_funding_rate
+v16_wrapper_permissionless_crank_rejects_invalid_action_and_recovery_reason
+v16_wrapper_permissionless_crank_rejects_invalid_asset_and_legacy_price_payload_without_mutation
+v16_wrapper_permissionless_crank_rejects_stale_now_without_mutation
+v16_wrapper_permissionless_maintenance_fee_charges_flat_portfolio_to_insurance
+v16_wrapper_permissionless_recovery_action_is_not_public_kill_switch
+v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch
+v16_wrapper_permissionless_recovery_rejects_every_caller_selected_reason
+v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race
+v16_wrapper_permissionless_settle_b_without_b_state_is_fail_closed
+v16_wrapper_permissionless_stale_resolve_requires_hard_stale_maturity
+v16_wrapper_portfolio_key_mismatch_and_self_trade_are_rejected
+v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_other_legs
+v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_after_trade
+v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_off_the_backstop
+v16_wrapper_protocol_fee_tradecpi_skims_20pct_and_accrues_creator_leg_off_the_backstop
+v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_the_backstop
+v16_wrapper_raising_the_maintenance_rate_is_not_retroactive
+v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured
+v16_wrapper_rebalance_reduce_is_owner_signed_and_strictly_reduces_risk
+v16_wrapper_resolve_market_is_admin_only_and_blocks_live_trade
+v16_wrapper_resolved_close_uses_engine_loss_and_fee_ordering_path
+v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open_accounts
+v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution
+v16_wrapper_same_owner_can_trade_independent_positions_across_markets
+v16_wrapper_security_sweep_resolved_market_and_fee_branches
+v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed
+v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance
+v16_wrapper_spl_u64_amount_limit_rejects_before_mutation
+v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slot
+v16_wrapper_token_accounts_must_be_initialized_for_custody_paths
+v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt
+v16_wrapper_trade_rejects_corrupt_unconfigured_tail_capacity_fail_closed
+v16_wrapper_tradecpi_ewma_mark_trade_moves_mark_without_refreshing_liveness
+v16_wrapper_tradecpi_executes_manual_consented_wide_price
+v16_wrapper_tradecpi_executes_on_added_asset_and_binds_matcher_asset_echo
+v16_wrapper_tradecpi_hybrid_regular_and_after_hours_follow_mark_policy
+v16_wrapper_tradecpi_rejects_corrupt_backing_fee_policy_before_later_checks
+v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response
+v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher
+v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi
+v16_wrapper_tradecpi_requires_bilateral_signatures_before_matcher_cpi
+v16_wrapper_tradecpi_zero_fill_rejects_fee_above_cap_before_success
+v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success
+v16_wrapper_tradenocpi_accepts_consented_wide_exec_price_without_moving_index
+v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark
+v16_wrapper_tradenocpi_applies_static_base_fee_floor
+v16_wrapper_tradenocpi_negative_size_flips_long_short_roles
+v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation
+v16_wrapper_tradenocpi_rejects_when_consented_price_would_break_margin
+v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset
+v16_wrapper_vault_accounts_reject_delegate_and_close_authority
+v16_wrapper_withdraw_creator_fee_resolved_requires_all_portfolios_closed
+v16_wrapper_withdraw_insurance_resolved_requires_all_portfolios_closed
+v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed
+v16_wrapper_withdraw_rejects_noncanonical_vault
+v16_wrapper_withdraw_rejects_over_capital_and_insufficient_vault_without_mutation
+v16_wrapper_withdraw_rejects_wrong_owner_without_mutation
+v16_wrapper_withdraw_rejects_wrong_vault_authority_and_wrong_destination_mint
+v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift
+v17_wrapper_lp_survives_zero_net_price_churn_end_to_end

@@ -662,6 +662,17 @@ pub mod error {
         /// ordinal after it, silently re-mapping errors for every deployed client.
         /// SDK agent: add `LpVaultBackingBucketNotEmpty = 63` to the client error map.
         LpVaultBackingBucketNotEmpty, // Custom(63)
+        // ── Rent-exempt portfolio initialization (adopt upstream ae78ea33) ──
+        // Appended after LpVaultBackingBucketNotEmpty (ordinal 63). Do NOT reorder.
+        /// `InitPortfolio` reallocated the portfolio account to its canonical
+        /// final size but the account's lamports do not cover rent exemption
+        /// at that size. Without this check, an underfunded caller could grow
+        /// the account, get it registered with the market as a "materialized"
+        /// portfolio, and leave it eligible for AccountsDb purge / rent
+        /// collection once it falls below the exempt minimum — a phantom
+        /// registration the engine believes is live custody.
+        /// SDK agent: add `RentExemptRequired = 64` to the client error map.
+        RentExemptRequired, // Custom(64)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -8169,6 +8180,14 @@ pub mod processor {
             state::portfolio_account_len_for_market_slots(max_market_slots)?;
         if portfolio_ai.data_len() < required_portfolio_len {
             portfolio_ai.realloc(required_portfolio_len, true)?;
+        }
+        // Adopt upstream ae78ea33 "require rent-exempt portfolio initialization":
+        // an underfunded portfolio account grown to its canonical size here must
+        // not be registered with the market — that would leave a resized account
+        // eligible for AccountsDb purge/collection while the engine still
+        // believes it holds live custody.
+        if !Rent::get()?.is_exempt(portfolio_ai.lamports(), required_portfolio_len) {
+            return Err(PercolatorError::RentExemptRequired.into());
         }
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
