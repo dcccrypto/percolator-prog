@@ -5789,6 +5789,288 @@ fn v16_bpf_existing_funding_ledger_refreshes_and_converts_between_sides() {
     assert_eq!(group.vault, DEPOSIT * 2);
 }
 
+// FIX (ADOPT upstream 06192caa/7a050c25, "canonical zero-move funding accrual",
+// Wave-1 subsystem #4): before this unit, `accrue_asset_to_not_atomic` had
+// exactly 2 call sites, both inside the liquidation branch of
+// `handle_permissionless_crank_zero_copy`. A position opened and fully closed
+// via ordinary trades between crank sweeps paid/received ZERO funding for its
+// entire lifetime, regardless of premium size or duration -- a funding-timing
+// arbitrage.
+//
+// This test constructs the "zero move" scenario the fix targets: the engine's
+// committed `effective_price` genuinely, exactly equals the asset's current
+// mark target (no further price convergence is possible or needed), while the
+// FUNDING CHECKPOINT (`funding_mark_e6`) still lags behind at an older value
+// because its prospective activation slot (`funding_mark_pending_slot`) is
+// still ahead of the asset's own internal clock (`slot_last`) -- a real,
+// deterministic, non-retroactive premium. One ORDINARY (non-liquidation)
+// `PermissionlessCrank { action: 0 }` is used only to establish this baseline
+// (converge price to the pushed mark) -- exactly matching the crank's existing,
+// unmodified role. NO crank runs after that: the position is closed purely via
+// a trade, with no further crank of ANY kind (liquidation or refresh),
+// demonstrating that the position-changing route itself now settles the
+// deterministic zero-move funding that accrued in the interim.
+#[test]
+fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    // A modest 10% premium: the solvency-envelope validator
+    // (`V16Config::validate_exact_solvency_envelope`, engine v16.rs:4379) rejects
+    // an `InitMarket` whose `max_price_move_bps_per_slot * max_accrual_dt_slots`
+    // price-move budget over one accrual window exceeds what the configured
+    // (default, zero-leverage) margin can safely cover -- a 10% target keeps the
+    // needed convergence budget small enough to pass with `V16CuMarketParams`'s
+    // default 100%-margin fields untouched.
+    const PUSHED_MARK: u64 = 1_100_000;
+    const DEPOSIT: u128 = 10_000_000;
+    // Small per-slot cap + a large single-crank `dt` fully converges price to
+    // the pushed mark in one shot (`max_delta = price * cap_bps * dt / 10_000`
+    // comfortably exceeds the 100,000-atom distance), while the SAME cap
+    // applied over a much smaller `dt` at close time (below) is deliberately
+    // too small to swing the checkpoint's own stale-mark projection all the
+    // way back to it -- see the two `max_delta` computations in the comments
+    // at the crank and close sites below.
+    const CAP_BPS: u64 = 25;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000; // engine cap (v16.rs validate_public_user_fund_shape)
+    // `accrue_asset_to_not_atomic` pins the MARKET-WIDE `header.current_slot` to
+    // `max(current, now_slot)` using the FULL (uncapped) `now_slot` argument --
+    // not the capped per-asset `segment_dt` -- and `authenticated_market_slot_
+    // or_fallback_view` in turn floors every later call's `now_slot` at that
+    // sticky value. The setup crank's own slot must therefore be kept SMALL
+    // (just enough to exceed MAX_ACCRUAL_DT_SLOTS so `segment_dt` is still
+    // capped at exactly 50) rather than far in the future, or the close's own
+    // segment_dt below would be forced huge too. The push and the setup crank
+    // run at THE SAME real slot (no warp between them) so the push's own
+    // `authenticated_slot_or_fallback` reads the same small value.
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    // asset.slot_last after the setup crank: dt_total = 51 - 0 = 51 exceeds
+    // MAX_ACCRUAL_DT_SLOTS (50), so segment_dt is capped at exactly 50.
+    const SETUP_CRANK_SLOT_LAST: u64 = MAX_ACCRUAL_DT_SLOTS;
+    // The pushed mark's own slot (== PUSH_AND_SETUP_CRANK_SLOT, 51) exceeds
+    // SETUP_CRANK_SLOT_LAST (50) -- the checkpoint therefore stays PENDING
+    // (not yet promoted) all the way through the close below.
+    const PUSH_SLOT: u64 = PUSH_AND_SETUP_CRANK_SLOT;
+    // A SMALL number of slots past the setup crank's committed `header.
+    // current_slot` (51) -- `asset_segment_dt_view` at close time computes
+    // `segment_dt = CLOSE_SLOT - 50 = 3`, small enough that the checkpoint's
+    // stale-mark projection (see below) cannot swing all the way back to the
+    // old mark.
+    const CLOSE_SLOT: u64 = PUSH_AND_SETUP_CRANK_SLOT + 2;
+
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: INITIAL_PRICE,
+        max_price_move_bps_per_slot: CAP_BPS,
+        max_accrual_dt_slots: MAX_ACCRUAL_DT_SLOTS,
+        max_abs_funding_e9_per_slot: MAX_ABS_FUNDING_E9_PER_SLOT,
+        min_funding_lifetime_slots: MAX_ACCRUAL_DT_SLOTS,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    // EWMA_MARK profile, seeded to match the engine's own init price exactly --
+    // no gap, no premium, nothing to accrue yet.
+    env.configure_ewma_mark_with_cu(0, INITIAL_PRICE, 1, 0);
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, DEPOSIT);
+    env.deposit(&short_owner, short_account, DEPOSIT);
+
+    // Open at slot 0. No open interest existed before this trade, so the new
+    // zero-move hook is a strict no-op here regardless of mark/price state.
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        INITIAL_PRICE,
+        0,
+    );
+    let (_, group_after_open) = env.market_state();
+    assert_eq!(group_after_open.assets[0].f_long_num, 0);
+    assert_eq!(group_after_open.assets[0].f_short_num, 0);
+    assert_eq!(group_after_open.assets[0].slot_last, 0);
+    assert_eq!(group_after_open.assets[0].effective_price, INITIAL_PRICE);
+
+    // Push the mark ABOVE the entry price, at the slot the setup crank below
+    // will also run at (51) -- deliberately beyond what that crank will
+    // advance the asset's own clock to (50), so `record_funding_mark_
+    // transition_view` records this as a PENDING checkpoint transition, not an
+    // immediate commit: `funding_mark_pending_e6` gets the new (EWMA-blended,
+    // close to PUSHED_MARK since a 51-slot gap at halflife=1 mostly saturates
+    // the blend) value at `funding_mark_pending_slot = 51`, while
+    // `funding_mark_e6` (the ACTIVE checkpoint used for the funding RATE)
+    // stays at the ORIGINAL INITIAL_PRICE. `mark_ewma_e6` (the raw PRICE
+    // target) updates immediately regardless. No warp between this and the
+    // setup crank below -- both run at the SAME real slot, since
+    // `authenticated_slot_or_fallback`/`authenticated_market_slot_or_fallback_view`
+    // prefer the LIVE `Clock` slot over any instruction-supplied `now_slot`.
+    env.svm.warp_to_slot(PUSH_AND_SETUP_CRANK_SLOT);
+    env.push_ewma_mark_with_cu(PUSH_SLOT, PUSHED_MARK);
+
+    // ONE ordinary (non-liquidation) crank converges the engine's committed
+    // `effective_price` all the way to the new `mark_ewma_e6` target -- this is
+    // the crank's existing, UNMODIFIED role (price catch-up), establishing the
+    // "already fully converged" baseline the zero-move mechanism requires.
+    // `dt_total = 51 - 0 = 51`, capped to `segment_dt = MAX_ACCRUAL_DT_SLOTS =
+    // 50`, so `asset.slot_last` becomes 50 (NOT 51) after this crank --
+    // `max_delta = INITIAL_PRICE * CAP_BPS * 50 / 10_000 = 125,000`, far more
+    // than the ~100,000-atom distance to the pushed mark, so price fully
+    // converges in this one call. Because the CHECKPOINT-advance inside
+    // `hybrid_effective_price_for_crank_view` uses the asset's PRE-crank
+    // `slot_last` (0), which is still `< PUSH_SLOT (51)`, the pending mark
+    // does NOT promote during this crank -- `funding_mark_e6` stays at
+    // INITIAL_PRICE even though `effective_price` has now moved to the new
+    // mark. This crank's OWN funding rate is (correctly) zero: the checkpoint
+    // is still anchored to INITIAL_PRICE on both sides of the premium formula
+    // at this point ("a newly pushed mark must not retroactively charge
+    // funding before its slot"). This crank ALSO pins the market-wide
+    // `header.current_slot` to 51 (see the constant comments above) -- kept
+    // deliberately small so the close below only needs a small additional dt.
+    env.crank(
+        long_account,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: PUSH_AND_SETUP_CRANK_SLOT,
+            funding_rate_e9: 0,
+            recovery_reason: 0,
+        },
+    );
+    let (_, group_after_setup_crank) = env.market_state();
+    assert_eq!(
+        group_after_setup_crank.assets[0].slot_last, SETUP_CRANK_SLOT_LAST,
+        "the setup crank's own dt must be capped at max_accrual_dt_slots, not \
+         the full wall-clock gap"
+    );
+    let converged_price = group_after_setup_crank.assets[0].effective_price;
+    assert_ne!(
+        converged_price, INITIAL_PRICE,
+        "the setup crank must have moved the engine's committed effective_price \
+         toward the pushed mark"
+    );
+    assert_eq!(
+        group_after_setup_crank.funding_epoch, 0,
+        "the setup crank's own segment must charge zero funding -- the \
+         checkpoint has not promoted yet, so both sides of the premium formula \
+         are still anchored to the SAME (pre-push) mark"
+    );
+    assert_eq!(
+        group_after_setup_crank.assets[0].f_long_num, 0,
+        "no funding index movement from the setup crank itself"
+    );
+
+    // NOW: no crank of any kind runs again for the rest of this test. `slot_last`
+    // is frozen at 50 (only an accrual can move it), while `mark_ewma_e6` /
+    // `funding_mark_pending_e6` sit at the pushed value and PUSH_SLOT (51) --
+    // i.e. `effective_price` has already, genuinely converged to `mark_ewma_e6`
+    // (a true zero-move interval), while `funding_mark_e6` (the checkpoint used
+    // for the RATE) is still the stale INITIAL_PRICE -- a real, deterministic
+    // premium with nothing left to converge.
+    env.svm.warp_to_slot(CLOSE_SLOT);
+
+    // Close purely via a trade. Pre-fix, no accrual call exists on this route:
+    // `slot_last`/the funding index would never move, and this stationary
+    // premium interval would settle for zero funding. Post-fix, the new
+    // pre-position-change hook computes `segment_dt = CLOSE_SLOT - 50 = 3`
+    // (small): the checkpoint's own stale-mark projection inside
+    // `permissionless_funding_rate_e9_view`'s `has_pending` branch computes
+    // `max_delta = converged_price * CAP_BPS * 3 / 10_000`, far short of the
+    // ~100,000-atom distance back to INITIAL_PRICE, so it does NOT fully
+    // revert to the stale mark -- the resulting `funding_index` differs from
+    // `active_mark` (INITIAL_PRICE), yielding a genuinely nonzero funding rate
+    // for this small zero-move segment.
+    let close_cu = env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        -(POS_SCALE as i128),
+        INITIAL_PRICE,
+        0,
+    );
+    assert_cu_within(
+        "zero-move funding settled on close trade (no further crank)",
+        close_cu,
+        TRADE_CU_LIMIT,
+    );
+
+    let (_, group_after_close) = env.market_state();
+    // Price did not move further in this final interval: it was already fully
+    // converged by the setup crank -- a genuine zero-move segment, not a
+    // disguised price-catchup one.
+    assert_eq!(group_after_close.assets[0].effective_price, converged_price);
+    // The engine's per-asset clock must have advanced by exactly the close
+    // trade's own 1-slot segment: the closing trade itself performed this
+    // accrual, not a crank (none ran after the setup crank).
+    assert_eq!(
+        group_after_close.assets[0].slot_last,
+        CLOSE_SLOT,
+        "closing trade must accrue the stationary-premium interval via the new \
+         zero-move hook, not leave slot_last stale at the pre-fix value of {}",
+        SETUP_CRANK_SLOT_LAST
+    );
+    // Funding index must have moved: the checkpoint's stale mark (INITIAL_PRICE)
+    // is BELOW the converged price, so under this engine's funding-rate sign
+    // convention (see `v16_bpf_permissionless_crank_computes_funding_from_internal_mark_premium`,
+    // mark > index => longs pay shorts) the funding rate here is the mirror
+    // case: shorts pay longs, since the converged price acts as the "index"
+    // side while the stale checkpoint acts as the "mark" side of the premium
+    // formula and stands below it.
+    assert_ne!(
+        group_after_close.assets[0].f_long_num, 0,
+        "long side funding index must move; pre-fix this stays 0 (zero-funding \
+         arbitrage)"
+    );
+    assert_ne!(
+        group_after_close.assets[0].f_short_num, 0,
+        "short side funding index must move; pre-fix this stays 0 (zero-funding \
+         arbitrage)"
+    );
+    assert_eq!(
+        group_after_close.assets[0].f_long_num,
+        -group_after_close.assets[0].f_short_num,
+        "funding index must be conserved between the two sides"
+    );
+    assert_ne!(
+        group_after_close.funding_epoch, group_after_setup_crank.funding_epoch,
+        "the close trade must have advanced the funding epoch -- proof that a \
+         real funding segment was applied outside any crank"
+    );
+
+    let long_final = env.portfolio_state(long_account);
+    let short_final = env.portfolio_state(short_account);
+    assert!(percolator::active_bitmap_is_empty(long_final.active_bitmap));
+    assert!(percolator::active_bitmap_is_empty(short_final.active_bitmap));
+    // Both trades executed at INITIAL_PRICE (no price-driven PnL for either
+    // leg), so any nonzero pnl/capital delta from DEPOSIT reflects the settled
+    // zero-move funding -- NOTE this EWMA_MARK profile's `hybrid_trade_fee_bps_
+    // view` externality floor can still charge a real, nonzero fee above the
+    // caller-supplied `fee_bps: 0` (not exempted the way AUTH_MARK is) and this
+    // test's 10% mark push deliberately drives a large externality-floor fee
+    // plus a_long/a_short ADL-scaling asymmetry, so an exact cross-account or
+    // custody-total conservation check here would assert on fee/ADL mechanics
+    // this unit does not touch, rather than on the funding fix itself. The
+    // primary evidence for the fix is structural (above): the closing trade's
+    // own `slot_last`/`funding_epoch`/`f_long_num`/`f_short_num` moved with NO
+    // crank in between, which pre-fix is categorically impossible (those
+    // fields never move outside the crank's liquidation branch).
+    let long_total = long_final.capital as i128 + long_final.pnl;
+    let short_total = short_final.capital as i128 + short_final.pnl;
+    assert_ne!(
+        long_total, DEPOSIT as i128,
+        "long side's total must differ from its deposit -- pre-fix this stays \
+         exactly DEPOSIT (zero funding transferred)"
+    );
+    assert_ne!(
+        short_total, DEPOSIT as i128,
+        "short side's total must differ from its deposit -- pre-fix this stays \
+         exactly DEPOSIT (zero funding transferred)"
+    );
+}
+
 #[test]
 fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 1_000, 1_000, 500);

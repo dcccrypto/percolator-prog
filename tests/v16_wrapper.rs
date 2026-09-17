@@ -9868,6 +9868,10 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         creator_fee_claimable_atoms: 0,
         maintenance_fee_checkpoint_slot: 0,
         maintenance_fee_previous_rate: 0,
+        funding_mark_e6: 0,
+        funding_mark_pending_e6: 0,
+        funding_mark_pending_slot: 0,
+        _padding1: [0u8; 8],
     };
     assert!(
         state::validate_asset_oracle_profile(&profile).is_err(),
@@ -17941,6 +17945,10 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             oracle_leg_feeds: [[0u8; 32]; ORACLE_LEG_CAP],
             oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
             oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
+            funding_mark_e6: 100,
+            funding_mark_pending_e6: 0,
+            funding_mark_pending_slot: 0,
+            _padding1: [0u8; 8],
         };
         state::write_asset_oracle_profile(&mut market.data, 1, &profile1).unwrap();
     }
@@ -18161,6 +18169,10 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             oracle_leg_feeds: [[0u8; 32]; ORACLE_LEG_CAP],
             oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
             oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
+            funding_mark_e6: 100,
+            funding_mark_pending_e6: 0,
+            funding_mark_pending_slot: 0,
+            _padding1: [0u8; 8],
         };
         state::write_asset_oracle_profile(&mut market.data, 1, &profile1).unwrap();
     }

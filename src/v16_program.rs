@@ -81,7 +81,37 @@ pub mod constants {
     // GH#420 400 -> 408, GH#444 408 -> 432. Still inside the fixed 512-byte
     // `ASSET_ORACLE_WRAPPER_LEN` slot (80 spare), so `MARKET_ASSET_SLOT_LEN` is
     // unchanged and no offset moves.
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 432;
+    // FIX (ADOPT upstream 06192caa/2669bf1b/7a050c25, "canonical zero-move
+    // funding accrual", adapted): 432 -> 464 for `funding_mark_e6` /
+    // `funding_mark_pending_e6` / `funding_mark_pending_slot` (24 bytes) plus 8
+    // bytes of explicit trailing `_padding1`. ABI_LANDMINE_REGISTRY.md: upstream
+    // appends these 3 fields at ITS offset 400, which is byte-exact-occupied on
+    // our fork by `creator_fee_claimable_atoms` (GH#420, u64 @400) and
+    // `maintenance_fee_checkpoint_slot` (GH#444, u64 @408) -- reusing upstream's
+    // literal offset would silently reinterpret our fee counters as
+    // funding-mark state. APPENDED instead at our own tail (432), never at
+    // upstream's 400.
+    //
+    // NOTE (correction to the adoption analysis's naive "432 -> 456"): the
+    // struct already contains a `u128` field (`maintenance_fee_previous_rate`),
+    // which forces `align_of::<AssetOracleProfileV16>() == 16`, and Rust
+    // guarantees `size_of::<T>() % align_of::<T>() == 0` for every type. 456 is
+    // not a multiple of 16 (456 / 16 = 28.5), so a bare 3x-u64 append would
+    // force the compiler to insert 8 bytes of HIDDEN trailing padding to reach
+    // 464 -- which `#[derive(bytemuck::Pod)]` correctly refuses at compile time
+    // ("derive(Pod) was applied to a type with padding"), and which the
+    // `ASSET_ORACLE_PROFILE_LEN` size-assert below would also have caught (456
+    // != the true 464). Making the padding EXPLICIT (`_padding1: [u8; 8]`)
+    // keeps the layout Pod-safe and gives 464 a real, asserted meaning instead
+    // of relying on unstated compiler-inserted bytes.
+    //
+    // Still inside the fixed 512-byte `ASSET_ORACLE_WRAPPER_LEN` slot (48 spare
+    // after this), so `MARKET_ASSET_SLOT_LEN` is unchanged and no offset moves.
+    // Deployed asset slots read the 3 real fields as zero after an in-place
+    // upgrade -- the legacy-sentinel semantics `advance_funding_mark_
+    // checkpoint_view` already gives zero ("not yet initialized, backfill from
+    // mark_ewma_e6") mean no migration instruction is needed.
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 464;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1469,6 +1499,33 @@ pub mod state {
         /// market whose rate never changed has no retroactive window to protect.
         pub maintenance_fee_checkpoint_slot: u64,
         pub maintenance_fee_previous_rate: u128,
+
+        /// FIX (ADOPT upstream 06192caa/2669bf1b/7a050c25, "canonical zero-move
+        /// funding accrual", adapted -- ABI_LANDMINE_REGISTRY.md): upstream's
+        /// `funding_mark_e6`/`funding_mark_pending_e6`/`funding_mark_pending_slot`
+        /// collide byte-exact with our GH#420/GH#444 fields at offsets 400/408/416,
+        /// so these are APPENDED at our own tail (432) instead of upstream's
+        /// literal offset (400). `ASSET_ORACLE_PROFILE_LEN` grows 432 -> 464 (see
+        /// the constant's own doc comment for why 464, not a naive 456), still
+        /// inside the fixed 512-byte `ASSET_ORACLE_WRAPPER_LEN` slot (48 bytes
+        /// spare afterward). Deployed asset slots read these as zero after an
+        /// in-place upgrade -- `advance_funding_mark_checkpoint_view` already
+        /// treats zero as "not yet initialized, backfill from mark_ewma_e6" -- so
+        /// no migration instruction is needed.
+        ///
+        /// Mark whose premium applies at the engine asset's current `slot_last`.
+        /// Zero is the legacy, not-yet-initialized sentinel.
+        pub funding_mark_e6: u64,
+        /// First prospective mark that must not affect funding before its slot.
+        pub funding_mark_pending_e6: u64,
+        pub funding_mark_pending_slot: u64,
+        /// Explicit trailing padding: the struct's `u128` field forces 16-byte
+        /// alignment, so `size_of` must be a multiple of 16 -- 432 + 24 = 456 is
+        /// not, and a bare 3x-u64 append would force 8 bytes of HIDDEN compiler
+        /// padding (`derive(Pod)` correctly refuses this). Kept explicit and
+        /// always-zero (checked in `validate_asset_oracle_profile`) rather than
+        /// implicit.
+        pub _padding1: [u8; 8],
     }
 
     // Compile-time guard (ABI_LANDMINE_REGISTRY.md W0-1: "our fork's build will NOT
@@ -2103,8 +2160,21 @@ pub mod state {
                 && profile.oracle_mode != ORACLE_MODE_EWMA_MARK
                 && profile.effective_price_provenance != EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED)
             || profile._padding0 != [0u8; 5]
+            || profile._padding1 != [0u8; 8]
             || profile.oracle_leg_count as usize > ORACLE_LEG_CAP
             || (profile.oracle_leg_flags & !ORACLE_LEG_FLAGS_MASK) != 0
+            // FIX (ADOPT upstream 06192caa, adapted): shape guard for the
+            // checkpoint fields -- zero is the legacy "not yet initialized"
+            // sentinel for `funding_mark_e6`, otherwise it must be a valid engine
+            // price; the pending pair must be all-zero or all-nonzero together
+            // (never a dangling slot with no mark or vice versa); and a pending
+            // mark can only exist once a committed (nonzero) mark exists to fall
+            // back to.
+            || (profile.funding_mark_e6 != 0 && !valid_engine_oracle_price(profile.funding_mark_e6))
+            || ((profile.funding_mark_pending_e6 == 0) != (profile.funding_mark_pending_slot == 0))
+            || (profile.funding_mark_pending_e6 != 0
+                && (!valid_engine_oracle_price(profile.funding_mark_pending_e6)
+                    || profile.funding_mark_e6 == 0))
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -2219,6 +2289,10 @@ pub mod state {
             creator_fee_claimable_atoms: 0,
             maintenance_fee_checkpoint_slot: 0,
             maintenance_fee_previous_rate: 0,
+            funding_mark_e6: initial_price,
+            funding_mark_pending_e6: 0,
+            funding_mark_pending_slot: 0,
+            _padding1: [0u8; 8],
         }
     }
 
@@ -2260,6 +2334,10 @@ pub mod state {
             creator_fee_claimable_atoms: 0,
             maintenance_fee_checkpoint_slot: 0,
             maintenance_fee_previous_rate: 0,
+            funding_mark_e6: config.mark_ewma_e6,
+            funding_mark_pending_e6: 0,
+            funding_mark_pending_slot: 0,
+            _padding1: [0u8; 8],
         }
     }
 
@@ -8488,6 +8566,22 @@ pub mod processor {
                 signed_position_for_asset_view(&group, &account_a, asset_index as usize)?;
             let account_b_position =
                 signed_position_for_asset_view(&group, &account_b, asset_index as usize)?;
+            // FIX (ADOPT upstream 06192caa/7a050c25, "canonical zero-move funding
+            // accrual", adapted -- Wave-1 S4): settle any owed stationary-premium
+            // funding on THIS asset before the engine applies the position change
+            // below. A reducing leg on either account must fully catch up in this
+            // same instruction (no dodging already-accrued funding by closing
+            // between crank sweeps); an opening/increasing leg may proceed with a
+            // partial, bounded catch-up.
+            let reduces_existing = trade_delta_reduces_existing(account_a_position, size_q)
+                || trade_delta_reduces_existing(account_b_position, -size_q);
+            accrue_zero_move_funding_before_position_change_for_profile_view(
+                &mut oracle_profile,
+                &mut group,
+                asset_index as usize,
+                reduces_existing,
+            )
+            .map_err(map_v16_error)?;
             // F-TRADENOCPI-FEE: the position enters/settles at the asset mark (effective_price), NOT at
             // the caller-supplied exec_price. The engine uses request.exec_price ONLY as the fee notional
             // basis (fee = size_q*exec_price/POS_SCALE * fee_bps), so without pinning it two cooperating
@@ -8965,7 +9059,7 @@ pub mod processor {
                 if requests.iter().any(|r| r.asset_index == asset_index) {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
-                let oracle_profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
+                let mut oracle_profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
                 reject_permissionless_resolve_matured_live_for_profile_view(
                     &cfg,
                     &oracle_profile,
@@ -8975,6 +9069,27 @@ pub mod processor {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
                 let abs_size = leg.size_q.unsigned_abs();
+                // FIX (ADOPT upstream 06192caa/7a050c25, "canonical zero-move
+                // funding accrual", adapted -- Wave-1 S4): same pre-position-change
+                // settlement as the single-trade route, applied per leg (a batch
+                // can span several assets, each with its own funding checkpoint).
+                let account_a_position_for_accrual =
+                    signed_position_for_asset_view(&group, &account_a, asset_index)?;
+                let account_b_position_for_accrual =
+                    signed_position_for_asset_view(&group, &account_b, asset_index)?;
+                let reduces_existing =
+                    trade_delta_reduces_existing(account_a_position_for_accrual, leg.size_q)
+                        || trade_delta_reduces_existing(
+                            account_b_position_for_accrual,
+                            -leg.size_q,
+                        );
+                accrue_zero_move_funding_before_position_change_for_profile_view(
+                    &mut oracle_profile,
+                    &mut group,
+                    asset_index,
+                    reduces_existing,
+                )
+                .map_err(map_v16_error)?;
                 let fee_basis_price = group.markets[asset_index]
                     .engine
                     .asset
@@ -13484,6 +13599,18 @@ pub mod processor {
             if group.header.mode == 0 && permissionless_resolve_matured_now_view(cfg, group) {
                 return Err(V16Error::LockActive);
             }
+            // FIX (ADOPT upstream 7a050c25, "canonical zero-move funding accrual",
+            // adapted -- Wave-1 S4): `ForfeitRecoveryLeg` changes this leg's
+            // position outside any trade/crank route, so settle owed zero-move
+            // funding first. Forfeit is always a reducing operation on this leg
+            // (`true` -- full catch-up required, matching the trade routes'
+            // closing-leg behavior).
+            accrue_zero_move_funding_before_position_change_view(
+                cfg,
+                group,
+                asset_index as usize,
+                true,
+            )?;
             group
                 .forfeit_recovery_leg_not_atomic(
                     portfolio,
@@ -13512,6 +13639,16 @@ pub mod processor {
             if group.header.mode == 0 && permissionless_resolve_matured_now_view(cfg, group) {
                 return Err(V16Error::LockActive);
             }
+            // FIX (ADOPT upstream 7a050c25, "canonical zero-move funding accrual",
+            // adapted -- Wave-1 S4): same pre-position-change settlement as
+            // `ForfeitRecoveryLeg` above -- a rebalance-reduce is always a
+            // reducing operation on this leg.
+            accrue_zero_move_funding_before_position_change_view(
+                cfg,
+                group,
+                asset_index as usize,
+                true,
+            )?;
             group
                 .rebalance_reduce_position_not_atomic(
                     portfolio,
@@ -14495,6 +14632,14 @@ pub mod processor {
                             .map_err(map_v16_error)?;
                         profile.mark_ewma_e6 = frozen_mark;
                         profile.mark_ewma_last_slot = authenticated_slot;
+                        // FIX (ADOPT upstream 06192caa, adapted): the asset is
+                        // going terminal (Recovery) here, so hard-reset the
+                        // funding checkpoint to the frozen mark with no pending
+                        // transition -- there is no future slot left for a
+                        // prospective mark to activate at.
+                        profile.funding_mark_e6 = frozen_mark;
+                        profile.funding_mark_pending_e6 = 0;
+                        profile.funding_mark_pending_slot = 0;
                         profile.oracle_target_price_e6 = frozen_mark;
                         profile.oracle_target_publish_time = 0;
                         profile.last_good_oracle_slot = authenticated_slot;
@@ -15338,6 +15483,15 @@ pub mod processor {
                 creator_fee_claimable_atoms: 0,
                 maintenance_fee_checkpoint_slot: 0,
                 maintenance_fee_previous_rate: 0,
+                // FIX (ADOPT upstream 06192caa, adapted): a fresh Hybrid
+                // reconfiguration has no committed mark yet -- `price` isn't
+                // known until `read_external_price_e6_profile` runs below, so
+                // seed the legacy sentinel (0) here and set the real checkpoint
+                // once `price` is discovered, mirroring `profile.mark_ewma_e6`.
+                funding_mark_e6: 0,
+                funding_mark_pending_e6: 0,
+                funding_mark_pending_slot: 0,
+                _padding1: [0u8; 8],
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs,
@@ -15367,6 +15521,7 @@ pub mod processor {
             profile.oracle_target_publish_time = publish_time;
             profile.mark_ewma_e6 = price;
             profile.mark_ewma_last_slot = authenticated_slot;
+            profile.funding_mark_e6 = price;
             group
                 .reset_empty_asset_oracle_anchor_not_atomic(
                     asset_index_usize,
@@ -15464,6 +15619,15 @@ pub mod processor {
                 creator_fee_claimable_atoms: 0,
                 maintenance_fee_checkpoint_slot: 0,
                 maintenance_fee_previous_rate: 0,
+                // FIX (ADOPT upstream 06192caa, adapted): a fresh EWMA_MARK
+                // reconfiguration commits `initial_mark_e6` immediately (unlike
+                // Hybrid, no external oracle read is needed), so seed the
+                // checkpoint directly from it -- matches the `mark_ewma_e6` init
+                // convention on this same literal.
+                funding_mark_e6: initial_mark_e6,
+                funding_mark_pending_e6: 0,
+                funding_mark_pending_slot: 0,
+                _padding1: [0u8; 8],
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -15572,6 +15736,14 @@ pub mod processor {
                 creator_fee_claimable_atoms: 0,
                 maintenance_fee_checkpoint_slot: 0,
                 maintenance_fee_previous_rate: 0,
+                // FIX (ADOPT upstream 06192caa, adapted): a fresh AUTH_MARK
+                // reconfiguration commits `initial_mark_e6` immediately, so seed
+                // the checkpoint directly from it (same convention as the
+                // EWMA_MARK reconfiguration handler above).
+                funding_mark_e6: initial_mark_e6,
+                funding_mark_pending_e6: 0,
+                funding_mark_pending_slot: 0,
+                _padding1: [0u8; 8],
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -15681,8 +15853,28 @@ pub mod processor {
             if next_mark == 0 || next_mark > percolator::MAX_ORACLE_PRICE {
                 return Err(PercolatorError::OracleInvalid.into());
             }
-            profile.mark_ewma_e6 = next_mark;
-            profile.mark_ewma_last_slot = authenticated_slot;
+            // FIX (ADOPT upstream 06192caa, adapted): record the mark transition
+            // in the funding checkpoint BEFORE committing it as the live
+            // `mark_ewma_e6` -- a push that lands ahead of the engine's own
+            // `slot_last` must not retroactively change funding already owed for
+            // the elapsed interval; it becomes a PENDING checkpoint instead
+            // (`record_funding_mark_transition_view`/`advance_funding_mark_
+            // checkpoint_view` below).
+            if next_mark != profile.mark_ewma_e6 {
+                let asset_slot = group.markets[asset_index_usize]
+                    .engine
+                    .asset
+                    .slot_last
+                    .get();
+                record_funding_mark_transition_view(
+                    &mut profile,
+                    asset_slot,
+                    next_mark,
+                    authenticated_slot,
+                )?;
+                profile.mark_ewma_e6 = next_mark;
+                profile.mark_ewma_last_slot = authenticated_slot;
+            }
             profile.oracle_target_price_e6 = next_mark;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
@@ -15740,8 +15932,23 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineStale.into());
             }
-            profile.mark_ewma_e6 = mark_e6;
-            profile.mark_ewma_last_slot = authenticated_slot;
+            // FIX (ADOPT upstream 06192caa, adapted): same non-retroactive
+            // checkpoint recording as `handle_push_ewma_mark` above.
+            if mark_e6 != profile.mark_ewma_e6 {
+                let asset_slot = group.markets[asset_index_usize]
+                    .engine
+                    .asset
+                    .slot_last
+                    .get();
+                record_funding_mark_transition_view(
+                    &mut profile,
+                    asset_slot,
+                    mark_e6,
+                    authenticated_slot,
+                )?;
+                profile.mark_ewma_e6 = mark_e6;
+                profile.mark_ewma_last_slot = authenticated_slot;
+            }
             profile.oracle_target_price_e6 = mark_e6;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
@@ -16064,6 +16271,7 @@ pub mod processor {
                 &oracle_profile,
                 &group,
                 asset_index_usize,
+                authenticated_now_slot,
                 crank_price,
             )?;
             group
@@ -19512,6 +19720,18 @@ pub mod processor {
         current_q == 0 || (current_q > 0 && delta_q > 0) || (current_q < 0 && delta_q < 0)
     }
 
+    // FIX (ADOPT upstream 7a050c25, "preserve accrual across public progress
+    // routes"): whether this leg's signed delta REDUCES an existing nonzero
+    // position (as opposed to opening, or increasing an already risk-increasing
+    // position). Used to decide whether a position-changing call must fully
+    // catch up any owed zero-move funding in this same instruction (closing/
+    // reducing trades cannot dodge already-accrued funding by never letting a
+    // crank land) versus opening trades, which may proceed with a partial
+    // catch-up bounded by `V16CuMarketParams::max_accrual_dt_slots`.
+    fn trade_delta_reduces_existing(current_q: i128, delta_q: i128) -> bool {
+        (current_q > 0 && delta_q < 0) || (current_q < 0 && delta_q > 0)
+    }
+
     /// `cpi_requests` is (asset_index, SIGNED requested size_q for account_a; account_b's
     /// requested delta is the negation) for every asset touched by this CPI call.
     fn ensure_cpi_trade_asset_lifecycle_before_matcher(
@@ -20099,6 +20319,13 @@ pub mod processor {
         if asset_index >= group.header.config.max_market_slots.get() as usize {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // FIX (ADOPT upstream 06192caa, adapted): advance any due prospective
+        // checkpoint against the asset's CURRENT (pre-crank) committed slot
+        // before this crank proposes any new price/funding state, so the crank
+        // route and the trade-time zero-move route observe the same checkpoint
+        // semantics.
+        let asset_slot = group.markets[asset_index].engine.asset.slot_last.get();
+        advance_funding_mark_checkpoint_view(profile, asset_slot);
         if oracle_v16::profile_is_ewma_mark(profile) || oracle_v16::profile_is_auth_mark(profile) {
             let target = profile.mark_ewma_e6;
             if target == 0 {
@@ -20201,7 +20428,13 @@ pub mod processor {
         if fresh_oracle_read && price == target {
             profile.effective_price_provenance = constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
         }
-        if !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot) {
+        // FIX (ADOPT upstream 06192caa, adapted): route the Hybrid crank-price
+        // mark update through the same non-retroactive checkpoint recording as
+        // the push-mark handlers and the trade-time mark update below.
+        if !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot)
+            && price != profile.mark_ewma_e6
+        {
+            record_funding_mark_transition_view(profile, asset_slot, price, now_slot)?;
             profile.mark_ewma_e6 = price;
             profile.mark_ewma_last_slot = now_slot;
         }
@@ -20240,10 +20473,19 @@ pub mod processor {
                 == constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED
     }
 
+    // FIX (ADOPT upstream 06192caa, adapted): the funding RATE now reasons about
+    // the CHECKPOINTED mark (`funding_mark_e6`), not the raw, possibly
+    // not-yet-due `mark_ewma_e6` -- a prospective mark pushed ahead of the
+    // asset's own committed slot must not move either side of the premium for
+    // time that has already elapsed. `now_slot` widens the signature so the
+    // caller's authenticated clock (not just the asset's own stale slot_last)
+    // is available to compute the elapsed segment for a pending mark's
+    // counterfactual index.
     fn permissionless_funding_rate_e9_view(
         profile: &state::AssetOracleProfileV16,
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
+        now_slot: u64,
         effective_price: u64,
     ) -> Result<i128, ProgramError> {
         if !oracle_v16::profile_is_price_managed(profile) {
@@ -20259,11 +20501,353 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let asset = group.markets[asset_index].engine.asset;
-        if profile.mark_ewma_last_slot > asset.slot_last.get() {
+        let asset_slot = asset.slot_last.get();
+        let active_mark = if profile.funding_mark_e6 != 0 {
+            profile.funding_mark_e6
+        } else if profile.mark_ewma_last_slot <= asset_slot {
+            profile.mark_ewma_e6
+        } else {
+            // A legacy profile cannot recover the mark that preceded an already-pending update.
+            // Preserve the old non-retroactive behavior until the engine catches up.
             return Ok(0);
-        }
-        policy_v16::premium_funding_rate_e9(profile.mark_ewma_e6, effective_price, max_abs_rate)
+        };
+        let segment_dt = asset_segment_dt_view(group, asset_index, now_slot)?;
+        let has_pending =
+            profile.funding_mark_pending_e6 != 0 && profile.funding_mark_pending_slot > asset_slot;
+        // A prospective mark must not rewrite either side of the premium for elapsed time. When a
+        // pending mark exists, derive the counterfactual index from the committed mark as well.
+        let funding_index = if has_pending {
+            let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
+            oracle_v16::effective_price_from_target(
+                asset.effective_price.get(),
+                active_mark,
+                group.header.config.max_price_move_bps_per_slot.get(),
+                segment_dt,
+                exposed,
+            )
+        } else {
+            effective_price
+        };
+        policy_v16::premium_funding_rate_e9(active_mark, funding_index, max_abs_rate)
             .ok_or(PercolatorError::EngineArithmeticOverflow.into())
+    }
+
+    /// FIX (ADOPT upstream 06192caa, adapted): activates a due prospective mark
+    /// (`funding_mark_pending_*`) once the asset's own committed `slot_last` has
+    /// caught up to its activation slot, rolling the live `funding_mark_e6`
+    /// checkpoint forward. Lazily backfills the legacy zero sentinel from
+    /// `mark_ewma_e6` the first time any code path touches an old profile whose
+    /// mark has already caught up. Idempotent and safe to call on every touch.
+    fn advance_funding_mark_checkpoint_view(
+        profile: &mut state::AssetOracleProfileV16,
+        asset_slot: u64,
+    ) {
+        if profile.funding_mark_e6 == 0 && profile.mark_ewma_last_slot <= asset_slot {
+            profile.funding_mark_e6 = profile.mark_ewma_e6;
+        }
+        if profile.funding_mark_pending_e6 != 0 && profile.funding_mark_pending_slot <= asset_slot {
+            let activated_slot = profile.funding_mark_pending_slot;
+            profile.funding_mark_e6 = profile.funding_mark_pending_e6;
+            profile.funding_mark_pending_e6 = 0;
+            profile.funding_mark_pending_slot = 0;
+            if profile.mark_ewma_last_slot > activated_slot {
+                if profile.mark_ewma_last_slot <= asset_slot {
+                    profile.funding_mark_e6 = profile.mark_ewma_e6;
+                } else {
+                    profile.funding_mark_pending_e6 = profile.mark_ewma_e6;
+                    profile.funding_mark_pending_slot = profile.mark_ewma_last_slot;
+                }
+            }
+        }
+    }
+
+    /// FIX (ADOPT upstream 06192caa, adapted): records a fresh mark transition
+    /// (from a push, a Hybrid crank price update, or a trade-driven mark move)
+    /// as PENDING if the asset hasn't caught up to any earlier checkpoint yet,
+    /// otherwise commits it immediately as the live checkpoint. Every call site
+    /// that mutates `profile.mark_ewma_e6` must route through this first.
+    fn record_funding_mark_transition_view(
+        profile: &mut state::AssetOracleProfileV16,
+        asset_slot: u64,
+        next_mark_e6: u64,
+        mark_slot: u64,
+    ) -> ProgramResult {
+        advance_funding_mark_checkpoint_view(profile, asset_slot);
+        if profile.funding_mark_e6 == 0 {
+            // A legacy profile can already have a prospective mark when first read by this code,
+            // so its prior checkpoint is unrecoverable. Keep trades live until a crank catches up.
+            return Ok(());
+        }
+        if profile.funding_mark_pending_e6 != 0 {
+            if mark_slot < profile.funding_mark_pending_slot {
+                return Err(PercolatorError::EngineStale.into());
+            }
+            if mark_slot == profile.funding_mark_pending_slot {
+                profile.funding_mark_pending_e6 = next_mark_e6;
+            }
+            // Retain the first pending boundary. Later fills cannot postpone already-owed funding;
+            // the profile's ordinary mark fields retain the latest transition for the next epoch.
+            return Ok(());
+        }
+        if mark_slot <= asset_slot {
+            profile.funding_mark_e6 = next_mark_e6;
+        } else {
+            profile.funding_mark_pending_e6 = next_mark_e6;
+            profile.funding_mark_pending_slot = mark_slot;
+        }
+        Ok(())
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // FIX (ADOPT upstream 06192caa/2669bf1b/7a050c25, "canonical zero-move
+    // funding accrual", adapted -- Wave-1 subsystem #4). See
+    // `adopt_zero_move_funding.md` for the full analysis. Grepping every call
+    // site of `accrue_asset_to_not_atomic`/`accrue_asset_path_to_not_atomic`
+    // before this unit found exactly 2, both inside the liquidation branch of
+    // `handle_permissionless_crank_zero_copy` -- meaning `TradeNoCpi`,
+    // `BatchTradeNoCpi`, `TradeCpi`, `BatchTradeCpi`, `ForfeitRecoveryLeg`, and
+    // `RebalanceReduce` never touched funding accrual: a position opened and
+    // fully closed between two crank sweeps paid/received ZERO funding for its
+    // entire lifetime, regardless of size or premium duration -- a funding-
+    // timing arbitrage reachable by any taker who can estimate crank cadence.
+    //
+    // The functions below settle exactly the interval an ordinary crank would
+    // process WITHOUT a price move (a "zero-move" segment -- the price has
+    // already fully caught up to its target under the configured
+    // `max_price_move_bps_per_slot` envelope, so only the funding premium, not
+    // K, needs applying) at every position-changing instruction, using the
+    // engine's own already-present `accrue_asset_to_not_atomic` (no engine
+    // change: `AccrueAssetOutcomeV16`, the single-segment accrual primitive,
+    // and `MarketGroupV16::accrue_asset_path_to_not_atomic`/
+    // `AccrualStepV16`/`canonical_accrual_price_step_v16` are all already
+    // byte-identical to upstream in `~/percolator`). Adaptation note: this
+    // deliberately uses the SIMPLER single-segment `accrue_asset_to_not_atomic`
+    // (matching 06192caa/7a050c25's own mechanism), not the later stepped-path
+    // `canonical_accrual_path_for_target_view` refinement upstream layered on
+    // top in `18f3ae94`/`2669bf1b` -- that refinement addresses precise
+    // price-cap-remainder carry across INTERLEAVED TRADES DURING A GENUINE
+    // PRICE MOVE, a separate, larger, and currently entirely-absent subsystem
+    // in our fork (0 hits for `canonical_accrual_path_for_target_view`); the
+    // zero-move defect this unit fixes needs only the stationary-interval case
+    // below. A price-moving interval is intentionally left on the ordinary
+    // observation-bearing crank/oracle-push route, matching upstream's own
+    // framing ("Price-moving intervals stay on the ordinary observation-
+    // bearing crank route").
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// The mark target used to decide whether the current interval is a "zero
+    /// move" (price already caught up) segment: the profile's live target for
+    /// price-managed modes whose mark can move outside a crank
+    /// (EWMA_MARK/AUTH_MARK always; Hybrid once soft-stale-matured, i.e. once
+    /// Hybrid has fallen back to internal mark discovery same as a trade would
+    /// use), or the engine's own `raw_oracle_target_price` otherwise (a
+    /// still-oracle-driven Hybrid asset's target is whatever the last crank/
+    /// oracle push committed, not something a trade can move).
+    fn stored_mark_target_for_zero_move_accrual_view(
+        profile: &state::AssetOracleProfileV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+    ) -> Result<u64, V16Error> {
+        let asset = group
+            .markets
+            .get(asset_index)
+            .ok_or(V16Error::InvalidConfig)?
+            .engine
+            .asset;
+        let target = if oracle_v16::profile_is_auth_mark(profile)
+            || oracle_v16::profile_is_ewma_mark(profile)
+            || (oracle_v16::profile_is_hybrid(profile)
+                && oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot))
+        {
+            profile.mark_ewma_e6
+        } else {
+            asset.raw_oracle_target_price.get()
+        };
+        if target == 0 || target > percolator::MAX_ORACLE_PRICE {
+            return Err(V16Error::InvalidConfig);
+        }
+        Ok(target)
+    }
+
+    /// Computes the (effective_price, funding_rate_e9) pair for a single
+    /// stationary-price accrual segment ending at the caller's authenticated
+    /// clock, or `None` if there is nothing to settle this way: no elapsed
+    /// time, no open interest on both sides yet, a genuine price move is still
+    /// due (stays on the ordinary crank route), or the resulting funding rate
+    /// rounds to zero.
+    fn zero_move_funding_segment_for_profile_view(
+        profile: &state::AssetOracleProfileV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<Option<(u64, i128)>, V16Error> {
+        if !oracle_v16::profile_is_price_managed(profile)
+            || asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return Ok(None);
+        }
+        let now_slot = authenticated_market_slot_or_fallback_view(group);
+        let asset = group.markets[asset_index].engine.asset;
+        let segment_dt = asset_segment_dt_view(group, asset_index, now_slot)
+            .map_err(|_| V16Error::InvalidConfig)?;
+        if segment_dt == 0 || asset.oi_eff_long_q.get() == 0 || asset.oi_eff_short_q.get() == 0 {
+            return Ok(None);
+        }
+        let effective_price = asset.effective_price.get();
+        let target =
+            stored_mark_target_for_zero_move_accrual_view(profile, group, asset_index, now_slot)?;
+        let bounded_price = oracle_v16::effective_price_from_target(
+            effective_price,
+            target,
+            group.header.config.max_price_move_bps_per_slot.get(),
+            segment_dt,
+            true,
+        );
+        // This helper settles only the interval a normal crank would process without changing K.
+        // Price-moving intervals stay on the ordinary observation-bearing crank route.
+        if bounded_price != effective_price {
+            return Ok(None);
+        }
+        let funding_rate_e9 = permissionless_funding_rate_e9_view(
+            profile,
+            group,
+            asset_index,
+            now_slot,
+            effective_price,
+        )
+        .map_err(|_| V16Error::ArithmeticOverflow)?;
+        if funding_rate_e9 == 0 {
+            return Ok(None);
+        }
+        Ok(Some((effective_price, funding_rate_e9)))
+    }
+
+    /// Whether a REDUCING position change (closing/decreasing) must be refused
+    /// (`V16Error::Stale`, mapped to `PercolatorError::EngineStale`) because a
+    /// prospective mark is already due to matter for the elapsed interval but
+    /// hasn't activated yet under the current committed slot -- i.e. there is
+    /// deterministic zero-move funding owed that this instruction's own single
+    /// bounded catch-up cannot yet reach (the pending mark's activation slot is
+    /// still in the future relative to the asset's own `slot_last`, so
+    /// `zero_move_funding_segment_for_profile_view` legitimately sees nothing
+    /// to settle THIS call, yet a reducing trade must not be allowed to dodge
+    /// funding that both sides already know is coming).
+    fn pending_zero_move_funding_requires_crank_view(
+        profile: &state::AssetOracleProfileV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<bool, V16Error> {
+        if profile.funding_mark_pending_e6 == 0
+            || asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return Ok(false);
+        }
+        let now_slot = authenticated_market_slot_or_fallback_view(group);
+        let asset = group.markets[asset_index].engine.asset;
+        if asset.oi_eff_long_q.get() == 0
+            || asset.oi_eff_short_q.get() == 0
+            || profile.funding_mark_pending_slot > now_slot
+            || asset.slot_last.get() >= profile.funding_mark_pending_slot
+        {
+            return Ok(false);
+        }
+        let segment_dt = asset_segment_dt_view(group, asset_index, now_slot)
+            .map_err(|_| V16Error::InvalidConfig)?;
+        if segment_dt == 0 {
+            return Ok(false);
+        }
+        let effective_price = asset.effective_price.get();
+        let pending_price = profile.funding_mark_pending_e6;
+        let bounded_price = oracle_v16::effective_price_from_target(
+            effective_price,
+            pending_price,
+            group.header.config.max_price_move_bps_per_slot.get(),
+            segment_dt,
+            true,
+        );
+        let pending_rate = policy_v16::premium_funding_rate_e9(
+            pending_price,
+            effective_price,
+            group.header.config.max_abs_funding_e9_per_slot.get(),
+        )
+        .ok_or(V16Error::ArithmeticOverflow)?;
+        Ok(bounded_price == effective_price && pending_rate != 0)
+    }
+
+    /// The per-instruction hook, called immediately before every
+    /// position-changing engine call on the traded asset: checkpoint-advance,
+    /// compute and apply the zero-move segment (if any) via the engine's
+    /// existing `accrue_asset_to_not_atomic`, checkpoint-advance again, and --
+    /// for a trade delta that REDUCES an existing position on either leg
+    /// (`require_full_catchup`) -- refuse a second attacker-sized catch-up
+    /// remaining in the same instruction rather than looping (that remains
+    /// actionable through a bounded public crank / another call).
+    fn accrue_zero_move_funding_before_position_change_for_profile_view(
+        profile: &mut state::AssetOracleProfileV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        require_full_catchup: bool,
+    ) -> Result<(), V16Error> {
+        if asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return Ok(());
+        }
+        let asset_slot = group.markets[asset_index].engine.asset.slot_last.get();
+        advance_funding_mark_checkpoint_view(profile, asset_slot);
+        let Some((effective_price, funding_rate_e9)) =
+            zero_move_funding_segment_for_profile_view(profile, group, asset_index)?
+        else {
+            if require_full_catchup
+                && pending_zero_move_funding_requires_crank_view(profile, group, asset_index)?
+            {
+                return Err(V16Error::Stale);
+            }
+            return Ok(());
+        };
+        let now_slot = authenticated_market_slot_or_fallback_view(group);
+        group.accrue_asset_to_not_atomic(
+            asset_index,
+            now_slot,
+            effective_price,
+            funding_rate_e9,
+            true,
+        )?;
+        let asset_slot = group.markets[asset_index].engine.asset.slot_last.get();
+        advance_funding_mark_checkpoint_view(profile, asset_slot);
+        // One instruction never performs an attacker-sized catch-up loop. If more deterministic
+        // zero-move funding remains, roll this inline segment back and require bounded public
+        // cranks before the unchanged position operation retries.
+        if require_full_catchup
+            && (zero_move_funding_segment_for_profile_view(profile, group, asset_index)?.is_some()
+                || pending_zero_move_funding_requires_crank_view(profile, group, asset_index)?)
+        {
+            return Err(V16Error::Stale);
+        }
+        Ok(())
+    }
+
+    /// Convenience wrapper for call sites (`ForfeitRecoveryLeg`, `RebalanceReduce`)
+    /// that only have `cfg: &WrapperConfigV16` in scope, not an already-decoded
+    /// `AssetOracleProfileV16` -- reads, mutates, and writes the profile itself.
+    fn accrue_zero_move_funding_before_position_change_view(
+        cfg: &WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        require_full_catchup: bool,
+    ) -> Result<(), V16Error> {
+        let mut profile = read_oracle_profile_from_view(group, cfg, asset_index)
+            .map_err(|_| V16Error::InvalidConfig)?;
+        accrue_zero_move_funding_before_position_change_for_profile_view(
+            &mut profile,
+            group,
+            asset_index,
+            require_full_catchup,
+        )?;
+        write_oracle_profile_to_view(group, asset_index, &profile)
+            .map_err(|_| V16Error::InvalidConfig)
     }
 
     fn update_hybrid_mark_after_trade_view(
@@ -20308,6 +20892,11 @@ pub mod processor {
             return Err(PercolatorError::OracleInvalid.into());
         }
         if new_mark != 0 && new_mark != old {
+            // FIX (ADOPT upstream 06192caa, adapted): route this trade-driven
+            // mark move through the same non-retroactive checkpoint recording as
+            // the push-mark handlers and the Hybrid crank-price path.
+            let asset_slot = group.markets[asset_index].engine.asset.slot_last.get();
+            record_funding_mark_transition_view(profile, asset_slot, new_mark, now_slot)?;
             profile.mark_ewma_e6 = new_mark;
             profile.mark_ewma_last_slot = now_slot;
             // FIX (ADOPT upstream 01ec6161, adapted): taint the provenance bit

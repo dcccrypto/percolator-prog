@@ -62,6 +62,10 @@ fn hybrid_profile(max_staleness_secs: u64) -> AssetOracleProfileV16 {
         creator_fee_claimable_atoms: 0,
         maintenance_fee_checkpoint_slot: 0,
         maintenance_fee_previous_rate: 0,
+        funding_mark_e6: MAX_ORACLE_PRICE,
+        funding_mark_pending_e6: 0,
+        funding_mark_pending_slot: 0,
+        _padding1: [0u8; 8],
     }
 }
 
