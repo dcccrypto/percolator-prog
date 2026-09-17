@@ -5957,6 +5957,84 @@ fn v16_bpf_fee_sync_rejects_reused_market_slot_stale_leg_without_mutation() {
     );
 }
 
+/// ADOPT upstream b2d4190b ("block fee sync ahead of committed marks"): a
+/// permissionless SyncMaintenanceFee crank must not run while an active
+/// leg's price-managed mark (here, AuthMark) has been pushed via
+/// `PushAuthMark` but not yet committed into the asset's engine-side
+/// `effective_price` / `raw_oracle_target_price` by a refresh/crank. Before
+/// the fix this window let the crank realize fee economics against a stale
+/// commit; the fix (`reject_portfolio_pending_price_managed_mark_view`,
+/// called from `handle_sync_maintenance_fee` right after
+/// `expect_portfolio_view_account_key`) rejects it closed with
+/// `EngineLockActive` (Custom 21) and mutates nothing.
+#[test]
+fn v16_bpf_fee_sync_rejects_pending_auth_mark_ahead_of_committed_mark() {
+    const INITIAL_MARK: u64 = 100;
+    const TARGET_MARK: u64 = 120;
+
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1, 10_000, 10_000, 10_000, 1,
+    );
+    env.svm.warp_to_slot(1);
+    env.configure_auth_mark_with_cu(1, INITIAL_MARK);
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_portfolio = env.create_portfolio(&long_owner);
+    let short_portfolio = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_portfolio, 1_000);
+    env.deposit(&short_owner, short_portfolio, 1_000);
+    env.trade_with_cu(
+        &long_owner,
+        long_portfolio,
+        &short_owner,
+        short_portfolio,
+        POS_SCALE as i128,
+        INITIAL_MARK,
+        0,
+    );
+
+    // Push a new AuthMark target WITHOUT running the refresh/crank that would
+    // commit it into the engine's `effective_price` / `raw_oracle_target_price`.
+    // The profile now disagrees with the engine's committed mark -- exactly
+    // the "pending, uncommitted price-managed mark" state the fix targets.
+    env.svm.warp_to_slot(2);
+    env.push_auth_mark_with_cu(2, TARGET_MARK);
+
+    let (_, group_before_push) = env.market_state();
+    assert_eq!(
+        group_before_push.assets[0].effective_price, INITIAL_MARK,
+        "PushAuthMark alone must not touch the engine's committed effective_price"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    let long_before = env.svm.get_account(&long_portfolio).unwrap().data;
+
+    let err = env
+        .try_sync_maintenance_fee_with_cu(long_portfolio, None, 2)
+        .expect_err(
+            "a permissionless fee-sync crank must not proceed ahead of a committed \
+             price-managed mark on an active leg",
+        );
+    println!("v16 SyncMaintenanceFee pending-AuthMark rejection: {err}");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineLockActive as u32),
+        "expected EngineLockActive (Custom 21), got: {err}"
+    );
+
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        market_before,
+        "rejected sync must not mutate the market"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_portfolio).unwrap().data,
+        long_before,
+        "rejected sync must not mutate the portfolio"
+    );
+}
+
 #[test]
 fn v16_bpf_close_portfolio_sweeps_rent_to_market_slab() {
     // Fixture repair note: this failure is NOT an E3/E4 regression -- it predates

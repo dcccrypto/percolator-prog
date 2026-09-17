@@ -7088,6 +7088,57 @@ pub mod processor {
         Ok(())
     }
 
+    // ADOPT upstream b2d4190b, "block fee sync ahead of committed marks": a
+    // permissionless fee-sync crank must not run while an active leg's
+    // price-managed mark (Hybrid/EWMA/AuthMark) has been pushed but not yet
+    // committed into the asset's `effective_price` / `raw_oracle_target_price`.
+    // Running the sync ahead of that commit lets the crank realize
+    // maintenance-fee economics against a stale mark, opening a
+    // timing/front-running window. Self-contained, no ABI change.
+    fn reject_portfolio_pending_price_managed_mark_view(
+        cfg: &WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> ProgramResult {
+        let active_bitmap = portfolio
+            .header
+            .active_bitmap
+            .map(percolator::V16PodU64::get);
+        let max_market_slots = group.header.config.max_market_slots.get() as usize;
+        let mut slot_index = 0usize;
+        while slot_index < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot_index]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            let active = percolator::active_bitmap_get(active_bitmap, slot_index);
+            if active != leg.active {
+                return Err(PercolatorError::EngineHiddenLeg.into());
+            }
+            if active {
+                let asset_index = leg.asset_index as usize;
+                if asset_index >= max_market_slots || asset_index >= group.markets.len() {
+                    return Err(PercolatorError::EngineInvalidLeg.into());
+                }
+                let asset = group.markets[asset_index].engine.asset;
+                if leg.market_id != asset.market_id.get() {
+                    return Err(PercolatorError::EngineInvalidLeg.into());
+                }
+                let profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
+                if oracle_v16::profile_is_price_managed(&profile) {
+                    let effective_price = asset.effective_price.get();
+                    if asset.raw_oracle_target_price.get() != effective_price
+                        || profile.mark_ewma_e6 != effective_price
+                        || profile.oracle_target_price_e6 != effective_price
+                    {
+                        return Err(PercolatorError::EngineLockActive.into());
+                    }
+                }
+            }
+            slot_index += 1;
+        }
+        Ok(())
+    }
+
     fn read_oracle_profile_for_asset(
         market_data: &[u8],
         cfg: &WrapperConfigV16,
@@ -13098,6 +13149,10 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+            // ADOPT upstream b2d4190b: reject this permissionless fee-sync
+            // crank if it would run ahead of a committed price-managed mark
+            // on an active leg (see reject_portfolio_pending_price_managed_mark_view).
+            reject_portfolio_pending_price_managed_mark_view(&cfg, &group, &portfolio)?;
 
             // Protocol-fee RESERVE amendment (~/v17/DECISIONS-LEDGER.md): the
             // cranker reward below is paid from the same unbudgeted insurance
