@@ -5882,6 +5882,142 @@ fn v16_bpf_underfunded_flat_sync_sweeps_remaining_capital_once() {
     );
 }
 
+// ── w1-aa84b45dd: ADOPT upstream a84b45dd "collect maintenance before value debits", FOLDED
+// with d1bff017 "crystallize flat first-risk fees" ──
+//
+// Before this fix, `collect_maintenance_fee_before_trade_view` /
+// `_before_value_debit_view` had ZERO call sites in this fork: Withdraw, TradeNoCpi/
+// BatchTradeNoCpi/TradeCpi, and the abandoned-asset force-close handler all moved an account's
+// capital/positions WITHOUT first crystallizing the maintenance fee accrued since that account's
+// last sync. A user could therefore Withdraw or Trade to dodge that fee entirely -- an ongoing
+// insurance-funding leak, since the only prior fee-collection paths (SyncMaintenanceFee,
+// CloseResolved, the Recovery-mode permissionless_auto_crank sweep) are never obligatory before
+// a Withdraw or Trade.
+//
+// The two tests below reproduce the dodge on the withdraw path and the trade path respectively
+// (the task's required "trade path and one other"), asserting the fee is now crystallized into
+// insurance and the account's `last_fee_slot` cursor BEFORE the value-debiting action lands.
+
+#[test]
+fn v16_bpf_withdraw_crystallizes_maintenance_fee_before_debiting_capital() {
+    // FIX regression (ADOPT a84b45dd/d1bff017): before the fix, `handle_withdraw` never called
+    // maintenance-fee collection, so a flat account that sat idle after deposit (never synced)
+    // could Withdraw its full stale capital and dodge every maintenance fee accrued since
+    // InitPortfolio -- this is the dodge the fix closes.
+    let fee_per_slot: u128 = 7;
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1, 10_000, 10_000, 10_000, fee_per_slot,
+    );
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    let deposit_amount: u128 = 100_000;
+    env.deposit(&owner, portfolio, deposit_amount);
+
+    let last_fee_slot_at_deposit = env.portfolio_state(portfolio).last_fee_slot;
+    let target_slot = last_fee_slot_at_deposit + 50;
+    env.svm.warp_to_slot(target_slot);
+
+    // Withdraw the account's full PRE-fee capital in one instruction, without ever calling
+    // SyncMaintenanceFee first -- exactly the dodge path the fix closes. The atomic
+    // withdraw-all preservation (submitted amount == pre-fee capital) must still drain the
+    // account fully, net of the fee just crystallized.
+    let dest = env.withdraw(&owner, portfolio, deposit_amount);
+
+    let dt = target_slot - last_fee_slot_at_deposit;
+    let expected_fee = fee_per_slot * dt as u128;
+    let received = env.token_amount(dest) as u128;
+    let (_, group_after) = env.market_state();
+    let portfolio_after = env.portfolio_state(portfolio);
+
+    assert!(expected_fee > 0, "test setup: elapsed time must accrue a nonzero fee");
+    assert_eq!(
+        received,
+        deposit_amount - expected_fee,
+        "FIX regression: Withdraw must crystallize the accrued maintenance fee BEFORE debiting \
+         capital -- the payout must be net of the fee, not the full stale (pre-fee) capital"
+    );
+    assert_eq!(
+        group_after.insurance, expected_fee,
+        "the crystallized fee must be credited to insurance before the withdraw pays out"
+    );
+    assert_eq!(
+        portfolio_after.capital, 0,
+        "the atomic withdraw-all preservation must still drain the account fully post-fee"
+    );
+    assert_eq!(
+        portfolio_after.last_fee_slot, target_slot,
+        "the fee cursor must advance to the withdraw's authenticated slot"
+    );
+}
+
+#[test]
+fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
+    // FIX regression (ADOPT a84b45dd/d1bff017): before the fix, TradeNoCpi never called
+    // maintenance-fee collection at all. This specifically exercises the d1bff017 FOLD: both
+    // accounts here are FLAT, about to open their FIRST leg via this trade -- exactly the case
+    // upstream's original a84b45dd short-circuit ("opening a first leg does not debit an
+    // existing exposure") used to skip, and which d1bff017 removed because it mis-anchored a
+    // first-risk-admission account's fee cursor. Adopting the two commits pre-folded means this
+    // fork never had that short-circuit, so a first-leg trade must still crystallize the fee
+    // accrued since deposit for BOTH sides.
+    let fee_per_slot: u128 = 7;
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1, 10_000, 10_000, 10_000, fee_per_slot,
+    );
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    env.deposit(&short_owner, short_account, 1_000_000);
+
+    let last_fee_slot_at_deposit = env.portfolio_state(long_account).last_fee_slot;
+    assert_eq!(
+        last_fee_slot_at_deposit,
+        env.portfolio_state(short_account).last_fee_slot,
+        "test setup: both accounts must start from the same fee cursor"
+    );
+    let trade_slot = last_fee_slot_at_deposit + 40;
+    env.svm.warp_to_slot(trade_slot);
+
+    // fee_bps = 0 isolates the maintenance fee from the ordinary trading fee.
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (10 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+
+    let dt = trade_slot - last_fee_slot_at_deposit;
+    let expected_fee_per_account = fee_per_slot * dt as u128;
+    let (_, group) = env.market_state();
+    let long = env.portfolio_state(long_account);
+    let short = env.portfolio_state(short_account);
+
+    assert!(
+        expected_fee_per_account > 0,
+        "test setup: elapsed time must accrue a nonzero fee"
+    );
+    assert_eq!(
+        group.insurance,
+        expected_fee_per_account * 2,
+        "FIX regression: TradeNoCpi must crystallize BOTH accounts' accrued maintenance fee \
+         before the trade opens their first leg -- opening a first-risk position must not let \
+         either side dodge the fee owed since its last sync"
+    );
+    assert_eq!(
+        long.last_fee_slot, trade_slot,
+        "the long leg's fee cursor must advance to the trade's authenticated slot"
+    );
+    assert_eq!(
+        short.last_fee_slot, trade_slot,
+        "the short leg's fee cursor must advance to the trade's authenticated slot"
+    );
+}
+
 #[test]
 fn v16_bpf_nonflat_fee_sync_settles_hidden_loss_before_sweeping_fee() {
     let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
