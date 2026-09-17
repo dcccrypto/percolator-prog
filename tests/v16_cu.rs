@@ -14382,3 +14382,249 @@ fn v16_bpf_elsa_open_cohort_on_target_asset_is_refused_narrow_not_delete() {
         "expected EngineLockActive Custom(21), got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Upstream caf1cc2a parity — "enforce canonical auxiliary ledger layouts".
+//
+// Before this fix, `state::{read,write,init}_backing_domain_ledger` and their
+// insurance-ledger counterparts accepted `data.len() < canonical_len()` (an
+// AT-LEAST check), so an oversized account was treated as valid. Separately,
+// `read_or_new_backing_domain_ledger` / `read_or_new_insurance_ledger` treated
+// ANY account without a matching magic header as an untouched blank slate —
+// even one carrying non-zero garbage — and happily initialized over it.
+//
+// Upstream tightens both: the wire length must match EXACTLY (`!=` instead of
+// `<`), and an "uninitialized-looking" account (no magic) must actually be
+// all-zero before it is accepted as fresh. See src/v16_program.rs
+// `read_or_new_backing_domain_ledger` / `read_or_new_insurance_ledger` and the
+// sibling `state::*_ledger` helpers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
+    let mut env = V16CuEnv::new();
+    let domain: u16 = 1;
+    let (ledger_pda, _bump) =
+        state::derive_lp_backing_ledger(&env.program_id, &env.market, domain);
+    let canonical_len = state::backing_domain_ledger_account_len();
+    // One byte OVER the canonical wire length, all-zero content — exactly the
+    // shape the pre-fix `data.len() < canonical` check waved through as valid.
+    env.svm
+        .set_account(
+            ledger_pda,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; canonical_len + 1],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let admin = env.admin.insecure_clone();
+    let source = env.token_account(admin.pubkey(), 100);
+    let pid = env.program_id;
+    let market = env.market;
+    let vault = env.vault;
+    let payer = env.payer.insecure_clone();
+    let res = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpBackingBucket {
+            domain,
+            amount: 50,
+            expiry_slot: 10,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger_pda, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[&admin],
+    );
+    let msg = res.expect_err(
+        "caf1cc2a: an oversized backing-domain ledger account must be rejected, not \
+         silently accepted as canonical (pre-fix `data.len() < canonical` treated any \
+         longer account as valid)",
+    );
+    assert!(
+        msg.contains("Custom(5)") || msg.contains("custom program error: 0x5"),
+        "expected InvalidAccountLen (Custom(5)), got: {msg}"
+    );
+
+    // And no partial write: the account must remain exactly as it was found,
+    // not half-initialized by a rolled-back instruction.
+    let after = env.svm.get_account(&ledger_pda).unwrap();
+    assert_eq!(after.data.len(), canonical_len + 1);
+    assert!(
+        after.data.iter().all(|b| *b == 0),
+        "no bytes should have been written on a rejected instruction"
+    );
+}
+
+#[test]
+fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
+    let mut env = V16CuEnv::new();
+    let domain: u16 = 1;
+    let (ledger_pda, _bump) =
+        state::derive_lp_backing_ledger(&env.program_id, &env.market, domain);
+    let canonical_len = state::backing_domain_ledger_account_len();
+    // Exact canonical length, but NOT all-zero — and the leading bytes do not
+    // form the MAGIC header, so `is_initialized` reads this as "fresh" even
+    // though it plainly is not blank storage.
+    let mut data = vec![0u8; canonical_len];
+    data[canonical_len - 1] = 0xAA;
+    env.svm
+        .set_account(
+            ledger_pda,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let admin = env.admin.insecure_clone();
+    let source = env.token_account(admin.pubkey(), 100);
+    let pid = env.program_id;
+    let market = env.market;
+    let vault = env.vault;
+    let payer = env.payer.insecure_clone();
+    let res = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpBackingBucket {
+            domain,
+            amount: 50,
+            expiry_slot: 10,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger_pda, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[&admin],
+    );
+    let msg = res.expect_err(
+        "caf1cc2a: a magic-less ledger account carrying non-zero garbage must be \
+         rejected, not silently reinterpreted as a blank-slate fresh ledger",
+    );
+    assert!(
+        msg.contains("InvalidAccountData"),
+        "expected InvalidAccountData, got: {msg}"
+    );
+
+    let after = env.svm.get_account(&ledger_pda).unwrap();
+    assert_eq!(
+        after.data[canonical_len - 1], 0xAA,
+        "no partial write over the garbage on a rejected instruction"
+    );
+}
+
+#[test]
+fn v16_bpf_oversized_insurance_ledger_account_is_rejected() {
+    let mut env = V16CuEnv::new();
+    let canonical_len = state::insurance_ledger_account_len();
+    // TopUpInsurance's ledger account is not PDA-pinned, so a plain
+    // program-owned account at any address exercises the same gate.
+    let ledger = env.program_account(canonical_len + 1);
+
+    let admin = env.admin.insecure_clone();
+    let source = env.token_account(admin.pubkey(), 100);
+    let pid = env.program_id;
+    let market = env.market;
+    let vault = env.vault;
+    let payer = env.payer.insecure_clone();
+    let res = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpInsurance { amount: 50 },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ],
+        &[&admin],
+    );
+    let msg = res.expect_err(
+        "caf1cc2a: an oversized insurance ledger account must be rejected, not \
+         silently accepted as canonical",
+    );
+    assert!(
+        msg.contains("Custom(5)") || msg.contains("custom program error: 0x5"),
+        "expected InvalidAccountLen (Custom(5)), got: {msg}"
+    );
+
+    let after = env.svm.get_account(&ledger).unwrap();
+    assert_eq!(after.data.len(), canonical_len + 1);
+    assert!(
+        after.data.iter().all(|b| *b == 0),
+        "no bytes should have been written on a rejected instruction"
+    );
+}
+
+#[test]
+fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
+    let mut env = V16CuEnv::new();
+    let canonical_len = state::insurance_ledger_account_len();
+    let ledger = env.program_account(canonical_len);
+    {
+        let mut acct = env.svm.get_account(&ledger).unwrap();
+        acct.data[canonical_len - 1] = 0xAA;
+        env.svm.set_account(ledger, acct).unwrap();
+    }
+
+    let admin = env.admin.insecure_clone();
+    let source = env.token_account(admin.pubkey(), 100);
+    let pid = env.program_id;
+    let market = env.market;
+    let vault = env.vault;
+    let payer = env.payer.insecure_clone();
+    let res = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::TopUpInsurance { amount: 50 },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ],
+        &[&admin],
+    );
+    let msg = res.expect_err(
+        "caf1cc2a: a magic-less insurance ledger account carrying non-zero garbage \
+         must be rejected, not silently reinterpreted as a blank-slate fresh ledger",
+    );
+    assert!(
+        msg.contains("InvalidAccountData"),
+        "expected InvalidAccountData, got: {msg}"
+    );
+
+    let after = env.svm.get_account(&ledger).unwrap();
+    assert_eq!(
+        after.data[canonical_len - 1], 0xAA,
+        "no partial write over the garbage on a rejected instruction"
+    );
+}
