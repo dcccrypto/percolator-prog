@@ -250,6 +250,33 @@ fn make_pyth_data(
     data
 }
 
+/// Builds a Switchboard `PullFeed` account layout matching `oracle_v16`'s byte offsets
+/// (see `SB_OFF_*` in `src/v16_program.rs`). `submission_idx` selects which of the 32
+/// `SB_OFF_SUBMISSION_TIMESTAMPS` slots callers may then poke independently of the
+/// account-wide `last_update_timestamp` (offset 2216), which the caller sets separately --
+/// that split is exactly the account-write-vs-selected-result distinction issue #405 (upstream
+/// `72926689`) closes.
+fn make_switchboard_data(
+    feed_hash: &[u8; 32],
+    value: i128,
+    std_dev: i128,
+    num_samples: u8,
+    min_sample_size: u8,
+    submission_idx: u8,
+    result_slot: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8; 3_208];
+    data[0..8].copy_from_slice(&[196, 27, 108, 196, 10, 215, 219, 40]);
+    data[2_120..2_152].copy_from_slice(feed_hash);
+    data[2_215] = min_sample_size;
+    data[2_264..2_280].copy_from_slice(&value.to_le_bytes());
+    data[2_280..2_296].copy_from_slice(&std_dev.to_le_bytes());
+    data[2_360] = num_samples;
+    data[2_361] = submission_idx; // SB_OFF_RESULT_SUBMISSION_IDX = 8 + 2_353
+    data[2_368..2_376].copy_from_slice(&result_slot.to_le_bytes());
+    data
+}
+
 fn cu_ix() -> Instruction {
     ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)
 }
@@ -1760,6 +1787,22 @@ impl V16CuEnv {
                     lamports: 1_000_000_000,
                     data: make_pyth_data(feed, price, expo, conf, publish_time),
                     owner: oracle_v16::PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        key
+    }
+
+    fn set_switchboard_account(&mut self, key: Pubkey, data: Vec<u8>) -> Pubkey {
+        self.svm
+            .set_account(
+                key,
+                Account {
+                    lamports: 1_000_000_000,
+                    data,
+                    owner: oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID,
                     executable: false,
                     rent_epoch: 0,
                 },
@@ -8233,6 +8276,151 @@ fn set_test_clock(env: &mut V16CuEnv, slot: u64, unix_timestamp: i64) {
     let mut clock = env.svm.get_sysvar::<Clock>();
     clock.unix_timestamp = unix_timestamp;
     env.svm.set_sysvar(&clock);
+}
+
+// Issue #405 (upstream `72926689`, "bind Switchboard freshness to selected result"):
+// `PullFeed.last_update_timestamp` (SB_OFF_LAST_UPDATE_TIMESTAMP) dates the account WRITE, not
+// `CurrentResult.value`. Switchboard can rewrite the account -- advancing that timestamp -- while
+// the selected submission (the one `CurrentResult.submission_idx` actually points at) is left
+// untouched and arbitrarily old. `read_switchboard_price_e6` must age the timestamp at that
+// selected submission slot, not the account-wide write timestamp, or a stale price can be kept
+// "fresh" forever by touching the account without ever updating the priced result.
+#[test]
+fn v16_bpf_switchboard_fresh_account_write_cannot_revive_stale_selected_submission() {
+    let mut env = V16CuEnv::new();
+    set_test_clock(&mut env, 1, 200);
+    let value: i128 = 200_000 * 1_000_000_000_000i128;
+
+    // Case 1: account-write timestamp is FRESH (== now), but the selected submission (idx 7)
+    // is 110s old against a 60s max_staleness_secs bound. Pre-fix, this reads
+    // SB_OFF_LAST_UPDATE_TIMESTAMP (fresh) and wrongly accepts. Post-fix, it must read the
+    // idx-7 submission timestamp and reject as stale.
+    let submission_idx = 7u8;
+    let stale_feed = Pubkey::new_unique();
+    let mut stale_data =
+        make_switchboard_data(&[0xABu8; 32], value, 0, 1, 1, submission_idx, 1);
+    stale_data[2_216..2_224].copy_from_slice(&200i64.to_le_bytes()); // account write: fresh
+    let selected_off = 2_952 + submission_idx as usize * 8;
+    stale_data[selected_off..selected_off + 8].copy_from_slice(&90i64.to_le_bytes()); // selected: stale
+    env.set_switchboard_account(stale_feed, stale_data);
+
+    let before = env.svm.get_account(&env.market).unwrap().data;
+    let rejected = env.try_configure_hybrid_asset_with_conf_filter_cu(
+        0,
+        1,
+        0,
+        [stale_feed.to_bytes(), [0; 32], [0; 32]],
+        &[stale_feed],
+        1,
+        200,
+        0,
+        0,
+        3,
+        500,
+    );
+    let err = rejected.expect_err(
+        "a fresh Switchboard account-write timestamp must not revive a stale selected submission",
+    );
+    assert!(
+        err.contains("Custom(27)"),
+        "stale selected submission must reject as OracleStale, got: {err}"
+    );
+    let after = env.svm.get_account(&env.market).unwrap().data;
+    assert_eq!(
+        after, before,
+        "selected-result staleness rejection must roll back the complete market"
+    );
+
+    // Case 2: an out-of-range submission_idx (>= SB_SUBMISSION_CAP = 32) must reject as
+    // OracleInvalid rather than reading out of the fixed-size submission-timestamp table.
+    let malformed_feed = Pubkey::new_unique();
+    let mut malformed_data = make_switchboard_data(&[0xABu8; 32], value, 0, 1, 1, 32, 1);
+    malformed_data[2_216..2_224].copy_from_slice(&200i64.to_le_bytes());
+    env.set_switchboard_account(malformed_feed, malformed_data);
+    let malformed_rejected = env
+        .try_configure_hybrid_asset_with_conf_filter_cu(
+            0,
+            1,
+            0,
+            [malformed_feed.to_bytes(), [0; 32], [0; 32]],
+            &[malformed_feed],
+            1,
+            200,
+            0,
+            0,
+            3,
+            500,
+        )
+        .expect_err("an out-of-range selected submission index must reject");
+    assert!(
+        malformed_rejected.contains("Custom(26)"),
+        "invalid selected index must reject as OracleInvalid, got: {malformed_rejected}"
+    );
+    let after_malformed = env.svm.get_account(&env.market).unwrap().data;
+    assert_eq!(after_malformed, before);
+
+    // Case 3: a genuinely current selected result (idx 3, fresh both ways) must remain usable --
+    // the fix must not make ALL Switchboard reads fail closed.
+    let fresh_feed = Pubkey::new_unique();
+    let fresh_idx = 3u8;
+    let mut fresh_data = make_switchboard_data(&[0xABu8; 32], value, 0, 1, 1, fresh_idx, 1);
+    fresh_data[2_216..2_224].copy_from_slice(&200i64.to_le_bytes());
+    let fresh_off = 2_952 + fresh_idx as usize * 8;
+    fresh_data[fresh_off..fresh_off + 8].copy_from_slice(&200i64.to_le_bytes());
+    env.set_switchboard_account(fresh_feed, fresh_data);
+    env.try_configure_hybrid_asset_with_conf_filter_cu(
+        0,
+        1,
+        0,
+        [fresh_feed.to_bytes(), [0; 32], [0; 32]],
+        &[fresh_feed],
+        1,
+        200,
+        0,
+        0,
+        3,
+        500,
+    )
+    .expect("a genuinely current selected Switchboard result remains usable");
+}
+
+// Boundary companion to the above: age == max_staleness_secs (60, hardcoded by
+// `try_configure_hybrid_asset_with_conf_filter_cu`) must remain valid, and one second older must
+// reject -- both measured against the SELECTED submission timestamp, not the account write time.
+#[test]
+fn v16_bpf_switchboard_selected_timestamp_staleness_boundary_is_inclusive() {
+    let configure = |selected_publish_time: i64| -> Result<u64, String> {
+        let mut env = V16CuEnv::new();
+        set_test_clock(&mut env, 1, 200);
+        let value: i128 = 200_000 * 1_000_000_000_000i128;
+        let submission_idx = 0u8;
+        let feed = Pubkey::new_unique();
+        let mut data = make_switchboard_data(&[0xABu8; 32], value, 0, 1, 1, submission_idx, 1);
+        data[2_216..2_224].copy_from_slice(&200i64.to_le_bytes()); // account write always fresh
+        let off = 2_952 + submission_idx as usize * 8;
+        data[off..off + 8].copy_from_slice(&selected_publish_time.to_le_bytes());
+        env.set_switchboard_account(feed, data);
+        env.try_configure_hybrid_asset_with_conf_filter_cu(
+            0,
+            1,
+            0,
+            [feed.to_bytes(), [0; 32], [0; 32]],
+            &[feed],
+            1,
+            200,
+            0,
+            0,
+            3,
+            500,
+        )
+    };
+
+    configure(140).expect("age exactly equal to max_staleness_secs (60) must remain valid");
+    let stale = configure(139).expect_err("age of max_staleness_secs + 1 must reject");
+    assert!(
+        stale.contains("Custom(27)"),
+        "one second past the selected-result freshness bound must be OracleStale: {stale}"
+    );
 }
 
 fn run_hybrid_fresh_oracle_trade_case(dt: u64, oracle_leg_count: u8, invert: u8) {

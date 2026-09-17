@@ -640,6 +640,11 @@ fn switchboard_account(
     data[2_264..2_280].copy_from_slice(&value.to_le_bytes());
     data[2_280..2_296].copy_from_slice(&std_dev.to_le_bytes());
     data[2_360] = 1;
+    // SB_OFF_RESULT_SUBMISSION_IDX (2_361) is left at 0, selecting submission slot 0; issue
+    // #405 (upstream `72926689`) ages that selected submission's timestamp instead of the
+    // account-wide write timestamp above, so it must be populated too or every read here would
+    // wrongly see publish_time <= 0 and reject as stale.
+    data[2_952..2_960].copy_from_slice(&publish_time.to_le_bytes());
     data[2_368..2_376].copy_from_slice(&1u64.to_le_bytes());
     TestAccount::new_with_data(
         key,
