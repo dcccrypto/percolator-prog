@@ -16869,6 +16869,17 @@ pub mod processor {
             let mut observations: alloc::vec::Vec<AutoCrankObservationV16> =
                 alloc::vec::Vec::with_capacity(percolator::V16_MAX_PORTFOLIO_ASSETS_N);
             let mut market_accrual_performed = false;
+            // GATE-2 FIX (bounded_market_catchup_only, ported from upstream
+            // `aeyakovenko/percolator-prog` src/v16_program.rs, handler
+            // `handle_permissionless_crank_zero_copy`, lines ~13925/14096/14141 at
+            // upstream/main commit a657d195): tracks whether pass-1's own
+            // single-segment `accrue_asset_to_not_atomic` call (capped at
+            // `config.max_accrual_dt_slots`, adaptation (1) above) fully caught any
+            // hinted asset up to `authenticated_now_slot`. If the cap bit and any
+            // hinted asset is left short (`asset_slot_after < authenticated_now_slot`),
+            // this crank instruction must stop HERE -- see the early-return check
+            // right after this loop for why.
+            let mut bounded_market_catchup_only = false;
             for hint in observation_hints.iter() {
                 let hint_asset_index = hint.asset_index as usize;
                 if hint_asset_index >= group.header.config.max_market_slots.get() as usize
@@ -16987,6 +16998,14 @@ pub mod processor {
                     || asset_after.raw_oracle_target_price.get() != asset_before_raw_target
                     || asset_after.effective_price.get() != asset_before_effective
                     || oracle_profile != oracle_profile_before;
+                // Mirrors upstream's own post-accrual check (same call site as above):
+                // pass-1's single-segment accrual is capped at `max_accrual_dt_slots`,
+                // so a large enough wall-clock gap leaves `slot_last` short of
+                // `authenticated_now_slot` for THIS asset even though the call
+                // succeeded. Sticky across the whole loop (`|=`) -- one short asset is
+                // enough to gate the whole instruction below.
+                bounded_market_catchup_only |=
+                    asset_after.slot_last.get() < authenticated_now_slot;
 
                 observations.push(AutoCrankObservationV16 {
                     asset_index: hint_asset_index,
@@ -16996,6 +17015,28 @@ pub mod processor {
             }
             if !oracle_tail.is_empty() {
                 return Err(PercolatorError::InvalidInstruction.into());
+            }
+
+            // GATE-2 FIX: upstream's `bounded_market_catchup_only` early-return
+            // (ported above; same source lines). If pass-1 hit the per-asset
+            // `max_accrual_dt_slots` cap and left any hinted asset short of
+            // `authenticated_now_slot`, STOP HERE -- do not fall through to the
+            // unified `permissionless_auto_crank_not_atomic` dispatch below, whose
+            // own internal `permissionless_crank_not_atomic` would otherwise accrue
+            // that same asset a SECOND time in this one instruction. Without this
+            // guard a single crank ix could atomically process up to 2x
+            // `max_accrual_dt_slots` of catch-up, breaking the per-instruction
+            // solvency envelope (`max_price_move_bps_per_slot * max_accrual_dt_slots
+            // <= margin`, `V16Config::validate_exact_solvency_envelope`) the engine's
+            // margin math is sized against. Returning `Ok(())` here (not an error)
+            // matches upstream: pass-1's accrual work is real, useful progress that
+            // must still be committed -- the caller simply needs to submit another
+            // crank ix to make further progress on this asset.
+            if bounded_market_catchup_only {
+                group.validate_shape().map_err(map_v16_error)?;
+                drop(group);
+                state::write_wrapper_config(&mut market_data, &cfg)?;
+                return Ok(());
             }
 
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
