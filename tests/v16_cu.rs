@@ -3732,6 +3732,115 @@ fn v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry() {
     );
 }
 
+/// Wave-1 S1a v2 griefing regression (Gate-2 REJECT, verifier `abe30333`).
+///
+/// THE HOLE: the terminal-slab scan's option-(b) `CloseSlab` gate (see the
+/// `OPTION-(B) SCOPE GATE` comment above `lp_vault_dead_share_floor_present`
+/// in `src/v16_program.rs`) permanently blocks `CloseSlab` for ANY funded
+/// domain whose `expiry_slot == LP_VAULT_BACKING_EXPIRY_SLOT` -- the sentinel
+/// (`u64::MAX / 2`) meaning "LP-vault-bound". That sentinel is meant to be
+/// reserved EXCLUSIVELY to the LP-vault-registry call sites
+/// (`handle_deposit_to_lp_vault` / rebalance / fee-crank-reclassify), which
+/// stamp it via `add_fresh_counterparty_backing_view` with a hardcoded
+/// constant -- never a caller-supplied argument.
+///
+/// Before this fix, `handle_top_up_backing_bucket` (tag 24) accepted the wire
+/// `expiry_slot` RAW, with only a lower-bound check (`> current_slot`). A
+/// domain's `backing_bucket_authority` -- a role separately delegatable from
+/// `marketauth` -- could set it to EXACTLY the sentinel on an ORDINARY
+/// top-up, on a market that never touched the LP-vault feature at all, and
+/// PERMANENTLY brick `CloseSlab` with `Custom(21)` (`EngineLockActive`) for
+/// that market. Both a self-inflicted foot-gun and a role-separation
+/// griefing vector; empirically PoC'd by the verifier on a plain market with
+/// zero LP-vault instructions.
+///
+/// THE FIX: `handle_top_up_backing_bucket` now rejects
+/// `expiry_slot == LP_VAULT_BACKING_EXPIRY_SLOT` with `InvalidInstruction`
+/// (`Custom(9)`) in BOTH the mode-0 preflight and the re-check/reuse branch
+/// that actually calls `deposit_fresh_counterparty_backing_not_atomic` --
+/// i.e. the sentinel is rejected at the top-up itself, long before it could
+/// ever reach `CloseSlab`.
+#[test]
+fn v16_bpf_topup_backing_bucket_rejects_lp_vault_sentinel_expiry() {
+    let mut env = V16CuEnv::new();
+    let sentinel = percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT;
+
+    let ledger = env.canonical_backing_domain_ledger_account(1);
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    let vault = env.vault;
+
+    // POSITIVE CONTROL (the fix under test): the exact sentinel must be
+    // rejected at the top-up itself.
+    let err = env
+        .send(
+            ProgInstruction::TopUpBackingBucket {
+                domain: 1,
+                amount: 1_000,
+                expiry_slot: sentinel,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(ledger, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect_err(
+            "a plain market's TopUpBackingBucket must reject expiry_slot == \
+             LP_VAULT_BACKING_EXPIRY_SLOT -- that sentinel is reserved to the \
+             LP-vault-registry call sites, which stamp it directly and never \
+             through this caller-supplied-argument handler. Pre-fix this let a \
+             domain's backing_bucket_authority permanently brick CloseSlab \
+             (Custom(21)) on a market that never touched the LP-vault feature.",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::InvalidInstruction as u32),
+        "expected InvalidInstruction (Custom(9)); got {err}"
+    );
+    // No capital moved and no bucket was opened by the refused top-up.
+    let (_, g) = env.market_state();
+    assert_eq!(g.vault, 0, "a refused top-up must not move any tokens");
+    assert_eq!(
+        g.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Empty,
+        "a refused top-up must not open the bucket"
+    );
+
+    // NEGATIVE CONTROL: only the EXACT sentinel is reserved. `sentinel - 1` is
+    // an ordinary (if enormous) expiry and must still succeed exactly as
+    // before this fix.
+    env.top_up_backing_bucket(1, 1_000, sentinel - 1);
+    let (_, g2) = env.market_state();
+    assert_eq!(
+        g2.source_backing_buckets[1].status,
+        BackingBucketStatusV16::Fresh,
+        "a top-up whose expiry_slot is one less than the sentinel must still succeed"
+    );
+    assert_eq!(
+        g2.source_backing_buckets[1].expiry_slot, sentinel - 1,
+        "the accepted expiry_slot must be stored unmodified"
+    );
+}
+
 #[test]
 fn v16_bpf_permissionless_asset_cannot_withdraw_unrelated_domain_insurance() {
     let mut env = V16CuEnv::new();

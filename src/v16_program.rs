@@ -11827,8 +11827,22 @@ pub mod processor {
                     // funding a "fresh" backing bucket that never backs a single lien for its
                     // provider, while callers relying on `require_domain_accepts_live_topup_view`
                     // above still treat the deposit as accepted.
+                    // Wave-1 S1a v2 griefing fix (Gate-2 rejection): the LP-vault sentinel
+                    // `LP_VAULT_BACKING_EXPIRY_SLOT` (`u64::MAX / 2`) marks a bucket as
+                    // "LP-vault-bound" and permanently blocks `CloseSlab`'s terminal-slab
+                    // scan (see the OPTION-(B) SCOPE GATE comment there). That sentinel is
+                    // reserved for the LP-vault-registry call sites
+                    // (`handle_deposit_to_lp_vault` / rebalance / fee-crank-reclassify),
+                    // which stamp it directly via `add_fresh_counterparty_backing_view` with
+                    // a hardcoded constant -- never through this handler. Without this
+                    // guard, `expiry_slot` here is a RAW caller-supplied argument (only
+                    // lower-bounded above), so a domain's `backing_bucket_authority` could
+                    // set it to exactly the sentinel on an ordinary top-up and permanently
+                    // brick `CloseSlab` (Custom(21)) for a market that never touched the
+                    // LP-vault feature at all.
                     if amount != 0
-                        && expiry_slot <= authenticated_market_slot_or_fallback_view(&group)
+                        && (expiry_slot <= authenticated_market_slot_or_fallback_view(&group)
+                            || expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT)
                     {
                         return Err(PercolatorError::InvalidInstruction.into());
                     }
@@ -11873,7 +11887,15 @@ pub mod processor {
             // slot, not just the preflight borrow's -- a stale-slot retained transaction that
             // slipped past the preflight check above must still be rejected here, against the
             // freshest available slot, before any capital moves.
-            if expiry_slot <= authenticated_market_slot_or_fallback_view(&group) {
+            //
+            // Wave-1 S1a v2: re-check the LP-vault-sentinel exclusion here too -- this is the
+            // re-check/reuse branch that actually calls
+            // `deposit_fresh_counterparty_backing_not_atomic` with the caller-supplied
+            // `expiry_slot` below, so it must fail closed on its own, not rely solely on the
+            // preflight borrow above. See the preflight comment for the full rationale.
+            if expiry_slot <= authenticated_market_slot_or_fallback_view(&group)
+                || expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+            {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
