@@ -7602,7 +7602,14 @@ fn v16_bpf_close_portfolio_sweeps_rent_to_market_slab() {
 
 #[test]
 fn v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded() {
-    let mut env = V16CuEnv::new();
+    // ADOPT upstream 42e70c84 (test-side companion): the CPI fee charge is now pinned to
+    // `trade_fee_base_bps`, not whatever fee_bps the taker happens to sign -- set the market's
+    // base fee explicitly (the harness default is 0) so this test's `insurance == 10` assertion
+    // below still exercises a nonzero charge, matching upstream's own test update for this fix.
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        trade_fee_base_bps: 100,
+        ..V16CuMarketParams::default()
+    });
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
     env.svm.add_program(matcher_program, &matcher_bytes);
@@ -7881,8 +7888,137 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
 }
 
 #[test]
-fn v16_bpf_tradecpi_external_matcher_executes_on_added_asset() {
+fn v16_attack_trade_cpi_n1_fallback_pins_to_base_fee_not_caller_fee_bps() {
+    // Security regression (adopts upstream 42e70c84 "ignore unsigned CPI caller fees",
+    // WRAPPER-only / logic-only per SECURITY_FIXES_TRIAGE.md's corrected verdict + this
+    // unit's own read of `percolator-prog:42e70c84 -- src/v16_program.rs`): our
+    // taker-only-fee design means account_b (the unsigned CPI/matcher side) normally pays
+    // no trade fee at all -- `handle_trade_cpi`'s `fee_bps` charges only account_a (the
+    // signer). BUT the engine's N1 maker-fallback
+    // (`charge_trade_fee_taker_only_not_atomic`) shifts the charge to the passive side
+    // whenever the taker's own charge resolves to a shortfall (negative-PnL waiver or
+    // capital exhaustion) -- and before this fix that fallback amount was still derived
+    // from the taker's own caller-controlled, floor-only-bounded `fee_bps`. A taker could
+    // structure a capital-exhausted leg and sign an inflated `fee_bps` (any value >= the
+    // live `trade_fee_base_bps`, up to `max_trading_fee_bps`) to shift a self-chosen,
+    // inflated fee onto the never-signing counterparty via this fallback. The fix pins
+    // the amount routed into the fallback to `cfg_pre.trade_fee_base_bps` instead.
+    fn fee_for_bps(size_q: u128, price: u64, fee_bps: u64) -> u128 {
+        let notional = size_q * price as u128 / POS_SCALE;
+        (notional * fee_bps as u128 + 9_999) / 10_000
+    }
+
     let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let base_bps: u64 = 100; // 1% live market base fee
+    env.update_trade_fee_policy_with_cu(base_bps);
+
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let maker_account = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker_account, 1_000_000);
+    env.deposit(&maker_owner, maker_account, 1_000_000);
+
+    let (matcher_ctx, matcher_delegate, _) =
+        env.init_matcher_context(&maker_owner, matcher_program, maker_account);
+
+    let size = (10 * POS_SCALE) as i128;
+    // Open the taker's position with ample capital, signed at exactly the base fee.
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        size,
+        base_bps,
+    );
+
+    // Drain the taker's capital to exactly 0, keeping the market's c_tot/vault
+    // consistent (same surgery pattern as tests/v16_wrapper.rs's
+    // b4_mid_batch_shortfall_batch fixture). A fully-drained taker's later fee-charge
+    // attempt resolves to 0 regardless of the fee owed, guaranteeing the N1 fallback
+    // fires for the WHOLE fee (shortfall == fee), which makes the assertion below exact.
+    {
+        let mut market_account = env.svm.get_account(&env.market).unwrap();
+        let mut taker_account_data = env.svm.get_account(&taker_account).unwrap();
+        let (cfg, mut group) = state::read_market(&market_account.data).unwrap();
+        let mut acct = state::read_portfolio(&taker_account_data.data).unwrap();
+        let drop = acct.capital;
+        acct.capital = 0;
+        acct.health_cert.valid = false;
+        group.c_tot -= drop;
+        group.vault -= drop;
+        state::write_market(&mut market_account.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut taker_account_data.data, &acct).unwrap();
+        env.svm.set_account(env.market, market_account).unwrap();
+        env.svm
+            .set_account(taker_account, taker_account_data)
+            .unwrap();
+    }
+
+    let maker_capital_before = env.portfolio_state(maker_account).capital;
+
+    // The taker signs a wildly inflated fee_bps (self-chosen, well above the live base
+    // fee but still within max_trading_fee_bps) on a full-reduction close (exempt from
+    // the initial-margin gate, so the zero-capital taker can still submit it).
+    let inflated_fee_bps: u64 = 5_000; // 50%, vs a 1% (100 bps) market base fee
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        -size,
+        inflated_fee_bps,
+    );
+
+    let maker_capital_after = env.portfolio_state(maker_account).capital;
+    let maker_paid = maker_capital_before - maker_capital_after;
+
+    let fee_at_base = fee_for_bps((10 * POS_SCALE) as u128, 100, base_bps);
+    let fee_at_inflated = fee_for_bps((10 * POS_SCALE) as u128, 100, inflated_fee_bps);
+    assert!(
+        fee_at_base < fee_at_inflated,
+        "fixture sanity: the inflated signed fee_bps must exceed the base-fee charge"
+    );
+
+    println!(
+        "[42e70c84] N1 fallback on a capital-exhausted CPI taker: maker paid {maker_paid} \
+         (fee at base_bps={base_bps} -> {fee_at_base}; fee at taker's inflated \
+         fee_bps={inflated_fee_bps} -> {fee_at_inflated})"
+    );
+    assert_eq!(
+        maker_paid, fee_at_base,
+        "the N1 fallback must pin account_b's (the never-signing maker's) charge to \
+         cfg_pre.trade_fee_base_bps, not the taker's self-chosen fee_bps"
+    );
+    assert!(
+        maker_paid < fee_at_inflated,
+        "the maker must not be overcharged using the taker's inflated fee_bps"
+    );
+}
+
+#[test]
+fn v16_bpf_tradecpi_external_matcher_executes_on_added_asset() {
+    // ADOPT upstream 42e70c84 (test-side companion): see the comment on
+    // v16_bpf_tradecpi_executes_through_external_matcher_and_is_bounded above -- the CPI fee
+    // charge is now pinned to `trade_fee_base_bps`, so this test needs a nonzero base fee set
+    // explicitly to still exercise (and assert) a nonzero charge.
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        trade_fee_base_bps: 100,
+        ..V16CuMarketParams::default()
+    });
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
     env.svm.add_program(matcher_program, &matcher_bytes);

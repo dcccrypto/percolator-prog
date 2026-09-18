@@ -10313,7 +10313,19 @@ pub mod processor {
             asset_index,
             ret.exec_size,
             ret.exec_price_e6,
-            fee_bps,
+            // ADOPT upstream 42e70c84 (wrapper-only, logic-only): account_b (the
+            // unsigned CPI/matcher-routed side) never signs `fee_bps`, and the matcher
+            // ABI carries no fee approval from it. Normally that's fine — the taker-only
+            // fee design means account_b pays nothing. But the engine's N1 maker-fallback
+            // (`charge_trade_fee_taker_only_not_atomic`) shifts the charge onto account_b
+            // whenever the taker's own charge resolves to a shortfall (negative-PnL
+            // waiver or capital exhaustion) — and that fallback amount was still derived
+            // from the taker's own floor-only-bounded `fee_bps`, letting a taker structure
+            // a losing/capital-exhausted leg to shift an inflated, self-chosen fee onto
+            // the never-signing counterparty. Pin the amount routed into the fee/fallback
+            // computation to the market's own `cfg_pre.trade_fee_base_bps` instead — the
+            // one fee figure account_b implicitly consents to by registering as an LP.
+            cfg_pre.trade_fee_base_bps,
             max_market_slots,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
@@ -10873,7 +10885,12 @@ pub mod processor {
                 asset_index: leg.asset_index,
                 size_q: ret.exec_size,
                 exec_price: ret.exec_price_e6,
-                fee_bps: leg.fee_bps,
+                // ADOPT upstream 42e70c84 (wrapper-only, logic-only): as in the single-CPI
+                // route above, account_b never signs `leg.fee_bps` and the matcher ABI
+                // carries no fee approval from it — pin the amount routed into the N1
+                // maker-fallback computation to the market's own base fee instead of the
+                // taker's caller-controlled, floor-only-bounded per-leg fee.
+                fee_bps: trade_fee_base_bps_pre,
             });
         }
 
