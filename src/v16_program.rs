@@ -2271,9 +2271,11 @@ pub mod state {
     }
 
     /// Pure predicate (ADOPT upstream `0b838425`): whether a granted matcher
-    /// capability is still live at `current_slot`. Provided as infra for TB-1b
-    /// to wire into the CPI trade-authorization check (`handle_batch_trade_cpi`
-    /// and friends) -- not called from any handler in this unit.
+    /// capability is still live at `current_slot`. Wired into the CPI
+    /// trade-authorization check in `matcher_tail_start_or_verify_lp_config`
+    /// (see call site below) -- an expired (or never-granted, `expiry_slot ==
+    /// 0`) matcher capability no longer authorizes a CPI trade even when
+    /// `enabled == 1` and the program/context/delegate triple still matches.
     #[inline]
     pub fn matcher_capability_is_live(expiry_slot: u64, current_slot: u64) -> bool {
         expiry_slot != 0 && current_slot < expiry_slot
@@ -2281,8 +2283,9 @@ pub mod state {
 
     /// Pure predicate (ADOPT upstream `0b838425`): whether a `SetMatcherConfig`
     /// payload's `(enabled, trade_fee_cap_bps, expiry_slot)` triple is
-    /// internally consistent. Provided as infra for TB-1b to wire into
-    /// `handle_set_matcher_config` -- not called from any handler in this unit.
+    /// internally consistent. Wired into `handle_set_matcher_config` (see call
+    /// site below), which rejects with `InvalidInstruction` when this predicate
+    /// returns false.
     #[inline]
     pub fn matcher_capability_config_is_valid(
         enabled: u8,
