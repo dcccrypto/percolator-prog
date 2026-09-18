@@ -5851,6 +5851,43 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     assert_eq!(long_account.data, stale_portfolio);
     pass_count += 1;
 
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: pass-1's own
+    // single-segment accrual is capped at `max_accrual_dt_slots` (1 here), so asset
+    // `last_asset` (sitting at slot_last == 3 from its reactivation above) needs its
+    // own bounded catch-up before a crank can ever reach the unified dispatch that
+    // performs the reused-market-id validation this probe checks -- otherwise the
+    // guard's early return (a plain `Ok(())`, not a rejection) absorbs the call before
+    // dispatch is reached at all. These catch-up calls never even borrow the portfolio
+    // (the guard's early return happens before that borrow), so reusing the
+    // already-stale `long_account` here is safe and does not disturb it -- verified via
+    // `long_account.data == stale_portfolio` below, unchanged throughout. They DO
+    // legitimately advance the market's per-asset accrual state though, so the "market
+    // unchanged" baseline for this probe (and every later probe in this sweep, which
+    // all assume the market never mutates once stale_market is captured) is re-pinned
+    // to the post-catch-up state right before the call actually expected to reject.
+    while state::read_market(&market.data).unwrap().1.assets[last_asset as usize]
+        .slot_last
+        + 1
+        < 10
+    {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 10,
+                observations: vec![CrankObservationHint {
+                    asset_index: last_asset,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [&mut admin, &mut market, &mut long_account],
+        )
+        .expect("bounded catch-up crank (still short of now_slot) must not revert");
+    }
+    assert_eq!(
+        long_account.data, stale_portfolio,
+        "catch-up crank calls must never touch the portfolio (guard fires before that borrow)"
+    );
+    let stale_market = market.data.clone();
+
     let refresh_stale = run_ix(
 Instruction::PermissionlessCrank {
             now_slot: 10,

@@ -6686,25 +6686,45 @@ fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
     // varied (3, 4, 5 via `nonce`) is authenticated against the REAL Clock sysvar
     // (`authenticated_slot_or_fallback`), which stays pinned at 3 throughout this loop (only
     // `env.svm.warp_to_slot` advances it, and that isn't called again here) -- so all 3
-    // iterations were always identical calls once decoded. Empirically verified: the first
-    // crank advances asset 0 to `slot_last == 2` (not 3) and settles there -- this asset carries
-    // no oracle/mark configuration (Manual mode), so once its price/funding have nothing left to
-    // record, the engine's bounded accrual step stops advancing `slot_last` further even though
-    // wall-clock time remains, and a repeat call correctly errors (EngineNonProgress). One call
-    // suffices; what this test actually verifies (asset 0 strictly LESS stale than the
-    // deliberately-behind asset 1, and an unrelated trade on it still succeeds) does not depend
-    // on the exact settled value.
-    env.crank(
-        cranker_portfolio,
-        ProgInstruction::PermissionlessCrank {
-            now_slot: 3,
-            observations: vec![CrankObservationHint {
-                asset_index: 0,
-                oracle_accounts: 0,
-            }],
-        },
-    );
+    // iterations were always identical calls once decoded.
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: pass-1's own
+    // single-segment accrual is capped at `max_accrual_dt_slots` (1 here), so a SINGLE crank
+    // call only advances asset 0 from `slot_last` 0 -> 1 (current_slot is 3) and then the
+    // guard early-returns before the unified dispatch runs -- pre-cbaf7c6f, that dispatch's
+    // own internal (unguarded) second accrual pass gave asset 0 an incidental extra +1
+    // (`slot_last == 2`) that this test's old assertions were tuned to, purely a side effect
+    // of the very over-accrual leak the guard closes. To make asset 0 GENUINELY current
+    // (what the test's premise -- "asset 0 strictly LESS stale than the deliberately-behind
+    // asset 1" -- actually requires) under bounded catch-up, submit repeated crank ixs
+    // hinting asset 0, mirroring a real keeper resubmitting across the per-instruction cap,
+    // until asset 0's `slot_last` reaches `now_slot`.
+    loop {
+        // Fresh blockhash each iteration -- otherwise the byte-identical repeated
+        // hint crank collides as AlreadyProcessed.
+        env.svm.expire_blockhash();
+        env.crank(
+            cranker_portfolio,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 3,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+        );
+        let (_, g) = env.market_state();
+        assert!(
+            g.assets[0].slot_last <= 3,
+            "asset 0 catch-up loop overshot now_slot"
+        );
+        if g.assets[0].slot_last >= 3 {
+            break;
+        }
+    }
 
+    // Asset 1 stays deliberately behind: exactly one bounded crank call, capped
+    // at max_accrual_dt_slots (1), leaving it short of now_slot.
     env.crank(
         cranker_portfolio,
         ProgInstruction::PermissionlessCrank {
@@ -6718,7 +6738,10 @@ fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
 
     let (_, group) = env.market_state();
     assert_eq!(group.current_slot, 3);
-    assert_eq!(group.assets[0].slot_last, 2);
+    assert_eq!(
+        group.assets[0].slot_last, 3,
+        "asset 0 must be genuinely current after the bounded catch-up loop"
+    );
     assert!(group.assets[1].slot_last < group.assets[0].slot_last);
     assert!(
         group.loss_stale_active,
@@ -6750,7 +6773,7 @@ fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
     );
 
     let (_, group_after) = env.market_state();
-    assert_eq!(group_after.assets[0].slot_last, 2);
+    assert_eq!(group_after.assets[0].slot_last, 3);
     assert!(group_after.assets[1].slot_last < group_after.current_slot);
     assert!(
         group_after.loss_stale_active,
@@ -8953,12 +8976,21 @@ fn v16_bpf_ewma_mark_liquidation_reward_never_reclaimable_by_self_cranked_attack
     // (no relationship between `attacker_account` and the liquidated `short_account`).
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the engine's plan selector
     // needs a CURRENT certificate before Liquidate is selectable (engine v16.rs:15163) -- the
-    // fresh EWMA push above invalidates `short_account`'s cached cert, so the first call
-    // re-certifies (discovering the deficit) and the second call liquidates. Both calls name the
-    // attacker's portfolio as the reward recipient; the first generates no fee (no insurance
-    // movement), so it cannot itself pay a reward.
+    // fresh EWMA push above invalidates `short_account`'s cached cert, so an early call
+    // re-certifies (discovering the deficit) and a later call liquidates.
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: the warp from
+    // trade-time to slot 25 exceeds `max_accrual_dt_slots` (20 here), so asset 0's own
+    // catch-up now needs its OWN extra bounded call before the guard lets any call reach
+    // the unified dispatch at all (pre-guard, a single call's pass-1 PLUS the dispatch's own
+    // unguarded second accrual pass could straddle both catch-up and re-cert in one shot).
+    // Loop (bounded, self-cranked every iteration, attacker-named reward every iteration)
+    // until the liquidation has genuinely fired -- insurance moves or the short leg closes
+    // -- rather than assuming a fixed call count. Every call in the loop is still the exact
+    // permissionless, attacker-named-reward shape under test; none of them is allowed to
+    // credit the attacker, which the assertions below verify against the FINAL state.
     let mut liq_cu = 0;
-    for _ in 0..2 {
+    for _ in 0..6 {
         env.svm.expire_blockhash();
         liq_cu = send_tx(
             &mut env.svm,
@@ -8980,6 +9012,13 @@ fn v16_bpf_ewma_mark_liquidation_reward_never_reclaimable_by_self_cranked_attack
             &[&attacker_owner],
         )
         .expect("self-cranked EWMA liquidation with attacker-supplied reward portfolio");
+        let (_, m) = env.market_state();
+        let s = env.portfolio_state(short_account);
+        if m.insurance > market_before.insurance
+            || percolator::active_bitmap_is_empty(s.active_bitmap)
+        {
+            break;
+        }
     }
     println!("v16 EWMA self-cranked liquidation-reward-reclaim CU: {liq_cu}");
 
@@ -9113,10 +9152,18 @@ fn v16_bpf_hybrid_trade_driven_liquidation_reward_is_not_reclaimable_by_self_cra
     // fresh-oracle-read path that would otherwise clear the trade-driven taint.
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): see the identical
     // derivation comment on v16_bpf_ewma_mark_liquidation_reward_never_reclaimable_by_self_cranked_attacker
-    // above -- the plan selector needs a current cert before Liquidate is selectable, so the
-    // first call re-certifies and the second liquidates.
+    // above -- the plan selector needs a current cert before Liquidate is selectable, so an
+    // early call re-certifies and a later call liquidates.
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: same root cause as
+    // the EWMA sibling test above -- asset 0's own bounded catch-up (max_accrual_dt_slots =
+    // 20) now needs its own call(s) before the guard lets any call reach the unified
+    // dispatch, so this loops (bounded, self-cranked every iteration, attacker-named reward
+    // every iteration) until the liquidation has genuinely fired rather than assuming a
+    // fixed call count. Every call is still the exact permissionless, attacker-named-reward
+    // shape under test; the assertions below check the FINAL state.
     let mut liq_cu = 0;
-    for _ in 0..2 {
+    for _ in 0..6 {
         env.svm.expire_blockhash();
         liq_cu = send_tx(
             &mut env.svm,
@@ -9138,6 +9185,13 @@ fn v16_bpf_hybrid_trade_driven_liquidation_reward_is_not_reclaimable_by_self_cra
             &[&attacker_owner],
         )
         .expect("self-cranked Hybrid liquidation with attacker-supplied reward portfolio");
+        let (_, m) = env.market_state();
+        let s = env.portfolio_state(short_account);
+        if m.insurance > market_before.insurance
+            || percolator::active_bitmap_is_empty(s.active_bitmap)
+        {
+            break;
+        }
     }
     println!("v16 Hybrid trade-driven liquidation-reward-reclaim CU: {liq_cu}");
 
@@ -9229,28 +9283,44 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the engine's plan selector
     // needs a current certificate before Liquidate is selectable (engine v16.rs:15163);
     // `force_portfolio_capital_for_benchmark` already invalidates the cert
-    // (`health_cert.valid = false`), so the first call re-certifies (discovering the deficit)
-    // and the second liquidates.
-    env.crank(
-        long_account,
-        ProgInstruction::PermissionlessCrank {
-            now_slot: 16,
-            observations: vec![CrankObservationHint {
-                asset_index: 0,
-                oracle_accounts: 0,
-            }],
-        },
-    );
-    env.svm.expire_blockhash();
-    let liquidation_cu = env.crank(
-        long_account,
-        ProgInstruction::PermissionlessCrank {
-            now_slot: 16,
-            observations: vec![CrankObservationHint {
-                asset_index: 0,
-                oracle_accounts: 0,
-            }],
-        },
+    // (`health_cert.valid = false`).
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair:
+    // `seed_n_leg_position_for_benchmark`'s direct (bypass) `accrue_asset_to_not_atomic`
+    // call is itself capped at `max_accrual_dt_slots` (1, the default here), so it only
+    // advances asset 0 to `slot_last == 1`, far short of `now_slot` (16) after the warp.
+    // Pre-guard, a crank's own unguarded second accrual pass inside the unified dispatch
+    // could still reach a genuine liquidation from that partially-caught-up state in just
+    // 2 calls; the guard now requires asset 0 to be genuinely current before dispatch runs
+    // at all. Loop bounded crank calls (fresh blockhash each time, mirroring a real keeper
+    // resubmitting across the per-instruction cap) until the long portfolio's active-leg
+    // count actually drops -- i.e. until the liquidation has genuinely fired -- and measure
+    // CU on THAT call, not an earlier catch-up/re-cert call that never reaches the
+    // liquidation dispatch.
+    let mut liquidation_cu = 0;
+    let mut liquidated = false;
+    for _ in 0..40 {
+        env.svm.expire_blockhash();
+        liquidation_cu = env.crank(
+            long_account,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 16,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+        );
+        let long_data = env.svm.get_account(&long_account).unwrap().data;
+        let long = state::read_portfolio(&long_data).unwrap();
+        if percolator::active_bitmap_count_ones(long.active_bitmap) < 14 {
+            liquidated = true;
+            break;
+        }
+    }
+    assert!(
+        liquidated,
+        "liquidation never fired within the bounded catch-up loop"
     );
     println!("v16 full-14-leg liquidation crank CU: {liquidation_cu}");
     const FULL_14_LEG_LIQUIDATION_CU_LIMIT: u64 = 1_375_000;
@@ -14626,6 +14696,40 @@ fn try_expire_backing_bucket(env: &mut V16CuEnv, domain: u16) -> Result<u64, Str
     )
 }
 
+/// GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture helper: pass-1's own
+/// single-segment accrual is capped at `max_accrual_dt_slots` per crank call, and the
+/// guard now refuses to let a crank reach the unified dispatch (and whatever
+/// settlement/liquidation/lock check that dispatch would attempt) until asset 0 is
+/// GENUINELY caught up to `now_slot`. Crucially, if the dispatch-reached call itself
+/// REVERTS (as every call in this test does, once caught up, against the lapsed
+/// backing bucket), the whole transaction rolls back -- including that call's own
+/// pass-1 accrual -- so asset 0's `slot_last` can never advance past `target_slot - 1`
+/// via a reverting call. This submits successful, dispatch-free catch-up crank calls
+/// (bounded, fresh blockhash each time, mirroring a real keeper) until asset 0 sits
+/// EXACTLY one segment short of `target_slot`, leaving the caller's own next crank
+/// call (already written in the test) as the one that completes catch-up and is the
+/// FIRST to reach dispatch -- preserving the original "first post-lapse crank reverts"
+/// shape instead of silently absorbing it into an early return.
+fn catch_up_asset0_to_one_short_of(env: &mut V16CuEnv, portfolio: Pubkey, target_slot: u64) {
+    loop {
+        let (_, g) = env.market_state();
+        let slot_last = g.assets[0].slot_last;
+        assert!(
+            slot_last < target_slot,
+            "catch-up target already reached or overshot: slot_last={slot_last} target={target_slot}"
+        );
+        if slot_last + 1 >= target_slot {
+            break;
+        }
+        env.svm.expire_blockhash();
+        try_refresh(env, portfolio, target_slot)
+            .expect("bounded catch-up crank (still short of now_slot) must not revert");
+    }
+    // Leave a fresh blockhash for the caller's own next call, which is byte-identical
+    // in shape to the calls this loop just sent.
+    env.svm.expire_blockhash();
+}
+
 fn custom_code(err: &str) -> Option<u32> {
     let marker = "Custom(";
     let start = err.find(marker)? + marker.len();
@@ -14734,6 +14838,13 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
     // second -- a STRICTER form of the same "the lapsed bucket permanently blocks loss
     // settlement" invariant (bricked from the very first attempt, not just a later one), not a
     // weakened one.
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: bring asset 0 to
+    // one segment short of `lapsed_slot` via successful bounded catch-up cranks first --
+    // see `catch_up_asset0_to_one_short_of` -- so THIS call is the one that completes
+    // catch-up and is the first to reach dispatch (and therefore the first to attempt, and
+    // revert against, the lapsed-bucket settlement).
+    catch_up_asset0_to_one_short_of(&mut env, a, lapsed_slot);
     let bricked = try_refresh(&mut env, a, lapsed_slot)
         .expect_err("settling a loss against a lapsed backing bucket must revert");
     assert_eq!(
@@ -14746,6 +14857,7 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
     for extra in [2u64, 50, 500] {
         let slot = lapsed_slot + extra;
         env.svm.warp_to_slot(slot);
+        catch_up_asset0_to_one_short_of(&mut env, a, slot);
         let again =
             try_refresh(&mut env, a, slot).expect_err("the brick must persist at every later slot");
         assert_eq!(
@@ -14813,9 +14925,12 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
         "after expiry the bucket must have left `Fresh` — that is the whole repair"
     );
 
-    // Settlement lives again.
+    // Settlement lives again. Catch asset 0 up to one segment short first (bounded
+    // catch-up, GATE-2 FIX) so this call is the one that reaches dispatch and
+    // genuinely re-settles, not an early-return that merely fails to error.
     let settle_slot = lapsed_slot + 600;
     env.svm.warp_to_slot(settle_slot);
+    catch_up_asset0_to_one_short_of(&mut env, a, settle_slot);
     try_refresh(&mut env, a, settle_slot)
         .expect("the losing account settles again once the lapsed bucket is expired");
 }

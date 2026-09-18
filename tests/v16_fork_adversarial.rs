@@ -519,6 +519,33 @@ impl Env {
         )
     }
 
+    /// GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: `crank` now
+    /// only advances ASSET by a single bounded segment (capped at
+    /// `max_accrual_dt_slots`, 1 for every fixture in this file) and, if that leaves
+    /// ASSET short of `now_slot`, early-returns `Ok(())` BEFORE ever reaching the
+    /// unified dispatch that settles `portfolio`'s PnL/certificate/liquidation state.
+    /// Submit repeated crank ixs -- mirroring a real keeper resubmitting across the
+    /// per-instruction cap -- until ASSET has genuinely caught up to `now_slot`, then
+    /// return the result of that FINAL call: the one that actually reaches dispatch and
+    /// settles `portfolio`. Bounded to avoid a true infinite loop if some unrelated
+    /// condition ever stalls progress; each successful call strictly advances
+    /// `slot_last` by at least 1, so `now_slot` iterations is always enough headroom.
+    fn crank_catchup(&mut self, portfolio: Pubkey, now_slot: u64) -> Result<(), TransactionError> {
+        let mut last = self.crank(portfolio, now_slot);
+        let mut iterations = 0u64;
+        while last.is_ok()
+            && self.group().assets[ASSET as usize].slot_last < now_slot
+        {
+            iterations += 1;
+            assert!(
+                iterations <= now_slot + 4,
+                "crank_catchup did not converge within a sane bound"
+            );
+            last = self.crank(portfolio, now_slot);
+        }
+        last
+    }
+
     fn top_up_insurance(&mut self, amount: u128) {
         let source = Pubkey::new_unique();
         let admin = self.admin.insecure_clone();
@@ -623,6 +650,21 @@ impl Env {
             ],
             &[],
         )
+    }
+
+    /// GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: `try_liquidate`
+    /// wire-encodes to the identical account shape as `crank` (payer, market,
+    /// portfolio), so this is `crank_catchup` under `try_liquidate`'s naming -- see
+    /// `crank_catchup` for why the loop is needed (a single call's own pass-1 accrual
+    /// is capped at `max_accrual_dt_slots`; the guard now refuses to reach dispatch,
+    /// and therefore the Liquidate action, until ASSET has genuinely caught up to
+    /// `now_slot`).
+    fn try_liquidate_catchup(
+        &mut self,
+        victim: Pubkey,
+        now_slot: u64,
+    ) -> Result<(), TransactionError> {
+        self.crank_catchup(victim, now_slot)
     }
 
     /// Move the asset mark to `effective_price` via the engine's own zero-sum
@@ -1004,8 +1046,16 @@ fn adv_yfi_style_profit_recycling_no_net_extraction() {
     // recycling attacker faces mid-move.
     env.warp(10);
     env.accrue_mark(ASSET, 10, 150).expect("accrue mark up");
-    let _ = env.crank(ua, 10);
-    let _ = env.crank(la, 10);
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: `crank` now
+    // only advances ASSET one bounded segment per call and early-returns before
+    // settling `ua`/`la` until ASSET has genuinely caught up to `now_slot` -- use
+    // `crank_catchup` (loops, mirrors a real keeper) so the PnL settlement below is
+    // actually reached. Crank `la` BEFORE `ua`: settling `la` bumps the market's
+    // shared `risk_epoch` (any account's settlement invalidates every OTHER cached
+    // cert -- v16.rs kernel_cert_is_current), so cranking the checked account (`ua`,
+    // PHASE A below) LAST is what keeps its own cert current going into that check.
+    let _ = env.crank_catchup(la, 10);
+    let _ = env.crank_catchup(ua, 10);
     assert!(
         env.portfolio(ua).pnl > 0,
         "fixture must create positive long PnL"
@@ -1013,12 +1063,17 @@ fn adv_yfi_style_profit_recycling_no_net_extraction() {
 
     // PHASE A — recycle attempt while the losing leg is open. Two layered v16
     // locks reject the premature extraction, each at its OPERATIVE economic gate:
-    //   * convert_released_pnl -> ensure_favorable_action_allowed: the favorable-
-    //     action lock (h_lock lane = HMax under the stale loss-state) returns
-    //     LockActive(21) (v16.rs:8168-8169 via loss_stale at 8338) — a winner may
-    //     not realize profit while the loss-state is unsettled. (A deeper
-    //     source-claim-exposure lock at v16.rs:10454-10458 backs this once the
-    //     cert is fresh; the favorable-action lock pre-empts it here.)
+    //   * convert_released_pnl -> LockActive(21). Under bounded catch-up ASSET is
+    //     now genuinely current (loss_stale_active == false here, confirmed), so
+    //     this is NOT the loss-stale h_lock lane the original derivation named --
+    //     it is the more fundamental gate underneath: convert_released_pnl_to_
+    //     capital_core_not_atomic (v16.rs ~19858-19880) computes `converted` as 0
+    //     for any account with no source claims while the market is Live, and
+    //     `converted == 0` unconditionally returns LockActive. A winner's PnL is
+    //     therefore never directly convertible in a Live market without
+    //     source-domain backing, independent of any staleness lag -- an even
+    //     stronger form of "no unmatured-profit extraction" than the original
+    //     loss-stale framing.
     //   * withdraw -> open-position guard: active_bitmap non-empty -> Stale(19)
     //     (v16.rs:10836-10838), independent of the lag.
     // Both reject atomically (no capital/PnL movement).
@@ -1108,8 +1163,11 @@ fn adv_lp_side_profit_recycling_no_net_extraction() {
         .expect("open");
     env.warp(10);
     env.accrue_mark(ASSET, 10, 50).expect("accrue mark down");
-    let _ = env.crank(ua, 10);
-    let _ = env.crank(la, 10);
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: see
+    // `adv_yfi_style_profit_recycling_no_net_extraction` above -- use `crank_catchup`
+    // so the PnL settlement below is actually reached.
+    let _ = env.crank_catchup(ua, 10);
+    let _ = env.crank_catchup(la, 10);
     assert!(
         env.portfolio(la).pnl > 0,
         "LP short must be in profit after price drop"
@@ -1188,8 +1246,14 @@ fn adv_whipsaw_profit_recycling_no_net_extraction() {
     // operative defenses, nothing extracted.
     env.warp(10);
     env.accrue_mark(ASSET, 10, 150).expect("accrue up");
-    let _ = env.crank(ua, 10);
-    let _ = env.crank(la, 10);
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: see
+    // `adv_yfi_style_profit_recycling_no_net_extraction` above -- use `crank_catchup`
+    // so the PnL settlement below is actually reached. Crank `la` BEFORE `ua`: `la`'s
+    // settlement bumps the market's shared `risk_epoch`, so cranking the checked
+    // account (`ua`) LAST is what keeps its own cert current for the convert check
+    // below (see the yfi-style test for the full derivation).
+    let _ = env.crank_catchup(la, 10);
+    let _ = env.crank_catchup(ua, 10);
     assert!(
         env.portfolio(ua).pnl > 0,
         "user must be in profit on the up-swing"
@@ -1214,8 +1278,14 @@ fn adv_whipsaw_profit_recycling_no_net_extraction() {
     // still holds — still nothing extracted.
     env.warp(20);
     env.accrue_mark(ASSET, 20, 100).expect("accrue down");
-    let _ = env.crank(ua, 20);
-    let _ = env.crank(la, 20);
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: see
+    // `adv_yfi_style_profit_recycling_no_net_extraction` above -- use `crank_catchup`
+    // so the reversal is actually settled into `ua`'s PnL before the assertions below
+    // (in particular "no unmatured profit ever became capital", which needs a
+    // genuinely re-settled portfolio, not one an early return left untouched). `la`
+    // before `ua` again, for the same cert-freshness reason as the up-swing above.
+    let _ = env.crank_catchup(la, 20);
+    let _ = env.crank_catchup(ua, 20);
     assert_custom(
         env.try_convert(&user, ua, 1_000_000_000),
         E_LOCK_ACTIVE,
@@ -1497,17 +1567,24 @@ fn adv_self_liquidation_backstop_no_insurance_siphon() {
     // Push the mark up to 400: the short's loss (300) EXCEEDS its 250 deposit, so
     // it is genuinely bankrupt — the case where a naive backstop would tap
     // insurance to forgive the toxic leg.
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: use
+    // `crank_catchup` so each price checkpoint is actually settled (not left behind
+    // an early return) before moving to the next.
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         let _ = env.accrue_mark(ASSET, slot, price);
-        let _ = env.crank(wa, slot);
-        let _ = env.crank(la, slot);
+        let _ = env.crank_catchup(wa, slot);
+        let _ = env.crank_catchup(la, slot);
     }
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the engine's plan selector
     // needs a current certificate before Liquidate is selectable (engine v16.rs:15163) -- the
     // first call re-certifies `wa` against the fully-accrued (400) price (discovering the
     // deficit), the second liquidates.
-    let _ = env.try_liquidate(wa, 30);
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair:
+    // `try_liquidate_catchup` first (bounded, mirrors a real keeper) so the first call
+    // below genuinely reaches dispatch instead of an early return.
+    let _ = env.try_liquidate_catchup(wa, 30);
     env.try_liquidate(wa, 30)
         .expect("liquidation of the bankrupt short must succeed");
 
@@ -1578,18 +1655,28 @@ fn adv_zero_insurance_self_liquidation_no_net_extraction() {
     let weak_pos_before = env.leg_size(wa).unsigned_abs();
 
     // Push the mark up past the short's collateral (bankruptcy) over bounded steps.
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: use
+    // `crank_catchup` so each price checkpoint is actually settled before the next.
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         let _ = env.accrue_mark(ASSET, slot, price);
-        let _ = env.crank(wa, slot);
-        let _ = env.crank(la, slot);
+        let _ = env.crank_catchup(wa, slot);
+        let _ = env.crank_catchup(la, slot);
     }
     // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the engine's plan selector
     // needs a current certificate before Liquidate is selectable (engine v16.rs:15163). Crank in
     // a bounded loop (re-certify, then liquidate -- possibly across more than one bounded step
     // under the zero-insurance source-credit/ADL socialization path) until the toxic leg closes.
-    let mut closed = false;
+    //
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair:
+    // `try_liquidate_catchup` first (bounded, mirrors a real keeper) so the loop below
+    // starts from a state where calls genuinely reach dispatch.
+    let _ = env.try_liquidate_catchup(wa, 30);
+    let mut closed = env.leg_size(wa) == 0;
     for _ in 0..6 {
+        if closed {
+            break;
+        }
         let _ = env.try_liquidate(wa, 30);
         if env.leg_size(wa) == 0 {
             closed = true;
@@ -1817,8 +1904,14 @@ fn unmatured_fixture() -> (Env, Keypair, Pubkey, Keypair, Pubkey) {
         .expect("open");
     env.warp(10);
     env.accrue_mark(ASSET, 10, 150).expect("accrue");
-    let _ = env.crank(ua, 10);
-    let _ = env.crank(la, 10);
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: see
+    // `adv_yfi_style_profit_recycling_no_net_extraction` above -- use `crank_catchup`
+    // so the PnL settlement below is actually reached. Crank `la` BEFORE `ua`: `la`'s
+    // settlement bumps the market's shared `risk_epoch`, so cranking the checked
+    // account (`ua`, this fixture feeds convert/withdraw/close probes on `ua`) LAST
+    // is what keeps its own cert current for those checks.
+    let _ = env.crank_catchup(la, 10);
+    let _ = env.crank_catchup(ua, 10);
     assert!(
         env.portfolio(ua).pnl > 0,
         "fixture must create positive unmatured PnL"
@@ -1963,7 +2056,11 @@ fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
         let cap = env.portfolio(ua).capital;
         let pnl = env.portfolio(ua).pnl;
         env.warp(20);
-        env.crank(ua, 20)
+        // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: use
+        // `crank_catchup` so this genuinely reaches the Refresh dispatch (not an
+        // early return that would make the "unlocks no capital" checks below hold
+        // vacuously without the Refresh action ever having run).
+        env.crank_catchup(ua, 20)
             .expect("permissionless Refresh crank must remain callable");
         assert_eq!(
             env.portfolio(ua).capital,
@@ -1980,7 +2077,10 @@ fn adv_unmatured_pnl_keeper_branch_matrix_no_extraction() {
         let (mut env, _user, ua, _, _) = unmatured_fixture();
         let cap = env.portfolio(ua).capital;
         env.warp(20);
-        let _ = env.crank(ua, 20); // no-op branch (no pending B-settlement state)
+        // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: use
+        // `crank_catchup` so this genuinely reaches dispatch (SettleB's no-op
+        // branch), not an early return.
+        let _ = env.crank_catchup(ua, 20); // no-op branch (no pending B-settlement state)
         assert_eq!(
             env.portfolio(ua).capital,
             cap,
@@ -2062,9 +2162,12 @@ fn adv_resolved_winner_lifecycle_pays_two_legs_and_tears_down() {
     // --- Push mark up so user long is in profit --------------------------------
     env.warp(10);
     env.accrue_mark(ASSET, 10, 150).expect("accrue mark up");
-    env.crank(ua, 10)
+    // GATE-2 FIX (bounded_market_catchup_only, cbaf7c6f) fixture repair: use
+    // `crank_catchup` so MTM settlement is actually reached (not an early return
+    // Ok(()) that would leave pnl at 0 and trip the anti-hollow gate below).
+    env.crank_catchup(ua, 10)
         .expect("crank winner (MTM) must succeed");
-    env.crank(la, 10)
+    env.crank_catchup(la, 10)
         .expect("crank loser (MTM) must succeed");
 
     // ANTI-HOLLOW gate: the fixture must produce a real winner.
