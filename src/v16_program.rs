@@ -10695,7 +10695,7 @@ pub mod processor {
         // freezes non-base legs too and a hostile matcher is never invoked once the market has
         // matured stale (previously this preflight had NO staleness gate at all; staleness was
         // only caught after the CPI returned, inside handle_batch_execute_zero_copy).
-        let (mode_pre, oracle_prices, stale_matured) = {
+        let (mode_pre, oracle_prices, stale_matured, trade_fee_base_bps_pre) = {
             let market_data = market_ai.try_borrow_data()?;
             let (cfg_pre, mode_pre, current_slot_pre, oracle_prices) =
                 state::read_asset_effective_prices(&market_data, &asset_indices)?;
@@ -10713,13 +10713,22 @@ pub mod processor {
                     break;
                 }
             }
-            (mode_pre, oracle_prices, stale_matured)
+            (mode_pre, oracle_prices, stale_matured, cfg_pre.trade_fee_base_bps)
         };
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
         if stale_matured {
             return Err(PercolatorError::OracleStale.into());
+        }
+        // The taker signs each leg's fee_bps independently of the LP's matcher capability cap
+        // (mirrors handle_batch_trade_nocpi's and handle_trade_cpi's guards — adopts
+        // upstream 93dd8719/7f319c6b's base-fee-consent reject at this 4th trade entry point).
+        if legs
+            .iter()
+            .any(|leg| trade_fee_base_bps_pre > leg.fee_bps)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
         }
         let (account_a_header, account_a_owner) =
             state::read_portfolio_owner_preflight(&account_a_ai.try_borrow_data()?)?;

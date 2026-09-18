@@ -7631,6 +7631,124 @@ fn v16_attack_trade_cpi_requires_signed_base_fee_consent() {
     );
 }
 
+// Wave-1 fork-only hardening, unit A-batchcpi-feeconsent: `handle_batch_trade_cpi` was the one
+// trade entry point in this fork still missing the base-fee-consent reject that
+// handle_trade_nocpi/handle_batch_trade_nocpi (upstream 93dd8719) and handle_trade_cpi (upstream
+// 7f319c6b) already have. Before this fix, a batch-CPI leg's `fee_bps` (what the taker signed
+// off-chain) was read via `cfg_pre` in the preflight block but then dropped -- `cfg_pre` never
+// left that scope -- and every leg's raw `fee_bps` was passed straight through to the shared
+// executor's `hybrid_trade_fee_bps_view`, which computes `base = max(caller_fee_bps,
+// cfg.trade_fee_base_bps)` using the LIVE config read at execution time. If the market authority
+// raised `trade_fee_base_bps` between the taker's signature and landing, that silently clamped
+// the charge up past what the taker consented to. The fix rejects the whole batch instead,
+// BEFORE the matcher CPI is ever invoked (proven below via the untouched matcher context).
+#[test]
+fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    env.update_trade_fee_policy_with_cu(500); // config base fee = 5%
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000);
+    env.deposit(&lp, lp_account, 1_000_000);
+
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+    let accounts = vec![
+        AccountMeta::new(taker.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(taker_account, false),
+        AccountMeta::new(lp_account, false),
+        AccountMeta::new_readonly(matcher_program, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(delegate, false),
+    ];
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    // Taker signed fee_bps=0 (below the live base of 500) -- the batch must be REJECTED before
+    // the matcher CPI runs, not silently floored up to 500 and charged without consent.
+    env.svm.expire_blockhash();
+    let under_base_leg = percolator_prog::ix::BatchTradeCpiLeg {
+        asset_index: 0,
+        size_q: (10 * POS_SCALE) as i128,
+        fee_bps: 0,
+        limit_price: 0,
+    };
+    let r = env.send(
+        ProgInstruction::BatchTradeCpi {
+            legs: vec![under_base_leg],
+        },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(
+        r.is_err() && r.as_ref().unwrap_err().contains("Custom(9)"),
+        "BatchTradeCpi leg signed below the live trade_fee_base_bps must reject with \
+         InvalidInstruction (Custom(9)) rather than silently overcharge to the new floor: {r:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected BatchTradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected BatchTradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&lp_account).unwrap(),
+        lp_before,
+        "a rejected BatchTradeCpi must not mutate the LP's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&ctx).unwrap(),
+        ctx_before,
+        "matcher context must be untouched -- proves the real matcher CPI was never invoked \
+         for a batch leg signed below the live base fee"
+    );
+
+    // Control: signing at (or above) the live base fee is accepted and charges normally.
+    let ins0 = env.market_state().1.insurance;
+    env.svm.expire_blockhash();
+    let at_base_leg = percolator_prog::ix::BatchTradeCpiLeg {
+        asset_index: 0,
+        size_q: (10 * POS_SCALE) as i128,
+        fee_bps: 500,
+        limit_price: 0,
+    };
+    env.send(
+        ProgInstruction::BatchTradeCpi {
+            legs: vec![at_base_leg],
+        },
+        accounts,
+        &[&taker],
+    )
+    .expect("BatchTradeCpi leg signed at the consented base fee must succeed");
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a BatchTradeCpi leg that signs at least the configured base fee must still be \
+         charged; insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the consented base-fee BatchTradeCpi"
+    );
+}
+
 #[test]
 fn v16_bpf_tradecpi_external_matcher_executes_on_added_asset() {
     let mut env = V16CuEnv::new();
