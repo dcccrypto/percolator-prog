@@ -545,8 +545,17 @@ impl Env {
         self.svm.warp_to_slot(slot);
     }
 
+    /// TB-2b: LIVE read of `AssetControlSequencesV16` for `ASSET`, so every
+    /// nonce-bearing helper below advances a genuinely fresh value.
+    fn control_sequences(&self) -> state::AssetControlSequencesV16 {
+        let account = self.svm.get_account(&self.market).expect("market account");
+        state::read_asset_control_sequences(&account.data, ASSET as usize)
+            .expect("read control sequences")
+    }
+
     fn configure_ewma_mark(&mut self, now_slot: u64, initial_mark_e6: u64, halflife_slots: u64) {
         let admin = self.admin.insecure_clone();
+        let observation_sequence = self.control_sequences().oracle_observation + 1;
         self.try_send(
             ProgInstruction::ConfigureEwmaMark {
                 asset_index: ASSET,
@@ -554,6 +563,7 @@ impl Env {
                 initial_mark_e6,
                 mark_ewma_halflife_slots: halflife_slots,
                 mark_min_fee: 0,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
@@ -566,11 +576,13 @@ impl Env {
 
     fn push_ewma_mark(&mut self, now_slot: u64, mark_e6: u64) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
+        let observation_sequence = self.control_sequences().oracle_observation + 1;
         self.try_send(
             ProgInstruction::PushEwmaMark {
                 asset_index: ASSET,
                 now_slot,
                 mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),

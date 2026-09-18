@@ -777,6 +777,8 @@ fn configure_base_ewma_mark(
     now_slot: u64,
     mark_e6: u64,
 ) {
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::ConfigureEwmaMark {
             asset_index: 0,
@@ -784,6 +786,7 @@ fn configure_base_ewma_mark(
             initial_mark_e6: mark_e6,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence,
         },
         &mut [admin, market],
     )
@@ -796,11 +799,14 @@ fn push_base_ewma_mark(
     now_slot: u64,
     mark_e6: u64,
 ) {
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::PushEwmaMark {
             asset_index: 0,
             now_slot,
             mark_e6,
+            observation_sequence,
         },
         &mut [admin, market],
     )
@@ -813,11 +819,14 @@ fn configure_base_auth_mark(
     now_slot: u64,
     mark_e6: u64,
 ) {
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::ConfigureAuthMark {
             asset_index: 0,
             now_slot,
             initial_mark_e6: mark_e6,
+            observation_sequence,
         },
         &mut [admin, market],
     )
@@ -830,11 +839,14 @@ fn push_base_auth_mark(
     now_slot: u64,
     mark_e6: u64,
 ) {
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::PushAuthMark {
             asset_index: 0,
             now_slot,
             mark_e6,
+            observation_sequence,
         },
         &mut [admin, market],
     )
@@ -1150,6 +1162,8 @@ fn configure_three_leg_hybrid(
     soft_stale_slots: u64,
     mark_min_fee: u64,
 ) {
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::ConfigureHybridOracle {
             asset_index: 0,
@@ -1165,6 +1179,7 @@ fn configure_three_leg_hybrid(
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: feeds,
+            observation_sequence,
         },
         &mut [admin, market, leg0, leg1, leg2],
     )
@@ -1462,6 +1477,8 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
             }
         }),
     );
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::ConfigureEwmaMark {
             asset_index: 0,
@@ -1469,6 +1486,7 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1478,6 +1496,8 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
 
     // Let a long idle window accrue at rate 0. Nothing is owed for it.
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::ConfigureEwmaMark {
             asset_index: 0,
@@ -1485,6 +1505,7 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1534,6 +1555,8 @@ fn v16_wrapper_init_portfolio_anchors_fee_slot_at_market_current_slot() {
             }
         }),
     );
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
     run_ix(
         Instruction::ConfigureEwmaMark {
             asset_index: 0,
@@ -1541,6 +1564,7 @@ fn v16_wrapper_init_portfolio_anchors_fee_slot_at_market_current_slot() {
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1797,6 +1821,10 @@ fn v16_wrapper_maintenance_fee_policy_splits_optional_cranker_share() {
     run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1842,6 +1870,10 @@ fn v16_wrapper_maintenance_fee_reward_account_absent_keeps_full_fee_in_insurance
     run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1883,6 +1915,10 @@ fn v16_wrapper_maintenance_fee_same_cranker_key_still_leaves_insurance_share() {
     run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1918,6 +1954,10 @@ fn v16_wrapper_maintenance_fee_policy_is_admin_gated_and_bounds_share() {
     let rejected = run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 10_001,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -1926,6 +1966,10 @@ fn v16_wrapper_maintenance_fee_policy_is_admin_gated_and_bounds_share() {
     let rejected = run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     );
@@ -1934,6 +1978,10 @@ fn v16_wrapper_maintenance_fee_policy_is_admin_gated_and_bounds_share() {
     run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -1984,6 +2032,10 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut insurance_authority, &mut market],
     )
@@ -1993,6 +2045,10 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
     let rejected_attacker = run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 2,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .trade_fee
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     );
@@ -2007,6 +2063,10 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
     let rejected_insurance_authority = run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 2,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .trade_fee
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     );
@@ -2017,6 +2077,10 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
     let rejected_over_engine_cap = run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 101,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .trade_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -2027,6 +2091,10 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
     run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 25,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .trade_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -2063,6 +2131,10 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     let rejected_attacker = run_ix(
         Instruction::UpdateFeeRedirectPolicy {
             redirect_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .fee_redirect
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     );
@@ -2071,6 +2143,10 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     let rejected_over_cap = run_ix(
         Instruction::UpdateFeeRedirectPolicy {
             redirect_bps: 10_001,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .fee_redirect
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -2079,6 +2155,10 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     run_ix(
         Instruction::UpdateFeeRedirectPolicy {
             redirect_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .fee_redirect
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -2282,7 +2362,13 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
     assert_err_and_market_unchanged(disabled, &market, &before_disabled);
 
     let rejected_attacker = run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 50,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut creator, &mut market],
     );
     assert_err_and_market_unchanged(rejected_attacker, &market, &before_disabled);
@@ -2290,13 +2376,23 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
     let rejected_over_u64 = run_ix(
         Instruction::UpdateMarketInitFeePolicy {
             min_init_fee: u64::MAX as u128 + 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
     assert_err_and_market_unchanged(rejected_over_u64, &market, &before_disabled);
 
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 50,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -2350,7 +2446,13 @@ fn v16_wrapper_permissionless_market_init_fee_doubles_every_32_markets() {
     let mint = init_market(&mut admin, &mut market);
 
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 50,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -2448,7 +2550,13 @@ fn v16_wrapper_permissionless_market_creator_must_reuse_shutdown_slot_before_app
     let mint = init_market(&mut admin, &mut market);
 
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 50,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -2581,7 +2689,13 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mint = init_market(&mut admin, &mut market);
 
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 50,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -2803,12 +2917,22 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 10 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 10,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -3159,12 +3283,22 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 25 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 25,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -3489,6 +3623,10 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -3745,6 +3883,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: backing_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut backing_authority, &mut market],
     )
@@ -3754,6 +3896,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut insurance_authority, &mut market],
     )
@@ -3765,6 +3911,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     );
@@ -3775,6 +3925,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -3785,6 +3939,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut backing_authority, &mut market],
     );
@@ -3795,6 +3953,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 101,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     );
@@ -3805,6 +3967,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 2,
             fee_bps: 25,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .backing_fee_long
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     );
@@ -3815,6 +3981,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 0,
             insurance_share_bps: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     );
@@ -3825,6 +3995,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 10_001,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     );
@@ -3835,6 +4009,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     )
@@ -3850,6 +4028,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 0,
             fee_bps: 33,
             insurance_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_long
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     )
@@ -3865,6 +4047,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             domain: 1,
             fee_bps: 0,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut insurance_authority, &mut market],
     )
@@ -3893,6 +4079,10 @@ fn v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
             // no trade here locks new counterparty backing), not on how
             // that fee would split between insurance and LP.
             insurance_share_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -3946,6 +4136,10 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
             // unaffected; only the insurance/LP split of any fee actually
             // charged changes, and this scenario never charges one).
             insurance_share_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -3994,6 +4188,10 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
             fee_bps: 100,
             // Fee-split floor enforcement, see note above.
             insurance_share_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -4062,6 +4260,10 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
             fee_bps: 100,
             // Fee-split floor enforcement, see note above.
             insurance_share_bps: 2_500,
+            policy_sequence: state::read_asset_control_sequences(&cpi_market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut cpi_market],
     )
@@ -4122,6 +4324,10 @@ fn v16_wrapper_backing_fee_policy_survives_non_base_oracle_reconfiguration() {
             domain: 3,
             fee_bps: 37,
             insurance_share_bps: 3_700,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -4138,6 +4344,10 @@ fn v16_wrapper_backing_fee_policy_survives_non_base_oracle_reconfiguration() {
             initial_mark_e6: 110,
             mark_ewma_halflife_slots: 10,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -4171,6 +4381,10 @@ fn v16_wrapper_backing_fee_policy_survives_non_base_oracle_reconfiguration() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: feeds,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut leg0, &mut leg1, &mut leg2],
     )
@@ -5260,6 +5474,10 @@ fn v16_wrapper_reactivated_asset_resets_prior_oracle_profile() {
             initial_mark_e6: 123_000,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 2)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -5333,6 +5551,10 @@ fn v16_wrapper_retired_asset_profile_cannot_refresh_market_liveness() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -5353,6 +5575,10 @@ fn v16_wrapper_retired_asset_profile_cannot_refresh_market_liveness() {
             initial_mark_e6: 123_000,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 2)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -5387,6 +5613,10 @@ fn v16_wrapper_retired_asset_profile_cannot_refresh_market_liveness() {
             asset_index: 2,
             now_slot: 4,
             mark_e6: 222_000,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 2)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -6683,6 +6913,10 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: bucket_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut bucket_authority, &mut market],
     )
@@ -6691,6 +6925,10 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -6866,6 +7104,10 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut insurance, &mut market],
     )
@@ -6892,6 +7134,10 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: admin.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut admin_cosigner, &mut market],
     );
@@ -7451,6 +7697,10 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: bucket_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut bucket_authority, &mut market],
     )
@@ -7599,6 +7849,10 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: [0u8; 32],
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut bucket_authority, &mut zero_new, &mut market],
     );
@@ -7626,6 +7880,10 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: bucket_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut bucket_authority, &mut market],
     )
@@ -9294,6 +9552,10 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut operator, &mut market],
     )
@@ -9485,6 +9747,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut insurance, &mut market],
     )
@@ -9494,6 +9760,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut operator, &mut market],
     )
@@ -9541,6 +9811,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: [0u8; 32],
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut operator, &mut attacker, &mut market],
     );
@@ -9551,6 +9825,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: new_operator.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut operator, &mut new_operator, &mut market],
     )
@@ -9581,6 +9859,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: [0u8; 32],
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut insurance, &mut zero_new, &mut market],
     );
@@ -9593,6 +9875,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: new_insurance.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut insurance, &mut new_insurance, &mut market],
     )
@@ -9628,6 +9914,10 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
             asset_index: 0,
             kind: ASSET_AUTH_ORACLE,
             new_pubkey: new_key.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut new_key, &mut market],
     )
@@ -9646,6 +9936,10 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
             asset_index: 0,
             kind: 99,
             new_pubkey: new_key.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut new_key, &mut admin, &mut market],
     );
@@ -9687,6 +9981,10 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -9708,6 +10006,10 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
             asset_index: 0,
             kind: ASSET_AUTH_ORACLE,
             new_pubkey: new_mark_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut new_mark_authority, &mut market],
     )
@@ -9720,6 +10022,10 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
             asset_index: 0,
             now_slot: 10,
             mark_e6: 120,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut wrong_authority, &mut market],
     );
@@ -9730,6 +10036,10 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
             asset_index: 0,
             now_slot: 10,
             mark_e6: 120,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut new_mark_authority, &mut market],
     )
@@ -9800,6 +10110,10 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
             asset_index: 0,
             kind: ASSET_AUTH_ORACLE,
             new_pubkey: new_mark_authority.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut new_mark_authority, &mut market],
     )
@@ -9812,6 +10126,10 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
             asset_index: 0,
             now_slot: 10,
             mark_e6: 120,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut wrong_authority, &mut market],
     );
@@ -9954,6 +10272,10 @@ fn v16_wrapper_push_ewma_mark_rejects_over_max_input_and_preserves_state() {
             initial_mark_e6: percolator::MAX_ORACLE_PRICE,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -9965,6 +10287,10 @@ fn v16_wrapper_push_ewma_mark_rejects_over_max_input_and_preserves_state() {
             asset_index: 0,
             now_slot: 2,
             mark_e6: percolator::MAX_ORACLE_PRICE + 1,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -10004,6 +10330,10 @@ fn v16_wrapper_configure_ewma_mark_clears_prior_hybrid_oracle_metadata() {
             unit_scale: 6,
             conf_filter_bps: 500,
             oracle_leg_feeds: feeds,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut leg0, &mut leg1, &mut leg2],
     )
@@ -10023,6 +10353,10 @@ fn v16_wrapper_configure_ewma_mark_clears_prior_hybrid_oracle_metadata() {
             initial_mark_e6: 123,
             mark_ewma_halflife_slots: 5,
             mark_min_fee: 9,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -10075,6 +10409,10 @@ fn v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_orac
             initial_mark_e6: 100_000,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -10241,6 +10579,10 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     );
@@ -10252,6 +10594,10 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
             Instruction::ConfigurePermissionlessResolve {
                 stale_slots,
                 force_close_delay_slots,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .permissionless_resolve
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         );
@@ -10262,6 +10608,10 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -12108,6 +12458,10 @@ fn v16_wrapper_non_base_asset_profile_converts_stoxx_eur_to_base_sol() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: feeds,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [
             &mut admin,
@@ -12222,6 +12576,10 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 14)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -12308,6 +12666,10 @@ fn v16_wrapper_hybrid_oracle_accepts_switchboard_and_chainlink_legs() {
                 chainlink_key.to_bytes(),
                 [0u8; 32],
             ],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut switchboard, &mut chainlink],
     )
@@ -12349,6 +12711,10 @@ fn v16_wrapper_switchboard_oracle_rejects_wrong_key_stale_and_conf_wide() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed_key.to_bytes(), [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut wrong_key],
     );
@@ -12370,6 +12736,10 @@ fn v16_wrapper_switchboard_oracle_rejects_wrong_key_stale_and_conf_wide() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed_key.to_bytes(), [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut stale],
     );
@@ -12391,6 +12761,10 @@ fn v16_wrapper_switchboard_oracle_rejects_wrong_key_stale_and_conf_wide() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed_key.to_bytes(), [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut wide],
     );
@@ -12426,6 +12800,10 @@ fn v16_wrapper_chainlink_oracle_rejects_wrong_key_stale_and_bad_answer() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed_key.to_bytes(), [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut wrong_key],
     );
@@ -12447,6 +12825,10 @@ fn v16_wrapper_chainlink_oracle_rejects_wrong_key_stale_and_bad_answer() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed_key.to_bytes(), [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut stale],
     );
@@ -12468,6 +12850,10 @@ fn v16_wrapper_chainlink_oracle_rejects_wrong_key_stale_and_bad_answer() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed_key.to_bytes(), [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut bad_answer],
     );
@@ -12616,6 +13002,10 @@ fn v16_wrapper_configure_hybrid_oracle_rejects_after_positions_enter_market() {
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: feeds,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [
             &mut admin,
@@ -12701,6 +13091,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
                 initial_mark_e6: 250,
                 mark_ewma_halflife_slots: 10,
                 mark_min_fee: 0,
+                observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                    .unwrap()
+                    .oracle_observation
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         ),
@@ -12746,6 +13140,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
             initial_mark_e6: 250,
             mark_ewma_halflife_slots: 10,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -12773,6 +13171,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: feeds,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut leg0, &mut leg1, &mut leg2],
     )
@@ -14031,6 +14433,10 @@ fn v16_wrapper_tradecpi_ewma_mark_trade_moves_mark_without_refreshing_liveness()
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -15030,7 +15436,13 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     )
     .unwrap();
     run_ix(
-        Instruction::UpdateLiquidationFeePolicy { cranker_share_bps },
+        Instruction::UpdateLiquidationFeePolicy {
+            cranker_share_bps,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .liquidation_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
@@ -15254,6 +15666,10 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     run_ix(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .liquidation_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -15382,6 +15798,10 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
     run_ix(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .liquidation_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -15433,6 +15853,10 @@ fn v16_wrapper_liquidation_fee_policy_is_admin_gated_and_bounds_share() {
     let rejected = run_ix(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 10_001,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .liquidation_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -15441,6 +15865,10 @@ fn v16_wrapper_liquidation_fee_policy_is_admin_gated_and_bounds_share() {
     let rejected = run_ix(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .liquidation_fee
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     );
@@ -15449,6 +15877,10 @@ fn v16_wrapper_liquidation_fee_policy_is_admin_gated_and_bounds_share() {
     run_ix(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .liquidation_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -15714,6 +16146,10 @@ fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch(
             initial_mark_e6: 1,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -15743,6 +16179,10 @@ fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch(
             asset_index: 0,
             now_slot: 1,
             mark_e6: 3,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -15980,6 +16420,10 @@ fn v16_wrapper_cure_and_cancel_close_rejects_after_permissionless_resolve_maturi
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -16241,6 +16685,10 @@ fn v16_wrapper_permissionless_stale_resolve_requires_hard_stale_maturity() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -16309,6 +16757,10 @@ fn v16_wrapper_permissionless_stale_resolve_uses_stamped_liveness_not_oracle_tai
             unit_scale: 0,
             conf_filter_bps: 500,
             oracle_leg_feeds: [feed, [0u8; 32], [0u8; 32]],
+            observation_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market, &mut fresh_oracle],
     )
@@ -16317,6 +16769,10 @@ fn v16_wrapper_permissionless_stale_resolve_uses_stamped_liveness_not_oracle_tai
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -16357,6 +16813,10 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -16708,6 +17168,10 @@ fn v16_wrapper_close_resolved_enforces_configured_force_close_delay() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -16749,6 +17213,10 @@ fn v16_wrapper_close_resolved_becomes_permissionless_after_force_close_delay() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -16985,6 +17453,10 @@ fn v16_wrapper_hybrid_hard_stale_uses_permissionless_resolve_not_recovery_kill_s
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -17072,6 +17544,10 @@ fn v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -17690,6 +18166,10 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut attacker, &mut market],
     )
@@ -17735,6 +18215,10 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
                 asset_index: 1,
                 now_slot: slot,
                 mark_e6: mark,
+                observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                    .unwrap()
+                    .oracle_observation
+                    + 1,
             },
             &mut [&mut attacker, &mut market],
         );
@@ -17994,6 +18478,10 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             asset_index: 1,
             now_slot: 6,
             mark_e6: target_mark_e6,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -19861,6 +20349,10 @@ fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_asset_admin(
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut operator, &mut market],
     )
@@ -19985,6 +20477,10 @@ fn v16_wrapper_withdraw_creator_fee_survives_the_staked_create_flow_and_only_ass
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator_pda.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut operator_pda, &mut market],
     )
@@ -20818,6 +21314,10 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
             domain: 1,
             fee_bps: 20,
             insurance_share_bps: 0,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -20838,6 +21338,10 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
             domain: 1,
             fee_bps: 20,
             insurance_share_bps: 10_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -20853,6 +21357,10 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
             domain: 1,
             fee_bps: 10_001,
             insurance_share_bps: 5_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -20864,6 +21372,10 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
             domain: 1,
             fee_bps: 0,
             insurance_share_bps: 5_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .backing_fee_short
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -20925,6 +21437,10 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
         run_ix(
             Instruction::UpdateTradeFeePolicy {
                 trade_fee_base_bps: 4,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .trade_fee
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         )
@@ -20934,6 +21450,10 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
                 domain: 1,
                 fee_bps: 16,
                 insurance_share_bps: 2_500,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .backing_fee_short
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         )
@@ -20967,6 +21487,10 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
         run_ix(
             Instruction::UpdateTradeFeePolicy {
                 trade_fee_base_bps: 5,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .trade_fee
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         )
@@ -20976,6 +21500,10 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
                 domain: 1,
                 fee_bps: 5,
                 insurance_share_bps: 2_727,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .backing_fee_short
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         )
@@ -21033,6 +21561,10 @@ fn v16_wrapper_update_trade_fee_policy_no_longer_enforces_the_two_rate_floor() {
             domain: 2,
             fee_bps: 1_000,
             insurance_share_bps: 2_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .backing_fee_long
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -21044,6 +21576,10 @@ fn v16_wrapper_update_trade_fee_policy_no_longer_enforces_the_two_rate_floor() {
     run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 9_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .trade_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -21061,6 +21597,10 @@ fn v16_wrapper_update_trade_fee_policy_no_longer_enforces_the_two_rate_floor() {
     let result = run_ix(
         Instruction::UpdateTradeFeePolicy {
             trade_fee_base_bps: 10_001,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .trade_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -21118,6 +21658,10 @@ fn v16_wrapper_lp_fee_claim_is_junior_to_bad_debt_coverage() {
     run_ix(
         Instruction::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 4_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .maintenance_fee
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -21399,6 +21943,10 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: holder.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut holder, &mut market],
     )
@@ -21412,6 +21960,10 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: attacker.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut attacker, &mut market],
     );
@@ -21434,6 +21986,10 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: holder.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut holder, &mut market],
     )
@@ -21446,6 +22002,10 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: attacker.key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [&mut admin, &mut attacker, &mut market],
     );
@@ -21611,6 +22171,10 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
             Instruction::ConfigurePermissionlessResolve {
                 stale_slots: bad,
                 force_close_delay_slots: 1,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .permissionless_resolve
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         );
@@ -21636,6 +22200,10 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
             Instruction::ConfigurePermissionlessResolve {
                 stale_slots: good,
                 force_close_delay_slots: 1,
+                policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                    .unwrap()
+                    .permissionless_resolve
+                    + 1,
             },
             &mut [&mut admin, &mut market],
         )
@@ -21652,6 +22220,10 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: max + 1,
             force_close_delay_slots: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     );
@@ -23297,6 +23869,10 @@ fn cw02_adl_recovery_pair() -> (
         Instruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
         },
         &mut [&mut admin, &mut market],
     )
@@ -24996,6 +25572,10 @@ fn wsib_rotate_backing_authority(
             asset_index: 1,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: new_key.to_bytes(),
+            authority_epoch: state::read_asset_control_sequences(&e.market.data, 1)
+                .unwrap()
+                .authority_epoch
+                + 1,
         },
         &mut [
             &mut current,
@@ -25301,7 +25881,13 @@ fn wgenl_stage_generation_one() -> WgenlStage {
     let mut market = market_account_with_capacity(4);
     let mint = init_market(&mut admin, &mut market);
     run_ix(
-        Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 50,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
         &mut [&mut admin, &mut market],
     )
     .unwrap();

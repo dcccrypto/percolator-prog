@@ -620,6 +620,14 @@ impl FeeEnv {
     /// sequence MUST perform for tag 87 to ever work.
     fn burn_asset_admin(&mut self) {
         let admin = self.admin.insecure_clone();
+        // TB-2b: LIVE read of `authority_epoch` -- never a hardcoded constant.
+        let authority_epoch = {
+            let market_account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&market_account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+                + 1
+        };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
             accounts: vec![
@@ -632,6 +640,7 @@ impl FeeEnv {
                 asset_index: 0,
                 kind: 0, // ASSET_AUTH_ADMIN
                 new_pubkey: [0u8; 32],
+                authority_epoch,
             }
             .encode(),
         };
@@ -1531,6 +1540,15 @@ fn burning_asset_admin_does_not_stop_the_creator_rotating_insurance_authority() 
     let admin = env.admin.insecure_clone();
     let payer = env.payer.insecure_clone();
     let rotate_to = |env: &mut FeeEnv, target: &Keypair| {
+        // TB-2b: LIVE read of `authority_epoch` -- this closure is called more
+        // than once, so a hardcoded value would only be valid the first time.
+        let authority_epoch = {
+            let market_account = env.svm.get_account(&env.market).expect("market account");
+            state::read_asset_control_sequences(&market_account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+                + 1
+        };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
             accounts: vec![
@@ -1542,6 +1560,7 @@ fn burning_asset_admin_does_not_stop_the_creator_rotating_insurance_authority() 
                 asset_index: 0,
                 kind: 1, // ASSET_AUTH_INSURANCE
                 new_pubkey: target.pubkey().to_bytes(),
+                authority_epoch,
             }
             .encode(),
         };

@@ -585,12 +585,27 @@ impl V16CuEnv {
         .expect("activate asset")
     }
 
+    /// TB-2b: reads the LIVE `AssetControlSequencesV16` lanes for `asset_index`
+    /// straight off the on-chain market account bytes, so every `..._with_cu`
+    /// nonce-bearing helper below can supply a genuinely fresh, strictly-
+    /// increasing value (never a hardcoded constant) regardless of how many
+    /// times a test has already advanced that lane.
+    fn control_sequences(&self, asset_index: u16) -> state::AssetControlSequencesV16 {
+        let account = self.svm.get_account(&self.market).expect("market account");
+        state::read_asset_control_sequences(&account.data, asset_index as usize)
+            .expect("read control sequences")
+    }
+
     fn update_market_init_fee_policy_with_cu(&mut self, min_init_fee: u128) -> u64 {
+        let policy_sequence = self.control_sequences(0).market_init_fee + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::UpdateMarketInitFeePolicy { min_init_fee },
+            ProgInstruction::UpdateMarketInitFeePolicy {
+                min_init_fee,
+                policy_sequence,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -632,11 +647,15 @@ impl V16CuEnv {
     }
 
     fn update_liquidation_fee_policy_with_cu(&mut self, cranker_share_bps: u16) -> u64 {
+        let policy_sequence = self.control_sequences(0).liquidation_fee + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::UpdateLiquidationFeePolicy { cranker_share_bps },
+            ProgInstruction::UpdateLiquidationFeePolicy {
+                cranker_share_bps,
+                policy_sequence,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -652,6 +671,14 @@ impl V16CuEnv {
         fee_bps: u16,
         insurance_share_bps: u16,
     ) -> u64 {
+        let asset_index = domain / 2;
+        let long_side = domain % 2 == 0;
+        let current = self.control_sequences(asset_index);
+        let policy_sequence = if long_side {
+            current.backing_fee_long
+        } else {
+            current.backing_fee_short
+        } + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -660,6 +687,7 @@ impl V16CuEnv {
                 domain,
                 fee_bps,
                 insurance_share_bps,
+                policy_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -671,11 +699,15 @@ impl V16CuEnv {
     }
 
     fn update_trade_fee_policy_with_cu(&mut self, trade_fee_base_bps: u64) -> u64 {
+        let policy_sequence = self.control_sequences(0).trade_fee + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::UpdateTradeFeePolicy { trade_fee_base_bps },
+            ProgInstruction::UpdateTradeFeePolicy {
+                trade_fee_base_bps,
+                policy_sequence,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -686,11 +718,15 @@ impl V16CuEnv {
     }
 
     fn update_fee_redirect_policy_with_cu(&mut self, redirect_bps: u16) -> u64 {
+        let policy_sequence = self.control_sequences(0).fee_redirect + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::UpdateFeeRedirectPolicy { redirect_bps },
+            ProgInstruction::UpdateFeeRedirectPolicy {
+                redirect_bps,
+                policy_sequence,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -1200,11 +1236,15 @@ impl V16CuEnv {
     }
 
     fn update_maintenance_fee_policy_with_cu(&mut self, cranker_share_bps: u16) -> u64 {
+        let policy_sequence = self.control_sequences(0).maintenance_fee + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::UpdateMaintenanceFeePolicy { cranker_share_bps },
+            ProgInstruction::UpdateMaintenanceFeePolicy {
+                cranker_share_bps,
+                policy_sequence,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -1825,6 +1865,7 @@ impl V16CuEnv {
         stale_slots: u64,
         force_close_delay_slots: u64,
     ) -> u64 {
+        let policy_sequence = self.control_sequences(0).permissionless_resolve + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -1832,6 +1873,7 @@ impl V16CuEnv {
             ProgInstruction::ConfigurePermissionlessResolve {
                 stale_slots,
                 force_close_delay_slots,
+                policy_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -1921,6 +1963,7 @@ impl V16CuEnv {
         now_slot: u64,
         now_unix_ts: i64,
     ) -> Result<u64, String> {
+        let observation_sequence = self.control_sequences(0).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -1939,6 +1982,7 @@ impl V16CuEnv {
                 unit_scale: 0,
                 conf_filter_bps: 500,
                 oracle_leg_feeds: feeds,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2033,6 +2077,7 @@ impl V16CuEnv {
                 .copied()
                 .map(|key| AccountMeta::new_readonly(key, false)),
         );
+        let observation_sequence = self.control_sequences(asset_index).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2051,6 +2096,7 @@ impl V16CuEnv {
                 unit_scale,
                 conf_filter_bps,
                 oracle_leg_feeds: feeds,
+                observation_sequence,
             },
             accounts,
             &[&self.admin],
@@ -2064,6 +2110,7 @@ impl V16CuEnv {
         halflife_slots: u64,
         mark_min_fee: u64,
     ) -> u64 {
+        let observation_sequence = self.control_sequences(0).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2074,6 +2121,7 @@ impl V16CuEnv {
                 initial_mark_e6,
                 mark_ewma_halflife_slots: halflife_slots,
                 mark_min_fee,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2085,6 +2133,7 @@ impl V16CuEnv {
     }
 
     fn push_ewma_mark_with_cu(&mut self, now_slot: u64, mark_e6: u64) -> u64 {
+        let observation_sequence = self.control_sequences(0).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2093,6 +2142,7 @@ impl V16CuEnv {
                 asset_index: 0,
                 now_slot,
                 mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2104,6 +2154,7 @@ impl V16CuEnv {
     }
 
     fn configure_auth_mark_with_cu(&mut self, now_slot: u64, initial_mark_e6: u64) -> u64 {
+        let observation_sequence = self.control_sequences(0).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2112,6 +2163,7 @@ impl V16CuEnv {
                 asset_index: 0,
                 now_slot,
                 initial_mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2123,6 +2175,7 @@ impl V16CuEnv {
     }
 
     fn push_auth_mark_with_cu(&mut self, now_slot: u64, mark_e6: u64) -> u64 {
+        let observation_sequence = self.control_sequences(0).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2131,6 +2184,7 @@ impl V16CuEnv {
                 asset_index: 0,
                 now_slot,
                 mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2147,6 +2201,7 @@ impl V16CuEnv {
         now_slot: u64,
         initial_mark_e6: u64,
     ) -> u64 {
+        let observation_sequence = self.control_sequences(asset_index).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2155,6 +2210,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 initial_mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2171,6 +2227,7 @@ impl V16CuEnv {
         now_slot: u64,
         mark_e6: u64,
     ) -> u64 {
+        let observation_sequence = self.control_sequences(asset_index).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2179,6 +2236,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2197,6 +2255,7 @@ impl V16CuEnv {
         initial_mark_e6: u64,
     ) -> u64 {
         self.ensure_signer_account(authority.pubkey());
+        let observation_sequence = self.control_sequences(asset_index).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2205,6 +2264,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 initial_mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
@@ -2223,6 +2283,7 @@ impl V16CuEnv {
         mark_e6: u64,
     ) -> u64 {
         self.ensure_signer_account(authority.pubkey());
+        let observation_sequence = self.control_sequences(asset_index).oracle_observation + 1;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2231,6 +2292,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 mark_e6,
+                observation_sequence,
             },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
@@ -12906,6 +12968,7 @@ fn v16_attack_non_active_asset_cannot_enable_backing_fee_batch_gate() {
         assert_eq!(cfg_after_lifecycle.backing_trade_fee_policy_count, 0);
 
         env.svm.expire_blockhash();
+        let policy_sequence = env.control_sequences(1).backing_fee_long + 1;
         let policy = send_tx(
             &mut env.svm,
             env.program_id,
@@ -12914,6 +12977,7 @@ fn v16_attack_non_active_asset_cannot_enable_backing_fee_batch_gate() {
                 domain: 2,
                 fee_bps: 77,
                 insurance_share_bps: 5_000,
+                policy_sequence,
             },
             vec![
                 AccountMeta::new(creator.pubkey(), true),
@@ -14119,10 +14183,12 @@ fn v16_attack_configure_permissionless_resolve_rejects_when_resolve_matured() {
     // Non-vacuous fresh control: before the stale boundary, marketauth can still tune the policy.
     env.svm.warp_to_slot(8999);
     env.svm.expire_blockhash();
+    let fresh_policy_sequence = env.control_sequences(0).permissionless_resolve + 1;
     let fresh = env.send(
         ProgInstruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 6,
+            policy_sequence: fresh_policy_sequence,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -14149,10 +14215,12 @@ fn v16_attack_configure_permissionless_resolve_rejects_when_resolve_matured() {
     let market_before = env.svm.get_account(&env.market).unwrap();
 
     env.svm.expire_blockhash();
+    let stale_policy_sequence = env.control_sequences(0).permissionless_resolve + 1;
     let stale = env.send(
         ProgInstruction::ConfigurePermissionlessResolve {
             stale_slots: 9000,
             force_close_delay_slots: 1_000,
+            policy_sequence: stale_policy_sequence,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -16826,6 +16894,7 @@ fn rotate_backing_authority(env: &mut V16CuEnv, asset_index: u16, new_authority:
     let payer = env.payer.insecure_clone();
     let pid = env.program_id;
     let market = env.market;
+    let authority_epoch = env.control_sequences(asset_index).authority_epoch + 1;
     env.ensure_signer_account(new_authority.pubkey());
     send_tx(
         &mut env.svm,
@@ -16835,6 +16904,7 @@ fn rotate_backing_authority(env: &mut V16CuEnv, asset_index: u16, new_authority:
             asset_index,
             kind: 3, // ASSET_AUTH_BACKING_BUCKET
             new_pubkey: new_authority.pubkey().to_bytes(),
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17671,5 +17741,577 @@ fn v16_bpf_oversized_portfolio_account_is_rejected() {
         after.data.len(),
         env.portfolio_account_len + 1,
         "a rejected instruction must not change the account's length"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TB-2b (W2): AssetControlSequencesV16 binding -- PERMANENT adversarial tests.
+//
+// One test per BOUND TAG (not per lane): `oracle_observation` is shared by six
+// tags (`ConfigureHybridOracle`/`ConfigureEwmaMark`/`PushEwmaMark`/
+// `ConfigureAuthMark`/`PushAuthMark`/`RestartAssetOracle`), each with its OWN
+// `advance_control_sequence_view` call site in `src/v16_program.rs`. A shared
+// underlying primitive (`state::require_newer_control_sequence`, already unit-
+// tested by TB-2a) does not prove any ONE handler actually calls it -- a
+// forgotten wire-up on a single tag would only be caught by a test that
+// exercises THAT tag specifically. Each test below: (1) makes one successful
+// call to establish a non-zero watermark, (2) re-submits the IDENTICAL
+// sequence value (a live-read of the watermark the first call just set, never
+// a hardcoded literal) on a second call, and (3) asserts `Custom(EngineStale)`
+// -- `require_newer_control_sequence` rejects `proposed <= current`, so the
+// exact same value is guaranteed stale. Every scenario below is otherwise
+// unremarkable (fresh market, default admin authority, in-bounds arguments)
+// specifically so the ONLY thing that can make the second call fail is the
+// sequence check -- ruling out interference from an unrelated pre-existing
+// guard so the observed rejection reason is unambiguous.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn v16_bpf_update_liquidation_fee_policy_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.update_liquidation_fee_policy_with_cu(1_000);
+    let stale = env.control_sequences(0).liquidation_fee;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateLiquidationFeePolicy {
+                cranker_share_bps: 2_000,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.liquidation_cranker_fee_share_bps,
+        1_000,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_update_maintenance_fee_policy_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.update_maintenance_fee_policy_with_cu(1_000);
+    let stale = env.control_sequences(0).maintenance_fee;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateMaintenanceFeePolicy {
+                cranker_share_bps: 2_000,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.maintenance_cranker_fee_share_bps,
+        1_000,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_update_backing_fee_policy_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.update_backing_fee_policy_with_cu(0, 50, 1_000);
+    // domain 0 -> asset_index 0, long_side (domain % 2 == 0).
+    let stale = env.control_sequences(0).backing_fee_long;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateBackingFeePolicy {
+                domain: 0,
+                fee_bps: 60,
+                insurance_share_bps: 1_000,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.backing_trade_fee_bps_long,
+        50,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+// `UpdateBackingFeePolicy` binds TWO independent lanes off the SAME tag
+// (`backing_fee_long`/`backing_fee_short`, selected by `domain % 2`) --
+// TB-2a's struct keeps these separate (unlike upstream's later merge into a
+// single `backing_fee` lane; see `AssetControlSequencesV16`'s doc comment).
+// The long-side test above proves the mechanism; this proves the SHORT lane
+// is independently wired, not just riding along with the long one.
+#[test]
+fn v16_bpf_update_backing_fee_policy_rejects_stale_policy_sequence_short_side() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.update_backing_fee_policy_with_cu(1, 55, 1_000);
+    // domain 1 -> asset_index 0, short_side (domain % 2 == 1).
+    let stale = env.control_sequences(0).backing_fee_short;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateBackingFeePolicy {
+                domain: 1,
+                fee_bps: 65,
+                insurance_share_bps: 1_000,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.backing_trade_fee_bps_short,
+        55,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_update_trade_fee_policy_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    env.update_trade_fee_policy_with_cu(500);
+    let stale = env.control_sequences(0).trade_fee;
+    env.svm.expire_blockhash();
+    let admin = env.admin.insecure_clone();
+    let err = env
+        .send(
+            ProgInstruction::UpdateTradeFeePolicy {
+                trade_fee_base_bps: 600,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.trade_fee_base_bps,
+        500,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_update_fee_redirect_policy_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.update_fee_redirect_policy_with_cu(1_000);
+    let stale = env.control_sequences(0).fee_redirect;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateFeeRedirectPolicy {
+                redirect_bps: 2_000,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.fee_redirect_to_market_0_bps,
+        1_000,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_update_market_init_fee_policy_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.update_market_init_fee_policy_with_cu(5);
+    let stale = env.control_sequences(0).market_init_fee;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateMarketInitFeePolicy {
+                min_init_fee: 6,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.permissionless_market_init_fee,
+        5,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_configure_permissionless_resolve_rejects_stale_policy_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.configure_permissionless_resolve_with_cu(9_000, 5);
+    let stale = env.control_sequences(0).permissionless_resolve;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::ConfigurePermissionlessResolve {
+                stale_slots: 9_000,
+                force_close_delay_slots: 6,
+                policy_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) policy_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+    assert_eq!(
+        env.market_state().0.force_close_delay_slots,
+        5,
+        "a rejected policy update must not mutate the config"
+    );
+}
+
+#[test]
+fn v16_bpf_configure_hybrid_oracle_rejects_stale_observation_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.svm.warp_to_slot(1);
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.unix_timestamp = 100;
+    env.svm.set_sysvar(&clock);
+    let feeds = [[0xc1u8; 32], [0xc2u8; 32], [0xc3u8; 32]];
+    let leg0 = env.set_pyth_price(&feeds[0], 4_000_000_000, -6, 100);
+    let leg1 = env.set_pyth_price(&feeds[1], 150_000_000, -6, 100);
+    let leg2 = env.set_pyth_price(&feeds[2], 200_000_000, -6, 100);
+    env.configure_three_leg_hybrid_with_cu(feeds, leg0, leg1, leg2, 1, 100);
+    let stale = env.control_sequences(0).oracle_observation;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::ConfigureHybridOracle {
+                asset_index: 0,
+                now_slot: 1,
+                now_unix_ts: 100,
+                oracle_leg_count: 3,
+                oracle_leg_flags: ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3,
+                max_staleness_secs: 60,
+                hybrid_soft_stale_slots: 3,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+                invert: 0,
+                unit_scale: 0,
+                conf_filter_bps: 500,
+                oracle_leg_feeds: feeds,
+                observation_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new_readonly(leg0, false),
+                AccountMeta::new_readonly(leg1, false),
+                AccountMeta::new_readonly(leg2, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) observation_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+}
+
+#[test]
+fn v16_bpf_configure_ewma_mark_rejects_stale_observation_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.configure_ewma_mark_with_cu(1, 100, 1, 0);
+    let stale = env.control_sequences(0).oracle_observation;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: 100,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+                observation_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) observation_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+}
+
+#[test]
+fn v16_bpf_push_ewma_mark_rejects_stale_observation_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.configure_ewma_mark_with_cu(1, 100, 1, 0);
+    env.push_ewma_mark_with_cu(1, 110);
+    let stale = env.control_sequences(0).oracle_observation;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::PushEwmaMark {
+                asset_index: 0,
+                now_slot: 1,
+                mark_e6: 120,
+                observation_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) observation_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+}
+
+#[test]
+fn v16_bpf_configure_auth_mark_rejects_stale_observation_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.configure_auth_mark_with_cu(1, 100);
+    let stale = env.control_sequences(0).oracle_observation;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: 100,
+                observation_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) observation_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+}
+
+#[test]
+fn v16_bpf_push_auth_mark_rejects_stale_observation_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    env.configure_auth_mark_with_cu(1, 100);
+    env.push_auth_mark_with_cu(2, 110);
+    let stale = env.control_sequences(0).oracle_observation;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::PushAuthMark {
+                asset_index: 0,
+                now_slot: 2,
+                mark_e6: 120,
+                observation_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) observation_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+}
+
+#[test]
+fn v16_bpf_restart_asset_oracle_rejects_stale_observation_sequence() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    // RestartAssetOracle requires asset 0 to be in RECOVERY lifecycle; force it
+    // directly (the natural recovery path is out of scope for this unit -- see
+    // `v16_bpf_recovery_and_reset_tags_are_bounded_and_update_state` for how the
+    // rest of this suite reaches Recovery/lifecycle states the same way).
+    env.mutate_market(|_, group| {
+        group.assets[0].lifecycle = AssetLifecycleV16::Recovery;
+    });
+    let observation_sequence = env.control_sequences(0).oracle_observation + 1;
+    env.send(
+        ProgInstruction::RestartAssetOracle {
+            asset_index: 0,
+            now_slot: 1,
+            initial_price: 100,
+            observation_sequence,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("restart asset oracle");
+    let stale = env.control_sequences(0).oracle_observation;
+    // A successful restart moves the asset out of Recovery; force it back so the
+    // SECOND call fails on the sequence check specifically, not on lifecycle.
+    env.mutate_market(|_, group| {
+        group.assets[0].lifecycle = AssetLifecycleV16::Recovery;
+    });
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::RestartAssetOracle {
+                asset_index: 0,
+                now_slot: 1,
+                initial_price: 110,
+                observation_sequence: stale,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+        .expect_err("a stale (non-increasing) observation_sequence must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
+    );
+}
+
+#[test]
+fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    let target1 = Keypair::new();
+    env.ensure_signer_account(target1.pubkey());
+    let epoch1 = env.control_sequences(0).authority_epoch + 1;
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 2, // ASSET_AUTH_INSURANCE_OPERATOR
+            new_pubkey: target1.pubkey().to_bytes(),
+            authority_epoch: epoch1,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(target1.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &target1],
+    )
+    .expect("rotate insurance_operator");
+    // `admin`'s asset_admin bypass only applies while the target authority is
+    // still the zero bootstrap sentinel (or the LP-vault-closed backing-bucket
+    // case, N/A for this kind); once `insurance_operator` is live (target1),
+    // ONLY target1 -- the current holder -- can self-rotate it further, per
+    // `handle_update_asset_authority`'s inverted allow-list (see its own doc
+    // comment). So the second attempt is signed by target1, isolating the
+    // rejection to the stale epoch rather than a signer/authority mismatch.
+    let stale = env.control_sequences(0).authority_epoch;
+    let target2 = Keypair::new();
+    env.ensure_signer_account(target2.pubkey());
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 2,
+                new_pubkey: target2.pubkey().to_bytes(),
+                authority_epoch: stale,
+            },
+            vec![
+                AccountMeta::new(target1.pubkey(), true),
+                AccountMeta::new_readonly(target2.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&target1, &target2],
+        )
+        .expect_err("a stale (non-increasing) authority_epoch must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {err}"
     );
 }
