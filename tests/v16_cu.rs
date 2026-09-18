@@ -7772,6 +7772,150 @@ fn v16_attack_trade_cpi_requires_signed_base_fee_consent() {
     );
 }
 
+// sync/w2-e24cf78e (adopt upstream e24cf78e, "require matcher consent for CPI backing fees"):
+// `v16_attack_trade_cpi_requires_signed_base_fee_consent` above covers the TAKER's base
+// trade_fee_bps consent. Before this fix there was a SEPARATE, unguarded charge: a CPI trade
+// that draws a NEW counterparty-backed lien on the LP-controlled account_b side pays a
+// backing-domain fee (`apply_backing_domain_fees_after_trade_view` /
+// `collect_backing_domain_fees_for_account_view`) that the matcher never got a chance to
+// consent to -- the LP's off-chain quoting logic has no visibility into that fee before
+// signing. The fix threads the matcher's CPI-return `backing_fee_cap_bps()` (flags bits
+// 8..21, `matcher_abi::FLAG_BACKING_FEE_CAP_MASK`) through as `handle_trade_cpi`'s
+// `Some(ret.backing_fee_cap_bps())` (vs `handle_trade_nocpi`'s permanent `None` -- no matcher,
+// no cap concept), and rejects with `Unauthorized` whenever the domain's fee bps exceeds it.
+// Our real matcher fixture (`../percolator-match`, built via `cargo build-sbf`) never sets
+// those bits (`flags: FLAG_VALID` / `FLAG_VALID | FLAG_PARTIAL_OK` only, grepped across
+// `src/lib.rs`/`src/vamm.rs`), so it always echoes cap=0 -- exactly the "unupgraded matcher"
+// case: every CPI trade that would actually charge a nonzero backing-domain fee against the
+// LP is rejected until percolator-match is updated to emit a real cap (coordination note for
+// the migration, not implemented here -- percolator-match is out of scope for this unit).
+#[test]
+fn v16_attack_trade_cpi_rejects_backing_domain_fee_without_matcher_cap_consent() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    // domain 1 = asset-0 SHORT-side backing (`backing_fee_policy_for_domain_view`:
+    // long_side = domain % 2 == 0). A nonzero policy here is required for
+    // `apply_backing_domain_fees_after_trade_view` to run at all --
+    // `cfg.backing_trade_fee_policy_count == 0` short-circuits it to a no-op otherwise.
+    env.update_backing_fee_policy_with_cu(1, 50, 5_000);
+
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let maker_account = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker_account, 1_000_000);
+    // Maker (the LP/matcher-controlled account_b) is capitalized far short of the margin
+    // this trade needs, so the engine must draw a NEW counterparty-backed lien from domain
+    // 1 to cover it -- the same mechanism as `setup_stale_cached_slot_fresh_bucket_scenario`
+    // (57d04a7d regression fixture, further below in this file) applied to the CPI maker
+    // leg instead of a plain NoCpi account, with a far-future expiry so this is a normal
+    // (non-stale) fresh draw, not a staleness regression.
+    env.deposit(&maker_owner, maker_account, 100);
+    env.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+    env.add_source_positive_pnl(maker_account, 1, 500_000);
+
+    let (matcher_ctx, matcher_delegate, _) =
+        env.init_matcher_context(&maker_owner, matcher_program, maker_account);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let maker_before = env.svm.get_account(&maker_account).unwrap();
+
+    // Taker requests SHORT (negative size_q) so the maker (account_b) fills LONG -- the
+    // same direction/magnitude/price as the 57d04a7d fixture's lien-drawing leg, just with
+    // the roles carried by the CPI maker instead of a bare NoCpi signer.
+    env.svm.expire_blockhash();
+    let r = env.try_trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        -(3 * POS_SCALE as i128),
+        0,
+    );
+    let err = r.expect_err(
+        "a CPI trade that would charge a nonzero backing-domain fee against the LP's \
+         account_b must be REJECTED when the matcher's CPI return does not consent to it \
+         -- our unmodified percolator-match fixture never sets the backing-fee-cap bits, \
+         so it always echoes cap=0",
+    );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::Unauthorized as u32),
+        "expected Unauthorized; got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected TradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected TradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&maker_account).unwrap(),
+        maker_before,
+        "a rejected TradeCpi must not mutate the maker's (LP) portfolio -- in particular it \
+         must not create the new counterparty-backed lien"
+    );
+
+    // CONTROL: identical setup, but with NO backing-fee policy configured for domain 1
+    // (bps stays 0) -- the trade draws the identical lien from the identical bucket, but
+    // since no fee is actually owed (`split.total_fee == 0`), the cap check never fires
+    // (guarded by `if split.total_fee != 0`) and the CPI trade succeeds normally, matching
+    // the code's own "fee-free and risk-reducing fills remain executable at cap zero"
+    // comment. Also proves the setup is non-vacuous: the lien draw itself is not what a
+    // less-capable fixture would trip over.
+    let mut env2 = V16CuEnv::new();
+    let matcher_bytes2 = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env2.svm.add_program(matcher_program, &matcher_bytes2);
+
+    let taker_owner2 = Keypair::new();
+    let maker_owner2 = Keypair::new();
+    let taker_account2 = env2.create_portfolio(&taker_owner2);
+    let maker_account2 = env2.create_portfolio(&maker_owner2);
+    env2.deposit(&taker_owner2, taker_account2, 1_000_000);
+    env2.deposit(&maker_owner2, maker_account2, 100);
+    env2.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+    env2.add_source_positive_pnl(maker_account2, 1, 500_000);
+
+    let (matcher_ctx2, matcher_delegate2, _) =
+        env2.init_matcher_context(&maker_owner2, matcher_program, maker_account2);
+
+    env2.svm.expire_blockhash();
+    env2.trade_cpi_with_cu_on_asset(
+        &taker_owner2,
+        taker_account2,
+        &maker_owner2,
+        maker_account2,
+        matcher_program,
+        matcher_ctx2,
+        matcher_delegate2,
+        0,
+        -(3 * POS_SCALE as i128),
+        0,
+    );
+    let maker_after2 = env2.portfolio_state(maker_account2);
+    assert!(
+        maker_after2
+            .source_lien_counterparty_backing_num
+            .iter()
+            .any(|amount| *amount != 0),
+        "control: with no backing-fee policy configured, the CPI trade must still draw the \
+         counterparty-backed lien (proving the setup is non-vacuous) but must SUCCEED since \
+         no fee is owed at cap zero"
+    );
+}
+
 // Wave-2 unit W2-6b627b43: adopts upstream 6b627b43 "require LP consent for CPI base
 // fees". Bit-packs a new `trade_fee_cap_bps` (14 bits, bits 50..63) into
 // PortfolioMatcherConfigV16.control (formerly `enabled: u64`, bit 0 unchanged) -- the LP

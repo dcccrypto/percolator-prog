@@ -5781,6 +5781,17 @@ pub mod matcher_abi {
     pub const FLAG_VALID: u32 = 1;
     pub const FLAG_PARTIAL_OK: u32 = 2;
     pub const FLAG_REJECTED: u32 = 4;
+    // sync/w2-e24cf78e (adopt upstream e24cf78e, "require matcher consent for CPI
+    // backing fees"): bits 8..21 of `flags` carry the LP matcher's self-declared cap
+    // (bps, 0..=10_000) on how much backing-domain fee it consents to being charged
+    // on its own (account_b) side of a CPI-filled trade. An unupgraded matcher (one
+    // that never sets these bits) reads back cap=0, which rejects any CPI trade that
+    // would actually charge a nonzero backing-domain fee against the LP until the
+    // matcher program is updated to emit a real cap -- see `backing_fee_cap_bps()`
+    // and its use in `apply_backing_domain_fees_after_trade_view`/
+    // `collect_backing_domain_fees_for_account_view` below.
+    pub const FLAG_BACKING_FEE_CAP_SHIFT: u32 = 8;
+    pub const FLAG_BACKING_FEE_CAP_MASK: u32 = 0x3fff << FLAG_BACKING_FEE_CAP_SHIFT;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MatcherReturn {
@@ -5792,6 +5803,12 @@ pub mod matcher_abi {
         pub lp_account_id: u64,
         pub oracle_price_e6: u64,
         pub asset_index: u64,
+    }
+
+    impl MatcherReturn {
+        pub fn backing_fee_cap_bps(&self) -> u16 {
+            ((self.flags & FLAG_BACKING_FEE_CAP_MASK) >> FLAG_BACKING_FEE_CAP_SHIFT) as u16
+        }
     }
 
     pub fn read_matcher_return(ctx: &[u8]) -> Result<MatcherReturn, ProgramError> {
@@ -5821,10 +5838,12 @@ pub mod matcher_abi {
         if ret.abi_version != MATCHER_ABI_VERSION {
             return Err(ProgramError::InvalidAccountData);
         }
-        const KNOWN_FLAGS: u32 = FLAG_VALID | FLAG_PARTIAL_OK | FLAG_REJECTED;
+        const KNOWN_FLAGS: u32 =
+            FLAG_VALID | FLAG_PARTIAL_OK | FLAG_REJECTED | FLAG_BACKING_FEE_CAP_MASK;
         if (ret.flags & !KNOWN_FLAGS) != 0
             || (ret.flags & FLAG_VALID) == 0
             || (ret.flags & FLAG_REJECTED) != 0
+            || ret.backing_fee_cap_bps() > 10_000
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -8781,6 +8800,7 @@ pub mod processor {
         size_q: i128,
         exec_price: u64,
         fee_bps: u64,
+        account_b_backing_fee_cap_bps: Option<u16>,
         max_market_slots: usize,
     ) -> ProgramResult {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
@@ -8979,6 +8999,7 @@ pub mod processor {
                     backing_before_a.as_ref(),
                     &mut account_b,
                     backing_before_b.as_ref(),
+                    account_b_backing_fee_cap_bps,
                 )?
             };
             // Four-way split (2026-07-19 design). Both aggregates are split and the two
@@ -9730,6 +9751,7 @@ pub mod processor {
             size_q,
             exec_price,
             fee_bps,
+            None,
             max_market_slots,
         )
     }
@@ -10436,7 +10458,7 @@ pub mod processor {
             asset_index,
             ret.exec_size,
             ret.exec_price_e6,
-            // ADOPT upstream 42e70c84 (wrapper-only, logic-only): account_b (the
+            // ADOPT upstream 42e70c84 (#489, wrapper-only, logic-only): account_b (the
             // unsigned CPI/matcher-routed side) never signs `fee_bps`, and the matcher
             // ABI carries no fee approval from it. Normally that's fine — the taker-only
             // fee design means account_b pays nothing. But the engine's N1 maker-fallback
@@ -10449,6 +10471,10 @@ pub mod processor {
             // computation to the market's own `cfg_pre.trade_fee_base_bps` instead — the
             // one fee figure account_b implicitly consents to by registering as an LP.
             cfg_pre.trade_fee_base_bps,
+            // ADOPT upstream e24cf78e: the backing-domain fee this trade may charge against
+            // the LP's own (account_b) side is a SEPARATE consent from the trade fee above —
+            // only the matcher can authorize it, via `backing_fee_cap_bps()` on its CPI return.
+            Some(ret.backing_fee_cap_bps()),
             max_market_slots,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
@@ -20702,6 +20728,7 @@ pub mod processor {
         cfg: &WrapperConfigV16,
         account: &percolator::PortfolioV16ViewMut<'_>,
         before: &[(u32, u128)],
+        backing_fee_cap_bps: Option<u16>,
         fees_by_domain: &mut DomainFeeTotals,
     ) -> Result<u128, ProgramError> {
         // Iterate only the OCCUPIED source-domain slots (after-state, <= CAP). For each, compute the
@@ -20726,6 +20753,12 @@ pub mod processor {
                 )
                 .map_err(map_v16_error)?;
                 if split.total_fee != 0 {
+                    // CPI supplies the unsigned LP's matcher-selected cap. Check only an
+                    // actual debit so fee-free and risk-reducing fills remain executable
+                    // at cap zero.
+                    if backing_fee_cap_bps.is_some_and(|cap| bps > cap) {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
                     domain_fee_add(
                         fees_by_domain,
                         domain,
@@ -20836,6 +20869,7 @@ pub mod processor {
         before_a: &[(u32, u128)],
         account_b: &mut percolator::PortfolioV16ViewMut<'_>,
         before_b: &[(u32, u128)],
+        account_b_backing_fee_cap_bps: Option<u16>,
     ) -> Result<u128, ProgramError> {
         let mut fees_a_by_domain: DomainFeeTotals = Vec::new();
         let fee_a = collect_backing_domain_fees_for_account_view(
@@ -20843,6 +20877,7 @@ pub mod processor {
             cfg,
             account_a,
             before_a,
+            None,
             &mut fees_a_by_domain,
         )?;
         let mut fees_b_by_domain: DomainFeeTotals = Vec::new();
@@ -20851,6 +20886,7 @@ pub mod processor {
             cfg,
             account_b,
             before_b,
+            account_b_backing_fee_cap_bps,
             &mut fees_b_by_domain,
         )?;
         if fee_a == 0 && fee_b == 0 {
@@ -22437,6 +22473,7 @@ pub mod processor {
                     before_a,
                     &mut account_b,
                     before_b,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(charged, 10);
