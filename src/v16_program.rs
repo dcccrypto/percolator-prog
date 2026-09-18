@@ -12,10 +12,10 @@ extern crate std;
 
 use alloc::vec::Vec;
 use percolator::{
-    v16_domain_count_for_market_slots, AutoCrankWorkV16, BackingBucketStatusV16, MarketModeV16,
-    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, RebalanceRequestV16, SideV16,
-    SourceCreditStateV16, TerminalSlabOutcomeV16, TradeRequestV16, V16Config, V16Error,
-    BOUND_SCALE,
+    v16_domain_count_for_market_slots, AutoCrankObservationV16, AutoCrankOutcomeV16,
+    AutoCrankPlanV16, AutoCrankWorkV16, BackingBucketStatusV16, MarketModeV16,
+    RebalanceRequestV16, SideV16, SourceCreditStateV16, TerminalSlabOutcomeV16, TradeRequestV16,
+    V16Config, V16Error, BOUND_SCALE,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -4209,6 +4209,26 @@ pub mod ix {
         pub limit_price: u64,
     }
 
+    /// ADOPT upstream (Group-B subsystem #2, AutoCrankObservation): authenticated market data
+    /// the caller makes available to the engine auto-crank. The caller chooses which oracle
+    /// accounts to provide (a bounded raw-evidence hint), never which engine action executes --
+    /// the engine self-classifies the step and its asset via
+    /// `permissionless_auto_crank_not_atomic` (`AutoCrankPlanV16` selection, already
+    /// byte-identical in `~/percolator`'s engine crate). `oracle_accounts` is how many trailing
+    /// `AccountInfo`s in the instruction's account list this hint's asset consumes (0 for a
+    /// committed-state-only refresh of a non-price-managed / already-current asset).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CrankObservationHint {
+        pub asset_index: u16,
+        pub oracle_accounts: u8,
+    }
+
+    /// Bound on the number of hints one `PermissionlessCrank` transaction may decode. Matches
+    /// upstream's `CRANK_OBSERVATION_DECODE_MAX` and `percolator::V16_MAX_PORTFOLIO_ASSETS_N`
+    /// (16) -- a portfolio can never have more active legs than that, so no honest caller needs
+    /// more hints than this in one call.
+    const CRANK_OBSERVATION_DECODE_MAX: usize = 16;
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Instruction {
         InitMarket {
@@ -4248,12 +4268,24 @@ pub mod ix {
         /// format no longer accepts caller-supplied `close_q`/`fee_bps`, closing the
         /// "min-fee chunking" exploit where a keeper could pick a tiny close_q to
         /// under-pay the liquidation fee while still making forward progress.
+        ///
+        /// ADOPT upstream Group-B subsystem #2 (AutoCrankObservation, d63c4dc9 +
+        /// 7d0d2539): the caller no longer picks the action, asset, or a
+        /// `funding_rate_e9`/`recovery_reason` -- it supplies a bounded set of
+        /// `CrankObservationHint`s (which assets it has fresh oracle evidence for,
+        /// and how many trailing accounts each one's evidence occupies) and the
+        /// engine's `AutoCrankPlanV16` selector picks the action and the asset. This
+        /// closes two live gaps the old caller-classifying shape could not even
+        /// express: (1) a multi-leg portfolio could be liquidated on one fresh leg
+        /// while a stale leg's un-applied accrual was never inspected at all
+        /// (`reject_incomplete_account_health_observations_view` now walks every
+        /// active leg via `active_bitmap`); (2) a stale-but-present Hybrid
+        /// observation could satisfy a health refresh without being a bona fide
+        /// this-slot report (`reject_incomplete_asset_health_observation_view` now
+        /// requires `last_good_oracle_slot == now_slot` absent soft-stale maturity).
         PermissionlessCrank {
-            action: u8,
-            asset_index: u16,
             now_slot: u64,
-            funding_rate_e9: i128,
-            recovery_reason: u8,
+            observations: Vec<CrankObservationHint>,
         },
         TradeNoCpi {
             asset_index: u16,
@@ -4738,13 +4770,24 @@ pub mod ix {
                 4 => Self::Withdraw {
                     amount: read_u128(&mut rest)?,
                 },
-                5 => Self::PermissionlessCrank {
-                    action: read_u8(&mut rest)?,
-                    asset_index: read_u16(&mut rest)?,
-                    now_slot: read_u64(&mut rest)?,
-                    funding_rate_e9: read_i128(&mut rest)?,
-                    recovery_reason: read_u8(&mut rest)?,
-                },
+                5 => {
+                    let now_slot = read_u64(&mut rest)?;
+                    let n = read_u8(&mut rest)? as usize;
+                    if n > CRANK_OBSERVATION_DECODE_MAX {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let mut observations = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        observations.push(CrankObservationHint {
+                            asset_index: read_u16(&mut rest)?,
+                            oracle_accounts: read_u8(&mut rest)?,
+                        });
+                    }
+                    Self::PermissionlessCrank {
+                        now_slot,
+                        observations,
+                    }
+                }
                 6 => Self::TradeNoCpi {
                     asset_index: read_u16(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
@@ -5113,18 +5156,16 @@ pub mod ix {
                     push_u128(&mut out, amount);
                 }
                 Self::PermissionlessCrank {
-                    action,
-                    asset_index,
                     now_slot,
-                    funding_rate_e9,
-                    recovery_reason,
+                    ref observations,
                 } => {
                     out.push(5);
-                    out.push(action);
-                    push_u16(&mut out, asset_index);
                     push_u64(&mut out, now_slot);
-                    push_i128(&mut out, funding_rate_e9);
-                    out.push(recovery_reason);
+                    out.push(observations.len() as u8);
+                    for observation in observations.iter() {
+                        push_u16(&mut out, observation.asset_index);
+                        out.push(observation.oracle_accounts);
+                    }
                 }
                 Self::TradeNoCpi {
                     asset_index,
@@ -6895,7 +6936,7 @@ pub mod processor {
     use super::*;
     use crate::{
         error::{map_v16_error, PercolatorError},
-        ix::Instruction,
+        ix::{CrankObservationHint, Instruction},
         state::{self, WrapperConfigV16},
     };
 
@@ -7278,6 +7319,131 @@ pub mod processor {
                 }
             }
             slot_index += 1;
+        }
+        Ok(())
+    }
+
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation) d63c4dc9 "gate liquidation on
+    // pending active-leg accrual" + 7d0d2539 "require current hybrid evidence for health refresh"
+    // (final upstream names/shape, per WRAPPER_SYNC_LOOP.md's "port the final shape, not the
+    // intermediate history" convention -- 7d0d2539 renamed d63c4dc9's
+    // `reject_missing_pending_liquidation_observations_view` /
+    // `reject_missing_observation_that_changes_accrual_view` to the names below and layered its
+    // own Hybrid-currentness clause directly into the per-asset gate). See
+    // adopt_autocrank_observation.md §2 for the two live gaps this closes:
+    //
+    // (d63c4dc9) Before this gate, this handler's freshness check was scoped to exactly the ONE
+    // asset a caller named. A multi-leg portfolio could be liquidated on a fresh leg while a
+    // stale leg's un-applied accrual was never inspected at all -- this fork had ZERO wrapper-
+    // level defense against that cross-leg accrual-timing gap (verified: no `active_bitmap` walk
+    // existed anywhere in the pre-port single-asset crank dispatch). This walks every active leg.
+    //
+    // (7d0d2539) Before this gate's Hybrid-currentness clause, ANY observation entry for an asset
+    // index (even one derived from a stale cached price) satisfied the freshness check. This
+    // closes the lever: absent soft-stale maturity, a Hybrid-mode leg's refresh must be backed by
+    // a bona fide THIS-SLOT external report (`last_good_oracle_slot == now_slot`), not merely "an
+    // observation object was constructed" -- closing a liquidation-evasion path via a perpetually
+    // "refreshed" account that never actually re-certifies against current evidence.
+    fn reject_incomplete_account_health_observations_view(
+        cfg: &WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        now_slot: u64,
+        observations: &[AutoCrankObservationV16],
+    ) -> ProgramResult {
+        let active_bitmap = portfolio
+            .header
+            .active_bitmap
+            .map(percolator::V16PodU64::get);
+        let mut seen_assets = [u32::MAX; percolator::V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut seen_asset_count = 0usize;
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            let bit = percolator::active_bitmap_get(active_bitmap, slot);
+            if bit != leg.active {
+                return Err(PercolatorError::EngineHiddenLeg.into());
+            }
+            if bit {
+                let mut seen = 0usize;
+                while seen < seen_asset_count {
+                    if seen_assets[seen] == leg.asset_index {
+                        return Err(PercolatorError::EngineHiddenLeg.into());
+                    }
+                    seen += 1;
+                }
+                seen_assets[seen_asset_count] = leg.asset_index;
+                seen_asset_count += 1;
+                reject_incomplete_asset_health_observation_view(
+                    cfg,
+                    group,
+                    leg.asset_index as usize,
+                    now_slot,
+                    observations,
+                )?;
+            }
+            slot += 1;
+        }
+        Ok(())
+    }
+
+    fn reject_incomplete_asset_health_observation_view(
+        cfg: &WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+        observations: &[AutoCrankObservationV16],
+    ) -> ProgramResult {
+        if asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
+        // A stale-account refresh cannot consume this slot's accrual interval from a prior-slot
+        // Hybrid observation. In normal external mode every active health leg must have advanced
+        // from an authenticated report in this slot. Once the configured after-hours threshold
+        // matures, the mark fallback is canonical and no external report is required.
+        if oracle_v16::profile_is_hybrid(&profile)
+            && !oracle_v16::profile_hybrid_soft_stale_matured(&profile, now_slot)
+            && profile.last_good_oracle_slot != now_slot
+        {
+            return Err(PercolatorError::EngineNonProgress.into());
+        }
+        if observations.iter().any(|o| o.asset_index == asset_index) {
+            return Ok(());
+        }
+        if !oracle_v16::profile_is_price_managed(&profile) {
+            return Ok(());
+        }
+        let asset = group.markets[asset_index].engine.asset;
+        let dt = asset_segment_dt_view(group, asset_index, now_slot)?;
+        if dt == 0 {
+            return Ok(());
+        }
+        let target = profile.mark_ewma_e6;
+        if target == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        let current = asset.effective_price.get();
+        let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
+        let next = oracle_v16::effective_price_from_target(
+            current,
+            target,
+            group.header.config.max_price_move_bps_per_slot.get(),
+            dt,
+            exposed,
+        );
+        // d63c4dc9's contribution beyond the price check: a pending nonzero funding rate is ALSO
+        // pending progress, even when the price itself has already fully caught up (next ==
+        // current) -- a caller cannot skip supplying an observation just because the price
+        // happens to be stationary this slot while funding still owes an update.
+        let funding_rate =
+            permissionless_funding_rate_e9_view(&profile, group, asset_index, now_slot, next)?;
+        if next != current || funding_rate != 0 {
+            return Err(PercolatorError::EngineNonProgress.into());
         }
         Ok(())
     }
@@ -7884,20 +8050,9 @@ pub mod processor {
             Instruction::Deposit { amount } => handle_deposit(program_id, accounts, amount),
             Instruction::Withdraw { amount } => handle_withdraw(program_id, accounts, amount),
             Instruction::PermissionlessCrank {
-                action,
-                asset_index,
                 now_slot,
-                funding_rate_e9,
-                recovery_reason,
-            } => handle_permissionless_crank(
-                program_id,
-                accounts,
-                action,
-                asset_index,
-                now_slot,
-                funding_rate_e9,
-                recovery_reason,
-            ),
+                observations,
+            } => handle_permissionless_crank(program_id, accounts, now_slot, observations),
             Instruction::TradeNoCpi {
                 asset_index,
                 size_q,
@@ -16584,36 +16739,68 @@ pub mod processor {
         market_ai: &AccountInfo<'a>,
         portfolio_ai: &AccountInfo<'a>,
         tail: &[AccountInfo<'a>],
-        action: u8,
-        asset_index: u16,
         now_slot: u64,
-        funding_rate_e9: i128,
-        recovery_reason: u8,
+        observation_hints: &[CrankObservationHint],
         max_market_slots: usize,
     ) -> ProgramResult {
-        if funding_rate_e9 != 0 || recovery_reason != 0 {
-            return Err(PercolatorError::InvalidInstruction.into());
-        }
-        if action > 2 {
+        // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation). Full rewrite: the caller
+        // no longer picks the action/asset -- it supplies a bounded set of raw-evidence hints and
+        // the engine's `AutoCrankPlanV16` selector (already byte-identical to upstream in our
+        // engine crate, `permissionless_auto_crank_not_atomic`) picks the action and the asset.
+        // See adopt_autocrank_observation.md for the full analysis. Adaptations vs. upstream's
+        // current-tip shape (documented at each site below, not silent):
+        //   (1) uses this fork's existing single-segment `hybrid_effective_price_for_crank_view`
+        //       + `accrue_asset_to_not_atomic` crank-price primitive, NOT upstream's later
+        //       path-based `hybrid_target_for_crank_view` / `canonical_accrual_path_for_target_view`
+        //       refinement -- that refinement is a separate, currently-fully-absent subsystem on
+        //       this fork (0 hits), matching the same adaptation this fork's Wave-1 #4 "zero-move
+        //       funding" unit already made for the identical reason.
+        //   (2) does not port upstream's resolve-matured terminal-settlement branch
+        //       (`required_market_resolve_accrual_for_profile_view`) -- instead reuses the
+        //       existing `reject_permissionless_resolve_matured_live_for_profile_view` gate
+        //       per-hint, matching this handler's own pre-port behavior (reject the crank,
+        //       force the caller through `ResolveStalePermissionless`, tag 39, unchanged). This
+        //       also makes a6365ad3 (a correctness fix INSIDE that branch) and half of 8b02d00b
+        //       (the branch's `continue`-on-already-settled refinement) not applicable here.
+        //   (3) does not port the `expired_close` pre-check short-circuit (bankrupt-close ->
+        //       DeclareRecovery escalation) -- the plan selector can still reach
+        //       `AdvanceClose`/`DeclareRecovery` naturally from the main unified call below when
+        //       `summary.expired_close`/`recovery_eligible` warrant it; only the EARLY, guaranteed
+        //       short-circuit (which needs to trust/bump `close_progress`/`current_slot` ahead of
+        //       the gates) is omitted, as a lower-risk choice for this unit.
+        //   (4) does not bump a portfolio position_epoch on position change -- this fork has not
+        //       adopted Track-B's portfolio-identity fields at all (0 hits for `position_epoch`
+        //       anywhere in this file); that bookkeeping is inapplicable to this fork's ABI today.
+        //   (5) defers 2f0c809d (CloseResolved hint threading) -- this fork's `CloseResolved`
+        //       (tag 30) is a separate, structurally unrelated handler
+        //       (`close_resolved_account_not_atomic` directly, its own NFT-holder-auth /
+        //       `force_close_delay_slots` logic) that does not route through the auto-crank entry
+        //       point at all. The `ResolvedClose` outcome guard below is upstream's OWN protective
+        //       measure for exactly this situation (its dispatcher routes Resolved mode elsewhere
+        //       before reaching this function; ours doesn't, so the guard is load-bearing here).
+        //   (6) preserves this fork's own protocol-fee/cranker-reward accounting (the
+        //       `protocol_fee_accrued_atoms`/`protocol_fee_withdrawn_atoms` reservation threaded
+        //       through the 3-arg `credit_account_from_insurance_not_atomic`, which upstream's
+        //       engine does not have) re-plumbed around the single unified engine call below,
+        //       replacing the two duplicated `liquidate_account_not_atomic` /
+        //       `permissionless_crank_not_atomic` call sites this handler used to carry inside
+        //       each of its two reward/no-reward branches.
+        if observation_hints.len() > percolator::V16_MAX_PORTFOLIO_ASSETS_N {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
         let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
-        let asset_index_usize = asset_index as usize;
         let cfg_after;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
-            if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
-                return Err(PercolatorError::InvalidInstruction.into());
-            }
-            // FIX F-05 (register row C-W-04): a market in Recovery has exactly ONE
-            // bounded public step left -- release the remaining obligation, then the
+            // FIX F-05 (register row C-W-04, PRESERVED VERBATIM): a market in Recovery has
+            // exactly ONE bounded public step left -- release the remaining obligation, then the
             // value-neutral transition to Resolved. The engine's escalation valve
             // (`permissionless_auto_crank_not_atomic`, engine 2c38570a:src/v16.rs:15171,
             // Recovery arm :15181-15210) is the ONLY writer of `Resolved` that a
             // permissionless caller can reach: the admin `ResolveMarket` (tag 19,
-            // :12880) and `ResolveStalePermissionless` (tag 44, :14368) both refuse
+            // :12880) and `ResolveStalePermissionless` (tag 39) both refuse
             // unless `mode == 0`, and `permissionless_crank_not_atomic` rejects every
             // non-`Recover` action outside Live (engine :15436-15440). Without this
             // branch Recovery is ABSORBING: every account's capital is locked in the
@@ -16626,8 +16813,7 @@ pub mod processor {
             // after another cranker declares Recovery. We therefore take this branch
             // BEFORE any oracle read/write, so a stale feed cannot block the only exit.
             //
-            // The caller-supplied `action` / `asset_index` are deliberately IGNORED
-            // here (they are validated above, so the ABI is unchanged): the engine
+            // The caller-supplied hints are deliberately IGNORED here: the engine
             // self-classifies the step and its asset. The Live path below is untouched.
             if group.header.mode == 2 {
                 let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
@@ -16651,30 +16837,13 @@ pub mod processor {
                 // (upstream returns here the same way).
                 return Ok(());
             }
-            let crank_action = match action {
-                0 => PermissionlessCrankActionV16::Refresh,
-                // FIX W3 (upstream #206, pairs with engine E3 / #92): close_q and
-                // fee_bps are no longer caller-supplied -- the engine selects the
-                // liquidation size (liquidation_engine_close_request_q) and always
-                // reads the fee rate from config inside liquidate_account_not_atomic.
-                1 => PermissionlessCrankActionV16::Liquidate(percolator::LiquidationRequestV16 {
-                    asset_index: asset_index_usize,
-                }),
-                2 => PermissionlessCrankActionV16::SettleB {
-                    asset_index: asset_index_usize,
-                },
-                _ => return Err(PercolatorError::InvalidInstruction.into()),
-            };
-            let mut oracle_profile =
-                read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
-            let now_unix_ts = Clock::get().map(|c| c.unix_timestamp).unwrap_or_else(|_| {
-                let elapsed_slots =
-                    authenticated_now_slot.saturating_sub(oracle_profile.last_good_oracle_slot);
-                oracle_profile
-                    .oracle_target_publish_time
-                    .saturating_add(i64::try_from(elapsed_slots).unwrap_or(i64::MAX))
-            });
-            let reward_enabled = action == 1 && cfg.liquidation_cranker_fee_share_bps != 0;
+
+            // Split the reward-eligible cranker account off the tail BEFORE the per-hint oracle
+            // loop consumes it -- upstream no longer knows the action in advance either, so
+            // (matching its current shape) this always tries to detect the trailing cranker
+            // account whenever the config knob is nonzero, and only decides whether to actually
+            // PAY the reward once the engine's plan is known, below.
+            let reward_enabled = cfg.liquidation_cranker_fee_share_bps != 0;
             let mut oracle_tail = tail;
             let mut cranker_portfolio_ai = None;
             if reward_enabled {
@@ -16691,56 +16860,142 @@ pub mod processor {
                     }
                 }
             }
-            reject_permissionless_resolve_matured_live_for_profile_view(
-                &cfg,
-                &oracle_profile,
-                &group,
-            )?;
-            let crank_price = hybrid_effective_price_for_crank_view(
-                &cfg,
-                &mut oracle_profile,
-                &group,
-                asset_index_usize,
-                authenticated_now_slot,
-                now_unix_ts,
-                oracle_tail,
-            )?;
-            let computed_funding_rate_e9 = permissionless_funding_rate_e9_view(
-                &oracle_profile,
-                &group,
-                asset_index_usize,
-                authenticated_now_slot,
-                crank_price,
-            )?;
-            group
-                .set_asset_raw_oracle_target_not_atomic(
-                    asset_index_usize,
-                    oracle_profile.oracle_target_price_e6,
-                )
-                .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot = core::cmp::max(
-                cfg.last_good_oracle_slot,
-                oracle_profile.last_good_oracle_slot,
-            );
-            write_oracle_profile_to_view(&mut group, asset_index_usize, &oracle_profile)?;
-            if asset_index_usize == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
-                cfg.oracle_mode = oracle_profile.oracle_mode;
-                cfg.oracle_leg_count = oracle_profile.oracle_leg_count;
-                cfg.oracle_leg_flags = oracle_profile.oracle_leg_flags;
-                cfg.invert = oracle_profile.invert;
-                cfg.unit_scale = oracle_profile.unit_scale;
-                cfg.conf_filter_bps = oracle_profile.conf_filter_bps;
-                cfg.max_staleness_secs = oracle_profile.max_staleness_secs;
-                cfg.hybrid_soft_stale_slots = oracle_profile.hybrid_soft_stale_slots;
-                cfg.mark_ewma_e6 = oracle_profile.mark_ewma_e6;
-                cfg.mark_ewma_last_slot = oracle_profile.mark_ewma_last_slot;
-                cfg.mark_ewma_halflife_slots = oracle_profile.mark_ewma_halflife_slots;
-                cfg.mark_min_fee = oracle_profile.mark_min_fee;
-                cfg.oracle_target_price_e6 = oracle_profile.oracle_target_price_e6;
-                cfg.oracle_target_publish_time = oracle_profile.oracle_target_publish_time;
-                cfg.oracle_leg_feeds = oracle_profile.oracle_leg_feeds;
-                cfg.oracle_leg_prices_e6 = oracle_profile.oracle_leg_prices_e6;
-                cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
+
+            // Per-hint oracle-reading loop: turns each caller-supplied `CrankObservationHint`
+            // into a real `AutoCrankObservationV16`, committing that asset's price/funding
+            // forward via this fork's existing single-segment crank-price primitive (adaptation
+            // (1) above). Every hinted asset's evidence is applied here, independent of which
+            // ONE asset the engine's plan selector ultimately picks a bounded action for below.
+            let mut observations: alloc::vec::Vec<AutoCrankObservationV16> =
+                alloc::vec::Vec::with_capacity(percolator::V16_MAX_PORTFOLIO_ASSETS_N);
+            let mut market_accrual_performed = false;
+            for hint in observation_hints.iter() {
+                let hint_asset_index = hint.asset_index as usize;
+                if hint_asset_index >= group.header.config.max_market_slots.get() as usize
+                    || observations
+                        .iter()
+                        .any(|o| o.asset_index == hint_asset_index)
+                {
+                    return Err(PercolatorError::InvalidInstruction.into());
+                }
+                let oracle_account_count = hint.oracle_accounts as usize;
+                if oracle_tail.len() < oracle_account_count {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                let asset = group.markets[hint_asset_index].engine.asset;
+                // Mirrors upstream's lifecycle carve-out: a hint naming an asset that isn't
+                // Active/DrainOnly (e.g. an individually-Recovery-lifecycle leg inside an
+                // otherwise-Live market -- `permissionless_auto_crank_not_atomic`'s own
+                // `RefreshAccount` branch already special-cases this asset state) cannot be
+                // accrued via the ordinary oracle path at all. Record its already-committed
+                // price as the observation (so the completeness gates below are satisfied by
+                // committed state, matching `obs_or_current_asset`'s own fallback) and consume
+                // the hint's declared trailing accounts without reading them, so an honest
+                // multi-hint caller's account-list bookkeeping still lines up.
+                if !matches!(
+                    asset.lifecycle,
+                    ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY
+                ) {
+                    oracle_tail = &oracle_tail[oracle_account_count..];
+                    observations.push(AutoCrankObservationV16 {
+                        asset_index: hint_asset_index,
+                        effective_price: asset.effective_price.get(),
+                        funding_rate_e9: 0,
+                    });
+                    continue;
+                }
+                let (hint_oracle_accounts, rest) = oracle_tail.split_at(oracle_account_count);
+                oracle_tail = rest;
+
+                let mut oracle_profile =
+                    read_oracle_profile_from_view(&group, &cfg, hint_asset_index)?;
+                let oracle_profile_before = oracle_profile;
+                let asset_before_raw_target = asset.raw_oracle_target_price.get();
+                let asset_before_effective = asset.effective_price.get();
+                // Adaptation (2): reuse the existing resolve-maturity gate instead of upstream's
+                // terminal-settlement branch -- see the function-level note above.
+                reject_permissionless_resolve_matured_live_for_profile_view(
+                    &cfg,
+                    &oracle_profile,
+                    &group,
+                )?;
+                let now_unix_ts = Clock::get().map(|c| c.unix_timestamp).unwrap_or_else(|_| {
+                    let elapsed_slots = authenticated_now_slot
+                        .saturating_sub(oracle_profile.last_good_oracle_slot);
+                    oracle_profile
+                        .oracle_target_publish_time
+                        .saturating_add(i64::try_from(elapsed_slots).unwrap_or(i64::MAX))
+                });
+                let crank_price = hybrid_effective_price_for_crank_view(
+                    &cfg,
+                    &mut oracle_profile,
+                    &group,
+                    hint_asset_index,
+                    authenticated_now_slot,
+                    now_unix_ts,
+                    hint_oracle_accounts,
+                )?;
+                let computed_funding_rate_e9 = permissionless_funding_rate_e9_view(
+                    &oracle_profile,
+                    &group,
+                    hint_asset_index,
+                    authenticated_now_slot,
+                    crank_price,
+                )?;
+                group
+                    .set_asset_raw_oracle_target_not_atomic(
+                        hint_asset_index,
+                        oracle_profile.oracle_target_price_e6,
+                    )
+                    .map_err(map_v16_error)?;
+                cfg.last_good_oracle_slot = core::cmp::max(
+                    cfg.last_good_oracle_slot,
+                    oracle_profile.last_good_oracle_slot,
+                );
+                if hint_asset_index == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
+                    cfg.oracle_mode = oracle_profile.oracle_mode;
+                    cfg.oracle_leg_count = oracle_profile.oracle_leg_count;
+                    cfg.oracle_leg_flags = oracle_profile.oracle_leg_flags;
+                    cfg.invert = oracle_profile.invert;
+                    cfg.unit_scale = oracle_profile.unit_scale;
+                    cfg.conf_filter_bps = oracle_profile.conf_filter_bps;
+                    cfg.max_staleness_secs = oracle_profile.max_staleness_secs;
+                    cfg.hybrid_soft_stale_slots = oracle_profile.hybrid_soft_stale_slots;
+                    cfg.mark_ewma_e6 = oracle_profile.mark_ewma_e6;
+                    cfg.mark_ewma_last_slot = oracle_profile.mark_ewma_last_slot;
+                    cfg.mark_ewma_halflife_slots = oracle_profile.mark_ewma_halflife_slots;
+                    cfg.mark_min_fee = oracle_profile.mark_min_fee;
+                    cfg.oracle_target_price_e6 = oracle_profile.oracle_target_price_e6;
+                    cfg.oracle_target_publish_time = oracle_profile.oracle_target_publish_time;
+                    cfg.oracle_leg_feeds = oracle_profile.oracle_leg_feeds;
+                    cfg.oracle_leg_prices_e6 = oracle_profile.oracle_leg_prices_e6;
+                    cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
+                }
+                write_oracle_profile_to_view(&mut group, hint_asset_index, &oracle_profile)?;
+
+                let accrual = group
+                    .accrue_asset_to_not_atomic(
+                        hint_asset_index,
+                        authenticated_now_slot,
+                        crank_price,
+                        computed_funding_rate_e9,
+                        true,
+                    )
+                    .map_err(map_v16_error)?;
+                let asset_after = group.markets[hint_asset_index].engine.asset;
+                market_accrual_performed |= accrual.dt != 0
+                    || asset_after.raw_oracle_target_price.get() != asset_before_raw_target
+                    || asset_after.effective_price.get() != asset_before_effective
+                    || oracle_profile != oracle_profile_before;
+
+                observations.push(AutoCrankObservationV16 {
+                    asset_index: hint_asset_index,
+                    effective_price: crank_price,
+                    funding_rate_e9: computed_funding_rate_e9,
+                });
+            }
+            if !oracle_tail.is_empty() {
+                return Err(PercolatorError::InvalidInstruction.into());
             }
 
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
@@ -16748,89 +17003,117 @@ pub mod processor {
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             // FIX (ADOPT upstream a84b45dd, "collect maintenance before value debits",
-            // adapted to this fork's action-based crank shape): maintenance collection is
-            // senior to a liquidation reward -- crystallize the fee BEFORE snapshotting
-            // `insurance_before` below, so the reward computed from
-            // `insurance_after - insurance_before` reflects only this crank/liquidation's own
+            // adapted): maintenance collection is senior to a liquidation reward --
+            // crystallize the fee BEFORE snapshotting `insurance_before` below, so the reward
+            // computed from `insurance_after - insurance_before` reflects only this crank's own
             // insurance movement, never the account's separately-owed maintenance obligation.
-            // Without this reorder, a permissionless crank/liquidation could dodge the fee
-            // accrued since the account's last sync (or, worse, let a cranker's reward silently
-            // include it).
             //
-            // LIVELOCK FIX (w1-aa84b45dd-v2, replaces the prior branch's
-            // `b_stale_state == 0`-gated call, gate-2-REJECTED for a real livelock): gating
-            // entry on the account's PRE-call `b_stale_state` misses the "becomes B-stale
-            // DURING this call" case. `collect_maintenance_fee_before_value_debit_view` ->
-            // engine `sync_account_fee_to_slot_not_atomic` (percolator `src/v16.rs:20356`)
-            // calls `settle_account_side_effects_not_atomic`, which for a B-backlog exceeding
-            // one `public_b_chunk_atoms` chunk MUTATES the account in place (marks the leg
-            // B-stale, consumes one bounded chunk) and returns `Ok(AccountBChunk(_))` --
-            // but `sync_account_fee_to_slot_not_atomic` then converts that `Ok` into
-            // `Err(V16Error::BStale)` (`src/v16.rs:20386-20394`) rather than returning the
-            // partial-progress outcome. The OLD code let that `Err` propagate via `?`, which
-            // reverts this WHOLE instruction -- discarding the chunk progress and
-            // `b_stale_state` mutation that had already been applied to this zero-copy view,
-            // since Solana rolls back every account touched by a failed instruction. Every
-            // subsequent Refresh(0)/Liquidate(1)/SettleB(2) call therefore re-enters with
-            // `b_stale_state` still 0, re-hits the identical `BStale` error at this same call
-            // site, and reverts again: a PERMANENT LIVELOCK on any account whose B-backlog
-            // exceeds one chunk -- reachable whenever `public_b_chunk_atoms` (an admin knob
-            // with no minimum validation) is bounded below the backlog. An underwater account
-            // stuck this way can never be liquidated.
-            //
-            // FIX: handle `EngineBStale` from THIS call site gracefully instead of propagating
-            // it -- skip fee collection for this call and let the instruction return `Ok(())`
-            // as usual. Any chunk progress `sync_account_fee_to_slot_not_atomic` already
-            // applied before returning `BStale` (the `mark_leg_b_stale` write and the one
-            // `settle_account_b_chunk` step) stays applied, because it lands on the same
-            // zero-copy view the rest of this handler mutates and the instruction as a whole
-            // now succeeds. The crank's OWN engine-level path just below
-            // (`liquidate_account_not_atomic` / `permissionless_crank_not_atomic`, which are
-            // already chunk-tolerant of B-staleness -- that is what SettleB(2) exists to
-            // drive) proceeds normally afterward in the same instruction, and durably advances
-            // the account's B-settlement over however many subsequent calls the backlog needs.
-            // This subsumes the old entry-state gate: an account that is ALREADY b-stale on
-            // entry also takes this `Err` arm (fee collection is skipped exactly the same
-            // way), so one graceful match handles both "already b-stale" and "becoming
-            // b-stale this call" uniformly, and a genuinely bounded chunk budget still
-            // eventually clears the backlog because each call consumes one more chunk.
+            // LIVELOCK FIX (w1-aa84b45dd-v2): handle `EngineBStale` from this call site
+            // gracefully instead of propagating it (see the historical note this handler carried
+            // pre-port for the full livelock mechanics this guards against) -- skip fee
+            // collection for this call only; the unified auto-crank dispatch below is already
+            // chunk-tolerant of B-staleness and keeps making progress on subsequent calls.
             match collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)
             {
                 Ok(_) => {}
-                Err(e) if e == ProgramError::from(PercolatorError::EngineBStale) => {
-                    // Becoming (or already) B-stale: skip fee collection for this call only.
-                    // The crank's chunk-tolerant liquidate/crank path below still runs and
-                    // makes progress; a later call (once the account is current again) will
-                    // collect the fee this call deferred.
-                }
+                Err(e) if e == ProgramError::from(PercolatorError::EngineBStale) => {}
                 Err(e) => return Err(e),
             }
+
+            let summary = group
+                .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
+                .map_err(map_v16_error)?;
+            // FIX (ADOPT upstream d63c4dc9 + 7d0d2539, final shape): refresh and liquidation
+            // both recertify the complete bounded portfolio. A pending wrapper-side mark/funding
+            // segment on ANY active leg must therefore be observed before either route can
+            // certify the account, even when the engine selects another leg for the first
+            // bounded step -- see `reject_incomplete_account_health_observations_view` above for
+            // the two live gaps this closes.
+            if (summary.stale || summary.liquidatable) && !summary.b_stale {
+                reject_incomplete_account_health_observations_view(
+                    &cfg,
+                    &group,
+                    &portfolio,
+                    authenticated_now_slot,
+                    observations.as_slice(),
+                )?;
+            }
+
+            // Maintenance collection is senior to a liquidation reward. Snapshot insurance only
+            // after that collection so the reward calculation below sees liquidation proceeds,
+            // never the old maintenance obligation.
             let insurance_before = group.header.insurance.get();
-            let is_liquidation = matches!(crank_action, PermissionlessCrankActionV16::Liquidate(_));
-            // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
-            // provenance", adapted -- confirmed live hole, ADOPT_HYBRID_REWARD_RECLAIM.md):
-            // a caller-supplied `cranker_portfolio_ai` reward recipient was paid up to
-            // `liquidation_cranker_fee_share_bps` (validated only <= 100%) of the
-            // liquidation penalty UNCONDITIONALLY, in both Hybrid and EWMA oracle
-            // modes -- with no check on whether the mark that made the account
-            // liquidatable was itself trade-driven. An attacker could push a trade
-            // that moves `mark_ewma_e6` past a victim's liquidation threshold (paying
-            // only the bounded `dynamic_fee_bps_with_externality_floor` externality
-            // tax), then self-crank the liquidation naming their own portfolio as
-            // reward recipient, capturing up to 100% of the victim's penalty. This
-            // reads `oracle_profile` as already updated by
-            // `hybrid_effective_price_for_crank_view` above (including any
-            // provenance reset this crank call itself earned), matching upstream's
-            // ordering (the reclaim decision uses the SAME crank's fresh oracle
-            // state, not the pre-crank one).
-            let liquidation_penalty_reclaimable = if is_liquidation {
+            let result = match group.permissionless_auto_crank_not_atomic(
+                &mut portfolio,
+                AutoCrankWorkV16 {
+                    now_slot: authenticated_now_slot,
+                    observations: observations.as_slice(),
+                    resolved_close_fee_rate_per_slot: 0,
+                },
+            ) {
+                Ok(result) if matches!(result.selected, AutoCrankPlanV16::NoAction) => {
+                    if market_accrual_performed {
+                        None
+                    } else {
+                        return Err(PercolatorError::EngineNonProgress.into());
+                    }
+                }
+                Ok(result) => Some(result),
+                Err(V16Error::NonProgress) if market_accrual_performed => None,
+                Err(V16Error::NonProgress) => {
+                    return Err(PercolatorError::EngineNonProgress.into());
+                }
+                Err(err) => return Err(map_v16_error(err)),
+            };
+            // Adaptation (5): defer 2f0c809d -- this fork's `CloseResolved` (tag 30) is the only
+            // sanctioned closer. Guard against the unified call ever landing a `ResolvedClose`
+            // outcome through this general path (upstream carries the identical guard).
+            if matches!(
+                result.as_ref().map(|r| &r.outcome),
+                Some(AutoCrankOutcomeV16::ResolvedClose(_))
+            ) {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+
+            for observation in observations.iter() {
+                let obs_asset_index = observation.asset_index;
+                let mut profile = read_oracle_profile_from_view(&group, &cfg, obs_asset_index)?;
+                let asset_slot = group.markets[obs_asset_index].engine.asset.slot_last.get();
+                advance_funding_mark_checkpoint_view(&mut profile, asset_slot);
+                write_oracle_profile_to_view(&mut group, obs_asset_index, &profile)?;
+            }
+
+            let selected_fee_asset = match result.as_ref().map(|r| &r.selected) {
+                Some(AutoCrankPlanV16::RefreshAccount {
+                    asset_index: Some(i),
+                })
+                | Some(AutoCrankPlanV16::SettleBChunk { asset_index: i })
+                | Some(AutoCrankPlanV16::Liquidate { asset_index: i }) => *i,
+                _ => observations.first().map(|o| o.asset_index).unwrap_or(0),
+            };
+            let selected_liquidation = matches!(
+                result.as_ref().map(|r| &r.selected),
+                Some(AutoCrankPlanV16::Liquidate { .. })
+            );
+            // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward provenance",
+            // PRESERVED): a mark mover can use a fresh cranker key and one paid mark move can
+            // render many portfolios liquidatable. A liquidation penalty whose price trace
+            // includes a trade-driven EWMA/Hybrid mark move must not be payable back through the
+            // public permissionless-crank reward.
+            let liquidation_penalty_reclaimable = if selected_liquidation {
+                let profile = read_oracle_profile_from_view(&group, &cfg, selected_fee_asset)?;
                 liquidation_penalty_reclaimable_from_profile_view(
-                    &oracle_profile,
+                    &profile,
                     authenticated_now_slot,
                 )
             } else {
                 false
             };
+
+            // Preserve this fork's own protocol-fee/cranker-reward accounting (adaptation (6)),
+            // re-plumbed around the single unified engine call above -- replaces the two
+            // duplicated `liquidate_account_not_atomic` / `permissionless_crank_not_atomic` call
+            // sites this handler used to carry inside each of these two branches.
             if let Some(cranker_ai) = cranker_portfolio_ai {
                 let mut cranker_data = cranker_ai.try_borrow_mut_data()?;
                 let mut cranker = state::portfolio_view_mut_for_market_slots(
@@ -16842,48 +17125,17 @@ pub mod processor {
                 cranker
                     .validate_with_market(&group.as_view())
                     .map_err(map_v16_error)?;
-                if let PermissionlessCrankActionV16::Liquidate(liq) = crank_action {
-                    group
-                        .accrue_asset_to_not_atomic(
-                            asset_index_usize,
-                            authenticated_now_slot,
-                            crank_price,
-                            computed_funding_rate_e9,
-                            true,
-                        )
-                        .map_err(map_v16_error)?;
-                    group
-                        .liquidate_account_not_atomic(&mut portfolio, liq)
-                        .map_err(map_v16_error)?;
-                } else {
-                    group
-                        .permissionless_crank_not_atomic(
-                            &mut portfolio,
-                            PermissionlessCrankRequestV16 {
-                                now_slot: authenticated_now_slot,
-                                asset_index: asset_index_usize,
-                                effective_price: crank_price,
-                                funding_rate_e9: computed_funding_rate_e9,
-                                action: crank_action,
-                            },
-                        )
-                        .map_err(map_v16_error)?;
-                }
                 let retained_fee = group
                     .header
                     .insurance
                     .get()
                     .saturating_sub(insurance_before);
-                // FIX (ADOPT upstream 01ec6161, adapted): a liquidation whose penalty
-                // is not reclaimable pays NO cranker reward at all -- the mover and a
-                // later self-cranker cannot be identity-separated, so a trade-driven
-                // mark move must not be able to unlock a payout back to a
-                // caller-supplied portfolio. The full `retained_fee` still flows to
-                // `credit_market_fee_split_across_domains_view` below unchanged (matches
-                // this function's own no-cranker-account `else` branch, which always
-                // routes the full amount there with no reward leg) -- the penalty is
-                // not lost, it simply cannot be privately claimed.
-                let reward = if is_liquidation && !liquidation_penalty_reclaimable {
+                // FIX (ADOPT upstream 01ec6161, PRESERVED): a liquidation whose penalty is not
+                // reclaimable pays NO cranker reward at all. The full `retained_fee` still flows
+                // to `credit_market_fee_split_across_domains_view` below unchanged (matches this
+                // function's own no-cranker-account branch) -- the penalty is not lost, it
+                // simply cannot be privately claimed.
+                let reward = if selected_liquidation && !liquidation_penalty_reclaimable {
                     0
                 } else {
                     let reward = maintenance_cranker_reward(
@@ -16893,17 +17145,12 @@ pub mod processor {
                     core::cmp::min(reward, retained_fee)
                 };
                 if reward != 0 {
-                    // Protocol-fee RESERVE amendment: same reservation
-                    // threading as SyncMaintenanceFee above -- this
-                    // permissionless-crank/liquidation reward must not be
-                    // able to dip insurance below the protocol's
-                    // accrued-but-unwithdrawn claim.
-                    //
-                    // The LP leg is deliberately NOT reserved here -- see the
-                    // `SyncMaintenanceFee` site above for why (this reward is
-                    // `engine_available`-neutral, and reserving LP fees against
-                    // `credit_account_from_insurance_not_atomic` would make them
-                    // senior to loss coverage).
+                    // Protocol-fee RESERVE amendment: same reservation threading as
+                    // SyncMaintenanceFee elsewhere -- this permissionless-crank/liquidation
+                    // reward must not be able to dip insurance below the protocol's
+                    // accrued-but-unwithdrawn claim. The LP leg is deliberately NOT reserved
+                    // here for the same reason as that site (this reward is
+                    // `engine_available`-neutral).
                     let protocol_owed = cfg
                         .protocol_fee_accrued_atoms
                         .saturating_sub(cfg.protocol_fee_withdrawn_atoms);
@@ -16921,7 +17168,7 @@ pub mod processor {
                 credit_market_fee_split_across_domains_view(
                     &cfg,
                     &mut group,
-                    asset_index_usize,
+                    selected_fee_asset,
                     retained_after_reward,
                 )?;
                 group.validate_shape().map_err(map_v16_error)?;
@@ -16929,33 +17176,6 @@ pub mod processor {
                     .validate_with_market(&group.as_view())
                     .map_err(map_v16_error)?;
             } else {
-                if let PermissionlessCrankActionV16::Liquidate(liq) = crank_action {
-                    group
-                        .accrue_asset_to_not_atomic(
-                            asset_index_usize,
-                            authenticated_now_slot,
-                            crank_price,
-                            computed_funding_rate_e9,
-                            true,
-                        )
-                        .map_err(map_v16_error)?;
-                    group
-                        .liquidate_account_not_atomic(&mut portfolio, liq)
-                        .map_err(map_v16_error)?;
-                } else {
-                    group
-                        .permissionless_crank_not_atomic(
-                            &mut portfolio,
-                            PermissionlessCrankRequestV16 {
-                                now_slot: authenticated_now_slot,
-                                asset_index: asset_index_usize,
-                                effective_price: crank_price,
-                                funding_rate_e9: computed_funding_rate_e9,
-                                action: crank_action,
-                            },
-                        )
-                        .map_err(map_v16_error)?;
-                }
                 let retained_fee = group
                     .header
                     .insurance
@@ -16964,10 +17184,10 @@ pub mod processor {
                 credit_market_fee_split_across_domains_view(
                     &cfg,
                     &mut group,
-                    asset_index_usize,
+                    selected_fee_asset,
                     retained_fee,
                 )?;
-                if is_liquidation {
+                if selected_liquidation {
                     group.validate_shape().map_err(map_v16_error)?;
                 }
             }
@@ -16982,11 +17202,8 @@ pub mod processor {
     fn handle_permissionless_crank<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
-        action: u8,
-        asset_index: u16,
         now_slot: u64,
-        funding_rate_e9: i128,
-        recovery_reason: u8,
+        observation_hints: Vec<CrankObservationHint>,
     ) -> ProgramResult {
         let owner = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -16997,17 +17214,25 @@ pub mod processor {
         expect_owner(portfolio_ai, program_id)?;
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        // NOTE (defer 2f0c809d): upstream's dispatcher special-cases Resolved mode
+        // here and routes to `handle_close_resolved` with an optional
+        // `backing_asset_hint`. Our fork's `CloseResolved` (tag 30) is a separate,
+        // structurally unrelated handler (`close_resolved_account_not_atomic`
+        // directly, with its own NFT-holder-auth / `force_close_delay_slots`
+        // logic) that does not route through the auto-crank entry point at all --
+        // rearchitecting it onto this path is a second, separate decision
+        // (adopt_autocrank_observation.md §6 item (b)). Left untouched: a
+        // Resolved-mode `PermissionlessCrank` call falls through to the zero-copy
+        // handler below exactly as it did before this port, and hits the
+        // `ResolvedClose` outcome guard there.
         handle_permissionless_crank_zero_copy(
             program_id,
             owner,
             market_ai,
             portfolio_ai,
             accounts.get(3..).unwrap_or(&[]),
-            action,
-            asset_index,
             now_slot,
-            funding_rate_e9,
-            recovery_reason,
+            observation_hints.as_slice(),
             max_market_slots,
         )
     }

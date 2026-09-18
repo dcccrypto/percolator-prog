@@ -16,7 +16,7 @@ use percolator_prog::{
         PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN,
         PORTFOLIO_STATE_LEN, WRAPPER_CONFIG_LEN,
     },
-    ix::Instruction,
+    ix::{CrankObservationHint, Instruction},
     oracle_v16, policy_v16, processor,
     processor::{
         ASSET_AUTH_ADMIN, ASSET_AUTH_BACKING_BUCKET, ASSET_AUTH_INSURANCE,
@@ -1598,12 +1598,9 @@ fn v16_wrapper_init_portfolio_fee_anchor_tracks_crank_and_asset_lifecycle_time()
     );
     init_portfolio(&mut old_owner, &mut market, &mut old_portfolio);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 100,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut old_owner, &mut market, &mut old_portfolio],
     )
@@ -5514,12 +5511,9 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     // crank must still use the prediction asset's own supplied price. The
     // asset-0 hybrid EWMA/composite is not a valid price for asset 1.
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: before_group.current_slot + 3,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut long_account],
     )
@@ -5858,12 +5852,9 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     pass_count += 1;
 
     let refresh_stale = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: last_asset,
+Instruction::PermissionlessCrank {
             now_slot: 10,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: last_asset, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut long_account],
     );
@@ -6023,12 +6014,9 @@ fn v16_wrapper_security_sweep_resolved_market_and_fee_branches() {
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 100);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 10,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -8215,12 +8203,9 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -8452,12 +8437,9 @@ fn v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance() 
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -8535,12 +8517,9 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -8666,12 +8645,9 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -8792,12 +8768,9 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -8915,12 +8888,9 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -9743,12 +9713,9 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
     let mut portfolio = portfolio_account();
     init_portfolio(&mut caller, &mut market, &mut portfolio);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 6,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut caller, &mut market, &mut portfolio],
     )
@@ -9828,12 +9795,9 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
     let mut portfolio = portfolio_account();
     init_portfolio(&mut caller, &mut market, &mut portfolio);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 10,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut caller, &mut market, &mut portfolio],
     )
@@ -11620,12 +11584,9 @@ fn v16_wrapper_cross_market_portfolio_provenance_is_fail_closed() {
     assert_eq!(account_a.data, before_a);
 
     let cross_crank = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner_a, &mut market_b, &mut account_a],
     );
@@ -11808,12 +11769,9 @@ fn v16_wrapper_account_kind_confusion_is_rejected_before_mutation() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let market_as_portfolio = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut second_market],
     );
@@ -12037,12 +11995,9 @@ fn v16_wrapper_configure_hybrid_oracle_composes_toto_sol_cross_and_rejects_rollb
     usd_jpy.data = make_pyth(&feeds[1], 150_000_000, -6, 1, 99);
     let before = market.data.clone();
     let rollback = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 6,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [
             &mut keeper,
@@ -12141,13 +12096,14 @@ fn v16_wrapper_non_base_asset_profile_converts_stoxx_eur_to_base_sol() {
     stoxx_eur.data = make_pyth(&feeds[0], 4_600_000_000, -6, 1, 103);
     eur_usd.data = make_pyth(&feeds[1], 1_200_000, -6, 1, 104);
     sol_usd.data = make_pyth(&feeds[2], 200_000_000, -6, 1, 105);
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): `oracle_accounts` must match
+    // the number of trailing oracle AccountInfos this hint's asset actually supplies (3, for
+    // this asset's 3-leg Hybrid config) -- the per-hint loop slices exactly that many accounts
+    // off the tail before reading them.
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 10,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 3 }],
         },
         &mut [
             &mut keeper,
@@ -12230,12 +12186,9 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
 
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 14,
+Instruction::PermissionlessCrank {
             now_slot: 2,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 14, oracle_accounts: 0 }],
         },
         &mut [&mut cranker, &mut market, &mut crank_account],
     )
@@ -12828,13 +12781,12 @@ fn v16_wrapper_hybrid_fresh_crank_tracks_external_composite_then_after_hours_tra
     let mut keeper_portfolio = portfolio_account();
     init_portfolio(&mut keeper, &mut market, &mut keeper_portfolio);
     toto_jpy.data = make_pyth(&feeds[0], 4_200_000_000, -6, 1, 101);
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): `oracle_accounts` must match
+    // the 3 trailing oracle AccountInfos this hint's 3-leg Hybrid asset actually supplies.
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 2,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 3 }],
         },
         &mut [
             &mut keeper,
@@ -13102,12 +13054,9 @@ fn v16_wrapper_hybrid_after_hours_downward_mark_moves_effective_price() {
     );
 
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 11,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut long_account],
     )
@@ -13500,12 +13449,9 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
     .unwrap();
     push_base_ewma_mark(&mut admin, &mut market, 1, 102);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut long_account],
     )
@@ -14644,12 +14590,9 @@ fn v16_wrapper_permissionless_crank_advances_account_local_market_progress() {
 
     push_base_ewma_mark(&mut admin, &mut market, 1, 102);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut long_account],
     )
@@ -14676,12 +14619,9 @@ fn v16_wrapper_permissionless_crank_does_not_require_owner_signature() {
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
 
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut caller, &mut market, &mut portfolio],
     )
@@ -14704,12 +14644,9 @@ fn v16_wrapper_permissionless_crank_rejects_stale_now_without_mutation() {
     init_portfolio(&mut owner, &mut market, &mut portfolio);
 
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     )
@@ -14718,12 +14655,9 @@ fn v16_wrapper_permissionless_crank_rejects_stale_now_without_mutation() {
     let market_before = market.data.clone();
     let portfolio_before = portfolio.data.clone();
     let rejected = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     );
@@ -14794,46 +14728,54 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     )
     .unwrap();
 
-    // Step 1: real EWMA push + accrual crank, capped to a 100% mark move ->
-    // effective_price 100 -> 200 (still solvent: capital 100, no loss
-    // realized against the fresh leg yet).
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this used to force two
+    // SEPARATE steps by caller-selecting `action: 0` (Refresh) explicitly for the first crank,
+    // relying on that forced selection to evaluate liquidation eligibility against a PARTIALLY
+    // converged price. The caller can no longer force that: the engine's plan selector
+    // (`V16Core::select_auto_crank_plan`, engine v16.rs:2269) checks `summary.stale` (the
+    // asset's price has not yet fully caught up to its pushed target under the bounded
+    // `max_price_move_bps_per_slot` envelope) BEFORE `summary.liquidatable`, so an account
+    // whose leg is still converging is refreshed, never liquidated, however underwater it
+    // looks at the CURRENT (still-converging) price. This is sounder than the old caller-forced
+    // shape (which could liquidate off a partially-converged, more easily influenced price) --
+    // matches this port's whole premise that the engine, not the caller, decides. Empirically
+    // verified (this fixture's 999_999 push target, doubling at most 100%/slot from 100, takes
+    // 13 calls to fully converge): crank in a bounded loop until the account is fully closed --
+    // the invariant this test actually cares about is the END state: a genuinely bankrupt
+    // account is fully closed through the public crank path, not the exact call at which that
+    // happens once price convergence gates it.
     push_base_ewma_mark(&mut admin, &mut market, 1, 999_999);
-    run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
-            now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut admin, &mut market, &mut short_account],
-    )
-    .unwrap();
-    let short_after_step1 = state::read_portfolio(&short_account.data).unwrap();
-    assert!(
-        short_after_step1.capital == 100 && short_after_step1.pnl == 0,
-        "fixture assumption: position must still be open and solvent after the first accrual round"
-    );
-
-    // Step 2: second real EWMA push + accrual, again capped to 100% ->
-    // effective_price 200 -> 400 (equity 100-300=-200: genuinely bankrupt).
     push_base_ewma_mark(&mut admin, &mut market, 2, 999_999);
-    run_ix(
-        Instruction::PermissionlessCrank {
-            action: 1,
-            asset_index: 0,
-            now_slot: 2,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut admin, &mut market, &mut short_account],
-    )
-    .unwrap();
+    let mut closed = false;
+    for slot in 1..=20u64 {
+        let _ = run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [&mut admin, &mut market, &mut short_account],
+        );
+        let short = state::read_portfolio(&short_account.data).unwrap();
+        if percolator::active_bitmap_is_empty(short.active_bitmap) {
+            closed = true;
+            break;
+        }
+    }
+    assert!(
+        closed,
+        "a genuinely bankrupt account must reach full closure through the public crank path \
+         once its price has fully converged"
+    );
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
-    assert_eq!(group.slot_last, 2);
-    assert_eq!(group.assets[0].effective_price, 400);
+    assert!(
+        group.assets[0].effective_price > 100,
+        "the bounded price envelope must have moved the mark toward the pushed target"
+    );
     assert_eq!(
         short.capital, 0,
         "bankrupt account's capital must be fully consumed"
@@ -14914,23 +14856,38 @@ fn v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee() {
         let (cfg, mut group) = state::read_market(&market.data).unwrap();
         let mut short = state::read_portfolio(&short_account.data).unwrap();
         short.capital = 99;
+        // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this raw test-only
+        // mutation bypasses every engine API, so the account's cached health CERTIFICATE
+        // (`health_cert`) still reports whatever it was certified at during the earlier
+        // TradeNoCpi -- a healthy state. The engine's plan selector requires a CURRENT
+        // certificate showing a deficit before Liquidate is even considered (engine
+        // v16.rs:15163); with `action: 1` gone from the wire, the crank can no longer force
+        // liquidation past an unrefreshed, stale-but-still-"valid" cert. Invalidate it here,
+        // the same way a real price move or trade would, so the crank's first call
+        // re-certifies against the mutated capital (discovering the deficit) instead of
+        // silently no-oping forever.
+        short.health_cert.valid = false;
         group.c_tot -= 2;
         group.vault -= 2;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
         state::write_portfolio(&mut short_account.data, &short).unwrap();
     }
 
-    run_ix(
-        Instruction::PermissionlessCrank {
-            action: 1,
-            asset_index: 0,
-            now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut admin, &mut market, &mut short_account],
-    )
-    .unwrap();
+    // Two bounded steps: the first re-certifies the account (discovering the deficit), the
+    // second liquidates using that now-current certificate.
+    for _ in 0..2 {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 1,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [&mut admin, &mut market, &mut short_account],
+        )
+        .unwrap();
+    }
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
@@ -15051,22 +15008,30 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
 
     let insurance_before = state::read_market(&market.data).unwrap().1.insurance;
     let vault_before = state::read_market(&market.data).unwrap().1.vault;
-    run_ix(
-        Instruction::PermissionlessCrank {
-            action: 1,
-            asset_index: 0,
-            now_slot: 100,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [
-            &mut cranker_owner,
-            &mut market,
-            &mut short_account,
-            &mut cranker_account,
-        ],
-    )
-    .unwrap();
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): see the identical derivation
+    // comment on v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_insurance
+    // below -- the engine's plan selector needs a CURRENT certificate before Liquidate is
+    // selectable, so the first call re-certifies (discovering the deficit) and the second call
+    // liquidates. The first call generates no fee (no insurance movement), so it cannot affect
+    // the cranker-split assertions below.
+    for _ in 0..2 {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 100,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [
+                &mut cranker_owner,
+                &mut market,
+                &mut short_account,
+                &mut cranker_account,
+            ],
+        )
+        .unwrap();
+    }
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
@@ -15274,17 +15239,30 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
 
     let insurance_before = state::read_market(&market.data).unwrap().1.insurance;
     let vault_before = state::read_market(&market.data).unwrap().1.vault;
-    run_ix(
-        Instruction::PermissionlessCrank {
-            action: 1,
-            asset_index: 0,
-            now_slot: 100,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut admin, &mut market, &mut short_account],
-    )
-    .unwrap();
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this used to force
+    // `action: 1` (Liquidate) directly, which called `accrue_asset_to_not_atomic` then
+    // `liquidate_account_not_atomic` DIRECTLY in one call, bypassing the account's own health
+    // CERTIFICATE entirely. The engine's plan selector instead requires
+    // `summary.liquidatable` (engine v16.rs:15163: `cert_current && cert.certified_liq_deficit
+    // != 0 && ...`), which needs a CURRENT certificate -- a price move (even one that fully
+    // converges in this single accrual step, per `landed_price` above) invalidates the
+    // account's cached cert, so the FIRST call's plan is RefreshAccount (re-certifying against
+    // the now-landed price, discovering the deficit), and only the SECOND call's cert is
+    // current with that deficit recorded, making Liquidate selectable. Verified empirically
+    // (2 calls: certify, then liquidate; a 3rd call correctly errors, nothing left to do).
+    for _ in 0..2 {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 100,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [&mut admin, &mut market, &mut short_account],
+        )
+        .unwrap();
+    }
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
@@ -15368,6 +15346,11 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
         let (cfg, mut group) = state::read_market(&market.data).unwrap();
         let mut short = state::read_portfolio(&short_account.data).unwrap();
         short.capital = 0;
+        // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): see the identical
+        // derivation comment on v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee
+        // above -- invalidate the cached health certificate so the crank's first call
+        // re-certifies against this raw mutation instead of trusting a stale "healthy" cert.
+        short.health_cert.valid = false;
         group.c_tot -= 100;
         group.vault -= 100;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
@@ -15381,22 +15364,26 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
     )
     .unwrap();
 
-    run_ix(
-        Instruction::PermissionlessCrank {
-            action: 1,
-            asset_index: 0,
-            now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [
-            &mut cranker_owner,
-            &mut market,
-            &mut short_account,
-            &mut cranker_account,
-        ],
-    )
-    .unwrap();
+    // Two bounded steps: the first re-certifies the account (discovering the deficit), the
+    // second liquidates using that now-current certificate.
+    for _ in 0..2 {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 1,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [
+                &mut cranker_owner,
+                &mut market,
+                &mut short_account,
+                &mut cranker_account,
+            ],
+        )
+        .unwrap();
+    }
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
@@ -15461,15 +15448,20 @@ fn v16_wrapper_permissionless_settle_b_without_b_state_is_fail_closed() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
 
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this used to force
+    // `action: 2` (SettleB) explicitly on a fresh account with no B-state and assert
+    // InvalidInstruction -- that caller-selected-action premise is gone (see
+    // v16_wrapper_permissionless_crank_rejects_legacy_action_recovery_funding_wire_fields).
+    // The NEW-wire equivalent "fail closed" property: a crank with NO hints at all, on a
+    // freshly-initialized market+account with nothing pending (no B-state, no stale leg, no
+    // elapsed time at `now_slot` == the market's own current_slot), must still reject with
+    // EngineNonProgress rather than silently succeed as a no-op.
     let market_before = market.data.clone();
     let portfolio_before = portfolio.data.clone();
     let rejected = run_ix(
         Instruction::PermissionlessCrank {
-            action: 2,
-            asset_index: 0,
             now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: Vec::new(),
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     );
@@ -15492,25 +15484,19 @@ fn v16_wrapper_permissionless_crank_rejects_invalid_asset_and_legacy_price_paylo
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let invalid_asset = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut owner, &mut market, &mut portfolio],
     );
     assert_err_and_market_unchanged(invalid_asset, &market, &before_market);
     assert_eq!(portfolio.data, before_portfolio);
 
-    let mut legacy_price_payload = Instruction::PermissionlessCrank {
-        action: 0,
-        asset_index: 0,
-        now_slot: 0,
-        funding_rate_e9: 0,
-        recovery_reason: 0,
-    }
+    let mut legacy_price_payload =Instruction::PermissionlessCrank {
+     now_slot: 0,
+     observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+ }
     .encode();
     legacy_price_payload.splice(12..12, 1_000_000u64.to_le_bytes().iter().copied());
     let legacy_price = run_ix_data(
@@ -15521,250 +15507,75 @@ fn v16_wrapper_permissionless_crank_rejects_invalid_asset_and_legacy_price_paylo
     assert_eq!(portfolio.data, before_portfolio);
 }
 
+// ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the four tests that used to
+// live here --
+//   v16_wrapper_permissionless_recovery_action_is_not_public_kill_switch
+//   v16_wrapper_permissionless_recovery_rejects_every_caller_selected_reason
+//   v16_wrapper_permissionless_crank_rejects_invalid_action_and_recovery_reason
+//   v16_wrapper_permissionless_crank_rejects_caller_supplied_funding_rate
+// each proved a caller-supplied `action`/`recovery_reason`/`funding_rate_e9` value on the
+// OLD `PermissionlessCrank` wire shape was rejected at runtime. That shape is gone: the tag-5
+// payload is now `{now_slot: u64, observations: Vec<CrankObservationHint>}` -- there is no
+// `action`, `funding_rate_e9`, or `recovery_reason` field left to supply at all, so a caller
+// cannot even CONSTRUCT the instructions these tests sent (a compile-time guarantee, strictly
+// stronger than the old runtime InvalidInstruction checks). Consolidated into one non-vacuous
+// byte-level proof below, following the same pattern
+// `v16_wrapper_permissionless_crank_rejects_w3_legacy_wire_fields` already established in this
+// file for an earlier field removal (W3's close_q/fee_bps): reconstruct the OLD 29-byte
+// payload shape byte-for-byte (including the concrete action/recovery_reason/funding_rate_e9
+// values each deleted test exercised) and prove `process_instruction` now rejects it as a
+// decode error, not that it silently reinterprets those bytes as something else.
 #[test]
-fn v16_wrapper_permissionless_recovery_action_is_not_public_kill_switch() {
-    let mut admin = signer();
-    let mut market = market_account();
-    let mut owner = signer();
-    let mut portfolio = portfolio_account();
-
-    init_market(&mut admin, &mut market);
-    init_portfolio(&mut owner, &mut market, &mut portfolio);
-
-    let before_market = market.data.clone();
-    let before_portfolio = portfolio.data.clone();
-    let result = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 3,
-            asset_index: 0,
-            now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut owner, &mut market, &mut portfolio],
-    );
-
-    assert_err_and_market_unchanged(result, &market, &before_market);
-    assert_eq!(portfolio.data, before_portfolio);
-    let (_, group) = state::read_market(&market.data).unwrap();
-    assert_eq!(group.mode, MarketModeV16::Live);
-    assert_eq!(
-        group.recovery_reason, None,
-        "a caller-selected recovery reason must not terminal-lock a healthy market"
-    );
-}
-
-#[test]
-fn v16_wrapper_permissionless_recovery_rejects_every_caller_selected_reason() {
-    let reasons = [
-        PermissionlessRecoveryReasonV16::BelowProgressFloor,
-        PermissionlessRecoveryReasonV16::BlockedSegmentHeadroomOrRepresentability,
-        PermissionlessRecoveryReasonV16::AccountBSettlementCannotProgress,
-        PermissionlessRecoveryReasonV16::BIndexHeadroomExhausted,
-        PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
-        PermissionlessRecoveryReasonV16::ExplicitLossOrDustAuditOverflow,
-        PermissionlessRecoveryReasonV16::OracleOrTargetUnavailableByAuthenticatedPolicy,
-        PermissionlessRecoveryReasonV16::CounterOrEpochOverflowDeclaredRecovery,
+fn v16_wrapper_permissionless_crank_rejects_legacy_action_recovery_funding_wire_fields() {
+    // (action, recovery_reason, funding_rate_e9) triples the four deleted tests exercised:
+    // recovery-as-kill-switch (action=3, reason=0), every PermissionlessRecoveryReasonV16
+    // variant (action=3, reason=0..=7), invalid action (action=9), invalid recovery reason
+    // (action=3, reason=99), and a caller-supplied nonzero funding rate (action=0, rate=1).
+    let cases: &[(u8, u8, i128)] = &[
+        (3, 0, 0),
+        (3, 1, 0),
+        (3, 2, 0),
+        (3, 3, 0),
+        (3, 4, 0),
+        (3, 5, 0),
+        (3, 6, 0),
+        (3, 7, 0),
+        (9, 0, 0),
+        (3, 99, 0),
+        (0, 0, 1),
     ];
+    for &(action, recovery_reason, funding_rate_e9) in cases {
+        let mut legacy = [0u8; 29];
+        legacy[0] = 5; // tag: PermissionlessCrank
+        legacy[1] = action;
+        legacy[2..4].copy_from_slice(&0u16.to_le_bytes()); // asset_index
+        legacy[4..12].copy_from_slice(&0u64.to_le_bytes()); // now_slot
+        legacy[12..28].copy_from_slice(&funding_rate_e9.to_le_bytes());
+        legacy[28] = recovery_reason;
 
-    for (reason, _) in reasons.iter().copied().enumerate() {
-        let mut admin = signer();
-        let mut market = market_account();
-        let mut owner = signer();
-        let mut portfolio = portfolio_account();
-        init_market(&mut admin, &mut market);
-        init_portfolio(&mut owner, &mut market, &mut portfolio);
-
-        let before_market = market.data.clone();
-        let before_portfolio = portfolio.data.clone();
-        let result = run_ix(
-            Instruction::PermissionlessCrank {
-                action: 3,
-                asset_index: 0,
-                now_slot: 0,
-                funding_rate_e9: 0,
-                recovery_reason: reason as u8,
-            },
-            &mut [&mut owner, &mut market, &mut portfolio],
+        let result = run_ix_data(&legacy, &mut []);
+        assert_eq!(
+            result,
+            Err(ProgramError::InvalidInstructionData),
+            "legacy (action={action}, recovery_reason={recovery_reason}, funding_rate_e9={funding_rate_e9}) payload must be rejected as a decode error"
         );
-        assert_err_and_market_unchanged(result, &market, &before_market);
-        assert_eq!(portfolio.data, before_portfolio);
-        let (_, group) = state::read_market(&market.data).unwrap();
-        assert_eq!(group.mode, MarketModeV16::Live);
-        assert_eq!(group.recovery_reason, None);
     }
 }
 
 #[test]
-fn v16_wrapper_permissionless_crank_rejects_invalid_action_and_recovery_reason() {
-    let mut admin = signer();
-    let mut market = market_account();
-    let mut owner = signer();
-    let mut portfolio = portfolio_account();
-
-    init_market(&mut admin, &mut market);
-    init_portfolio(&mut owner, &mut market, &mut portfolio);
-
-    let before_market = market.data.clone();
-    let before_portfolio = portfolio.data.clone();
-    let bad_action = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 9,
-            asset_index: 0,
-            now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut owner, &mut market, &mut portfolio],
-    );
-    assert_err_and_market_unchanged(bad_action, &market, &before_market);
-    assert_eq!(portfolio.data, before_portfolio);
-
-    let bad_recovery_reason = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 3,
-            asset_index: 0,
-            now_slot: 0,
-            funding_rate_e9: 0,
-            recovery_reason: 99,
-        },
-        &mut [&mut owner, &mut market, &mut portfolio],
-    );
-    assert_err_and_market_unchanged(bad_recovery_reason, &market, &before_market);
-    assert_eq!(portfolio.data, before_portfolio);
-}
-
-#[test]
-fn v16_wrapper_permissionless_crank_rejects_caller_supplied_funding_rate() {
-    let mut admin = signer();
-    let mut market = market_account();
-    let mut mint = mint_account();
-    let mut owner = signer();
-    let mut portfolio = portfolio_account();
-
-    run_ix(
-        init_market_ix_with(|ix| {
-            if let Instruction::InitMarket {
-                max_abs_funding_e9_per_slot,
-                max_price_move_bps_per_slot,
-                ..
-            } = ix
-            {
-                *max_abs_funding_e9_per_slot = 1;
-                *max_price_move_bps_per_slot = 4_999;
-            }
-        }),
-        &mut [&mut admin, &mut market, &mut mint],
-    )
-    .unwrap();
-    init_portfolio(&mut owner, &mut market, &mut portfolio);
-
-    let before_market = market.data.clone();
-    let before_portfolio = portfolio.data.clone();
-    let result = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
-            now_slot: 1,
-            funding_rate_e9: 1,
-            recovery_reason: 0,
-        },
-        &mut [&mut owner, &mut market, &mut portfolio],
-    );
-    assert_err_and_market_unchanged(result, &market, &before_market);
-    assert_eq!(portfolio.data, before_portfolio);
-}
-
-#[test]
-fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch() {
-    let mut admin = signer();
-    let mut market = market_account();
-    let mut long_owner = signer();
-    let mut short_owner = signer();
-    let mut long_account = portfolio_account();
-    let mut short_account = portfolio_account();
-
-    init_market_with_ix(
-        &mut admin,
-        &mut market,
-        init_market_ix_with(|ix| {
-            if let Instruction::InitMarket {
-                initial_price,
-                max_price_move_bps_per_slot,
-                max_trading_fee_bps,
-                ..
-            } = ix
-            {
-                *initial_price = 1;
-                *max_price_move_bps_per_slot = 1;
-                *max_trading_fee_bps = 10_000;
-            }
-        }),
-    );
-    run_ix(
-        Instruction::ConfigureEwmaMark {
-            asset_index: 0,
-            now_slot: 0,
-            initial_mark_e6: 1,
-            mark_ewma_halflife_slots: 1,
-            mark_min_fee: 0,
-        },
-        &mut [&mut admin, &mut market],
-    )
-    .unwrap();
-    init_portfolio(&mut long_owner, &mut market, &mut long_account);
-    init_portfolio(&mut short_owner, &mut market, &mut short_account);
-    deposit(&mut long_owner, &mut market, &mut long_account, 1_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 1_000);
-    run_ix(
-        Instruction::TradeNoCpi {
-            asset_index: 0,
-            size_q: POS_SCALE as i128,
-            exec_price: 1,
-            fee_bps: 0,
-        },
-        &mut [
-            &mut long_owner,
-            &mut short_owner,
-            &mut market,
-            &mut long_account,
-            &mut short_account,
-        ],
-    )
-    .unwrap();
-    run_ix(
-        Instruction::PushEwmaMark {
-            asset_index: 0,
-            now_slot: 1,
-            mark_e6: 3,
-        },
-        &mut [&mut admin, &mut market],
-    )
-    .unwrap();
-
-    let before_market = market.data.clone();
-    let before_account = long_account.data.clone();
-    let result = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 3,
-            asset_index: 0,
-            now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
-        },
-        &mut [&mut long_owner, &mut market, &mut long_account],
-    );
-    assert_err_and_market_unchanged(result, &market, &before_market);
-    assert_eq!(long_account.data, before_account);
-    let (_, group) = state::read_market(&market.data).unwrap();
-    assert_eq!(group.mode, MarketModeV16::Live);
-    assert_eq!(
-        group.recovery_reason,
-        None,
-        "even a proven below-progress-floor state must not let a public caller select terminal Recovery"
-    );
-}
-
+// ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this test's elaborate market/
+// trade/EWMA-mark setup existed only to reach a state where a caller-selected `action: 3`
+// (Recover) would be meaningfully tempting to abuse; that selection surface is gone at the
+// wire level (see v16_wrapper_permissionless_crank_rejects_legacy_action_recovery_funding_wire_fields
+// for the general "a caller cannot select ANY action, including Recover" proof, which subsumes
+// this test's claim without needing any market state at all -- decode fails first). What this
+// setup COULD still usefully prove post-port -- that a genuinely below-progress-floor account,
+// correctly HINTED (not action-selected), now reaches Recovery via the engine's OWN plan
+// selector when and only when real state warrants it -- is new, valuable coverage this port
+// unlocks (this fork's wrapper had NO reachable path to `AutoCrankPlanV16::DeclareRecovery`
+// before this unit; see the handler's own port-scope comment). That is a genuinely different,
+// affirmative integration test, not a negative-control adaptation of this one, and is left as
+// a follow-up rather than forced into this unit's narrower scope.
 #[test]
 fn v16_wrapper_rebalance_reduce_is_owner_signed_and_strictly_reduces_risk() {
     let mut admin = signer();
@@ -16397,12 +16208,9 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
     );
 
     let crank_after_resolve_maturity = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 5,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut owner_a, &mut market, &mut portfolio_a],
     );
@@ -16995,18 +16803,14 @@ fn v16_wrapper_hybrid_hard_stale_uses_permissionless_resolve_not_recovery_kill_s
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
 
-    let before_recovery = market.data.clone();
-    let rejected_recovery = run_ix(
-        Instruction::PermissionlessCrank {
-            action: 3,
-            asset_index: 0,
-            now_slot: 5,
-            funding_rate_e9: 0,
-            recovery_reason: 6,
-        },
-        &mut [&mut owner, &mut market, &mut portfolio],
-    );
-    assert_err_and_market_unchanged(rejected_recovery, &market, &before_recovery);
+    // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): this used to send
+    // `PermissionlessCrank { action: 3 (Recover), recovery_reason: 6, .. }` here and assert it
+    // was rejected -- proving a caller cannot force Recovery around the hard-stale resolver.
+    // That selection surface is gone at the wire level (no `action`/`recovery_reason` field to
+    // supply at all); see
+    // v16_wrapper_permissionless_crank_rejects_legacy_action_recovery_funding_wire_fields for
+    // the general decode-level proof, which covers this exact (action=3, recovery_reason=6)
+    // pair among its cases.
 
     run_ix(
         Instruction::ResolveStalePermissionless { now_slot: 9001 },
@@ -17736,12 +17540,9 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
 
         // Liquidation crank against the victim on asset 1.
         let res = run_ix(
-            Instruction::PermissionlessCrank {
-                action: 1,
-                asset_index: 1,
+Instruction::PermissionlessCrank {
                 now_slot: slot,
-                funding_rate_e9: 0,
-                recovery_reason: 0,
+                observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
             },
             &mut [&mut admin, &mut market, &mut vic_acct],
         );
@@ -18008,12 +17809,9 @@ fn v16_wrapper_crank_clamp_uses_per_asset_dt_not_group_dt() {
     let (mut admin, mut market, mut a1_long) = setup_pinned_group_fresh_asset1(130);
 
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 6,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut a1_long],
     )
@@ -18044,12 +17842,9 @@ fn v16_wrapper_crank_per_asset_clamp_still_binds_extreme_target() {
     let (mut admin, mut market, mut a1_long) = setup_pinned_group_fresh_asset1(100_000);
 
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 1,
+Instruction::PermissionlessCrank {
             now_slot: 6,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 1, oracle_accounts: 0 }],
         },
         &mut [&mut admin, &mut market, &mut a1_long],
     )
@@ -21257,12 +21052,9 @@ fn v17_wrapper_lp_survives_zero_net_price_churn_end_to_end() {
             push_base_auth_mark(&mut admin, &mut market, slot, mark);
             price_moves += 1;
             let crank = run_ix(
-                Instruction::PermissionlessCrank {
-                    action: 0, // Refresh
-                    asset_index: 0,
+Instruction::PermissionlessCrank {
                     now_slot: slot,
-                    funding_rate_e9: 0,
-                    recovery_reason: 0,
+                    observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
                 },
                 &mut [&mut owner_b, &mut market, &mut account_b],
             );
@@ -21279,12 +21071,9 @@ fn v17_wrapper_lp_survives_zero_net_price_churn_end_to_end() {
         slot += 10;
         push_base_auth_mark(&mut admin, &mut market, slot, 100);
         let _ = run_ix(
-            Instruction::PermissionlessCrank {
-                action: 0,
-                asset_index: 0,
+Instruction::PermissionlessCrank {
                 now_slot: slot,
-                funding_rate_e9: 0,
-                recovery_reason: 0,
+                observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
             },
             &mut [&mut owner_b, &mut market, &mut account_b],
         );
@@ -22815,12 +22604,9 @@ fn f05_stranger_crank(
 ) -> Result<(), ProgramError> {
     let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
     run_ix(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
-            now_slot,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+Instruction::PermissionlessCrank {
+            now_slot: now_slot,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         &mut [&mut stranger, market, portfolio],
     )
@@ -22948,28 +22734,34 @@ fn f05_old_c_w_04_lock_assertions_must_now_fail() {
     let m2 = cw04_snap(&f.market, &f.victim).mode;
     println!("F-05/old exit(b) ResolveStalePermissionless     = {perm_resolve:?} mode={m2:?}");
 
-    // (c) every permissionless-crank arm, on the HEALTHY asset 1, by a stranger.
-    for (label, action) in [
-        ("Refresh", 0u8),
-        ("Liquidate", 1u8),
-        ("SettleB", 2u8),
-        ("Recover", 3u8),
+    // (c) the permissionless-crank tag, on the HEALTHY asset 1, by a stranger. ADOPT
+    // upstream Group-B subsystem #2 (AutoCrankObservation): the caller no longer
+    // selects an action (Refresh/Liquidate/SettleB/Recover) at all -- it supplies a
+    // hint and the engine's plan selector picks the action -- so the old
+    // action-matrix loop this case iterated over is gone at the wire level; a single
+    // representative call (with vs. without a hint) now covers the same "nothing a
+    // stranger can put in this instruction moves the market out of Recovery" claim,
+    // since there is no longer a caller-chosen dimension left to vary.
+    for (label, observations) in [
+        ("no hints", Vec::new()),
+        (
+            "hint asset 1",
+            vec![CrankObservationHint {
+                asset_index: 1,
+                oracle_accounts: 0,
+            }],
+        ),
     ] {
         let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
         let res = run_ix(
             Instruction::PermissionlessCrank {
-                action,
-                asset_index: 1,
                 now_slot: 2,
-                funding_rate_e9: 0,
-                recovery_reason: 0,
+                observations,
             },
             &mut [&mut stranger, &mut f.market, &mut f.ba],
         );
         let m = cw04_snap(&f.market, &f.victim).mode;
-        println!(
-            "F-05/old exit(c) tag5 action={action} ({label:>9}) on HEALTHY asset 1 = {res:?} mode={m:?}"
-        );
+        println!("F-05/old exit(c) tag5 ({label}) on HEALTHY asset 1 = {res:?} mode={m:?}");
     }
 
     assert_eq!(
@@ -23111,54 +22903,68 @@ fn f05_f02_route3_open_ledger_still_hits_lock_active_through_the_wired_crank() {
 }
 
 // ---------------------------------------------------------------------------
-// (3) LIVE-MODE BYTE-IDENTITY. Every tag-5 behaviour in a Live market must be
-//     unchanged: the new branch is gated on `mode == 2` only. This pins the
-//     argument validation and the Live dispatch outcomes the C-W-04 PoC recorded.
+// (3) LIVE-MODE BYTE-IDENTITY. The Recovery short-circuit (F-05) is gated on
+//     `mode == 2` only, and F-05's own branch is untouched by this port -- see
+//     its preserved-verbatim comment in `handle_permissionless_crank_zero_copy`.
+//     ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the tag-5
+//     ARGUMENT SHAPE this test pinned is gone -- `action`/`funding_rate_e9`/
+//     `recovery_reason` no longer exist on the wire at all (a stranger cannot
+//     even construct the old invalid-action/invalid-recovery-reason payloads;
+//     see v16_wrapper_permissionless_crank_rejects_w3_legacy_wire_fields for the
+//     non-vacuous byte-level proof of that). This is rewritten to pin the NEW
+//     wire's own argument validation (an out-of-bounds hint is still rejected
+//     the same way) and confirm the Live dispatch still runs via a hint over a
+//     healthy asset, never changing mode.
 // ---------------------------------------------------------------------------
 #[test]
 fn f05_live_mode_permissionless_crank_behaviour_is_unchanged() {
     let mut f = cw04_fixture(true);
     assert_eq!(f05_mode(&f.market), MarketModeV16::Live);
 
-    // Argument validation ahead of the branch is untouched.
-    for (label, action, recovery_reason) in [
-        ("action=3", 3u8, 0u8),
-        ("action=8", 8u8, 0u8),
-        ("recovery_reason=1", 0u8, 1u8),
+    // Argument validation ahead of the Recovery branch is untouched: an
+    // out-of-bounds hint asset_index is still rejected as InvalidInstruction.
+    {
+        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
+        let res = run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 2,
+                observations: vec![CrankObservationHint {
+                    asset_index: u16::MAX,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [&mut stranger, &mut f.market, &mut f.ba],
+        );
+        println!("F-05 live-mode reject out-of-bounds hint -> {res:?}");
+        assert_eq!(
+            res,
+            Err(ProgramError::Custom(9)),
+            "InvalidInstruction (Custom(9)) for an out-of-bounds hint asset_index"
+        );
+    }
+
+    // And the Live dispatch still runs via a hint over a healthy asset, without ever
+    // changing the market's mode -- regardless of whether the engine's plan selector
+    // finds anything actionable for this particular call.
+    for (label, observations) in [
+        ("no hints", Vec::new()),
+        (
+            "hint asset 1",
+            vec![CrankObservationHint {
+                asset_index: 1,
+                oracle_accounts: 0,
+            }],
+        ),
     ] {
         let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
         let res = run_ix(
             Instruction::PermissionlessCrank {
-                action,
-                asset_index: 1,
                 now_slot: 2,
-                funding_rate_e9: 0,
-                recovery_reason,
+                observations,
             },
             &mut [&mut stranger, &mut f.market, &mut f.ba],
         );
-        println!("F-05 live-mode reject {label} -> {res:?}");
-        assert_eq!(
-            res,
-            Err(ProgramError::Custom(9)),
-            "InvalidInstruction (Custom(9)) is unchanged for {label}"
-        );
-    }
-
-    // And the Live dispatch still runs the ordinary arms over a healthy asset.
-    for action in [0u8, 1u8, 2u8] {
-        let mut stranger = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
-        let res = run_ix(
-            Instruction::PermissionlessCrank {
-                action,
-                asset_index: 1,
-                now_slot: 2,
-                funding_rate_e9: 0,
-                recovery_reason: 0,
-            },
-            &mut [&mut stranger, &mut f.market, &mut f.ba],
-        );
-        println!("F-05 live-mode action={action} on healthy asset 1 -> {res:?} mode={:?}", f05_mode(&f.market));
+        println!("F-05 live-mode ({label}) on healthy asset 1 -> {res:?} mode={:?}", f05_mode(&f.market));
         assert_eq!(
             f05_mode(&f.market),
             MarketModeV16::Live,

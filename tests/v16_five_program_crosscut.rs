@@ -44,7 +44,7 @@ use percolator_prog::{
         HEADER_LEN, KIND_PORTFOLIO, LP_VAULT_MINIMUM_LIQUIDITY, MAGIC, MATCHER_ABI_VERSION,
         NFT_REGISTRY_SEED, VERSION,
     },
-    ix::Instruction as ProgInstruction,
+    ix::{CrankObservationHint, Instruction as ProgInstruction},
     processor::ASSET_ACTION_ACTIVATE,
     // v17: MarketGroupV16 and PortfolioAccountV16 are wrapper-side types in state (not engine).
     state::{self, MarketGroupV16, PortfolioAccountV16},
@@ -882,15 +882,15 @@ impl CrosscutEnv {
         self.svm.set_account(self.market, acct).unwrap();
     }
 
-    /// PermissionlessCrank on CROSSCUT_ASSET (action 0 = refresh, 1 = liquidate).
-    /// FIX W3 (upstream #206, pairs with engine E3 / #92): no caller-supplied
-    /// close_q -- the engine selects the liquidation size.
-    fn crank(
-        &mut self,
-        portfolio: Pubkey,
-        action: u8,
-        now_slot: u64,
-    ) -> Result<(), TransactionError> {
+    /// PermissionlessCrank on CROSSCUT_ASSET. FIX W3 (upstream #206, pairs with engine
+    /// E3 / #92): no caller-supplied close_q -- the engine selects the liquidation size.
+    /// ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the action is also no
+    /// longer caller-supplied -- this hints CROSSCUT_ASSET's fresh evidence and relies on
+    /// the engine's `AutoCrankPlanV16` selector to pick Refresh/Liquidate as the account's
+    /// own state warrants (matching this helper's callers, which invoke it either on a
+    /// healthy account expecting a plain refresh, or on an account already made
+    /// liquidatable by the surrounding test's setup).
+    fn crank(&mut self, portfolio: Pubkey, now_slot: u64) -> Result<(), TransactionError> {
         let wix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -899,11 +899,11 @@ impl CrosscutEnv {
                 AccountMeta::new(portfolio, false),
             ],
             data: ProgInstruction::PermissionlessCrank {
-                action,
-                asset_index: CROSSCUT_ASSET,
                 now_slot,
-                funding_rate_e9: 0,
-                recovery_reason: 0,
+                observations: vec![CrankObservationHint {
+                    asset_index: CROSSCUT_ASSET,
+                    oracle_accounts: 0,
+                }],
             }
             .encode(),
         };
@@ -2214,8 +2214,8 @@ fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i1
     for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
         env.warp(slot);
         env.accrue_mark(slot, price);
-        let _ = env.crank(wa, 0, slot);
-        let _ = env.crank(la, 0, slot);
+        let _ = env.crank(wa, slot);
+        let _ = env.crank(la, slot);
     }
 
     let ctx = env.setup_stake_pool(flush_amount);
@@ -2223,9 +2223,9 @@ fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i1
 
     if flush_first {
         env.stake_flush(&ctx, flush_amount).expect("flush");
-        env.crank(wa, 1, 30).expect("liquidate bankrupt short");
+        env.crank(wa, 30).expect("liquidate bankrupt short");
     } else {
-        env.crank(wa, 1, 30).expect("liquidate bankrupt short");
+        env.crank(wa, 30).expect("liquidate bankrupt short");
         env.stake_flush(&ctx, flush_amount).expect("flush");
     }
 
