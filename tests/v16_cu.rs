@@ -1557,7 +1557,10 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::SetMatcherConfig { enabled: 1 },
+            ProgInstruction::SetMatcherConfig {
+                enabled: 1,
+                trade_fee_cap_bps: 10_000,
+            },
             vec![
                 AccountMeta::new(maker_owner.pubkey(), true),
                 AccountMeta::new_readonly(self.market, false),
@@ -7766,6 +7769,300 @@ fn v16_attack_trade_cpi_requires_signed_base_fee_consent() {
         g1.vault,
         g1.c_tot + g1.insurance,
         "exact conservation after the consented base-fee TradeCpi"
+    );
+}
+
+// Wave-2 unit W2-6b627b43: adopts upstream 6b627b43 "require LP consent for CPI base
+// fees". Bit-packs a new `trade_fee_cap_bps` (14 bits, bits 50..63) into
+// PortfolioMatcherConfigV16.control (formerly `enabled: u64`, bit 0 unchanged) -- the LP
+// now caps the maximum market base fee they'll accept via SetMatcherConfig, and CPI trade
+// paths refuse to route through an LP whose cap is below the market's current base fee.
+// This is the LP-side counterpart to v16_attack_trade_cpi_requires_signed_base_fee_consent
+// above (upstream 7f319c6b), which only covers the taker's own consent.
+#[test]
+fn v16_attack_trade_cpi_requires_lp_fee_cap_consent() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    env.update_trade_fee_policy_with_cu(500); // market base fee = 5%
+
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let maker_account = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker_account, 1_000_000);
+    env.deposit(&maker_owner, maker_account, 1_000_000);
+
+    let (matcher_ctx, matcher_delegate, _) =
+        env.init_matcher_context(&maker_owner, matcher_program, maker_account);
+
+    // LP caps its accepted base fee at 1% (100 bps), below the live 5% (500 bps) base.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 100,
+        },
+        vec![
+            AccountMeta::new(maker_owner.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(maker_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new_readonly(matcher_ctx, false),
+            AccountMeta::new_readonly(matcher_delegate, false),
+        ],
+        &[&maker_owner],
+    )
+    .expect("LP lowers its accepted fee cap below the live base fee");
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let maker_before = env.svm.get_account(&maker_account).unwrap();
+    let ctx_before = env.svm.get_account(&matcher_ctx).unwrap();
+
+    // Taker signs fee_bps=500 (matches the live base -- satisfies taker-side consent) but
+    // the LP's registered cap (100) is below it -- must be REJECTED before the matcher CPI
+    // ever runs.
+    env.svm.expire_blockhash();
+    let r = env.try_trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        (10 * POS_SCALE) as i128,
+        500,
+    );
+    assert!(
+        r.is_err(),
+        "TradeCpi routed through an LP whose trade_fee_cap_bps is below the live \
+         trade_fee_base_bps must reject: {r:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected TradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected TradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&maker_account).unwrap(),
+        maker_before,
+        "a rejected TradeCpi must not mutate the LP's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&matcher_ctx).unwrap(),
+        ctx_before,
+        "matcher context must be untouched -- proves the real matcher CPI was never \
+         invoked for a trade routed through an under-cap LP"
+    );
+
+    // Control: the LP raises its cap back to (at least) the live base fee -- the same
+    // trade now succeeds and is charged normally.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 500,
+        },
+        vec![
+            AccountMeta::new(maker_owner.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(maker_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new_readonly(matcher_ctx, false),
+            AccountMeta::new_readonly(matcher_delegate, false),
+        ],
+        &[&maker_owner],
+    )
+    .expect("LP raises its accepted fee cap to (at least) the live base fee");
+
+    let ins0 = env.market_state().1.insurance;
+    env.svm.expire_blockhash();
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker_account,
+        &maker_owner,
+        maker_account,
+        matcher_program,
+        matcher_ctx,
+        matcher_delegate,
+        0,
+        (10 * POS_SCALE) as i128,
+        500,
+    );
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a TradeCpi routed through an LP whose cap covers the live base fee must still be \
+         charged; insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the consented LP-fee-cap TradeCpi"
+    );
+}
+
+// Batch-CPI counterpart of v16_attack_trade_cpi_requires_lp_fee_cap_consent above: both
+// handle_trade_cpi and handle_batch_trade_cpi share matcher_tail_start_or_verify_lp_config,
+// which this fix modifies to also return the LP's trade_fee_cap_bps -- prove the cap is
+// enforced on the batch route too, not just the single-leg one.
+#[test]
+fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    env.update_trade_fee_policy_with_cu(500); // market base fee = 5%
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000);
+    env.deposit(&lp, lp_account, 1_000_000);
+
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+    // LP caps its accepted base fee at 1% (100 bps), below the live 5% (500 bps) base.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 100,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new_readonly(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[&lp],
+    )
+    .expect("LP lowers its accepted fee cap below the live base fee");
+
+    let accounts = vec![
+        AccountMeta::new(taker.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(taker_account, false),
+        AccountMeta::new(lp_account, false),
+        AccountMeta::new_readonly(matcher_program, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(delegate, false),
+    ];
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    // Taker signs fee_bps=500 (matches the live base) but the LP's registered cap (100) is
+    // below it -- the batch must be REJECTED before the matcher CPI ever runs.
+    env.svm.expire_blockhash();
+    let over_cap_leg = percolator_prog::ix::BatchTradeCpiLeg {
+        asset_index: 0,
+        size_q: (10 * POS_SCALE) as i128,
+        fee_bps: 500,
+        limit_price: 0,
+    };
+    let r = env.send(
+        ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
+            legs: vec![over_cap_leg],
+        },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(
+        r.is_err() && r.as_ref().unwrap_err().contains("Custom(9)"),
+        "BatchTradeCpi routed through an LP whose trade_fee_cap_bps is below the live \
+         trade_fee_base_bps must reject with InvalidInstruction (Custom(9)): {r:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected BatchTradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected BatchTradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&lp_account).unwrap(),
+        lp_before,
+        "a rejected BatchTradeCpi must not mutate the LP's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&ctx).unwrap(),
+        ctx_before,
+        "matcher context must be untouched -- proves the real matcher CPI was never invoked \
+         for a batch leg routed through an under-cap LP"
+    );
+
+    // Control: the LP raises its cap back to (at least) the live base fee -- the same batch
+    // now succeeds and is charged normally.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 500,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new_readonly(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[&lp],
+    )
+    .expect("LP raises its accepted fee cap to (at least) the live base fee");
+
+    let ins0 = env.market_state().1.insurance;
+    env.svm.expire_blockhash();
+    let at_cap_leg = percolator_prog::ix::BatchTradeCpiLeg {
+        asset_index: 0,
+        size_q: (10 * POS_SCALE) as i128,
+        fee_bps: 500,
+        limit_price: 0,
+    };
+    env.send(
+        ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
+            legs: vec![at_cap_leg],
+        },
+        accounts,
+        &[&taker],
+    )
+    .expect("BatchTradeCpi leg routed through an LP whose cap covers the live base fee must succeed");
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a BatchTradeCpi leg routed through an LP whose cap covers the live base fee must \
+         still be charged; insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the consented LP-fee-cap BatchTradeCpi"
     );
 }
 

@@ -742,7 +742,11 @@ impl CrosscutEnv {
                     AccountMeta::new(ctx, false),
                     AccountMeta::new_readonly(delegate, false),
                 ],
-                data: ProgInstruction::SetMatcherConfig { enabled: 1 }.encode(),
+                data: ProgInstruction::SetMatcherConfig {
+                    enabled: 1,
+                    trade_fee_cap_bps: 10_000,
+                }
+                .encode(),
             }],
             &[maker_owner],
         )

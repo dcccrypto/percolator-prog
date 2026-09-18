@@ -542,7 +542,10 @@ fn run_trade_cpi_with_matcher(
     // matcher_ctx, delegate) triple.  Without this, matcher_tail_start_or_verify_lp_config
     // returns Unauthorized.  Register now; the SetMatcherConfig call is idempotent per trade.
     run_ix(
-        Instruction::SetMatcherConfig { enabled: 1 },
+        Instruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 10_000,
+        },
         &mut [
             owner_b,
             market,
@@ -14341,7 +14344,10 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
     deposit(&mut owner_b, &mut market, &mut account_b, 1_000_000);
 
     run_ix(
-        Instruction::SetMatcherConfig { enabled: 1 },
+        Instruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 10_000,
+        },
         &mut [
             &mut owner_b,
             &mut market,
@@ -18889,7 +18895,10 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
         &matcher_context,
     );
     run_ix(
-        Instruction::SetMatcherConfig { enabled: 1 },
+        Instruction::SetMatcherConfig {
+            enabled: 1,
+            trade_fee_cap_bps: 10_000,
+        },
         &mut [
             &mut owner_b,
             &mut market,

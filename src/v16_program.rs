@@ -1689,7 +1689,58 @@ pub mod state {
         pub matcher_program: [u8; 32],
         pub matcher_context: [u8; 32],
         pub matcher_delegate: [u8; 32],
-        pub enabled: u64,
+        /// Bit 0 is the matcher-enabled flag. Bits 50..63 carry the LP's maximum accepted
+        /// market base fee in basis points (`trade_fee_cap_bps`, 14 bits, 0..=10_000).
+        /// Bits 1..49 are currently unused by this fork (upstream reserves them for a
+        /// position-episode counter we don't have yet -- see ABI_LANDMINE_REGISTRY.md §4).
+        /// Legacy accounts contain only 0 or 1 here, which decodes as a zero fee cap: CPI
+        /// trades fail closed against any nonzero base fee until the LP reauthorizes via
+        /// SetMatcherConfig. Named `control` (not `enabled`) for parity with upstream's
+        /// bit-packed field at this same byte offset.
+        pub control: u64,
+    }
+
+    impl PortfolioMatcherConfigV16 {
+        const ENABLED_MASK: u64 = 1;
+        const TRADE_FEE_CAP_SHIFT: u32 = 50;
+        const TRADE_FEE_CAP_MASK: u64 = 0x3fffu64 << Self::TRADE_FEE_CAP_SHIFT;
+
+        #[inline]
+        pub fn enabled(&self) -> u64 {
+            self.control & Self::ENABLED_MASK
+        }
+
+        #[inline]
+        pub fn trade_fee_cap_bps(&self) -> u16 {
+            ((self.control & Self::TRADE_FEE_CAP_MASK) >> Self::TRADE_FEE_CAP_SHIFT) as u16
+        }
+
+        #[inline]
+        fn validate(&self) -> Result<(), ProgramError> {
+            if self.enabled() > 1 || self.trade_fee_cap_bps() > 10_000 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            Ok(())
+        }
+
+        #[inline]
+        pub fn set_enabled(&mut self, enabled: u8) -> Result<(), ProgramError> {
+            if enabled > 1 {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            self.control = (self.control & !Self::ENABLED_MASK) | u64::from(enabled);
+            Ok(())
+        }
+
+        #[inline]
+        pub fn set_trade_fee_cap_bps(&mut self, trade_fee_cap_bps: u16) -> Result<(), ProgramError> {
+            if trade_fee_cap_bps > 10_000 {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            self.control = (self.control & !Self::TRADE_FEE_CAP_MASK)
+                | (u64::from(trade_fee_cap_bps) << Self::TRADE_FEE_CAP_SHIFT);
+            Ok(())
+        }
     }
 
     pub type AssetOracleStorageV16 = [u8; ASSET_ORACLE_WRAPPER_LEN];
@@ -1833,9 +1884,7 @@ pub mod state {
                 .get(..config_len)
                 .ok_or(PercolatorError::InvalidAccountLen)?,
         );
-        if cfg.enabled > 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -1845,9 +1894,7 @@ pub mod state {
         cfg: &PortfolioMatcherConfigV16,
     ) -> Result<(), ProgramError> {
         check_header(data, KIND_PORTFOLIO)?;
-        if cfg.enabled > 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        cfg.validate()?;
         let bytes = matcher_config_bytes_mut(data)?;
         for b in bytes.iter_mut() {
             *b = 0;
@@ -4290,6 +4337,7 @@ pub mod ix {
         },
         SetMatcherConfig {
             enabled: u8,
+            trade_fee_cap_bps: u16,
         },
         ClosePortfolio,
         TopUpInsurance {
@@ -4800,9 +4848,21 @@ pub mod ix {
                         legs,
                     }
                 }
-                68 => Self::SetMatcherConfig {
-                    enabled: read_u8(&mut rest)?,
-                },
+                68 => {
+                    let enabled = read_u8(&mut rest)?;
+                    // Backward-compat decode: a legacy-length payload (no trailing bytes)
+                    // decodes as trade_fee_cap_bps=0, which fails closed against any
+                    // nonzero market base fee until the LP reauthorizes with an explicit cap.
+                    let trade_fee_cap_bps = if rest.is_empty() {
+                        0
+                    } else {
+                        read_u16(&mut rest)?
+                    };
+                    Self::SetMatcherConfig {
+                        enabled,
+                        trade_fee_cap_bps,
+                    }
+                }
                 8 => Self::ClosePortfolio,
                 9 => Self::TopUpInsurance {
                     amount: read_u128(&mut rest)?,
@@ -5193,9 +5253,13 @@ pub mod ix {
                     push_u128(&mut out, max_slippage_atoms);
                     push_u128(&mut out, max_fee_atoms);
                 }
-                Self::SetMatcherConfig { enabled } => {
+                Self::SetMatcherConfig {
+                    enabled,
+                    trade_fee_cap_bps,
+                } => {
                     out.push(68);
                     out.push(enabled);
+                    push_u16(&mut out, trade_fee_cap_bps);
                 }
                 Self::ClosePortfolio => out.push(8),
                 Self::TopUpInsurance { amount } => {
@@ -7961,9 +8025,10 @@ pub mod processor {
                 max_fee_atoms,
                 &legs,
             ),
-            Instruction::SetMatcherConfig { enabled } => {
-                handle_set_matcher_config(program_id, accounts, enabled)
-            }
+            Instruction::SetMatcherConfig {
+                enabled,
+                trade_fee_cap_bps,
+            } => handle_set_matcher_config(program_id, accounts, enabled, trade_fee_cap_bps),
             Instruction::ClosePortfolio => handle_close_portfolio(program_id, accounts),
             Instruction::TopUpInsurance { amount } => {
                 handle_top_up_insurance(program_id, accounts, amount)
@@ -10118,16 +10183,16 @@ pub mod processor {
         matcher_prog_key: &Pubkey,
         matcher_ctx_key: &Pubkey,
         matcher_delegate_key: &Pubkey,
-    ) -> Result<usize, ProgramError> {
+    ) -> Result<(usize, u16), ProgramError> {
         let cfg = state::read_portfolio_matcher_config(&account_b_ai.try_borrow_data()?)?;
-        if cfg.enabled != 1
+        if cfg.enabled() != 1
             || cfg.matcher_program != matcher_prog_key.to_bytes()
             || cfg.matcher_context != matcher_ctx_key.to_bytes()
             || cfg.matcher_delegate != matcher_delegate_key.to_bytes()
         {
             return Err(PercolatorError::Unauthorized.into());
         }
-        Ok(7)
+        Ok((7, cfg.trade_fee_cap_bps()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10266,12 +10331,20 @@ pub mod processor {
             matcher_ctx.key,
         );
         expect_key(matcher_delegate, &delegate)?;
-        let tail_start = matcher_tail_start_or_verify_lp_config(
+        let (tail_start, lp_trade_fee_cap_bps) = matcher_tail_start_or_verify_lp_config(
             account_b_ai,
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
         )?;
+        // FIX (upstream 6b627b43, "require LP consent for CPI base fees"): the taker's own
+        // fee_bps consent (checked above) is independent of the LP's matcher capability
+        // cap. Without this, a market authority raising trade_fee_base_bps after an LP
+        // registered a matcher would route CPI trades through that LP regardless of
+        // whether the LP ever agreed to accept a fee that high.
+        if cfg_pre.trade_fee_base_bps > u64::from(lp_trade_fee_cap_bps) {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
         let tail = accounts
             .get(tail_start..)
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -10387,8 +10460,9 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         enabled: u8,
+        trade_fee_cap_bps: u16,
     ) -> ProgramResult {
-        if enabled > 1 {
+        if enabled > 1 || trade_fee_cap_bps > 10_000 || (enabled == 0 && trade_fee_cap_bps != 0) {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let lp_owner = account(accounts, 0)?;
@@ -10411,7 +10485,7 @@ pub mod processor {
         // grow-only check, so this call site also picks up the oversized-account
         // rejection added there.
         ensure_portfolio_storage_for_market_slots(lp_portfolio_ai, 0)?;
-        let cfg = if enabled == 0 {
+        let mut cfg = if enabled == 0 {
             state::PortfolioMatcherConfigV16::default()
         } else {
             let matcher_prog = account(accounts, 3)?;
@@ -10438,9 +10512,11 @@ pub mod processor {
                 matcher_program: matcher_prog.key.to_bytes(),
                 matcher_context: matcher_ctx.key.to_bytes(),
                 matcher_delegate: matcher_delegate.key.to_bytes(),
-                enabled: 1,
+                control: 0,
             }
         };
+        cfg.set_enabled(enabled)?;
+        cfg.set_trade_fee_cap_bps(trade_fee_cap_bps)?;
         state::write_portfolio_matcher_config(&mut lp_portfolio_ai.try_borrow_mut_data()?, &cfg)
     }
 
@@ -10836,12 +10912,18 @@ pub mod processor {
             matcher_ctx.key,
         );
         expect_key(matcher_delegate, &delegate)?;
-        let tail_start = matcher_tail_start_or_verify_lp_config(
+        let (tail_start, lp_trade_fee_cap_bps) = matcher_tail_start_or_verify_lp_config(
             account_b_ai,
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
         )?;
+        // FIX (upstream 6b627b43, "require LP consent for CPI base fees"): see the mirror
+        // check in handle_trade_cpi -- the taker's per-leg fee_bps consent (checked above)
+        // is independent of the LP's matcher capability cap.
+        if trade_fee_base_bps_pre > u64::from(lp_trade_fee_cap_bps) {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
         let tail = accounts
             .get(tail_start..)
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
