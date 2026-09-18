@@ -7,7 +7,10 @@ use percolator::{
     SideModeV16, SideV16, TradeRequestV16, ADL_ONE, BOUND_SCALE, POS_SCALE,
 };
 use percolator_prog::{
-    constants::{MATCHER_ABI_VERSION, ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3},
+    constants::{
+        CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS, HEADER_LEN, KIND_CLOSED_MARKET, MAGIC,
+        MATCHER_ABI_VERSION, ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, VERSION,
+    },
     error::PercolatorError,
     ix::Instruction as ProgInstruction,
     oracle_v16, processor, state,
@@ -34,6 +37,31 @@ const CUSTODY_CU_LIMIT: u64 = 300_000;
 const TRADE_CU_LIMIT: u64 = 345_000;
 const MULTI_ASSET_OPEN_TRADE_CU_LIMIT: u64 = 750_000;
 const MATCHER_CONTEXT_LEN: usize = 320;
+
+/// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market address
+/// reuse"): asserts a just-closed market account carries the permanent
+/// `KIND_CLOSED_MARKET` tombstone -- shrunk to `HEADER_LEN`, non-zero header,
+/// retaining exactly `CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS` -- rather than
+/// the pre-fix "zeroed and drained to 0 lamports" shape. LiteSVM constructs
+/// accounts with the real runtime's serialized layout, so `handle_close_slab`'s
+/// `AccountInfo::realloc` call is safe and exercised for real here (unlike
+/// the plain-`Vec<u8>` `TestAccount` harness in `tests/v16_wrapper.rs`, where
+/// `realloc` is unsound per `AccountInfo::realloc`'s own safety doc and that
+/// harness's close-slab tests assert on data/lamports without calling it
+/// through to a full close+reinit cycle for that reason).
+fn assert_market_is_closed_market_tombstone(data: &[u8]) {
+    assert_eq!(
+        data.len(),
+        HEADER_LEN,
+        "closed market account should be shrunk to the tombstone header size"
+    );
+    assert_eq!(&data[0..8], &MAGIC.to_le_bytes());
+    assert_eq!(&data[8..10], &VERSION.to_le_bytes());
+    assert_eq!(
+        data[10], KIND_CLOSED_MARKET,
+        "closed market account must be stamped KIND_CLOSED_MARKET, not zeroed"
+    );
+}
 
 fn active_bitmap_with(indices: &[usize]) -> percolator::V16ActiveBitmap {
     let mut bitmap = percolator::active_bitmap_empty();
@@ -3624,8 +3652,113 @@ fn v16_bpf_resolved_terminal_insurance_drains_dynamic_domain_after_positions_clo
     assert_eq!(group.insurance_domain_budget[2], 0);
 
     env.close_slab_with_cu();
-    let market_data = env.svm.get_account(&env.market).unwrap().data;
-    assert!(market_data.iter().all(|b| *b == 0));
+    let market_account = env.svm.get_account(&env.market).unwrap();
+    assert_market_is_closed_market_tombstone(&market_account.data);
+    assert_eq!(market_account.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS);
+}
+
+/// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market address
+/// reuse") -- THE inline invariant test for this unit.
+///
+/// This is the actual security property, not just the tombstone's shape:
+/// once a market has been closed via `CloseSlab`, this exact account pubkey
+/// must never again be usable as a market. Before this fix, `CloseSlab`
+/// zeroed the account and drained it to 0 lamports without changing its
+/// length or owner, so a subsequent `InitMarket` targeting the SAME account
+/// would have proceeded and silently reinitialized it as a brand-new market
+/// at the identical pubkey (the ABA / whole-market address-reuse hole the
+/// upstream commit message names). On real Solana this is compounded by
+/// 0-lamport accounts being eligible for runtime reclaim, which can hand the
+/// freed pubkey to a completely unrelated account.
+///
+/// DELIBERATELY LiteSVM-based (`V16CuEnv`), not the plain-`TestAccount`
+/// harness in `tests/v16_wrapper.rs`: `handle_close_slab`'s tail now calls
+/// `AccountInfo::realloc`, whose own safety doc states it is sound only for
+/// an `AccountInfo` "created by the runtime and received in the
+/// `process_instruction` entrypoint of a program" -- `tests/v16_wrapper.rs`'s
+/// `TestAccount::to_info()` builds one from a bare `&mut Vec<u8>` with none of
+/// the runtime's reserved pre/post scratch layout, so calling `.realloc()`
+/// through it is undefined behavior (confirmed empirically: it SIGBUS-crashed
+/// the entire `v16_wrapper` test binary when first tried there, taking down
+/// every test running in that process, not just this one). LiteSVM
+/// constructs accounts with the real serialized runtime layout, so `realloc`
+/// is sound here, matching how this same file already exercises
+/// `close_slab_with_cu()` to full completion above.
+///
+/// NEGATIVE CONTROL (see sync loop report): reverting just the
+/// `handle_close_slab` tail hunk (the realloc+tombstone block) while keeping
+/// this test flips the final assertion from `Err(.., Custom(2))` to `Ok(..)`
+/// -- i.e. the reinit silently SUCCEEDS -- which is exactly the vulnerability
+/// this unit closes.
+#[test]
+fn v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected() {
+    let mut env = V16CuEnv::new();
+    env.resolve();
+    env.close_slab_with_cu();
+    let market_account = env.svm.get_account(&env.market).unwrap();
+    assert_market_is_closed_market_tombstone(&market_account.data);
+    assert_eq!(market_account.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS);
+
+    // Same market pubkey (still owned by the program, never transferred),
+    // same admin, same mint -- everything an attacker or an honest client
+    // that cached this pubkey could supply. Force a fresh blockhash first:
+    // this InitMarket call is byte-identical to the one `V16CuEnv::new()`
+    // already sent (same accounts, same field values), and LiteSVM correctly
+    // rejects a byte-identical transaction under the SAME still-live
+    // blockhash as `AlreadyProcessed` before the program even runs -- a
+    // harness artifact, not the property under test.
+    env.svm.expire_blockhash();
+    let reinit = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::InitMarket {
+            max_portfolio_assets: 1,
+            h_min: 0,
+            h_max: 10,
+            initial_price: 100,
+            min_nonzero_mm_req: 1,
+            min_nonzero_im_req: 2,
+            maintenance_margin_bps: 10_000,
+            initial_margin_bps: 10_000,
+            max_trading_fee_bps: 10_000,
+            trade_fee_base_bps: 0,
+            liquidation_fee_bps: 0,
+            liquidation_fee_cap: 0,
+            min_liquidation_abs: 0,
+            max_price_move_bps_per_slot: 10_000,
+            max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 1,
+            max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1,
+            max_bankrupt_close_lifetime_slots: 100,
+            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+            maintenance_fee_per_slot: 0,
+        },
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new_readonly(env.mint, false),
+        ],
+        &[&env.admin],
+    );
+    let err =
+        reinit.expect_err("InitMarket must refuse to reinitialize a closed market's pubkey");
+    assert!(
+        err.contains("Custom(2)"),
+        "expected PercolatorError::AlreadyInitialized (Custom(2)), got: {err}"
+    );
+
+    // A failed transaction never commits (LiteSVM enforces the same
+    // atomicity guarantee as the real runtime) -- the tombstone must survive
+    // the rejected reinit attempt untouched.
+    let market_account_after = env.svm.get_account(&env.market).unwrap();
+    assert_market_is_closed_market_tombstone(&market_account_after.data);
+    assert_eq!(
+        market_account_after.lamports,
+        CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS
+    );
 }
 
 /// ADOPT upstream `547847ed` "invalidate terminal scan prefix after backing
@@ -3777,9 +3910,10 @@ fn v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry() {
         &[&env.admin],
     )
     .expect("close slab with mint for unbudgeted-residue burn");
-    let market_data = env.svm.get_account(&env.market).unwrap().data;
-    assert!(
-        market_data.iter().all(|b| *b == 0),
+    let market_account = env.svm.get_account(&env.market).unwrap();
+    assert_market_is_closed_market_tombstone(&market_account.data);
+    assert_eq!(
+        market_account.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS,
         "third call completes the now-unblocked scan and closes the market"
     );
 }

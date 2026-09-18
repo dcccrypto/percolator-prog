@@ -60,9 +60,10 @@ pub mod constants {
                                                   // `InvalidVersion` = `Custom(1)`, uniformly, on every KIND_* account and
                                                   // every route that touches one. It creates NO new exit: the refusal is
                                                   // relabelled and made earlier, never relaxed. Consequence, deliberate: a
-                                                  // PARTIAL re-seed hard-fails, because the gate is generic over all seven
+                                                  // PARTIAL re-seed hard-fails, because the gate is generic over all eight
                                                   // kinds (market, portfolio, backing ledger, insurance ledger, LP registry,
-                                                  // LP redemption, NFT registry) -- the deploy path is a FULL re-seed.
+                                                  // LP redemption, NFT registry, closed-market tombstone) -- the deploy
+                                                  // path is a FULL re-seed.
                                                   // Cross-program: percolator-nft vendors this constant
                                                   // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
                                                   // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
@@ -335,6 +336,59 @@ pub mod constants {
     // ── Fork NFT / B-3 TransferPortfolioOwnership ─────────────────────────
     // Tags 72/73 are free at the frozen target (toly top=69). NFT-B3 KEPT.
     pub const KIND_NFT_REGISTRY: u8 = 7;
+
+    // ── Sync unit W2-S1b (upstream `d57411f8`, "prevent whole-market address
+    // reuse") ───────────────────────────────────────────────────────────
+    // Upstream introduces its OWN `KIND_CLOSED_MARKET = 5`. That literal value
+    // collides byte-exact with our fork-only `KIND_LP_VAULT_REGISTRY = 5`
+    // (added after our kinds 1-4, same as upstream's baseline) -- exactly the
+    // collision the CI assert above/`lp_kinds_distinct`-style tests
+    // (`tests/v16_fork_lp_vault_state_tests.rs`) exist to catch. Re-numbered
+    // to the next free ordinal (8) instead of upstream's literal 5. This is a
+    // NAME/OFFSET adaptation only: the tombstone mechanism itself (write a
+    // permanent, minimal, program-owned marker header into a closed market
+    // account instead of draining it to 0 lamports) is unchanged from
+    // upstream.
+    pub const KIND_CLOSED_MARKET: u8 = 8;
+
+    /// `Rent::default().minimum_balance(HEADER_LEN)`, computed at COMPILE TIME
+    /// via plain integer arithmetic instead of a live `Rent::get()` syscall.
+    ///
+    /// Upstream `d57411f8` calls `Rent::get()?.minimum_balance(HEADER_LEN)` at
+    /// the `handle_close_slab` tail. On the real SBF target that syscall
+    /// always resolves (and always to exactly `Rent::default()` -- Solana's
+    /// rent parameters are fixed protocol constants, never governance-mutable,
+    /// unchanged since mainnet-beta genesis on every cluster), so this
+    /// constant is numerically identical to what `Rent::get()` would return
+    /// there.
+    ///
+    /// It is NOT wired through a live `Rent::get()` call here because
+    /// `handle_close_slab` is exercised to full completion (not just partial,
+    /// early-rejected paths) by the native (non-BPF, `cargo test`) integration
+    /// suite in `tests/v16_wrapper.rs`, and that test binary registers no
+    /// custom `solana_program::program_stubs::SyscallStubs` -- confirmed
+    /// empirically, `Rent::get()` there returns
+    /// `Err(ProgramError::UnsupportedSysvar)` (the `DefaultSyscallStubs`
+    /// fallback). Calling the live sysvar in this handler would turn the
+    /// already-passing `v16_wrapper_close_slab_requires_admin_resolved_empty_market`
+    /// test into a hard failure with no change in on-chain behavior. Using
+    /// this compile-time-verified constant keeps `handle_close_slab` runnable
+    /// end-to-end in that harness while remaining bit-identical, in practice,
+    /// to upstream's live-syscall approach on the real target.
+    ///
+    /// Equivalence is asserted at test time (not just documented) --
+    /// `closed_market_tombstone_rent_matches_default_rent_formula` in
+    /// `tests/v16_wrapper.rs` compares this constant against
+    /// `solana_program::rent::Rent::default().minimum_balance(HEADER_LEN)`
+    /// (a plain struct default, no sysvar call, safe natively) so any future
+    /// drift in `solana_program`'s default rent constants is caught rather
+    /// than silently going stale.
+    pub const CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS: u64 = (HEADER_LEN as u64
+        + 128 /* solana_program::rent::ACCOUNT_STORAGE_OVERHEAD */)
+        * 3_480 /* solana_program::rent::DEFAULT_LAMPORTS_PER_BYTE_YEAR */
+        * 2 /* solana_program::rent::DEFAULT_EXEMPTION_THRESHOLD (2.0 exactly; kept
+            integer here so this stays a plain-integer const, no f64-in-const
+            concerns) */;
 
     /// Per-market NFT-program-id registry. PDA seeds: `["nft_registry", market_group]`.
     pub const NFT_REGISTRY_SEED: &[u8] = b"nft_registry";
@@ -715,6 +769,25 @@ pub mod error {
         /// ordinal after it, silently re-mapping errors for every deployed client.
         /// SDK agent: add `LpVaultBackingBucketNotEmpty = 63` to the client error map.
         LpVaultBackingBucketNotEmpty, // Custom(63)
+        /// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market
+        /// address reuse"). `handle_close_slab`'s tail must retain at least
+        /// `constants::CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS` lamports in the
+        /// market account so the closed-market tombstone header
+        /// (`state::write_closed_market_tombstone`, `KIND_CLOSED_MARKET`)
+        /// stays permanently rent-exempt and is never subject to runtime
+        /// garbage collection -- collection would free the pubkey for an
+        /// unrelated account (an ABA identity-confusion / address-reuse
+        /// hole). This fires only if the market account somehow holds fewer
+        /// lamports than that floor at close time; every real market is
+        /// rent-exempt for its FULL (much larger) size already, so this is a
+        /// fail-closed guard against a theoretical underfunded account, not
+        /// a path expected to be reachable on a real deployed market.
+        ///
+        /// APPENDED at the end on purpose: adding a variant anywhere else
+        /// shifts every ordinal after it, silently re-mapping errors for
+        /// every deployed client.
+        /// SDK agent: add `RentExemptRequired = 64` to the client error map.
+        RentExemptRequired, // Custom(64)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -758,7 +831,8 @@ pub mod state {
         constants::{
             ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
             EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN, HEADER_LEN,
-            KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET, KIND_PORTFOLIO, MAGIC,
+            KIND_BACKING_DOMAIN_LEDGER, KIND_CLOSED_MARKET, KIND_INSURANCE_LEDGER, KIND_MARKET,
+            KIND_PORTFOLIO, MAGIC,
             MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
             ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
             ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
@@ -1805,6 +1879,27 @@ pub mod state {
     #[inline]
     pub fn is_initialized(data: &[u8]) -> bool {
         data.len() >= HEADER_LEN && read_u64(data, 0).ok() == Some(MAGIC)
+    }
+
+    /// Sync unit W2-S1b (ADOPT upstream `d57411f8` verbatim, "prevent
+    /// whole-market address reuse"): writes a permanent, minimal
+    /// `KIND_CLOSED_MARKET` header into an already-realloc'd
+    /// (`HEADER_LEN`-sized) market account.
+    ///
+    /// Called ONLY from `handle_close_slab`'s tail, AFTER the account has
+    /// been shrunk to exactly `HEADER_LEN` bytes via `AccountInfo::realloc`
+    /// and BEFORE the retained rent-exempt lamports are set. `is_initialized`
+    /// (checked by every KIND_* init path, including
+    /// `init_market_account_zero_copy`) sees the `MAGIC`/`VERSION` bytes this
+    /// writes and permanently refuses reinitialization at this pubkey --
+    /// this is the actual anti-ABA-reuse mechanism, not merely a label.
+    #[inline]
+    pub fn write_closed_market_tombstone(data: &mut [u8]) -> Result<(), ProgramError> {
+        if data.len() != HEADER_LEN {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        data.fill(0);
+        write_header(data, KIND_CLOSED_MARKET)
     }
 
     const MARKET_MATCHER_NONCE_OFF: usize = 11;
@@ -3541,11 +3636,27 @@ pub mod state {
         initial_price: u64,
         init_slot: u64,
     ) -> Result<(), ProgramError> {
-        if data.len() < MIN_MARKET_ACCOUNT_LEN {
-            return Err(PercolatorError::InvalidAccountLen.into());
-        }
+        // ADOPT upstream `d57411f8` (sync unit W2-S1b, "prevent whole-market
+        // address reuse"): check `is_initialized` BEFORE the length check,
+        // not after. Defense-in-depth for the tombstone this same commit
+        // introduces -- `write_closed_market_tombstone` leaves the account at
+        // exactly `HEADER_LEN` (< `MIN_MARKET_ACCOUNT_LEN`), so today the
+        // length check alone already rejects a same-transaction reinit. But
+        // that protection is an accident of the tombstone's CURRENT size, not
+        // a guarantee: if the account is later enlarged by any other path
+        // (funded with extra lamports and reallocated), Solana's realloc only
+        // zero-fills the NEWLY added trailing bytes, so the original
+        // `HEADER_LEN` prefix -- including the tombstone's `MAGIC`/`VERSION`
+        // -- survives untouched, and `data.len()` could then be
+        // `>= MIN_MARKET_ACCOUNT_LEN` again. Checking `is_initialized` FIRST
+        // makes rejection depend only on the surviving header bytes, never on
+        // account size, so "already claimed" always wins regardless of
+        // whatever size manipulation preceded this call.
         if is_initialized(data) {
             return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        if data.len() < MIN_MARKET_ACCOUNT_LEN {
+            return Err(PercolatorError::InvalidAccountLen.into());
         }
         for b in data.iter_mut() {
             *b = 0;
@@ -14093,14 +14204,39 @@ pub mod processor {
             )?;
         }
 
-        for b in market_ai.try_borrow_mut_data()?.iter_mut() {
-            *b = 0;
-        }
+        // ADOPT upstream `d57411f8` (sync unit W2-S1b, "prevent whole-market
+        // address reuse"). PRE-PORT (and still upstream's OWN pre-fix)
+        // behavior: zero every byte in place, then drain the account to 0
+        // lamports. On real Solana, a 0-lamport account is not immediately
+        // deleted, but it IS eligible to be swept by the runtime between
+        // transactions/epochs, which frees the pubkey for an entirely
+        // UNRELATED account -- possibly with a different owner, opened by
+        // anyone who can sign for (or derive) that address. Any code or
+        // off-chain reference that trusted "this pubkey == this market"
+        // (rather than a persistent, program-assigned identity) would then
+        // silently bind to whatever gets created there next: the classic ABA
+        // address-reuse hole the upstream commit message names directly.
+        //
+        // FIX: shrink to `HEADER_LEN`, stamp a permanent `KIND_CLOSED_MARKET`
+        // tombstone, and retain only the lamports needed to keep THAT shrunk
+        // size rent-exempt forever -- never draining to 0. `is_initialized`
+        // (checked by `init_market_account_zero_copy`, reordered above to
+        // check first) sees the tombstone's `MAGIC`/`VERSION` bytes and
+        // permanently refuses reinitialization at this exact pubkey. The
+        // account is inert (16 bytes, `KIND_CLOSED_MARKET`, unreachable by
+        // every other KIND_* accessor via `check_header`'s kind check) but
+        // never eligible for reclaim, so the address itself can never be
+        // reused for a different market.
+        market_ai.realloc(constants::HEADER_LEN, false)?;
+        state::write_closed_market_tombstone(&mut market_ai.try_borrow_mut_data()?)?;
         let market_lamports = market_ai.lamports();
-        **market_ai.lamports.borrow_mut() = 0;
+        let refunded_lamports = market_lamports
+            .checked_sub(constants::CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS)
+            .ok_or(PercolatorError::RentExemptRequired)?;
+        **market_ai.lamports.borrow_mut() = constants::CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS;
         **admin_dest.lamports.borrow_mut() = admin_dest
             .lamports()
-            .checked_add(market_lamports)
+            .checked_add(refunded_lamports)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         Ok(())
     }

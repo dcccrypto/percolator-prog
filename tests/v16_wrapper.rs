@@ -9,12 +9,14 @@ use percolator::{
 };
 use percolator_prog::{
     constants::{
-        ASSET_ORACLE_WRAPPER_LEN, DEFAULT_MARKET_SLOT_CAPACITY, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-        HEADER_LEN, MARKET_ACCOUNT_LEN, MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, ORACLE_LEG_CAP,
+        ASSET_ORACLE_WRAPPER_LEN, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS,
+        DEFAULT_MARKET_SLOT_CAPACITY, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+        HEADER_LEN, KIND_CLOSED_MARKET, MAGIC, MARKET_ACCOUNT_LEN, MARKET_ASSET_SLOT_LEN,
+        MARKET_GROUP_LEN, ORACLE_LEG_CAP,
         ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, ORACLE_MODE_AUTH_MARK,
         ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL,
         PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN,
-        PORTFOLIO_STATE_LEN, WRAPPER_CONFIG_LEN,
+        PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
     },
     ix::Instruction,
     oracle_v16, policy_v16, processor,
@@ -10436,11 +10438,82 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
         ],
     )
     .unwrap();
-    assert_eq!(market.lamports, 0);
-    assert_eq!(admin.lamports, admin_lamports + market_lamports);
+    // Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market
+    // address reuse"): CloseSlab no longer drains the market account to 0
+    // lamports / all-zero data. It shrinks to `HEADER_LEN` and stamps a
+    // permanent `KIND_CLOSED_MARKET` tombstone, retaining exactly
+    // `CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS` so the shrunk account stays
+    // rent-exempt forever (never swept by the runtime, so the pubkey can
+    // never be reused for an unrelated account). Only the EXCESS over that
+    // floor is refunded to admin.
+    let expected_refund = market_lamports - CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS;
+    assert_eq!(market.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS);
+    assert_eq!(admin.lamports, admin_lamports + expected_refund);
+    assert_eq!(
+        market.data.len(),
+        HEADER_LEN,
+        "closed market account should be shrunk to the tombstone header size"
+    );
+    assert_eq!(
+        &market.data[0..8],
+        &MAGIC.to_le_bytes(),
+        "tombstone must still carry MAGIC (is_initialized must see it)"
+    );
+    assert_eq!(&market.data[8..10], &VERSION.to_le_bytes());
+    assert_eq!(
+        market.data[10], KIND_CLOSED_MARKET,
+        "closed market account must be stamped KIND_CLOSED_MARKET, not zeroed"
+    );
     assert!(
-        market.data.iter().all(|b| *b == 0),
-        "closed market account should be zeroed"
+        state::is_initialized(&market.data),
+        "tombstone must read as initialized, so a same-pubkey reinit is rejected"
+    );
+}
+
+/// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market address
+/// reuse") -- THE ABA-reuse-prevention invariant ("close, then reinit the
+/// same pubkey must be rejected") is tested in
+/// `tests/v16_cu.rs::v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected`,
+/// NOT here.
+///
+/// WHY NOT HERE: `handle_close_slab`'s tail now calls `AccountInfo::realloc`.
+/// Its own safety doc states it is sound only for an `AccountInfo` "created
+/// by the runtime and received in the `process_instruction` entrypoint of a
+/// program" -- this file's `TestAccount::to_info()` builds one from a bare
+/// `&mut Vec<u8>` with none of the runtime's reserved scratch layout
+/// `realloc` writes into (`data_ptr.offset(-8)`), so calling it through here
+/// is undefined behavior. Confirmed empirically, not just by reading the doc:
+/// a CloseSlab-to-completion test added here SIGBUS-crashed the entire
+/// `v16_wrapper` test binary (taking down every other test running in that
+/// process, not just itself) the first time this unit tried it. `v16_cu.rs`
+/// is LiteSVM-based (real serialized runtime account layout), so `realloc` is
+/// sound there, matching how that file already exercises
+/// `close_slab_with_cu()` to full completion elsewhere.
+///
+/// This file keeps only the tombstone-SHAPE assertions in
+/// `v16_wrapper_close_slab_requires_admin_resolved_empty_market` above
+/// (currently unreachable there too, blocked by a pre-existing,
+/// out-of-scope-for-this-unit `ClosePortfolio` `ExpectedWritable` failure
+/// confirmed present on a clean `origin/main` baseline) and the
+/// sysvar-free rent-formula canary below.
+
+/// Compile-time/runtime equivalence canary for
+/// `constants::CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS`. Does NOT call
+/// `Rent::get()` (no sysvar involved, so this is safe to run in every native
+/// test binary): `Rent::default()` is a plain struct literal. This exists so
+/// that if `solana_program`'s default rent constants (`lamports_per_byte_year`,
+/// `exemption_threshold`, `ACCOUNT_STORAGE_OVERHEAD`) ever change upstream, the
+/// hand-derived compile-time constant used by `handle_close_slab` is caught
+/// drifting from what a live `Rent::get()` would actually return on-chain,
+/// rather than silently going stale.
+#[test]
+fn closed_market_tombstone_rent_matches_default_rent_formula() {
+    let rent = solana_program::rent::Rent::default();
+    assert_eq!(
+        CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS,
+        rent.minimum_balance(HEADER_LEN),
+        "constants::CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS must stay bit-identical \
+         to Rent::default().minimum_balance(HEADER_LEN)"
     );
 }
 
