@@ -126,7 +126,166 @@ pub mod constants {
     // slots read this as zero after an in-place upgrade, which correctly means
     // "full rescan from asset 0" -- no migration instruction is needed.
     pub const ASSET_ORACLE_PROFILE_LEN: usize = 480;
-    pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
+
+    // TB-2a (W2, "asset control-sequences INFRA"; ADOPTS upstream `ef3b1a55`
+    // "fix: sequence-bind retained market controls", the commit that
+    // introduces `AssetControlSequencesV16`): grows the fixed per-asset
+    // wrapper slot to make room for that struct PLUS reserved placeholder
+    // space for two Wave-2 SIBLING units that also claim spare tail bytes
+    // in this slot but have not merged to `main` yet (they are independent
+    // branches off the same `origin/main` base, per the isolation rule
+    // every Wave-2 unit works under):
+    //
+    // TWO SIZE CONSTRAINTS DISCOVERED WHILE BUILDING THIS UNIT. Neither
+    // required touching the pinned engine to WORK AROUND, but constraint (2)
+    // is left UNRESOLVED and reported rather than fixed -- see this unit's
+    // handback report for the full STOP-and-report.
+    //
+    // (1) `Market<T>`'s `Pod`/`Zeroable` impls, and every
+    //     `MarketGroupV16HeaderAccount::dynamic_*` layout helper this file
+    //     calls with `T = AssetOracleStorageV16`, require
+    //     `T: percolator::v16::MarketWrapperPod` (`~/percolator/src/v16.rs`,
+    //     pinned `c141d47f` -- DO NOT move/pull). That trait is implemented
+    //     only for a macro-enumerated, FIXED list of array lengths: 0..=32,
+    //     64, 128, 256, 512, 1024 -- the naive 640-byte target (480 profile +
+    //     32 reserved + 88 control-sequences + modest headroom) is not among
+    //     them, so `[u8; 640]: MarketWrapperPod` does not hold and the build
+    //     fails with unsatisfied-trait-bound errors at every call site.
+    //     TRIED: a local newtype (`struct
+    //     AssetOracleStorageV16([u8; ASSET_ORACLE_WRAPPER_LEN])`) with a
+    //     local `unsafe impl MarketWrapperPod` -- legal under orphan rules
+    //     since the TYPE would be local even though the TRAIT is foreign,
+    //     and it would unblock ANY byte length. BLOCKED, not just risky:
+    //     `MarketWrapperPod` is not part of the engine's public (non-`kani`)
+    //     API in the first place -- `~/percolator/src/lib.rs` declares
+    //     `#[cfg(not(kani))] mod v16;` (PRIVATE) and re-exports only an
+    //     explicit allowlist (`pub use v16::{ ... }`, also
+    //     `#[cfg(not(kani))]`) that does not name `MarketWrapperPod` --
+    //     so it cannot be NAMED from this crate in a normal build
+    //     (confirmed: `error[E0603]: module 'v16' is private`), let alone
+    //     implemented for a new type. Only the engine's own
+    //     `impl_market_wrapper_pod_for_byte_arrays!` invocation can grow
+    //     that impl set. REVERTED; `AssetOracleStorageV16` stays the plain
+    //     type alias it always was (see its own definition below). Given
+    //     this, the only value that compiles without an engine change is
+    //     the smallest engine-precedented size ABOVE 512: 1024.
+    //
+    // (2) That 1024-byte slot exposes (does not introduce) a LATENT,
+    //     PRE-EXISTING bug: `handle_update_asset_lifecycle`'s
+    //     `market_ai.realloc(new_len, true)` call (permissionless/admin
+    //     asset activation growing the market by one slot at a time from a
+    //     small starting capacity) fails with `InvalidRealloc` once
+    //     `new_len` ALONE exceeds `solana_program::entrypoint::
+    //     MAX_PERMITTED_DATA_INCREASE` (10_240 bytes) -- REGARDLESS of the
+    //     account's actual prior size. Root cause (confirmed empirically by
+    //     a temporary `msg!` probe, since reverted):
+    //     `AccountInfo::original_data_len()` -- the unsafe 4-byte read
+    //     `solana_program::account_info::AccountInfo::realloc` uses to
+    //     compute the TRUE incremental delta -- reads back `0` for this
+    //     program's accounts under its Anchor-v2/Pinocchio entrypoint
+    //     bridge, instead of the account's real pre-instruction length.
+    //     With that field reading 0, `realloc`'s internal check degenerates
+    //     from "reject a >10_240-byte INCREASE" to "reject a >10_240-byte
+    //     ABSOLUTE new length", a much tighter, non-obvious ceiling. This is
+    //     100% PRE-EXISTING (confirmed: this unit's diff touches zero
+    //     entrypoint/serialization code) -- baseline `origin/main` has the
+    //     identical bug and already fails the identical way once a market
+    //     grown one slot at a time from capacity 1 reaches capacity 5
+    //     (`cap5_len` = 10_415 > 10_240 on baseline's original 512-byte
+    //     slot); no currently-passing test happens to reach capacity 5 via
+    //     that path, so it was invisible before this unit's necessary
+    //     growth to 1024 pulled the SAME ceiling down to capacity 4, which
+    //     TWO existing tests (`v16_bpf_permissionless_asset_cannot_
+    //     withdraw_unrelated_domain_insurance`,
+    //     `v16_bpf_permissionless_oracle_liquidation_uses_only_its_own_
+    //     domain_insurance`) do reach. NOT FIXED here: fixing the root
+    //     cause (why `original_data_len` reads 0 under this entrypoint
+    //     bridge) is a cross-cutting, security-relevant entrypoint/ABI
+    //     question, not an asset-control-sequences layout question, and a
+    //     narrower workaround (pick a smaller `ASSET_ORACLE_WRAPPER_LEN`
+    //     via option (1)'s newtype) is exactly what's BLOCKED above. Left
+    //     as 2 KNOWN, EXPLAINED test regressions (byte-identical to
+    //     baseline otherwise) -- this unit's handback report is the
+    //     STOP-and-report; it also bounds how large a market can ever grow
+    //     via this exact code path in PRODUCTION, not just in tests, which
+    //     makes this a HIGH-PRIORITY finding independent of this unit.
+    //
+    //   - `sync/w2-tb3` ("adopt intent_id one-shot replay nonce on top-up
+    //     instructions") appends `insurance_top_up: u64` +
+    //     `backing_top_up: u64` (16B) to the END of `AssetOracleProfileV16`
+    //     itself (480 -> 496), NOT into this struct -- TB-3's own comment
+    //     explains it deliberately did not adopt `AssetControlSequencesV16`
+    //     ("that struct and its sibling lanes are W2-TB-1/TB-2/TB-5 scope,
+    //     NOT adopted here").
+    //   - `sync/w2-tb1a-portfolio-identity` independently ALSO appends to
+    //     `AssetOracleProfileV16`'s tail: `next_portfolio_id: u64` + 8 bytes
+    //     of explicit Pod-alignment padding (16B), ALSO 480 -> 496.
+    //
+    // Both siblings claim the same 480..512 region from the SAME 480-byte
+    // baseline (they do not know about each other), so at the Wave-2
+    // integration pass their two diffs splice together into ONE
+    // `AssetOracleProfileV16` growing 480 -> 512 (`insurance_top_up`,
+    // `backing_top_up`, `next_portfolio_id`, `_padding2`, in that order,
+    // filling the full 32 bytes that were spare before either of them
+    // started). `ASSET_RESERVED_TB3_TOPUP_OFF`/`ASSET_RESERVED_TB1A_
+    // PORTFOLIO_ID_OFF` below reserve exactly that 32-byte region -- inert,
+    // asserted-zero padding on THIS branch -- so the two sibling diffs have
+    // a byte-identical landing spot to merge into and this unit's own
+    // `AssetControlSequencesV16` region does not have to move at
+    // integration (it already starts at the post-merge profile boundary,
+    // 512). See `ASSET_CONTROL_SEQUENCES_OFF` for that struct's own offset
+    // and `read_asset_control_sequences`/`write_asset_control_sequences`
+    // for its accessors.
+    //
+    // Layout inside the new 1024-byte `ASSET_ORACLE_WRAPPER_LEN` slot (the
+    // smallest engine-precedented size above 512, per constraint (1) above
+    // -- NOT a free choice; a smaller value such as 768 would have kept
+    // `cap4_len` comfortably under the 10_240-byte ceiling from constraint
+    // (2) too, but is unreachable without the blocked newtype):
+    //   [   0,  480) AssetOracleProfileV16              (UNCHANGED, this unit
+    //                                                     does not touch it)
+    //   [ 480,  496) reserved for TB-3's 2 lanes         (16B, asserted zero)
+    //   [ 496,  512) reserved for TB-1a's 1 lane + pad   (16B, asserted zero)
+    //   [ 512,  600) AssetControlSequencesV16            (88B, THIS unit)
+    //   [ 600, 1024) spare headroom                      (424B)
+    pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
+
+    /// TB-2a: start of the reserved placeholder for `sync/w2-tb3`'s
+    /// `insurance_top_up`/`backing_top_up` lanes (not adopted on this
+    /// branch -- see `ASSET_ORACLE_WRAPPER_LEN`'s doc comment). Always
+    /// exactly `ASSET_ORACLE_PROFILE_LEN` so the reserved region begins the
+    /// instant the (unchanged) profile struct ends.
+    pub const ASSET_RESERVED_TB3_TOPUP_OFF: usize = ASSET_ORACLE_PROFILE_LEN;
+    /// 2 lanes x u64 = 16 bytes, matching TB-3's actual append size exactly.
+    pub const ASSET_RESERVED_TB3_TOPUP_LEN: usize = 16;
+
+    /// TB-2a: start of the reserved placeholder for
+    /// `sync/w2-tb1a-portfolio-identity`'s `next_portfolio_id` lane + its
+    /// Pod-alignment pad (not adopted on this branch -- see
+    /// `ASSET_ORACLE_WRAPPER_LEN`'s doc comment).
+    pub const ASSET_RESERVED_TB1A_PORTFOLIO_ID_OFF: usize =
+        ASSET_RESERVED_TB3_TOPUP_OFF + ASSET_RESERVED_TB3_TOPUP_LEN;
+    /// 1 lane (u64) + 8 bytes explicit pad = 16 bytes, matching TB-1a's
+    /// actual append size exactly.
+    pub const ASSET_RESERVED_TB1A_PORTFOLIO_ID_LEN: usize = 16;
+
+    /// TB-2a: byte offset of `AssetControlSequencesV16` within each asset's
+    /// `ASSET_ORACLE_WRAPPER_LEN`-byte wrapper slot. Sits immediately after
+    /// both sibling reservations, at exactly the offset `AssetOracleProfileV16`
+    /// will end at once TB-3 and TB-1a are integrated (480 + 16 + 16 = 512) --
+    /// so integrating them is a pure constant simplification
+    /// (`ASSET_CONTROL_SEQUENCES_OFF` collapses to `= ASSET_ORACLE_PROFILE_LEN`,
+    /// matching upstream's own definition in `ef3b1a55`) and never requires
+    /// moving this struct's bytes.
+    pub const ASSET_CONTROL_SEQUENCES_OFF: usize =
+        ASSET_RESERVED_TB1A_PORTFOLIO_ID_OFF + ASSET_RESERVED_TB1A_PORTFOLIO_ID_LEN;
+    /// `size_of::<state::AssetControlSequencesV16>()`: 9 x u64 lanes (72B)
+    /// plus a 16B reserved tail, matching upstream `ef3b1a55`'s struct
+    /// exactly (88B total). Asserted against the real struct size below the
+    /// struct definition, the same convention `ASSET_ORACLE_PROFILE_LEN`
+    /// uses.
+    pub const ASSET_CONTROL_SEQUENCES_LEN: usize = 88;
+
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
     pub const PORTFOLIO_STATE_LEN: usize = size_of::<PortfolioAccountV16Account>();
@@ -756,7 +915,10 @@ pub mod error {
 pub mod state {
     use crate::{
         constants::{
-            ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
+            ASSET_CONTROL_SEQUENCES_LEN, ASSET_CONTROL_SEQUENCES_OFF, ASSET_ORACLE_PROFILE_LEN,
+            ASSET_RESERVED_TB1A_PORTFOLIO_ID_LEN, ASSET_RESERVED_TB1A_PORTFOLIO_ID_OFF,
+            ASSET_RESERVED_TB3_TOPUP_LEN, ASSET_RESERVED_TB3_TOPUP_OFF,
+            ASSET_ORACLE_WRAPPER_LEN, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
             EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN, HEADER_LEN,
             KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_MARKET, KIND_PORTFOLIO, MAGIC,
             MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
@@ -1578,6 +1740,210 @@ pub mod state {
     // slot.
     const _: () = assert!(core::mem::size_of::<AssetOracleProfileV16>() == ASSET_ORACLE_PROFILE_LEN);
 
+    /// TB-2a (W2, "asset control-sequences INFRA"; ADOPTS upstream `ef3b1a55`
+    /// "fix: sequence-bind retained market controls" byte-for-byte -- see
+    /// `git show ef3b1a55:src/v16_program.rs`): wrapper-only ordering
+    /// watermarks stored in the (grown) unused tail of each asset's wrapper
+    /// slot, at `ASSET_CONTROL_SEQUENCES_OFF`. Asset zero owns the
+    /// market-wide policy lanes (`trade_fee`, `liquidation_fee`,
+    /// `maintenance_fee`, `fee_redirect`, `market_init_fee`,
+    /// `permissionless_resolve`); `oracle_observation` and the backing-fee
+    /// lanes are per asset. Each lane is a caller-supplied
+    /// strictly-increasing nonce (an instruction-level `..._sequence`
+    /// argument such as `policy_sequence`/`observation_sequence` in
+    /// `ef3b1a55`'s `Instruction` variants) checked by
+    /// `require_newer_control_sequence` before the corresponding admin
+    /// instruction is allowed to take effect, so a captured/delayed
+    /// transaction cannot be replayed against a since-superseded
+    /// authority/policy/observation. `0` is the "never used" legacy
+    /// sentinel (this fork does no legacy backfill -- see
+    /// `ASSET_ORACLE_WRAPPER_LEN`'s doc comment -- so a fresh asset slot
+    /// reads every lane as `0`, meaning the first valid caller-supplied
+    /// sequence value for any lane must be `>= 1`).
+    ///
+    /// SCOPE (infra only -- this unit does NOT wire these lanes to any tag):
+    /// no instruction currently reads or writes this struct. Binding it to
+    /// the ~20 admin/observation tag sites (`UpdateLiquidationFeePolicy`,
+    /// `ConfigureHybridOracle`, `PushAuthMark`, etc., matching `ef3b1a55`'s
+    /// `Instruction` diff) is `sync/w2-tb2b`'s job; TB-5's watermark work
+    /// also builds on this struct. Every accessor below is therefore
+    /// `#[allow(dead_code)]` with a `TB-2b future consumer` marker, exactly
+    /// like TB-1a/TB-3 left their own not-yet-wired infra.
+    ///
+    /// REPRESENTATION CHOICE: this is a struct/byte-region INDEPENDENT of
+    /// `AssetOracleProfileV16` (matching upstream's own `ef3b1a55` design:
+    /// `ASSET_CONTROL_SEQUENCES_OFF` sits right after where the profile
+    /// ends, with its own `read_asset_control_sequences`/
+    /// `write_asset_control_sequences` accessors, byte-disjoint from the
+    /// profile's `read_asset_oracle_profile`/`write_asset_oracle_profile`)
+    /// rather than fields embedded inside `AssetOracleProfileV16` itself
+    /// (the alternative, matching how TB-3/TB-1a appended their own lanes).
+    /// Rationale: `write_oracle_profile_to_view`/`write_asset_oracle_profile`
+    /// write ONLY `market.wrapper[..ASSET_ORACLE_PROFILE_LEN]` (verified by
+    /// inspection -- there is no wider write to `market.wrapper` anywhere
+    /// in this file), so every one of the 4-5 `AssetOracleProfileV16`
+    /// reconstruction sites (oracle-mode reconfigure/restart/lifecycle)
+    /// physically cannot touch this struct's disjoint byte range --
+    /// nothing to reset, no copy-forward code needed, no risk of a future
+    /// site forgetting to preserve a lane. It also means the Wave-2
+    /// integration pass never has to interleave three different units'
+    /// field lists inside the SAME struct: TB-3 and TB-1a's real fields
+    /// simply replace this file's `ASSET_RESERVED_TB3_TOPUP_*`/
+    /// `ASSET_RESERVED_TB1A_PORTFOLIO_ID_*` placeholder bytes in
+    /// `AssetOracleProfileV16`'s own tail, `ASSET_CONTROL_SEQUENCES_OFF`
+    /// collapses from this branch's explicit constant to
+    /// `= ASSET_ORACLE_PROFILE_LEN` (matching upstream exactly), and this
+    /// struct's own bytes never move.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct AssetControlSequencesV16 {
+        pub oracle_observation: u64,
+        pub backing_fee_long: u64,
+        pub backing_fee_short: u64,
+        pub trade_fee: u64,
+        pub liquidation_fee: u64,
+        pub maintenance_fee: u64,
+        pub fee_redirect: u64,
+        pub market_init_fee: u64,
+        pub permissionless_resolve: u64,
+        /// Explicit, asserted-zero headroom (see `validate_asset_control_
+        /// sequences`) matching upstream `ef3b1a55` byte-for-byte. Deliberately
+        /// left spare rather than immediately assigned: upstream's OWN later
+        /// history (commits after `ef3b1a55`, out of this unit's scope) grows
+        /// this exact struct further by consuming this same reserved tail
+        /// (e.g. an `authority_epoch` lane), so keeping it unassigned here
+        /// gives a future unit the same option without another slot resize.
+        pub _reserved: [u8; 16],
+    }
+
+    const _: () = assert!(
+        core::mem::size_of::<AssetControlSequencesV16>() == ASSET_CONTROL_SEQUENCES_LEN
+    );
+
+    // TB-2a layout self-checks. These make the byte map documented on
+    // `ASSET_ORACLE_WRAPPER_LEN` a COMPILE-TIME guarantee, not just a
+    // comment -- any future edit that drifts the layout fails the build
+    // here instead of silently desyncing the zero-copy account format.
+    //
+    //   [   0,  480) AssetOracleProfileV16              (untouched by this unit)
+    //   [ 480,  496) reserved for TB-3's 2 lanes         (16B)
+    //   [ 496,  512) reserved for TB-1a's 1 lane + pad   (16B)
+    //   [ 512,  600) AssetControlSequencesV16            (88B)
+    //   [ 600, 1024) spare headroom                      (424B)
+    const _: () = assert!(ASSET_RESERVED_TB3_TOPUP_OFF == ASSET_ORACLE_PROFILE_LEN);
+    const _: () = assert!(ASSET_RESERVED_TB3_TOPUP_OFF == 480);
+    const _: () = assert!(ASSET_RESERVED_TB3_TOPUP_LEN == 16);
+    const _: () = assert!(ASSET_RESERVED_TB1A_PORTFOLIO_ID_OFF == 496);
+    const _: () = assert!(ASSET_RESERVED_TB1A_PORTFOLIO_ID_LEN == 16);
+    const _: () = assert!(ASSET_CONTROL_SEQUENCES_OFF == 512);
+    const _: () = assert!(ASSET_CONTROL_SEQUENCES_LEN == 88);
+    const _: () = assert!(ASSET_ORACLE_WRAPPER_LEN == 1024);
+    // NOT asserted here (deliberately, unlike the guards above): "cap4_len
+    // stays under the pre-existing realloc ceiling" -- constraint (2) in
+    // `ASSET_ORACLE_WRAPPER_LEN`'s doc comment. At 1024 it is KNOWINGLY
+    // VIOLATED (`MIN_MARKET_ACCOUNT_LEN + 4 * MARKET_ASSET_SLOT_LEN` =
+    // 10_650 > 10_240), which is exactly the 2 known, reported test
+    // regressions -- a `const` assert here would just fail the build
+    // instead of documenting the finding. See this unit's handback report.
+    #[cfg(any())]
+    const _: () = assert!(MIN_MARKET_ACCOUNT_LEN + 4 * MARKET_ASSET_SLOT_LEN < 10_240);
+    // Non-overlap + in-bounds: the control-sequences region must fit entirely
+    // inside the wrapper slot, strictly after both reserved regions and the
+    // (unchanged) profile, with no negative headroom.
+    const _: () = assert!(ASSET_CONTROL_SEQUENCES_OFF >= ASSET_ORACLE_PROFILE_LEN);
+    const _: () = assert!(
+        ASSET_CONTROL_SEQUENCES_OFF + ASSET_CONTROL_SEQUENCES_LEN <= ASSET_ORACLE_WRAPPER_LEN
+    );
+    // `AssetOracleProfileV16` itself is append-only and UNCHANGED by this unit
+    // (verify via `git diff origin/main -- src/v16_program.rs`: zero lines
+    // touched inside that struct's definition) -- its own existing
+    // `const _: () = assert!(core::mem::size_of::<AssetOracleProfileV16>() ==
+    // ASSET_ORACLE_PROFILE_LEN);` guard, unmodified, above, is therefore
+    // still the authoritative proof that every pre-existing field offset is
+    // unchanged: an unmodified `#[repr(C)]` struct definition cannot produce
+    // a different layout.
+
+    #[inline]
+    fn asset_control_sequences_range(
+        data: &[u8],
+        asset_index: usize,
+    ) -> Result<core::ops::Range<usize>, ProgramError> {
+        let capacity = market_slot_capacity(data)?;
+        if asset_index >= capacity {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let start = dynamic_slot_offset(asset_index)?
+            .checked_add(ASSET_CONTROL_SEQUENCES_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(start..start + ASSET_CONTROL_SEQUENCES_LEN)
+    }
+
+    /// TB-2b future consumer: no instruction site validates a caller-supplied
+    /// `AssetControlSequencesV16` yet.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn validate_asset_control_sequences(
+        sequences: &AssetControlSequencesV16,
+    ) -> Result<(), ProgramError> {
+        if sequences._reserved != [0u8; 16] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// TB-2b future consumer: no instruction site reads this struct yet.
+    #[allow(dead_code)]
+    pub fn read_asset_control_sequences(
+        data: &[u8],
+        asset_index: usize,
+    ) -> Result<AssetControlSequencesV16, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = asset_control_sequences_range(data, asset_index)?;
+        let bytes = data.get(range).ok_or(PercolatorError::InvalidAccountLen)?;
+        let sequences: AssetControlSequencesV16 = bytemuck::pod_read_unaligned(bytes);
+        validate_asset_control_sequences(&sequences)?;
+        Ok(sequences)
+    }
+
+    /// TB-2b future consumer: no instruction site writes this struct yet.
+    #[allow(dead_code)]
+    pub fn write_asset_control_sequences(
+        data: &mut [u8],
+        asset_index: usize,
+        sequences: &AssetControlSequencesV16,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        validate_asset_control_sequences(sequences)?;
+        let range = asset_control_sequences_range(data, asset_index)?;
+        data.get_mut(range)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(sequences));
+        Ok(())
+    }
+
+    /// ADOPT upstream `ef3b1a55`/`20f0b9b1`'s helper of the same name,
+    /// byte-for-byte (this fork's `sync/w2-tb3` unit already carries an
+    /// identical copy for its own two ad hoc top-up-nonce fields, which are
+    /// NOT part of this struct -- see `ASSET_ORACLE_WRAPPER_LEN`'s doc
+    /// comment; the two copies are expected to be de-duplicated into one at
+    /// the Wave-2 integration pass since both adopt the same upstream
+    /// helper). Rejects a caller-supplied sequence value that is not
+    /// STRICTLY greater than the stored watermark -- `current == 0` is the
+    /// legacy "never used" sentinel, so the first valid value for a fresh
+    /// lane must be `>= 1`.
+    ///
+    /// TB-2b future consumer: no instruction site calls this for an
+    /// `AssetControlSequencesV16` lane yet (only `sync/w2-tb3`'s own
+    /// separate top-up-nonce fields call the identical logic above).
+    #[allow(dead_code)]
+    #[inline]
+    pub fn require_newer_control_sequence(current: u64, proposed: u64) -> Result<(), ProgramError> {
+        if proposed <= current {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        Ok(())
+    }
+
     /// Aggregate backing-domain accounting for an authority-controlled vault.
     /// This intentionally contains no per-depositor state; external authority
     /// programs can use these monotonic counters to run their own subledgers.
@@ -1743,6 +2109,24 @@ pub mod state {
         }
     }
 
+    // TB-2a: this was going to be a local newtype (`struct
+    // AssetOracleStorageV16([u8; ASSET_ORACLE_WRAPPER_LEN])`) with a local
+    // `unsafe impl MarketWrapperPod`, to unlock an `ASSET_ORACLE_WRAPPER_LEN`
+    // value smaller than 1024 (see that constant's own doc comment,
+    // constraint (1)) and thereby also dodge constraint (2)'s realloc
+    // regression. REVERTED: `percolator::v16::MarketWrapperPod`
+    // (`~/percolator/src/v16.rs`, pinned `c141d47f`) is NOT part of the
+    // engine's public (non-`kani`) API -- `mod v16;` is private under
+    // `#[cfg(not(kani))]` and the crate-root `pub use v16::{ ... }`
+    // allowlist (also `#[cfg(not(kani))]`) does not name
+    // `MarketWrapperPod` -- so it cannot be NAMED from this crate in a
+    // normal (non-kani) build, let alone implemented for a new type. This
+    // is a deliberate boundary (only the engine's own
+    // `impl_market_wrapper_pod_for_byte_arrays!` macro can grow that impl
+    // set), not a workaround-able oversight, confirmed via `error[E0603]:
+    // module 'v16' is private`. Left as plain type alias; see this unit's
+    // report for the STOP-and-report this triggered and the recommended
+    // (minimal, additive) engine-side fix.
     pub type AssetOracleStorageV16 = [u8; ASSET_ORACLE_WRAPPER_LEN];
     pub type MarketViewMutV16<'a> = MarketGroupV16ViewMut<'a, AssetOracleStorageV16>;
 
@@ -22173,6 +22557,192 @@ pub mod processor {
                 state::wrapper_config_len_for_test(),
                 "WRAPPER_CONFIG_LEN must equal size_of::<WrapperConfigV16>() for the zero-copy layout",
             );
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // TB-2a: AssetControlSequencesV16 infra tests (W2, "asset
+        // control-sequences INFRA"; ADOPTS upstream `ef3b1a55`). No tag
+        // site consumes this struct yet (`sync/w2-tb2b`'s job) -- these
+        // tests exercise the struct and its accessors directly.
+        // ═══════════════════════════════════════════════════════════════
+
+        fn populated_control_sequences() -> state::AssetControlSequencesV16 {
+            state::AssetControlSequencesV16 {
+                oracle_observation: 11,
+                backing_fee_long: 22,
+                backing_fee_short: 33,
+                trade_fee: 44,
+                liquidation_fee: 55,
+                maintenance_fee: 66,
+                fee_redirect: 77,
+                market_init_fee: 88,
+                permissionless_resolve: 99,
+                _reserved: [0u8; 16],
+            }
+        }
+
+        /// Builds a minimal synthetic `KIND_MARKET` account buffer with
+        /// `asset_capacity` asset slots, valid enough for `check_header` /
+        /// `market_slot_capacity` (which derive capacity purely from
+        /// `data.len()`, not from any stored header field -- see
+        /// `state::market_slot_capacity`). Every byte beyond the 11-byte
+        /// header prefix is zero, matching a freshly re-seeded (never
+        /// written) account.
+        fn test_market_buffer(asset_capacity: usize) -> alloc::vec::Vec<u8> {
+            let len = constants::MIN_MARKET_ACCOUNT_LEN
+                + asset_capacity * constants::MARKET_ASSET_SLOT_LEN;
+            let mut data = vec![0u8; len];
+            data[0..8].copy_from_slice(&constants::MAGIC.to_le_bytes());
+            data[8..10].copy_from_slice(&constants::VERSION.to_le_bytes());
+            data[10] = constants::KIND_MARKET;
+            data
+        }
+
+        #[test]
+        fn asset_control_sequences_struct_roundtrip_via_pod_bytes() {
+            // "struct roundtrip (write -> read each lane)": every lane survives
+            // a raw Pod byte serialize/deserialize round trip distinctly (no
+            // aliasing between lanes, no hidden padding silently dropping a
+            // value -- the load-bearing property `#[derive(bytemuck::Pod)]`
+            // and the `ASSET_CONTROL_SEQUENCES_LEN` size-assert exist to
+            // guarantee).
+            let seq = populated_control_sequences();
+            let bytes = bytemuck::bytes_of(&seq);
+            assert_eq!(bytes.len(), constants::ASSET_CONTROL_SEQUENCES_LEN);
+            let roundtripped: state::AssetControlSequencesV16 = bytemuck::pod_read_unaligned(bytes);
+            assert_eq!(roundtripped, seq);
+            assert_eq!(roundtripped.oracle_observation, 11);
+            assert_eq!(roundtripped.backing_fee_long, 22);
+            assert_eq!(roundtripped.backing_fee_short, 33);
+            assert_eq!(roundtripped.trade_fee, 44);
+            assert_eq!(roundtripped.liquidation_fee, 55);
+            assert_eq!(roundtripped.maintenance_fee, 66);
+            assert_eq!(roundtripped.fee_redirect, 77);
+            assert_eq!(roundtripped.market_init_fee, 88);
+            assert_eq!(roundtripped.permissionless_resolve, 99);
+        }
+
+        #[test]
+        fn asset_control_sequences_zero_init_is_never_used_sentinel() {
+            // A freshly re-seeded (never written) asset slot reads every lane
+            // as 0 -- the documented "never used" sentinel, matching TB-3's
+            // identical convention for its own top-up-nonce lanes. Zeroed
+            // `_reserved` must also validate cleanly.
+            let seq = state::AssetControlSequencesV16::default();
+            assert_eq!(seq.oracle_observation, 0);
+            assert_eq!(seq.backing_fee_long, 0);
+            assert_eq!(seq.backing_fee_short, 0);
+            assert_eq!(seq.trade_fee, 0);
+            assert_eq!(seq.liquidation_fee, 0);
+            assert_eq!(seq.maintenance_fee, 0);
+            assert_eq!(seq.fee_redirect, 0);
+            assert_eq!(seq.market_init_fee, 0);
+            assert_eq!(seq.permissionless_resolve, 0);
+            assert_eq!(seq._reserved, [0u8; 16]);
+            assert!(state::validate_asset_control_sequences(&seq).is_ok());
+
+            // bytemuck::Zeroable's all-zero bit pattern must agree with
+            // `Default` -- both are how a fresh account slot is actually read.
+            let zeroed: state::AssetControlSequencesV16 = bytemuck::Zeroable::zeroed();
+            assert_eq!(zeroed, seq);
+        }
+
+        #[test]
+        fn asset_control_sequences_rejects_nonzero_reserved() {
+            let mut seq = populated_control_sequences();
+            seq._reserved[0] = 1;
+            assert!(state::validate_asset_control_sequences(&seq).is_err());
+        }
+
+        // "advance/replay-reject via the shared require_newer_control_sequence
+        // for at least authority_epoch + policy_sequence + observation_sequence":
+        // this struct (ported verbatim from upstream `ef3b1a55`) does not carry
+        // a literal `authority_epoch` lane -- see the struct's own doc comment
+        // for why that lane is deliberately left for a future unit to carve out
+        // of `_reserved` rather than guessed at here. The three lane categories
+        // named in this unit's task ARE all present under their `ef3b1a55`
+        // names: `oracle_observation` is the "observation_sequence" lane, and
+        // `trade_fee`/`permissionless_resolve` are two independent
+        // "policy_sequence" lanes (matching `ef3b1a55`'s `UpdateTradeFeePolicy`/
+        // `ConfigurePermissionlessResolve` instruction arguments). All three are
+        // exercised below via the identical shared helper.
+
+        #[test]
+        fn require_newer_control_sequence_oracle_observation_lane() {
+            let mut seq = state::AssetControlSequencesV16::default();
+            // First use: 0 -> 5 is accepted (current == 0 is the sentinel).
+            assert!(state::require_newer_control_sequence(seq.oracle_observation, 5).is_ok());
+            seq.oracle_observation = 5;
+            // Advance: 5 -> 9 is accepted.
+            assert!(state::require_newer_control_sequence(seq.oracle_observation, 9).is_ok());
+            // Replay: resubmitting the SAME value (5) is rejected.
+            assert!(state::require_newer_control_sequence(seq.oracle_observation, 5).is_err());
+            // Regression: an older value (3 < 5) is rejected.
+            assert!(state::require_newer_control_sequence(seq.oracle_observation, 3).is_err());
+        }
+
+        #[test]
+        fn require_newer_control_sequence_trade_fee_lane() {
+            let mut seq = state::AssetControlSequencesV16::default();
+            assert!(state::require_newer_control_sequence(seq.trade_fee, 1).is_ok());
+            seq.trade_fee = 1;
+            assert!(state::require_newer_control_sequence(seq.trade_fee, 2).is_ok());
+            assert!(state::require_newer_control_sequence(seq.trade_fee, 1).is_err());
+            assert!(state::require_newer_control_sequence(seq.trade_fee, 0).is_err());
+        }
+
+        #[test]
+        fn require_newer_control_sequence_permissionless_resolve_lane() {
+            let mut seq = state::AssetControlSequencesV16::default();
+            assert!(state::require_newer_control_sequence(seq.permissionless_resolve, 42).is_ok());
+            seq.permissionless_resolve = 42;
+            assert!(state::require_newer_control_sequence(seq.permissionless_resolve, 100).is_ok());
+            assert!(state::require_newer_control_sequence(seq.permissionless_resolve, 42).is_err());
+            assert!(state::require_newer_control_sequence(seq.permissionless_resolve, 10).is_err());
+        }
+
+        #[test]
+        fn read_write_asset_control_sequences_roundtrip_through_market_bytes() {
+            let mut data = test_market_buffer(1);
+            let seq = populated_control_sequences();
+
+            state::write_asset_control_sequences(&mut data, 0, &seq)
+                .expect("write to a freshly re-seeded 1-asset market buffer must succeed");
+            let read_back = state::read_asset_control_sequences(&data, 0)
+                .expect("read back what was just written must succeed");
+            assert_eq!(read_back, seq);
+
+            // Byte-disjointness (see this struct's own doc comment on the
+            // representation choice): writing the control-sequences region
+            // must not touch a sentinel planted anywhere in
+            // `AssetOracleProfileV16`'s own [0, ASSET_ORACLE_PROFILE_LEN)
+            // range, nor in the TB-3/TB-1a reserved placeholder range
+            // [ASSET_ORACLE_PROFILE_LEN, ASSET_CONTROL_SEQUENCES_OFF).
+            let mut data_with_sentinel = test_market_buffer(1);
+            let profile_region = &mut data_with_sentinel
+                [constants::MARKET_GROUP_OFF + constants::MARKET_GROUP_LEN
+                    ..constants::MARKET_GROUP_OFF
+                        + constants::MARKET_GROUP_LEN
+                        + constants::ASSET_CONTROL_SEQUENCES_OFF];
+            profile_region.fill(0xAB);
+            let before = profile_region.to_vec();
+            state::write_asset_control_sequences(&mut data_with_sentinel, 0, &seq)
+                .expect("write must succeed");
+            let after = &data_with_sentinel[constants::MARKET_GROUP_OFF + constants::MARKET_GROUP_LEN
+                ..constants::MARKET_GROUP_OFF
+                    + constants::MARKET_GROUP_LEN
+                    + constants::ASSET_CONTROL_SEQUENCES_OFF];
+            assert_eq!(
+                before, after,
+                "writing AssetControlSequencesV16 must not touch the disjoint profile/reserved bytes before it"
+            );
+        }
+
+        #[test]
+        fn read_asset_control_sequences_rejects_out_of_range_asset_index() {
+            let data = test_market_buffer(1);
+            // capacity is 1 (asset_index 0 only); index 1 is out of range.
+            assert!(state::read_asset_control_sequences(&data, 1).is_err());
         }
 
         fn test_wrapper_config(price: u64) -> state::WrapperConfigV16 {
