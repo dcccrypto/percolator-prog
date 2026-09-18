@@ -41,6 +41,17 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
+// sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only): test-only
+// monotonic nonce generator. Every call returns a value strictly greater
+// than the last, guaranteeing intent_id uniqueness across every top-up in
+// this test binary regardless of loops, shared helper functions, or how
+// many tests run -- so no existing test's outcome changes by acquiring a
+// fresh nonce (only a genuine same-value REPLAY is ever rejected).
+fn next_intent_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const MAX_PORTFOLIO_ASSETS: u16 = 1;
 const APPEND_ASSET_INDEX: u16 = 1;
 const DOMAIN: u16 = 2;
@@ -884,6 +895,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
         &payer_a,
         vec![(
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain: DOMAIN,
                 amount: DEPOSIT,
                 // Wave-1 S1a v2 griefing fix: LP_VAULT_BACKING_EXPIRY_SLOT is now reserved

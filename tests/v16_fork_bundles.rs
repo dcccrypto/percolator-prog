@@ -25,6 +25,8 @@ use percolator_prog::{
 /// Tests below tweak `max_staleness_secs` to exercise B-11 bound.
 fn hybrid_profile(max_staleness_secs: u64) -> AssetOracleProfileV16 {
     AssetOracleProfileV16 {
+        insurance_top_up: 0,
+        backing_top_up: 0,
         oracle_mode: ORACLE_MODE_HYBRID_AFTER_HOURS,
         oracle_leg_count: 1,
         oracle_leg_flags: 0,
