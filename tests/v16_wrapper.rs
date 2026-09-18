@@ -2305,7 +2305,8 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
 
     let before_disabled = market.data.clone();
     let disabled = run_ix(
-        Instruction::UpdateAssetLifecycle { market_id: 1,
+        Instruction::UpdateAssetLifecycle {
+            market_id: state::read_asset_lifecycle_generation_preflight(&market.data, 1, true).unwrap().1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -2318,7 +2319,16 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
         },
         &mut [&mut creator, &mut market],
     );
-    assert_err_and_market_unchanged(disabled, &market, &before_disabled);
+    // With the generation binding now correct, the rejection must come from
+    // the intended fee-policy gate (permissionless_market_init_fee == 0 ->
+    // Unauthorized, Custom(8)), not from an unrelated generation mismatch.
+    assert_eq!(
+        disabled,
+        Err(ProgramError::Custom(8)), // Unauthorized
+        "a permissionless activation before any init-fee policy is configured must be \
+         rejected by the fee-policy gate specifically, not by a generation mismatch"
+    );
+    assert_eq!(market.data, before_disabled, "rejected activation mutated market");
 
     let rejected_attacker = run_ix(
         Instruction::UpdateMarketInitFeePolicy { min_init_fee: 50 },
@@ -2632,7 +2642,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::UpdateAssetLifecycle { market_id: 1,
+        Instruction::UpdateAssetLifecycle { market_id: state::read_asset_lifecycle_generation_preflight(&market.data, 1, true).unwrap().1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -2881,7 +2891,11 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { market_id: 1, domain, amount },
+            Instruction::TopUpInsuranceDomain {
+                market_id: state::read_market_trade_preflight(&market.data, (domain as usize) / 2).unwrap().3,
+                domain,
+                amount,
+            },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3156,7 +3170,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     let mut reuse_source = user_token_account(creator.key, mint, 10);
     let mut reuse_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::UpdateAssetLifecycle { market_id: 1,
+        Instruction::UpdateAssetLifecycle { market_id: reuse_market_id,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 8,
@@ -3234,7 +3248,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut init_fee_vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::UpdateAssetLifecycle { market_id: 1,
+        Instruction::UpdateAssetLifecycle { market_id: state::read_asset_lifecycle_generation_preflight(&market.data, 1, true).unwrap().1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -3271,7 +3285,11 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { market_id: 1, domain, amount },
+            Instruction::TopUpInsuranceDomain {
+                market_id: state::read_market_trade_preflight(&market.data, (domain as usize) / 2).unwrap().3,
+                domain,
+                amount,
+            },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3441,7 +3459,11 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     for (domain, amount) in [(2u16, 20u128), (3u16, 25u128)] {
         let mut __lg4 = canonical_backing_ledger_account(&market, 0);
         run_ix(
-            Instruction::WithdrawBackingBucket { market_id: 1, domain, amount },
+            Instruction::WithdrawBackingBucket {
+                market_id: state::read_market_trade_preflight(&market.data, (domain as usize) / 2).unwrap().3,
+                domain,
+                amount,
+            },
             &mut [
                 &mut backing_authority,
                 &mut market,
@@ -3508,7 +3530,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut reuse_source = user_token_account(attacker.key, mint, 25);
     let mut reuse_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::UpdateAssetLifecycle { market_id: 1,
+        Instruction::UpdateAssetLifecycle { market_id: reuse_market_id,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 8,
@@ -17556,8 +17578,22 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
         match op {
             0 => {
                 // Per-domain insurance top-up (TopUpInsuranceDomain still uses domain).
+                // Wave-2 TB-4 fix (gate-2 finding): market_id must be the LIVE
+                // generation of the asset this domain maps to (asset_index =
+                // domain/2), not a hardcoded 1 -- assets 1 and 2 were appended
+                // after asset 0 already consumed generation 1, so their market_id
+                // is >= 2. A hardcoded 1 made every top-up on domains 2-5 fail
+                // and be silently swallowed by `if res.is_ok()` below, which let
+                // this stress test's cross-domain-isolation invariant pass
+                // vacuously for assets 1 and 2.
                 let res = run_ix(
-                    Instruction::TopUpInsuranceDomain { market_id: 1, domain, amount },
+                    Instruction::TopUpInsuranceDomain {
+                        market_id: state::read_market_trade_preflight(&market.data, asset_index)
+                            .unwrap()
+                            .3,
+                        domain,
+                        amount,
+                    },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17739,7 +17775,10 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                 let mut __lg30 = canonical_backing_ledger_account(&market, domain);
                 let mut __sp30 = system_program_account();
                 let res = run_ix(
-                    Instruction::TopUpBackingBucket { market_id: 1,
+                    Instruction::TopUpBackingBucket {
+                        market_id: state::read_market_trade_preflight(&market.data, (domain as usize) / 2)
+                            .unwrap()
+                            .3,
                         domain,
                         amount,
                         expiry_slot: FAR_EXPIRY,
@@ -17762,7 +17801,13 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
             1 => {
                 let mut __lg21 = canonical_backing_ledger_account(&market, 0);
                 let res = run_ix(
-                    Instruction::WithdrawBackingBucket { market_id: 1, domain, amount },
+                    Instruction::WithdrawBackingBucket {
+                        market_id: state::read_market_trade_preflight(&market.data, (domain as usize) / 2)
+                            .unwrap()
+                            .3,
+                        domain,
+                        amount,
+                    },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17790,7 +17835,10 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                 let before = market.data.clone();
                 let mut __lg22 = canonical_backing_ledger_account(&market, domain);
                 let res = run_ix(
-                    Instruction::WithdrawBackingBucket { market_id: 1,
+                    Instruction::WithdrawBackingBucket {
+                        market_id: state::read_market_trade_preflight(&market.data, (domain as usize) / 2)
+                            .unwrap()
+                            .3,
                         domain,
                         amount: over,
                     },
