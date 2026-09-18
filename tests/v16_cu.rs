@@ -7817,6 +7817,8 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
     };
     let r = env.send(
         ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
             legs: vec![under_base_leg],
         },
         accounts.clone(),
@@ -7860,6 +7862,8 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
     };
     env.send(
         ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
             legs: vec![at_base_leg],
         },
         accounts,
@@ -7877,6 +7881,133 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
         g1.vault,
         g1.c_tot + g1.insurance,
         "exact conservation after the consented base-fee BatchTradeCpi"
+    );
+}
+
+// ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent": `BatchTradeCpi` now carries a
+// caller-signed `max_fee_atoms` ceiling on the AGGREGATE engine fee charged to the signing taker
+// (account_a) across the whole batch. This is DISTINCT from the per-leg `fee_bps` consent floor
+// exercised above (`v16_attack_batch_trade_cpi_requires_signed_base_fee_consent`), which only
+// bounds the FEE RATE the taker signed off-chain against the market's live base rate -- it says
+// nothing about the aggregate ATOMS an external matcher's per-leg returns actually charge once
+// admitted. `max_fee_atoms` closes that gap directly, checked in
+// `handle_batch_execute_zero_copy` immediately once the engine's aggregate `outcome.fee_a` is
+// known, ahead of (and independent of) the pre-existing `batch_fee_charge_within_owed` guard.
+// The matcher context here is a zero-spread passive VAMM (`init_matcher_context`'s
+// `encode_matcher_init_passive`, base_spread_bps=0), so the fill lands exactly at the
+// authenticated oracle price and this leg's adverse slippage is zero -- `max_slippage_atoms` is
+// left at `u128::MAX` throughout so only the aggregate-FEE bound is under test here.
+#[test]
+fn v16_attack_batch_trade_cpi_rejects_over_bound_aggregate_fee() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let fee_bps = 500u64; // 5%
+    env.update_trade_fee_policy_with_cu(fee_bps);
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000);
+    env.deposit(&lp, lp_account, 1_000_000);
+
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+    let accounts = vec![
+        AccountMeta::new(taker.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(taker_account, false),
+        AccountMeta::new(lp_account, false),
+        AccountMeta::new_readonly(matcher_program, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(delegate, false),
+    ];
+
+    let size_q = (10 * POS_SCALE) as i128;
+    // Read the live effective price rather than assuming the market default, so this test does
+    // not silently mis-measure the bound if that default ever changes.
+    let exec_price_pre = env.market_state().1.assets[0].effective_price;
+    let expected_fee =
+        percolator_prog::processor::batch_leg_fee(size_q.unsigned_abs(), exec_price_pre, fee_bps)
+            .expect("fee math");
+    assert!(
+        expected_fee > 0,
+        "test setup must produce a nonzero fee to bound; got 0"
+    );
+
+    let leg = percolator_prog::ix::BatchTradeCpiLeg {
+        asset_index: 0,
+        size_q,
+        fee_bps,
+        limit_price: 0,
+    };
+
+    // ── 1. OVER BOUND: `max_fee_atoms` signed one atom below the fee this batch actually owes --
+    // REJECTED before any state mutation, matcher CPI notwithstanding.
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    env.svm.expire_blockhash();
+    let over = env.send(
+        ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: expected_fee - 1,
+            legs: vec![leg],
+        },
+        accounts.clone(),
+        &[&taker],
+    );
+    assert!(
+        over.is_err() && over.as_ref().unwrap_err().contains("Custom(9)"),
+        "aggregate fee {expected_fee} exceeding the taker's signed max_fee_atoms={} must reject \
+         with InvalidInstruction (Custom(9)): {over:?}",
+        expected_fee - 1
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected over-bound BatchTradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected over-bound BatchTradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&lp_account).unwrap(),
+        lp_before,
+        "a rejected over-bound BatchTradeCpi must not mutate the LP's portfolio"
+    );
+
+    // ── 2. CONTROL: `max_fee_atoms` signed exactly at the fee owed succeeds identically to an
+    // unbounded (u128::MAX) call -- the new cap does not reject a batch it should admit.
+    let ins0 = env.market_state().1.insurance;
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: expected_fee,
+            legs: vec![leg],
+        },
+        accounts,
+        &[&taker],
+    )
+    .expect(
+        "BatchTradeCpi whose aggregate fee is exactly at the taker's signed bound must succeed",
+    );
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.insurance > ins0,
+        "a within-bound BatchTradeCpi must still be charged; insurance {ins0} -> {}",
+        g1.insurance
+    );
+    assert_eq!(
+        g1.vault,
+        g1.c_tot + g1.insurance,
+        "exact conservation after the within-bound BatchTradeCpi"
     );
 }
 
@@ -13833,6 +13964,8 @@ fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_m
     env.svm.expire_blockhash();
     let fresh = env.send(
         ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
             legs: vec![leg.clone()],
         },
         accounts.clone(),
@@ -13867,7 +14000,11 @@ fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_m
 
     env.svm.expire_blockhash();
     let stale = env.send(
-        ProgInstruction::BatchTradeCpi { legs: vec![leg] },
+        ProgInstruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
+            legs: vec![leg],
+        },
         accounts.clone(),
         &[&taker],
     );
@@ -14039,7 +14176,11 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         };
         let err = if route_is_batch {
             env.send(
-                ProgInstruction::BatchTradeCpi { legs: vec![leg] },
+                ProgInstruction::BatchTradeCpi {
+                    max_slippage_atoms: u128::MAX,
+                    max_fee_atoms: u128::MAX,
+                    legs: vec![leg],
+                },
                 hostile_accounts.clone(),
                 &[&taker, &tail_signer],
             )
@@ -14086,7 +14227,11 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         };
         let ok_result = if route_is_batch {
             env.send(
-                ProgInstruction::BatchTradeCpi { legs: vec![leg] },
+                ProgInstruction::BatchTradeCpi {
+                    max_slippage_atoms: u128::MAX,
+                    max_fee_atoms: u128::MAX,
+                    legs: vec![leg],
+                },
                 ok_accounts,
                 &[&taker],
             )
@@ -14194,6 +14339,8 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
             let err = if route_is_batch {
                 env.send(
                     ProgInstruction::BatchTradeCpi {
+                        max_slippage_atoms: u128::MAX,
+                        max_fee_atoms: u128::MAX,
                         legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
                             asset_index: 1,
                             size_q: POS_SCALE as i128,
@@ -14293,6 +14440,8 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
         let err = if route_is_batch {
             env.send(
                 ProgInstruction::BatchTradeCpi {
+                    max_slippage_atoms: u128::MAX,
+                    max_fee_atoms: u128::MAX,
                     legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
                         asset_index: 0,
                         size_q: POS_SCALE as i128,
@@ -14442,7 +14591,11 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     env.svm.expire_blockhash();
     let over = env
         .send(
-            ProgInstruction::BatchTradeCpi { legs: mk_legs(OVER_LEGS) },
+            ProgInstruction::BatchTradeCpi {
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
+                legs: mk_legs(OVER_LEGS),
+            },
             matcher_accounts(
                 taker.pubkey(), env.market, taker_account, lp_account,
                 matcher_program, ctx, delegate, &small_tail,
@@ -14471,6 +14624,8 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     let rejected = env
         .send(
             ProgInstruction::BatchTradeCpi {
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
                 legs: mk_legs(MAX_LEGS),
             },
             matcher_accounts(
@@ -14504,6 +14659,8 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     let allowed_cu = env
         .send(
             ProgInstruction::BatchTradeCpi {
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
                 legs: mk_legs(MAX_LEGS),
             },
             matcher_accounts(
@@ -15135,7 +15292,11 @@ fn v16_bpf_batch_trade_cpi_fanout_budget_characterisation() {
         let tail = benign_tail(&mut env, tail_n);
         env.svm.expire_blockhash();
         env.send(
-            ProgInstruction::BatchTradeCpi { legs },
+            ProgInstruction::BatchTradeCpi {
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
+                legs,
+            },
             metas(
                 taker.pubkey(),
                 env.market,

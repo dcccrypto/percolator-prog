@@ -4275,6 +4275,17 @@ pub mod ix {
         /// Atomic multi-leg batch routed through an external matcher: one batched matcher CPI fills
         /// every leg against a single LP, then all fills apply with one end-state margin check.
         BatchTradeCpi {
+            /// Maximum aggregate adverse execution-price movement from the authenticated
+            /// landing-state prices the signing taker consents to, measured in quote atoms
+            /// summed across all legs (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi
+            /// consent" -- adapted: upstream also carries `account_b_portfolio_id`/
+            /// `account_b_position_epoch`/`account_b_matcher_sequence` on this variant; we lack
+            /// all three (no TB-1 portfolio-identity bloc in this fork yet) so only the two new
+            /// consent-cap fields are ported).
+            max_slippage_atoms: u128,
+            /// Maximum aggregate engine fee charged to the signing taker (account_a) across all
+            /// legs.
+            max_fee_atoms: u128,
             legs: Vec<BatchTradeCpiLeg>,
         },
         SetMatcherConfig {
@@ -4781,7 +4792,13 @@ pub mod ix {
                             limit_price: read_u64(&mut rest)?,
                         });
                     }
-                    Self::BatchTradeCpi { legs }
+                    let max_slippage_atoms = read_u128(&mut rest)?;
+                    let max_fee_atoms = read_u128(&mut rest)?;
+                    Self::BatchTradeCpi {
+                        max_slippage_atoms,
+                        max_fee_atoms,
+                        legs,
+                    }
                 }
                 68 => Self::SetMatcherConfig {
                     enabled: read_u8(&mut rest)?,
@@ -5160,7 +5177,11 @@ pub mod ix {
                         push_u64(&mut out, leg.fee_bps);
                     }
                 }
-                Self::BatchTradeCpi { ref legs } => {
+                Self::BatchTradeCpi {
+                    max_slippage_atoms,
+                    max_fee_atoms,
+                    ref legs,
+                } => {
                     out.push(67);
                     out.push(legs.len() as u8);
                     for leg in legs.iter() {
@@ -5169,6 +5190,8 @@ pub mod ix {
                         push_u64(&mut out, leg.fee_bps);
                         push_u64(&mut out, leg.limit_price);
                     }
+                    push_u128(&mut out, max_slippage_atoms);
+                    push_u128(&mut out, max_fee_atoms);
                 }
                 Self::SetMatcherConfig { enabled } => {
                     out.push(68);
@@ -7927,9 +7950,17 @@ pub mod processor {
             Instruction::BatchTradeNoCpi { legs } => {
                 handle_batch_trade_nocpi(program_id, accounts, &legs)
             }
-            Instruction::BatchTradeCpi { legs } => {
-                handle_batch_trade_cpi(program_id, accounts, &legs)
-            }
+            Instruction::BatchTradeCpi {
+                max_slippage_atoms,
+                max_fee_atoms,
+                legs,
+            } => handle_batch_trade_cpi(
+                program_id,
+                accounts,
+                max_slippage_atoms,
+                max_fee_atoms,
+                &legs,
+            ),
             Instruction::SetMatcherConfig { enabled } => {
                 handle_set_matcher_config(program_id, accounts, enabled)
             }
@@ -9154,6 +9185,7 @@ pub mod processor {
             account_b_ai,
             legs,
             max_market_slots,
+            None,
         )
     }
 
@@ -9167,6 +9199,12 @@ pub mod processor {
         account_b_ai: &AccountInfo<'a>,
         legs: &[ix::BatchTradeLeg],
         max_market_slots: usize,
+        // ADOPT upstream 42ec8ab6: the signing taker's (account_a's) caller-supplied ceiling on
+        // the AGGREGATE engine fee across this batch. `None` for `BatchTradeNoCpi` (both sides
+        // sign every leg's `fee_bps` directly, no CPI-return-controlled aggregate to bound).
+        // `Some(max_fee_atoms)` for `BatchTradeCpi`, where an external matcher's per-leg returns
+        // otherwise decide the charged aggregate unilaterally.
+        max_account_a_fee_atoms: Option<u128>,
     ) -> ProgramResult {
         if legs.is_empty() {
             return Err(PercolatorError::EngineNonProgress.into());
@@ -9374,6 +9412,18 @@ pub mod processor {
                     true,
                 )
                 .map_err(map_v16_error)?;
+            // FIX (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent"): for
+            // BatchTradeCpi, the taker's signed `max_fee_atoms` is a hard ceiling on the
+            // AGGREGATE engine fee charged to account_a across this batch (distinct from
+            // `batch_fee_charge_within_owed` below, which only checks the two aggregates never
+            // exceed what the RECONSTRUCTED per-leg `fee_bps` consent already owes -- a matcher
+            // that returns adverse-but-still-"owed" fills can still land within that bound while
+            // exceeding what the taker was willing to pay in absolute atoms for this specific
+            // batch). Checked immediately once `outcome` exists, same placement as upstream, so
+            // an over-cap batch aborts before any further post-trade accounting.
+            if max_account_a_fee_atoms.is_some_and(|cap| outcome.fee_a > cap) {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
             // FIX (ADOPT upstream 3496acf0, "enforce side OI caps"): checked per-leg
             // immediately after the engine mutates OI on this batch, before any other
             // post-trade check, so an over-cap post-state on ANY leg's asset aborts the
@@ -10654,6 +10704,13 @@ pub mod processor {
     fn handle_batch_trade_cpi<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        // ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent": the taker's signed
+        // aggregate ceilings across every leg of this batch. Upstream's variant also carries
+        // `account_b_portfolio_id`/`account_b_position_epoch`/`account_b_matcher_sequence`
+        // (TB-1's portfolio-identity bloc); this fork has none of those fields yet, so only the
+        // two consent-cap fields are ported (see `ADOPTION_ROADMAP.md`).
+        max_slippage_atoms: u128,
+        max_fee_atoms: u128,
         legs: &[ix::BatchTradeCpiLeg],
     ) -> ProgramResult {
         if legs.is_empty() || legs.len() > MATCHER_BATCH_MAX_LEGS {
@@ -10843,6 +10900,14 @@ pub mod processor {
         }
 
         let mut exec_legs: Vec<ix::BatchTradeLeg> = Vec::with_capacity(legs.len());
+        // ADOPT upstream 42ec8ab6: aggregate adverse slippage (quote atoms, summed across every
+        // leg's execution away from that leg's authenticated oracle price in the taker's adverse
+        // direction) must stay within the taker's signed `max_slippage_atoms` for this whole
+        // batch. A favorable leg contributes zero, so it cannot offset another leg's adverse
+        // movement -- this bounds worst-case taker slippage exposure to a hostile/collusive
+        // matcher return, independent of (and in addition to) the per-leg `limit_price` check
+        // below, which only bounds ONE leg's price in isolation.
+        let mut aggregate_slippage_atoms: u128 = 0;
         for (i, leg) in legs.iter().enumerate() {
             let chunk = &ret_data[i * matcher_abi::MATCHER_RETURN_BYTES
                 ..(i + 1) * matcher_abi::MATCHER_RETURN_BYTES];
@@ -10869,6 +10934,13 @@ pub mod processor {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
             }
+            let leg_slippage_atoms =
+                adverse_trade_slippage_atoms(ret.exec_size, ret.exec_price_e6, oracle_prices[i])?;
+            aggregate_slippage_atoms = accumulate_with_cap(
+                aggregate_slippage_atoms,
+                leg_slippage_atoms,
+                max_slippage_atoms,
+            )?;
             exec_legs.push(ix::BatchTradeLeg {
                 asset_index: leg.asset_index,
                 size_q: ret.exec_size,
@@ -10888,6 +10960,7 @@ pub mod processor {
             account_b_ai,
             &exec_legs,
             max_market_slots,
+            Some(max_fee_atoms),
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -20745,6 +20818,56 @@ pub mod processor {
             .checked_add(percolator::POS_SCALE - 1)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?
             / percolator::POS_SCALE)
+    }
+
+    // FIX (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent"): bound the aggregate
+    // adverse slippage and fee a `BatchTradeCpi` taker is exposed to across every leg of one
+    // atomic batch, in addition to the pre-existing per-leg `fee_bps` consent floor
+    // (`trade_fee_base_bps_pre > leg.fee_bps` in `handle_batch_trade_cpi`, which bounds the
+    // FEE RATE the taker signed, not the aggregate ATOMS a multi-leg matcher return can extract).
+    // Ported here (in `processor`, not `policy_v16`) because it reuses this module's existing
+    // private `risk_notional_ceil` rather than duplicating a second copy of it; adapted to this
+    // module's `Result<_, ProgramError>` idiom instead of upstream's `Option<_>`.
+
+    /// Quote-atom loss from executing away from the authenticated landing-state price in the
+    /// taker's adverse direction. A favorable execution contributes zero and therefore cannot
+    /// offset another leg's adverse movement.
+    fn adverse_trade_price_delta(
+        size_q: i128,
+        exec_price: u64,
+        authenticated_price: u64,
+    ) -> Result<u64, ProgramError> {
+        if size_q == i128::MIN {
+            return Err(PercolatorError::EngineArithmeticOverflow.into());
+        }
+        Ok(match size_q.cmp(&0) {
+            core::cmp::Ordering::Greater => exec_price.saturating_sub(authenticated_price),
+            core::cmp::Ordering::Less => authenticated_price.saturating_sub(exec_price),
+            core::cmp::Ordering::Equal => 0,
+        })
+    }
+
+    fn adverse_trade_slippage_atoms(
+        size_q: i128,
+        exec_price: u64,
+        authenticated_price: u64,
+    ) -> Result<u128, ProgramError> {
+        let adverse_price_delta =
+            adverse_trade_price_delta(size_q, exec_price, authenticated_price)?;
+        risk_notional_ceil(size_q.unsigned_abs(), adverse_price_delta)
+    }
+
+    /// Add `amount` to `total`, rejecting (rather than saturating or silently accepting) once the
+    /// running total would exceed `cap` -- the caller's signed aggregate bound.
+    fn accumulate_with_cap(total: u128, amount: u128, cap: u128) -> Result<u128, ProgramError> {
+        let next = total
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if next <= cap {
+            Ok(next)
+        } else {
+            Err(PercolatorError::InvalidInstruction.into())
+        }
     }
 
     // Per-asset accrual dt, mirroring the engine's

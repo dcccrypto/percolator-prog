@@ -18922,6 +18922,8 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
     // account_a, account_b, matcher_prog, matcher_ctx, matcher_delegate].
     run_ix(
         Instruction::BatchTradeCpi {
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
             legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
