@@ -865,7 +865,14 @@ fn lp_deposit_backing_state_matches_top_up() {
         ProgInstruction::TopUpBackingBucket {
             domain: DOMAIN,
             amount: DEPOSIT,
-            expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT,
+            // Wave-1 S1a v2 griefing fix: LP_VAULT_BACKING_EXPIRY_SLOT is now reserved
+            // exclusively to the LP-vault-registry call sites (handle_deposit_to_lp_vault
+            // / rebalance / fee-crank-reclassify), which stamp it directly, never through
+            // this caller-supplied-argument handler. This test only compares
+            // BackingDomainLedger counters + vault totals below (never expiry_slot
+            // itself), so any valid large future expiry preserves the exact comparison --
+            // use SENTINEL - 1 rather than the reserved sentinel.
+            expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT - 1,
         },
         vec![
             AccountMeta::new(admin_a.pubkey(), true),
