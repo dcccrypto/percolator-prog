@@ -541,10 +541,19 @@ fn run_trade_cpi_with_matcher(
     // B-side LP to have called SetMatcherConfig first, registering the specific (matcher_prog,
     // matcher_ctx, delegate) triple.  Without this, matcher_tail_start_or_verify_lp_config
     // returns Unauthorized.  Register now; the SetMatcherConfig call is idempotent per trade.
+    let (matcher_config_portfolio_id, matcher_config_expected_sequence, _) =
+        portfolio_identity(account_b);
     run_ix(
         Instruction::SetMatcherConfig {
+            portfolio_id: matcher_config_portfolio_id,
+            expected_sequence: matcher_config_expected_sequence,
             enabled: 1,
             trade_fee_cap_bps: 10_000,
+            // TB-1b: a live future slot -- the harness's native `run_ix` has no
+            // Clock sysvar, so the program falls back to slot 0 here
+            // (`authenticated_slot_or_fallback(0)`); u64::MAX is live under both
+            // that fallback and a real Clock.
+            expiry_slot: u64::MAX,
         },
         &mut [
             owner_b,
@@ -574,8 +583,14 @@ fn run_trade_cpi_with_matcher(
     // Account order matches handle_trade_cpi: [signer_a, market, account_a, account_b,
     // matcher_prog, matcher_ctx, matcher_delegate]. owner_b is the B-side signer but is NOT
     // passed as a separate account; account_b must already be writable.
+    let (account_a_portfolio_id, _, account_a_position_epoch) = portfolio_identity(account_a);
+    let (account_b_portfolio_id, _, account_b_position_epoch) = portfolio_identity(account_b);
     run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
             asset_index,
             size_q: req_size,
             fee_bps,
@@ -1038,6 +1053,18 @@ fn sync_maintenance_fee_with_cranker(
     )
 }
 
+/// TB-1b: read the account's CURRENT portfolio_id/sequence/position_epoch
+/// directly off its raw bytes, right before building an instruction that
+/// binds to them. Always correct regardless of how many prior Deposits/
+/// trades/etc. this specific portfolio has already seen in this test.
+fn portfolio_identity(portfolio: &TestAccount) -> (u64, u64, u64) {
+    (
+        state::read_portfolio_id(&portfolio.data).unwrap(),
+        state::read_portfolio_matcher_sequence(&portfolio.data).unwrap(),
+        state::read_portfolio_position_epoch(&portfolio.data).unwrap(),
+    )
+}
+
 fn deposit(
     owner: &mut TestAccount,
     market: &mut TestAccount,
@@ -1049,8 +1076,13 @@ fn deposit(
     let mut source_token = user_token_account(owner.key, mint, amount_u64);
     let mut vault_token = vault_token_account(market, mint, 0);
     let mut token_program = token_program_account();
+    let (portfolio_id, expected_sequence, _) = portfolio_identity(portfolio);
     run_ix(
-        Instruction::Deposit { amount },
+        Instruction::Deposit {
+            portfolio_id,
+            expected_sequence,
+            amount,
+        },
         &mut [
             owner,
             market,
@@ -1123,8 +1155,13 @@ fn withdraw(
     let mut vault_token = vault_token_account(market, mint, amount_u64);
     let mut vault_auth = vault_authority_account(market);
     let mut token_program = token_program_account();
+    let (portfolio_id, expected_sequence, _) = portfolio_identity(portfolio);
     run_ix(
-        Instruction::Withdraw { amount },
+        Instruction::Withdraw {
+            portfolio_id,
+            expected_sequence,
+            amount,
+        },
         &mut [
             owner,
             market,
@@ -1204,8 +1241,13 @@ fn close_portfolio(
     market: &mut TestAccount,
     portfolio: &mut TestAccount,
 ) {
+    let (portfolio_id, expected_sequence, position_epoch) = portfolio_identity(portfolio);
     run_ix(
-        Instruction::ClosePortfolio,
+        Instruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
         &mut [closer, market, portfolio],
     )
     .unwrap();
@@ -1743,6 +1785,10 @@ fn v16_wrapper_underfunded_flat_sync_sweeps_remaining_capital_once() {
     );
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&reopened_long_account).0,
+            account_a_position_epoch: portfolio_identity(&reopened_long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -2105,6 +2151,10 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     let (_, group_before_trade) = state::read_market(&market.data).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: size_q as i128,
             exec_price,
@@ -2655,6 +2705,10 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 150,
@@ -2683,6 +2737,10 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
@@ -2852,6 +2910,10 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: (POS_SCALE * 2) as i128,
             exec_price: 150,
@@ -2902,6 +2964,10 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
@@ -3235,6 +3301,10 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -3267,6 +3337,10 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
@@ -3909,6 +3983,10 @@ fn v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
@@ -3966,6 +4044,10 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     let before_b = account_b.data.clone();
     let too_expensive = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -4002,6 +4084,10 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -4033,6 +4119,10 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     let fresh_before_reduce = group.source_backing_buckets[1].fresh_unliened_backing_num;
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: -(5 * POS_SCALE as i128),
             exec_price: 100,
@@ -4251,6 +4341,10 @@ fn v16_wrapper_maintenance_fee_sync_charges_recurring_fee_without_forcing_local_
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4359,6 +4453,10 @@ fn v16_wrapper_asset_authority_can_append_activate_and_trade_assets() {
     let before = market.data.clone();
     let rejected_before_add = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -4402,6 +4500,10 @@ fn v16_wrapper_asset_authority_can_append_activate_and_trade_assets() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -4478,6 +4580,10 @@ fn v16_wrapper_trade_rejects_corrupt_unconfigured_tail_capacity_fail_closed() {
     let before_short = short_account.data.clone();
     let result = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4669,6 +4775,10 @@ fn v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4685,6 +4795,10 @@ fn v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently() {
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -4834,6 +4948,10 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 150,
@@ -4865,6 +4983,10 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
@@ -4894,6 +5016,10 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
     let before_new_position = market.data.clone();
     let new_position = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 150,
@@ -4967,6 +5093,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     // Keep another market leg live while the prediction-style asset is cycled.
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4983,6 +5113,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5010,6 +5144,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     let before_blocked_risk_increase = market.data.clone();
     let blocked_risk_increase = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5046,10 +5184,15 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
 
     run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 2,
             reduce_q: prediction_q,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     )
     .unwrap();
     let after_unilateral_reduce = state::read_portfolio(&short_account.data).unwrap();
@@ -5059,10 +5202,15 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     );
     let second_unilateral_reduce = run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&short_account).0,
+            position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             reduce_q: prediction_q,
         },
-        &mut [&mut short_owner, &mut market, &mut short_account],
+        &mut [
+            &mut short_owner,
+            &mut market,
+            &mut short_account],
     );
     assert!(
         second_unilateral_reduce.is_err(),
@@ -5070,10 +5218,15 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     );
     run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&short_account).0,
+            position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             b_loss_atom_budget: 1,
         },
-        &mut [&mut short_owner, &mut market, &mut short_account],
+        &mut [
+            &mut short_owner,
+            &mut market,
+            &mut short_account],
     )
     .unwrap();
     run_ix(
@@ -5177,11 +5330,15 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
         let mut vault_token = vault_token_account(&market, mint, 0);
         let mut token_program = token_program_account();
         run_ix(
-            Instruction::Deposit { amount: 1 },
-            &mut [
-                &mut long_owner,
-                &mut market,
-                &mut long_account,
+            Instruction::Deposit {
+            portfolio_id: portfolio_identity(&long_account).0,
+            expected_sequence: portfolio_identity(&long_account).1,
+            amount: 1,
+        },
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account,
                 &mut source_token,
                 &mut vault_token,
                 &mut token_program,
@@ -5196,6 +5353,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: prediction_q as i128,
             exec_price: 500_000,
@@ -5460,6 +5621,10 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     let prediction_q = POS_SCALE / 100;
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
@@ -5476,6 +5641,10 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5492,6 +5661,10 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 2,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 250,
@@ -5560,6 +5733,10 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     .unwrap();
     let blocked_new_prediction_risk = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5577,18 +5754,28 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
 
     run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 1,
             reduce_q: prediction_q,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     )
     .unwrap();
     run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&short_account).0,
+            position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             b_loss_atom_budget: 1,
         },
-        &mut [&mut short_owner, &mut market, &mut short_account],
+        &mut [
+            &mut short_owner,
+            &mut market,
+            &mut short_account],
     )
     .unwrap();
     run_ix(
@@ -5685,6 +5872,10 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     let before_stale_trade = market.data.clone();
     let stale_reuse_trade = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 750_000,
@@ -5821,7 +6012,11 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     let mut vault = vault_token_account(&market, mint, 1);
     let mut token_program = token_program_account();
     let deposit_stale = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&long_account).0,
+            expected_sequence: portfolio_identity(&long_account).1,
+            amount: 1,
+        },
         &mut [
             &mut long_owner,
             &mut market,
@@ -5840,7 +6035,11 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
     let withdraw_stale = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&long_account).0,
+            expected_sequence: portfolio_identity(&long_account).1,
+            amount: 1,
+        },
         &mut [
             &mut long_owner,
             &mut market,
@@ -5876,6 +6075,10 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
 
     let trade_stale = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: last_asset,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -5895,10 +6098,15 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
 
     let reduce_stale = run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: last_asset,
             reduce_q: 1,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     assert_err_and_market_unchanged(reduce_stale, &market, &stale_market);
     assert_eq!(long_account.data, stale_portfolio);
@@ -5906,18 +6114,30 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
 
     let forfeit_stale = run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: last_asset,
             b_loss_atom_budget: 1,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     assert_err_and_market_unchanged(forfeit_stale, &market, &stale_market);
     assert_eq!(long_account.data, stale_portfolio);
     pass_count += 1;
 
     let close_stale = run_ix(
-        Instruction::ClosePortfolio,
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        Instruction::ClosePortfolio {
+            portfolio_id: portfolio_identity(&long_account).0,
+            expected_sequence: portfolio_identity(&long_account).1,
+            position_epoch: portfolio_identity(&long_account).2,
+        },
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     assert_err_and_market_unchanged(close_stale, &market, &stale_market);
     assert_eq!(long_account.data, stale_portfolio);
@@ -5970,6 +6190,10 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     state::write_portfolio(&mut long_account.data, &clean).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: last_asset,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -8240,8 +8464,15 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
     )
     .unwrap();
     run_ix(
-        Instruction::ConvertReleasedPnl { amount: 40 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 40,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
     run_ix(
@@ -8478,8 +8709,15 @@ fn v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance() 
     .unwrap();
 
     run_ix(
-        Instruction::ConvertReleasedPnl { amount: 40 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 40,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
 
@@ -8560,8 +8798,15 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
     )
     .unwrap();
     run_ix(
-        Instruction::ConvertReleasedPnl { amount: 40 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 40,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
     {
@@ -8694,8 +8939,15 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let before_convert_market = market.data.clone();
     let before_convert_portfolio = portfolio.data.clone();
     let convert = run_ix(
-        Instruction::ConvertReleasedPnl { amount: 50 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 50,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     assert_err_and_market_unchanged(convert, &market, &before_convert_market);
     assert_eq!(portfolio.data, before_convert_portfolio);
@@ -8705,7 +8957,11 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let mut dest = user_token_account(owner.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
     let over_withdraw = run_ix(
-        Instruction::Withdraw { amount: 21 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 21,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -8818,8 +9074,15 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
     .unwrap();
 
     run_ix(
-        Instruction::ConvertReleasedPnl { amount: 100 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 100,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -8849,7 +9112,11 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
     let mut dest = user_token_account(owner.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
     let over_withdraw = run_ix(
-        Instruction::Withdraw { amount: 31 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 31,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -8941,8 +9208,15 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
     .unwrap();
 
     run_ix(
-        Instruction::ConvertReleasedPnl { amount: 130 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 130,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -8961,8 +9235,15 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
     let before_second_convert_market = market.data.clone();
     let before_second_convert_portfolio = portfolio.data.clone();
     let second_convert = run_ix(
-        Instruction::ConvertReleasedPnl { amount: 100 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 100,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     assert_err_and_market_unchanged(second_convert, &market, &before_second_convert_market);
     assert_eq!(portfolio.data, before_second_convert_portfolio);
@@ -10121,6 +10402,10 @@ fn v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_orac
     let base_only_fee = two_sided_fee(size_q, exec_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -10205,6 +10490,10 @@ fn v16_wrapper_auth_mark_trade_cannot_update_authority_mark() {
     let base_only_fee = taker_only_fee(size_q, before_group.assets[0].effective_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -10345,8 +10634,15 @@ fn v16_wrapper_close_portfolio_rejects_non_empty_and_closes_empty() {
 
     let before = market.data.clone();
     let rejected = run_ix(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            position_epoch: portfolio_identity(&portfolio).2,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     assert_err_and_market_unchanged(rejected, &market, &before);
     assert!(state::read_portfolio(&portfolio.data).is_ok());
@@ -10355,8 +10651,15 @@ fn v16_wrapper_close_portfolio_rejects_non_empty_and_closes_empty() {
     let market_lamports_before_close = market.lamports;
     let portfolio_lamports_before_close = portfolio.lamports;
     run_ix(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            position_epoch: portfolio_identity(&portfolio).2,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
 
@@ -10431,8 +10734,15 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
     assert_err_and_market_unchanged(nonempty_count, &market, &with_portfolio);
 
     run_ix(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            position_epoch: portfolio_identity(&portfolio).2,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     )
     .unwrap();
     let market_lamports = market.lamports;
@@ -10608,6 +10918,10 @@ fn v16_wrapper_multiple_portfolios_same_owner_stay_isolated_and_totals_match() {
     let untouched_b = portfolio_b.data.clone();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&portfolio_a).0,
+            account_a_position_epoch: portfolio_identity(&portfolio_a).2,
+            account_b_portfolio_id: portfolio_identity(&counterparty).0,
+            account_b_position_epoch: portfolio_identity(&counterparty).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -10653,7 +10967,11 @@ fn v16_wrapper_deposit_rejects_without_token_accounts() {
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let rejected = run_ix(
-        Instruction::Deposit { amount: 1_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000,
+        },
         &mut [&mut owner, &mut market, &mut portfolio],
     );
     assert_err_and_market_unchanged(rejected, &market, &before_market);
@@ -10680,7 +10998,11 @@ fn v16_wrapper_deposit_rejects_wrong_mint_and_insufficient_source_balance() {
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let wrong_mint = run_ix(
-        Instruction::Deposit { amount: 1_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10694,7 +11016,11 @@ fn v16_wrapper_deposit_rejects_wrong_mint_and_insufficient_source_balance() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let short_balance = run_ix(
-        Instruction::Deposit { amount: 1_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10727,7 +11053,11 @@ fn v16_wrapper_deposit_rejects_wrong_owner_and_bad_token_program() {
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let wrong_owner = run_ix(
-        Instruction::Deposit { amount: 1_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000,
+        },
         &mut [
             &mut attacker,
             &mut market,
@@ -10741,7 +11071,11 @@ fn v16_wrapper_deposit_rejects_wrong_owner_and_bad_token_program() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let bad_program = run_ix(
-        Instruction::Deposit { amount: 1_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10788,7 +11122,11 @@ fn v16_wrapper_vault_accounts_reject_delegate_and_close_authority() {
     let before_portfolio = portfolio.data.clone();
 
     let deposit_bad_vault = run_ix(
-        Instruction::Deposit { amount: 1_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10802,7 +11140,11 @@ fn v16_wrapper_vault_accounts_reject_delegate_and_close_authority() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let withdraw_bad_vault = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10856,7 +11198,11 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
     let before_portfolio = portfolio.data.clone();
 
     let frozen_deposit_source = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10870,7 +11216,11 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let frozen_deposit_vault = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10884,7 +11234,11 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let frozen_withdraw_dest = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10899,7 +11253,11 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let frozen_withdraw_vault = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10971,7 +11329,11 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
     let before_portfolio = portfolio.data.clone();
 
     let deposit_too_large = run_ix(
-        Instruction::Deposit { amount: too_large },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: too_large,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -10985,7 +11347,11 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let withdraw_too_large = run_ix(
-        Instruction::Withdraw { amount: too_large },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: too_large,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11056,7 +11422,11 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
     let before_portfolio = portfolio.data.clone();
 
     run_ix(
-        Instruction::Deposit { amount: 0 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 0,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11068,10 +11438,43 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
     )
     .unwrap();
     assert_eq!(market.data, before_market);
-    assert_eq!(portfolio.data, before_portfolio);
+    // TB-1b (ADOPT upstream 0492ebbc): a zero-amount Deposit is still a LANDED
+    // instruction and consumes one replay-protection sequence slot -- that is
+    // the one-shot invariant this unit exists to enforce (a landed Deposit,
+    // Withdraw, or SetMatcherConfig always advances the shared sequence, so a
+    // stale copy of it can never replay). "No state drift" now means no
+    // ECONOMIC drift (capital/positions/everything but the sequence counter),
+    // not zero bytes changed.
+    assert_eq!(
+        state::read_portfolio_matcher_sequence(&portfolio.data).unwrap(),
+        state::read_portfolio_matcher_sequence(&before_portfolio).unwrap() + 1,
+        "a landed zero-amount Deposit still advances the one-shot sequence"
+    );
+    {
+        let mut after_minus_sequence = portfolio.data.clone();
+        let seq_off = percolator_prog::constants::PORTFOLIO_MATCHER_SEQUENCE_OFF;
+        let seq_len = percolator_prog::constants::PORTFOLIO_MATCHER_SEQUENCE_LEN;
+        after_minus_sequence[seq_off..seq_off + seq_len]
+            .copy_from_slice(&before_portfolio[seq_off..seq_off + seq_len]);
+        assert_eq!(
+            after_minus_sequence, before_portfolio,
+            "a zero-amount Deposit must not move capital/positions/anything but the sequence"
+        );
+    }
+    // Re-baseline: from here on, Withdraw{amount:0} early-returns before
+    // touching the sequence at all (`if amount == 0 { return Ok(()); }`, ahead
+    // of the sequence-binding block), and TopUpInsurance/TopUpBackingBucket
+    // don't touch the portfolio's sequence lane either -- so the REST of this
+    // test's "no drift" comparisons are against the post-Deposit state, not the
+    // pre-Deposit one.
+    let before_portfolio = portfolio.data.clone();
 
     run_ix(
-        Instruction::Withdraw { amount: 0 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 0,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11143,7 +11546,11 @@ fn v16_wrapper_withdraw_rejects_wrong_vault_authority_and_wrong_destination_mint
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let wrong_mint = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11160,7 +11567,11 @@ fn v16_wrapper_withdraw_rejects_wrong_vault_authority_and_wrong_destination_mint
     let mut dest = user_token_account(owner.key, mint, 0);
     let mut wrong_vault_auth = TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0);
     let wrong_authority = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11194,7 +11605,11 @@ fn v16_wrapper_withdraw_rejects_wrong_owner_without_mutation() {
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let wrong_owner = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut attacker,
             &mut market,
@@ -11227,7 +11642,11 @@ fn v16_wrapper_withdraw_rejects_over_capital_and_insufficient_vault_without_muta
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let over_capital = run_ix(
-        Instruction::Withdraw { amount: 501 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 501,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11243,7 +11662,11 @@ fn v16_wrapper_withdraw_rejects_over_capital_and_insufficient_vault_without_muta
 
     let mut underfunded_vault = vault_token_account(&market, mint, 399);
     let insufficient_vault = run_ix(
-        Instruction::Withdraw { amount: 400 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 400,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11290,7 +11713,11 @@ fn v16_wrapper_base_unit_secondary_withdraws_but_primary_only_deposits() {
     let mut secondary_vault_for_deposit = vault_token_account(&market, secondary_key, 0);
     let mut token_program = token_program_account();
     let secondary_deposit = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11307,7 +11734,11 @@ fn v16_wrapper_base_unit_secondary_withdraws_but_primary_only_deposits() {
     let mut primary_vault = vault_token_account(&market, primary_key, 250);
     let mut vault_auth = vault_authority_account(&market);
     let mismatched_vault = run_ix(
-        Instruction::Withdraw { amount: 250 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 250,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11324,7 +11755,11 @@ fn v16_wrapper_base_unit_secondary_withdraws_but_primary_only_deposits() {
     let mut secondary_dest = user_token_account(owner.key, secondary_key, 0);
     let mut secondary_vault = vault_token_account(&market, secondary_key, 250);
     run_ix(
-        Instruction::Withdraw { amount: 250 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 250,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11406,7 +11841,11 @@ fn v16_wrapper_base_unit_authority_changes_primary_and_rotates() {
     let mut old_primary_vault = vault_token_account(&market, old_primary_key, 0);
     let mut token_program = token_program_account();
     let old_primary_deposit = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11422,7 +11861,11 @@ fn v16_wrapper_base_unit_authority_changes_primary_and_rotates() {
     let mut new_primary_source = user_token_account(owner.key, new_primary_key, 1);
     let mut new_primary_vault = vault_token_account(&market, new_primary_key, 0);
     run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -11588,8 +12031,15 @@ fn v16_wrapper_close_portfolio_rejects_wrong_owner_without_mutation() {
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let rejected = run_ix(
-        Instruction::ClosePortfolio,
-        &mut [&mut attacker, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            position_epoch: portfolio_identity(&portfolio).2,
+        },
+        &mut [
+            &mut attacker,
+            &mut market,
+            &mut portfolio],
     );
     assert_err_and_market_unchanged(rejected, &market, &before_market);
     assert_eq!(portfolio.data, before_portfolio);
@@ -11622,7 +12072,11 @@ fn v16_wrapper_cross_market_portfolio_provenance_is_fail_closed() {
     let mut vault_b = vault_token_account(&market_b, mint_b, 1_000);
     let mut token_program = token_program_account();
     let cross_deposit = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&account_a).0,
+            expected_sequence: portfolio_identity(&account_a).1,
+            amount: 1,
+        },
         &mut [
             &mut owner_a,
             &mut market_b,
@@ -11649,14 +12103,25 @@ fn v16_wrapper_cross_market_portfolio_provenance_is_fail_closed() {
     assert_eq!(account_a.data, before_a);
 
     let cross_close = run_ix(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner_a, &mut market_b, &mut account_a],
+        Instruction::ClosePortfolio {
+            portfolio_id: portfolio_identity(&account_a).0,
+            expected_sequence: portfolio_identity(&account_a).1,
+            position_epoch: portfolio_identity(&account_a).2,
+        },
+        &mut [
+            &mut owner_a,
+            &mut market_b,
+            &mut account_a],
     );
     assert_err_and_market_unchanged(cross_close, &market_b, &before_market_b);
     assert_eq!(account_a.data, before_a);
 
     let cross_trade = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -11722,6 +12187,10 @@ fn v16_wrapper_same_owner_can_trade_independent_positions_across_markets() {
     let owner_b_before_a_trade = owner_account_b.data.clone();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&owner_account_a).0,
+            account_a_position_epoch: portfolio_identity(&owner_account_a).2,
+            account_b_portfolio_id: portfolio_identity(&counterparty_a).0,
+            account_b_position_epoch: portfolio_identity(&counterparty_a).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -11747,6 +12216,10 @@ fn v16_wrapper_same_owner_can_trade_independent_positions_across_markets() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&owner_account_b).0,
+            account_a_position_epoch: portfolio_identity(&owner_account_b).2,
+            account_b_portfolio_id: portfolio_identity(&counterparty_b).0,
+            account_b_position_epoch: portfolio_identity(&counterparty_b).2,
             asset_index: 0,
             size_q: -(2 * POS_SCALE as i128),
             exec_price: 100,
@@ -11806,7 +12279,16 @@ fn v16_wrapper_account_kind_confusion_is_rejected_before_mutation() {
     let mut token_program = token_program_account();
 
     let portfolio_as_market = run_ix(
-        Instruction::Deposit { amount: 1 },
+        // TB-1b: accounts[1] is `portfolio` (not `market`, by design -- this test
+        // swaps them). The header check inside `expect_portfolio_sequence_binding`
+        // (reading accounts[2], which here is `market`) already rejects on the
+        // KIND_PORTFOLIO mismatch before these values matter, so any constants
+        // reproduce the same rejection the account-order swap causes.
+        Instruction::Deposit {
+            portfolio_id: 0,
+            expected_sequence: 0,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut portfolio,
@@ -11866,7 +12348,11 @@ fn v16_wrapper_portfolio_key_mismatch_and_self_trade_are_rejected() {
     let mut vault = vault_token_account(&market, mint, 1_000);
     let mut token_program = token_program_account();
     let key_mismatch_deposit = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&account_a).0,
+            expected_sequence: portfolio_identity(&account_a).1,
+            amount: 1,
+        },
         &mut [
             &mut owner_a,
             &mut market,
@@ -11888,6 +12374,10 @@ fn v16_wrapper_portfolio_key_mismatch_and_self_trade_are_rejected() {
     account_b.key = account_a.key;
     let same_key_trade = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -11923,6 +12413,10 @@ fn v16_wrapper_tradenocpi_negative_size_flips_long_short_roles() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
@@ -11969,6 +12463,10 @@ fn v16_wrapper_tradenocpi_accepts_consented_wide_exec_price_without_moving_index
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
@@ -12262,6 +12760,10 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 14,
             size_q: POS_SCALE as i128,
             exec_price: 200,
@@ -12594,6 +13096,10 @@ fn v16_wrapper_configure_hybrid_oracle_rejects_after_positions_enter_market() {
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -12671,6 +13177,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -12730,6 +13240,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     // Flatten asset 0 positions (trade back to zero OI) so the group is position-free.
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
@@ -12900,6 +13414,10 @@ fn v16_wrapper_hybrid_fresh_crank_tracks_external_composite_then_after_hours_tra
     let base_only_fee = two_sided_fee(size_q, exec_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -12992,6 +13510,10 @@ fn v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_ora
     let exec_price = before_group.assets[0].effective_price * 150 / 100;
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -13093,6 +13615,10 @@ fn v16_wrapper_hybrid_after_hours_downward_mark_moves_effective_price() {
     let exec_price = before_group.assets[0].effective_price / 2;
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -13216,6 +13742,10 @@ fn v16_wrapper_hybrid_after_hours_fee_floor_scales_with_next_crank_segment_budge
     let before_insurance = before_group.insurance;
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -13307,6 +13837,10 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
     let initial_price = state::read_market(&market.data).unwrap().1.assets[0].effective_price;
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: initial_price,
@@ -13366,6 +13900,10 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
 
     let result = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: probe_size as i128,
             exec_price: probe_price,
@@ -13416,6 +13954,10 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
@@ -13458,6 +14000,10 @@ fn v16_wrapper_tradenocpi_rejects_when_consented_price_would_break_margin() {
 
     let result = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -13500,6 +14046,10 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -13528,6 +14078,10 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&short_account).0,
+            account_a_position_epoch: portfolio_identity(&short_account).2,
+            account_b_portfolio_id: portfolio_identity(&long_account).0,
+            account_b_position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 101,
@@ -13552,16 +14106,30 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
     let capital_before_convert = long.capital;
 
     let too_low_cap = run_ix(
-        Instruction::ConvertReleasedPnl { amount: 1 },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
+            amount: 1,
+        },
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     assert_err_and_market_unchanged(too_low_cap, &market, &before_market);
     assert_eq!(long_account.data, before_long);
     assert_eq!(short_account.data, before_short);
 
     run_ix(
-        Instruction::ConvertReleasedPnl { amount: 2 },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
+            amount: 2,
+        },
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -13592,8 +14160,15 @@ fn v16_wrapper_convert_released_pnl_rejects_resolved_market_without_mutation() {
     let market_before = market.data.clone();
     let portfolio_before = portfolio.data.clone();
     let rejected = run_ix(
-        Instruction::ConvertReleasedPnl { amount: 1 },
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
+            amount: 1,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     assert_err_and_market_unchanged(rejected, &market, &market_before);
     assert_eq!(portfolio.data, portfolio_before);
@@ -13620,6 +14195,10 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
     let before_b = account_b.data.clone();
     let missing_signature = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -13639,6 +14218,10 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
 
     let zero_size = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: 0,
             exec_price: 100,
@@ -13658,6 +14241,10 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
 
     let min_size = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: i128::MIN,
             exec_price: 100,
@@ -13697,6 +14284,10 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
     let before_b = account_b.data.clone();
     let wrong_owner = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -13716,6 +14307,10 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
 
     let fee_over_cap = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -13735,6 +14330,10 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
 
     let invalid_asset = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -14135,6 +14734,10 @@ fn v16_wrapper_tradecpi_requires_bilateral_signatures_before_matcher_cpi() {
     let _ = unsigned_b; // unused in v17 TradeCpi account list
     let rejected = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14184,6 +14787,10 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
     // v17 TradeCpi: 7 accounts. Pass wrong_delegate at slot 6 — handler rejects via expect_key.
     let wrong_delegate_result = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14214,6 +14821,10 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
     let mut program_owned_tail = TestAccount::new(Pubkey::new_unique(), program_id(), 0).writable();
     let unsafe_tail = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14238,6 +14849,11 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
         .map(|_| TestAccount::new(Pubkey::new_unique(), Pubkey::new_unique(), 0))
         .collect();
     let oversized_tail = {
+        // TB-1b: read identity BEFORE `.to_info()` takes mutable-style borrows of
+        // account_a/account_b into `infos` below (those borrows live until
+        // `process_instruction` returns, so reading afterward would conflict).
+        let (account_a_portfolio_id, _, account_a_position_epoch) = portfolio_identity(&account_a);
+        let (account_b_portfolio_id, _, account_b_position_epoch) = portfolio_identity(&account_b);
         let mut infos = vec![
             owner_a.to_info(),
             market.to_info(),
@@ -14252,6 +14868,10 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
             &program_id(),
             &infos,
             &Instruction::TradeCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index: 0,
                 size_q: POS_SCALE as i128,
                 fee_bps: 0,
@@ -14311,6 +14931,10 @@ fn v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher() {
     // v17 TradeCpi: 7 accounts.
     let rejected = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14356,21 +14980,27 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
     deposit(&mut owner_a, &mut market, &mut account_a, 1_000_000);
     deposit(&mut owner_b, &mut market, &mut account_b, 1_000_000);
 
-    run_ix(
-        Instruction::SetMatcherConfig {
-            enabled: 1,
-            trade_fee_cap_bps: 10_000,
-        },
-        &mut [
-            &mut owner_b,
-            &mut market,
-            &mut account_b,
-            &mut matcher_program,
-            &mut matcher_context,
-            &mut delegate,
-        ],
-    )
-    .unwrap();
+    {
+        let (portfolio_id, expected_sequence, _) = portfolio_identity(&account_b);
+        run_ix(
+            Instruction::SetMatcherConfig {
+                portfolio_id,
+                expected_sequence,
+                enabled: 1,
+                trade_fee_cap_bps: 10_000,
+                expiry_slot: u64::MAX,
+            },
+            &mut [
+                &mut owner_b,
+                &mut market,
+                &mut account_b,
+                &mut matcher_program,
+                &mut matcher_context,
+                &mut delegate,
+            ],
+        )
+        .unwrap();
+    }
 
     let (_, group_before) = state::read_market(&market.data).unwrap();
     let req_id = state::next_market_matcher_req_id(&market.data).unwrap();
@@ -14390,6 +15020,10 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
 
     run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14424,6 +15058,10 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
     let before_second_b = account_b.data.clone();
     let rejected_replay = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14481,6 +15119,10 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
     // v17 TradeCpi: 7 accounts.
     let rejected = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14536,6 +15178,10 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_fee_above_cap_before_success() {
     // v17 TradeCpi: 7 accounts.
     let rejected = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 10_001,
@@ -14604,6 +15250,10 @@ fn v16_wrapper_tradecpi_rejects_corrupt_backing_fee_policy_before_later_checks()
     let _ = attacker;
     let rejected = run_ix(
         Instruction::TradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14646,6 +15296,10 @@ fn v16_wrapper_permissionless_crank_advances_account_local_market_progress() {
     configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -14798,6 +15452,10 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -14915,6 +15573,10 @@ fn v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee() {
     deposit(&mut short_owner, &mut market, &mut short_account, 101);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -15028,6 +15690,10 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     deposit(&mut short_owner, &mut market, &mut short_account, 601);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
@@ -15250,6 +15916,10 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     deposit(&mut short_owner, &mut market, &mut short_account, 601);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
@@ -15369,6 +16039,10 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
     deposit(&mut short_owner, &mut market, &mut short_account, 100);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -15737,6 +16411,10 @@ fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch(
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 1,
@@ -15801,6 +16479,10 @@ fn v16_wrapper_rebalance_reduce_is_owner_signed_and_strictly_reduces_risk() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -15820,20 +16502,30 @@ fn v16_wrapper_rebalance_reduce_is_owner_signed_and_strictly_reduces_risk() {
     let before_account = long_account.data.clone();
     let unauthorized = run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             reduce_q: POS_SCALE,
         },
-        &mut [&mut attacker, &mut market, &mut long_account],
+        &mut [
+            &mut attacker,
+            &mut market,
+            &mut long_account],
     );
     assert_err_and_market_unchanged(unauthorized, &market, &before_market);
     assert_eq!(long_account.data, before_account);
 
     run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             reduce_q: POS_SCALE,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -15859,6 +16551,10 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -15884,20 +16580,30 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     let before_account = long_account.data.clone();
     let unauthorized = run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             b_loss_atom_budget: 1,
         },
-        &mut [&mut attacker, &mut market, &mut long_account],
+        &mut [
+            &mut attacker,
+            &mut market,
+            &mut long_account],
     );
     assert_err_and_market_unchanged(unauthorized, &market, &before_market);
     assert_eq!(long_account.data, before_account);
 
     run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             b_loss_atom_budget: 1,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     )
     .unwrap();
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -15921,6 +16627,8 @@ fn v16_wrapper_cure_and_cancel_close_uses_owner_deposit_before_support_is_consum
     let mut token_program = token_program_account();
     run_ix(
         Instruction::CureAndCancelClose {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
             optional_deposit: 20,
         },
         &mut [
@@ -15965,6 +16673,8 @@ fn v16_wrapper_cure_and_cancel_close_rejects_resolved_market() {
     let before_portfolio = portfolio.data.clone();
     let rejected = run_ix(
         Instruction::CureAndCancelClose {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
             optional_deposit: 20,
         },
         &mut [
@@ -16011,6 +16721,8 @@ fn v16_wrapper_cure_and_cancel_close_rejects_after_permissionless_resolve_maturi
     let before_portfolio = portfolio.data.clone();
     let rejected = run_ix(
         Instruction::CureAndCancelClose {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            position_epoch: portfolio_identity(&portfolio).2,
             optional_deposit: 20,
         },
         &mut [
@@ -16218,6 +16930,10 @@ fn v16_wrapper_resolve_market_is_admin_only_and_blocks_live_trade() {
     let before_b = portfolio_b.data.clone();
     let trade_after_resolve = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&portfolio_a).0,
+            account_a_position_epoch: portfolio_identity(&portfolio_a).2,
+            account_b_portfolio_id: portfolio_identity(&portfolio_b).0,
+            account_b_position_epoch: portfolio_identity(&portfolio_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16280,6 +16996,10 @@ fn v16_wrapper_permissionless_stale_resolve_requires_hard_stale_maturity() {
     let before_b = portfolio_b.data.clone();
     let trade_after_resolve = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&portfolio_a).0,
+            account_a_position_epoch: portfolio_identity(&portfolio_a).2,
+            account_b_portfolio_id: portfolio_identity(&portfolio_b).0,
+            account_b_position_epoch: portfolio_identity(&portfolio_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16386,6 +17106,10 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
     let before_b = portfolio_b.data.clone();
     let trade_after_resolve_maturity = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&portfolio_a).0,
+            account_a_position_epoch: portfolio_identity(&portfolio_a).2,
+            account_b_portfolio_id: portfolio_identity(&portfolio_b).0,
+            account_b_position_epoch: portfolio_identity(&portfolio_b).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16470,7 +17194,11 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
     let mut vault = vault_token_account(&market, mint, 1_000);
     let mut token_program = token_program_account();
     let deposit_after_resolve = run_ix(
-        Instruction::Deposit { amount: 1 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -16486,7 +17214,11 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
     let mut dest = user_token_account(owner.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
     let withdraw_after_resolve = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -16837,6 +17569,10 @@ fn v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure()
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16903,6 +17639,10 @@ fn v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clea
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -17112,6 +17852,10 @@ fn v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved() {
     let before_short = short_account.data.clone();
     let trade_after_hard_stale = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
@@ -17134,7 +17878,11 @@ fn v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved() {
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
     let withdraw_after_hard_stale = run_ix(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&long_account).0,
+            expected_sequence: portfolio_identity(&long_account).1,
+            amount: 1,
+        },
         &mut [
             &mut long_owner,
             &mut market,
@@ -17713,6 +18461,10 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     // (short) at the honest price.
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&atk_acct).0,
+            account_a_position_epoch: portfolio_identity(&atk_acct).2,
+            account_b_portfolio_id: portfolio_identity(&vic_acct).0,
+            account_b_position_epoch: portfolio_identity(&vic_acct).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -17773,6 +18525,8 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
         // equity; can never pull honest-domain value.
         let _ = run_ix(
             Instruction::Withdraw {
+                portfolio_id: portfolio_identity(&atk_acct).0,
+                expected_sequence: portfolio_identity(&atk_acct).1,
                 amount: (next(&mut rng) % 2_000_000) as u128,
             },
             &mut [
@@ -17880,6 +18634,10 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
     deposit(&mut a0_short_owner, &mut market, &mut a0_short, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&a0_long).0,
+            account_a_position_epoch: portfolio_identity(&a0_long).2,
+            account_b_portfolio_id: portfolio_identity(&a0_short).0,
+            account_b_position_epoch: portfolio_identity(&a0_short).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -17915,6 +18673,10 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
     deposit(&mut a1_short_owner, &mut market, &mut a1_short, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&a1_long).0,
+            account_a_position_epoch: portfolio_identity(&a1_long).2,
+            account_b_portfolio_id: portfolio_identity(&a1_short).0,
+            account_b_position_epoch: portfolio_identity(&a1_short).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -18139,6 +18901,10 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
     deposit(&mut a0_short_owner, &mut market, &mut a0_short, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&a0_long).0,
+            account_a_position_epoch: portfolio_identity(&a0_long).2,
+            account_b_portfolio_id: portfolio_identity(&a0_short).0,
+            account_b_position_epoch: portfolio_identity(&a0_short).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -18237,6 +19003,10 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
     // the fix) but per-asset dt = 0 -> max(1,..) = 1 (floor 1000 < cap) after it.
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&a1_long).0,
+            account_a_position_epoch: portfolio_identity(&a1_long).2,
+            account_b_portfolio_id: portfolio_identity(&a1_short).0,
+            account_b_position_epoch: portfolio_identity(&a1_short).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -18293,6 +19063,10 @@ fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
 
         run_ix(
             Instruction::TradeNoCpi {
+                account_a_portfolio_id: portfolio_identity(&long_account).0,
+                account_a_position_epoch: portfolio_identity(&long_account).2,
+                account_b_portfolio_id: portfolio_identity(&short_account).0,
+                account_b_position_epoch: portfolio_identity(&short_account).2,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price,
@@ -18349,6 +19123,10 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
         );
         run_ix(
             Instruction::TradeNoCpi {
+                account_a_portfolio_id: portfolio_identity(&long_account).0,
+                account_a_position_epoch: portfolio_identity(&long_account).2,
+                account_b_portfolio_id: portfolio_identity(&short_account).0,
+                account_b_position_epoch: portfolio_identity(&short_account).2,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price,
@@ -18430,7 +19208,11 @@ fn v16_wrapper_deposit_rejects_noncanonical_vault() {
     let mut bad_vault = noncanonical_vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     let rejected = run_ix(
-        Instruction::Deposit { amount: 1_000_000 },
+        Instruction::Deposit {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1_000_000,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -18465,7 +19247,11 @@ fn v16_wrapper_withdraw_rejects_noncanonical_vault() {
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
     let rejected = run_ix(
-        Instruction::Withdraw { amount: 500_000 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 500_000,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -18570,6 +19356,10 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     // the engine's long_account slot (domain 0 for asset 0).
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -18768,6 +19558,10 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_
 
     run_ix(
         Instruction::BatchTradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             legs: vec![percolator_prog::ix::BatchTradeLeg {
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
@@ -18913,8 +19707,11 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
     );
     run_ix(
         Instruction::SetMatcherConfig {
+            portfolio_id: portfolio_identity(&account_b).0,
+            expected_sequence: portfolio_identity(&account_b).1,
             enabled: 1,
             trade_fee_cap_bps: 10_000,
+            expiry_slot: u64::MAX,
         },
         &mut [
             &mut owner_b,
@@ -18948,6 +19745,10 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
     // account_a, account_b, matcher_prog, matcher_ctx, matcher_delegate].
     run_ix(
         Instruction::BatchTradeCpi {
+            account_a_portfolio_id: portfolio_identity(&account_a).0,
+            account_a_position_epoch: portfolio_identity(&account_a).2,
+            account_b_portfolio_id: portfolio_identity(&account_b).0,
+            account_b_position_epoch: portfolio_identity(&account_b).2,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
@@ -19494,18 +20295,22 @@ fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulate
     for expected_trades in 1..=2u128 {
         run_ix(
             Instruction::TradeNoCpi {
-                asset_index: 0,
-                size_q: (10 * POS_SCALE) as i128,
-                exec_price: 100,
-                fee_bps: 1_000,
-            },
-            &mut [
-                &mut long_owner,
-                &mut short_owner,
-                &mut market,
-                &mut long_account,
-                &mut short_account,
-            ],
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
+            asset_index: 0,
+            size_q: (10 * POS_SCALE) as i128,
+            exec_price: 100,
+            fee_bps: 1_000,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
         )
         .unwrap();
         let expected = (per_trade_creator * expected_trades) as u64;
@@ -19561,6 +20366,10 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
     let before = market.data.clone();
     let rejected = run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -19625,6 +20434,10 @@ fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_w
     let before = market.data.clone();
     let rejected = run_ix(
         Instruction::BatchTradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             legs: vec![percolator_prog::ix::BatchTradeLeg {
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
@@ -20177,6 +20990,10 @@ fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_
     let (cfg_before, _) = state::read_market(&market.data).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -20690,6 +21507,10 @@ fn v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg() {
     let leg1_size = 30 * POS_SCALE;
     run_ix(
         Instruction::BatchTradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             legs: vec![
                 percolator_prog::ix::BatchTradeLeg {
                     asset_index: 0,
@@ -21845,6 +22666,10 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
     );
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -21877,10 +22702,15 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
     let before = market.data.clone();
     let blocked = run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             reduce_q: POS_SCALE / 2,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     assert!(
         blocked.is_err(),
@@ -21936,6 +22766,10 @@ fn v16_wrapper_force_close_abandoned_asset_is_blocked_once_resolve_has_matured()
     );
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -22161,6 +22995,13 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
 fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
     let (_admin, mut owner, mut market, mut portfolio, mint) = f01_w19_fixture();
     let healthy = portfolio.data.clone();
+    // TB-1b: capture identity from the HEALTHY image before it gets stamped
+    // stale below -- `portfolio_identity` itself calls `check_header` and would
+    // panic on the pre-18 image this test deliberately constructs. The
+    // account's real identity doesn't change; only its VERSION/discriminator
+    // header bytes are corrupted, so these captured values stay correct for
+    // every call against the stamped image below.
+    let (portfolio_id, expected_sequence, position_epoch) = portfolio_identity(&portfolio);
 
     // The on-chain shape: the old account after
     // `ensure_portfolio_storage_for_market_slots` grew it 9347 -> 9539.
@@ -22191,7 +23032,11 @@ fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
     let w = run_ix_no_rollback(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id,
+            expected_sequence,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -22214,8 +23059,15 @@ fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
     assert_eq!(portfolio.data, stamped, "no partial write to the portfolio");
 
     let c = run_ix_no_rollback(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     println!("[w19] ClosePortfolio on the pre-18 image -> {c:?}   (was Custom(16) at VERSION 17)");
     assert_eq!(
@@ -22242,7 +23094,11 @@ fn f01_w19_pre_layout18_image_is_refused_by_check_header_with_custom1() {
     // And the healthy image under THIS build still withdraws.
     portfolio.data = healthy;
     let ok = run_ix_no_rollback(
-        Instruction::Withdraw { amount: 1 },
+        Instruction::Withdraw {
+            portfolio_id: portfolio_identity(&portfolio).0,
+            expected_sequence: portfolio_identity(&portfolio).1,
+            amount: 1,
+        },
         &mut [
             &mut owner,
             &mut market,
@@ -22267,6 +23123,16 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     // that trips only ONE of the two gates and read which error comes back.
     let (_admin, mut owner, mut market, mut portfolio, _mint) = f01_w19_fixture();
     let healthy = portfolio.data.clone();
+    // TB-1b: capture the identity-binding fields ONCE, from the HEALTHY image,
+    // before any VERSION/discriminator corruption below. `portfolio_identity`
+    // itself calls `read_portfolio_id` (a `check_header` gate) and would panic
+    // on the very corruption this test exists to exercise -- but the account's
+    // real portfolio_id/sequence/position_epoch never change here (only the
+    // VERSION/discriminator header bytes are stamped stale), so the captured
+    // values stay correct for the whole test: the wrapper's VERSION gate is
+    // expected to reject cases (a)/(c) before this binding is ever checked, and
+    // case (b) uses these exact live values to isolate the engine's own gate.
+    let (portfolio_id, expected_sequence, position_epoch) = portfolio_identity(&portfolio);
 
     // (a) wrapper VERSION stale, engine layout CURRENT -> only the wrapper gate
     //     can object, and it does. At VERSION 17 this image was fully accepted.
@@ -22274,8 +23140,15 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     f01_w19_set_header_version(&mut portfolio.data, F01W19_PRE18_WRAPPER_VERSION);
     assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
     let a = run_ix_no_rollback(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     println!("[w19-order] (a) VERSION=17, disc=18 -> {a:?}   (wrapper gate only)");
     assert_eq!(
@@ -22294,8 +23167,15 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
         "the wrapper gate reads MAGIC/VERSION/kind only — it cannot see the discriminator"
     );
     let b = run_ix_no_rollback(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     println!("[w19-order] (b) VERSION=18, disc=16 -> {b:?}   (engine gate only)");
     assert_eq!(
@@ -22308,8 +23188,15 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     portfolio.data = healthy;
     f01_w19_stamp_pre18(&mut portfolio.data);
     let c = run_ix_no_rollback(
-        Instruction::ClosePortfolio,
-        &mut [&mut owner, &mut market, &mut portfolio],
+        Instruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
+        &mut [
+            &mut owner,
+            &mut market,
+            &mut portfolio],
     );
     println!("[w19-order] (c) VERSION=17, disc=16 -> {c:?}   (BOTH stale: Custom(1) wins)");
     assert_eq!(
@@ -22400,6 +23287,10 @@ fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128
     };
     run_ix(
         Instruction::BatchTradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&taker).0,
+            account_a_position_epoch: portfolio_identity(&taker).2,
+            account_b_portfolio_id: portfolio_identity(&maker).0,
+            account_b_position_epoch: portfolio_identity(&maker).2,
             legs: vec![open(0), open(1)],
         },
         &mut [
@@ -22445,6 +23336,10 @@ fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128
     };
     let res = run_ix(
         Instruction::BatchTradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&taker).0,
+            account_a_position_epoch: portfolio_identity(&taker).2,
+            account_b_portfolio_id: portfolio_identity(&maker).0,
+            account_b_position_epoch: portfolio_identity(&maker).2,
             legs: vec![reduce(0), reduce(1)],
         },
         &mut [
@@ -22725,6 +23620,10 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
     // asset 0: victim LONG 1 unit @100 against the counterparty
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&victim).0,
+            account_a_position_epoch: portfolio_identity(&victim).2,
+            account_b_portfolio_id: portfolio_identity(&cp).0,
+            account_b_position_epoch: portfolio_identity(&cp).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -22742,6 +23641,10 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
     // asset 1: two UNRELATED bystanders hold a matched, healthy pair
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&ba).0,
+            account_a_position_epoch: portfolio_identity(&ba).2,
+            account_b_portfolio_id: portfolio_identity(&bb).0,
+            account_b_position_epoch: portfolio_identity(&bb).2,
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -22800,8 +23703,11 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
 }
 
 fn cw04_forfeit(f: &mut Cw04Fixture, budget: u128) -> Result<(), ProgramError> {
+    let (portfolio_id, _, position_epoch) = portfolio_identity(&f.victim);
     run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id,
+            position_epoch,
             asset_index: 0,
             b_loss_atom_budget: budget,
         },
@@ -23334,6 +24240,10 @@ fn cw02_adl_recovery_pair() -> (
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             size_q: (POS_SCALE * 2) as i128,
             exec_price: 150,
@@ -23357,6 +24267,8 @@ fn cw02_adl_recovery_pair() -> (
     let reduce_q = POS_SCALE / 100;
     run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 1,
             reduce_q,
         },
@@ -23365,6 +24277,8 @@ fn cw02_adl_recovery_pair() -> (
     .unwrap();
     run_ix(
         Instruction::RebalanceReduce {
+            portfolio_id: portfolio_identity(&short_account).0,
+            position_epoch: portfolio_identity(&short_account).2,
             asset_index: 1,
             reduce_q,
         },
@@ -23590,10 +24504,15 @@ fn cw02_tag43_owner_forfeit_still_works_on_the_adl_recovery_leg() {
 
     let r = run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 1,
             b_loss_atom_budget: 1,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     println!("(cw02) tag 43 owner forfeit on the ADL'd Recovery leg -> {r:?}");
     assert_eq!(r, Ok(()), "the owner-signed dead-leg exit is untouched by B-3");
@@ -23685,8 +24604,16 @@ fn cw02_forfeit_is_not_the_same_outcome_as_a_close_for_the_holder() {
     let (mut market_f, mut long_f, _short_f, _cranker2, mut long_owner, _raw2, _eff2) =
         cw02_adl_recovery_pair();
     run_ix(
-        Instruction::ForfeitRecoveryLeg { asset_index: 1, b_loss_atom_budget: u128::MAX },
-        &mut [&mut long_owner, &mut market_f, &mut long_f],
+        Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&long_f).0,
+            position_epoch: portfolio_identity(&long_f).2,
+            asset_index: 1,
+            b_loss_atom_budget: u128::MAX,
+        },
+        &mut [
+            &mut long_owner,
+            &mut market_f,
+            &mut long_f],
     )
     .expect("the owner may forfeit");
     let forfeited = state::read_portfolio(&long_f.data).unwrap();
@@ -23754,6 +24681,10 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -23786,10 +24717,15 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
     let before_leg = active_leg_for_asset(&before_a, 0);
     let result = run_ix(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: portfolio_identity(&long_account).0,
+            position_epoch: portfolio_identity(&long_account).2,
             asset_index: 0,
             b_loss_atom_budget: budget,
         },
-        &mut [&mut long_owner, &mut market, &mut long_account],
+        &mut [
+            &mut long_owner,
+            &mut market,
+            &mut long_account],
     );
     let after_a = state::read_portfolio(&long_account.data).unwrap();
     let detached = percolator::active_bitmap_is_empty(after_a.active_bitmap);
@@ -23884,9 +24820,16 @@ nothing settles beyond min(public_b_chunk_atoms, b_remaining)",
     );
 }
 
-/// The rename must be a RENAME: the encoded instruction is byte-identical to the
-/// layout tag 43 has always had — `[43][asset_index: u16 LE][budget: u128 LE]` —
-/// and it round-trips through `decode`. No ABI break, so no tag bump.
+/// The rename must be a RENAME: `asset_index`/`b_loss_atom_budget` sit at the
+/// exact same trailing offsets tag 43 has always had. TB-1b (portfolio-identity
+/// binding) prepends `portfolio_id`/`position_epoch` (u64 LE each) ahead of
+/// them — `[43][portfolio_id: u64 LE][position_epoch: u64 LE][asset_index: u16
+/// LE][budget: u128 LE]`, 35 bytes total — so the WHOLE-INSTRUCTION byte
+/// identity this test originally asserted no longer holds (that is TB-1b's
+/// point: these fields are now load-bearing wire bytes, not zero-cost). What
+/// still holds, and what this test now proves, is that the rename itself moved
+/// no bytes within the still-present `asset_index`/`b_loss_atom_budget` tail,
+/// and the instruction round-trips through `decode`.
 #[test]
 fn cw03_tag43_wire_layout_is_byte_identical_after_the_rename() {
     for (asset_index, budget) in [
@@ -23895,32 +24838,45 @@ fn cw03_tag43_wire_layout_is_byte_identical_after_the_rename() {
         (7, 4_000_000),
         (u16::MAX, u128::MAX),
     ] {
+        let portfolio_id = 1u64;
+        let position_epoch = 0u64;
         let encoded = Instruction::ForfeitRecoveryLeg {
+            portfolio_id,
+            position_epoch,
             asset_index,
             b_loss_atom_budget: budget,
         }
         .encode();
-        let mut expected = Vec::with_capacity(19);
+        let mut expected = Vec::with_capacity(35);
         expected.push(43u8);
+        expected.extend_from_slice(&portfolio_id.to_le_bytes());
+        expected.extend_from_slice(&position_epoch.to_le_bytes());
         expected.extend_from_slice(&asset_index.to_le_bytes());
         expected.extend_from_slice(&budget.to_le_bytes());
         assert_eq!(
             encoded, expected,
-            "tag 43 is [43][u16 LE asset_index][u128 LE budget]; the rename moves no bytes"
+            "tag 43 is [43][u64 LE portfolio_id][u64 LE position_epoch][u16 LE asset_index]\
+             [u128 LE budget]; the rename moves no bytes within the trailing asset_index/budget pair"
         );
-        assert_eq!(encoded.len(), 19, "1 + 2 + 16");
+        assert_eq!(encoded.len(), 35, "1 + 8 + 8 + 2 + 16");
         match Instruction::decode(&encoded).expect("round-trips") {
             Instruction::ForfeitRecoveryLeg {
+                portfolio_id: got_portfolio_id,
+                position_epoch: got_position_epoch,
                 asset_index: got_asset,
                 b_loss_atom_budget: got_budget,
             } => {
+                assert_eq!(got_portfolio_id, portfolio_id);
+                assert_eq!(got_position_epoch, position_epoch);
                 assert_eq!(got_asset, asset_index);
                 assert_eq!(got_budget, budget);
             }
             other => panic!("decoded to the wrong variant: {other:?}"),
         }
     }
-    println!("[cw03] tag 43 wire layout unchanged: 19 bytes, [43][u16][u128], round-trips");
+    println!(
+        "[cw03] tag 43 wire layout: 35 bytes, [43][u64][u64][u16][u128], rename moves no bytes, round-trips"
+    );
 }
 
 /// Anti-rot: the old name is gone from source, tests and the README, and the

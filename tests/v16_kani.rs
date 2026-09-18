@@ -142,16 +142,12 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
 fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     let tag: u8 = kani::any();
     // Note: tag 23 (WithdrawInsuranceLimited) removed in v17 auth overhaul.
-    kani::assume(
-        tag == 3
-            || tag == 4
-            || tag == 9
-            || tag == 28
-            || tag == 30
-            || tag == 41
-            || tag == 42
-            || tag == 47,
-    );
+    // TB-1b: tags 3 (Deposit), 4 (Withdraw), 28 (ConvertReleasedPnl), and 42
+    // (CureAndCancelClose) no longer share this uniform "tag + amount(16)"
+    // shape -- they now carry a leading portfolio-identity binding (see
+    // `kani_v16_deposit_withdraw_decode_preserves_wire_fields` and
+    // `kani_v16_convert_and_cure_decode_preserves_wire_fields` below).
+    kani::assume(tag == 9 || tag == 30 || tag == 41 || tag == 47);
     let amount: u128 = kani::any();
 
     let mut data = [0u8; 17];
@@ -159,22 +155,110 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     data[1..17].copy_from_slice(&amount.to_le_bytes());
 
     match (tag, Instruction::decode(&data).unwrap()) {
-        (3, Instruction::Deposit { amount: got }) => assert_eq!(got, amount),
-        (4, Instruction::Withdraw { amount: got }) => assert_eq!(got, amount),
         (9, Instruction::TopUpInsurance { amount: got }) => assert_eq!(got, amount),
-        (28, Instruction::ConvertReleasedPnl { amount: got }) => assert_eq!(got, amount),
         (30, Instruction::CloseResolved { fee_rate_per_slot }) => {
             assert_eq!(fee_rate_per_slot, amount)
         }
         (41, Instruction::WithdrawInsurance { amount: got }) => assert_eq!(got, amount),
-        (
-            42,
-            Instruction::CureAndCancelClose {
-                optional_deposit: got,
-            },
-        ) => assert_eq!(got, amount),
         (47, Instruction::RefineResolvedUnreceiptedBound { decrease_num }) => {
             assert_eq!(decrease_num, amount)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// TB-1b (ADOPT upstream cf0ce5d3/0492ebbc): Deposit/Withdraw now carry a
+/// leading `portfolio_id`/`expected_sequence` binding. Symbolic over every
+/// field via the `Instruction` encode/decode API (not a hand-built byte
+/// buffer), so this also proves the wire OFFSET/ORDER the encoder actually
+/// produces, not just an offset this proof assumes.
+#[kani::proof]
+fn kani_v16_deposit_withdraw_decode_preserves_wire_fields() {
+    let portfolio_id: u64 = kani::any();
+    let expected_sequence: u64 = kani::any();
+    let amount: u128 = kani::any();
+
+    let deposit = Instruction::Deposit {
+        portfolio_id,
+        expected_sequence,
+        amount,
+    }
+    .encode();
+    match Instruction::decode(&deposit).unwrap() {
+        Instruction::Deposit {
+            portfolio_id: got_id,
+            expected_sequence: got_seq,
+            amount: got_amount,
+        } => {
+            assert_eq!(got_id, portfolio_id);
+            assert_eq!(got_seq, expected_sequence);
+            assert_eq!(got_amount, amount);
+        }
+        _ => unreachable!(),
+    }
+
+    let withdraw = Instruction::Withdraw {
+        portfolio_id,
+        expected_sequence,
+        amount,
+    }
+    .encode();
+    match Instruction::decode(&withdraw).unwrap() {
+        Instruction::Withdraw {
+            portfolio_id: got_id,
+            expected_sequence: got_seq,
+            amount: got_amount,
+        } => {
+            assert_eq!(got_id, portfolio_id);
+            assert_eq!(got_seq, expected_sequence);
+            assert_eq!(got_amount, amount);
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// TB-1b (ADOPT upstream 7453c7cd): ConvertReleasedPnl/CureAndCancelClose now
+/// carry a leading `portfolio_id`/`position_epoch` binding.
+#[kani::proof]
+fn kani_v16_convert_and_cure_decode_preserves_wire_fields() {
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let amount: u128 = kani::any();
+
+    let convert = Instruction::ConvertReleasedPnl {
+        portfolio_id,
+        position_epoch,
+        amount,
+    }
+    .encode();
+    match Instruction::decode(&convert).unwrap() {
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: got_id,
+            position_epoch: got_epoch,
+            amount: got_amount,
+        } => {
+            assert_eq!(got_id, portfolio_id);
+            assert_eq!(got_epoch, position_epoch);
+            assert_eq!(got_amount, amount);
+        }
+        _ => unreachable!(),
+    }
+
+    let cure = Instruction::CureAndCancelClose {
+        portfolio_id,
+        position_epoch,
+        optional_deposit: amount,
+    }
+    .encode();
+    match Instruction::decode(&cure).unwrap() {
+        Instruction::CureAndCancelClose {
+            portfolio_id: got_id,
+            position_epoch: got_epoch,
+            optional_deposit: got_amount,
+        } => {
+            assert_eq!(got_id, portfolio_id);
+            assert_eq!(got_epoch, position_epoch);
+            assert_eq!(got_amount, amount);
         }
         _ => unreachable!(),
     }
@@ -229,17 +313,27 @@ fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
     let reduce_q: u128 = kani::any();
     let close_q: u128 = kani::any();
     let now_slot: u64 = kani::any();
+    // TB-1b: ForfeitRecoveryLeg/RebalanceReduce now also bind portfolio_id +
+    // position_epoch.
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
 
     let forfeit = Instruction::ForfeitRecoveryLeg {
+        portfolio_id,
+        position_epoch,
         asset_index,
         b_loss_atom_budget,
     }
     .encode();
     match Instruction::decode(&forfeit).unwrap() {
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: got_id,
+            position_epoch: got_epoch,
             asset_index: got_asset,
             b_loss_atom_budget: got_budget,
         } => {
+            assert_eq!(got_id, portfolio_id);
+            assert_eq!(got_epoch, position_epoch);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_budget, b_loss_atom_budget);
         }
@@ -247,15 +341,21 @@ fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
     }
 
     let rebalance = Instruction::RebalanceReduce {
+        portfolio_id,
+        position_epoch,
         asset_index,
         reduce_q,
     }
     .encode();
     match Instruction::decode(&rebalance).unwrap() {
         Instruction::RebalanceReduce {
+            portfolio_id: got_id,
+            position_epoch: got_epoch,
             asset_index: got_asset,
             reduce_q: got_reduce,
         } => {
+            assert_eq!(got_id, portfolio_id);
+            assert_eq!(got_epoch, position_epoch);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_reduce, reduce_q);
         }
@@ -404,25 +504,46 @@ fn kani_v16_asset_lifecycle_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
+    // TB-1b: TradeNoCpi now leads with the two accounts' portfolio_id/
+    // position_epoch binding. Symbolic over every field via the `Instruction`
+    // encode/decode API (not a hand-built byte buffer with recomputed
+    // offsets), so this proves the wire order the encoder actually produces.
+    let account_a_portfolio_id: u64 = kani::any();
+    let account_a_position_epoch: u64 = kani::any();
+    let account_b_portfolio_id: u64 = kani::any();
+    let account_b_position_epoch: u64 = kani::any();
     let asset_index: u16 = kani::any();
     let size_q: i128 = kani::any();
     let exec_price: u64 = kani::any();
     let fee_bps: u64 = kani::any();
 
-    let mut data = [0u8; 35];
-    data[0] = 6;
-    data[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    data[3..19].copy_from_slice(&size_q.to_le_bytes());
-    data[19..27].copy_from_slice(&exec_price.to_le_bytes());
-    data[27..35].copy_from_slice(&fee_bps.to_le_bytes());
+    let data = Instruction::TradeNoCpi {
+        account_a_portfolio_id,
+        account_a_position_epoch,
+        account_b_portfolio_id,
+        account_b_position_epoch,
+        asset_index,
+        size_q,
+        exec_price,
+        fee_bps,
+    }
+    .encode();
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: got_a_id,
+            account_a_position_epoch: got_a_epoch,
+            account_b_portfolio_id: got_b_id,
+            account_b_position_epoch: got_b_epoch,
             asset_index: got_asset,
             size_q: got_size,
             exec_price: got_price,
             fee_bps: got_fee,
         } => {
+            assert_eq!(got_a_id, account_a_portfolio_id);
+            assert_eq!(got_a_epoch, account_a_position_epoch);
+            assert_eq!(got_b_id, account_b_portfolio_id);
+            assert_eq!(got_b_epoch, account_b_position_epoch);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_size, size_q);
             assert_eq!(got_price, exec_price);
@@ -434,25 +555,42 @@ fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_tradecpi_decode_preserves_wire_fields() {
+    let account_a_portfolio_id: u64 = kani::any();
+    let account_a_position_epoch: u64 = kani::any();
+    let account_b_portfolio_id: u64 = kani::any();
+    let account_b_position_epoch: u64 = kani::any();
     let asset_index: u16 = kani::any();
     let size_q: i128 = kani::any();
     let fee_bps: u64 = kani::any();
     let limit_price: u64 = kani::any();
 
-    let mut data = [0u8; 35];
-    data[0] = 10;
-    data[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    data[3..19].copy_from_slice(&size_q.to_le_bytes());
-    data[19..27].copy_from_slice(&fee_bps.to_le_bytes());
-    data[27..35].copy_from_slice(&limit_price.to_le_bytes());
+    let data = Instruction::TradeCpi {
+        account_a_portfolio_id,
+        account_a_position_epoch,
+        account_b_portfolio_id,
+        account_b_position_epoch,
+        asset_index,
+        size_q,
+        fee_bps,
+        limit_price,
+    }
+    .encode();
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TradeCpi {
+            account_a_portfolio_id: got_a_id,
+            account_a_position_epoch: got_a_epoch,
+            account_b_portfolio_id: got_b_id,
+            account_b_position_epoch: got_b_epoch,
             asset_index: got_asset,
             size_q: got_size,
             fee_bps: got_fee,
             limit_price: got_limit,
         } => {
+            assert_eq!(got_a_id, account_a_portfolio_id);
+            assert_eq!(got_a_epoch, account_a_position_epoch);
+            assert_eq!(got_b_id, account_b_portfolio_id);
+            assert_eq!(got_b_epoch, account_b_position_epoch);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_size, size_q);
             assert_eq!(got_fee, fee_bps);
@@ -1057,8 +1195,22 @@ fn kani_v16_custody_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
 
     assert_rejects_trailing_byte(Instruction::InitPortfolio, extra);
-    assert_rejects_trailing_byte(Instruction::Deposit { amount: 1 }, extra);
-    assert_rejects_trailing_byte(Instruction::Withdraw { amount: 1 }, extra);
+    assert_rejects_trailing_byte(
+        Instruction::Deposit {
+            portfolio_id: 1,
+            expected_sequence: 0,
+            amount: 1,
+        },
+        extra,
+    );
+    assert_rejects_trailing_byte(
+        Instruction::Withdraw {
+            portfolio_id: 1,
+            expected_sequence: 0,
+            amount: 1,
+        },
+        extra,
+    );
     assert_rejects_trailing_byte(Instruction::TopUpInsurance { amount: 1 }, extra);
     assert_rejects_trailing_byte(
         Instruction::TopUpBackingBucket {
@@ -1103,6 +1255,10 @@ fn kani_v16_trade_and_crank_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::TradeNoCpi {
+            account_a_portfolio_id: 1,
+            account_a_position_epoch: 0,
+            account_b_portfolio_id: 2,
+            account_b_position_epoch: 0,
             asset_index: 0,
             size_q: 1,
             exec_price: 100,
@@ -1112,6 +1268,10 @@ fn kani_v16_trade_and_crank_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::TradeCpi {
+            account_a_portfolio_id: 1,
+            account_a_position_epoch: 0,
+            account_b_portfolio_id: 2,
+            account_b_position_epoch: 0,
             asset_index: 0,
             size_q: 1,
             fee_bps: 0,
@@ -1275,7 +1435,14 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
 fn kani_v16_resolved_recovery_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
 
-    assert_rejects_trailing_byte(Instruction::ConvertReleasedPnl { amount: 1 }, extra);
+    assert_rejects_trailing_byte(
+        Instruction::ConvertReleasedPnl {
+            portfolio_id: 1,
+            position_epoch: 0,
+            amount: 1,
+        },
+        extra,
+    );
     assert_rejects_trailing_byte(
         Instruction::CloseResolved {
             fee_rate_per_slot: 0,
@@ -1284,12 +1451,16 @@ fn kani_v16_resolved_recovery_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::CureAndCancelClose {
+            portfolio_id: 1,
+            position_epoch: 0,
             optional_deposit: 1,
         },
         extra,
     );
     assert_rejects_trailing_byte(
         Instruction::ForfeitRecoveryLeg {
+            portfolio_id: 1,
+            position_epoch: 0,
             asset_index: 0,
             b_loss_atom_budget: 1,
         },
@@ -1297,6 +1468,8 @@ fn kani_v16_resolved_recovery_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::RebalanceReduce {
+            portfolio_id: 1,
+            position_epoch: 0,
             asset_index: 0,
             reduce_q: 1,
         },
@@ -1322,7 +1495,14 @@ fn kani_v16_resolved_recovery_payloads_reject_trailing_byte() {
         Instruction::RefineResolvedUnreceiptedBound { decrease_num: 1 },
         extra,
     );
-    assert_rejects_trailing_byte(Instruction::ClosePortfolio, extra);
+    assert_rejects_trailing_byte(
+        Instruction::ClosePortfolio {
+            portfolio_id: 1,
+            expected_sequence: 0,
+            position_epoch: 0,
+        },
+        extra,
+    );
 }
 
 #[kani::proof]

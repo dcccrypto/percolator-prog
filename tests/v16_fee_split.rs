@@ -907,6 +907,20 @@ impl FeeEnv {
         portfolio
     }
 
+    /// TB-1b: read the account's CURRENT portfolio_id/sequence/position_epoch
+    /// directly off the live SVM account bytes, right before building an
+    /// instruction that binds to them. Always correct regardless of how many
+    /// prior Deposits/trades/etc. this specific portfolio has already seen in
+    /// this test.
+    fn portfolio_identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
+        let data = self.svm.get_account(&portfolio).unwrap().data;
+        (
+            state::read_portfolio_id(&data).unwrap(),
+            state::read_portfolio_matcher_sequence(&data).unwrap(),
+            state::read_portfolio_position_epoch(&data).unwrap(),
+        )
+    }
+
     /// Real `Deposit`: moves real SPL tokens into the market vault.
     fn deposit(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) {
         let source = Pubkey::new_unique();
@@ -922,6 +936,7 @@ impl FeeEnv {
                 },
             )
             .unwrap();
+        let (portfolio_id, expected_sequence, _) = self.portfolio_identity(portfolio);
         let payer = self.payer.insecure_clone();
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
@@ -933,7 +948,12 @@ impl FeeEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
             ],
-            data: ProgInstruction::Deposit { amount }.encode(),
+            data: ProgInstruction::Deposit {
+                portfolio_id,
+                expected_sequence,
+                amount,
+            }
+            .encode(),
         };
         send_ixs(&mut self.svm, &payer, vec![ix], &[owner]).expect("Deposit");
     }
@@ -951,6 +971,10 @@ impl FeeEnv {
         exec_price: u64,
         fee_bps: u64,
     ) -> Result<(), solana_sdk::transaction::TransactionError> {
+        let (account_a_portfolio_id, _, account_a_position_epoch) =
+            self.portfolio_identity(account_a);
+        let (account_b_portfolio_id, _, account_b_position_epoch) =
+            self.portfolio_identity(account_b);
         let payer = self.payer.insecure_clone();
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
@@ -962,6 +986,10 @@ impl FeeEnv {
                 AccountMeta::new(account_b, false),
             ],
             data: ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index: 0,
                 size_q,
                 exec_price,
