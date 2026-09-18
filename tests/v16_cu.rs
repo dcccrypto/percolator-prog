@@ -29,6 +29,17 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
+// sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only): test-only
+// monotonic nonce generator. Every call returns a value strictly greater
+// than the last, guaranteeing intent_id uniqueness across every top-up in
+// this test binary regardless of loops, shared helper functions, or how
+// many tests run -- so no existing test's outcome changes by acquiring a
+// fresh nonce (only a genuine same-value REPLAY is ever rejected).
+fn next_intent_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const CRANK_CU_LIMIT: u64 = 325_000;
 const CUSTODY_CU_LIMIT: u64 = 300_000;
 const TRADE_CU_LIMIT: u64 = 345_000;
@@ -2316,7 +2327,10 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance {
+                intent_id: next_intent_id(),
+                amount,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2342,6 +2356,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain,
                 amount,
                 expiry_slot,
@@ -2378,7 +2393,10 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance {
+                intent_id: next_intent_id(),
+                amount,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2414,7 +2432,10 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance {
+                intent_id: next_intent_id(),
+                amount,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2453,7 +2474,11 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsuranceDomain { domain, amount },
+            ProgInstruction::TopUpInsuranceDomain {
+                intent_id: next_intent_id(),
+                domain,
+                amount,
+            },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2492,6 +2517,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain,
                 amount,
                 expiry_slot,
@@ -2536,6 +2562,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain,
                 amount,
                 expiry_slot,
@@ -2570,6 +2597,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain,
                 amount,
                 expiry_slot,
@@ -3393,7 +3421,10 @@ fn v16_bpf_failed_insurance_topup_transfer_rolls_back_budget_and_ledger() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::TopUpInsurance { amount: 100 },
+        ProgInstruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
             AccountMeta::new(env.market, false),
@@ -3416,6 +3447,169 @@ fn v16_bpf_failed_insurance_topup_transfer_rolls_back_budget_and_ledger() {
     let (_, group) = env.market_state();
     assert_eq!(group.insurance, 0);
     assert_eq!(group.vault, 0);
+}
+
+// sync/w2-tb3 (ADOPT upstream 20f0b9b1, "make retained top-ups one-shot",
+// intent_id slice only): TopUpInsurance(9) now carries a caller-supplied
+// `intent_id: u64`. A resubmitted (replayed) transaction that reuses a
+// previously-consumed intent_id must be rejected with EngineStale, and must
+// not move any capital; a fresh, strictly-greater intent_id must succeed.
+#[test]
+fn v16_bpf_top_up_insurance_intent_id_is_one_shot() {
+    let mut env = V16CuEnv::new();
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    fn top_up(
+        env: &mut V16CuEnv,
+        source: Pubkey,
+        intent_id: u64,
+        amount: u128,
+    ) -> Result<u64, String> {
+        send_tx(
+            &mut env.svm,
+            env.program_id,
+            &env.payer,
+            ProgInstruction::TopUpInsurance { intent_id, amount },
+            vec![
+                AccountMeta::new(env.admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&env.admin],
+        )
+    }
+
+    // First use of intent_id=7 succeeds and moves capital.
+    top_up(&mut env, source, 7, 100).expect("first top-up with a fresh intent_id must succeed");
+    let (_, group_after_first) = env.market_state();
+    assert_eq!(group_after_first.insurance, 100);
+
+    // Replaying the SAME intent_id=7 (e.g. a resubmitted/captured transaction)
+    // must be rejected -- this is the mechanism this unit adopts: a top-up
+    // authorization is one-shot, not indefinitely resubmittable. Expire the
+    // blockhash first so this is a genuinely NEW transaction (a byte-identical
+    // resubmission would otherwise be caught by the runtime's own duplicate-
+    // signature dedup before ever reaching the program -- that is a different,
+    // uninteresting rejection, not the intent_id check this test targets).
+    env.svm.expire_blockhash();
+    let replay_err = top_up(&mut env, source, 7, 100)
+        .expect_err("replaying the same intent_id must be rejected");
+    assert_eq!(
+        custom_code(&replay_err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (one-shot replay rejection); got {replay_err}"
+    );
+    // The rejected replay must not have moved any additional capital.
+    let (_, group_after_replay) = env.market_state();
+    assert_eq!(
+        group_after_replay.insurance, 100,
+        "a rejected replay must not move capital"
+    );
+
+    // A fresh, strictly-greater intent_id succeeds.
+    top_up(&mut env, source, 8, 50).expect("a fresh, strictly-greater intent_id must succeed");
+    let (_, group_after_second) = env.market_state();
+    assert_eq!(group_after_second.insurance, 150);
+
+    // An intent_id that is not STRICTLY greater than the last consumed value
+    // (3 < 8, even though 3 itself was never used before) is also rejected --
+    // the check is "newer than the last seen value", not "never seen before".
+    let stale_err = top_up(&mut env, source, 3, 10)
+        .expect_err("an intent_id lower than the last consumed one must be rejected");
+    assert_eq!(
+        custom_code(&stale_err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale; got {stale_err}"
+    );
+    let (_, group_after_stale) = env.market_state();
+    assert_eq!(
+        group_after_stale.insurance, 150,
+        "a rejected stale intent_id must not move capital"
+    );
+}
+
+// sync/w2-tb3: TopUpInsuranceDomain(56) targeting domain 0/1 (asset index 0)
+// shares the SAME `insurance_top_up` lane as TopUpInsurance(9) -- an intent_id
+// consumed via one entrypoint must not be replayable through the other.
+#[test]
+fn v16_bpf_top_up_insurance_domain_shares_asset0_lane_with_top_up_insurance() {
+    let mut env = V16CuEnv::new();
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, env.admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Consume intent_id=5 via the plain (non-domain) entrypoint.
+    send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::TopUpInsurance {
+            intent_id: 5,
+            amount: 10,
+        },
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&env.admin],
+    )
+    .expect("first top-up via TopUpInsurance must succeed");
+
+    // Replaying the same intent_id=5 via TopUpInsuranceDomain(56) at domain 0
+    // (asset index 0) must ALSO be rejected -- same lane, alternate route.
+    let err = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::TopUpInsuranceDomain {
+            domain: 0,
+            intent_id: 5,
+            amount: 10,
+        },
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&env.admin],
+    )
+    .expect_err(
+        "an intent_id consumed via TopUpInsurance must not be replayable via TopUpInsuranceDomain",
+    );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (shared-lane replay rejection); got {err}"
+    );
 }
 
 #[test]
@@ -3447,6 +3641,7 @@ fn v16_bpf_failed_backing_topup_transfer_rolls_back_bucket_and_ledger() {
         env.program_id,
         &env.payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -3685,7 +3880,11 @@ fn v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry() {
     );
 
     env.resolve();
-    assert_eq!(terminal_slab_scan_progress(&env), 0, "fresh market, no scan run yet");
+    assert_eq!(
+        terminal_slab_scan_progress(&env),
+        0,
+        "fresh market, no scan run yet"
+    );
 
     // First CloseSlab call: asset 0 -> Continue, asset 1 -> Wait (bucket Fresh,
     // not yet lapsed at slot 1 < EXPIRY_SLOT). The scan makes progress (returns
@@ -3840,6 +4039,7 @@ fn v16_bpf_topup_backing_bucket_rejects_lp_vault_sentinel_expiry() {
     let err = env
         .send(
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain: 1,
                 amount: 1_000,
                 expiry_slot: sentinel,
@@ -3888,7 +4088,8 @@ fn v16_bpf_topup_backing_bucket_rejects_lp_vault_sentinel_expiry() {
         "a top-up whose expiry_slot is one less than the sentinel must still succeed"
     );
     assert_eq!(
-        g2.source_backing_buckets[1].expiry_slot, sentinel - 1,
+        g2.source_backing_buckets[1].expiry_slot,
+        sentinel - 1,
         "the accepted expiry_slot must be stored unmodified"
     );
 }
@@ -4045,7 +4246,10 @@ fn v16_bpf_permissionless_activation_rejects_fee_above_caller_cap() {
     let before_vault = env.token_amount(env.vault);
     let (_, before_group) = env.market_state();
     let before_slots = before_group.config.max_market_slots;
-    assert_eq!(before_slots, 1, "fresh market starts with only asset 0 configured");
+    assert_eq!(
+        before_slots, 1,
+        "fresh market starts with only asset 0 configured"
+    );
 
     // Caller consents to at most 50, but the computed fee is 100 — must be rejected,
     // not silently overcharged.
@@ -4071,8 +4275,7 @@ fn v16_bpf_permissionless_activation_rejects_fee_above_caller_cap() {
     // Rejected activation must be a true refusal: no state mutation, no fee charged.
     let (_, after_reject_group) = env.market_state();
     assert_eq!(
-        after_reject_group.config.max_market_slots,
-        before_slots,
+        after_reject_group.config.max_market_slots, before_slots,
         "rejected activation must not append/grow the configured asset slots"
     );
     assert_eq!(
@@ -6377,16 +6580,16 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     const CAP_BPS: u64 = 25;
     const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000; // engine cap (v16.rs validate_public_user_fund_shape)
-    // `accrue_asset_to_not_atomic` pins the MARKET-WIDE `header.current_slot` to
-    // `max(current, now_slot)` using the FULL (uncapped) `now_slot` argument --
-    // not the capped per-asset `segment_dt` -- and `authenticated_market_slot_
-    // or_fallback_view` in turn floors every later call's `now_slot` at that
-    // sticky value. The setup crank's own slot must therefore be kept SMALL
-    // (just enough to exceed MAX_ACCRUAL_DT_SLOTS so `segment_dt` is still
-    // capped at exactly 50) rather than far in the future, or the close's own
-    // segment_dt below would be forced huge too. The push and the setup crank
-    // run at THE SAME real slot (no warp between them) so the push's own
-    // `authenticated_slot_or_fallback` reads the same small value.
+                                                     // `accrue_asset_to_not_atomic` pins the MARKET-WIDE `header.current_slot` to
+                                                     // `max(current, now_slot)` using the FULL (uncapped) `now_slot` argument --
+                                                     // not the capped per-asset `segment_dt` -- and `authenticated_market_slot_
+                                                     // or_fallback_view` in turn floors every later call's `now_slot` at that
+                                                     // sticky value. The setup crank's own slot must therefore be kept SMALL
+                                                     // (just enough to exceed MAX_ACCRUAL_DT_SLOTS so `segment_dt` is still
+                                                     // capped at exactly 50) rather than far in the future, or the close's own
+                                                     // segment_dt below would be forced huge too. The push and the setup crank
+                                                     // run at THE SAME real slot (no warp between them) so the push's own
+                                                     // `authenticated_slot_or_fallback` reads the same small value.
     const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
     // asset.slot_last after the setup crank: dt_total = 51 - 0 = 51 exceeds
     // MAX_ACCRUAL_DT_SLOTS (50), so segment_dt is capped at exactly 50.
@@ -6551,8 +6754,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     // trade's own 1-slot segment: the closing trade itself performed this
     // accrual, not a crank (none ran after the setup crank).
     assert_eq!(
-        group_after_close.assets[0].slot_last,
-        CLOSE_SLOT,
+        group_after_close.assets[0].slot_last, CLOSE_SLOT,
         "closing trade must accrue the stationary-premium interval via the new \
          zero-move hook, not leave slot_last stale at the pre-fix value of {}",
         SETUP_CRANK_SLOT_LAST
@@ -6575,8 +6777,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
          arbitrage)"
     );
     assert_eq!(
-        group_after_close.assets[0].f_long_num,
-        -group_after_close.assets[0].f_short_num,
+        group_after_close.assets[0].f_long_num, -group_after_close.assets[0].f_short_num,
         "funding index must be conserved between the two sides"
     );
     assert_ne!(
@@ -6588,7 +6789,9 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     let long_final = env.portfolio_state(long_account);
     let short_final = env.portfolio_state(short_account);
     assert!(percolator::active_bitmap_is_empty(long_final.active_bitmap));
-    assert!(percolator::active_bitmap_is_empty(short_final.active_bitmap));
+    assert!(percolator::active_bitmap_is_empty(
+        short_final.active_bitmap
+    ));
     // Both trades executed at INITIAL_PRICE (no price-driven PnL for either
     // leg), so any nonzero pnl/capital delta from DEPOSIT reflects the settled
     // zero-move funding -- NOTE this EWMA_MARK profile's `hybrid_trade_fee_bps_
@@ -6895,7 +7098,11 @@ fn v16_bpf_withdraw_crystallizes_maintenance_fee_before_debiting_capital() {
     // InitPortfolio -- this is the dodge the fix closes.
     let fee_per_slot: u128 = 7;
     let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
-        1, 10_000, 10_000, 10_000, fee_per_slot,
+        1,
+        10_000,
+        10_000,
+        10_000,
+        fee_per_slot,
     );
     let owner = Keypair::new();
     let portfolio = env.create_portfolio(&owner);
@@ -6918,7 +7125,10 @@ fn v16_bpf_withdraw_crystallizes_maintenance_fee_before_debiting_capital() {
     let (_, group_after) = env.market_state();
     let portfolio_after = env.portfolio_state(portfolio);
 
-    assert!(expected_fee > 0, "test setup: elapsed time must accrue a nonzero fee");
+    assert!(
+        expected_fee > 0,
+        "test setup: elapsed time must accrue a nonzero fee"
+    );
     assert_eq!(
         received,
         deposit_amount - expected_fee,
@@ -6951,7 +7161,11 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
     // accrued since deposit for BOTH sides.
     let fee_per_slot: u128 = 7;
     let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
-        1, 10_000, 10_000, 10_000, fee_per_slot,
+        1,
+        10_000,
+        10_000,
+        10_000,
+        fee_per_slot,
     );
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -7063,7 +7277,15 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         env.deposit(&victim_owner, victim, 1_000_000);
         env.deposit(&cp_owner, cp, 1_000_000);
         // victim LONG 1 unit @ 100 against cp (SHORT).
-        env.trade_with_cu(&victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+        env.trade_with_cu(
+            &victim_owner,
+            victim,
+            &cp_owner,
+            cp,
+            POS_SCALE as i128,
+            100,
+            0,
+        );
         let last_fee_slot_at_deposit = env.portfolio_state(victim).last_fee_slot;
         // Pre-advance the asset's own `slot_last` past `last_fee_slot` via a real engine
         // accrual (price unchanged), BEFORE seeding the backlog or running any crank. This is
@@ -7080,7 +7302,9 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         // DURING this call" scenario the fix targets.
         let accrual_slot = last_fee_slot_at_deposit + 1;
         env.mutate_market(|_cfg, group| {
-            group.accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true).unwrap();
+            group
+                .accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true)
+                .unwrap();
         });
         // Seed a real, outstanding LONG-domain B debt exceeding one chunk (mirrors the CW04
         // fixture in tests/v16_wrapper.rs): `b_target_for_leg` reports `b_remaining = DEBT_B`
@@ -7129,7 +7353,8 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
              instead of livelocking"
         );
         assert_eq!(
-            env.portfolio_state(victim).legs[0].b_snap, DEBT_B,
+            env.portfolio_state(victim).legs[0].b_snap,
+            DEBT_B,
             "the leg's b_snap must reach the full seeded backlog once settlement completes"
         );
     }
@@ -7151,14 +7376,24 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         let cp = env.create_portfolio(&cp_owner);
         env.deposit(&victim_owner, victim, 1_000_000);
         env.deposit(&cp_owner, cp, 1_000_000);
-        env.trade_with_cu(&victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+        env.trade_with_cu(
+            &victim_owner,
+            victim,
+            &cp_owner,
+            cp,
+            POS_SCALE as i128,
+            100,
+            0,
+        );
         let last_fee_slot_at_deposit = env.portfolio_state(victim).last_fee_slot;
         // See Phase 1's comment: pre-advance `asset.slot_last` so the FIRST crank call's own
         // fee-collection sync (not just the crank_action's independent B-check) is the one that
         // discovers the backlog while `b_stale_state` is still 0 entering.
         let accrual_slot = last_fee_slot_at_deposit + 1;
         env.mutate_market(|_cfg, group| {
-            group.accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true).unwrap();
+            group
+                .accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true)
+                .unwrap();
         });
         env.mutate_market(|_cfg, group| {
             group.assets[0].b_long_num = DEBT_B;
@@ -7236,7 +7471,9 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         // discovers the backlog while `b_stale_state` is still 0 entering.
         let accrual_slot = last_fee_slot_at_deposit + 1;
         env.mutate_market(|_cfg, group| {
-            group.accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true).unwrap();
+            group
+                .accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true)
+                .unwrap();
         });
         // Seed a real, outstanding SHORT-domain B debt on the victim's leg, exceeding one
         // chunk.
@@ -7308,8 +7545,7 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         // SOCIAL_LOSS_DEN`) is comfortably larger than the account's ~1_000_000-atom deposit.
         const BANKRUPTCY_DEBT_B: u128 = 10 * 1_000_000_000_000_000_000_000; // 10 * SOCIAL_LOSS_DEN
         env.mutate_market(|_cfg, group| {
-            group.assets[0].b_short_num = group
-                .assets[0]
+            group.assets[0].b_short_num = group.assets[0]
                 .b_short_num
                 .checked_add(BANKRUPTCY_DEBT_B)
                 .expect("test setup: BANKRUPTCY_DEBT_B must not overflow b_short_num");
@@ -7327,7 +7563,10 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
             },
         );
         assert!(
-            env.portfolio_state(short_account).health_cert.certified_equity < 0,
+            env.portfolio_state(short_account)
+                .health_cert
+                .certified_equity
+                < 0,
             "test setup: settling BANKRUPTCY_DEBT_B must certify as genuinely bankrupt"
         );
         assert!(
@@ -9687,8 +9926,7 @@ fn v16_bpf_ewma_mark_liquidation_reward_never_reclaimable_by_self_cranked_attack
          caller-supplied reward portfolio -- trades can always move this mode's mark, so \
          `liquidation_penalty_reclaimable_from_profile_view` must be permanently closed for \
          it. Attacker capital before={} after={}",
-        attacker_before.capital,
-        attacker_after.capital
+        attacker_before.capital, attacker_after.capital
     );
     assert!(
         market_after.insurance > market_before.insurance,
@@ -9830,8 +10068,7 @@ fn v16_bpf_hybrid_trade_driven_liquidation_reward_is_not_reclaimable_by_self_cra
         "FIX (ADOPT 01ec6161): a liquidation penalty whose price trace includes a \
          trade-driven Hybrid mark move must NEVER be payable to the mover's own \
          self-cranked reward portfolio. Attacker capital before={} after={}",
-        attacker_before.capital,
-        attacker_after.capital
+        attacker_before.capital, attacker_after.capital
     );
     assert!(
         market_after.insurance > market_before.insurance,
@@ -10872,8 +11109,7 @@ fn v16_bpf_switchboard_fresh_account_write_cannot_revive_stale_selected_submissi
     // idx-7 submission timestamp and reject as stale.
     let submission_idx = 7u8;
     let stale_feed = Pubkey::new_unique();
-    let mut stale_data =
-        make_switchboard_data(&[0xABu8; 32], value, 0, 1, 1, submission_idx, 1);
+    let mut stale_data = make_switchboard_data(&[0xABu8; 32], value, 0, 1, 1, submission_idx, 1);
     stale_data[2_216..2_224].copy_from_slice(&200i64.to_le_bytes()); // account write: fresh
     let selected_off = 2_952 + submission_idx as usize * 8;
     stale_data[selected_off..selected_off + 8].copy_from_slice(&90i64.to_le_bytes()); // selected: stale
@@ -15440,6 +15676,7 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
     let refund = env
         .send(
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain: 0,
                 amount: 500,
                 expiry_slot: lapsed_slot + 10_000,
@@ -16120,6 +16357,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -16298,6 +16536,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 10,
@@ -16407,6 +16646,7 @@ fn v16_bpf_legacy_ledgerless_nonzero_topup_does_not_book_refill_as_recovery() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: DOMAIN,
             amount: 20,
             expiry_slot: 10,
@@ -16533,6 +16773,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 10,
@@ -16665,6 +16906,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: DOMAIN,
             amount: 1,
             expiry_slot: 20,
@@ -16700,6 +16942,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 20,
@@ -16940,6 +17183,7 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 50,
             expiry_slot: 10,
@@ -17168,6 +17412,7 @@ fn v16_bpf_topup_backing_bucket_rejects_expiry_at_or_before_now() {
     let err = env
         .send(
             ProgInstruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain: 1,
                 amount: 1_000,
                 expiry_slot: 10,
@@ -17315,7 +17560,10 @@ fn v16_bpf_batch_trade_nocpi_rejects_new_counterparty_lien_after_backing_expiry(
         "expected EngineStale; got {err}"
     );
     let pa = env.portfolio_state(a);
-    assert_eq!(pa.capital, 100, "a refused batch trade must not move capital");
+    assert_eq!(
+        pa.capital, 100,
+        "a refused batch trade must not move capital"
+    );
     assert_eq!(
         pa.source_lien_counterparty_backing_num[1], 0,
         "a refused batch trade must not create the new counterparty-backed lien"
@@ -17343,8 +17591,7 @@ fn v16_bpf_batch_trade_nocpi_rejects_new_counterparty_lien_after_backing_expiry(
 fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
     let mut env = V16CuEnv::new();
     let domain: u16 = 1;
-    let (ledger_pda, _bump) =
-        state::derive_lp_backing_ledger(&env.program_id, &env.market, domain);
+    let (ledger_pda, _bump) = state::derive_lp_backing_ledger(&env.program_id, &env.market, domain);
     let canonical_len = state::backing_domain_ledger_account_len();
     // One byte OVER the canonical wire length, all-zero content — exactly the
     // shape the pre-fix `data.len() < canonical` check waved through as valid.
@@ -17372,6 +17619,7 @@ fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain,
             amount: 50,
             expiry_slot: 10,
@@ -17411,8 +17659,7 @@ fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
 fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
     let mut env = V16CuEnv::new();
     let domain: u16 = 1;
-    let (ledger_pda, _bump) =
-        state::derive_lp_backing_ledger(&env.program_id, &env.market, domain);
+    let (ledger_pda, _bump) = state::derive_lp_backing_ledger(&env.program_id, &env.market, domain);
     let canonical_len = state::backing_domain_ledger_account_len();
     // Exact canonical length, but NOT all-zero — and the leading bytes do not
     // form the MAGIC header, so `is_initialized` reads this as "fresh" even
@@ -17443,6 +17690,7 @@ fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain,
             amount: 50,
             expiry_slot: 10,
@@ -17469,7 +17717,8 @@ fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
 
     let after = env.svm.get_account(&ledger_pda).unwrap();
     assert_eq!(
-        after.data[canonical_len - 1], 0xAA,
+        after.data[canonical_len - 1],
+        0xAA,
         "no partial write over the garbage on a rejected instruction"
     );
 }
@@ -17492,7 +17741,10 @@ fn v16_bpf_oversized_insurance_ledger_account_is_rejected() {
         &mut env.svm,
         pid,
         &payer,
-        ProgInstruction::TopUpInsurance { amount: 50 },
+        ProgInstruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 50,
+        },
         vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(market, false),
@@ -17541,7 +17793,10 @@ fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
         &mut env.svm,
         pid,
         &payer,
-        ProgInstruction::TopUpInsurance { amount: 50 },
+        ProgInstruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 50,
+        },
         vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(market, false),
@@ -17563,7 +17818,8 @@ fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
 
     let after = env.svm.get_account(&ledger).unwrap();
     assert_eq!(
-        after.data[canonical_len - 1], 0xAA,
+        after.data[canonical_len - 1],
+        0xAA,
         "no partial write over the garbage on a rejected instruction"
     );
 }

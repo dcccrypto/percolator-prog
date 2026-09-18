@@ -9,12 +9,13 @@ use percolator::{
 };
 use percolator_prog::{
     constants::{
-        ASSET_ORACLE_WRAPPER_LEN, DEFAULT_MARKET_SLOT_CAPACITY, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-        HEADER_LEN, MARKET_ACCOUNT_LEN, MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, ORACLE_LEG_CAP,
-        ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, ORACLE_MODE_AUTH_MARK,
-        ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL,
-        PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN,
-        PORTFOLIO_STATE_LEN, WRAPPER_CONFIG_LEN,
+        ASSET_ORACLE_WRAPPER_LEN, DEFAULT_MARKET_SLOT_CAPACITY,
+        EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED, HEADER_LEN, MARKET_ACCOUNT_LEN,
+        MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, ORACLE_LEG_CAP, ORACLE_LEG_FLAG_DIVIDE_LEG2,
+        ORACLE_LEG_FLAG_DIVIDE_LEG3, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
+        ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
+        PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN, PORTFOLIO_STATE_LEN,
+        WRAPPER_CONFIG_LEN,
     },
     ix::Instruction,
     oracle_v16, policy_v16, processor,
@@ -30,6 +31,17 @@ use solana_program::{
     program_pack::Pack, pubkey::Pubkey,
 };
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
+
+// sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only): test-only
+// monotonic nonce generator. Every call returns a value strictly greater
+// than the last, guaranteeing intent_id uniqueness across every top-up in
+// this test binary regardless of loops, shared helper functions, or how
+// many tests run -- so no existing test's outcome changes by acquiring a
+// fresh nonce (only a genuine same-value REPLAY is ever rejected).
+fn next_intent_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 struct TestAccount {
     key: Pubkey,
@@ -1079,6 +1091,7 @@ fn top_up_backing_bucket(
     let mut __sp1 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain,
             amount,
             expiry_slot,
@@ -2615,6 +2628,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut vault = vault_token_account(&market, mint, 0);
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 10,
         },
@@ -2633,6 +2647,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut __sp2 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 25,
             expiry_slot: 10,
@@ -2832,7 +2847,11 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { domain, amount },
+            Instruction::TopUpInsuranceDomain {
+                intent_id: next_intent_id(),
+                domain,
+                amount,
+            },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3215,7 +3234,11 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { domain, amount },
+            Instruction::TopUpInsuranceDomain {
+                intent_id: next_intent_id(),
+                domain,
+                amount,
+            },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3398,7 +3421,10 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut base_insurance_source = user_token_account(admin.key, mint, 10);
     let mut base_insurance_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 10,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -3512,6 +3538,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut vault = vault_token_account(&market, mint, 0);
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 9,
         },
@@ -3532,6 +3559,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut __sp3 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 20,
             expiry_slot: 20,
@@ -6605,7 +6633,10 @@ fn v16_wrapper_top_up_insurance_requires_authority_and_updates_vault() {
 
     let before = market.data.clone();
     let unauthorized = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 777,
+        },
         &mut [
             &mut attacker,
             &mut market,
@@ -6617,7 +6648,10 @@ fn v16_wrapper_top_up_insurance_requires_authority_and_updates_vault() {
     assert_err_and_market_unchanged(unauthorized, &market, &before);
 
     run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 777,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -6646,7 +6680,10 @@ fn v16_wrapper_top_up_insurance_rejects_wrong_mint_and_insufficient_source_balan
     let before = market.data.clone();
 
     let wrong_mint = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 777,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -6658,7 +6695,10 @@ fn v16_wrapper_top_up_insurance_rejects_wrong_mint_and_insufficient_source_balan
     assert_err_and_market_unchanged(wrong_mint, &market, &before);
 
     let short_balance = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 777,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -6707,7 +6747,10 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     let mut token_program = token_program_account();
     let before = market.data.clone();
     let top_up_insurance = run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -6724,6 +6767,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     let mut __sp4 = system_program_account();
     let top_up_backing = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -6750,7 +6794,10 @@ fn v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -6796,7 +6843,10 @@ fn v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -6874,7 +6924,10 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut insurance,
             &mut market,
@@ -7004,6 +7057,7 @@ fn v16_wrapper_non_main_domain_insurance_isolated_from_global_withdrawals() {
     let mut token_program = token_program_account();
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 100,
         },
@@ -7104,6 +7158,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut primary_vault = vault_token_account(&market, primary_key, 0);
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 11,
         },
@@ -7121,6 +7176,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut __sp5 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 30,
             expiry_slot: 10,
@@ -7314,6 +7370,7 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
     let mut __sp6 = system_program_account();
     let unauthorized = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 10,
             expiry_slot: 10,
@@ -7335,6 +7392,7 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
     let mut __sp7 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 10,
             expiry_slot: 10,
@@ -7403,6 +7461,7 @@ fn v16_wrapper_asset_retire_rejects_nonzero_domain_insurance_budget() {
     let mut token_program = token_program_account();
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 1,
         },
@@ -7464,6 +7523,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp8 = system_program_account();
     let unauthorized = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -7485,6 +7545,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp9 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -7531,6 +7592,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp10 = system_program_account();
     let bad_domain = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 32,
             amount: 1,
             expiry_slot: 10,
@@ -7553,6 +7615,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp11 = system_program_account();
     let inactive_domain = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 1,
             expiry_slot: 10,
@@ -7575,6 +7638,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp12 = system_program_account();
     let bad_expiry = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 1,
             expiry_slot: 0,
@@ -7638,6 +7702,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __sp13 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -7852,6 +7917,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     let mut __sp14 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 25,
             expiry_slot: 10,
@@ -7971,6 +8037,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
     let mut __sp15 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 10,
             expiry_slot: 10,
@@ -8072,6 +8139,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
     let mut __sp16 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -8189,6 +8257,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
     let mut __sp17 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 40,
             expiry_slot: 10,
@@ -8247,6 +8316,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
     let mut __sp18 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 10,
             expiry_slot: 20,
@@ -8291,6 +8361,7 @@ fn v16_wrapper_backing_domain_ledger_rejects_wrong_authority_and_domain() {
     let mut __sp19 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 10,
             expiry_slot: 10,
@@ -8333,7 +8404,10 @@ fn v16_wrapper_insurance_ledger_tracks_topup_profit_loss_and_withdrawal() {
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -8426,6 +8500,7 @@ fn v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance() 
     let mut __sp20 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 40,
             expiry_slot: 10,
@@ -8509,6 +8584,7 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
     let mut __sp21 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 40,
             expiry_slot: 10,
@@ -8570,6 +8646,7 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
     let mut __sp22 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 10,
             expiry_slot: 20,
@@ -8624,7 +8701,10 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let mut vault = vault_token_account(&market, mint, 120);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -8639,6 +8719,7 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let mut __sp23 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 0,
             amount: 100,
             expiry_slot: 10,
@@ -8747,6 +8828,7 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
     let mut __sp24 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 0,
             amount: 80,
             expiry_slot: 10,
@@ -8766,6 +8848,7 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
     let mut __sp25 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount: 30,
             expiry_slot: 10,
@@ -8886,6 +8969,7 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
     let mut __sp26 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 0,
             amount: 30,
             expiry_slot: 10,
@@ -8971,7 +9055,10 @@ fn v16_wrapper_insurance_policy_deposit_only_leaves_fee_growth_behind() {
     let mut vault = vault_token_account(&market, mint, 150);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9028,7 +9115,10 @@ fn v16_wrapper_insurance_withdraw_disabled_by_default() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9079,7 +9169,10 @@ fn v16_wrapper_insurance_policy_rejects_live_unbounded_or_zero_cooldown() {
     let mut vault = vault_token_account(&market, mint, 10);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 10,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9121,7 +9214,10 @@ fn v16_wrapper_insurance_policy_enforces_bps_cap_and_cooldown() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9184,7 +9280,10 @@ fn v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 100,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9302,7 +9401,10 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
     let mut vault = vault_token_account(&market, mint, 50);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 50 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 50,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9380,7 +9482,10 @@ fn v16_wrapper_withdraw_insurance_resolved_requires_all_portfolios_closed() {
     let mut vault = vault_token_account(&market, mint, 20);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 10,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9510,7 +9615,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut token_program = token_program_account();
     let rotated = market.data.clone();
     let old_insurance_auth = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9521,7 +9629,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     );
     assert_err_and_market_unchanged(old_insurance_auth, &market, &rotated);
     run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1,
+        },
         &mut [
             &mut insurance,
             &mut market,
@@ -9564,7 +9675,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut insurance_src = user_token_account(insurance.key, mint, 1);
     let mut vault = vault_token_account(&market, mint, 1);
     run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1,
+        },
         &mut [
             &mut insurance,
             &mut market,
@@ -9600,7 +9714,10 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let after_rotate = market.data.clone();
     let mut dead_src = user_token_account(insurance.key, mint, 1);
     let dead_insurance_auth = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1,
+        },
         &mut [
             &mut insurance,
             &mut market,
@@ -9851,6 +9968,8 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
 #[test]
 fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
     let mut profile = state::AssetOracleProfileV16 {
+        insurance_top_up: 0,
+        backing_top_up: 0,
         oracle_mode: ORACLE_MODE_EWMA_MARK,
         oracle_leg_count: 0,
         oracle_leg_flags: 0,
@@ -10491,7 +10610,10 @@ fn v16_wrapper_close_slab_rejects_nonzero_engine_vault_or_insurance() {
     let mut vault = vault_token_account(&market, mint, 10);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 10,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10805,7 +10927,10 @@ fn v16_wrapper_vault_accounts_reject_delegate_and_close_authority() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let topup_bad_vault = run_ix(
-        Instruction::TopUpInsurance { amount: 1_000 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1_000,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10902,7 +11027,10 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let frozen_topup_vault = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10919,6 +11047,7 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
     let mut __sp27 = system_program_account();
     let frozen_backing_vault = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: 1,
             expiry_slot: 1,
@@ -10988,7 +11117,10 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
 
     let mut admin_source = user_token_account(admin.key, mint, u64::MAX);
     let topup_too_large = run_ix(
-        Instruction::TopUpInsurance { amount: too_large },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: too_large,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -11005,6 +11137,7 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
     let mut __sp28 = system_program_account();
     let backing_too_large = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 1,
             amount: too_large,
             expiry_slot: 1,
@@ -11074,8 +11207,19 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
     assert_eq!(portfolio.data, before_portfolio);
 
     let mut admin_source = user_token_account(admin.key, mint, 0);
+    // sync/w2-tb3: a zero-amount top-up moves no funds (custody is still a
+    // no-op -- that invariant this test is named for holds) but DOES still
+    // consume the one-shot `insurance_top_up` nonce, matching upstream's
+    // design (20f0b9b1): intent_id is about single-use AUTHORIZATION
+    // consumption, not "did money move". Build the expected post-state as
+    // `before_market` with ONLY that one field advanced, so this still
+    // proves nothing else in the account changed.
+    let insurance_topup_intent_id = next_intent_id();
     run_ix(
-        Instruction::TopUpInsurance { amount: 0 },
+        Instruction::TopUpInsurance {
+            intent_id: insurance_topup_intent_id,
+            amount: 0,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -11085,14 +11229,23 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
         ],
     )
     .unwrap();
-    assert_eq!(market.data, before_market);
+    let mut expected_after_insurance_topup = before_market.clone();
+    let mut profile0 = state::read_asset_oracle_profile(&before_market, 0).unwrap();
+    profile0.insurance_top_up = insurance_topup_intent_id;
+    state::write_asset_oracle_profile(&mut expected_after_insurance_topup, 0, &profile0).unwrap();
+    assert_eq!(market.data, expected_after_insurance_topup);
     assert_eq!(portfolio.data, before_portfolio);
+    let before_market = expected_after_insurance_topup;
 
     let mut admin_source = user_token_account(admin.key, mint, 0);
     let mut __lg29 = canonical_backing_ledger_account(&market, 1);
     let mut __sp29 = system_program_account();
+    // sync/w2-tb3: same reasoning as above, for TopUpBackingBucket's
+    // per-asset `backing_top_up` lane (domain 1 -> asset index 0).
+    let backing_topup_intent_id = next_intent_id();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: backing_topup_intent_id,
             domain: 1,
             amount: 0,
             expiry_slot: 1,
@@ -11108,7 +11261,11 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
         ],
     )
     .unwrap();
-    assert_eq!(market.data, before_market);
+    let mut expected_after_backing_topup = before_market.clone();
+    let mut profile0 = state::read_asset_oracle_profile(&before_market, 0).unwrap();
+    profile0.backing_top_up = backing_topup_intent_id;
+    state::write_asset_oracle_profile(&mut expected_after_backing_topup, 0, &profile0).unwrap();
+    assert_eq!(market.data, expected_after_backing_topup);
     assert_eq!(portfolio.data, before_portfolio);
 }
 
@@ -16489,7 +16646,10 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let topup_after_resolve = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance {
+            intent_id: next_intent_id(),
+            amount: 1,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -17271,7 +17431,11 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
             0 => {
                 // Per-domain insurance top-up (TopUpInsuranceDomain still uses domain).
                 let res = run_ix(
-                    Instruction::TopUpInsuranceDomain { domain, amount },
+                    Instruction::TopUpInsuranceDomain {
+                        intent_id: next_intent_id(),
+                        domain,
+                        amount,
+                    },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17452,6 +17616,7 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                 let mut __sp30 = system_program_account();
                 let res = run_ix(
                     Instruction::TopUpBackingBucket {
+                        intent_id: next_intent_id(),
                         domain,
                         amount,
                         expiry_slot: FAR_EXPIRY,
@@ -17598,6 +17763,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     for dom in [4u16, 5u16] {
         run_ix(
             Instruction::TopUpInsuranceDomain {
+                intent_id: next_intent_id(),
                 domain: dom,
                 amount: 5_000,
             },
@@ -17615,6 +17781,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     let mut __sp31 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 4,
             amount: 3_000,
             expiry_slot: 1_000_000,
@@ -17932,6 +18099,8 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
         // Build and store AUTH_MARK oracle profile for asset 1.  oracle_authority
         // is set to admin.key so PushAuthMark passes expect_live_authority.
         let profile1 = state::AssetOracleProfileV16 {
+            insurance_top_up: 0,
+            backing_top_up: 0,
             oracle_mode: ORACLE_MODE_AUTH_MARK,
             oracle_leg_count: 0,
             oracle_leg_flags: 0,
@@ -18157,6 +18326,8 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
         // EWMA_MARK oracle profile for asset 1 (halflife = 1 as the original
         // ConfigureEwmaMark call specified).
         let profile1 = state::AssetOracleProfileV16 {
+            insurance_top_up: 0,
+            backing_top_up: 0,
             oracle_mode: ORACLE_MODE_EWMA_MARK,
             oracle_leg_count: 0,
             oracle_leg_flags: 0,
@@ -18482,6 +18653,7 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
     let mut __sp32 = system_program_account();
     let rejected = run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 0,
             amount: 1_000,
             expiry_slot: 1_000_000,
@@ -22457,7 +22629,10 @@ fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128
 fn b4_batch_with_taker_shortfall_and_maker_remainder_executes() {
     let (res, fee_leg, taker_before, taker_after, maker_before, maker_after) =
         b4_mid_batch_shortfall_batch();
-    println!("[b4] fee_leg={fee_leg} (per leg, 2 legs) -> batch owes {}", 2 * fee_leg);
+    println!(
+        "[b4] fee_leg={fee_leg} (per leg, 2 legs) -> batch owes {}",
+        2 * fee_leg
+    );
     println!("[b4] two-leg reduction with a mid-batch taker shortfall -> {res:?}");
     assert_eq!(
         res,
@@ -22522,9 +22697,18 @@ fn b4_aggregate_bound_admits_every_legitimate_split_and_refuses_over_collection(
 
     // Legitimate shapes at 2c38570a.
     assert!(within(owed, 0, owed), "taker pays the whole fee");
-    assert!(within(0, owed, owed), "N1: the taker paid nothing, the maker pays it all");
-    assert!(within(600, 400, owed), "#160: taker pays part, maker pays the REMAINDER");
-    assert!(within(999, 1, owed), "a one-atom shortfall handed to the maker");
+    assert!(
+        within(0, owed, owed),
+        "N1: the taker paid nothing, the maker pays it all"
+    );
+    assert!(
+        within(600, 400, owed),
+        "#160: taker pays part, maker pays the REMAINDER"
+    );
+    assert!(
+        within(999, 1, owed),
+        "a one-atom shortfall handed to the maker"
+    );
     assert!(
         within(1, 0, owed),
         "an uncollectible remainder is FORGIVEN, not over-collected (av:spec.md:61 #26); the \
@@ -22534,16 +22718,25 @@ fn b4_aggregate_bound_admits_every_legitimate_split_and_refuses_over_collection(
 
     // Over-collection — refused, which is what the guard site is for.
     assert!(!within(owed, 1, owed), "one atom MORE than the batch owes");
-    assert!(!within(owed, owed, owed), "both sides charged the full fee (upstream's engine shape)");
+    assert!(
+        !within(owed, owed, owed),
+        "both sides charged the full fee (upstream's engine shape)"
+    );
     assert!(!within(1, 0, 0), "a fee on a zero-fee batch");
-    assert!(!within(u128::MAX, 1, u128::MAX), "an aggregate pair that cannot even be summed");
+    assert!(
+        !within(u128::MAX, 1, u128::MAX),
+        "an aggregate pair that cannot even be summed"
+    );
 
     // The consequence the item asks for, restated: under this bound a nonzero
     // maker charge forces the taker to have fallen short of the total owed.
     for (a, b) in [(600u128, 400u128), (0, 1_000), (999, 1)] {
         assert!(within(a, b, owed));
         if b > 0 {
-            assert!(a < owed, "maker charged => taker fell short: fee_a={a} < owed={owed}");
+            assert!(
+                a < owed,
+                "maker charged => taker fell short: fee_a={a} < owed={owed}"
+            );
         }
     }
 }
@@ -22578,7 +22771,8 @@ fn b4_batch_guard_site_enumeration() {
     );
     // The total-integrity cross-check B-4 keeps, byte-identical.
     assert_eq!(
-        src.matches("if reconstructed_total != engine_total {").count(),
+        src.matches("if reconstructed_total != engine_total {")
+            .count(),
         1,
         "the reconstructed-total cross-check is untouched"
     );
@@ -22730,13 +22924,7 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
             exec_price: 100,
             fee_bps: 0,
         },
-        &mut [
-            &mut ba_owner,
-            &mut bb_owner,
-            &mut market,
-            &mut ba,
-            &mut bb,
-        ],
+        &mut [&mut ba_owner, &mut bb_owner, &mut market, &mut ba, &mut bb],
     )
     .unwrap();
 
@@ -22791,7 +22979,6 @@ fn cw04_forfeit(f: &mut Cw04Fixture, budget: u128) -> Result<(), ProgramError> {
         &mut [&mut f.victim_owner, &mut f.market, &mut f.victim],
     )
 }
-
 
 // ===========================================================================
 // F-05 REGRESSION BLOCK -- register row C-W-04
@@ -22888,7 +23075,12 @@ fn f05_permissionless_crank_advances_recovery_to_resolved_and_unlocks_bystanders
 
     // And the bystanders can now actually get out. `CloseResolved` is the terminal
     // exit that returned Custom(21) for everyone in the C-W-04 measurement.
-    let mint = Pubkey::new_from_array(state::read_market(&f.market.data).unwrap().0.collateral_mint);
+    let mint = Pubkey::new_from_array(
+        state::read_market(&f.market.data)
+            .unwrap()
+            .0
+            .collateral_mint,
+    );
     let payout = state::read_portfolio(&f.ba.data).unwrap().capital;
     let payout_u64 = u64::try_from(payout).unwrap_or(0);
     let mut dest_token = user_token_account(f.ba_owner.key, mint, 0);
@@ -22945,7 +23137,10 @@ fn f05_old_c_w_04_lock_assertions_must_now_fail() {
     );
 
     // (a) the MARKET AUTHORITY's own ResolveMarket (tag 19).
-    let admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut f.admin, &mut f.market]);
+    let admin_resolve = run_ix(
+        Instruction::ResolveMarket,
+        &mut [&mut f.admin, &mut f.market],
+    );
     let m1 = cw04_snap(&f.market, &f.victim).mode;
     println!("F-05/old exit(a) admin ResolveMarket (tag 19)   = {admin_resolve:?} mode={m1:?}");
 
@@ -23169,7 +23364,10 @@ fn f05_live_mode_permissionless_crank_behaviour_is_unchanged() {
             },
             &mut [&mut stranger, &mut f.market, &mut f.ba],
         );
-        println!("F-05 live-mode action={action} on healthy asset 1 -> {res:?} mode={:?}", f05_mode(&f.market));
+        println!(
+            "F-05 live-mode action={action} on healthy asset 1 -> {res:?} mode={:?}",
+            f05_mode(&f.market)
+        );
         assert_eq!(
             f05_mode(&f.market),
             MarketModeV16::Live,
@@ -23395,7 +23593,10 @@ fn cw02_adl_recovery_pair() -> (
         "restated ceil == engine oi_eff_short_q"
     );
     assert!(raw_long > eff_long, "long raw basis exceeds its effective");
-    assert!(raw_short > eff_short, "short raw basis exceeds its effective");
+    assert!(
+        raw_short > eff_short,
+        "short raw basis exceeds its effective"
+    );
 
     //   OLD wrapper clamp, origin/main:9010-9012 : close_q.min(|raw_a|).min(|raw_b|)
     //   engine clamp,      2c38570a:18565-18571  : q.min(eff_a).min(eff_b).min(oi_eff_long).min(oi_eff_short)
@@ -23554,7 +23755,8 @@ fn cw02_basis_clamp_site_enumeration_is_reads_only() {
         );
     }
     assert_eq!(
-        src.matches(".force_close_recovery_pair_not_atomic(").count(),
+        src.matches(".force_close_recovery_pair_not_atomic(")
+            .count(),
         1,
         "and the engine primitive now has exactly one caller (it had none)"
     );
@@ -23579,7 +23781,11 @@ fn cw02_tag43_owner_forfeit_still_works_on_the_adl_recovery_leg() {
         &mut [&mut long_owner, &mut market, &mut long_account],
     );
     println!("(cw02) tag 43 owner forfeit on the ADL'd Recovery leg -> {r:?}");
-    assert_eq!(r, Ok(()), "the owner-signed dead-leg exit is untouched by B-3");
+    assert_eq!(
+        r,
+        Ok(()),
+        "the owner-signed dead-leg exit is untouched by B-3"
+    );
 }
 
 /// The state upstream's extra branch (`upstream/main:9037-9077`) exists for, chased
@@ -23626,7 +23832,10 @@ long_leg_active={long_active} short_leg_active={short_active} oi_eff_long={} oi_
     );
     assert_eq!(g.assets[1].oi_eff_long_q, 0);
     assert_eq!(g.assets[1].oi_eff_short_q, 0);
-    assert_eq!(long_raw, 0, "no raw residue is left behind on the long side");
+    assert_eq!(
+        long_raw, 0,
+        "no raw residue is left behind on the long side"
+    );
     assert_eq!(short_raw, 0, "nor on the short side");
 
     // With nothing left, tag 64 refuses. It does NOT fall through to a permissionless
@@ -23660,15 +23869,26 @@ fn cw02_forfeit_is_not_the_same_outcome_as_a_close_for_the_holder() {
     let (mut market_c, mut long_c, mut short_c, mut cranker, _o, _raw, _eff) =
         cw02_adl_recovery_pair();
     let before = state::read_portfolio(&long_c.data).unwrap();
-    force_close_abandoned_asset(&mut cranker, &mut market_c, &mut long_c, &mut short_c, 1, 7, u128::MAX)
-        .expect("the pair closes");
+    force_close_abandoned_asset(
+        &mut cranker,
+        &mut market_c,
+        &mut long_c,
+        &mut short_c,
+        1,
+        7,
+        u128::MAX,
+    )
+    .expect("the pair closes");
     let closed = state::read_portfolio(&long_c.data).unwrap();
 
     // (b) the forfeit, through the owner-signed tag 43, on the same fixture.
     let (mut market_f, mut long_f, _short_f, _cranker2, mut long_owner, _raw2, _eff2) =
         cw02_adl_recovery_pair();
     run_ix(
-        Instruction::ForfeitRecoveryLeg { asset_index: 1, b_loss_atom_budget: u128::MAX },
+        Instruction::ForfeitRecoveryLeg {
+            asset_index: 1,
+            b_loss_atom_budget: u128::MAX,
+        },
         &mut [&mut long_owner, &mut market_f, &mut long_f],
     )
     .expect("the owner may forfeit");
@@ -23676,15 +23896,21 @@ fn cw02_forfeit_is_not_the_same_outcome_as_a_close_for_the_holder() {
 
     println!(
         "(cw02-dec) before      capital={} pnl={} leg_active={}",
-        before.capital, before.pnl, has_active_leg_for_asset(&before, 1)
+        before.capital,
+        before.pnl,
+        has_active_leg_for_asset(&before, 1)
     );
     println!(
         "(cw02-dec) tag64 close capital={} pnl={} leg_active={}",
-        closed.capital, closed.pnl, has_active_leg_for_asset(&closed, 1)
+        closed.capital,
+        closed.pnl,
+        has_active_leg_for_asset(&closed, 1)
     );
     println!(
         "(cw02-dec) tag43 forfeit capital={} pnl={} leg_active={}",
-        forfeited.capital, forfeited.pnl, has_active_leg_for_asset(&forfeited, 1)
+        forfeited.capital,
+        forfeited.pnl,
+        has_active_leg_for_asset(&forfeited, 1)
     );
     assert!(
         !has_active_leg_for_asset(&closed, 1),
@@ -23734,7 +23960,12 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
     init_portfolio(&mut long_owner, &mut market, &mut long_account);
     init_portfolio(&mut short_owner, &mut market, &mut short_account);
     deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
-    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    deposit(
+        &mut short_owner,
+        &mut market,
+        &mut short_account,
+        10_000_000,
+    );
     run_ix(
         Instruction::TradeNoCpi {
             asset_index: 0,
@@ -23813,7 +24044,10 @@ fn cw03_tag43_budget_is_collateral_atoms_under_the_new_name() {
     ] {
         let (res, f) = cw03_run(budget);
         println!("[cw03] b_loss_atom_budget={label:>9} ({budget}) -> res={res:?} {f:?}");
-        assert!(res.is_ok(), "tag 43 must be accepted for budget {label}: {res:?}");
+        assert!(
+            res.is_ok(),
+            "tag 43 must be accepted for budget {label}: {res:?}"
+        );
         rows.push(f);
     }
     let one = rows[0];
@@ -23872,12 +24106,7 @@ nothing settles beyond min(public_b_chunk_atoms, b_remaining)",
 /// and it round-trips through `decode`. No ABI break, so no tag bump.
 #[test]
 fn cw03_tag43_wire_layout_is_byte_identical_after_the_rename() {
-    for (asset_index, budget) in [
-        (0u16, 0u128),
-        (1, 1),
-        (7, 4_000_000),
-        (u16::MAX, u128::MAX),
-    ] {
+    for (asset_index, budget) in [(0u16, 0u128), (1, 1), (7, 4_000_000), (u16::MAX, u128::MAX)] {
         let encoded = Instruction::ForfeitRecoveryLeg {
             asset_index,
             b_loss_atom_budget: budget,
@@ -24146,6 +24375,7 @@ fn w91_env() -> W91Env {
     // Real tag 50: the provider funds domain 2 at a FINITE expiry.
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: W91_FROM_DOMAIN,
             amount: W91_U_ATOMS,
             expiry_slot: W91_FINITE_EXPIRY,
@@ -24322,6 +24552,7 @@ fn w21_tag50_env(expiry_slot: u64) -> W21Tag50Env {
     let mut source = user_token_account(provider.key, mint, W91_U_ATOMS as u64);
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: W91_FROM_DOMAIN,
             amount: W91_U_ATOMS,
             expiry_slot,
@@ -24491,7 +24722,11 @@ fn w21_old_tag50_lapsed_payout_assertion_must_now_fail() {
     w91_set_slot(&mut e.market, W91_FINITE_EXPIRY + 1);
     let r = w21_tag50_withdraw(&mut e, W91_U_ATOMS);
     println!("[w21-old50] provider tag50 on the LAPSED bucket -> {r:?}");
-    assert_eq!(r, Ok(()), "PRE-W-21: a lapsed Fresh bucket still pays the provider");
+    assert_eq!(
+        r,
+        Ok(()),
+        "PRE-W-21: a lapsed Fresh bucket still pays the provider"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -24518,7 +24753,11 @@ fn w21_tag91_refuses_a_lapsed_bucket_and_the_two_orderings_converge() {
         Err(percolator_prog::error::PercolatorError::EngineLockActive.into()),
         "W-21: :16207 now carries the expiry test"
     );
-    assert_eq!(w91_principal(&e.to_ledger), 0, "nothing moved into the LP pot");
+    assert_eq!(
+        w91_principal(&e.to_ledger),
+        0,
+        "nothing moved into the LP pot"
+    );
 
     w91_expire(&mut e, W91_FROM_DOMAIN).expect("the canonical transition still runs");
     let g = w91_group(&e.market);
@@ -24550,10 +24789,7 @@ fn w21_tag91_refuses_a_lapsed_bucket_and_the_two_orderings_converge() {
         ra,
         Err(percolator_prog::error::PercolatorError::EngineLockActive.into())
     );
-    assert_eq!(
-        w91_residual(&w91_group(&a.market)) - res_a_pre,
-        W91_U_ATOMS
-    );
+    assert_eq!(w91_residual(&w91_group(&a.market)) - res_a_pre, W91_U_ATOMS);
 }
 
 #[test]
@@ -24616,7 +24852,9 @@ fn w21_old_w91_counterfactual_assertion_must_now_fail() {
     w91_forge_ledger_authority_to_registry(&mut e);
     let r = w91_rebalance(&mut e, W91_U_ATOMS);
     println!("[w21-old91] LIVE tag91 on the LAPSED bucket -> {r:?}");
-    r.expect("the gate at :16207-16212 tests `status != Fresh` only — a lapsed Fresh bucket passes");
+    r.expect(
+        "the gate at :16207-16212 tests `status != Fresh` only — a lapsed Fresh bucket passes",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -24806,6 +25044,7 @@ fn wsib_env_unbound() -> WsibEnv {
     let mut provider_signing = TestAccount::new(provider.key, provider.owner, 0).signer();
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: WSIB_PROVIDER_DOMAIN,
             amount: WSIB_U_ATOMS,
             expiry_slot: WSIB_FINITE_EXPIRY,
@@ -24927,8 +25166,7 @@ fn wsib_create_lp_vault(
         TestAccount::new(e.registry_pda, solana_program::system_program::ID, 0).writable()
     };
     let (mint_pda, _) = state::derive_lp_vault_mint(&program_id(), &e.market.key);
-    let mut mint_ai =
-        TestAccount::new(mint_pda, solana_program::system_program::ID, 0).writable();
+    let mut mint_ai = TestAccount::new(mint_pda, solana_program::system_program::ID, 0).writable();
     run_ix_no_rollback(
         Instruction::CreateLpVault {
             fee_share_bps: WSIB_FEE_SHARE_BPS,
@@ -25005,7 +25243,6 @@ fn wsib_rotate_backing_authority(
         ],
     )
 }
-
 
 /// `wsib_env_unbound` with the provider top-up SKIPPED: both domains of asset 1
 /// are Empty, which is the shape an LP vault is meant to be created over.
@@ -25213,7 +25450,9 @@ fn w22_gh453_spent_ledger_adoption_path_is_unaffected() {
 /// `verify/poc/W-SIB/poc_W-SIB_appended_to_v16_wrapper.rs`'s §1 case (c)
 /// assertion, verbatim. It must now PANIC.
 #[test]
-#[should_panic(expected = "must be the expect_key marker, NOT Custom(63): the guard did not bite on the sibling")]
+#[should_panic(
+    expected = "must be the expect_key marker, NOT Custom(63): the guard did not bite on the sibling"
+)]
 fn w22_old_wsib_sibling_assertion_must_now_fail() {
     let mut e = wsib_env_unbound();
     let (ak, ao) = (e.admin.key, e.admin.owner);
@@ -25328,6 +25567,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
             Instruction::TopUpBackingBucket {
+                intent_id: next_intent_id(),
                 domain: 2,
                 amount: 700,
                 expiry_slot: 10_000,
@@ -25425,6 +25665,7 @@ fn wgenl_topup(s: &mut WgenlStage, amount: u128) -> Result<(), ProgramError> {
     let mut vault = vault_token_account(&s.market, s.mint, 0);
     run_ix(
         Instruction::TopUpBackingBucket {
+            intent_id: next_intent_id(),
             domain: 2,
             amount,
             expiry_slot: 10_000,

@@ -62,6 +62,18 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 // Operative Custom(N) error codes (see header map).
 // ---------------------------------------------------------------------------
+
+// sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only): test-only
+// monotonic nonce generator. Every call returns a value strictly greater
+// than the last, guaranteeing intent_id uniqueness across every top-up in
+// this test binary regardless of loops, shared helper functions, or how
+// many tests run -- so no existing test's outcome changes by acquiring a
+// fresh nonce (only a genuine same-value REPLAY is ever rejected).
+fn next_intent_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const E_INVALID_CONFIG: u32 = 14;
 #[allow(dead_code)]
 const E_INVALID_LEG: u32 = 18;
@@ -528,7 +540,10 @@ impl Env {
             )
             .unwrap();
         self.try_send(
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance {
+                intent_id: next_intent_id(),
+                amount,
+            },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
