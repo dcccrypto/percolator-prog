@@ -355,7 +355,7 @@ fn setup_vault(cooldown_slots: u64) -> Env {
         program_id,
         &payer,
         vec![(
-            ProgInstruction::UpdateAssetLifecycle {
+            ProgInstruction::UpdateAssetLifecycle { market_id: 2,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index: APPEND_ASSET_INDEX,
                 now_slot: 1,
@@ -583,12 +583,17 @@ fn resolve_market(env: &mut Env) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
+    let asset_generation_frontier =
+        state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket {
+                asset_generation_frontier,
+            },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),

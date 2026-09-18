@@ -629,6 +629,7 @@ impl FeeEnv {
                 AccountMeta::new(self.market, false),
             ],
             data: ProgInstruction::UpdateAssetAuthority {
+            market_id: 1,
                 asset_index: 0,
                 kind: 0, // ASSET_AUTH_ADMIN
                 new_pubkey: [0u8; 32],
@@ -715,7 +716,7 @@ impl FeeEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
             ],
-            data: ProgInstruction::TopUpInsurance {
+            data: ProgInstruction::TopUpInsurance { market_id: 1,
                 amount: amount as u128,
             }
             .encode(),
@@ -962,6 +963,7 @@ impl FeeEnv {
                 AccountMeta::new(account_b, false),
             ],
             data: ProgInstruction::TradeNoCpi {
+            market_id: 1,
                 asset_index: 0,
                 size_q,
                 exec_price,
@@ -1439,7 +1441,7 @@ fn tag87_on_a_resolved_market_is_rejected_without_marking_the_claim_paid() {
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(env.market, false),
         ],
-        data: ProgInstruction::ResolveMarket.encode(),
+        data: ProgInstruction::ResolveMarket { asset_generation_frontier: 2 }.encode(),
     };
     send_ixs(&mut env.svm, &payer, vec![ix], &[&admin]).expect("ResolveMarket");
 
@@ -1539,6 +1541,7 @@ fn burning_asset_admin_does_not_stop_the_creator_rotating_insurance_authority() 
                 AccountMeta::new(env.market, false),
             ],
             data: ProgInstruction::UpdateAssetAuthority {
+            market_id: 1,
                 asset_index: 0,
                 kind: 1, // ASSET_AUTH_INSURANCE
                 new_pubkey: target.pubkey().to_bytes(),

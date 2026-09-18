@@ -493,8 +493,17 @@ impl CrosscutEnv {
         // here only because it's a convenient way for this fixture to seed a
         // non-zero starting value and is idempotent with CreateLpVault's write.
         // Harmless to the trade/user-deposit paths, which never touch it.
+        // Wave-2 TB-4: an ACTIVATE binds against the market's live `next_market_id`
+        // frontier -- read it, don't hardcode it.
+        let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            true,
+        )
+        .unwrap_or((0, 0));
         self.try_wrapper(
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index,
                 now_slot,
@@ -799,6 +808,14 @@ impl CrosscutEnv {
         size_q: i128,
         fee_bps: u64,
     ) -> Result<(), TransactionError> {
+        // Wave-2 TB-4: read the live market_id -- this helper is shared across
+        // every asset_index the suite trades on.
+        let market_id = state::read_market_trade_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+        )
+        .map(|t| t.3)
+        .unwrap_or(0);
         let wix = Instruction {
             program_id: self.program_id,
             // v17 account layout: [signer_a, market, account_a, account_b,
@@ -813,6 +830,7 @@ impl CrosscutEnv {
                 AccountMeta::new_readonly(delegate, false),
             ],
             data: ProgInstruction::TradeCpi {
+                market_id,
                 asset_index,
                 size_q,
                 fee_bps,
@@ -853,6 +871,7 @@ impl CrosscutEnv {
                 AccountMeta::new(account_b, false),
             ],
             data: ProgInstruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (CROSSCUT_ASSET) as usize).unwrap().3,
                 asset_index: CROSSCUT_ASSET,
                 size_q,
                 exec_price,
@@ -1950,7 +1969,7 @@ impl CrosscutEnv {
     fn resolve_market(&mut self) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
         self.try_wrapper(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&self.svm.get_account(&self.market).unwrap().data).unwrap() },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),

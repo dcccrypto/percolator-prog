@@ -245,7 +245,7 @@ fn setup_vault() -> Env {
         &mut svm,
         program_id,
         &payer,
-        ProgInstruction::UpdateAssetLifecycle {
+        ProgInstruction::UpdateAssetLifecycle { market_id: 2,
             action: ASSET_ACTION_ACTIVATE,
             asset_index: APPEND_ASSET_INDEX,
             now_slot: 1,

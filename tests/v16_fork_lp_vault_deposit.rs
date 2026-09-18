@@ -199,7 +199,7 @@ fn init_market_ix() -> ProgInstruction {
 /// authority. admin is the cfg.asset_authority (init default) so the append is
 /// fee-free. configured_slots grows 1 → 2, enabling domain 2.
 fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstruction {
-    ProgInstruction::UpdateAssetLifecycle {
+    ProgInstruction::UpdateAssetLifecycle { market_id: 2,
         action: ASSET_ACTION_ACTIVATE,
         asset_index: APPEND_ASSET_INDEX,
         now_slot: 1,
@@ -863,7 +863,7 @@ fn lp_deposit_backing_state_matches_top_up() {
         &mut env_a.svm,
         env_a.program_id,
         &env_a.payer,
-        ProgInstruction::TopUpBackingBucket {
+        ProgInstruction::TopUpBackingBucket { market_id: 2,
             domain: DOMAIN,
             amount: DEPOSIT,
             // Wave-1 S1a v2 griefing fix: LP_VAULT_BACKING_EXPIRY_SLOT is now reserved
@@ -1014,6 +1014,7 @@ fn try_rotate_backing_authority(
         env.program_id,
         &env.payer,
         ProgInstruction::UpdateAssetAuthority {
+            market_id: asset_index as u64 + 1,
             asset_index,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: new_authority.pubkey().to_bytes(),
@@ -1139,7 +1140,7 @@ fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::UpdateAssetAuthority {
+        ProgInstruction::UpdateAssetAuthority { market_id: 2,
             asset_index: APPEND_ASSET_INDEX,
             kind: percolator_prog::processor::ASSET_AUTH_ADMIN,
             new_pubkey: manager.pubkey().to_bytes(),

@@ -406,6 +406,7 @@ fn withdraw_insurance_asset_cannot_reduce_the_creator_claim() {
 
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: 1,
             asset_index: 0,
             amount: 120,
         },
@@ -462,6 +463,7 @@ fn a_fully_drained_backstop_still_leaves_the_creator_claim_payable() {
 
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: 1,
             asset_index: 0,
             amount: 100,
         },
@@ -646,6 +648,7 @@ fn withdraw_creator_fee_leaves_the_backstop_fully_spendable_by_tag57() {
     // consume its capacity indirectly (e.g. via the shared insurance fund).
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: 1,
             asset_index: 0,
             amount: 240,
         },

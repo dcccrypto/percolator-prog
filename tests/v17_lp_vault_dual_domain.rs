@@ -190,7 +190,7 @@ fn init_market_ix() -> ProgInstruction {
 /// authority. admin is the cfg.asset_authority (init default) so the append is
 /// fee-free. configured_slots grows 1 → 2, enabling domain 2.
 fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstruction {
-    ProgInstruction::UpdateAssetLifecycle {
+    ProgInstruction::UpdateAssetLifecycle { market_id: 2,
         action: ASSET_ACTION_ACTIVATE,
         asset_index: APPEND_ASSET_INDEX,
         now_slot: 1,

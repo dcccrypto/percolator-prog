@@ -561,11 +561,20 @@ impl V16CuEnv {
         if clock.slot < now_slot {
             self.svm.warp_to_slot(now_slot);
         }
+        // Wave-2 TB-4: an ACTIVATE binds against the market's live `next_market_id`
+        // frontier -- read it, don't hardcode it.
+        let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            true,
+        )
+        .unwrap_or((0, 0));
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index,
                 now_slot,
@@ -607,11 +616,27 @@ impl V16CuEnv {
         now_slot: u64,
         initial_price: u64,
     ) -> u64 {
+        // Wave-2 TB-4: compute the caller-supplied generation-binding market_id
+        // live from market state -- this helper is shared by append/reuse/
+        // retire/drain-only/shutdown callers at every asset_index in the suite.
+        let is_activation = action == percolator_prog::processor::ASSET_ACTION_ACTIVATE;
+        let (current_market_id, next_market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            is_activation,
+        )
+        .unwrap_or((0, 0));
+        let market_id = if is_activation {
+            next_market_id
+        } else {
+            current_market_id
+        };
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action,
                 asset_index,
                 now_slot,
@@ -652,11 +677,13 @@ impl V16CuEnv {
         fee_bps: u16,
         insurance_share_bps: u16,
     ) -> u64 {
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::UpdateBackingFeePolicy {
+                market_id,
                 domain,
                 fee_bps,
                 insurance_share_bps,
@@ -1020,11 +1047,20 @@ impl V16CuEnv {
     ) -> (Pubkey, u64) {
         self.ensure_signer_account(creator.pubkey());
         let source = self.token_account(creator.pubkey(), fee as u64);
+        // Wave-2 TB-4: this is always an ACTIVATE (append or reuse), which binds
+        // against the market's live `next_market_id` frontier.
+        let (_current_market_id, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            true,
+        )
+        .unwrap_or((0, 0));
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index,
                 now_slot,
@@ -1067,11 +1103,20 @@ impl V16CuEnv {
     ) -> Result<(Pubkey, u64), String> {
         self.ensure_signer_account(creator.pubkey());
         let source = self.token_account(creator.pubkey(), fund_amount as u64);
+        // Wave-2 TB-4: an ACTIVATE binds against the market's live `next_market_id`
+        // frontier -- read it, don't hardcode it.
+        let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            true,
+        )
+        .unwrap_or((0, 0));
         let result = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index,
                 now_slot,
@@ -1181,8 +1226,17 @@ impl V16CuEnv {
         exec_price: u64,
         fee_bps: u64,
     ) -> Result<u64, String> {
+        // Wave-2 TB-4: this helper is shared by every asset_index in the suite
+        // (base and appended), so market_id must be read live, not hardcoded.
+        let market_id = state::read_market_trade_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+        )
+        .unwrap()
+        .3;
         self.send(
             ProgInstruction::TradeNoCpi {
+                market_id,
                 asset_index,
                 size_q,
                 exec_price,
@@ -1696,8 +1750,16 @@ impl V16CuEnv {
         // passes the flag through but the solver doesn't add them to signer slots. The
         // on-chain handler only checks signer_a (accounts[0]).
         let _ = owner_b; // signer_b no longer needed in v17 TradeCpi
+        // Wave-2 TB-4: read live, this helper is shared by every asset_index.
+        let market_id = state::read_market_trade_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+        )
+        .unwrap()
+        .3;
         self.send(
             ProgInstruction::TradeCpi {
+                market_id,
                 asset_index,
                 size_q,
                 fee_bps,
@@ -1771,11 +1833,16 @@ impl V16CuEnv {
     }
 
     fn resolve(&mut self) -> u64 {
+        let asset_generation_frontier =
+            state::read_asset_generation_frontier(&self.svm.get_account(&self.market).unwrap().data)
+                .unwrap();
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket {
+                asset_generation_frontier,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -1822,11 +1889,15 @@ impl V16CuEnv {
         stale_slots: u64,
         force_close_delay_slots: u64,
     ) -> u64 {
+        let asset_generation_frontier =
+            state::read_asset_generation_frontier(&self.svm.get_account(&self.market).unwrap().data)
+                .unwrap();
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigurePermissionlessResolve {
+                asset_generation_frontier,
                 stale_slots,
                 force_close_delay_slots,
             },
@@ -1923,6 +1994,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigureHybridOracle {
+            market_id: 1,
                 asset_index: 0,
                 now_slot,
                 now_unix_ts,
@@ -2030,11 +2102,18 @@ impl V16CuEnv {
                 .copied()
                 .map(|key| AccountMeta::new_readonly(key, false)),
         );
+        let market_id = state::read_market_trade_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+        )
+        .unwrap()
+        .3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigureHybridOracle {
+                market_id,
                 asset_index,
                 now_slot,
                 now_unix_ts,
@@ -2066,6 +2145,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigureEwmaMark {
+            market_id: 1,
                 asset_index: 0,
                 now_slot,
                 initial_mark_e6,
@@ -2087,6 +2167,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::PushEwmaMark {
+            market_id: 1,
                 asset_index: 0,
                 now_slot,
                 mark_e6,
@@ -2106,6 +2187,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigureAuthMark {
+            market_id: 1,
                 asset_index: 0,
                 now_slot,
                 initial_mark_e6,
@@ -2125,6 +2207,7 @@ impl V16CuEnv {
             self.program_id,
             &self.payer,
             ProgInstruction::PushAuthMark {
+            market_id: 1,
                 asset_index: 0,
                 now_slot,
                 mark_e6,
@@ -2144,11 +2227,13 @@ impl V16CuEnv {
         now_slot: u64,
         initial_mark_e6: u64,
     ) -> u64 {
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, asset_index as usize).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigureAuthMark {
+                market_id,
                 asset_index,
                 now_slot,
                 initial_mark_e6,
@@ -2168,11 +2253,13 @@ impl V16CuEnv {
         now_slot: u64,
         mark_e6: u64,
     ) -> u64 {
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, asset_index as usize).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::PushAuthMark {
+                market_id,
                 asset_index,
                 now_slot,
                 mark_e6,
@@ -2194,11 +2281,13 @@ impl V16CuEnv {
         initial_mark_e6: u64,
     ) -> u64 {
         self.ensure_signer_account(authority.pubkey());
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, asset_index as usize).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::ConfigureAuthMark {
+                market_id,
                 asset_index,
                 now_slot,
                 initial_mark_e6,
@@ -2220,11 +2309,13 @@ impl V16CuEnv {
         mark_e6: u64,
     ) -> u64 {
         self.ensure_signer_account(authority.pubkey());
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, asset_index as usize).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::PushAuthMark {
+                market_id,
                 asset_index,
                 now_slot,
                 mark_e6,
@@ -2313,7 +2404,7 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { market_id: 1, amount },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2334,11 +2425,13 @@ impl V16CuEnv {
         expiry_slot: u64,
     ) -> u64 {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                market_id,
                 domain,
                 amount,
                 expiry_slot,
@@ -2375,7 +2468,7 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { market_id: 1, amount },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2411,7 +2504,7 @@ impl V16CuEnv {
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { market_id: 1, amount },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2446,11 +2539,13 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsuranceDomain { domain, amount },
+            ProgInstruction::TopUpInsuranceDomain {
+                market_id, domain, amount },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2484,11 +2579,13 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                market_id,
                 domain,
                 amount,
                 expiry_slot,
@@ -2528,11 +2625,13 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                market_id,
                 domain,
                 amount,
                 expiry_slot,
@@ -2562,11 +2661,13 @@ impl V16CuEnv {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
         self.ensure_signer_account(authority.pubkey());
         let source = self.token_account(authority.pubkey(), amount as u64);
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::TopUpBackingBucket {
+                market_id,
                 domain,
                 amount,
                 expiry_slot,
@@ -2611,6 +2712,7 @@ impl V16CuEnv {
             // budget via TopUpInsuranceDomain before calling this helper.
             // Matrix row: v17-auth-overhaul (WithdrawInsuranceLimited → WithdrawInsuranceAsset).
             ProgInstruction::WithdrawInsuranceAsset {
+            market_id: 1,
                 asset_index: 0,
                 amount,
             },
@@ -2665,11 +2767,13 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, asset_index as usize).unwrap().3;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::WithdrawInsuranceAsset {
+                market_id,
                 asset_index,
                 amount,
             },
@@ -2694,11 +2798,13 @@ impl V16CuEnv {
         amount: u128,
     ) -> u64 {
         self.ensure_signer_account(authority.pubkey());
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, asset_index as usize).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::WithdrawInsuranceAsset {
+                market_id,
                 asset_index,
                 amount,
             },
@@ -2722,11 +2828,13 @@ impl V16CuEnv {
         amount: u128,
     ) -> u64 {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            ProgInstruction::WithdrawBackingBucket {
+                market_id, domain, amount },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2748,11 +2856,13 @@ impl V16CuEnv {
         amount: u128,
     ) -> Result<u64, String> {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            ProgInstruction::WithdrawBackingBucket {
+                market_id, domain, amount },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2783,11 +2893,13 @@ impl V16CuEnv {
     ) -> u64 {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
         self.ensure_signer_account(authority.pubkey());
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            ProgInstruction::WithdrawBackingBucket {
+                market_id, domain, amount },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2825,11 +2937,13 @@ impl V16CuEnv {
         domain: u16,
         amount: u128,
     ) -> u64 {
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (domain as usize) / 2).unwrap().3;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucketEarnings { domain, amount },
+            ProgInstruction::WithdrawBackingBucketEarnings {
+                market_id, domain, amount },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2884,11 +2998,18 @@ impl V16CuEnv {
         // will reach asset_index = domain/2 which maps to the same asset, not the short side.
         // Callers that expect rejection (.is_err()) remain correct since the auth check is
         // per-asset regardless of side. Matrix row: v17-auth-overhaul.
+        let market_id = state::read_market_trade_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            (domain / 2) as usize,
+        )
+        .unwrap()
+        .3;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::WithdrawInsuranceAsset {
+                market_id,
                 asset_index: domain / 2,
                 amount,
             },
@@ -3390,7 +3511,7 @@ fn v16_bpf_failed_insurance_topup_transfer_rolls_back_budget_and_ledger() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::TopUpInsurance { amount: 100 },
+        ProgInstruction::TopUpInsurance { market_id: 1, amount: 100 },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
             AccountMeta::new(env.market, false),
@@ -3444,6 +3565,7 @@ fn v16_bpf_failed_backing_topup_transfer_rolls_back_bucket_and_ledger() {
         env.program_id,
         &env.payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -3837,6 +3959,7 @@ fn v16_bpf_topup_backing_bucket_rejects_lp_vault_sentinel_expiry() {
     let err = env
         .send(
             ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
                 domain: 1,
                 amount: 1_000,
                 expiry_slot: sentinel,
@@ -4279,7 +4402,8 @@ fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        ProgInstruction::WithdrawBackingBucket {
+                market_id: 1, domain, amount: 40 },
         withdraw_accounts(None),
         &[&env.admin],
     );
@@ -4296,7 +4420,8 @@ fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        ProgInstruction::WithdrawBackingBucket {
+                market_id: 1, domain, amount: 40 },
         withdraw_accounts(Some(impostor)),
         &[&env.admin],
     );
@@ -4319,7 +4444,8 @@ fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        ProgInstruction::WithdrawBackingBucket {
+                market_id: 1, domain, amount: 40 },
         withdraw_accounts(Some(ledger)),
         &[&env.admin],
     )
@@ -4912,6 +5038,7 @@ fn v16_attack_batch_trade_nocpi_requires_signed_base_fee_consent() {
     let batch = env.send(
         ProgInstruction::BatchTradeNoCpi {
             legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: POS_SCALE as i128,
                 exec_price: 100,
@@ -4952,6 +5079,7 @@ fn v16_attack_batch_trade_nocpi_requires_signed_base_fee_consent() {
     env.send(
         ProgInstruction::BatchTradeNoCpi {
             legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: POS_SCALE as i128,
                 exec_price: 100,
@@ -5192,6 +5320,7 @@ fn v16_bpf_batchtradenocpi_rejects_trade_exceeding_side_oi_cap() {
     let result = env.send(
         ProgInstruction::BatchTradeNoCpi {
             legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (2 * POS_SCALE) as i128,
                 exec_price: 100,
@@ -5298,6 +5427,127 @@ fn v16_bpf_tradenocpi_fresh_open_on_base_and_added_asset_is_bounded() {
     );
     assert_eq!(
         active_leg_for_asset(&short, 3).basis_pos_q,
+        -((10 * POS_SCALE) as i128)
+    );
+}
+
+/// Wave-2 TB-4 (adopts upstream a61000f9 + 47a3c86f + 5d9e4cb3 + 9a138bdf + 4c100ca6 +
+/// e50784d8 + f5c2c6bb, "asset-generation binding"): a signed instruction captured
+/// against an OLD asset generation must be rejected once the slot's generation has
+/// advanced (retire + reactivate), not silently admitted against the NEW occupant.
+/// Exercises the sharpest instance -- TradeNoCpi -- since a wrong-asset trade fill is
+/// the most direct fund-safety consequence of the gap this cluster closes.
+#[test]
+fn v16_bpf_stale_market_id_against_reused_slot_is_rejected_current_id_succeeds() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(1, 1_000, 1_000, 500);
+
+    // Append asset 1: first generation, market_id == 2 (asset 0 took generation 1 at
+    // InitMarket, so the market's next_market_id frontier was 2 before this call).
+    env.activate_asset(1, 1, 100);
+    let (_, group_after_append) = env.market_state();
+    let stale_market_id = group_after_append.assets[1].market_id;
+    assert_eq!(
+        stale_market_id, 2,
+        "first activation of asset 1 must stamp generation 2"
+    );
+
+    // Retire it, then reactivate it -- CloseSlab-class slot reuse (S1a, already
+    // adopted) makes this slot's address/index reusable; the engine stamps a NEW
+    // generation on reactivation rather than reusing the retired one. The engine
+    // authenticates against the REAL clock when available (`authenticated_slot_or_
+    // fallback`), so each transition needs the SVM clock warped forward to its
+    // own now_slot, not just the ix payload field.
+    env.svm.warp_to_slot(2);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_RETIRE,
+        1,
+        2,
+        0,
+    );
+    env.svm.warp_to_slot(3);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_ACTIVATE,
+        1,
+        3,
+        100,
+    );
+    let (_, group_after_reactivate) = env.market_state();
+    let current_market_id = group_after_reactivate.assets[1].market_id;
+    assert_eq!(
+        current_market_id, 3,
+        "reactivation must stamp a NEW generation, not reuse the retired one"
+    );
+    assert_ne!(
+        stale_market_id, current_market_id,
+        "fixture precondition: the generation must actually have advanced"
+    );
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000_000);
+    env.deposit(&short_owner, short_account, 1_000_000_000);
+
+    // STALE: a trade signed against the OLD (pre-reactivation) generation must be
+    // rejected with AssetGenerationMismatch (Custom(64)) -- NOT silently admitted
+    // against whatever now occupies asset index 1.
+    let stale_err = env
+        .send(
+            ProgInstruction::TradeNoCpi {
+                market_id: stale_market_id,
+                asset_index: 1,
+                size_q: (10 * POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            vec![
+                AccountMeta::new(long_owner.pubkey(), true),
+                AccountMeta::new(short_owner.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(long_account, false),
+                AccountMeta::new(short_account, false),
+            ],
+            &[&long_owner, &short_owner],
+        )
+        .expect_err("a stale market_id against a reused slot must be rejected");
+    assert!(
+        stale_err.contains("Custom(64)"),
+        "expected AssetGenerationMismatch (Custom(64)), got: {stale_err}"
+    );
+
+    // Confirm the rejected stale trade did not partially apply.
+    let long_data_after_stale = env.svm.get_account(&long_account).unwrap().data;
+    let long_after_stale = state::read_portfolio(&long_data_after_stale).unwrap();
+    assert!(
+        !has_active_leg_for_asset(&long_after_stale, 1),
+        "the rejected stale-generation trade must not have opened any position"
+    );
+
+    // CONTROL: the identical trade, signed against the CURRENT generation, must
+    // succeed and actually fill.
+    env.trade_asset_with_cu(
+        1,
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (10 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+
+    let long_data = env.svm.get_account(&long_account).unwrap().data;
+    let short_data = env.svm.get_account(&short_account).unwrap().data;
+    let long = state::read_portfolio(&long_data).unwrap();
+    let short = state::read_portfolio(&short_data).unwrap();
+    assert_eq!(
+        active_leg_for_asset(&long, 1).basis_pos_q,
+        (10 * POS_SCALE) as i128,
+        "the control trade (current market_id) must actually have filled"
+    );
+    assert_eq!(
+        active_leg_for_asset(&short, 1).basis_pos_q,
         -((10 * POS_SCALE) as i128)
     );
 }
@@ -6106,6 +6356,7 @@ fn v16_bpf_cross_margin_positive_pnl_allows_backed_risk_increase_on_negative_leg
         env.program_id,
         &env.payer,
         ProgInstruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: over_watermark_amount,
         },
@@ -7810,6 +8061,7 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
     // the matcher CPI runs, not silently floored up to 500 and charged without consent.
     env.svm.expire_blockhash();
     let under_base_leg = percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: 1,
         asset_index: 0,
         size_q: (10 * POS_SCALE) as i128,
         fee_bps: 0,
@@ -7853,6 +8105,7 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
     let ins0 = env.market_state().1.insurance;
     env.svm.expire_blockhash();
     let at_base_leg = percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: 1,
         asset_index: 0,
         size_q: (10 * POS_SCALE) as i128,
         fee_bps: 500,
@@ -9482,8 +9735,15 @@ fn ecu_send_trade_cpi(
     size_q: i128,
 ) -> Result<u64, String> {
     env.svm.expire_blockhash();
+    let market_id = state::read_market_trade_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        asset_index as usize,
+    )
+    .map(|t| t.3)
+    .unwrap_or(0);
     env.send(
         ProgInstruction::TradeCpi {
+            market_id,
             asset_index,
             size_q,
             fee_bps: 0,
@@ -9815,6 +10075,7 @@ fn v16_bpf_failed_backing_withdraw_transfer_rolls_back_bucket_and_ledger() {
         env.program_id,
         &env.payer,
         ProgInstruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
         },
@@ -11722,11 +11983,16 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
     .expect("rotate marketauth to signing market key");
 
     svm.expire_blockhash();
+    let asset_generation_frontier =
+        state::read_asset_generation_frontier(&svm.get_account(&market.pubkey()).unwrap().data)
+            .unwrap();
     send_tx(
         &mut svm,
         program_id,
         &payer,
-        ProgInstruction::ResolveMarket,
+        ProgInstruction::ResolveMarket {
+            asset_generation_frontier,
+        },
         vec![
             AccountMeta::new(market.pubkey(), true),
             AccountMeta::new(market.pubkey(), false),
@@ -11830,12 +12096,22 @@ fn v16_audit_permissionless_reuse_rejects_zero_insurance_authority() {
         let vault = env.vault;
         let c = creator.pubkey().to_bytes();
         let z = [0u8; 32];
+        // Wave-2 TB-4: this is a reactivation (asset 1 was activated then retired
+        // above), so market_id must be read live (it binds against the market's
+        // next_market_id frontier), not hardcoded to the first generation.
+        let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &env.svm.get_account(&env.market).unwrap().data,
+            1,
+            true,
+        )
+        .unwrap_or((0, 0));
         // zero exactly ONE of the four authorities (the `which`-th); the other three are valid.
         let res = send_tx(
             &mut env.svm,
             pid,
             &payer,
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index: 1,
                 now_slot: 4,
@@ -12084,6 +12360,7 @@ fn v16_attack_resolved_backing_withdraw_requires_full_user_wind_down() {
     env.svm.expire_blockhash();
     let r = env.send(
         ProgInstruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
         },
@@ -12178,11 +12455,18 @@ fn v16_attack_non_active_asset_cannot_enable_backing_fee_batch_gate() {
         assert_eq!(cfg_after_lifecycle.backing_trade_fee_policy_count, 0);
 
         env.svm.expire_blockhash();
+        let market_id = state::read_market_trade_preflight(
+            &env.svm.get_account(&env.market).unwrap().data,
+            2usize / 2,
+        )
+        .unwrap()
+        .3;
         let policy = send_tx(
             &mut env.svm,
             env.program_id,
             &env.payer,
             ProgInstruction::UpdateBackingFeePolicy {
+                market_id,
                 domain: 2,
                 fee_bps: 77,
                 insurance_share_bps: 5_000,
@@ -12214,6 +12498,7 @@ fn v16_attack_non_active_asset_cannot_enable_backing_fee_batch_gate() {
         let batch = env.send(
             ProgInstruction::BatchTradeNoCpi {
                 legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                     asset_index: 0,
                     size_q: sz,
                     exec_price: 100,
@@ -12278,6 +12563,7 @@ fn v16_bpf_batch_trade_nocpi_subatom_leg_charges_fee_on_ceil_notional() {
     let batch = env.send(
         ProgInstruction::BatchTradeNoCpi {
             legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: sub_atom_size,
                 exec_price: 100,
@@ -13393,6 +13679,7 @@ fn v16_attack_configure_permissionless_resolve_rejects_when_resolve_matured() {
     env.svm.expire_blockhash();
     let fresh = env.send(
         ProgInstruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 6,
         },
@@ -13423,6 +13710,7 @@ fn v16_attack_configure_permissionless_resolve_rejects_when_resolve_matured() {
     env.svm.expire_blockhash();
     let stale = env.send(
         ProgInstruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1_000,
         },
@@ -13509,7 +13797,7 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
     let before_drain = env.svm.get_account(&env.market).unwrap();
     env.svm.expire_blockhash();
     let stale_drain = env.send(
-        ProgInstruction::UpdateAssetLifecycle {
+        ProgInstruction::UpdateAssetLifecycle { market_id: 1,
             action: percolator_prog::processor::ASSET_ACTION_DRAIN_ONLY,
             asset_index: 2,
             now_slot: 0,
@@ -13539,7 +13827,7 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
     let before_retire = env.svm.get_account(&env.market).unwrap();
     env.svm.expire_blockhash();
     let stale_retire = env.send(
-        ProgInstruction::UpdateAssetLifecycle {
+        ProgInstruction::UpdateAssetLifecycle { market_id: 1,
             action: percolator_prog::processor::ASSET_ACTION_RETIRE,
             asset_index: 2,
             now_slot: 40,
@@ -13720,6 +14008,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
     env.svm.expire_blockhash();
     let fresh = env.send(
         ProgInstruction::TradeCpi {
+            market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: sz,
             fee_bps: 0,
@@ -13762,6 +14051,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
     env.svm.expire_blockhash();
     let stale = env.send(
         ProgInstruction::TradeCpi {
+            market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: sz,
             fee_bps: 0,
@@ -13821,6 +14111,7 @@ fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_m
     ];
     let sz = (5 * POS_SCALE) as i128;
     let leg = percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
         asset_index: 1,
         size_q: sz,
         fee_bps: 0,
@@ -14032,6 +14323,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         let ctx_before = env.svm.get_account(&ctx).unwrap();
 
         let leg = percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14046,6 +14338,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         } else {
             env.send(
                 ProgInstruction::TradeCpi {
+            market_id: 1,
                     asset_index: 0,
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
@@ -14079,6 +14372,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         let mut ok_accounts = hostile_accounts;
         ok_accounts.pop();
         let leg = percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14093,6 +14387,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         } else {
             env.send(
                 ProgInstruction::TradeCpi {
+            market_id: 1,
                     asset_index: 0,
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
@@ -14195,6 +14490,7 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
                 env.send(
                     ProgInstruction::BatchTradeCpi {
                         legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
                             asset_index: 1,
                             size_q: POS_SCALE as i128,
                             fee_bps: 0,
@@ -14207,6 +14503,7 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
             } else {
                 env.send(
                     ProgInstruction::TradeCpi {
+            market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
                         asset_index: 1,
                         size_q: POS_SCALE as i128,
                         fee_bps: 0,
@@ -14294,6 +14591,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
             env.send(
                 ProgInstruction::BatchTradeCpi {
                     legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: 1,
                         asset_index: 0,
                         size_q: POS_SCALE as i128,
                         fee_bps: 0,
@@ -14306,6 +14604,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
         } else {
             env.send(
                 ProgInstruction::TradeCpi {
+            market_id: 1,
                     asset_index: 0,
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
@@ -14424,6 +14723,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     let mk_legs = |n: usize| -> Vec<percolator_prog::ix::BatchTradeCpiLeg> {
         (0..n as u16)
             .map(|asset_index| percolator_prog::ix::BatchTradeCpiLeg {
+                market_id: asset_index as u64 + 1,
                 asset_index,
                 size_q: POS_SCALE as i128,
                 fee_bps: 100,
@@ -14706,6 +15006,7 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
     let refund = env
         .send(
             ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
                 domain: 0,
                 amount: 500,
                 expiry_slot: lapsed_slot + 10_000,
@@ -14995,9 +15296,20 @@ fn v17_activate_already_configured_slot_reports_a_distinct_error() {
     let admin = env.admin.insecure_clone();
     let market = env.market;
     let authority = admin.pubkey().to_bytes();
+    // Wave-2 TB-4: an ACTIVATE always binds against the market's live
+    // next_market_id frontier (even this illegal already-active-slot attempt),
+    // so the wrapper's own AssetSlotAlreadyConfigured check (not this repo's
+    // generation check) is what the test observes.
+    let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        1,
+        true,
+    )
+    .unwrap_or((0, 0));
     let err = env
         .send(
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: 0, // ACTIVATE
                 asset_index: 1,
                 now_slot: 1,
@@ -15126,6 +15438,7 @@ fn v16_bpf_batch_trade_cpi_fanout_budget_characterisation() {
         let (ctx, delegate, _) = env.init_matcher_context(&lp, matcher_program, lp_account);
         let legs: Vec<percolator_prog::ix::BatchTradeCpiLeg> = (0..legs_n)
             .map(|asset_index| percolator_prog::ix::BatchTradeCpiLeg {
+                market_id: asset_index as u64 + 1,
                 asset_index,
                 size_q: POS_SCALE as i128,
                 fee_bps: 100,
@@ -15249,6 +15562,7 @@ fn withdraw_insurance_asset_result(env: &mut V16CuEnv, amount: u128) -> Result<u
         pid,
         &payer,
         ProgInstruction::WithdrawInsuranceAsset {
+            market_id: 1,
             asset_index: 0,
             amount,
         },
@@ -15382,6 +15696,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -15411,6 +15726,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
         pid,
         &payer,
         ProgInstruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
         },
@@ -15560,6 +15876,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 10,
@@ -15611,6 +15928,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
         pid,
         &payer,
         ProgInstruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 60,
         },
@@ -15669,6 +15987,7 @@ fn v16_bpf_legacy_ledgerless_nonzero_topup_does_not_book_refill_as_recovery() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 20,
             expiry_slot: 10,
@@ -15795,6 +16114,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 10,
@@ -15844,6 +16164,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
         pid,
         &payer,
         ProgInstruction::WithdrawBackingBucketEarnings {
+            market_id: 1,
             domain: DOMAIN,
             amount: 20,
         },
@@ -15927,6 +16248,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 1,
             expiry_slot: 20,
@@ -15962,6 +16284,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 20,
@@ -16015,6 +16338,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         pid,
         &payer,
         ProgInstruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: DOMAIN,
             amount: 40,
         },
@@ -16069,11 +16393,18 @@ fn rotate_backing_authority(env: &mut V16CuEnv, asset_index: u16, new_authority:
     let pid = env.program_id;
     let market = env.market;
     env.ensure_signer_account(new_authority.pubkey());
+    let market_id = state::read_market_trade_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        asset_index as usize,
+    )
+    .map(|t| t.3)
+    .unwrap_or(0);
     send_tx(
         &mut env.svm,
         pid,
         &payer,
         ProgInstruction::UpdateAssetAuthority {
+            market_id,
             asset_index,
             kind: 3, // ASSET_AUTH_BACKING_BUCKET
             new_pubkey: new_authority.pubkey().to_bytes(),
@@ -16202,6 +16533,7 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 50,
             expiry_slot: 10,
@@ -16430,6 +16762,7 @@ fn v16_bpf_topup_backing_bucket_rejects_expiry_at_or_before_now() {
     let err = env
         .send(
             ProgInstruction::TopUpBackingBucket {
+            market_id: 1,
                 domain: 1,
                 amount: 1_000,
                 expiry_slot: 10,
@@ -16551,6 +16884,7 @@ fn v16_bpf_batch_trade_nocpi_rejects_new_counterparty_lien_after_backing_expiry(
         .send(
             ProgInstruction::BatchTradeNoCpi {
                 legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                     asset_index: 0,
                     size_q: 3 * POS_SCALE as i128,
                     exec_price: 100,
@@ -16634,6 +16968,7 @@ fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+                market_id: 1,
             domain,
             amount: 50,
             expiry_slot: 10,
@@ -16705,6 +17040,7 @@ fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
         pid,
         &payer,
         ProgInstruction::TopUpBackingBucket {
+                market_id: 1,
             domain,
             amount: 50,
             expiry_slot: 10,
@@ -16754,7 +17090,7 @@ fn v16_bpf_oversized_insurance_ledger_account_is_rejected() {
         &mut env.svm,
         pid,
         &payer,
-        ProgInstruction::TopUpInsurance { amount: 50 },
+        ProgInstruction::TopUpInsurance { market_id: 1, amount: 50 },
         vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(market, false),
@@ -16803,7 +17139,7 @@ fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
         &mut env.svm,
         pid,
         &payer,
-        ProgInstruction::TopUpInsurance { amount: 50 },
+        ProgInstruction::TopUpInsurance { market_id: 1, amount: 50 },
         vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(market, false),

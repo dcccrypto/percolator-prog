@@ -571,8 +571,14 @@ fn run_trade_cpi_with_matcher(
     // Account order matches handle_trade_cpi: [signer_a, market, account_a, account_b,
     // matcher_prog, matcher_ctx, matcher_delegate]. owner_b is the B-side signer but is NOT
     // passed as a separate account; account_b must already be writable.
+    // Wave-2 TB-4: read the live market_id -- this helper is shared across every
+    // asset_index the suite trades on.
+    let market_id = state::read_market_trade_preflight(&market.data, asset_index as usize)
+        .map(|t| t.3)
+        .unwrap_or(0);
     run_ix(
         Instruction::TradeCpi {
+            market_id,
             asset_index,
             size_q: req_size,
             fee_bps,
@@ -776,6 +782,7 @@ fn configure_base_ewma_mark(
 ) {
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot,
             initial_mark_e6: mark_e6,
@@ -795,6 +802,7 @@ fn push_base_ewma_mark(
 ) {
     run_ix(
         Instruction::PushEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot,
             mark_e6,
@@ -812,6 +820,7 @@ fn configure_base_auth_mark(
 ) {
     run_ix(
         Instruction::ConfigureAuthMark {
+            market_id: 1,
             asset_index: 0,
             now_slot,
             initial_mark_e6: mark_e6,
@@ -829,6 +838,7 @@ fn push_base_auth_mark(
 ) {
     run_ix(
         Instruction::PushAuthMark {
+            market_id: 1,
             asset_index: 0,
             now_slot,
             mark_e6,
@@ -973,8 +983,29 @@ fn update_asset_lifecycle_with_authorities(
     insurance_operator: [u8; 32],
     backing_bucket_authority: [u8; 32],
 ) -> Result<(), ProgramError> {
+    // Wave-2 TB-4: compute the caller-supplied generation-binding market_id
+    // automatically from live market state, rather than hardcoding it, since
+    // this one helper is shared by append/reuse/retire/drain-only/shutdown
+    // callers with every asset_index in the suite. Some callers deliberately
+    // pass an out-of-bounds asset_index to exercise the wrapper's OWN rejection
+    // path (not this generation read) -- fall back to a don't-care value
+    // instead of panicking the harness, so the real instruction still gets
+    // sent and rejected by the program.
+    let is_activation = action == processor::ASSET_ACTION_ACTIVATE;
+    let (current_market_id, next_market_id) = state::read_asset_lifecycle_generation_preflight(
+        &market.data,
+        asset_index as usize,
+        is_activation,
+    )
+    .unwrap_or((0, 0));
+    let market_id = if is_activation {
+        next_market_id
+    } else {
+        current_market_id
+    };
     run_ix(
         Instruction::UpdateAssetLifecycle {
+            market_id,
             action,
             asset_index,
             now_slot,
@@ -1074,8 +1105,12 @@ fn top_up_backing_bucket(
     let mut token_program = token_program_account();
     let mut __lg1 = canonical_backing_ledger_account(&market, domain);
     let mut __sp1 = system_program_account();
+    let market_id = state::read_market_trade_preflight(&market.data, domain as usize / 2)
+        .unwrap()
+        .3;
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id,
             domain,
             amount,
             expiry_slot,
@@ -1149,6 +1184,7 @@ fn configure_three_leg_hybrid(
 ) {
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot,
             now_unix_ts,
@@ -1461,6 +1497,7 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
     );
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 100,
             initial_mark_e6: 100,
@@ -1477,6 +1514,7 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
     // Let a long idle window accrue at rate 0. Nothing is owed for it.
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1_000,
             initial_mark_e6: 100,
@@ -1533,6 +1571,7 @@ fn v16_wrapper_init_portfolio_anchors_fee_slot_at_market_current_slot() {
     );
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 100,
             initial_mark_e6: 100,
@@ -1740,6 +1779,7 @@ fn v16_wrapper_underfunded_flat_sync_sweeps_remaining_capital_once() {
     );
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -1978,6 +2018,7 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
     );
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance_authority.key.to_bytes(),
@@ -2102,6 +2143,7 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     let (_, group_before_trade) = state::read_market(&market.data).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: size_q as i128,
             exec_price,
@@ -2176,7 +2218,7 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     // evaluated. The assertions are written against the real contract so they
     // become live the moment a Clock stub lands; they are not claimed to hold
     // today.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     // v17: handle_withdraw_insurance requires materialized_portfolio_count == 0 && c_tot == 0.
     // Close both portfolios so the market is fully drained before testing insurance withdrawal.
@@ -2263,7 +2305,7 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
 
     let before_disabled = market.data.clone();
     let disabled = run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -2305,6 +2347,7 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
     let mut token_program = token_program_account();
     run_ix(
         Instruction::UpdateAssetLifecycle {
+            market_id: state::read_asset_generation_frontier(&market.data).unwrap(),
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -2379,7 +2422,7 @@ fn v16_wrapper_permissionless_market_init_fee_doubles_every_32_markets() {
     let mut token_program = token_program_account();
     let before_boundary = market.data.clone();
     let underpaid = run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: state::read_asset_generation_frontier(&market.data).unwrap(),
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 32,
             now_slot: 32,
@@ -2403,7 +2446,7 @@ fn v16_wrapper_permissionless_market_init_fee_doubles_every_32_markets() {
     let mut source = user_token_account(creator.key, mint, 100);
     let mut vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: state::read_asset_generation_frontier(&market.data).unwrap(),
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 32,
             now_slot: 32,
@@ -2500,6 +2543,7 @@ fn v16_wrapper_permissionless_market_creator_must_reuse_shutdown_slot_before_app
     let before_append = market.data.clone();
     let append = run_ix(
         Instruction::UpdateAssetLifecycle {
+            market_id: state::read_asset_generation_frontier(&market.data).unwrap(),
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 3,
             now_slot: 4,
@@ -2524,6 +2568,7 @@ fn v16_wrapper_permissionless_market_creator_must_reuse_shutdown_slot_before_app
     let mut reuse_vault = vault_token_account(&market, mint, 0);
     run_ix(
         Instruction::UpdateAssetLifecycle {
+            market_id: state::read_asset_generation_frontier(&market.data).unwrap(),
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 4,
@@ -2587,7 +2632,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -2612,6 +2657,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut vault = vault_token_account(&market, mint, 0);
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 10,
         },
@@ -2630,6 +2676,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut __sp2 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 25,
             expiry_slot: 10,
@@ -2652,6 +2699,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 150,
@@ -2680,6 +2728,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
@@ -2726,6 +2775,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut vault_auth = vault_authority_account(&market);
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 10,
         },
@@ -2743,6 +2793,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
     let mut __lg1 = canonical_backing_ledger_account(&market, 2);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 25,
         },
@@ -2798,6 +2849,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
 
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 5,
         },
@@ -2829,7 +2881,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { domain, amount },
+            Instruction::TopUpInsuranceDomain { market_id: 1, domain, amount },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -2849,6 +2901,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: (POS_SCALE * 2) as i128,
             exec_price: 150,
@@ -2899,6 +2952,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
@@ -2973,6 +3027,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     // insurance_authority is non-zero).
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 6,
         },
@@ -2988,6 +3043,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     .unwrap();
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 4,
         },
@@ -3005,6 +3061,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     let mut __lg2 = canonical_backing_ledger_account(&market, 2);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 20,
         },
@@ -3023,6 +3080,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     let mut __lg3 = canonical_backing_ledger_account(&market, 3);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((3) as usize) / 2).unwrap().3,
             domain: 3,
             amount: 25,
         },
@@ -3074,7 +3132,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     let mut append_vault = vault_token_account(&market, mint, 0);
     let before_append = market.data.clone();
     let append = run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 2,
             now_slot: 8,
@@ -3098,7 +3156,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
     let mut reuse_source = user_token_account(creator.key, mint, 10);
     let mut reuse_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 8,
@@ -3154,6 +3212,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
 
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 5,
         },
@@ -3175,7 +3234,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut init_fee_vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 1,
@@ -3212,7 +3271,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { domain, amount },
+            Instruction::TopUpInsuranceDomain { market_id: 1, domain, amount },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3232,6 +3291,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -3264,6 +3324,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
@@ -3344,6 +3405,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     // v17: WithdrawInsuranceAsset; insurance_operator must sign (D-STAKE-1 blocks marketauth).
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 6,
         },
@@ -3359,6 +3421,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     .unwrap();
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 4,
         },
@@ -3378,7 +3441,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     for (domain, amount) in [(2u16, 20u128), (3u16, 25u128)] {
         let mut __lg4 = canonical_backing_ledger_account(&market, 0);
         run_ix(
-            Instruction::WithdrawBackingBucket { domain, amount },
+            Instruction::WithdrawBackingBucket { market_id: 1, domain, amount },
             &mut [
                 &mut backing_authority,
                 &mut market,
@@ -3395,7 +3458,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut base_insurance_source = user_token_account(admin.key, mint, 10);
     let mut base_insurance_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 10 },
         &mut [
             &mut admin,
             &mut market,
@@ -3445,7 +3508,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut reuse_source = user_token_account(attacker.key, mint, 25);
     let mut reuse_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 8,
@@ -3484,6 +3547,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
 
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 5,
         },
@@ -3509,6 +3573,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut vault = vault_token_account(&market, mint, 0);
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 9,
         },
@@ -3529,6 +3594,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut __sp3 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 20,
             expiry_slot: 20,
@@ -3574,6 +3640,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let before_timeout = market.data.clone();
     let too_early = run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 1,
         },
@@ -3599,6 +3666,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let before_wrong_insurance_ledger = market.data.clone();
     let wrong_insurance_ledger = run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 1,
         },
@@ -3622,6 +3690,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut op_insurance_ledger = insurance_ledger_account();
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 9,
         },
@@ -3650,6 +3719,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let before_wrong_backing_ledger = market.data.clone();
     let wrong_backing_ledger = run_ix(
         Instruction::WithdrawBackingBucketEarnings {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 1,
         },
@@ -3669,6 +3739,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut admin_backing_ledger = backing_domain_ledger_account();
     run_ix(
         Instruction::WithdrawBackingBucketEarnings {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 5,
         },
@@ -3691,6 +3762,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     let mut __lg5 = canonical_backing_ledger_account(&market, 2);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 20,
         },
@@ -3739,6 +3811,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
     );
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: backing_authority.key.to_bytes(),
@@ -3748,6 +3821,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
     .unwrap();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance_authority.key.to_bytes(),
@@ -3759,6 +3833,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_attacker = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 0,
@@ -3769,6 +3844,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_admin_after_rotation = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 0,
@@ -3779,6 +3855,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_backing_authority = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 0,
@@ -3789,6 +3866,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_over_engine_cap = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 101,
             insurance_share_bps: 0,
@@ -3799,6 +3877,10 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_inactive_domain = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            // domain 2 (asset 1) is not configured/active in this fixture -- the
+            // rejection is expected on that basis, so market_id is a don't-care
+            // (a live read would itself fail: the slot is out of bounds).
+            market_id: 1,
             domain: 2,
             fee_bps: 25,
             insurance_share_bps: 0,
@@ -3809,6 +3891,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_share_without_fee = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 0,
             insurance_share_bps: 1,
@@ -3819,6 +3902,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     let rejected_share_over_bps = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 10_001,
@@ -3829,6 +3913,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 25,
             insurance_share_bps: 2_500,
@@ -3844,6 +3929,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 0,
             fee_bps: 33,
             insurance_share_bps: 4_000,
@@ -3859,6 +3945,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
 
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 0,
             insurance_share_bps: 0,
@@ -3880,6 +3967,7 @@ fn v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
     init_market(&mut admin, &mut market);
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 25,
             // Fee-split floor enforcement (policy_v16::fee_split_floor_ok):
@@ -3906,6 +3994,7 @@ fn v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
@@ -3935,6 +4024,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     top_up_backing_bucket(&mut admin, &mut market, 1, 1_000, 10);
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 1_000,
             // Fee-split floor enforcement (policy_v16::fee_split_floor_ok):
@@ -3963,6 +4053,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     let before_b = account_b.data.clone();
     let too_expensive = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -3987,6 +4078,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
 
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 100,
             // Fee-split floor enforcement, see note above.
@@ -3999,6 +4091,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -4030,6 +4123,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     let fresh_before_reduce = group.source_backing_buckets[1].fresh_unliened_backing_num;
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: -(5 * POS_SCALE as i128),
             exec_price: 100,
@@ -4055,6 +4149,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     top_up_backing_bucket(&mut admin, &mut cpi_market, 1, 1_000, 10);
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 100,
             // Fee-split floor enforcement, see note above.
@@ -4116,6 +4211,7 @@ fn v16_wrapper_backing_fee_policy_survives_non_base_oracle_reconfiguration() {
 
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: state::read_market_trade_preflight(&market.data, ((3) as usize) / 2).unwrap().3,
             domain: 3,
             fee_bps: 37,
             insurance_share_bps: 3_700,
@@ -4130,6 +4226,7 @@ fn v16_wrapper_backing_fee_policy_survives_non_base_oracle_reconfiguration() {
 
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 2,
             initial_mark_e6: 110,
@@ -4155,6 +4252,7 @@ fn v16_wrapper_backing_fee_policy_survives_non_base_oracle_reconfiguration() {
     let mut leg2 = pyth_account(&feeds[2], 200_000_000, -6, 1, 1_000);
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 3,
             now_unix_ts: 1_000,
@@ -4248,6 +4346,7 @@ fn v16_wrapper_maintenance_fee_sync_charges_recurring_fee_without_forcing_local_
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4356,6 +4455,11 @@ fn v16_wrapper_asset_authority_can_append_activate_and_trade_assets() {
     let before = market.data.clone();
     let rejected_before_add = run_ix(
         Instruction::TradeNoCpi {
+            // asset_index 2 does not exist yet (max_portfolio_assets == 1) --
+            // the trade must be rejected on that basis, so the exact market_id
+            // value here is a don't-care; a live read would itself fail since
+            // the slot is out of bounds.
+            market_id: 1,
             asset_index: 2,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -4399,6 +4503,7 @@ fn v16_wrapper_asset_authority_can_append_activate_and_trade_assets() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -4475,6 +4580,7 @@ fn v16_wrapper_trade_rejects_corrupt_unconfigured_tail_capacity_fail_closed() {
     let before_short = short_account.data.clone();
     let result = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4537,7 +4643,7 @@ fn v16_wrapper_dynamic_market_account_can_activate_beyond_fixed_runtime_window()
         "append activation must consume the next dynamic market slot"
     );
 
-    let (_, mode, current_slot, effective_price, _) =
+    let (_, mode, current_slot, _, effective_price, _) =
         state::read_market_trade_preflight(&market.data, grown_capacity - 1).unwrap();
     assert_eq!(mode, MarketModeV16::Live);
     assert_eq!(current_slot, grown_capacity as u64);
@@ -4666,6 +4772,7 @@ fn v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4682,6 +4789,7 @@ fn v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently() {
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -4831,6 +4939,7 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 150,
@@ -4862,6 +4971,7 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
@@ -4891,6 +5001,7 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
     let before_new_position = market.data.clone();
     let new_position = run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 150,
@@ -4964,6 +5075,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     // Keep another market leg live while the prediction-style asset is cycled.
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -4980,6 +5092,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5007,6 +5120,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
     let before_blocked_risk_increase = market.data.clone();
     let blocked_risk_increase = run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5193,6 +5307,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             size_q: prediction_q as i128,
             exec_price: 500_000,
@@ -5252,6 +5367,7 @@ fn v16_wrapper_reactivated_asset_resets_prior_oracle_profile() {
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             now_slot: 2,
             initial_mark_e6: 123_000,
@@ -5328,6 +5444,7 @@ fn v16_wrapper_retired_asset_profile_cannot_refresh_market_liveness() {
     );
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -5345,6 +5462,7 @@ fn v16_wrapper_retired_asset_profile_cannot_refresh_market_liveness() {
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             now_slot: 1,
             initial_mark_e6: 123_000,
@@ -5381,6 +5499,7 @@ fn v16_wrapper_retired_asset_profile_cannot_refresh_market_liveness() {
     let before_push = market.data.clone();
     let stale_refresh = run_ix(
         Instruction::PushEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             now_slot: 4,
             mark_e6: 222_000,
@@ -5457,6 +5576,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     let prediction_q = POS_SCALE / 100;
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
@@ -5473,6 +5593,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5489,6 +5610,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (2) as usize).unwrap().3,
             asset_index: 2,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 250,
@@ -5557,6 +5679,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     .unwrap();
     let blocked_new_prediction_risk = run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
@@ -5682,6 +5805,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
     let before_stale_trade = market.data.clone();
     let stale_reuse_trade = run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: prediction_q as i128,
             exec_price: 750_000,
@@ -5873,6 +5997,7 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
 
     let trade_stale = run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (last_asset) as usize).unwrap().3,
             asset_index: last_asset,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -5967,6 +6092,7 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
     state::write_portfolio(&mut long_account.data, &clean).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (last_asset) as usize).unwrap().3,
             asset_index: last_asset,
             size_q: POS_SCALE as i128,
             exec_price: 250,
@@ -6034,7 +6160,7 @@ fn v16_wrapper_security_sweep_resolved_market_and_fee_branches() {
     )
     .unwrap();
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved = state::read_market(&market.data).unwrap().1;
     assert_eq!(resolved.mode, MarketModeV16::Resolved);
     assert_eq!(resolved.resolved_slot, 10);
@@ -6602,7 +6728,7 @@ fn v16_wrapper_top_up_insurance_requires_authority_and_updates_vault() {
 
     let before = market.data.clone();
     let unauthorized = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 777 },
         &mut [
             &mut attacker,
             &mut market,
@@ -6614,7 +6740,7 @@ fn v16_wrapper_top_up_insurance_requires_authority_and_updates_vault() {
     assert_err_and_market_unchanged(unauthorized, &market, &before);
 
     run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 777 },
         &mut [
             &mut admin,
             &mut market,
@@ -6643,7 +6769,7 @@ fn v16_wrapper_top_up_insurance_rejects_wrong_mint_and_insufficient_source_balan
     let before = market.data.clone();
 
     let wrong_mint = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 777 },
         &mut [
             &mut admin,
             &mut market,
@@ -6655,7 +6781,7 @@ fn v16_wrapper_top_up_insurance_rejects_wrong_mint_and_insufficient_source_balan
     assert_err_and_market_unchanged(wrong_mint, &market, &before);
 
     let short_balance = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 777 },
         &mut [
             &mut admin,
             &mut market,
@@ -6677,6 +6803,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     // v17: backing_bucket_authority is a per-asset profile field; rotate via UpdateAssetAuthority.
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: bucket_authority.key.to_bytes(),
@@ -6686,6 +6813,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     .unwrap();
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -6704,7 +6832,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     let mut token_program = token_program_account();
     let before = market.data.clone();
     let top_up_insurance = run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -6721,6 +6849,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     let mut __sp4 = system_program_account();
     let top_up_backing = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -6747,7 +6876,7 @@ fn v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -6757,7 +6886,7 @@ fn v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     // v17: UpdateInsurancePolicy (tag 33) deleted — terminal WithdrawInsurance needs no
     // rate-limit config; resolved mode + authority check is sufficient (matrix row 35).
 
@@ -6793,7 +6922,7 @@ fn v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -6821,7 +6950,7 @@ fn v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open
     assert_err_and_market_unchanged(live_reject, &market, &live);
 
     init_portfolio(&mut owner, &mut market, &mut portfolio);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_with_open = market.data.clone();
     let open_reject = run_ix(
         Instruction::WithdrawInsurance { amount: 1 },
@@ -6860,6 +6989,7 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
 
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance.key.to_bytes(),
@@ -6871,7 +7001,7 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut insurance,
             &mut market,
@@ -6881,11 +7011,12 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let resolved = market.data.clone();
     let rotate_after_resolve = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: admin.key.to_bytes(),
@@ -7001,6 +7132,7 @@ fn v16_wrapper_non_main_domain_insurance_isolated_from_global_withdrawals() {
     let mut token_program = token_program_account();
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 100,
         },
@@ -7040,6 +7172,7 @@ fn v16_wrapper_non_main_domain_insurance_isolated_from_global_withdrawals() {
     let mut domain_dest = user_token_account(insurance_operator.key, mint, 0);
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 100,
         },
@@ -7101,6 +7234,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut primary_vault = vault_token_account(&market, primary_key, 0);
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 11,
         },
@@ -7118,6 +7252,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut __sp5 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 30,
             expiry_slot: 10,
@@ -7146,6 +7281,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let before_admin_insurance = market.data.clone();
     let admin_insurance = run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 1,
         },
@@ -7164,6 +7300,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut __lg6 = canonical_backing_ledger_account(&market, 2);
     let admin_backing = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 1,
         },
@@ -7183,6 +7320,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let before_admin_earnings = market.data.clone();
     let admin_earnings = run_ix(
         Instruction::WithdrawBackingBucketEarnings {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 1,
         },
@@ -7203,6 +7341,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let before_mismatched_mints = market.data.clone();
     let mismatched_mints = run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 1,
         },
@@ -7221,6 +7360,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut insurance_dest = user_token_account(insurance_operator.key, secondary_key, 0);
     run_ix(
         Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             amount: 11,
         },
@@ -7239,6 +7379,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut backing_dest = user_token_account(backing_authority.key, secondary_key, 0);
     run_ix(
         Instruction::WithdrawBackingBucketEarnings {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 7,
         },
@@ -7257,6 +7398,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
     let mut __lg7 = canonical_backing_ledger_account(&market, 2);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 30,
         },
@@ -7311,6 +7453,7 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
     let mut __sp6 = system_program_account();
     let unauthorized = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 10,
             expiry_slot: 10,
@@ -7332,6 +7475,7 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
     let mut __sp7 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 10,
             expiry_slot: 10,
@@ -7400,6 +7544,7 @@ fn v16_wrapper_asset_retire_rejects_nonzero_domain_insurance_budget() {
     let mut token_program = token_program_account();
     run_ix(
         Instruction::TopUpInsuranceDomain {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 1,
         },
@@ -7445,6 +7590,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     // v17: backing_bucket_authority is per-asset; use UpdateAssetAuthority for asset-0.
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: bucket_authority.key.to_bytes(),
@@ -7461,6 +7607,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp8 = system_program_account();
     let unauthorized = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -7482,6 +7629,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp9 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -7528,6 +7676,10 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp10 = system_program_account();
     let bad_domain = run_ix(
         Instruction::TopUpBackingBucket {
+            // domain 32 is intentionally out of bounds -- the rejection is
+            // expected on that basis, so market_id is a don't-care (a live
+            // read would itself fail: the slot is out of bounds).
+            market_id: 1,
             domain: 32,
             amount: 1,
             expiry_slot: 10,
@@ -7550,6 +7702,10 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp11 = system_program_account();
     let inactive_domain = run_ix(
         Instruction::TopUpBackingBucket {
+            // domain 2 (asset 1) is not configured/active in this fixture --
+            // the rejection is expected on that basis, so market_id is a
+            // don't-care (a live read would itself fail: out of bounds).
+            market_id: 1,
             domain: 2,
             amount: 1,
             expiry_slot: 10,
@@ -7572,6 +7728,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut __sp12 = system_program_account();
     let bad_expiry = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
             expiry_slot: 0,
@@ -7593,6 +7750,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
     let mut zero_new = TestAccount::new(Pubkey::default(), Pubkey::new_unique(), 0);
     let burn_rejected = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: [0u8; 32],
@@ -7620,6 +7778,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     // v17: backing_bucket_authority is per-asset; use UpdateAssetAuthority for asset-0.
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: bucket_authority.key.to_bytes(),
@@ -7635,6 +7794,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __sp13 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -7662,6 +7822,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __lg8 = canonical_backing_ledger_account(&market, 1);
     let unauthorized = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -7683,6 +7844,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __lg9 = canonical_backing_ledger_account(&market, 1);
     let substituted_ledger = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -7703,6 +7865,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __lg10 = canonical_backing_ledger_account(&market, 1);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
         },
@@ -7747,6 +7910,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __lg11 = canonical_backing_ledger_account(&market, 1);
     let overdraw = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 61,
         },
@@ -7779,6 +7943,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __lg12 = canonical_backing_ledger_account(&market, 1);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 20,
         },
@@ -7813,6 +7978,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
     let mut __lg13 = canonical_backing_ledger_account(&market, 1);
     let claim_dilution = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -7849,6 +8015,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     let mut __sp14 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 25,
             expiry_slot: 10,
@@ -7870,6 +8037,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     let mut __lg14 = canonical_backing_ledger_account(&market, 1);
     let zero = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 0,
         },
@@ -7911,6 +8079,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
         let mut __lg15 = canonical_backing_ledger_account(&market, 1);
         let stressed_withdraw = run_ix(
             Instruction::WithdrawBackingBucket {
+            market_id: 1,
                 domain: 1,
                 amount: 1,
             },
@@ -7931,6 +8100,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
     let mut __lg16 = canonical_backing_ledger_account(&market, 1);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 25,
         },
@@ -7968,6 +8138,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
     let mut __sp15 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 10,
             expiry_slot: 10,
@@ -7991,6 +8162,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
     let mut __lg17 = canonical_backing_ledger_account(&market, 1);
     let wrong_dest = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -8012,6 +8184,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
     let mut __lg18 = canonical_backing_ledger_account(&market, 1);
     let wrong_auth = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -8033,6 +8206,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
     let mut __lg19 = canonical_backing_ledger_account(&market, 1);
     let wrong_vault_result = run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -8069,6 +8243,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
     let mut __sp16 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 100,
             expiry_slot: 10,
@@ -8120,6 +8295,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
     let mut vault_auth = vault_authority_account(&market);
     run_ix(
         Instruction::WithdrawBackingBucketEarnings {
+            market_id: 1,
             domain: 1,
             amount: 20,
         },
@@ -8145,6 +8321,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
     let mut __lg20 = canonical_backing_ledger_account(&market, 1);
     run_ix(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
         },
@@ -8186,6 +8363,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
     let mut __sp17 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
             expiry_slot: 10,
@@ -8244,6 +8422,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
     let mut __sp18 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 10,
             expiry_slot: 20,
@@ -8288,6 +8467,7 @@ fn v16_wrapper_backing_domain_ledger_rejects_wrong_authority_and_domain() {
     let mut __sp19 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 10,
             expiry_slot: 10,
@@ -8330,7 +8510,7 @@ fn v16_wrapper_insurance_ledger_tracks_topup_profit_loss_and_withdrawal() {
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -8384,7 +8564,7 @@ fn v16_wrapper_insurance_ledger_tracks_topup_profit_loss_and_withdrawal() {
 
     // v17: UpdateInsurancePolicy (tag 33) deleted; WithdrawInsurance only works in
     // terminal mode (matrix row 35). Resolve the market to enable terminal withdrawal.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     vault = vault_token_account(&market, mint, 110);
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -8423,6 +8603,7 @@ fn v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance() 
     let mut __sp20 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
             expiry_slot: 10,
@@ -8506,6 +8687,7 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
     let mut __sp21 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 40,
             expiry_slot: 10,
@@ -8567,6 +8749,7 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
     let mut __sp22 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 10,
             expiry_slot: 20,
@@ -8621,7 +8804,7 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let mut vault = vault_token_account(&market, mint, 120);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -8636,6 +8819,7 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let mut __sp23 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 0,
             amount: 100,
             expiry_slot: 10,
@@ -8744,6 +8928,7 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
     let mut __sp24 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 0,
             amount: 80,
             expiry_slot: 10,
@@ -8763,6 +8948,7 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
     let mut __sp25 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount: 30,
             expiry_slot: 10,
@@ -8883,6 +9069,7 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
     let mut __sp26 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 0,
             amount: 30,
             expiry_slot: 10,
@@ -8968,7 +9155,7 @@ fn v16_wrapper_insurance_policy_deposit_only_leaves_fee_growth_behind() {
     let mut vault = vault_token_account(&market, mint, 150);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -8989,7 +9176,7 @@ fn v16_wrapper_insurance_policy_deposit_only_leaves_fee_growth_behind() {
     }
 
     // Resolve the market so terminal withdrawal is enabled.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -9025,7 +9212,7 @@ fn v16_wrapper_insurance_withdraw_disabled_by_default() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -9076,7 +9263,7 @@ fn v16_wrapper_insurance_policy_rejects_live_unbounded_or_zero_cooldown() {
     let mut vault = vault_token_account(&market, mint, 10);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 10 },
         &mut [
             &mut admin,
             &mut market,
@@ -9118,7 +9305,7 @@ fn v16_wrapper_insurance_policy_enforces_bps_cap_and_cooldown() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -9128,7 +9315,7 @@ fn v16_wrapper_insurance_policy_enforces_bps_cap_and_cooldown() {
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -9181,7 +9368,7 @@ fn v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 100 },
         &mut [
             &mut admin,
             &mut market,
@@ -9210,7 +9397,7 @@ fn v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market() {
     assert_err_and_market_unchanged(live_reject, &market, &live);
 
     // Resolve to enable terminal withdrawal.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved = market.data.clone();
 
     // Unauthorized caller rejected in terminal mode.
@@ -9288,6 +9475,7 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
     // Rotate the insurance_operator for asset-0 to a separate key; admin keeps insurance_authority.
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator.key.to_bytes(),
@@ -9299,7 +9487,7 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
     let mut vault = vault_token_account(&market, mint, 50);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 50 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 50 },
         &mut [
             &mut admin,
             &mut market,
@@ -9309,7 +9497,7 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut vault_auth = vault_authority_account(&market);
     let resolved = market.data.clone();
@@ -9377,7 +9565,7 @@ fn v16_wrapper_withdraw_insurance_resolved_requires_all_portfolios_closed() {
     let mut vault = vault_token_account(&market, mint, 20);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 10 },
         &mut [
             &mut admin,
             &mut market,
@@ -9387,7 +9575,7 @@ fn v16_wrapper_withdraw_insurance_resolved_requires_all_portfolios_closed() {
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -9446,10 +9634,10 @@ fn v16_wrapper_update_authority_rotates_admin_with_dual_signature() {
     assert_eq!(cfg.marketauth, new_admin.key.to_bytes());
 
     let rotated = market.data.clone();
-    let old_admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]);
+    let old_admin_resolve = run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]);
     assert_err_and_market_unchanged(old_admin_resolve, &market, &rotated);
     run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() },
         &mut [&mut new_admin, &mut market],
     )
     .unwrap();
@@ -9479,6 +9667,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     // Rotate insurance_authority and insurance_operator to separate keys via UpdateAssetAuthority.
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: insurance.key.to_bytes(),
@@ -9488,6 +9677,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     .unwrap();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator.key.to_bytes(),
@@ -9507,7 +9697,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut token_program = token_program_account();
     let rotated = market.data.clone();
     let old_insurance_auth = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1 },
         &mut [
             &mut admin,
             &mut market,
@@ -9518,7 +9708,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     );
     assert_err_and_market_unchanged(old_insurance_auth, &market, &rotated);
     run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1 },
         &mut [
             &mut insurance,
             &mut market,
@@ -9535,6 +9725,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let before_burn_attempt = market.data.clone();
     let operator_zero_burn = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: [0u8; 32],
@@ -9545,6 +9736,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     // Operator CAN self-rotate to a live key.
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: new_operator.key.to_bytes(),
@@ -9561,7 +9753,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut insurance_src = user_token_account(insurance.key, mint, 1);
     let mut vault = vault_token_account(&market, mint, 1);
     run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1 },
         &mut [
             &mut insurance,
             &mut market,
@@ -9575,6 +9767,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut zero_new = TestAccount::new(Pubkey::default(), Pubkey::new_unique(), 0);
     let insurance_zero_burn = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: [0u8; 32],
@@ -9587,6 +9780,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut new_insurance = signer();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: new_insurance.key.to_bytes(),
@@ -9597,7 +9791,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let after_rotate = market.data.clone();
     let mut dead_src = user_token_account(insurance.key, mint, 1);
     let dead_insurance_auth = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1 },
         &mut [
             &mut insurance,
             &mut market,
@@ -9622,6 +9816,7 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
     // Rotate oracle_authority for asset-0 (replaces old AUTHORITY_MARK rotation).
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_ORACLE,
             new_pubkey: new_key.key.to_bytes(),
@@ -9640,6 +9835,7 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
     // Unknown kind is rejected by UpdateAssetAuthority (matrix row 30).
     let unknown = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: 99,
             new_pubkey: new_key.key.to_bytes(),
@@ -9679,6 +9875,7 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
 
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 5,
             initial_mark_e6: 100,
@@ -9702,6 +9899,7 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
     let mut new_mark_authority = signer();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_ORACLE,
             new_pubkey: new_mark_authority.key.to_bytes(),
@@ -9714,6 +9912,7 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
     let mut wrong_authority = signer();
     let bad_push = run_ix(
         Instruction::PushEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 10,
             mark_e6: 120,
@@ -9724,6 +9923,7 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
 
     run_ix(
         Instruction::PushEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 10,
             mark_e6: 120,
@@ -9794,6 +9994,7 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
     let mut new_mark_authority = signer();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_ORACLE,
             new_pubkey: new_mark_authority.key.to_bytes(),
@@ -9806,6 +10007,7 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
     let mut wrong_authority = signer();
     let bad_push = run_ix(
         Instruction::PushAuthMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 10,
             mark_e6: 120,
@@ -9946,6 +10148,7 @@ fn v16_wrapper_push_ewma_mark_rejects_over_max_input_and_preserves_state() {
 
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             initial_mark_e6: percolator::MAX_ORACLE_PRICE,
@@ -9959,6 +10162,7 @@ fn v16_wrapper_push_ewma_mark_rejects_over_max_input_and_preserves_state() {
     let before = market.data.clone();
     let rejected = run_ix(
         Instruction::PushEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 2,
             mark_e6: percolator::MAX_ORACLE_PRICE + 1,
@@ -9988,6 +10192,7 @@ fn v16_wrapper_configure_ewma_mark_clears_prior_hybrid_oracle_metadata() {
     let mut leg2 = pyth_account(&feeds[2], 4, 0, 0, 1_000);
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 10,
             now_unix_ts: 1_000,
@@ -10015,6 +10220,7 @@ fn v16_wrapper_configure_ewma_mark_clears_prior_hybrid_oracle_metadata() {
 
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 11,
             initial_mark_e6: 123,
@@ -10067,6 +10273,7 @@ fn v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_orac
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             initial_mark_e6: 100_000,
@@ -10105,6 +10312,7 @@ fn v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_orac
     let base_only_fee = two_sided_fee(size_q, exec_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -10189,6 +10397,7 @@ fn v16_wrapper_auth_mark_trade_cannot_update_authority_mark() {
     let base_only_fee = taker_only_fee(size_q, before_group.assets[0].effective_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -10236,6 +10445,7 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
 
     let attacker_update = run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -10247,6 +10457,7 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
         let before = market.data.clone();
         let rejected = run_ix(
             Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
                 stale_slots,
                 force_close_delay_slots,
             },
@@ -10257,6 +10468,7 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
 
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -10309,11 +10521,11 @@ fn v16_wrapper_update_authority_allows_chained_admin_rotation_without_old_key_re
     .unwrap();
 
     let rotated = market.data.clone();
-    let old_admin = run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]);
+    let old_admin = run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]);
     assert_err_and_market_unchanged(old_admin, &market, &rotated);
-    let prior_admin = run_ix(Instruction::ResolveMarket, &mut [&mut admin_b, &mut market]);
+    let prior_admin = run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin_b, &mut market]);
     assert_err_and_market_unchanged(prior_admin, &market, &rotated);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin_c, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin_c, &mut market]).unwrap();
 }
 
 #[test]
@@ -10385,7 +10597,7 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
     assert_err_and_market_unchanged(live_close, &market, &live_before);
 
     init_portfolio(&mut owner, &mut market, &mut portfolio);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_before = market.data.clone();
     let non_admin = run_ix(
         Instruction::CloseSlab,
@@ -10447,7 +10659,7 @@ fn v16_wrapper_close_slab_rejects_burned_admin_zero_key() {
     let mut market = market_account();
 
     let mint = init_market(&mut admin, &mut market);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     {
         // v17: WrapperConfigV16 uses marketauth (not admin) — matrix row 27.
         let (mut cfg, group) = state::read_market(&market.data).unwrap();
@@ -10488,7 +10700,7 @@ fn v16_wrapper_close_slab_rejects_nonzero_engine_vault_or_insurance() {
     let mut vault = vault_token_account(&market, mint, 10);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 10 },
         &mut [
             &mut admin,
             &mut market,
@@ -10498,7 +10710,7 @@ fn v16_wrapper_close_slab_rejects_nonzero_engine_vault_or_insurance() {
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut vault_auth = vault_authority_account(&market);
     let mut dest_token = user_token_account(admin.key, mint, 0);
@@ -10592,6 +10804,7 @@ fn v16_wrapper_multiple_portfolios_same_owner_stay_isolated_and_totals_match() {
     let untouched_b = portfolio_b.data.clone();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -10802,7 +11015,7 @@ fn v16_wrapper_vault_accounts_reject_delegate_and_close_authority() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let topup_bad_vault = run_ix(
-        Instruction::TopUpInsurance { amount: 1_000 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1_000 },
         &mut [
             &mut admin,
             &mut market,
@@ -10899,7 +11112,7 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let frozen_topup_vault = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1 },
         &mut [
             &mut admin,
             &mut market,
@@ -10916,6 +11129,7 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
     let mut __sp27 = system_program_account();
     let frozen_backing_vault = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
             expiry_slot: 1,
@@ -10985,7 +11199,7 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
 
     let mut admin_source = user_token_account(admin.key, mint, u64::MAX);
     let topup_too_large = run_ix(
-        Instruction::TopUpInsurance { amount: too_large },
+        Instruction::TopUpInsurance { market_id: 1, amount: too_large },
         &mut [
             &mut admin,
             &mut market,
@@ -11002,6 +11216,7 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
     let mut __sp28 = system_program_account();
     let backing_too_large = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: too_large,
             expiry_slot: 1,
@@ -11072,7 +11287,7 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
 
     let mut admin_source = user_token_account(admin.key, mint, 0);
     run_ix(
-        Instruction::TopUpInsurance { amount: 0 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 0 },
         &mut [
             &mut admin,
             &mut market,
@@ -11090,6 +11305,7 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
     let mut __sp29 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 0,
             expiry_slot: 1,
@@ -11641,6 +11857,7 @@ fn v16_wrapper_cross_market_portfolio_provenance_is_fail_closed() {
 
     let cross_trade = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -11706,6 +11923,7 @@ fn v16_wrapper_same_owner_can_trade_independent_positions_across_markets() {
     let owner_b_before_a_trade = owner_account_b.data.clone();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -11731,6 +11949,7 @@ fn v16_wrapper_same_owner_can_trade_independent_positions_across_markets() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: -(2 * POS_SCALE as i128),
             exec_price: 100,
@@ -11872,6 +12091,7 @@ fn v16_wrapper_portfolio_key_mismatch_and_self_trade_are_rejected() {
     account_b.key = account_a.key;
     let same_key_trade = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -11907,6 +12127,7 @@ fn v16_wrapper_tradenocpi_negative_size_flips_long_short_roles() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
@@ -11953,6 +12174,7 @@ fn v16_wrapper_tradenocpi_accepts_consented_wide_exec_price_without_moving_index
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
@@ -12092,6 +12314,7 @@ fn v16_wrapper_non_base_asset_profile_converts_stoxx_eur_to_base_sol() {
     let mut sol_usd = pyth_account(&feeds[2], 200_000_000, -6, 1, 102);
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 5,
             now_unix_ts: 102,
@@ -12214,6 +12437,7 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, (14) as usize).unwrap().3,
             asset_index: 14,
             now_slot: 1,
             initial_mark_e6: 100,
@@ -12246,6 +12470,7 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, (14) as usize).unwrap().3,
             asset_index: 14,
             size_q: POS_SCALE as i128,
             exec_price: 200,
@@ -12288,6 +12513,7 @@ fn v16_wrapper_hybrid_oracle_accepts_switchboard_and_chainlink_legs() {
     let mut chainlink = chainlink_account(chainlink_key, 150_000_000_000, 8, 100);
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12333,6 +12559,7 @@ fn v16_wrapper_switchboard_oracle_rejects_wrong_key_stale_and_conf_wide() {
     let mut wrong_key = switchboard_account(Pubkey::new_unique(), 100_000_000, 0, 100);
     let wrong_key_result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12354,6 +12581,7 @@ fn v16_wrapper_switchboard_oracle_rejects_wrong_key_stale_and_conf_wide() {
     let mut stale = switchboard_account(feed_key, 100_000_000, 0, 39);
     let stale_result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12375,6 +12603,7 @@ fn v16_wrapper_switchboard_oracle_rejects_wrong_key_stale_and_conf_wide() {
     let mut wide = switchboard_account(feed_key, 100_000_000, 6_000_000, 100);
     let conf_result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12410,6 +12639,7 @@ fn v16_wrapper_chainlink_oracle_rejects_wrong_key_stale_and_bad_answer() {
     let mut wrong_key = chainlink_account(Pubkey::new_unique(), 100_000_000, 6, 100);
     let wrong_key_result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12431,6 +12661,7 @@ fn v16_wrapper_chainlink_oracle_rejects_wrong_key_stale_and_bad_answer() {
     let mut stale = chainlink_account(feed_key, 100_000_000, 6, 39);
     let stale_result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12452,6 +12683,7 @@ fn v16_wrapper_chainlink_oracle_rejects_wrong_key_stale_and_bad_answer() {
     let mut bad_answer = chainlink_account(feed_key, 0, 6, 100);
     let bad_result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12578,6 +12810,7 @@ fn v16_wrapper_configure_hybrid_oracle_rejects_after_positions_enter_market() {
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -12600,6 +12833,7 @@ fn v16_wrapper_configure_hybrid_oracle_rejects_after_positions_enter_market() {
     let before = market.data.clone();
     let result = run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 100,
@@ -12655,6 +12889,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -12693,6 +12928,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     assert_err_and_market_unchanged(
         run_ix(
             Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
                 asset_index: 1,
                 now_slot: 100,
                 initial_mark_e6: 250,
@@ -12714,6 +12950,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     // Flatten asset 0 positions (trade back to zero OI) so the group is position-free.
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
@@ -12738,6 +12975,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     // advancing slot_last is safe (there are no exposed positions to misprice fees against).
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 100,
             initial_mark_e6: 250,
@@ -12757,6 +12995,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     let mut leg2 = pyth_account(&feeds[2], 200_000_000, -6, 1, 1_000);
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 101,
             now_unix_ts: 1_000,
@@ -12884,6 +13123,7 @@ fn v16_wrapper_hybrid_fresh_crank_tracks_external_composite_then_after_hours_tra
     let base_only_fee = two_sided_fee(size_q, exec_price, 1);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -12976,6 +13216,7 @@ fn v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_ora
     let exec_price = before_group.assets[0].effective_price * 150 / 100;
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -13077,6 +13318,7 @@ fn v16_wrapper_hybrid_after_hours_downward_mark_moves_effective_price() {
     let exec_price = before_group.assets[0].effective_price / 2;
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -13200,6 +13442,7 @@ fn v16_wrapper_hybrid_after_hours_fee_floor_scales_with_next_crank_segment_budge
     let before_insurance = before_group.insurance;
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: size_q as i128,
             exec_price,
@@ -13291,6 +13534,7 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
     let initial_price = state::read_market(&market.data).unwrap().1.assets[0].effective_price;
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: initial_price,
@@ -13350,6 +13594,7 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
 
     let result = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: probe_size as i128,
             exec_price: probe_price,
@@ -13400,6 +13645,7 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
@@ -13442,6 +13688,7 @@ fn v16_wrapper_tradenocpi_rejects_when_consented_price_would_break_margin() {
 
     let result = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -13484,6 +13731,7 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
 
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -13512,6 +13760,7 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
     .unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 101,
@@ -13571,7 +13820,7 @@ fn v16_wrapper_convert_released_pnl_rejects_resolved_market_without_mutation() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 10);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let market_before = market.data.clone();
     let portfolio_before = portfolio.data.clone();
@@ -13604,6 +13853,7 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
     let before_b = account_b.data.clone();
     let missing_signature = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -13623,6 +13873,7 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
 
     let zero_size = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: 0,
             exec_price: 100,
@@ -13642,6 +13893,7 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
 
     let min_size = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: i128::MIN,
             exec_price: 100,
@@ -13681,6 +13933,7 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
     let before_b = account_b.data.clone();
     let wrong_owner = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -13700,6 +13953,7 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
 
     let fee_over_cap = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -13719,6 +13973,7 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
 
     let invalid_asset = run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -14023,6 +14278,7 @@ fn v16_wrapper_tradecpi_ewma_mark_trade_moves_mark_without_refreshing_liveness()
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 5,
             initial_mark_e6: 100,
@@ -14119,6 +14375,7 @@ fn v16_wrapper_tradecpi_requires_bilateral_signatures_before_matcher_cpi() {
     let _ = unsigned_b; // unused in v17 TradeCpi account list
     let rejected = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14168,6 +14425,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
     // v17 TradeCpi: 7 accounts. Pass wrong_delegate at slot 6 — handler rejects via expect_key.
     let wrong_delegate_result = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14198,6 +14456,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
     let mut program_owned_tail = TestAccount::new(Pubkey::new_unique(), program_id(), 0).writable();
     let unsafe_tail = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14236,6 +14495,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
             &program_id(),
             &infos,
             &Instruction::TradeCpi {
+            market_id: 1,
                 asset_index: 0,
                 size_q: POS_SCALE as i128,
                 fee_bps: 0,
@@ -14295,6 +14555,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher() {
     // v17 TradeCpi: 7 accounts.
     let rejected = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14371,6 +14632,7 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
 
     run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14405,6 +14667,7 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
     let before_second_b = account_b.data.clone();
     let rejected_replay = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14446,7 +14709,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
         &matcher_program,
         &matcher_context,
     );
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let req_id = group.current_slot.wrapping_add(1);
@@ -14462,6 +14725,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
     // v17 TradeCpi: 7 accounts.
     let rejected = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14517,6 +14781,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_fee_above_cap_before_success() {
     // v17 TradeCpi: 7 accounts.
     let rejected = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 10_001,
@@ -14585,6 +14850,7 @@ fn v16_wrapper_tradecpi_rejects_corrupt_backing_fee_policy_before_later_checks()
     let _ = attacker;
     let rejected = run_ix(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -14627,6 +14893,7 @@ fn v16_wrapper_permissionless_crank_advances_account_local_market_progress() {
     configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -14779,6 +15046,7 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
     configure_base_ewma_mark(&mut admin, &mut market, 0, 100);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -14896,6 +15164,7 @@ fn v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee() {
     deposit(&mut short_owner, &mut market, &mut short_account, 101);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -15009,6 +15278,7 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     deposit(&mut short_owner, &mut market, &mut short_account, 601);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
@@ -15231,6 +15501,7 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     deposit(&mut short_owner, &mut market, &mut short_account, 601);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
@@ -15350,6 +15621,7 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
     deposit(&mut short_owner, &mut market, &mut short_account, 100);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -15703,6 +15975,7 @@ fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch(
     );
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 0,
             initial_mark_e6: 1,
@@ -15718,6 +15991,7 @@ fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch(
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 1,
@@ -15734,6 +16008,7 @@ fn v16_wrapper_permissionless_recovery_rejects_below_progress_floor_kill_switch(
     .unwrap();
     run_ix(
         Instruction::PushEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             mark_e6: 3,
@@ -15782,6 +16057,7 @@ fn v16_wrapper_rebalance_reduce_is_owner_signed_and_strictly_reduces_risk() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
@@ -15840,6 +16116,7 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -15972,6 +16249,7 @@ fn v16_wrapper_cure_and_cancel_close_rejects_after_permissionless_resolve_maturi
     seed_cancellable_close_progress(&mut market, &mut portfolio);
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -16188,17 +16466,18 @@ fn v16_wrapper_resolve_market_is_admin_only_and_blocks_live_trade() {
 
     let before = market.data.clone();
     let non_admin = run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() },
         &mut [&mut attacker, &mut market],
     );
     assert_err_and_market_unchanged(non_admin, &market, &before);
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_market = market.data.clone();
     let before_a = portfolio_a.data.clone();
     let before_b = portfolio_b.data.clone();
     let trade_after_resolve = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16233,6 +16512,7 @@ fn v16_wrapper_permissionless_stale_resolve_requires_hard_stale_maturity() {
     deposit(&mut owner_b, &mut market, &mut portfolio_b, 1_000_000);
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -16261,6 +16541,7 @@ fn v16_wrapper_permissionless_stale_resolve_requires_hard_stale_maturity() {
     let before_b = portfolio_b.data.clone();
     let trade_after_resolve = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16290,6 +16571,7 @@ fn v16_wrapper_permissionless_stale_resolve_uses_stamped_liveness_not_oracle_tai
     init_market(&mut admin, &mut market);
     run_ix(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 10,
             now_unix_ts: 1_000,
@@ -16309,6 +16591,7 @@ fn v16_wrapper_permissionless_stale_resolve_uses_stamped_liveness_not_oracle_tai
     .unwrap();
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -16349,6 +16632,7 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
     deposit(&mut owner_b, &mut market, &mut portfolio_b, 1_000_000);
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -16367,6 +16651,7 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
     let before_b = portfolio_b.data.clone();
     let trade_after_resolve_maturity = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16429,11 +16714,11 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_market = market.data.clone();
     let resolved_portfolio = portfolio.data.clone();
 
-    let double_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]);
+    let double_resolve = run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]);
     assert_err_and_market_unchanged(double_resolve, &market, &resolved_market);
     assert_eq!(portfolio.data, resolved_portfolio);
 
@@ -16483,7 +16768,7 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let topup_after_resolve = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { market_id: 1, amount: 1 },
         &mut [
             &mut admin,
             &mut market,
@@ -16506,7 +16791,7 @@ fn v16_wrapper_resolved_close_uses_engine_loss_and_fee_ordering_path() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     close_resolved(&mut owner, &mut market, &mut portfolio, 0);
 
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -16532,7 +16817,7 @@ fn v16_wrapper_close_resolved_uses_configured_fee_not_permissionless_caller_fee(
         group.slot_last = 10;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     close_resolved(&mut owner, &mut market, &mut portfolio, 100);
 
@@ -16558,7 +16843,7 @@ fn v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger() {
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
     top_up_backing_bucket(&mut admin, &mut market, 1, 250, 10);
     add_source_positive_pnl(&mut market, &mut portfolio, 1, 250);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(owner.key, mint, 0);
     let mut vault = vault_token_account(&market, mint, 1_250);
@@ -16610,7 +16895,7 @@ fn v16_wrapper_close_resolved_does_not_double_pay_after_closed_payout() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     close_resolved(&mut owner, &mut market, &mut portfolio, 0);
 
     let after_first_market = market.data.clone();
@@ -16638,7 +16923,7 @@ fn v16_wrapper_close_resolved_is_permissionless_but_pays_only_owner_token_accoun
     let mut owner_for_init = TestAccount::new(owner.key, Pubkey::new_unique(), 0).signer();
     init_portfolio(&mut owner_for_init, &mut market, &mut portfolio);
     deposit(&mut owner_for_init, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mint = Pubkey::new_from_array(state::read_market(&market.data).unwrap().0.collateral_mint);
     let mut attacker_dest = user_token_account(Pubkey::new_unique(), mint, 0);
@@ -16700,13 +16985,14 @@ fn v16_wrapper_close_resolved_enforces_configured_force_close_delay() {
     init_portfolio(&mut owner_for_init, &mut market, &mut portfolio);
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 5,
         },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
@@ -16741,13 +17027,14 @@ fn v16_wrapper_close_resolved_becomes_permissionless_after_force_close_delay() {
     init_portfolio(&mut owner_for_init, &mut market, &mut portfolio);
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 5,
         },
         &mut [&mut admin, &mut market],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     {
         let (cfg, mut group) = state::read_market(&market.data).unwrap();
         group.current_slot = group.resolved_slot + 5;
@@ -16818,6 +17105,7 @@ fn v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure()
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16832,7 +17120,7 @@ fn v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure()
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(long_owner.key, mint, 0);
     let mut vault = vault_token_account(&market, mint, 2_000_000);
@@ -16884,6 +17172,7 @@ fn v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clea
     deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -16898,7 +17187,7 @@ fn v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clea
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let before_market = market.data.clone();
     let before_portfolio = long_account.data.clone();
@@ -16923,7 +17212,7 @@ fn v16_wrapper_close_resolved_requires_recipient_and_vault_accounts_for_payout()
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
 
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
@@ -16977,6 +17266,7 @@ fn v16_wrapper_hybrid_hard_stale_uses_permissionless_resolve_not_recovery_kill_s
     );
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -17064,6 +17354,7 @@ fn v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved() {
     );
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -17093,6 +17384,7 @@ fn v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved() {
     let before_short = short_account.data.clone();
     let trade_after_hard_stale = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
@@ -17265,7 +17557,7 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
             0 => {
                 // Per-domain insurance top-up (TopUpInsuranceDomain still uses domain).
                 let res = run_ix(
-                    Instruction::TopUpInsuranceDomain { domain, amount },
+                    Instruction::TopUpInsuranceDomain { market_id: 1, domain, amount },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17282,6 +17574,7 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
                 // Per-asset insurance withdraw (v17: WithdrawInsuranceAsset).
                 let res = run_ix(
                     Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, (asset_index as u16) as usize).unwrap().3,
                         asset_index: asset_index as u16,
                         amount,
                     },
@@ -17318,6 +17611,7 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
                 let before_vault = vault_tok.data.clone();
                 let res = run_ix(
                     Instruction::WithdrawInsuranceAsset {
+            market_id: state::read_market_trade_preflight(&market.data, (asset_index as u16) as usize).unwrap().3,
                         asset_index: asset_index as u16,
                         amount: over,
                     },
@@ -17445,7 +17739,7 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                 let mut __lg30 = canonical_backing_ledger_account(&market, domain);
                 let mut __sp30 = system_program_account();
                 let res = run_ix(
-                    Instruction::TopUpBackingBucket {
+                    Instruction::TopUpBackingBucket { market_id: 1,
                         domain,
                         amount,
                         expiry_slot: FAR_EXPIRY,
@@ -17468,7 +17762,7 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
             1 => {
                 let mut __lg21 = canonical_backing_ledger_account(&market, 0);
                 let res = run_ix(
-                    Instruction::WithdrawBackingBucket { domain, amount },
+                    Instruction::WithdrawBackingBucket { market_id: 1, domain, amount },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17496,7 +17790,7 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                 let before = market.data.clone();
                 let mut __lg22 = canonical_backing_ledger_account(&market, domain);
                 let res = run_ix(
-                    Instruction::WithdrawBackingBucket {
+                    Instruction::WithdrawBackingBucket { market_id: 1,
                         domain,
                         amount: over,
                     },
@@ -17592,6 +17886,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     for dom in [4u16, 5u16] {
         run_ix(
             Instruction::TopUpInsuranceDomain {
+            market_id: state::read_market_trade_preflight(&market.data, ((dom) as usize) / 2).unwrap().3,
                 domain: dom,
                 amount: 5_000,
             },
@@ -17609,6 +17904,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     let mut __sp31 = system_program_account();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((4) as usize) / 2).unwrap().3,
             domain: 4,
             amount: 3_000,
             expiry_slot: 1_000_000,
@@ -17679,6 +17975,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     // Configure asset 1 oracle as the attacker-controlled oracle authority.
     run_ix(
         Instruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 300,
             initial_mark_e6: 100,
@@ -17694,6 +17991,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
     // (short) at the honest price.
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -17726,6 +18024,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
         let mark = 1 + (next(&mut rng) % 1_000_000);
         let _ = run_ix(
             Instruction::PushEwmaMark {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
                 asset_index: 1,
                 now_slot: slot,
                 mark_e6: mark,
@@ -17861,6 +18160,7 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
     deposit(&mut a0_short_owner, &mut market, &mut a0_short, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -17896,6 +18196,7 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
     deposit(&mut a1_short_owner, &mut market, &mut a1_short, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -17985,6 +18286,7 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
     // for a crank at slot 6 where group dt = 6 but asset-1 accrual dt = 1.
     run_ix(
         Instruction::PushAuthMark {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             now_slot: 6,
             mark_e6: target_mark_e6,
@@ -18118,6 +18420,7 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
     deposit(&mut a0_short_owner, &mut market, &mut a0_short, 1_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -18214,6 +18517,7 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
     // the fix) but per-asset dt = 0 -> max(1,..) = 1 (floor 1000 < cap) after it.
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -18270,6 +18574,7 @@ fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
 
         run_ix(
             Instruction::TradeNoCpi {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price,
@@ -18326,6 +18631,7 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
         );
         run_ix(
             Instruction::TradeNoCpi {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price,
@@ -18476,6 +18782,7 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
     let mut __sp32 = system_program_account();
     let rejected = run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 0,
             amount: 1_000,
             expiry_slot: 1_000_000,
@@ -18547,6 +18854,7 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
     // the engine's long_account slot (domain 0 for asset 0).
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -18746,6 +19054,7 @@ fn v16_wrapper_protocol_fee_batchtradenocpi_skims_20pct_and_accrues_creator_leg_
     run_ix(
         Instruction::BatchTradeNoCpi {
             legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price: 100,
@@ -18923,6 +19232,7 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
     run_ix(
         Instruction::BatchTradeCpi {
             legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 fee_bps: 1_000,
@@ -19183,7 +19493,7 @@ fn v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed() {
     let mint = init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 10);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     {
         // Seed the protocol-fee ledger + a generous unbudgeted surplus
         // directly (NOT via seed_protocol_fee_fixture, which unconditionally
@@ -19466,6 +19776,7 @@ fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulate
     for expected_trades in 1..=2u128 {
         run_ix(
             Instruction::TradeNoCpi {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price: 100,
@@ -19533,6 +19844,7 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
     let before = market.data.clone();
     let rejected = run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -19598,6 +19910,7 @@ fn v16_wrapper_creator_fee_batch_accrual_overflow_rejects_the_batch_instead_of_w
     let rejected = run_ix(
         Instruction::BatchTradeNoCpi {
             legs: vec![percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                 asset_index: 0,
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price: 100,
@@ -19847,6 +20160,7 @@ fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_asset_admin(
     let mut operator = signer();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator.key.to_bytes(),
@@ -19971,6 +20285,7 @@ fn v16_wrapper_withdraw_creator_fee_survives_the_staked_create_flow_and_only_ass
     let mut operator_pda = signer();
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: operator_pda.key.to_bytes(),
@@ -20149,6 +20464,7 @@ fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_
     let (cfg_before, _) = state::read_market(&market.data).unwrap();
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
@@ -20520,7 +20836,7 @@ fn v16_wrapper_withdraw_creator_fee_resolved_requires_all_portfolios_closed() {
     let mint = init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 10);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     {
         // Seeded inline rather than via `seed_creator_fee_fixture`, which
         // unconditionally zeroes `c_tot` -- the very precondition under test.
@@ -20664,12 +20980,14 @@ fn v16_wrapper_creator_fee_batch_multi_leg_accrues_the_sum_of_every_leg() {
         Instruction::BatchTradeNoCpi {
             legs: vec![
                 percolator_prog::ix::BatchTradeLeg {
+            market_id: 1,
                     asset_index: 0,
                     size_q: leg0_size as i128,
                     exec_price: 100,
                     fee_bps: 1_000,
                 },
                 percolator_prog::ix::BatchTradeLeg {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
                     asset_index: 1,
                     size_q: leg1_size as i128,
                     exec_price: 100,
@@ -20804,6 +21122,7 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
     // 0% insurance at T=20 -- formerly rejected against the 15% floor.
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 20,
             insurance_share_bps: 0,
@@ -20824,6 +21143,7 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
     // 0% LP (isb=10_000) at T=20 -- formerly rejected against the 40% floor.
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 20,
             insurance_share_bps: 10_000,
@@ -20839,6 +21159,7 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
     let before = market.data.clone();
     let result = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 10_001,
             insurance_share_bps: 5_000,
@@ -20850,6 +21171,7 @@ fn v16_wrapper_update_backing_fee_policy_no_longer_enforces_the_two_rate_floor()
     let before = market.data.clone();
     let result = run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 1,
             fee_bps: 0,
             insurance_share_bps: 5_000,
@@ -20920,6 +21242,7 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
         .unwrap();
         run_ix(
             Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
                 domain: 1,
                 fee_bps: 16,
                 insurance_share_bps: 2_500,
@@ -20962,6 +21285,7 @@ fn v16_wrapper_legacy_fee_policy_setters_persist_and_leave_the_tag86_split_untou
         .unwrap();
         run_ix(
             Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
                 domain: 1,
                 fee_bps: 5,
                 insurance_share_bps: 2_727,
@@ -21019,6 +21343,7 @@ fn v16_wrapper_update_trade_fee_policy_no_longer_enforces_the_two_rate_floor() {
     // Asset 1 LONG domain: bf=1000bps, isb=2000bps.
     run_ix(
         Instruction::UpdateBackingFeePolicy {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             fee_bps: 1_000,
             insurance_share_bps: 2_000,
@@ -21353,7 +21678,7 @@ fn v16_wrapper_update_maintenance_fee_per_slot_is_live_only() {
     )
     .expect("rate change must be allowed while Live");
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap() }, &mut [&mut admin, &mut market]).unwrap();
     let resolved = market.data.clone();
 
     // Not Live: the rate change must be refused, and the market left untouched.
@@ -21385,6 +21710,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
     // Legitimately hand insurance_authority to `holder` (holder co-signs).
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: holder.key.to_bytes(),
@@ -21398,6 +21724,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
     // asset_admin now tries to take it away. `holder` does NOT sign.
     let seized = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE,
             new_pubkey: attacker.key.to_bytes(),
@@ -21420,6 +21747,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
 
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: holder.key.to_bytes(),
@@ -21432,6 +21760,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
 
     let seized = run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: ASSET_AUTH_INSURANCE_OPERATOR,
             new_pubkey: attacker.key.to_bytes(),
@@ -21598,6 +21927,7 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
         let _mint = init_market(&mut admin, &mut market);
         let r = run_ix(
             Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
                 stale_slots: bad,
                 force_close_delay_slots: 1,
             },
@@ -21623,6 +21953,7 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
         let _mint = init_market(&mut admin, &mut market);
         run_ix(
             Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
                 stale_slots: good,
                 force_close_delay_slots: 1,
             },
@@ -21639,6 +21970,7 @@ fn v16_wrapper_permissionless_resolve_stale_slots_has_a_lower_bound() {
     let _mint = init_market(&mut admin, &mut market);
     let over = run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: max + 1,
             force_close_delay_slots: 1,
         },
@@ -21817,6 +22149,7 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
     );
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -21908,6 +22241,7 @@ fn v16_wrapper_force_close_abandoned_asset_is_blocked_once_resolve_has_matured()
     );
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -22364,7 +22698,7 @@ fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128
 
     // Open a position on each asset (taker long, maker short) with ample capital.
     let size = 10 * POS_SCALE;
-    let open = |asset_index: u16| percolator_prog::ix::BatchTradeLeg {
+    let open = |asset_index: u16| percolator_prog::ix::BatchTradeLeg { market_id: asset_index as u64 + 1,
         asset_index,
         size_q: size as i128,
         exec_price: 100,
@@ -22409,7 +22743,7 @@ fn b4_mid_batch_shortfall_batch() -> (Result<(), ProgramError>, u128, u128, u128
     // under-margin taker may execute it. Leg 0: the taker pays `fee_leg` in
     // full, leaving 1 atom. Leg 1: the taker can pay 1 atom of `fee_leg`, and
     // the N1 fallback asks the solvent maker for the remainder.
-    let reduce = |asset_index: u16| percolator_prog::ix::BatchTradeLeg {
+    let reduce = |asset_index: u16| percolator_prog::ix::BatchTradeLeg { market_id: asset_index as u64 + 1,
         asset_index,
         size_q: -(size as i128),
         exec_price: 100,
@@ -22697,6 +23031,7 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
     // asset 0: victim LONG 1 unit @100 against the counterparty
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -22714,6 +23049,7 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
     // asset 1: two UNRELATED bystanders hold a matched, healthy pair
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -22934,7 +23270,7 @@ fn f05_old_c_w_04_lock_assertions_must_now_fail() {
     );
 
     // (a) the MARKET AUTHORITY's own ResolveMarket (tag 19).
-    let admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut f.admin, &mut f.market]);
+    let admin_resolve = run_ix(Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&f.market.data).unwrap() }, &mut [&mut f.admin, &mut f.market]);
     let m1 = cw04_snap(&f.market, &f.victim).mode;
     println!("F-05/old exit(a) admin ResolveMarket (tag 19)   = {admin_resolve:?} mode={m1:?}");
 
@@ -23284,6 +23620,7 @@ fn cw02_adl_recovery_pair() -> (
 
     run_ix(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 5,
         },
@@ -23306,6 +23643,7 @@ fn cw02_adl_recovery_pair() -> (
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
             asset_index: 1,
             size_q: (POS_SCALE * 2) as i128,
             exec_price: 150,
@@ -23726,6 +24064,7 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
     deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
     run_ix(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             exec_price: 100,
@@ -24135,6 +24474,7 @@ fn w91_env() -> W91Env {
     // Real tag 50: the provider funds domain 2 at a FINITE expiry.
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((W91_FROM_DOMAIN) as usize) / 2).unwrap().3,
             domain: W91_FROM_DOMAIN,
             amount: W91_U_ATOMS,
             expiry_slot: W91_FINITE_EXPIRY,
@@ -24255,7 +24595,7 @@ fn w91_resolve_with_open_trader(e: &mut W91Env) {
     init_portfolio(&mut trader, &mut e.market, &mut portfolio);
     deposit(&mut trader, &mut e.market, &mut portfolio, 500);
     run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&e.market.data).unwrap() },
         &mut [&mut e.admin, &mut e.market],
     )
     .expect("admin resolve");
@@ -24311,6 +24651,7 @@ fn w21_tag50_env(expiry_slot: u64) -> W21Tag50Env {
     let mut source = user_token_account(provider.key, mint, W91_U_ATOMS as u64);
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((W91_FROM_DOMAIN) as usize) / 2).unwrap().3,
             domain: W91_FROM_DOMAIN,
             amount: W91_U_ATOMS,
             expiry_slot,
@@ -24345,6 +24686,7 @@ fn w21_tag50_withdraw(e: &mut W21Tag50Env, amount: u128) -> Result<(), ProgramEr
     let mut vault_auth = vault_authority_account(&e.market);
     run_ix_no_rollback(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&e.market.data, ((W91_FROM_DOMAIN) as usize) / 2).unwrap().3,
             domain: W91_FROM_DOMAIN,
             amount,
         },
@@ -24438,7 +24780,7 @@ fn w21_tag50_refuses_a_lapsed_bucket_in_terminal_flat_resolved_too() {
     // 97376 -> 0`; it must now refuse.
     let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
     run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&e.market.data).unwrap() },
         &mut [&mut e.admin, &mut e.market],
     )
     .expect("admin resolve on an empty market");
@@ -24795,6 +25137,7 @@ fn wsib_env_unbound() -> WsibEnv {
     let mut provider_signing = TestAccount::new(provider.key, provider.owner, 0).signer();
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((WSIB_PROVIDER_DOMAIN) as usize) / 2).unwrap().3,
             domain: WSIB_PROVIDER_DOMAIN,
             amount: WSIB_U_ATOMS,
             expiry_slot: WSIB_FINITE_EXPIRY,
@@ -24874,6 +25217,7 @@ fn wsib_withdraw_no_rollback(
     };
     run_ix_no_rollback(
         Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&e.market.data, ((WSIB_PROVIDER_DOMAIN) as usize) / 2).unwrap().3,
             domain: WSIB_PROVIDER_DOMAIN,
             amount,
         },
@@ -24982,6 +25326,9 @@ fn wsib_rotate_backing_authority(
     };
     run_ix(
         Instruction::UpdateAssetAuthority {
+            market_id: state::read_market_trade_preflight(&e.market.data, 1)
+                .map(|t| t.3)
+                .unwrap_or(0),
             asset_index: 1,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: new_key.to_bytes(),
@@ -25244,13 +25591,30 @@ fn wgenl_co_signer(key: Pubkey) -> TestAccount {
 }
 
 fn wgenl_lifecycle_ix(
+    market: &TestAccount,
     action: u8,
     asset_index: u16,
     now_slot: u64,
     initial_price: u64,
     auth: [u8; 32],
 ) -> Instruction {
+    // Wave-2 TB-4: read the generation-binding market_id live -- this whole
+    // test suite is specifically about generations advancing across retire/
+    // reactivate cycles, so a hardcoded value would defeat the point.
+    let is_activation = action == processor::ASSET_ACTION_ACTIVATE;
+    let (current_market_id, next_market_id) = state::read_asset_lifecycle_generation_preflight(
+        &market.data,
+        asset_index as usize,
+        is_activation,
+    )
+    .unwrap_or((0, 0));
+    let market_id = if is_activation {
+        next_market_id
+    } else {
+        current_market_id
+    };
     Instruction::UpdateAssetLifecycle {
+        market_id,
         action,
         asset_index,
         now_slot,
@@ -25296,6 +25660,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
     .unwrap();
     run_ix(
         wgenl_lifecycle_ix(
+            &market,
             processor::ASSET_ACTION_ACTIVATE,
             1,
             1,
@@ -25317,6 +25682,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
             Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
                 domain: 2,
                 amount: 700,
                 expiry_slot: 10_000,
@@ -25338,6 +25704,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
         let mut vault_auth = vault_authority_account(&market);
         run_ix(
             Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&market.data, ((2) as usize) / 2).unwrap().3,
                 domain: 2,
                 amount: 700,
             },
@@ -25371,7 +25738,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
 /// Returns the freshly minted generation.
 fn wgenl_flip_generation(s: &mut WgenlStage) -> u64 {
     run_ix(
-        wgenl_lifecycle_ix(processor::ASSET_ACTION_RETIRE, 1, 3, 0, [0u8; 32]),
+        wgenl_lifecycle_ix(&s.market, processor::ASSET_ACTION_RETIRE, 1, 3, 0, [0u8; 32]),
         &mut [&mut s.admin, &mut s.market],
     )
     .unwrap();
@@ -25379,8 +25746,17 @@ fn wgenl_flip_generation(s: &mut WgenlStage) -> u64 {
     let mut reuse_vault = vault_token_account(&s.market, s.mint, 0);
     let victim_bytes = s.victim_key.to_bytes();
     let attacker_bytes = s.attacker.key.to_bytes();
+    // Wave-2 TB-4: this is the PERMISSIONLESS reuse branch (a fresh generation
+    // gets stamped on this reactivation too) -- read it live.
+    let (_current, reuse_market_id) = state::read_asset_lifecycle_generation_preflight(
+        &s.market.data,
+        1,
+        true,
+    )
+    .unwrap_or((0, 0));
     run_ix(
         Instruction::UpdateAssetLifecycle {
+            market_id: reuse_market_id,
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
             now_slot: 4,
@@ -25414,6 +25790,7 @@ fn wgenl_topup(s: &mut WgenlStage, amount: u128) -> Result<(), ProgramError> {
     let mut vault = vault_token_account(&s.market, s.mint, 0);
     run_ix(
         Instruction::TopUpBackingBucket {
+            market_id: state::read_market_trade_preflight(&s.market.data, ((2) as usize) / 2).unwrap().3,
             domain: 2,
             amount,
             expiry_slot: 10_000,
@@ -25731,6 +26108,7 @@ fn wgenl_legacy_ledger_is_protected_from_the_next_flip_once_stamped() {
         let mut vault_auth = vault_authority_account(&s.market);
         run_ix(
             Instruction::WithdrawBackingBucket {
+            market_id: state::read_market_trade_preflight(&s.market.data, ((2) as usize) / 2).unwrap().3,
                 domain: 2,
                 amount: 300,
             },

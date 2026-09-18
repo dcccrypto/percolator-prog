@@ -161,7 +161,7 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     match (tag, Instruction::decode(&data).unwrap()) {
         (3, Instruction::Deposit { amount: got }) => assert_eq!(got, amount),
         (4, Instruction::Withdraw { amount: got }) => assert_eq!(got, amount),
-        (9, Instruction::TopUpInsurance { amount: got }) => assert_eq!(got, amount),
+        (9, Instruction::TopUpInsurance { market_id: 1, amount: got }) => assert_eq!(got, amount),
         (28, Instruction::ConvertReleasedPnl { amount: got }) => assert_eq!(got, amount),
         (30, Instruction::CloseResolved { fee_rate_per_slot }) => {
             assert_eq!(fee_rate_per_slot, amount)
@@ -185,17 +185,22 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
     // v17: domain fields are u16 (not u8).
     let domain: u16 = kani::any();
     let amount: u128 = kani::any();
+    // Wave-2 TB-4: market_id: u64 trailing the domain/asset_index field.
+    let market_id: u64 = kani::any();
 
-    // TopUpInsuranceDomain: tag(1) + domain(u16=2) + amount(u128=16) = 19 bytes.
-    let mut top_up = [0u8; 19];
+    // TopUpInsuranceDomain: tag(1) + domain(u16=2) + market_id(u64=8) + amount(u128=16) = 27 bytes.
+    let mut top_up = [0u8; 27];
     top_up[0] = 56;
     top_up[1..3].copy_from_slice(&domain.to_le_bytes());
-    top_up[3..19].copy_from_slice(&amount.to_le_bytes());
+    top_up[3..11].copy_from_slice(&market_id.to_le_bytes());
+    top_up[11..27].copy_from_slice(&amount.to_le_bytes());
     match Instruction::decode(&top_up).unwrap() {
         Instruction::TopUpInsuranceDomain {
+            market_id: got_market_id,
             domain: got_domain,
             amount: got_amount,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
         }
@@ -204,16 +209,20 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
 
     // v17: tag 57 is now WithdrawInsuranceAsset { asset_index: u16, amount: u128 }.
     // (WithdrawInsuranceDomain was removed in the v17 auth overhaul.)
-    let mut withdraw = [0u8; 19];
+    // Wave-2 TB-4: tag(1) + asset_index(u16=2) + market_id(u64=8) + amount(u128=16) = 27 bytes.
+    let mut withdraw = [0u8; 27];
     let asset_index: u16 = kani::any();
     withdraw[0] = 57;
     withdraw[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    withdraw[3..19].copy_from_slice(&amount.to_le_bytes());
+    withdraw[3..11].copy_from_slice(&market_id.to_le_bytes());
+    withdraw[11..27].copy_from_slice(&amount.to_le_bytes());
     match Instruction::decode(&withdraw).unwrap() {
         Instruction::WithdrawInsuranceAsset {
+            market_id: got_market_id,
             asset_index: got_asset_index,
             amount: got_amount,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_amount, amount);
         }
@@ -307,23 +316,28 @@ fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
-    // v17: domain is u16. Wire: tag(1) + domain(u16=2) + amount(u128=16) + expiry_slot(u64=8) = 27.
+    // v17: domain is u16. Wave-2 TB-4: tag(1) + domain(u16=2) + market_id(u64=8) +
+    // amount(u128=16) + expiry_slot(u64=8) = 35.
     let domain: u16 = kani::any();
     let amount: u128 = kani::any();
     let expiry_slot: u64 = kani::any();
+    let market_id: u64 = kani::any();
 
-    let mut data = [0u8; 27];
+    let mut data = [0u8; 35];
     data[0] = 24;
     data[1..3].copy_from_slice(&domain.to_le_bytes());
-    data[3..19].copy_from_slice(&amount.to_le_bytes());
-    data[19..27].copy_from_slice(&expiry_slot.to_le_bytes());
+    data[3..11].copy_from_slice(&market_id.to_le_bytes());
+    data[11..27].copy_from_slice(&amount.to_le_bytes());
+    data[27..35].copy_from_slice(&expiry_slot.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TopUpBackingBucket {
+            market_id: got_market_id,
             domain: got_domain,
             amount: got_amount,
             expiry_slot: got_expiry,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
             assert_eq!(got_expiry, expiry_slot);
@@ -337,14 +351,22 @@ fn kani_v16_withdraw_backing_bucket_decode_preserves_wire_fields() {
     // v17: domain is u16.
     let domain: u16 = kani::any();
     let amount: u128 = kani::any();
+    let market_id: u64 = kani::any();
 
-    let data = Instruction::WithdrawBackingBucket { domain, amount }.encode();
+    let data = Instruction::WithdrawBackingBucket {
+        market_id,
+        domain,
+        amount,
+    }
+    .encode();
 
     match Instruction::decode(&data).unwrap() {
         Instruction::WithdrawBackingBucket {
+            market_id: got_market_id,
             domain: got_domain,
             amount: got_amount,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
         }
@@ -363,7 +385,7 @@ fn kani_v16_asset_lifecycle_decode_preserves_wire_fields() {
     let backing_bucket_authority: [u8; 32] = kani::any();
     let oracle_authority: [u8; 32] = kani::any();
 
-    let data = Instruction::UpdateAssetLifecycle {
+    let data = Instruction::UpdateAssetLifecycle { market_id: 1,
         action,
         asset_index,
         now_slot,
@@ -377,7 +399,7 @@ fn kani_v16_asset_lifecycle_decode_preserves_wire_fields() {
     .encode();
 
     match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: got_action,
             asset_index: got_asset_index,
             now_slot: got_now_slot,
@@ -405,24 +427,30 @@ fn kani_v16_asset_lifecycle_decode_preserves_wire_fields() {
 #[kani::proof]
 fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
     let asset_index: u16 = kani::any();
+    let market_id: u64 = kani::any();
     let size_q: i128 = kani::any();
     let exec_price: u64 = kani::any();
     let fee_bps: u64 = kani::any();
 
-    let mut data = [0u8; 35];
+    // Wave-2 TB-4: tag(1) + asset_index(u16=2) + market_id(u64=8) + size_q(i128=16) +
+    // exec_price(u64=8) + fee_bps(u64=8) = 43.
+    let mut data = [0u8; 43];
     data[0] = 6;
     data[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    data[3..19].copy_from_slice(&size_q.to_le_bytes());
-    data[19..27].copy_from_slice(&exec_price.to_le_bytes());
-    data[27..35].copy_from_slice(&fee_bps.to_le_bytes());
+    data[3..11].copy_from_slice(&market_id.to_le_bytes());
+    data[11..27].copy_from_slice(&size_q.to_le_bytes());
+    data[27..35].copy_from_slice(&exec_price.to_le_bytes());
+    data[35..43].copy_from_slice(&fee_bps.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TradeNoCpi {
+            market_id: got_market_id,
             asset_index: got_asset,
             size_q: got_size,
             exec_price: got_price,
             fee_bps: got_fee,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_size, size_q);
             assert_eq!(got_price, exec_price);
@@ -435,24 +463,30 @@ fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
 #[kani::proof]
 fn kani_v16_tradecpi_decode_preserves_wire_fields() {
     let asset_index: u16 = kani::any();
+    let market_id: u64 = kani::any();
     let size_q: i128 = kani::any();
     let fee_bps: u64 = kani::any();
     let limit_price: u64 = kani::any();
 
-    let mut data = [0u8; 35];
+    // Wave-2 TB-4: tag(1) + asset_index(u16=2) + market_id(u64=8) + size_q(i128=16) +
+    // fee_bps(u64=8) + limit_price(u64=8) = 43.
+    let mut data = [0u8; 43];
     data[0] = 10;
     data[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    data[3..19].copy_from_slice(&size_q.to_le_bytes());
-    data[19..27].copy_from_slice(&fee_bps.to_le_bytes());
-    data[27..35].copy_from_slice(&limit_price.to_le_bytes());
+    data[3..11].copy_from_slice(&market_id.to_le_bytes());
+    data[11..27].copy_from_slice(&size_q.to_le_bytes());
+    data[27..35].copy_from_slice(&fee_bps.to_le_bytes());
+    data[35..43].copy_from_slice(&limit_price.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TradeCpi {
+            market_id: got_market_id,
             asset_index: got_asset,
             size_q: got_size,
             fee_bps: got_fee,
             limit_price: got_limit,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_size, size_q);
             assert_eq!(got_fee, fee_bps);
@@ -637,7 +671,9 @@ fn kani_v16_update_authority_decode_preserves_wire_fields() {
     }
 
     // Tag 65: UpdateAssetAuthority — per-asset authority rotation (kind + asset_index).
+    let market_id65: u64 = kani::any();
     let data65 = Instruction::UpdateAssetAuthority {
+        market_id: market_id65,
         asset_index,
         kind,
         new_pubkey,
@@ -645,10 +681,12 @@ fn kani_v16_update_authority_decode_preserves_wire_fields() {
     .encode();
     match Instruction::decode(&data65).unwrap() {
         Instruction::UpdateAssetAuthority {
+            market_id: got_market_id65,
             asset_index: got_asset,
             kind: got_kind,
             new_pubkey: got_pubkey,
         } => {
+            assert_eq!(got_market_id65, market_id65);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_kind, kind);
             assert_eq!(got_pubkey, new_pubkey);
@@ -707,23 +745,28 @@ fn kani_v16_update_maintenance_fee_policy_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_update_backing_fee_policy_decode_preserves_wire_fields() {
-    // v17: domain is u16. Wire: tag(1) + domain(u16=2) + fee_bps(u16=2) + insurance_share_bps(u16=2) = 7.
+    // v17: domain is u16. Wave-2 TB-4: tag(1) + domain(u16=2) + market_id(u64=8) +
+    // fee_bps(u16=2) + insurance_share_bps(u16=2) = 15.
     let domain: u16 = kani::any();
     let fee_bps: u16 = kani::any();
     let insurance_share_bps: u16 = kani::any();
+    let market_id: u64 = kani::any();
 
-    let mut data = [0u8; 7];
+    let mut data = [0u8; 15];
     data[0] = 51;
     data[1..3].copy_from_slice(&domain.to_le_bytes());
-    data[3..5].copy_from_slice(&fee_bps.to_le_bytes());
-    data[5..7].copy_from_slice(&insurance_share_bps.to_le_bytes());
+    data[3..11].copy_from_slice(&market_id.to_le_bytes());
+    data[11..13].copy_from_slice(&fee_bps.to_le_bytes());
+    data[13..15].copy_from_slice(&insurance_share_bps.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::UpdateBackingFeePolicy {
+            market_id: got_market_id,
             domain: got_domain,
             fee_bps: got_fee_bps,
             insurance_share_bps: got_insurance_share_bps,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_domain, domain);
             assert_eq!(got_fee_bps, fee_bps);
             assert_eq!(got_insurance_share_bps, insurance_share_bps);
@@ -813,16 +856,22 @@ fn kani_v16_permissionless_resolve_decode_preserves_wire_fields() {
     let stale_slots: u64 = kani::any();
     let force_close_delay_slots: u64 = kani::any();
     let now_slot: u64 = kani::any();
+    // Wave-2 TB-4: asset_generation_frontier: u64 is a LEADING field (before
+    // stale_slots), not trailing -- shifts the whole payload by +8 (17 -> 25).
+    let asset_generation_frontier: u64 = kani::any();
 
-    let mut configure = [0u8; 17];
+    let mut configure = [0u8; 25];
     configure[0] = 38;
-    configure[1..9].copy_from_slice(&stale_slots.to_le_bytes());
-    configure[9..17].copy_from_slice(&force_close_delay_slots.to_le_bytes());
+    configure[1..9].copy_from_slice(&asset_generation_frontier.to_le_bytes());
+    configure[9..17].copy_from_slice(&stale_slots.to_le_bytes());
+    configure[17..25].copy_from_slice(&force_close_delay_slots.to_le_bytes());
     match Instruction::decode(&configure).unwrap() {
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: got_frontier,
             stale_slots: got_stale,
             force_close_delay_slots: got_delay,
         } => {
+            assert_eq!(got_frontier, asset_generation_frontier);
             assert_eq!(got_stale, stale_slots);
             assert_eq!(got_delay, force_close_delay_slots);
         }
@@ -865,26 +914,31 @@ fn kani_v16_configure_hybrid_oracle_decode_preserves_wire_fields() {
         i += 1;
     }
 
-    let mut data = [0u8; 156];
+    // Wave-2 TB-4: an 8-byte market_id lands right after asset_index, shifting every
+    // subsequent field by +8 (156 -> 164 total).
+    let market_id: u64 = kani::any();
+    let mut data = [0u8; 164];
     data[0] = 34;
     data[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    data[3..11].copy_from_slice(&now_slot.to_le_bytes());
-    data[11..19].copy_from_slice(&now_unix_ts.to_le_bytes());
-    data[19] = oracle_leg_count;
-    data[20] = oracle_leg_flags;
-    data[21..29].copy_from_slice(&max_staleness_secs.to_le_bytes());
-    data[29..37].copy_from_slice(&hybrid_soft_stale_slots.to_le_bytes());
-    data[37..45].copy_from_slice(&mark_ewma_halflife_slots.to_le_bytes());
-    data[45..53].copy_from_slice(&mark_min_fee.to_le_bytes());
-    data[53] = invert;
-    data[54..58].copy_from_slice(&unit_scale.to_le_bytes());
-    data[58..60].copy_from_slice(&conf_filter_bps.to_le_bytes());
-    data[60..92].copy_from_slice(&feeds[0]);
-    data[92..124].copy_from_slice(&feeds[1]);
-    data[124..156].copy_from_slice(&feeds[2]);
+    data[3..11].copy_from_slice(&market_id.to_le_bytes());
+    data[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    data[19..27].copy_from_slice(&now_unix_ts.to_le_bytes());
+    data[27] = oracle_leg_count;
+    data[28] = oracle_leg_flags;
+    data[29..37].copy_from_slice(&max_staleness_secs.to_le_bytes());
+    data[37..45].copy_from_slice(&hybrid_soft_stale_slots.to_le_bytes());
+    data[45..53].copy_from_slice(&mark_ewma_halflife_slots.to_le_bytes());
+    data[53..61].copy_from_slice(&mark_min_fee.to_le_bytes());
+    data[61] = invert;
+    data[62..66].copy_from_slice(&unit_scale.to_le_bytes());
+    data[66..68].copy_from_slice(&conf_filter_bps.to_le_bytes());
+    data[68..100].copy_from_slice(&feeds[0]);
+    data[100..132].copy_from_slice(&feeds[1]);
+    data[132..164].copy_from_slice(&feeds[2]);
 
     match Instruction::decode(&data).unwrap() {
         Instruction::ConfigureHybridOracle {
+            market_id: got_market_id,
             asset_index: got_asset_index,
             now_slot: got_now_slot,
             now_unix_ts: got_now_unix,
@@ -899,6 +953,7 @@ fn kani_v16_configure_hybrid_oracle_decode_preserves_wire_fields() {
             conf_filter_bps: got_conf,
             oracle_leg_feeds: got_feeds,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_now_slot, now_slot);
             assert_eq!(got_now_unix, now_unix_ts);
@@ -927,22 +982,28 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
     let mark_ewma_halflife_slots: u64 = kani::any();
     let mark_min_fee: u64 = kani::any();
     let push_mark_e6: u64 = kani::any();
+    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs,
+    // shifting the remaining fields by +8 each.
+    let market_id: u64 = kani::any();
 
-    let mut configure = [0u8; 35];
+    let mut configure = [0u8; 43];
     configure[0] = 35;
     configure[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    configure[3..11].copy_from_slice(&now_slot.to_le_bytes());
-    configure[11..19].copy_from_slice(&initial_mark_e6.to_le_bytes());
-    configure[19..27].copy_from_slice(&mark_ewma_halflife_slots.to_le_bytes());
-    configure[27..35].copy_from_slice(&mark_min_fee.to_le_bytes());
+    configure[3..11].copy_from_slice(&market_id.to_le_bytes());
+    configure[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    configure[19..27].copy_from_slice(&initial_mark_e6.to_le_bytes());
+    configure[27..35].copy_from_slice(&mark_ewma_halflife_slots.to_le_bytes());
+    configure[35..43].copy_from_slice(&mark_min_fee.to_le_bytes());
     match Instruction::decode(&configure).unwrap() {
         Instruction::ConfigureEwmaMark {
+            market_id: got_market_id,
             asset_index: got_asset_index,
             now_slot: got_now,
             initial_mark_e6: got_mark,
             mark_ewma_halflife_slots: got_halflife,
             mark_min_fee: got_min_fee,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, initial_mark_e6);
@@ -952,17 +1013,20 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
         _ => unreachable!(),
     }
 
-    let mut push = [0u8; 19];
+    let mut push = [0u8; 27];
     push[0] = 36;
     push[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    push[3..11].copy_from_slice(&now_slot.to_le_bytes());
-    push[11..19].copy_from_slice(&push_mark_e6.to_le_bytes());
+    push[3..11].copy_from_slice(&market_id.to_le_bytes());
+    push[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    push[19..27].copy_from_slice(&push_mark_e6.to_le_bytes());
     match Instruction::decode(&push).unwrap() {
         Instruction::PushEwmaMark {
+            market_id: got_market_id,
             asset_index: got_asset_index,
             now_slot: got_now,
             mark_e6: got_mark,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, push_mark_e6);
@@ -970,17 +1034,20 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
         _ => unreachable!(),
     }
 
-    let mut configure_auth = [0u8; 19];
+    let mut configure_auth = [0u8; 27];
     configure_auth[0] = 62;
     configure_auth[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    configure_auth[3..11].copy_from_slice(&now_slot.to_le_bytes());
-    configure_auth[11..19].copy_from_slice(&initial_mark_e6.to_le_bytes());
+    configure_auth[3..11].copy_from_slice(&market_id.to_le_bytes());
+    configure_auth[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    configure_auth[19..27].copy_from_slice(&initial_mark_e6.to_le_bytes());
     match Instruction::decode(&configure_auth).unwrap() {
         Instruction::ConfigureAuthMark {
+            market_id: got_market_id,
             asset_index: got_asset_index,
             now_slot: got_now,
             initial_mark_e6: got_mark,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, initial_mark_e6);
@@ -988,17 +1055,20 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
         _ => unreachable!(),
     }
 
-    let mut push_auth = [0u8; 19];
+    let mut push_auth = [0u8; 27];
     push_auth[0] = 63;
     push_auth[1..3].copy_from_slice(&asset_index.to_le_bytes());
-    push_auth[3..11].copy_from_slice(&now_slot.to_le_bytes());
-    push_auth[11..19].copy_from_slice(&push_mark_e6.to_le_bytes());
+    push_auth[3..11].copy_from_slice(&market_id.to_le_bytes());
+    push_auth[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    push_auth[19..27].copy_from_slice(&push_mark_e6.to_le_bytes());
     match Instruction::decode(&push_auth).unwrap() {
         Instruction::PushAuthMark {
+            market_id: got_market_id,
             asset_index: got_asset_index,
             now_slot: got_now,
             mark_e6: got_mark,
         } => {
+            assert_eq!(got_market_id, market_id);
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, push_mark_e6);
@@ -1059,9 +1129,10 @@ fn kani_v16_custody_payloads_reject_trailing_byte() {
     assert_rejects_trailing_byte(Instruction::InitPortfolio, extra);
     assert_rejects_trailing_byte(Instruction::Deposit { amount: 1 }, extra);
     assert_rejects_trailing_byte(Instruction::Withdraw { amount: 1 }, extra);
-    assert_rejects_trailing_byte(Instruction::TopUpInsurance { amount: 1 }, extra);
+    assert_rejects_trailing_byte(Instruction::TopUpInsurance { market_id: 1, amount: 1 }, extra);
     assert_rejects_trailing_byte(
         Instruction::TopUpBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
             expiry_slot: 10,
@@ -1070,6 +1141,7 @@ fn kani_v16_custody_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::WithdrawBackingBucket {
+            market_id: 1,
             domain: 1,
             amount: 1,
         },
@@ -1079,6 +1151,7 @@ fn kani_v16_custody_payloads_reject_trailing_byte() {
     // v17: WithdrawInsuranceLimited removed; WithdrawInsuranceAsset replaces domain withdraw.
     assert_rejects_trailing_byte(
         Instruction::WithdrawInsuranceAsset {
+            market_id: 1,
             asset_index: 0,
             amount: 1,
         },
@@ -1103,6 +1176,7 @@ fn kani_v16_trade_and_crank_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::TradeNoCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: 1,
             exec_price: 100,
@@ -1112,6 +1186,7 @@ fn kani_v16_trade_and_crank_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::TradeCpi {
+            market_id: 1,
             asset_index: 0,
             size_q: 1,
             fee_bps: 0,
@@ -1127,7 +1202,7 @@ fn kani_v16_admin_policy_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
 
     assert_rejects_trailing_byte(Instruction::CloseSlab, extra);
-    assert_rejects_trailing_byte(Instruction::ResolveMarket, extra);
+    assert_rejects_trailing_byte(Instruction::ResolveMarket { asset_generation_frontier: 2 }, extra);
     // v17: UpdateAuthority no longer has `kind`; UpdateAssetAuthority (tag 65) handles per-asset.
     assert_rejects_trailing_byte(
         Instruction::UpdateAuthority {
@@ -1137,6 +1212,7 @@ fn kani_v16_admin_policy_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::UpdateAssetAuthority {
+            market_id: 1,
             asset_index: 0,
             kind: 0,
             new_pubkey: [1u8; 32],
@@ -1159,6 +1235,7 @@ fn kani_v16_admin_policy_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::UpdateBackingFeePolicy {
+            market_id: 1,
             domain: 0,
             fee_bps: 25,
             insurance_share_bps: 0,
@@ -1188,6 +1265,7 @@ fn kani_v16_admin_policy_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
             stale_slots: 9000,
             force_close_delay_slots: 1,
         },
@@ -1205,6 +1283,7 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
 
     assert_rejects_trailing_byte(
         Instruction::ConfigureHybridOracle {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             now_unix_ts: 1,
@@ -1223,6 +1302,7 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::ConfigureEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             initial_mark_e6: 100,
@@ -1233,6 +1313,7 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::PushEwmaMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 2,
             mark_e6: 101,
@@ -1241,6 +1322,7 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::ConfigureAuthMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 1,
             initial_mark_e6: 100,
@@ -1249,6 +1331,7 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
     );
     assert_rejects_trailing_byte(
         Instruction::PushAuthMark {
+            market_id: 1,
             asset_index: 0,
             now_slot: 2,
             mark_e6: 101,
@@ -1256,7 +1339,7 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
         extra,
     );
     assert_rejects_trailing_byte(
-        Instruction::UpdateAssetLifecycle {
+        Instruction::UpdateAssetLifecycle { market_id: 1,
             action: 0,
             asset_index: 1,
             now_slot: 2,

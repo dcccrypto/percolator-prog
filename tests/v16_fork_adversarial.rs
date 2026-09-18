@@ -344,8 +344,17 @@ impl Env {
 
     fn activate_asset(&mut self, asset_index: u16, now_slot: u64, initial_price: u64) {
         let admin = self.admin.insecure_clone();
+        // Wave-2 TB-4: an ACTIVATE binds against the market's live `next_market_id`
+        // frontier -- read it, don't hardcode it.
+        let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            true,
+        )
+        .unwrap_or((0, 0));
         self.send_ok(
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index,
                 now_slot,
@@ -473,6 +482,7 @@ impl Env {
     ) -> Result<(), TransactionError> {
         self.try_send(
             ProgInstruction::TradeNoCpi {
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (ASSET) as usize).unwrap().3,
                 asset_index: ASSET,
                 size_q,
                 exec_price,
@@ -528,7 +538,7 @@ impl Env {
             )
             .unwrap();
         self.try_send(
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { market_id: 1, amount },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -549,6 +559,7 @@ impl Env {
         let admin = self.admin.insecure_clone();
         self.try_send(
             ProgInstruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (ASSET) as usize).unwrap().3,
                 asset_index: ASSET,
                 now_slot,
                 initial_mark_e6,
@@ -568,6 +579,7 @@ impl Env {
         let admin = self.admin.insecure_clone();
         self.try_send(
             ProgInstruction::PushEwmaMark {
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (ASSET) as usize).unwrap().3,
                 asset_index: ASSET,
                 now_slot,
                 mark_e6,
@@ -583,7 +595,7 @@ impl Env {
     fn resolve(&mut self) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
         self.try_send(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&self.svm.get_account(&self.market).unwrap().data).unwrap() },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
