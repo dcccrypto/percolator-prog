@@ -204,6 +204,7 @@ fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstructio
         asset_index: APPEND_ASSET_INDEX,
         now_slot: 1,
         initial_price: 100,
+        max_init_fee: u128::MAX,
         insurance_authority: admin.to_bytes(),
         insurance_operator: admin.to_bytes(),
         backing_bucket_authority: backing_authority.to_bytes(),

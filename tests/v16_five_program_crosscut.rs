@@ -499,6 +499,7 @@ impl CrosscutEnv {
                 asset_index,
                 now_slot,
                 initial_price,
+                max_init_fee: u128::MAX,
                 insurance_authority: admin.pubkey().to_bytes(),
                 insurance_operator: admin.pubkey().to_bytes(),
                 backing_bucket_authority: self.lp_registry.to_bytes(),

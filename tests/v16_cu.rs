@@ -570,6 +570,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 initial_price,
+                max_init_fee: u128::MAX,
                 insurance_authority: insurance_authority.to_bytes(),
                 insurance_operator: insurance_operator.to_bytes(),
                 backing_bucket_authority: backing_bucket_authority.to_bytes(),
@@ -615,6 +616,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 initial_price,
+                max_init_fee: u128::MAX,
                 insurance_authority: self.admin.pubkey().to_bytes(),
                 insurance_operator: self.admin.pubkey().to_bytes(),
                 backing_bucket_authority: self.admin.pubkey().to_bytes(),
@@ -1027,6 +1029,7 @@ impl V16CuEnv {
                 asset_index,
                 now_slot,
                 initial_price,
+                max_init_fee: u128::MAX,
                 insurance_authority: insurance_authority.to_bytes(),
                 insurance_operator: insurance_operator.to_bytes(),
                 backing_bucket_authority: backing_bucket_authority.to_bytes(),
@@ -1043,6 +1046,52 @@ impl V16CuEnv {
         )
         .expect("permissionless asset activation with fee");
         (source, cu)
+    }
+
+    /// Same wire shape as `activate_permissionless_asset_with_fee`, but exposes the
+    /// caller-supplied `max_init_fee` consent cap (W2-4ed3411b) and returns the raw
+    /// `Result` instead of panicking, so callers can assert on rejection.
+    #[allow(clippy::too_many_arguments)]
+    fn try_activate_permissionless_asset_with_fee_and_cap(
+        &mut self,
+        creator: &Keypair,
+        asset_index: u16,
+        now_slot: u64,
+        initial_price: u64,
+        insurance_authority: Pubkey,
+        insurance_operator: Pubkey,
+        backing_bucket_authority: Pubkey,
+        oracle_authority: Pubkey,
+        fund_amount: u128,
+        max_init_fee: u128,
+    ) -> Result<(Pubkey, u64), String> {
+        self.ensure_signer_account(creator.pubkey());
+        let source = self.token_account(creator.pubkey(), fund_amount as u64);
+        let result = send_tx(
+            &mut self.svm,
+            self.program_id,
+            &self.payer,
+            ProgInstruction::UpdateAssetLifecycle {
+                action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
+                asset_index,
+                now_slot,
+                initial_price,
+                max_init_fee,
+                insurance_authority: insurance_authority.to_bytes(),
+                insurance_operator: insurance_operator.to_bytes(),
+                backing_bucket_authority: backing_bucket_authority.to_bytes(),
+                oracle_authority: oracle_authority.to_bytes(),
+            },
+            vec![
+                AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[creator],
+        );
+        result.map(|cu| (source, cu))
     }
 
     fn deposit_with_cu(
@@ -3971,6 +4020,88 @@ fn v16_bpf_permissionless_append_activation_uses_authenticated_slot() {
             funding_rate_e9: 0,
             recovery_reason: 0,
         },
+    );
+}
+
+/// W2-4ed3411b: `max_init_fee` binds permissionless-activation fee consent.
+/// The permissionless init fee is computed server-side from
+/// `WrapperConfigV16.permissionless_market_init_fee` at landing time, which can move
+/// between the caller signing the tx and it landing (a policy update in between). The
+/// caller now supplies a `max_init_fee` ceiling in the instruction payload; the handler
+/// must reject when the computed fee exceeds it, and only proceed (charging the fee) when
+/// the cap covers the computed fee.
+#[test]
+fn v16_bpf_permissionless_activation_rejects_fee_above_caller_cap() {
+    let mut env = V16CuEnv::new();
+    let attacker = Keypair::new();
+    // Base fee 100, asset_index 1 is in the first (un-doubled) 32-slot band, so
+    // permissionless_market_init_fee_for_asset(100, 1) == 100 exactly.
+    env.update_market_init_fee_policy_with_cu(100);
+    env.svm.warp_to_slot(5);
+
+    let before_vault = env.token_amount(env.vault);
+    let (_, before_group) = env.market_state();
+    let before_slots = before_group.config.max_market_slots;
+    assert_eq!(before_slots, 1, "fresh market starts with only asset 0 configured");
+
+    // Caller consents to at most 50, but the computed fee is 100 — must be rejected,
+    // not silently overcharged.
+    let err = env
+        .try_activate_permissionless_asset_with_fee_and_cap(
+            &attacker,
+            1,
+            5,
+            100,
+            attacker.pubkey(),
+            attacker.pubkey(),
+            attacker.pubkey(),
+            attacker.pubkey(),
+            100,
+            50,
+        )
+        .expect_err("computed fee (100) exceeds caller's max_init_fee (50): must reject");
+    assert!(
+        err.contains("Custom(8)"),
+        "expected Unauthorized (Custom(8)) from the max_init_fee cap check, got: {err}"
+    );
+
+    // Rejected activation must be a true refusal: no state mutation, no fee charged.
+    let (_, after_reject_group) = env.market_state();
+    assert_eq!(
+        after_reject_group.config.max_market_slots,
+        before_slots,
+        "rejected activation must not append/grow the configured asset slots"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        before_vault,
+        "rejected activation must not move any funds into the vault"
+    );
+
+    // Control: same asset, same computed fee, caller's cap now covers it exactly
+    // (max_init_fee == computed fee) — activation must proceed and the fee must be
+    // charged in full.
+    let (_source, _cu) = env
+        .try_activate_permissionless_asset_with_fee_and_cap(
+            &attacker,
+            1,
+            5,
+            100,
+            attacker.pubkey(),
+            attacker.pubkey(),
+            attacker.pubkey(),
+            attacker.pubkey(),
+            100,
+            100,
+        )
+        .expect("max_init_fee (100) covers the computed fee (100): must succeed");
+
+    let (_, after_group) = env.market_state();
+    assert_eq!(after_group.assets[1].lifecycle, AssetLifecycleV16::Active);
+    assert_eq!(
+        env.token_amount(env.vault),
+        before_vault + 100,
+        "accepted activation must charge exactly the computed permissionless init fee"
     );
 }
 
@@ -11709,6 +11840,7 @@ fn v16_audit_permissionless_reuse_rejects_zero_insurance_authority() {
                 asset_index: 1,
                 now_slot: 4,
                 initial_price: 250,
+                max_init_fee: u128::MAX,
                 insurance_authority: if which == 0 { z } else { c },
                 insurance_operator: if which == 1 { z } else { c },
                 backing_bucket_authority: if which == 2 { z } else { c },
@@ -13382,6 +13514,7 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
             asset_index: 2,
             now_slot: 0,
             initial_price: 0,
+            max_init_fee: u128::MAX,
             insurance_authority: admin.pubkey().to_bytes(),
             insurance_operator: admin.pubkey().to_bytes(),
             backing_bucket_authority: admin.pubkey().to_bytes(),
@@ -13411,6 +13544,7 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
             asset_index: 2,
             now_slot: 40,
             initial_price: 0,
+            max_init_fee: u128::MAX,
             insurance_authority: admin.pubkey().to_bytes(),
             insurance_operator: admin.pubkey().to_bytes(),
             backing_bucket_authority: admin.pubkey().to_bytes(),
@@ -14868,6 +15002,7 @@ fn v17_activate_already_configured_slot_reports_a_distinct_error() {
                 asset_index: 1,
                 now_slot: 1,
                 initial_price: 100,
+                max_init_fee: u128::MAX,
                 insurance_authority: authority,
                 insurance_operator: authority,
                 backing_bucket_authority: authority,

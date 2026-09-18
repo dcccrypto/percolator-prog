@@ -360,6 +360,7 @@ fn setup_vault(cooldown_slots: u64) -> Env {
                 asset_index: APPEND_ASSET_INDEX,
                 now_slot: 1,
                 initial_price: 100,
+                max_init_fee: u128::MAX,
                 insurance_authority: admin.pubkey().to_bytes(),
                 insurance_operator: admin.pubkey().to_bytes(),
                 backing_bucket_authority: registry.to_bytes(),
