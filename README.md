@@ -571,6 +571,14 @@ These are governance powers, not bugs:
 9. `CloseSlab` (when market is fully empty)
     - decommission market account and recover slab lamports.
     - impact: market is permanently closed.
+    - once every claim is terminal, `CloseSlab` retires booked unbudgeted classic-SPL
+      residue by burning it; booked native wSOL residue (which cannot be burned)
+      instead transfers to the canonical asset-0 insurance authority's unencumbered
+      ATA, without that role signing (ADOPT upstream `236b4f85`, sync unit
+      W3C-residue). For nonzero native residue, append that writable insurance ATA
+      after the writable primary mint account (index 7 for a single quote rail, or 9
+      after the existing dual-quote accounts); a keeper may recreate missing custody
+      with the associated-token program in the same transaction.
 
 ### What a malicious admin should NOT be able to do
 
