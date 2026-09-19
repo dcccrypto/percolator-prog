@@ -2034,8 +2034,7 @@ fn v16_wrapper_trade_fee_policy_is_marketauth_gated_not_insurance_authority_gate
             new_pubkey: insurance_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut insurance_authority, &mut market],
     )
@@ -3885,8 +3884,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             new_pubkey: backing_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut backing_authority, &mut market],
     )
@@ -3898,8 +3896,7 @@ fn v16_wrapper_backing_fee_policy_is_insurance_authority_gated_and_bounds_fee() 
             new_pubkey: insurance_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut insurance_authority, &mut market],
     )
@@ -6915,8 +6912,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
             new_pubkey: bucket_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut bucket_authority, &mut market],
     )
@@ -7106,8 +7102,7 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
             new_pubkey: insurance.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut insurance, &mut market],
     )
@@ -7136,8 +7131,7 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
             new_pubkey: admin.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut admin_cosigner, &mut market],
     );
@@ -7699,8 +7693,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             new_pubkey: bucket_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut bucket_authority, &mut market],
     )
@@ -7851,8 +7844,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             new_pubkey: [0u8; 32],
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut bucket_authority, &mut zero_new, &mut market],
     );
@@ -7882,8 +7874,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             new_pubkey: bucket_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut bucket_authority, &mut market],
     )
@@ -9554,8 +9545,7 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
             new_pubkey: operator.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut operator, &mut market],
     )
@@ -9749,8 +9739,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             new_pubkey: insurance.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut insurance, &mut market],
     )
@@ -9762,8 +9751,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             new_pubkey: operator.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut operator, &mut market],
     )
@@ -9813,8 +9801,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             new_pubkey: [0u8; 32],
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut operator, &mut attacker, &mut market],
     );
@@ -9827,8 +9814,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             new_pubkey: new_operator.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut operator, &mut new_operator, &mut market],
     )
@@ -9861,8 +9847,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             new_pubkey: [0u8; 32],
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut insurance, &mut zero_new, &mut market],
     );
@@ -9877,8 +9862,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
             new_pubkey: new_insurance.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut insurance, &mut new_insurance, &mut market],
     )
@@ -9916,8 +9900,7 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
             new_pubkey: new_key.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut new_key, &mut market],
     )
@@ -9938,8 +9921,7 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
             new_pubkey: new_key.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut new_key, &mut admin, &mut market],
     );
@@ -10008,8 +9990,7 @@ fn v16_wrapper_configure_ewma_mark_pushes_and_cranks_from_internal_mark() {
             new_pubkey: new_mark_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut new_mark_authority, &mut market],
     )
@@ -10112,8 +10093,7 @@ fn v16_wrapper_configure_auth_mark_pushes_direct_mark_without_ewma_setup() {
             new_pubkey: new_mark_authority.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut new_mark_authority, &mut market],
     )
@@ -20351,8 +20331,7 @@ fn v16_wrapper_withdraw_creator_fee_rejects_a_signer_who_is_not_the_asset_admin(
             new_pubkey: operator.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut operator, &mut market],
     )
@@ -20479,8 +20458,7 @@ fn v16_wrapper_withdraw_creator_fee_survives_the_staked_create_flow_and_only_ass
             new_pubkey: operator_pda.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut operator_pda, &mut market],
     )
@@ -21945,8 +21923,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
             new_pubkey: holder.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut holder, &mut market],
     )
@@ -21962,8 +21939,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_authority_from_holder() {
             new_pubkey: attacker.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut attacker, &mut market],
     );
@@ -21988,8 +21964,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
             new_pubkey: holder.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut holder, &mut market],
     )
@@ -22004,8 +21979,7 @@ fn v16_wrapper_asset_admin_cannot_seize_insurance_operator_from_holder() {
             new_pubkey: attacker.key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&market.data, 0)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [&mut admin, &mut attacker, &mut market],
     );
@@ -25574,8 +25548,7 @@ fn wsib_rotate_backing_authority(
             new_pubkey: new_key.to_bytes(),
             authority_epoch: state::read_asset_control_sequences(&e.market.data, 1)
                 .unwrap()
-                .authority_epoch
-                + 1,
+                .authority_epoch,
         },
         &mut [
             &mut current,

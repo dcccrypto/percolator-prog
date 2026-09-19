@@ -626,7 +626,6 @@ impl FeeEnv {
             state::read_asset_control_sequences(&market_account.data, 0)
                 .expect("read control sequences")
                 .authority_epoch
-                + 1
         };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
@@ -1547,7 +1546,6 @@ fn burning_asset_admin_does_not_stop_the_creator_rotating_insurance_authority() 
             state::read_asset_control_sequences(&market_account.data, 0)
                 .expect("read control sequences")
                 .authority_epoch
-                + 1
         };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,

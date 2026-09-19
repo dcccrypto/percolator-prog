@@ -1816,25 +1816,40 @@ pub mod state {
         /// TB-2b: carved from the 16B `_reserved` tail TB-2a left for exactly
         /// this purpose (see the removed doc note on `_reserved`, below).
         /// Strict per-asset authority-rotation watermark bound to
-        /// `UpdateAssetAuthority` (tag 65). Kept as a TENTH lane using the
-        /// SAME strictly-increasing-nonce mechanism as the other nine
-        /// (`require_newer_control_sequence`), for uniformity with this
-        /// struct's existing lanes and because TB-2a shipped no OTHER
-        /// primitive.
+        /// `UpdateAssetAuthority` (tag 65).
         ///
-        /// NOTE for the Wave-2 integration pass: upstream's OWN later history
-        /// (`95d155bc`, "bind authority handoffs to incarnation epochs", three
-        /// weeks after `ef3b1a55`) also adds an `authority_epoch` lane, but
-        /// via a DIFFERENT mechanism (`require_current_authority_epoch`:
-        /// strict `current == expected` compare-and-swap, auto-incremented by
-        /// exactly 1 per rotation) AND by merging `backing_fee_long`/
-        /// `backing_fee_short` into one `backing_fee` lane to free the slot,
-        /// rather than carving `_reserved`. That merge is incompatible with
-        /// this unit's task-directed lane mapping (`UpdateBackingFeePolicy` ->
-        /// TWO separate `backing_fee_long`/`backing_fee_short` lanes, matching
-        /// TB-2a's already-landed 9-lane struct), so it is NOT adopted here.
-        /// Reconcile at integration if upstream's exact CAS semantics are
-        /// wanted instead of the uniform strictly-increasing nonce used below.
+        /// Gate-2 fix (sync/w2-tb2b follow-up, post-review): originally
+        /// shipped as a TENTH lane using the SAME strictly-increasing-nonce
+        /// mechanism as the other nine (`require_newer_control_sequence`).
+        /// An independent gate-2 verifier found that mechanism WEAKER than
+        /// upstream's for an authority-handoff lane specifically: it rejects
+        /// only a NON-INCREASING proposal, not an INFLATED one, so a signer
+        /// could hold a durable-nonce `UpdateAssetAuthority` with an
+        /// inflated `authority_epoch` (e.g. 999 while current = 5) that
+        /// survives every legitimate rotation in between (5->6->7->... all
+        /// still `< 999`) until something happens to reach that value.
+        ///
+        /// This lane now uses upstream `95d155bc`'s OWN mechanism instead
+        /// (`require_current_authority_epoch` / `next_authority_epoch`,
+        /// below): a strict `current == expected` compare-and-swap,
+        /// auto-incremented by exactly 1 per successful rotation. The
+        /// caller reads the CURRENT stored value and passes it back as
+        /// `expected`; the program alone decides the next value. ANY
+        /// intervening rotation invalidates every other previously-signed
+        /// intent from the prior incarnation, closing the durable-nonce
+        /// landmine. See `require_current_authority_epoch`'s own doc
+        /// comment for the full attack and fix rationale.
+        ///
+        /// This does NOT adopt upstream's other `95d155bc` change (merging
+        /// `backing_fee_long`/`backing_fee_short` into one `backing_fee`
+        /// lane) -- that merge is incompatible with this fork's
+        /// task-directed lane mapping (`UpdateBackingFeePolicy` -> TWO
+        /// separate `backing_fee_long`/`backing_fee_short` lanes) and is
+        /// out of scope for this narrowly-targeted fix. Every OTHER of the
+        /// 13 non-authority tags bound by this struct keeps
+        /// `require_newer_control_sequence` unchanged -- they were verified
+        /// sound and don't carry the single-incarnation claim this lane
+        /// does.
         pub authority_epoch: u64,
         /// Explicit, asserted-zero headroom (see `validate_asset_control_
         /// sequences`), shrunk from `ef3b1a55`'s original 16B by exactly the
@@ -1964,6 +1979,60 @@ pub mod state {
             return Err(PercolatorError::EngineStale.into());
         }
         Ok(())
+    }
+
+    /// Gate-2 fix (sync/w2-tb2b follow-up): ADOPT upstream `95d155bc`'s
+    /// `require_current_authority_epoch` byte-for-byte (`git show
+    /// 95d155bc:src/v16_program.rs`). Used ONLY for the `authority_epoch`
+    /// lane on `UpdateAssetAuthority` -- a strict compare-and-swap, NOT the
+    /// uniform strictly-increasing nonce `require_newer_control_sequence`
+    /// above (which remains, unmodified, the mechanism for the other 13
+    /// control-sequence tags this fork binds).
+    ///
+    /// Why: `require_newer_control_sequence` only rejects a
+    /// NON-INCREASING proposal; it does not reject an INFLATED one. An
+    /// authorized signer (or a since-revoked delegate) can sign an
+    /// `UpdateAssetAuthority` today with `authority_epoch` set far ahead of
+    /// the current value (e.g. 999 while current = 5), hold it via a
+    /// Solana durable nonce, and it stays valid to rotate or BURN that
+    /// asset's authority at ANY future point -- surviving every legitimate
+    /// rotation in between (5->6->7->...) because `6 < 999` still satisfies
+    /// `proposed > current`. It only dies if some action happens to reach
+    /// epoch >= 999 first. That is a single-signature landmine with no
+    /// expiry, on the instruction that rotates (or permanently burns) an
+    /// asset's own authorities.
+    ///
+    /// The CAS closes this: `expected` must equal the CURRENT stored value
+    /// exactly, and the caller must read that current value immediately
+    /// before signing. ANY intervening rotation -- legitimate or not --
+    /// advances the stored epoch, which makes every other previously-signed
+    /// `expected` stale and therefore rejected. A held/durable-nonce
+    /// intent can no longer wait out a chain of rotations; the FIRST
+    /// rotation to land invalidates every other pending signed intent from
+    /// the prior incarnation.
+    #[inline]
+    pub fn require_current_authority_epoch(
+        current: u64,
+        expected: u64,
+    ) -> Result<(), ProgramError> {
+        if current != expected {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        Ok(())
+    }
+
+    /// Gate-2 fix companion to `require_current_authority_epoch` above,
+    /// ADOPTED from upstream `95d155bc` byte-for-byte. Validates `expected`
+    /// against `current` via the CAS, then returns `current + 1` --
+    /// auto-increment by EXACTLY 1 per successful rotation, matching
+    /// upstream's own semantics (never caller-supplied, so the stored value
+    /// can never jump ahead of the true rotation count).
+    #[inline]
+    pub fn next_authority_epoch(current: u64, expected: u64) -> Result<u64, ProgramError> {
+        require_current_authority_epoch(current, expected)?;
+        current
+            .checked_add(1)
+            .ok_or_else(|| PercolatorError::EngineCounterOverflow.into())
     }
 
     /// Aggregate backing-domain accounting for an authority-controlled vault.
@@ -4778,12 +4847,22 @@ pub mod ix {
         /// Rotate one of an asset's per-asset authorities. Gated by the asset's own `asset_admin`
         /// (rotates any; only the admin authority itself is burnable) or the current holder of that
         /// authority (self-rotation). Isolated to the given asset_index.
-        /// TB-2b (W2): `authority_epoch` binds this rotation to
-        /// `AssetControlSequencesV16::authority_epoch` via
-        /// `require_newer_control_sequence` before the rotation is allowed to
-        /// take effect (see that struct's doc comment for why this fork uses
-        /// a strictly-increasing nonce here rather than upstream `95d155bc`'s
-        /// compare-and-swap semantics).
+        ///
+        /// `authority_epoch` (gate-2 fix, sync/w2-tb2b follow-up): the caller's
+        /// EXPECTED CURRENT value of `AssetControlSequencesV16::authority_epoch`
+        /// for this asset -- NOT a new/proposed value. The caller must read the
+        /// live current value immediately before signing and pass it back
+        /// unchanged; the program validates it via strict compare-and-swap
+        /// (`require_current_authority_epoch`: `current == expected`, ADOPTED
+        /// from upstream `95d155bc`) and on success auto-increments the stored
+        /// value to `expected + 1` itself -- the caller never chooses the next
+        /// value. This closes a durable-nonce landmine the field's original
+        /// strictly-increasing-nonce semantics allowed: with "proposed must
+        /// exceed current", a signer could pre-sign an inflated epoch that
+        /// stayed valid across every legitimate rotation in between. Under the
+        /// CAS, ANY intervening rotation invalidates a held/durable-nonce
+        /// intent signed against the prior incarnation. Wire shape unchanged
+        /// (still a trailing `u64`, same position) -- only its meaning did.
         UpdateAssetAuthority {
             asset_index: u16,
             kind: u8,
@@ -7926,12 +8005,25 @@ pub mod processor {
     // byte); this unit wires the ~14 authority/policy/observation tags to
     // it, ADOPTING `ef3b1a55`'s own `ControlSequenceLane` framework
     // (`git show ef3b1a55:src/v16_program.rs`, processor module) plus the
-    // `authority_epoch` lane this fork carves from TB-2a's `_reserved` tail
-    // (see `AssetControlSequencesV16`'s own doc comment for why this fork
-    // uses a strictly-increasing nonce for `authority_epoch` rather than
-    // upstream `95d155bc`'s later compare-and-swap mechanism).
+    // `authority_epoch` lane this fork carves from TB-2a's `_reserved` tail.
+    //
+    // Gate-2 fix (sync/w2-tb2b follow-up): `authority_epoch` originally used
+    // this same `ControlSequenceLane` strictly-increasing-nonce framework;
+    // it now uses upstream `95d155bc`'s compare-and-swap mechanism instead
+    // (`require_current_authority_epoch` / `next_authority_epoch` /
+    // `advance_authority_epoch_view`, below) and so is NOT a
+    // `ControlSequenceLane` variant any more -- see
+    // `AssetControlSequencesV16::authority_epoch`'s doc comment for why.
     // ═══════════════════════════════════════════════════════════════════
 
+    // `authority_epoch` (asset authority handoffs, `UpdateAssetAuthority`)
+    // is deliberately NOT a `ControlSequenceLane` variant: gate-2 fix
+    // (sync/w2-tb2b follow-up) moved it off the uniform strictly-increasing
+    // nonce these lanes share and onto upstream `95d155bc`'s own CAS
+    // mechanism (`require_current_authority_epoch` / `next_authority_epoch`,
+    // `advance_authority_epoch_view` below) -- see `AssetControlSequencesV16
+    // ::authority_epoch`'s doc comment for the attack this closes. The other
+    // 13 tags below are UNCHANGED by that fix.
     #[derive(Clone, Copy)]
     enum ControlSequenceLane {
         OracleObservation,
@@ -7943,7 +8035,6 @@ pub mod processor {
         FeeRedirect,
         MarketInitFee,
         PermissionlessResolve,
-        AuthorityEpoch,
     }
 
     fn control_sequence(sequences: &state::AssetControlSequencesV16, lane: ControlSequenceLane) -> u64 {
@@ -7957,7 +8048,6 @@ pub mod processor {
             ControlSequenceLane::FeeRedirect => sequences.fee_redirect,
             ControlSequenceLane::MarketInitFee => sequences.market_init_fee,
             ControlSequenceLane::PermissionlessResolve => sequences.permissionless_resolve,
-            ControlSequenceLane::AuthorityEpoch => sequences.authority_epoch,
         }
     }
 
@@ -7976,7 +8066,6 @@ pub mod processor {
             ControlSequenceLane::FeeRedirect => sequences.fee_redirect = value,
             ControlSequenceLane::MarketInitFee => sequences.market_init_fee = value,
             ControlSequenceLane::PermissionlessResolve => sequences.permissionless_resolve = value,
-            ControlSequenceLane::AuthorityEpoch => sequences.authority_epoch = value,
         }
     }
 
@@ -8050,6 +8139,30 @@ pub mod processor {
         let mut sequences = read_control_sequences_from_view(group, asset_index)?;
         state::require_newer_control_sequence(control_sequence(&sequences, lane), proposed)?;
         set_control_sequence(&mut sequences, lane, proposed);
+        write_control_sequences_to_view(group, asset_index, &sequences)
+    }
+
+    /// Gate-2 fix (sync/w2-tb2b follow-up): ADOPTED from upstream
+    /// `95d155bc` byte-for-byte (`advance_authority_epoch_view`,
+    /// `git show 95d155bc:src/v16_program.rs`). REPLACES the
+    /// `advance_control_sequence_view(..., ControlSequenceLane::
+    /// AuthorityEpoch, ...)` uniform-nonce call this unit's single call
+    /// site (`handle_update_asset_authority`) used before this fix -- the
+    /// ONLY lane this fix touches; the other 13 tags still go through
+    /// `advance_control_sequence_view` above, unchanged.
+    ///
+    /// `expected` is the caller-supplied "current value as I last read it";
+    /// the stored `authority_epoch` becomes `expected + 1` on success, via
+    /// `state::next_authority_epoch`'s own CAS + auto-increment. See
+    /// `AssetControlSequencesV16::authority_epoch`'s doc comment for why.
+    fn advance_authority_epoch_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        expected: u64,
+    ) -> ProgramResult {
+        let mut sequences = read_control_sequences_from_view(group, asset_index)?;
+        sequences.authority_epoch =
+            state::next_authority_epoch(sequences.authority_epoch, expected)?;
         write_control_sequences_to_view(group, asset_index, &sequences)
     }
 
@@ -15375,12 +15488,11 @@ pub mod processor {
         if !admin_bypass_permitted {
             expect_live_authority(&current_value, current.key)?;
         }
-        advance_control_sequence_view(
-            &mut group,
-            asset_index,
-            ControlSequenceLane::AuthorityEpoch,
-            authority_epoch,
-        )?;
+        // Gate-2 fix (sync/w2-tb2b follow-up): CAS, not the uniform
+        // strictly-increasing nonce -- `authority_epoch` here is the
+        // caller's belief about the CURRENT stored value, not a proposed
+        // new one. See `advance_authority_epoch_view`'s own doc comment.
+        advance_authority_epoch_view(&mut group, asset_index, authority_epoch)?;
         match kind {
             ASSET_AUTH_ADMIN => profile.asset_admin = new_pubkey,
             ASSET_AUTH_INSURANCE => profile.insurance_authority = new_pubkey,

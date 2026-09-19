@@ -997,14 +997,14 @@ fn try_rotate_backing_authority(
     new_authority: &Keypair,
     registry: Option<Pubkey>,
 ) -> Result<(), String> {
-    // TB-2b: LIVE read of `authority_epoch` so this nonce-bearing call is
-    // always fresh, never a hardcoded constant.
+    // TB-2b (gate-2 fix, sync/w2-tb2b follow-up): LIVE read of the CURRENT
+    // `authority_epoch` so this CAS-bound call always supplies the value the
+    // program expects, never a hardcoded/stale constant.
     let authority_epoch = {
         let market_account = env.svm.get_account(&env.market).expect("market account");
         state::read_asset_control_sequences(&market_account.data, asset_index as usize)
             .expect("read control sequences")
             .authority_epoch
-            + 1
     };
     let mut accounts = vec![
         AccountMeta::new(signer.pubkey(), true),
@@ -1150,7 +1150,6 @@ fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
         state::read_asset_control_sequences(&market_account.data, APPEND_ASSET_INDEX as usize)
             .expect("read control sequences")
             .authority_epoch
-            + 1
     };
     send(
         &mut env.svm,

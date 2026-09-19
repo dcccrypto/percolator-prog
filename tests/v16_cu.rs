@@ -16894,7 +16894,10 @@ fn rotate_backing_authority(env: &mut V16CuEnv, asset_index: u16, new_authority:
     let payer = env.payer.insecure_clone();
     let pid = env.program_id;
     let market = env.market;
-    let authority_epoch = env.control_sequences(asset_index).authority_epoch + 1;
+    // Gate-2 fix (sync/w2-tb2b follow-up): CAS semantics -- pass the CURRENT
+    // stored value as `authority_epoch` (never `+ 1`); the program itself
+    // auto-increments to `current + 1` on success.
+    let authority_epoch = env.control_sequences(asset_index).authority_epoch;
     env.ensure_signer_account(new_authority.pubkey());
     send_tx(
         &mut env.svm,
@@ -18260,19 +18263,27 @@ fn v16_bpf_restart_asset_oracle_rejects_stale_observation_sequence() {
     );
 }
 
+/// Gate-2 fix (sync/w2-tb2b follow-up): rewritten for the CAS semantics
+/// `require_current_authority_epoch` gives `authority_epoch` --
+/// `expected` must equal the CURRENT stored value exactly (not "any value
+/// greater than current", as the pre-fix uniform strictly-increasing nonce
+/// required). The first call below succeeds by supplying the LIVE current
+/// value as `expected` (never `+ 1` -- the program itself decides the next
+/// value); the second call resubmits that SAME, now-consumed `expected`,
+/// which is a stale CAS mismatch and must be rejected.
 #[test]
 fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
     let mut env = V16CuEnv::new();
     let admin = env.admin.insecure_clone();
     let target1 = Keypair::new();
     env.ensure_signer_account(target1.pubkey());
-    let epoch1 = env.control_sequences(0).authority_epoch + 1;
+    let expected0 = env.control_sequences(0).authority_epoch;
     env.send(
         ProgInstruction::UpdateAssetAuthority {
             asset_index: 0,
             kind: 2, // ASSET_AUTH_INSURANCE_OPERATOR
             new_pubkey: target1.pubkey().to_bytes(),
-            authority_epoch: epoch1,
+            authority_epoch: expected0,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -18281,15 +18292,24 @@ fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
         ],
         &[&admin, &target1],
     )
-    .expect("rotate insurance_operator");
+    .expect("rotate insurance_operator (expected == current)");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        expected0 + 1,
+        "CAS auto-increments the stored epoch by exactly 1 on success"
+    );
     // `admin`'s asset_admin bypass only applies while the target authority is
     // still the zero bootstrap sentinel (or the LP-vault-closed backing-bucket
     // case, N/A for this kind); once `insurance_operator` is live (target1),
     // ONLY target1 -- the current holder -- can self-rotate it further, per
     // `handle_update_asset_authority`'s inverted allow-list (see its own doc
     // comment). So the second attempt is signed by target1, isolating the
-    // rejection to the stale epoch rather than a signer/authority mismatch.
-    let stale = env.control_sequences(0).authority_epoch;
+    // rejection to the stale `expected` rather than a signer/authority
+    // mismatch.
+    //
+    // `expected0` was already consumed by the first call (current is now
+    // `expected0 + 1`); resubmitting it is therefore a stale
+    // `expected != current` CAS mismatch.
     let target2 = Keypair::new();
     env.ensure_signer_account(target2.pubkey());
     env.svm.expire_blockhash();
@@ -18299,7 +18319,7 @@ fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
                 asset_index: 0,
                 kind: 2,
                 new_pubkey: target2.pubkey().to_bytes(),
-                authority_epoch: stale,
+                authority_epoch: expected0,
             },
             vec![
                 AccountMeta::new(target1.pubkey(), true),
@@ -18308,10 +18328,103 @@ fn v16_bpf_update_asset_authority_rejects_stale_authority_epoch() {
             ],
             &[&target1, &target2],
         )
-        .expect_err("a stale (non-increasing) authority_epoch must be rejected");
+        .expect_err("a stale (already-consumed) expected authority_epoch must be rejected");
     assert_eq!(
         custom_code(&err),
         Some(PercolatorError::EngineStale as u32),
-        "expected EngineStale; got {err}"
+        "expected EngineStale (CAS mismatch); got {err}"
     );
+}
+
+/// Gate-2 REJECT-WITH-DEFECT landmine regression -- the exact attack that
+/// got TB-2b's original uniform strictly-increasing-nonce binding for
+/// `authority_epoch` rejected: an authorized signer (or a since-revoked
+/// delegate) signs an `UpdateAssetAuthority` against the CURRENT epoch,
+/// holds the signed tx (e.g. via a Solana durable nonce) instead of
+/// submitting it immediately, and a legitimate rotation of the SAME lane
+/// lands first. Under the CAS (`require_current_authority_epoch`: strict
+/// `current == expected`, `next_authority_epoch`: auto-increment by exactly
+/// 1), that intervening rotation invalidates the held tx -- its `expected`
+/// no longer equals the (now-advanced) current epoch, so it is rejected
+/// rather than staying silently valid until some unrelated action happens
+/// to reach whatever value it was signed against.
+#[test]
+fn v16_bpf_update_asset_authority_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) an UpdateAssetAuthority against the
+    //    CURRENT epoch -- exactly what a legitimately-authorized signer (or
+    //    a durable-nonce holder) would do. `held_expected` plays the role of
+    //    the reported attack's "current = 5".
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let landmine_target = Keypair::new();
+    env.ensure_signer_account(landmine_target.pubkey());
+    let held_ix = ProgInstruction::UpdateAssetAuthority {
+        asset_index: 0,
+        kind: 2, // ASSET_AUTH_INSURANCE_OPERATOR
+        new_pubkey: landmine_target.pubkey().to_bytes(),
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new_readonly(landmine_target.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1, i.e. "5 -> 6"), advancing the SAME per-asset
+    //    `authority_epoch` counter. Deliberately a DIFFERENT `kind`
+    //    (ASSET_AUTH_ORACLE, not ASSET_AUTH_INSURANCE_OPERATOR) so the
+    //    rejection below is isolated to the epoch/CAS mismatch alone --
+    //    `insurance_operator` itself is untouched and stays the zero
+    //    bootstrap sentinel, so `admin`'s bypass for the held tx's kind
+    //    would otherwise still be authorized. The held tx above is NOT
+    //    submitted here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    let current_after_rotation = env.control_sequences(0).authority_epoch;
+    assert_eq!(
+        current_after_rotation,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. Under the CAS it MUST be rejected: its
+    //    `expected` (held_expected) no longer equals the current stored
+    //    value (held_expected + 1) -- the intervening rotation invalidated
+    //    it. This is the landmine, defused.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin, &landmine_target])
+        .expect_err(
+            "a held UpdateAssetAuthority signed against a since-superseded \
+             authority_epoch must be rejected once an intervening rotation \
+             has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    // Negative control: see this fix's handback report for the literal
+    // build-sbf'd revert-of-`handle_update_asset_authority`-only exercise
+    // proving this test is genuinely coupled to the CAS (not vacuously true
+    // under the pre-fix uniform strictly-increasing nonce too).
 }
