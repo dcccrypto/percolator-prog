@@ -714,6 +714,13 @@ impl FeeEnv {
 
     fn top_up_insurance(&mut self, source: Pubkey, amount: u64) {
         let admin = self.admin.insecure_clone();
+        // W3A-3: LIVE read of asset-0's `authority_epoch`.
+        let authority_epoch = {
+            let market_account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&market_account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
             accounts: vec![
@@ -725,6 +732,7 @@ impl FeeEnv {
             ],
             data: ProgInstruction::TopUpInsurance {
                 amount: amount as u128,
+                authority_epoch,
             }
             .encode(),
         };
@@ -1441,13 +1449,21 @@ fn tag87_on_a_resolved_market_is_rejected_without_marking_the_claim_paid() {
     let admin = env.admin.insecure_clone();
     let payer = env.payer.insecure_clone();
     env.svm.warp_to_slot(50_000);
+    // W3A-3: LIVE read of asset-0's `authority_epoch` -- never a hardcoded
+    // constant.
+    let authority_epoch = {
+        let market_account = env.svm.get_account(&env.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, 0)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     let ix = Instruction {
         program_id: PERCOLATOR_MAINNET,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(env.market, false),
         ],
-        data: ProgInstruction::ResolveMarket.encode(),
+        data: ProgInstruction::ResolveMarket { authority_epoch }.encode(),
     };
     send_ixs(&mut env.svm, &payer, vec![ix], &[&admin]).expect("ResolveMarket");
 

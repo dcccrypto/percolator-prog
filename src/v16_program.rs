@@ -4815,19 +4815,39 @@ pub mod ix {
             trade_fee_cap_bps: u16,
         },
         ClosePortfolio,
+        /// W3A-3: `authority_epoch` (upstream `238436c5`) -- the caller's EXPECTED
+        /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`
+        /// (this market-wide top-up always deposits into asset 0), checked (NOT
+        /// advanced) via `require_authority_epoch_view` before any deposit takes
+        /// effect. See that helper's own doc comment for the durable-nonce replay
+        /// this closes for market-authority round-trips.
         TopUpInsurance {
             amount: u128,
+            authority_epoch: u64,
         },
+        /// W3A-3: `authority_epoch` (upstream `238436c5`) -- checked (NOT advanced)
+        /// against the TARGET DOMAIN's own asset epoch (`domain / 2`, matching
+        /// `UpdateAssetAuthority`'s per-asset lane), not asset-0's.
         TopUpInsuranceDomain {
             domain: u16,
             amount: u128,
+            authority_epoch: u64,
         },
         CloseSlab,
-        ResolveMarket,
+        /// W3A-3: `authority_epoch` (upstream `95d155bc`) -- the caller's EXPECTED
+        /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`,
+        /// checked (NOT advanced) against `marketauth`'s own epoch lane, mirroring
+        /// `UpdateAuthority`'s asset-0 slot.
+        ResolveMarket {
+            authority_epoch: u64,
+        },
+        /// W3A-3: `authority_epoch` (upstream `238436c5`) -- checked (NOT advanced)
+        /// against the TARGET DOMAIN's own asset epoch (`domain / 2`).
         TopUpBackingBucket {
             domain: u16,
             amount: u128,
             expiry_slot: u64,
+            authority_epoch: u64,
         },
         WithdrawBackingBucket {
             domain: u16,
@@ -5371,17 +5391,22 @@ pub mod ix {
                 8 => Self::ClosePortfolio,
                 9 => Self::TopUpInsurance {
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 56 => Self::TopUpInsuranceDomain {
                     domain: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 13 => Self::CloseSlab,
-                19 => Self::ResolveMarket,
+                19 => Self::ResolveMarket {
+                    authority_epoch: read_u64(&mut rest)?,
+                },
                 24 => Self::TopUpBackingBucket {
                     domain: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                     expiry_slot: read_u64(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 50 => Self::WithdrawBackingBucket {
                     domain: read_u16(&mut rest)?,
@@ -5781,17 +5806,29 @@ pub mod ix {
                     push_u16(&mut out, trade_fee_cap_bps);
                 }
                 Self::ClosePortfolio => out.push(8),
-                Self::TopUpInsurance { amount } => {
+                Self::TopUpInsurance {
+                    amount,
+                    authority_epoch,
+                } => {
                     out.push(9);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
-                Self::TopUpInsuranceDomain { domain, amount } => {
+                Self::TopUpInsuranceDomain {
+                    domain,
+                    amount,
+                    authority_epoch,
+                } => {
                     out.push(56);
                     push_u16(&mut out, domain);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::CloseSlab => out.push(13),
-                Self::ResolveMarket => out.push(19),
+                Self::ResolveMarket { authority_epoch } => {
+                    out.push(19);
+                    push_u64(&mut out, authority_epoch);
+                }
                 Self::RebalanceLpVaultBacking {
                     from_domain,
                     to_domain,
@@ -5806,11 +5843,13 @@ pub mod ix {
                     domain,
                     amount,
                     expiry_slot,
+                    authority_epoch,
                 } => {
                     out.push(24);
                     push_u16(&mut out, domain);
                     push_u128(&mut out, amount);
                     push_u64(&mut out, expiry_slot);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::WithdrawBackingBucket { domain, amount } => {
                     out.push(50);
@@ -8166,6 +8205,24 @@ pub mod processor {
         write_control_sequences_to_view(group, asset_index, &sequences)
     }
 
+    /// CHECK-only sibling of `advance_authority_epoch_view` (does not
+    /// mutate `authority_epoch`) -- for AE-bound instructions that must
+    /// reject a stale-epoch caller without themselves advancing the
+    /// per-asset incarnation (only `UpdateAuthority`/`UpdateAssetAuthority`
+    /// advance it; every other AE-bound tag only checks it). Byte-for-byte
+    /// the same helper W3A-1/W3A-2 each independently add on top of this
+    /// branch (`sync/w3a-authority-fundcritical`,
+    /// `sync/w3a2-baseunit-lifecycle-epoch`) -- de-dups to one definition
+    /// at integration.
+    fn require_authority_epoch_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        expected: u64,
+    ) -> ProgramResult {
+        let sequences = read_control_sequences_from_view(group, asset_index)?;
+        state::require_current_authority_epoch(sequences.authority_epoch, expected)
+    }
+
     fn mirror_manual_profile_to_base_config(
         cfg: &mut WrapperConfigV16,
         profile: &state::AssetOracleProfileV16,
@@ -8773,19 +8830,32 @@ pub mod processor {
                 trade_fee_cap_bps,
             } => handle_set_matcher_config(program_id, accounts, enabled, trade_fee_cap_bps),
             Instruction::ClosePortfolio => handle_close_portfolio(program_id, accounts),
-            Instruction::TopUpInsurance { amount } => {
-                handle_top_up_insurance(program_id, accounts, amount)
-            }
-            Instruction::TopUpInsuranceDomain { domain, amount } => {
-                handle_top_up_insurance_domain(program_id, accounts, domain, amount)
-            }
+            Instruction::TopUpInsurance {
+                amount,
+                authority_epoch,
+            } => handle_top_up_insurance(program_id, accounts, amount, authority_epoch),
+            Instruction::TopUpInsuranceDomain {
+                domain,
+                amount,
+                authority_epoch,
+            } => handle_top_up_insurance_domain(program_id, accounts, domain, amount, authority_epoch),
             Instruction::CloseSlab => handle_close_slab(program_id, accounts),
-            Instruction::ResolveMarket => handle_resolve_market(program_id, accounts),
+            Instruction::ResolveMarket { authority_epoch } => {
+                handle_resolve_market(program_id, accounts, authority_epoch)
+            }
             Instruction::TopUpBackingBucket {
                 domain,
                 amount,
                 expiry_slot,
-            } => handle_top_up_backing_bucket(program_id, accounts, domain, amount, expiry_slot),
+                authority_epoch,
+            } => handle_top_up_backing_bucket(
+                program_id,
+                accounts,
+                domain,
+                amount,
+                expiry_slot,
+                authority_epoch,
+            ),
             Instruction::WithdrawBackingBucket { domain, amount } => {
                 handle_withdraw_backing_bucket(program_id, accounts, domain, amount)
             }
@@ -11963,6 +12033,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let signer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -11983,6 +12054,22 @@ pub mod processor {
         let (cfg_pre, mode, asset0_insurance_authority) = {
             let market_data = market_ai.try_borrow_data()?;
             let (cfg_pre, mode, _, _) = state::read_market_config_mode_and_capacity(&market_data)?;
+            // W3A-3: CHECK-only (mirrors upstream `238436c5`'s first
+            // `require_authority_epoch_view` call site in
+            // `handle_top_up_insurance`, adapted here to the fork's own
+            // immutable-borrow pre-check phase via the data-slice-level
+            // `state::read_asset_control_sequences` reader instead of the
+            // mutable `MarketViewMutV16`-typed `require_authority_epoch_view`
+            // helper -- same underlying `AssetControlSequencesV16.
+            // authority_epoch` field, same `require_current_authority_epoch`
+            // comparison, asset-0 lane (this market-wide top-up always
+            // deposits into asset 0, matching upstream's
+            // `InsuranceTopUpScope::BaseMarket` -> `scope.asset_index() == 0`).
+            let sequences_pre = state::read_asset_control_sequences(&market_data, 0)?;
+            state::require_current_authority_epoch(
+                sequences_pre.authority_epoch,
+                expected_authority_epoch,
+            )?;
             let profile0 = read_oracle_profile_for_asset(&market_data, &cfg_pre, 0)?;
             (cfg_pre, mode, profile0.insurance_authority)
         };
@@ -12003,6 +12090,13 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // W3A-3: re-checked in this second, independently re-borrowed
+            // scope, right before mutation -- mirrors upstream's second
+            // `require_authority_epoch_view` call site in the same function
+            // (belt-and-suspenders against a stale first-borrow read; the
+            // authoritative check for this deposit is THIS one, which
+            // strictly precedes `deposit_market_zero_insurance_view` below).
+            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             let asset0_insurance_authority =
                 domain_authorities_from_view(&group, &cfg, 0)?.insurance_authority;
@@ -12066,6 +12160,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let signer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -12095,6 +12190,12 @@ pub mod processor {
             {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            // W3A-3: mirrors upstream `238436c5`'s first
+            // `require_authority_epoch_view` call site for
+            // `InsuranceTopUpScope::Domain`, keyed to the TARGET DOMAIN's own
+            // asset epoch (`asset_index == domain / 2`), not asset-0 -- same
+            // lane `UpdateAssetAuthority` advances for this asset.
+            require_authority_epoch_view(&group, asset_index, expected_authority_epoch)?;
             require_domain_accepts_live_topup_view(&group, domain)?;
             let profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
             let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
@@ -12113,6 +12214,11 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // W3A-3: re-checked in this second, independently re-borrowed
+            // scope, right before mutation -- the authoritative check for
+            // THIS deposit, strictly preceding
+            // `deposit_domain_insurance_not_atomic` below.
+            require_authority_epoch_view(&group, domain / 2, expected_authority_epoch)?;
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             require_domain_accepts_live_topup_view(&group, domain)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
@@ -12772,6 +12878,7 @@ pub mod processor {
         domain: u16,
         amount: u128,
         expiry_slot: u64,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let signer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -12831,6 +12938,14 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // W3A-3: `authority_epoch` (upstream `238436c5`) -- mirrors its
+            // first `require_authority_epoch_view` call site in
+            // `handle_top_up_backing_bucket`, checked (NOT advanced) BEFORE
+            // the mode-specific dispatch below, against the TARGET DOMAIN's
+            // own asset epoch (`domain_usize / 2`). Applies unconditionally
+            // to both the Live (mode 0) and #433-migration Resolved-only
+            // (mode 1, amount == 0) reconciliation paths this fork supports.
+            require_authority_epoch_view(&group, asset_index, expected_authority_epoch)?;
 
             match group.header.mode {
                 // Normal backing deposits remain strictly Live-only.
@@ -12897,6 +13012,12 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // W3A-3: re-checked in this second, independently re-borrowed
+            // scope -- mirrors upstream's second `require_authority_epoch_view`
+            // call site, strictly preceding
+            // `deposit_fresh_counterparty_backing_not_atomic` below (the
+            // authoritative check for this mutation).
+            require_authority_epoch_view(&group, domain_usize / 2, expected_authority_epoch)?;
             // sync/w1-abacking (5314c05f): re-authenticate the expiry against THIS borrow's
             // slot, not just the preflight borrow's -- a stale-slot retained transaction that
             // slipped past the preflight check above must still be rejected here, against the
@@ -12969,6 +13090,11 @@ pub mod processor {
         if amount == 0 {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            // W3A-3: mirrors upstream's third `require_authority_epoch_view`
+            // call site (the `amount == 0` reconciliation branch), checked
+            // immediately upon obtaining this borrow's `group`, before any
+            // ledger read/write below.
+            require_authority_epoch_view(&group, domain_usize / 2, expected_authority_epoch)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain_usize)?;
             expect_live_authority(&authorities.backing_bucket_authority, signer.key)?;
 
@@ -15287,6 +15413,7 @@ pub mod processor {
     fn handle_resolve_market<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -15299,6 +15426,13 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // W3A-3: `authority_epoch` (upstream `95d155bc`) -- CHECK-only (NOT
+        // advanced -- only `UpdateAuthority`/`UpdateAssetAuthority` advance
+        // asset-0's epoch), mirrors upstream's exact placement: right after
+        // `marketauth` authorization, before the slot-staleness gate and
+        // `resolve_market_not_atomic`. asset-0 lane, matching `marketauth`'s
+        // own epoch slot (`UpdateAuthority`'s asset_index == 0).
+        require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
         let slot = Clock::get()
             .map(|c| c.slot)
             .unwrap_or(group.header.current_slot.get());

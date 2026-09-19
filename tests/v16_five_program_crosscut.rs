@@ -1953,8 +1953,15 @@ impl CrosscutEnv {
     /// wrapper ResolveMarket — transitions the market mode Live -> resolved.
     fn resolve_market(&mut self) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
+        // W3A-3: LIVE read of asset-0's `authority_epoch`.
+        let authority_epoch = {
+            let account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         self.try_wrapper(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),

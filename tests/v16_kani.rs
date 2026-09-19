@@ -142,10 +142,13 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
 fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     let tag: u8 = kani::any();
     // Note: tag 23 (WithdrawInsuranceLimited) removed in v17 auth overhaul.
+    // W3A-3: tag 9 (TopUpInsurance) REMOVED from this uniform "bare u128
+    // amount" harness -- it now carries a trailing `authority_epoch: u64`
+    // (upstream `238436c5`) so its wire layout is no longer 17 bytes. See
+    // `kani_v16_top_up_insurance_decode_preserves_wire_fields` below.
     kani::assume(
         tag == 3
             || tag == 4
-            || tag == 9
             || tag == 28
             || tag == 30
             || tag == 41
@@ -161,7 +164,6 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     match (tag, Instruction::decode(&data).unwrap()) {
         (3, Instruction::Deposit { amount: got }) => assert_eq!(got, amount),
         (4, Instruction::Withdraw { amount: got }) => assert_eq!(got, amount),
-        (9, Instruction::TopUpInsurance { amount: got }) => assert_eq!(got, amount),
         (28, Instruction::ConvertReleasedPnl { amount: got }) => assert_eq!(got, amount),
         (30, Instruction::CloseResolved { fee_rate_per_slot }) => {
             assert_eq!(fee_rate_per_slot, amount)
@@ -180,22 +182,54 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     }
 }
 
+/// W3A-3: TopUpInsurance (tag 9) wire: tag(1) + amount(u128=16) +
+/// authority_epoch(u64=8) = 25 bytes (upstream `238436c5` adds the trailing
+/// `authority_epoch` field; this fork has not yet adopted the leading
+/// `market_id`/`intent_id` half -- see ABI_OVERHAUL_SCOPE.md §1).
+#[kani::proof]
+fn kani_v16_top_up_insurance_decode_preserves_wire_fields() {
+    let amount: u128 = kani::any();
+    let authority_epoch: u64 = kani::any();
+
+    let mut data = [0u8; 25];
+    data[0] = 9;
+    data[1..17].copy_from_slice(&amount.to_le_bytes());
+    data[17..25].copy_from_slice(&authority_epoch.to_le_bytes());
+
+    match Instruction::decode(&data).unwrap() {
+        Instruction::TopUpInsurance {
+            amount: got_amount,
+            authority_epoch: got_epoch,
+        } => {
+            assert_eq!(got_amount, amount);
+            assert_eq!(got_epoch, authority_epoch);
+        }
+        _ => unreachable!(),
+    }
+}
+
 #[kani::proof]
 fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
     // v17: domain fields are u16 (not u8).
     let domain: u16 = kani::any();
     let amount: u128 = kani::any();
+    // W3A-3: trailing `authority_epoch` (upstream `238436c5`).
+    let authority_epoch: u64 = kani::any();
 
-    // TopUpInsuranceDomain: tag(1) + domain(u16=2) + amount(u128=16) = 19 bytes.
-    let mut top_up = [0u8; 19];
+    // TopUpInsuranceDomain: tag(1) + domain(u16=2) + amount(u128=16) +
+    // authority_epoch(u64=8) = 27 bytes.
+    let mut top_up = [0u8; 27];
     top_up[0] = 56;
     top_up[1..3].copy_from_slice(&domain.to_le_bytes());
     top_up[3..19].copy_from_slice(&amount.to_le_bytes());
+    top_up[19..27].copy_from_slice(&authority_epoch.to_le_bytes());
     match Instruction::decode(&top_up).unwrap() {
         Instruction::TopUpInsuranceDomain {
             domain: got_domain,
             amount: got_amount,
+            authority_epoch: got_epoch,
         } => {
+            assert_eq!(got_epoch, authority_epoch);
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
         }
@@ -307,26 +341,32 @@ fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
-    // v17: domain is u16. Wire: tag(1) + domain(u16=2) + amount(u128=16) + expiry_slot(u64=8) = 27.
+    // v17: domain is u16. W3A-3: wire now: tag(1) + domain(u16=2) +
+    // amount(u128=16) + expiry_slot(u64=8) + authority_epoch(u64=8) = 35
+    // (upstream `238436c5` adds the trailing `authority_epoch`).
     let domain: u16 = kani::any();
     let amount: u128 = kani::any();
     let expiry_slot: u64 = kani::any();
+    let authority_epoch: u64 = kani::any();
 
-    let mut data = [0u8; 27];
+    let mut data = [0u8; 35];
     data[0] = 24;
     data[1..3].copy_from_slice(&domain.to_le_bytes());
     data[3..19].copy_from_slice(&amount.to_le_bytes());
     data[19..27].copy_from_slice(&expiry_slot.to_le_bytes());
+    data[27..35].copy_from_slice(&authority_epoch.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TopUpBackingBucket {
             domain: got_domain,
             amount: got_amount,
             expiry_slot: got_expiry,
+            authority_epoch: got_epoch,
         } => {
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
             assert_eq!(got_expiry, expiry_slot);
+            assert_eq!(got_epoch, authority_epoch);
         }
         _ => unreachable!(),
     }
@@ -1059,12 +1099,19 @@ fn kani_v16_custody_payloads_reject_trailing_byte() {
     assert_rejects_trailing_byte(Instruction::InitPortfolio, extra);
     assert_rejects_trailing_byte(Instruction::Deposit { amount: 1 }, extra);
     assert_rejects_trailing_byte(Instruction::Withdraw { amount: 1 }, extra);
-    assert_rejects_trailing_byte(Instruction::TopUpInsurance { amount: 1 }, extra);
+    assert_rejects_trailing_byte(
+        Instruction::TopUpInsurance {
+            amount: 1,
+            authority_epoch: 1,
+        },
+        extra,
+    );
     assert_rejects_trailing_byte(
         Instruction::TopUpBackingBucket {
             domain: 1,
             amount: 1,
             expiry_slot: 10,
+            authority_epoch: 1,
         },
         extra,
     );
@@ -1127,7 +1174,7 @@ fn kani_v16_admin_policy_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
 
     assert_rejects_trailing_byte(Instruction::CloseSlab, extra);
-    assert_rejects_trailing_byte(Instruction::ResolveMarket, extra);
+    assert_rejects_trailing_byte(Instruction::ResolveMarket { authority_epoch: 1 }, extra);
     // v17: UpdateAuthority no longer has `kind`; UpdateAssetAuthority (tag 65) handles per-asset.
     assert_rejects_trailing_byte(
         Instruction::UpdateAuthority {

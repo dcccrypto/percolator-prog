@@ -1094,6 +1094,7 @@ fn top_up_backing_bucket(
             domain,
             amount,
             expiry_slot,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (domain as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             authority,
@@ -2258,7 +2259,7 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
     // evaluated. The assertions are written against the real contract so they
     // become live the moment a Clock stub lands; they are not claimed to hold
     // today.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     // v17: handle_withdraw_insurance requires materialized_portfolio_count == 0 && c_tot == 0.
     // Close both portfolios so the market is fully drained before testing insurance withdrawal.
@@ -2730,6 +2731,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
         Instruction::TopUpInsuranceDomain {
             domain: 2,
             amount: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut insurance_authority,
@@ -2749,6 +2751,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
             domain: 2,
             amount: 25,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut backing_authority,
@@ -2955,7 +2958,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { domain, amount },
+            Instruction::TopUpInsuranceDomain { domain, amount, authority_epoch: state::read_asset_control_sequences(&market.data, (domain as usize) / 2).unwrap().authority_epoch },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3348,7 +3351,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         let mut source = user_token_account(insurance_authority.key, mint, amount as u64);
         let mut vault = vault_token_account(&market, mint, 0);
         run_ix(
-            Instruction::TopUpInsuranceDomain { domain, amount },
+            Instruction::TopUpInsuranceDomain { domain, amount, authority_epoch: state::read_asset_control_sequences(&market.data, (domain as usize) / 2).unwrap().authority_epoch },
             &mut [
                 &mut insurance_authority,
                 &mut market,
@@ -3531,7 +3534,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut base_insurance_source = user_token_account(admin.key, mint, 10);
     let mut base_insurance_vault = vault_token_account(&market, mint, 0);
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { amount: 10, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -3651,6 +3654,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::TopUpInsuranceDomain {
             domain: 2,
             amount: 9,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut insurance_authority,
@@ -3672,6 +3676,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
             domain: 2,
             amount: 20,
             expiry_slot: 20,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut backing_authority,
@@ -6264,7 +6269,7 @@ fn v16_wrapper_security_sweep_resolved_market_and_fee_branches() {
     )
     .unwrap();
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved = state::read_market(&market.data).unwrap().1;
     assert_eq!(resolved.mode, MarketModeV16::Resolved);
     assert_eq!(resolved.resolved_slot, 10);
@@ -6832,7 +6837,7 @@ fn v16_wrapper_top_up_insurance_requires_authority_and_updates_vault() {
 
     let before = market.data.clone();
     let unauthorized = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { amount: 777, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut attacker,
             &mut market,
@@ -6844,7 +6849,7 @@ fn v16_wrapper_top_up_insurance_requires_authority_and_updates_vault() {
     assert_err_and_market_unchanged(unauthorized, &market, &before);
 
     run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { amount: 777, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -6873,7 +6878,7 @@ fn v16_wrapper_top_up_insurance_rejects_wrong_mint_and_insufficient_source_balan
     let before = market.data.clone();
 
     let wrong_mint = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { amount: 777, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -6885,7 +6890,7 @@ fn v16_wrapper_top_up_insurance_rejects_wrong_mint_and_insufficient_source_balan
     assert_err_and_market_unchanged(wrong_mint, &market, &before);
 
     let short_balance = run_ix(
-        Instruction::TopUpInsurance { amount: 777 },
+        Instruction::TopUpInsurance { amount: 777, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -6941,7 +6946,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
     let mut token_program = token_program_account();
     let before = market.data.clone();
     let top_up_insurance = run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -6961,6 +6966,7 @@ fn v16_wrapper_top_up_paths_reject_after_permissionless_resolve_maturity() {
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut bucket_authority,
@@ -6984,7 +6990,7 @@ fn v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -6994,7 +7000,7 @@ fn v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     // v17: UpdateInsurancePolicy (tag 33) deleted — terminal WithdrawInsurance needs no
     // rate-limit config; resolved mode + authority check is sufficient (matrix row 35).
 
@@ -7030,7 +7036,7 @@ fn v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -7058,7 +7064,7 @@ fn v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open
     assert_err_and_market_unchanged(live_reject, &market, &live);
 
     init_portfolio(&mut owner, &mut market, &mut portfolio);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_with_open = market.data.clone();
     let open_reject = run_ix(
         Instruction::WithdrawInsurance { amount: 1 },
@@ -7111,7 +7117,7 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut insurance,
             &mut market,
@@ -7121,7 +7127,7 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let resolved = market.data.clone();
     let rotate_after_resolve = run_ix(
@@ -7246,6 +7252,7 @@ fn v16_wrapper_non_main_domain_insurance_isolated_from_global_withdrawals() {
         Instruction::TopUpInsuranceDomain {
             domain: 2,
             amount: 100,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut insurance_authority,
@@ -7346,6 +7353,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::TopUpInsuranceDomain {
             domain: 2,
             amount: 11,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut insurance_authority,
@@ -7364,6 +7372,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
             domain: 2,
             amount: 30,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut backing_authority,
@@ -7557,6 +7566,7 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
             domain: 2,
             amount: 10,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -7578,6 +7588,7 @@ fn v16_wrapper_backing_bucket_authority_is_domain_scoped_for_dynamic_assets() {
             domain: 2,
             amount: 10,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut backing_authority,
@@ -7645,6 +7656,7 @@ fn v16_wrapper_asset_retire_rejects_nonzero_domain_insurance_budget() {
         Instruction::TopUpInsuranceDomain {
             domain: 2,
             amount: 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut insurance_authority,
@@ -7710,6 +7722,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut attacker,
@@ -7731,6 +7744,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut bucket_authority,
@@ -7777,6 +7791,15 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             domain: 32,
             amount: 1,
             expiry_slot: 10,
+            // W3A-3: domain 32 -> asset_index 16 is deliberately OUT OF RANGE
+            // for this single-asset test market, so a LIVE read of that
+            // asset's control sequences would itself fail (there is no such
+            // asset) -- the program's own bounds check
+            // (`domain_usize >= configured_slots.saturating_mul(2) ||
+            // asset_index >= configured_slots`) runs BEFORE the
+            // `authority_epoch` check either way, so any value here is
+            // rejected identically; 0 is a safe placeholder.
+            authority_epoch: 0,
         },
         &mut [
             &mut bucket_authority,
@@ -7799,6 +7822,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             domain: 2,
             amount: 1,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut bucket_authority,
@@ -7821,6 +7845,7 @@ fn v16_wrapper_top_up_backing_bucket_uses_separate_authority_and_domain_ledger()
             domain: 1,
             amount: 1,
             expiry_slot: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut bucket_authority,
@@ -7890,6 +7915,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut bucket_authority,
@@ -8104,6 +8130,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             domain: 1,
             amount: 25,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8223,6 +8250,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
             domain: 1,
             amount: 10,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8324,6 +8352,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8441,6 +8470,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
             domain: 1,
             amount: 40,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8499,6 +8529,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_unavailable_principal_loss_and_recov
             domain: 1,
             amount: 10,
             expiry_slot: 20,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8543,6 +8574,7 @@ fn v16_wrapper_backing_domain_ledger_rejects_wrong_authority_and_domain() {
             domain: 1,
             amount: 10,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8582,7 +8614,7 @@ fn v16_wrapper_insurance_ledger_tracks_topup_profit_loss_and_withdrawal() {
     let mut vault = vault_token_account(&market, mint, 0);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -8636,7 +8668,7 @@ fn v16_wrapper_insurance_ledger_tracks_topup_profit_loss_and_withdrawal() {
 
     // v17: UpdateInsurancePolicy (tag 33) deleted; WithdrawInsurance only works in
     // terminal mode (matrix row 35). Resolve the market to enable terminal withdrawal.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     vault = vault_token_account(&market, mint, 110);
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -8678,6 +8710,7 @@ fn v16_wrapper_source_backed_positive_pnl_converts_from_backing_not_insurance() 
             domain: 1,
             amount: 40,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8761,6 +8794,7 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
             domain: 1,
             amount: 40,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8822,6 +8856,7 @@ fn v16_wrapper_backing_top_up_refills_provider_receivable_in_engine() {
             domain: 1,
             amount: 10,
             expiry_slot: 20,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8873,7 +8908,7 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
     let mut vault = vault_token_account(&market, mint, 120);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -8891,6 +8926,7 @@ fn v16_wrapper_exploited_oracle_pnl_cannot_exit_against_unrelated_backing_or_ins
             domain: 0,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (0 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -8999,6 +9035,7 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
             domain: 0,
             amount: 80,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (0 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -9018,6 +9055,7 @@ fn v16_wrapper_exploited_added_asset_pnl_exit_caps_to_its_source_domain_backing(
             domain: 2,
             amount: 30,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -9138,6 +9176,7 @@ fn v16_wrapper_cross_margin_source_claims_leave_unbacked_corrupt_claim_unconvert
             domain: 0,
             amount: 30,
             expiry_slot: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (0 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -9220,7 +9259,7 @@ fn v16_wrapper_insurance_policy_deposit_only_leaves_fee_growth_behind() {
     let mut vault = vault_token_account(&market, mint, 150);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9241,7 +9280,7 @@ fn v16_wrapper_insurance_policy_deposit_only_leaves_fee_growth_behind() {
     }
 
     // Resolve the market so terminal withdrawal is enabled.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -9277,7 +9316,7 @@ fn v16_wrapper_insurance_withdraw_disabled_by_default() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9328,7 +9367,7 @@ fn v16_wrapper_insurance_policy_rejects_live_unbounded_or_zero_cooldown() {
     let mut vault = vault_token_account(&market, mint, 10);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { amount: 10, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9370,7 +9409,7 @@ fn v16_wrapper_insurance_policy_enforces_bps_cap_and_cooldown() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9380,7 +9419,7 @@ fn v16_wrapper_insurance_policy_enforces_bps_cap_and_cooldown() {
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -9433,7 +9472,7 @@ fn v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market() {
     let mut vault = vault_token_account(&market, mint, 100);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 100 },
+        Instruction::TopUpInsurance { amount: 100, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9462,7 +9501,7 @@ fn v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market() {
     assert_err_and_market_unchanged(live_reject, &market, &live);
 
     // Resolve to enable terminal withdrawal.
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved = market.data.clone();
 
     // Unauthorized caller rejected in terminal mode.
@@ -9554,7 +9593,7 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
     let mut vault = vault_token_account(&market, mint, 50);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 50 },
+        Instruction::TopUpInsurance { amount: 50, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9564,7 +9603,7 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut vault_auth = vault_authority_account(&market);
     let resolved = market.data.clone();
@@ -9632,7 +9671,7 @@ fn v16_wrapper_withdraw_insurance_resolved_requires_all_portfolios_closed() {
     let mut vault = vault_token_account(&market, mint, 20);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { amount: 10, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9642,7 +9681,7 @@ fn v16_wrapper_withdraw_insurance_resolved_requires_all_portfolios_closed() {
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(admin.key, mint, 0);
     let mut vault_auth = vault_authority_account(&market);
@@ -9701,10 +9740,10 @@ fn v16_wrapper_update_authority_rotates_admin_with_dual_signature() {
     assert_eq!(cfg.marketauth, new_admin.key.to_bytes());
 
     let rotated = market.data.clone();
-    let old_admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]);
+    let old_admin_resolve = run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]);
     assert_err_and_market_unchanged(old_admin_resolve, &market, &rotated);
     run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [&mut new_admin, &mut market],
     )
     .unwrap();
@@ -9768,7 +9807,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut token_program = token_program_account();
     let rotated = market.data.clone();
     let old_insurance_auth = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { amount: 1, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -9779,7 +9818,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     );
     assert_err_and_market_unchanged(old_insurance_auth, &market, &rotated);
     run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { amount: 1, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut insurance,
             &mut market,
@@ -9828,7 +9867,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let mut insurance_src = user_token_account(insurance.key, mint, 1);
     let mut vault = vault_token_account(&market, mint, 1);
     run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { amount: 1, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut insurance,
             &mut market,
@@ -9870,7 +9909,7 @@ fn v16_wrapper_update_authority_rotates_insurance_keys_and_supports_operator_bur
     let after_rotate = market.data.clone();
     let mut dead_src = user_token_account(insurance.key, mint, 1);
     let dead_insurance_auth = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { amount: 1, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut insurance,
             &mut market,
@@ -10642,11 +10681,11 @@ fn v16_wrapper_update_authority_allows_chained_admin_rotation_without_old_key_re
     .unwrap();
 
     let rotated = market.data.clone();
-    let old_admin = run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]);
+    let old_admin = run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]);
     assert_err_and_market_unchanged(old_admin, &market, &rotated);
-    let prior_admin = run_ix(Instruction::ResolveMarket, &mut [&mut admin_b, &mut market]);
+    let prior_admin = run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin_b, &mut market]);
     assert_err_and_market_unchanged(prior_admin, &market, &rotated);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin_c, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin_c, &mut market]).unwrap();
 }
 
 #[test]
@@ -10718,7 +10757,7 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
     assert_err_and_market_unchanged(live_close, &market, &live_before);
 
     init_portfolio(&mut owner, &mut market, &mut portfolio);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_before = market.data.clone();
     let non_admin = run_ix(
         Instruction::CloseSlab,
@@ -10780,7 +10819,7 @@ fn v16_wrapper_close_slab_rejects_burned_admin_zero_key() {
     let mut market = market_account();
 
     let mint = init_market(&mut admin, &mut market);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     {
         // v17: WrapperConfigV16 uses marketauth (not admin) — matrix row 27.
         let (mut cfg, group) = state::read_market(&market.data).unwrap();
@@ -10821,7 +10860,7 @@ fn v16_wrapper_close_slab_rejects_nonzero_engine_vault_or_insurance() {
     let mut vault = vault_token_account(&market, mint, 10);
     let mut token_program = token_program_account();
     run_ix(
-        Instruction::TopUpInsurance { amount: 10 },
+        Instruction::TopUpInsurance { amount: 10, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -10831,7 +10870,7 @@ fn v16_wrapper_close_slab_rejects_nonzero_engine_vault_or_insurance() {
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut vault_auth = vault_authority_account(&market);
     let mut dest_token = user_token_account(admin.key, mint, 0);
@@ -11135,7 +11174,7 @@ fn v16_wrapper_vault_accounts_reject_delegate_and_close_authority() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let topup_bad_vault = run_ix(
-        Instruction::TopUpInsurance { amount: 1_000 },
+        Instruction::TopUpInsurance { amount: 1_000, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -11232,7 +11271,7 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let frozen_topup_vault = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { amount: 1, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -11252,6 +11291,7 @@ fn v16_wrapper_token_accounts_must_be_initialized_for_custody_paths() {
             domain: 1,
             amount: 1,
             expiry_slot: 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -11318,7 +11358,7 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
 
     let mut admin_source = user_token_account(admin.key, mint, u64::MAX);
     let topup_too_large = run_ix(
-        Instruction::TopUpInsurance { amount: too_large },
+        Instruction::TopUpInsurance { amount: too_large, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -11338,6 +11378,7 @@ fn v16_wrapper_spl_u64_amount_limit_rejects_before_mutation() {
             domain: 1,
             amount: too_large,
             expiry_slot: 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -11405,7 +11446,7 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
 
     let mut admin_source = user_token_account(admin.key, mint, 0);
     run_ix(
-        Instruction::TopUpInsurance { amount: 0 },
+        Instruction::TopUpInsurance { amount: 0, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -11426,6 +11467,7 @@ fn v16_wrapper_zero_amount_custody_paths_are_noop_without_state_drift() {
             domain: 1,
             amount: 0,
             expiry_slot: 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (1 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -13956,7 +13998,7 @@ fn v16_wrapper_convert_released_pnl_rejects_resolved_market_without_mutation() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 10);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let market_before = market.data.clone();
     let portfolio_before = portfolio.data.clone();
@@ -14838,7 +14880,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
         &matcher_program,
         &matcher_context,
     );
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let req_id = group.current_slot.wrapping_add(1);
@@ -16618,12 +16660,12 @@ fn v16_wrapper_resolve_market_is_admin_only_and_blocks_live_trade() {
 
     let before = market.data.clone();
     let non_admin = run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [&mut attacker, &mut market],
     );
     assert_err_and_market_unchanged(non_admin, &market, &before);
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_market = market.data.clone();
     let before_a = portfolio_a.data.clone();
     let before_b = portfolio_b.data.clone();
@@ -16875,11 +16917,11 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved_market = market.data.clone();
     let resolved_portfolio = portfolio.data.clone();
 
-    let double_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]);
+    let double_resolve = run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]);
     assert_err_and_market_unchanged(double_resolve, &market, &resolved_market);
     assert_eq!(portfolio.data, resolved_portfolio);
 
@@ -16929,7 +16971,7 @@ fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
 
     let mut admin_source = user_token_account(admin.key, mint, 1_000);
     let topup_after_resolve = run_ix(
-        Instruction::TopUpInsurance { amount: 1 },
+        Instruction::TopUpInsurance { amount: 1, authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch },
         &mut [
             &mut admin,
             &mut market,
@@ -16952,7 +16994,7 @@ fn v16_wrapper_resolved_close_uses_engine_loss_and_fee_ordering_path() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     close_resolved(&mut owner, &mut market, &mut portfolio, 0);
 
     let (_, group) = state::read_market(&market.data).unwrap();
@@ -16978,7 +17020,7 @@ fn v16_wrapper_close_resolved_uses_configured_fee_not_permissionless_caller_fee(
         group.slot_last = 10;
         state::write_market(&mut market.data, &cfg, &group).unwrap();
     }
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     close_resolved(&mut owner, &mut market, &mut portfolio, 100);
 
@@ -17004,7 +17046,7 @@ fn v16_wrapper_close_resolved_pays_positive_pnl_through_engine_ledger() {
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
     top_up_backing_bucket(&mut admin, &mut market, 1, 250, 10);
     add_source_positive_pnl(&mut market, &mut portfolio, 1, 250);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(owner.key, mint, 0);
     let mut vault = vault_token_account(&market, mint, 1_250);
@@ -17056,7 +17098,7 @@ fn v16_wrapper_close_resolved_does_not_double_pay_after_closed_payout() {
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     close_resolved(&mut owner, &mut market, &mut portfolio, 0);
 
     let after_first_market = market.data.clone();
@@ -17084,7 +17126,7 @@ fn v16_wrapper_close_resolved_is_permissionless_but_pays_only_owner_token_accoun
     let mut owner_for_init = TestAccount::new(owner.key, Pubkey::new_unique(), 0).signer();
     init_portfolio(&mut owner_for_init, &mut market, &mut portfolio);
     deposit(&mut owner_for_init, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mint = Pubkey::new_from_array(state::read_market(&market.data).unwrap().0.collateral_mint);
     let mut attacker_dest = user_token_account(Pubkey::new_unique(), mint, 0);
@@ -17156,7 +17198,7 @@ fn v16_wrapper_close_resolved_enforces_configured_force_close_delay() {
         &mut [&mut admin, &mut market],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
@@ -17201,7 +17243,7 @@ fn v16_wrapper_close_resolved_becomes_permissionless_after_force_close_delay() {
         &mut [&mut admin, &mut market],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     {
         let (cfg, mut group) = state::read_market(&market.data).unwrap();
         group.current_slot = group.resolved_slot + 5;
@@ -17286,7 +17328,7 @@ fn v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure()
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let mut dest = user_token_account(long_owner.key, mint, 0);
     let mut vault = vault_token_account(&market, mint, 2_000_000);
@@ -17352,7 +17394,7 @@ fn v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clea
         ],
     )
     .unwrap();
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let before_market = market.data.clone();
     let before_portfolio = long_account.data.clone();
@@ -17377,7 +17419,7 @@ fn v16_wrapper_close_resolved_requires_recipient_and_vault_accounts_for_payout()
     init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 1_000);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
 
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
@@ -17727,7 +17769,7 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
             0 => {
                 // Per-domain insurance top-up (TopUpInsuranceDomain still uses domain).
                 let res = run_ix(
-                    Instruction::TopUpInsuranceDomain { domain, amount },
+                    Instruction::TopUpInsuranceDomain { domain, amount, authority_epoch: state::read_asset_control_sequences(&market.data, (domain as usize) / 2).unwrap().authority_epoch },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17911,6 +17953,7 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                         domain,
                         amount,
                         expiry_slot: FAR_EXPIRY,
+                        authority_epoch: state::read_asset_control_sequences(&market.data, (domain as usize) / 2).unwrap().authority_epoch,
                     },
                     &mut [
                         &mut admin,
@@ -18056,6 +18099,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
             Instruction::TopUpInsuranceDomain {
                 domain: dom,
                 amount: 5_000,
+                authority_epoch: state::read_asset_control_sequences(&market.data, (dom as usize) / 2).unwrap().authority_epoch,
             },
             &mut [
                 &mut admin,
@@ -18074,6 +18118,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
             domain: 4,
             amount: 3_000,
             expiry_slot: 1_000_000,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (4 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -18953,6 +18998,7 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
             domain: 0,
             amount: 1_000,
             expiry_slot: 1_000_000,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (0 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut admin,
@@ -19662,7 +19708,7 @@ fn v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed() {
     let mint = init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 10);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     {
         // Seed the protocol-fee ledger + a generous unbudgeted surplus
         // directly (NOT via seed_protocol_fee_fixture, which unconditionally
@@ -21005,7 +21051,7 @@ fn v16_wrapper_withdraw_creator_fee_resolved_requires_all_portfolios_closed() {
     let mint = init_market(&mut admin, &mut market);
     init_portfolio(&mut owner, &mut market, &mut portfolio);
     deposit(&mut owner, &mut market, &mut portfolio, 10);
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     {
         // Seeded inline rather than via `seed_creator_fee_fixture`, which
         // unconditionally zeroes `c_tot` -- the very precondition under test.
@@ -21886,7 +21932,7 @@ fn v16_wrapper_update_maintenance_fee_per_slot_is_live_only() {
     )
     .expect("rate change must be allowed while Live");
 
-    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&market.data, 0).unwrap().authority_epoch }, &mut [&mut admin, &mut market]).unwrap();
     let resolved = market.data.clone();
 
     // Not Live: the rate change must be refused, and the market left untouched.
@@ -23491,7 +23537,7 @@ fn f05_old_c_w_04_lock_assertions_must_now_fail() {
     );
 
     // (a) the MARKET AUTHORITY's own ResolveMarket (tag 19).
-    let admin_resolve = run_ix(Instruction::ResolveMarket, &mut [&mut f.admin, &mut f.market]);
+    let admin_resolve = run_ix(Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&f.market.data, 0).unwrap().authority_epoch }, &mut [&mut f.admin, &mut f.market]);
     let m1 = cw04_snap(&f.market, &f.victim).mode;
     println!("F-05/old exit(a) admin ResolveMarket (tag 19)   = {admin_resolve:?} mode={m1:?}");
 
@@ -24699,6 +24745,7 @@ fn w91_env() -> W91Env {
             domain: W91_FROM_DOMAIN,
             amount: W91_U_ATOMS,
             expiry_slot: W91_FINITE_EXPIRY,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (W91_FROM_DOMAIN as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut provider,
@@ -24816,7 +24863,7 @@ fn w91_resolve_with_open_trader(e: &mut W91Env) {
     init_portfolio(&mut trader, &mut e.market, &mut portfolio);
     deposit(&mut trader, &mut e.market, &mut portfolio, 500);
     run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&e.market.data, 0).unwrap().authority_epoch },
         &mut [&mut e.admin, &mut e.market],
     )
     .expect("admin resolve");
@@ -24875,6 +24922,7 @@ fn w21_tag50_env(expiry_slot: u64) -> W21Tag50Env {
             domain: W91_FROM_DOMAIN,
             amount: W91_U_ATOMS,
             expiry_slot,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (W91_FROM_DOMAIN as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut provider,
@@ -24999,7 +25047,7 @@ fn w21_tag50_refuses_a_lapsed_bucket_in_terminal_flat_resolved_too() {
     // 97376 -> 0`; it must now refuse.
     let mut e = w21_tag50_env(W91_FINITE_EXPIRY);
     run_ix(
-        Instruction::ResolveMarket,
+        Instruction::ResolveMarket { authority_epoch: state::read_asset_control_sequences(&e.market.data, 0).unwrap().authority_epoch },
         &mut [&mut e.admin, &mut e.market],
     )
     .expect("admin resolve on an empty market");
@@ -25359,6 +25407,7 @@ fn wsib_env_unbound() -> WsibEnv {
             domain: WSIB_PROVIDER_DOMAIN,
             amount: WSIB_U_ATOMS,
             expiry_slot: WSIB_FINITE_EXPIRY,
+            authority_epoch: state::read_asset_control_sequences(&market.data, (WSIB_PROVIDER_DOMAIN as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut provider_signing,
@@ -25890,6 +25939,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
                 domain: 2,
                 amount: 700,
                 expiry_slot: 10_000,
+                authority_epoch: state::read_asset_control_sequences(&market.data, (2 as usize) / 2).unwrap().authority_epoch,
             },
             &mut [
                 &mut victim_co,
@@ -25987,6 +26037,7 @@ fn wgenl_topup(s: &mut WgenlStage, amount: u128) -> Result<(), ProgramError> {
             domain: 2,
             amount,
             expiry_slot: 10_000,
+            authority_epoch: state::read_asset_control_sequences(&s.market.data, (2 as usize) / 2).unwrap().authority_epoch,
         },
         &mut [
             &mut victim_co,

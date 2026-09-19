@@ -583,12 +583,20 @@ fn resolve_market(env: &mut Env) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
+    // W3A-3: LIVE read of asset-0's `authority_epoch` -- never a hardcoded
+    // constant.
+    let authority_epoch = {
+        let market_account = env.svm.get_account(&env.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, 0)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),
