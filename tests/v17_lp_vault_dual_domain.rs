@@ -193,6 +193,10 @@ fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstructio
     ProgInstruction::UpdateAssetLifecycle {
         action: ASSET_ACTION_ACTIVATE,
         asset_index: APPEND_ASSET_INDEX,
+        // W3A-2: this file's only `UpdateAssetAuthority` mention is a doc
+        // comment, not a call -- asset-0's authority_epoch stays at its genesis
+        // value (0) here. The correct LIVE value, not a hardcode.
+        authority_epoch: 0,
         now_slot: 1,
         initial_price: 100,
         max_init_fee: u128::MAX,

@@ -368,6 +368,11 @@ fn activate_ix(
     Instruction::UpdateAssetLifecycle {
         action: processor::ASSET_ACTION_ACTIVATE,
         asset_index,
+        // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this file, so
+        // asset-0's `AssetControlSequencesV16.authority_epoch` stays at its genesis
+        // value (0) for every call this helper builds -- the correct LIVE value, not
+        // a hardcode.
+        authority_epoch: 0,
         now_slot,
         initial_price,
         max_init_fee: u128::MAX,
@@ -382,6 +387,8 @@ fn retire_ix(asset_index: u16, now_slot: u64) -> Instruction {
     Instruction::UpdateAssetLifecycle {
         action: processor::ASSET_ACTION_RETIRE,
         asset_index,
+        // W3A-2: see `activate_ix`'s comment -- LIVE value, not a hardcode.
+        authority_epoch: 0,
         now_slot,
         initial_price: 0,
         max_init_fee: u128::MAX,

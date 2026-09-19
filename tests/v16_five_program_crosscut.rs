@@ -497,6 +497,10 @@ impl CrosscutEnv {
             ProgInstruction::UpdateAssetLifecycle {
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index,
+                // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this
+                // file, so asset-0's authority_epoch stays at its genesis value (0)
+                // -- the correct LIVE value, not a hardcode.
+                authority_epoch: 0,
                 now_slot,
                 initial_price,
                 max_init_fee: u128::MAX,

@@ -202,6 +202,12 @@ fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstructio
     ProgInstruction::UpdateAssetLifecycle {
         action: ASSET_ACTION_ACTIVATE,
         asset_index: APPEND_ASSET_INDEX,
+        // W3A-2: this is the FIRST admin op on a freshly-initialized market (append
+        // asset 1, configured_slots 1 -> 2), and the only `UpdateAssetAuthority`
+        // calls in this file (tags at lines ~1025/1158) happen in later, separate
+        // tests after this activation -- so asset-0's authority_epoch is still its
+        // genesis value (0) here. The correct LIVE value, not a hardcode.
+        authority_epoch: 0,
         now_slot: 1,
         initial_price: 100,
         max_init_fee: u128::MAX,

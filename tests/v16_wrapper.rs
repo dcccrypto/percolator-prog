@@ -944,10 +944,20 @@ fn configure_base_unit_mints(
         }
     }
 
+    // W3A-2: `UpdateBaseUnitMints` binds to asset-0's LIVE `authority_epoch`
+    // (`require_authority_epoch_view(&group, 0, ...)`, unconditional, single call
+    // site). Read it fresh from the account right before building the ix so this
+    // shared helper (eight callers) never goes stale if a caller composes this
+    // with a prior `UpdateAssetAuthority` rotation -- no hardcode.
+    let authority_epoch = state::read_asset_control_sequences(&market.data, 0)
+        .map(|s| s.authority_epoch)
+        .unwrap_or(0);
+
     // Read the keys BEFORE the mutable borrows below.
     let ix = Instruction::UpdateBaseUnitMints {
         primary_mint: primary_mint.key.to_bytes(),
         secondary_mint: secondary_mint.key.to_bytes(),
+        authority_epoch,
     };
     let mut accounts: Vec<&mut TestAccount> = vec![authority, market, primary_mint, secondary_mint];
     for v in old_vaults.iter_mut() {
@@ -988,10 +998,42 @@ fn update_asset_lifecycle_with_authorities(
     insurance_operator: [u8; 32],
     backing_bucket_authority: [u8; 32],
 ) -> Result<(), ProgramError> {
+    // W3A-2: `UpdateAssetLifecycle` binds to `authority_epoch` at three call
+    // sites, keyed by action and by WHICH authority actually signs (see
+    // `handle_update_asset_lifecycle`'s own per-call-site comments). Computed
+    // here, once, for this helper's many callers rather than at each site:
+    //   - SHUTDOWN, signed by marketauth           -> asset-0's live epoch
+    //   - SHUTDOWN, signed by the per-asset admin   -> that asset's own live epoch
+    //   - ACTIVATE/DRAIN_ONLY/RETIRE, by marketauth -> asset-0's live epoch
+    //     (covers both the append/reuse early-return path and the in-place
+    //     reactivate/drain/retire match block -- both key off asset-0)
+    //   - ACTIVATE, permissionless (not marketauth) -> the canonical zero value
+    //     that lane requires UNCONDITIONALLY, not a live read (see
+    //     `handle_update_asset_lifecycle`'s "Requiring the canonical zero value"
+    //     comment) -- a live read would be WRONG here even if it happened to be
+    //     nonzero.
+    // Falls back to 0 (harmless: some earlier bounds/authorization check always
+    // rejects first) if the account can't be read at the given index, e.g. a
+    // caller deliberately probing an out-of-range `asset_index`.
+    let (cfg, _) = state::read_market(&market.data).expect("market must be initialised");
+    let is_market_authority =
+        cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
+    let authority_epoch = if is_market_authority {
+        state::read_asset_control_sequences(&market.data, 0)
+            .map(|s| s.authority_epoch)
+            .unwrap_or(0)
+    } else if action == processor::ASSET_ACTION_SHUTDOWN {
+        state::read_asset_control_sequences(&market.data, asset_index as usize)
+            .map(|s| s.authority_epoch)
+            .unwrap_or(0)
+    } else {
+        0
+    };
     run_ix(
         Instruction::UpdateAssetLifecycle {
             action,
             asset_index,
+            authority_epoch,
             now_slot,
             initial_price,
             max_init_fee: u128::MAX,
@@ -2348,6 +2390,10 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally (not a live
+            // read) -- see `handle_update_asset_lifecycle`'s comment.
+            authority_epoch: 0,
             now_slot: 1,
             initial_price: 100,
             max_init_fee: u128::MAX,
@@ -2405,6 +2451,10 @@ fn v16_wrapper_permissionless_market_init_fee_policy_gates_and_funds_base_market
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally (not a live
+            // read) -- see `handle_update_asset_lifecycle`'s comment.
+            authority_epoch: 0,
             now_slot: 1,
             initial_price: 100,
             max_init_fee: u128::MAX,
@@ -2486,6 +2536,9 @@ fn v16_wrapper_permissionless_market_init_fee_doubles_every_32_markets() {
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 32,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 32,
             initial_price: 132,
             max_init_fee: u128::MAX,
@@ -2510,6 +2563,9 @@ fn v16_wrapper_permissionless_market_init_fee_doubles_every_32_markets() {
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 32,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 32,
             initial_price: 132,
             max_init_fee: u128::MAX,
@@ -2612,6 +2668,9 @@ fn v16_wrapper_permissionless_market_creator_must_reuse_shutdown_slot_before_app
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 3,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 4,
             initial_price: 103,
             max_init_fee: u128::MAX,
@@ -2636,6 +2695,9 @@ fn v16_wrapper_permissionless_market_creator_must_reuse_shutdown_slot_before_app
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 4,
             initial_price: 201,
             max_init_fee: u128::MAX,
@@ -2706,6 +2768,9 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 1,
             initial_price: 150,
             max_init_fee: u128::MAX,
@@ -3203,6 +3268,9 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 2,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 8,
             initial_price: 250,
             max_init_fee: u128::MAX,
@@ -3227,6 +3295,9 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `creator` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 8,
             initial_price: 250,
             max_init_fee: u128::MAX,
@@ -3314,6 +3385,9 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `attacker` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 1,
             initial_price: 100,
             max_init_fee: u128::MAX,
@@ -3584,6 +3658,9 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `attacker` is not marketauth, so this permissionless lane
+            // requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 8,
             initial_price: 250,
             max_init_fee: u128::MAX,
@@ -11819,7 +11896,12 @@ fn v16_wrapper_base_unit_atomic_swap_requires_primary_in_for_secondary_out() {
     let mut token_program = token_program_account();
     let before_market = market.data.clone();
     let zero_swap = run_ix(
-        Instruction::SwapSecondaryForPrimary { amount: 0 },
+        Instruction::SwapSecondaryForPrimary {
+            amount: 0,
+            // W3A-2: fresh market, no `UpdateAssetAuthority` rotation in this
+            // test -- asset-0's authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -11834,7 +11916,12 @@ fn v16_wrapper_base_unit_atomic_swap_requires_primary_in_for_secondary_out() {
     assert_err_and_market_unchanged(zero_swap, &market, &before_market);
 
     let unauthorized = run_ix(
-        Instruction::SwapSecondaryForPrimary { amount: 50 },
+        Instruction::SwapSecondaryForPrimary {
+            amount: 50,
+            // W3A-2: fresh market, no `UpdateAssetAuthority` rotation in this
+            // test -- asset-0's authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
+        },
         &mut [
             &mut attacker,
             &mut market,
@@ -11853,7 +11940,12 @@ fn v16_wrapper_base_unit_atomic_swap_requires_primary_in_for_secondary_out() {
     let mut secondary_dest = user_token_account(admin.key, secondary_key, 0);
     let mut secondary_vault = vault_token_account(&market, secondary_key, 50);
     let short_primary_in = run_ix(
-        Instruction::SwapSecondaryForPrimary { amount: 50 },
+        Instruction::SwapSecondaryForPrimary {
+            amount: 50,
+            // W3A-2: fresh market, no `UpdateAssetAuthority` rotation in this
+            // test -- asset-0's authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -11872,7 +11964,12 @@ fn v16_wrapper_base_unit_atomic_swap_requires_primary_in_for_secondary_out() {
     let mut secondary_dest = user_token_account(admin.key, secondary_key, 0);
     let mut secondary_vault = vault_token_account(&market, secondary_key, 50);
     run_ix(
-        Instruction::SwapSecondaryForPrimary { amount: 50 },
+        Instruction::SwapSecondaryForPrimary {
+            amount: 50,
+            // W3A-2: fresh market, no `UpdateAssetAuthority` rotation in this
+            // test -- asset-0's authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -22257,6 +22354,9 @@ fn v16_wrapper_update_base_unit_mints_rejects_a_nonempty_old_vault() {
         Instruction::UpdateBaseUnitMints {
             primary_mint: new_primary.key.to_bytes(),
             secondary_mint: new_secondary.key.to_bytes(),
+            // W3A-2: `admin` is marketauth on a fresh market -- asset-0's
+            // authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
         },
         &mut [
             &mut admin,
@@ -22282,6 +22382,10 @@ fn v16_wrapper_update_base_unit_mints_rejects_a_nonempty_old_vault() {
         Instruction::UpdateBaseUnitMints {
             primary_mint: new_primary.key.to_bytes(),
             secondary_mint: new_secondary.key.to_bytes(),
+            // W3A-2: the prior call above was rejected (no state committed), and
+            // `UpdateBaseUnitMints` never advances the epoch on success either --
+            // asset-0's authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
         },
         &mut [
             &mut admin,
@@ -22316,6 +22420,9 @@ fn v16_wrapper_update_base_unit_mints_rejects_mismatched_decimals() {
         Instruction::UpdateBaseUnitMints {
             primary_mint: primary.key.to_bytes(),
             secondary_mint: mismatched.key.to_bytes(),
+            // W3A-2: `admin` is marketauth on a fresh market -- asset-0's
+            // authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
         },
         &mut [&mut admin, &mut market, &mut primary, &mut mismatched],
     );
@@ -22334,6 +22441,9 @@ fn v16_wrapper_update_base_unit_mints_rejects_mismatched_decimals() {
         Instruction::UpdateBaseUnitMints {
             primary_mint: primary.key.to_bytes(),
             secondary_mint: matched.key.to_bytes(),
+            // W3A-2: the prior (decimals-mismatch) call above was rejected --
+            // asset-0's authority_epoch is still its genesis value (0).
+            authority_epoch: 0,
         },
         &mut [
             &mut admin,
@@ -25817,6 +25927,12 @@ fn wgenl_lifecycle_ix(
     Instruction::UpdateAssetLifecycle {
         action,
         asset_index,
+        // W3A-2: both of this helper's callers sign with `admin`/`s.admin`
+        // (marketauth), and no `UpdateAssetAuthority` rotation occurs anywhere
+        // in this W-GEN-L test group -- asset-0's authority_epoch is still its
+        // genesis value (0) at every call. The correct LIVE value, not a
+        // hardcode.
+        authority_epoch: 0,
         now_slot,
         initial_price,
         max_init_fee: u128::MAX,
@@ -25953,6 +26069,9 @@ fn wgenl_flip_generation(s: &mut WgenlStage) -> u64 {
         Instruction::UpdateAssetLifecycle {
             action: processor::ASSET_ACTION_ACTIVATE,
             asset_index: 1,
+            // W3A-2: `s.attacker` is not marketauth, so this permissionless
+            // reuse lane requires the canonical zero value unconditionally.
+            authority_epoch: 0,
             now_slot: 4,
             initial_price: 201,
             max_init_fee: u128::MAX,
