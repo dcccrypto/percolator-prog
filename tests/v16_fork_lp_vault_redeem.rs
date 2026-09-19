@@ -550,16 +550,61 @@ fn close_lp_vault(env: &mut Env) -> Result<(), String> {
     )
 }
 
+/// W3A-1: mirrors `handle_withdraw_backing_bucket`'s own `epoch_asset_index`
+/// selection (`if local_authorized { domain_usize / 2 } else { 0 }`), reading
+/// the on-chain `backing_bucket_authority` for `domain / 2` directly rather
+/// than assuming which path `authority` takes.
+fn backing_withdraw_authority_epoch(
+    svm: &LiteSVM,
+    market: Pubkey,
+    domain: u16,
+    authority: &Pubkey,
+) -> u64 {
+    let data = svm.get_account(&market).unwrap().data;
+    let asset_index = (domain / 2) as usize;
+    let profile = state::read_asset_oracle_profile(&data, asset_index).unwrap();
+    let local_authorized = profile.backing_bucket_authority == authority.to_bytes();
+    let epoch_asset_index = if local_authorized { asset_index } else { 0 };
+    state::read_asset_control_sequences(&data, epoch_asset_index)
+        .unwrap()
+        .authority_epoch
+}
+
+/// W3A-1: same idea as `backing_withdraw_authority_epoch`, for
+/// `WithdrawInsuranceAsset`'s `epoch_asset_index` selection
+/// (`if local_authorized { asset_index } else { 0 }`).
+fn insurance_withdraw_authority_epoch(
+    svm: &LiteSVM,
+    market: Pubkey,
+    asset_index: u16,
+    authority: &Pubkey,
+) -> u64 {
+    let data = svm.get_account(&market).unwrap().data;
+    let profile = state::read_asset_oracle_profile(&data, asset_index as usize).unwrap();
+    let local_authorized = profile.insurance_operator == authority.to_bytes();
+    let epoch_asset_index = if local_authorized { asset_index } else { 0 };
+    state::read_asset_control_sequences(&data, epoch_asset_index as usize)
+        .unwrap()
+        .authority_epoch
+}
+
 fn close_slab(env: &mut Env, dest: Pubkey) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
+    // W3A-1: CloseSlab binds asset-0's `authority_epoch` (CHECK-only).
+    let authority_epoch = state::read_asset_control_sequences(
+        &env.svm.get_account(&env.market).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .authority_epoch;
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::CloseSlab,
+            ProgInstruction::CloseSlab { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),
@@ -909,6 +954,8 @@ fn execute_redemption_backing_state_matches_withdraw() {
     )
     .expect("top up");
     env_a.svm.expire_blockhash();
+    let backing_withdraw_authority_epoch_a =
+        backing_withdraw_authority_epoch(&env_a.svm, env_a.market, DOMAIN, &admin_a.pubkey());
     send(
         &mut env_a.svm,
         pid_a,
@@ -917,6 +964,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
             ProgInstruction::WithdrawBackingBucket {
                 domain: DOMAIN,
                 amount: MINTED,
+                authority_epoch: backing_withdraw_authority_epoch_a,
             },
             vec![
                 AccountMeta::new(admin_a.pubkey(), true),
@@ -2319,6 +2367,12 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
         0,
     );
     env.svm.expire_blockhash();
+    let drain_authority_epoch = insurance_withdraw_authority_epoch(
+        &env.svm,
+        env.market,
+        APPEND_ASSET_INDEX,
+        &admin.pubkey(),
+    );
     send(
         &mut env.svm,
         pid,
@@ -2327,6 +2381,7 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
             ProgInstruction::WithdrawInsuranceAsset {
                 asset_index: APPEND_ASSET_INDEX,
                 amount: 199_800,
+                authority_epoch: drain_authority_epoch,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true), // 0 operator (signer)
@@ -2405,12 +2460,20 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
         0,
     );
     env.svm.expire_blockhash();
+    let close_authority_epoch = state::read_asset_control_sequences(
+        &env.svm.get_account(&env.market).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .authority_epoch;
     let res = send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::CloseSlab,
+            ProgInstruction::CloseSlab {
+                authority_epoch: close_authority_epoch,
+            },
             vec![
                 AccountMeta::new(admin.pubkey(), true), // 0 admin (signer, writable, rent dest)
                 AccountMeta::new(env.market, false),    // 1 market

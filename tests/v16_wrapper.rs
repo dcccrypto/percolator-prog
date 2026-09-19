@@ -395,6 +395,45 @@ fn creator_claimable(market: &TestAccount, asset_index: usize) -> u64 {
         .creator_fee_claimable_atoms
 }
 
+/// W3A-1: mirrors `handle_withdraw_backing_bucket[_earnings]`'s own
+/// `epoch_asset_index` selection (`if local_authorized { domain_usize / 2 }
+/// else { 0 }`), reading the on-chain `backing_bucket_authority` for
+/// `domain / 2` directly rather than assuming which path `authority` takes.
+fn backing_withdraw_authority_epoch(market: &TestAccount, domain: u16, authority: &Pubkey) -> u64 {
+    let asset_index = (domain / 2) as usize;
+    let profile = state::read_asset_oracle_profile(&market.data, asset_index).unwrap();
+    let local_authorized = profile.backing_bucket_authority == authority.to_bytes();
+    let epoch_asset_index = if local_authorized { asset_index } else { 0 };
+    state::read_asset_control_sequences(&market.data, epoch_asset_index)
+        .unwrap()
+        .authority_epoch
+}
+
+/// W3A-1: same idea as `backing_withdraw_authority_epoch`, for
+/// `WithdrawInsuranceAsset`'s `epoch_asset_index` selection
+/// (`if local_authorized { asset_index } else { 0 }`).
+fn insurance_withdraw_authority_epoch(
+    market: &TestAccount,
+    asset_index: u16,
+    authority: &Pubkey,
+) -> u64 {
+    let profile = state::read_asset_oracle_profile(&market.data, asset_index as usize).unwrap();
+    let local_authorized = profile.insurance_operator == authority.to_bytes();
+    let epoch_asset_index = if local_authorized { asset_index } else { 0 };
+    state::read_asset_control_sequences(&market.data, epoch_asset_index as usize)
+        .unwrap()
+        .authority_epoch
+}
+
+/// W3A-1: `UpdateAuthority` (market-level rotation) and `CloseSlab` always bind
+/// asset-0's `authority_epoch` lane (see `UpdateAuthority`'s own doc comment on
+/// why it reuses that slot rather than a new one).
+fn asset0_authority_epoch(market: &TestAccount) -> u64 {
+    state::read_asset_control_sequences(&market.data, 0)
+        .unwrap()
+        .authority_epoch
+}
+
 fn vault_token_account(market: &TestAccount, mint: Pubkey, amount: u64) -> TestAccount {
     TestAccount::new_with_data(
         canonical_vault_ata(&vault_authority(market), &mint),
@@ -2844,6 +2883,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 10,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -2861,6 +2901,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
         Instruction::WithdrawBackingBucket {
             domain: 2,
             amount: 25,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &backing_authority.key),
         },
         &mut [
             &mut backing_authority,
@@ -3101,6 +3142,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 6,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -3116,6 +3158,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 4,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -3133,6 +3176,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::WithdrawBackingBucket {
             domain: 2,
             amount: 20,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &backing_authority.key),
         },
         &mut [
             &mut backing_authority,
@@ -3151,6 +3195,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
         Instruction::WithdrawBackingBucket {
             domain: 3,
             amount: 25,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 3, &admin.key),
         },
         &mut [
             &mut admin,
@@ -3482,6 +3527,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 6,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator_key),
         },
         &mut [
             &mut insurance_operator_acct,
@@ -3497,6 +3543,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 4,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator_key),
         },
         &mut [
             &mut insurance_operator_acct,
@@ -3513,8 +3560,13 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
     let mut backing_dest = user_token_account(backing_authority.key, mint, 0);
     for (domain, amount) in [(2u16, 20u128), (3u16, 25u128)] {
         let mut __lg4 = canonical_backing_ledger_account(&market, 0);
+        let authority_epoch = backing_withdraw_authority_epoch(&market, domain, &backing_authority.key);
         run_ix(
-            Instruction::WithdrawBackingBucket { domain, amount },
+            Instruction::WithdrawBackingBucket {
+                domain,
+                amount,
+                authority_epoch,
+            },
             &mut [
                 &mut backing_authority,
                 &mut market,
@@ -3716,6 +3768,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 1,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -3741,6 +3794,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 1,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -3764,6 +3818,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 9,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -3792,6 +3847,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::WithdrawBackingBucketEarnings {
             domain: 2,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &admin.key),
         },
         &mut [
             &mut admin,
@@ -3811,6 +3867,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::WithdrawBackingBucketEarnings {
             domain: 2,
             amount: 5,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &admin.key),
         },
         &mut [
             &mut admin,
@@ -3833,6 +3890,7 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         Instruction::WithdrawBackingBucket {
             domain: 2,
             amount: 20,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &admin.key),
         },
         &mut [
             &mut admin,
@@ -4968,6 +5026,7 @@ fn v16_wrapper_asset_authority_rotation_and_burn_gate_lifecycle_updates() {
     run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: new_asset_authority.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut new_asset_authority, &mut market],
     )
@@ -5001,6 +5060,7 @@ fn v16_wrapper_asset_authority_rotation_and_burn_gate_lifecycle_updates() {
     let burn_rejected = run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: [0u8; 32],
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut new_asset_authority, &mut attacker, &mut market],
     );
@@ -7285,6 +7345,7 @@ fn v16_wrapper_non_main_domain_insurance_isolated_from_global_withdrawals() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 100,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -7391,6 +7452,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 1,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -7409,6 +7471,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawBackingBucket {
             domain: 2,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &admin.key),
         },
         &mut [
             &mut admin,
@@ -7428,6 +7491,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawBackingBucketEarnings {
             domain: 2,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &admin.key),
         },
         &mut [
             &mut admin,
@@ -7448,6 +7512,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 1,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -7466,6 +7531,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawInsuranceAsset {
             asset_index: 1,
             amount: 11,
+            authority_epoch: insurance_withdraw_authority_epoch(&market, 1, &insurance_operator.key),
         },
         &mut [
             &mut insurance_operator,
@@ -7484,6 +7550,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawBackingBucketEarnings {
             domain: 2,
             amount: 7,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &backing_authority.key),
         },
         &mut [
             &mut backing_authority,
@@ -7502,6 +7569,7 @@ fn v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_second
         Instruction::WithdrawBackingBucket {
             domain: 2,
             amount: 30,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 2, &backing_authority.key),
         },
         &mut [
             &mut backing_authority,
@@ -7916,6 +7984,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &attacker.key),
         },
         &mut [
             &mut attacker,
@@ -7937,6 +8006,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &bucket_authority.key),
         },
         &mut [
             &mut bucket_authority,
@@ -7957,6 +8027,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 40,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &bucket_authority.key),
         },
         &mut [
             &mut bucket_authority,
@@ -8001,6 +8072,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 61,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &bucket_authority.key),
         },
         &mut [
             &mut bucket_authority,
@@ -8033,6 +8105,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 20,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &bucket_authority.key),
         },
         &mut [
             &mut bucket_authority,
@@ -8067,6 +8140,7 @@ fn v16_wrapper_withdraw_backing_bucket_returns_only_unencumbered_backing() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &bucket_authority.key),
         },
         &mut [
             &mut bucket_authority,
@@ -8124,6 +8198,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 0,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -8165,6 +8240,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
             Instruction::WithdrawBackingBucket {
                 domain: 1,
                 amount: 1,
+                authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
             },
             &mut [
                 &mut admin,
@@ -8185,6 +8261,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_stress_and_allows_full_clean_drai
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 25,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -8245,6 +8322,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -8266,6 +8344,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -8287,6 +8366,7 @@ fn v16_wrapper_withdraw_backing_bucket_rejects_bad_custody_accounts() {
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 1,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -8374,6 +8454,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
         Instruction::WithdrawBackingBucketEarnings {
             domain: 1,
             amount: 20,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -8399,6 +8480,7 @@ fn v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdra
         Instruction::WithdrawBackingBucket {
             domain: 1,
             amount: 40,
+            authority_epoch: backing_withdraw_authority_epoch(&market, 1, &admin.key),
         },
         &mut [
             &mut admin,
@@ -9604,7 +9686,9 @@ fn v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authori
 
     let mut close_dest = user_token_account(admin.key, mint, 0);
     run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -9676,6 +9760,7 @@ fn v16_wrapper_update_authority_rotates_admin_with_dual_signature() {
         run_ix(
             Instruction::UpdateAuthority {
                 new_pubkey: new_admin.key.to_bytes(),
+                authority_epoch: asset0_authority_epoch(&market),
             },
             &mut [&mut admin, &mut unsigned_new_admin, &mut market],
         )
@@ -9685,6 +9770,7 @@ fn v16_wrapper_update_authority_rotates_admin_with_dual_signature() {
     let unauthorized_current = run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: new_admin.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut attacker, &mut new_admin, &mut market],
     );
@@ -9693,6 +9779,7 @@ fn v16_wrapper_update_authority_rotates_admin_with_dual_signature() {
     run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: new_admin.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut new_admin, &mut market],
     )
@@ -9931,6 +10018,7 @@ fn v16_wrapper_update_authority_rejects_unsupported_kind_and_live_admin_burn() {
     let live_admin_burn = run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: [0u8; 32],
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut new_key, &mut market],
     );
@@ -10605,6 +10693,7 @@ fn v16_wrapper_permissionless_resolve_policy_is_admin_gated_and_enables_admin_bu
     let burn_rejected = run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: [0u8; 32],
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut new_key, &mut market],
     );
@@ -10629,6 +10718,7 @@ fn v16_wrapper_update_authority_allows_chained_admin_rotation_without_old_key_re
     run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: admin_b.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut admin_b, &mut market],
     )
@@ -10636,6 +10726,7 @@ fn v16_wrapper_update_authority_allows_chained_admin_rotation_without_old_key_re
     run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: admin_c.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin_b, &mut admin_c, &mut market],
     )
@@ -10705,7 +10796,9 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
 
     let live_before = market.data.clone();
     let live_close = run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10721,7 +10814,9 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
     run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
     let resolved_before = market.data.clone();
     let non_admin = run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut attacker,
             &mut market,
@@ -10735,7 +10830,9 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
 
     let with_portfolio = market.data.clone();
     let nonempty_count = run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10755,7 +10852,9 @@ fn v16_wrapper_close_slab_requires_admin_resolved_empty_market() {
     let market_lamports = market.lamports;
     let admin_lamports = admin.lamports;
     run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10798,7 +10897,9 @@ fn v16_wrapper_close_slab_rejects_burned_admin_zero_key() {
 
     let burned_admin_market = market.data.clone();
     let rejected = run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut zero_admin,
             &mut market,
@@ -10837,7 +10938,9 @@ fn v16_wrapper_close_slab_rejects_nonzero_engine_vault_or_insurance() {
     let mut dest_token = user_token_account(admin.key, mint, 0);
     let before = market.data.clone();
     let rejected = run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            authority_epoch: asset0_authority_epoch(&market),
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -10863,7 +10966,13 @@ fn v16_wrapper_close_slab_rejects_uninitialized_market_without_rent_drain() {
     let before_market = market.data.clone();
     let before_lamports = (admin.lamports, market.lamports);
     let rejected = run_ix(
-        Instruction::CloseSlab,
+        Instruction::CloseSlab {
+            // The market account is never initialized here (no `init_market` call), so
+            // there is no live `AssetControlSequencesV16` to read -- 0 is the correct
+            // value for a never-used epoch lane, and `check_header` rejects this
+            // uninitialized account long before the epoch check would run anyway.
+            authority_epoch: 0,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -11690,6 +11799,7 @@ fn v16_wrapper_base_unit_authority_changes_primary_and_rotates() {
     run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: base_unit_authority.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut base_unit_authority, &mut market],
     )
@@ -17746,6 +17856,11 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
                     Instruction::WithdrawInsuranceAsset {
                         asset_index: asset_index as u16,
                         amount,
+                        authority_epoch: insurance_withdraw_authority_epoch(
+                            &market,
+                            asset_index as u16,
+                            &admin.key,
+                        ),
                     },
                     &mut [
                         &mut admin,
@@ -17782,6 +17897,11 @@ fn v16_wrapper_stress_per_domain_insurance_never_overdraws_cross_domain() {
                     Instruction::WithdrawInsuranceAsset {
                         asset_index: asset_index as u16,
                         amount: over,
+                        authority_epoch: insurance_withdraw_authority_epoch(
+                            &market,
+                            asset_index as u16,
+                            &admin.key,
+                        ),
                     },
                     &mut [
                         &mut admin,
@@ -17929,8 +18049,13 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
             }
             1 => {
                 let mut __lg21 = canonical_backing_ledger_account(&market, 0);
+                let authority_epoch = backing_withdraw_authority_epoch(&market, domain, &admin.key);
                 let res = run_ix(
-                    Instruction::WithdrawBackingBucket { domain, amount },
+                    Instruction::WithdrawBackingBucket {
+                        domain,
+                        amount,
+                        authority_epoch,
+                    },
                     &mut [
                         &mut admin,
                         &mut market,
@@ -17961,6 +18086,7 @@ fn v16_wrapper_stress_per_domain_backing_never_overdraws() {
                     Instruction::WithdrawBackingBucket {
                         domain,
                         amount: over,
+                        authority_epoch: backing_withdraw_authority_epoch(&market, domain, &admin.key),
                     },
                     &mut [
                         &mut admin,
@@ -20441,6 +20567,7 @@ fn v16_wrapper_withdraw_creator_fee_survives_the_staked_create_flow_and_only_ass
     run_ix(
         Instruction::UpdateAuthority {
             new_pubkey: pool_pda.key.to_bytes(),
+            authority_epoch: asset0_authority_epoch(&market),
         },
         &mut [&mut admin, &mut pool_pda, &mut market],
     )
@@ -24904,10 +25031,12 @@ fn w21_tag50_withdraw(e: &mut W21Tag50Env, amount: u128) -> Result<(), ProgramEr
     let mut dest = user_token_account(e.provider.key, e.mint, 0);
     let mut vault = vault_token_account(&e.market, e.mint, W91_U_ATOMS as u64);
     let mut vault_auth = vault_authority_account(&e.market);
+    let authority_epoch = backing_withdraw_authority_epoch(&e.market, W91_FROM_DOMAIN, &e.provider.key);
     run_ix_no_rollback(
         Instruction::WithdrawBackingBucket {
             domain: W91_FROM_DOMAIN,
             amount,
+            authority_epoch,
         },
         &mut [
             &mut e.provider,
@@ -25433,10 +25562,13 @@ fn wsib_withdraw_no_rollback(
     } else {
         &mut e.provider_dest
     };
+    let authority_epoch =
+        backing_withdraw_authority_epoch(&e.market, WSIB_PROVIDER_DOMAIN, &who_key);
     run_ix_no_rollback(
         Instruction::WithdrawBackingBucket {
             domain: WSIB_PROVIDER_DOMAIN,
             amount,
+            authority_epoch,
         },
         &mut [
             &mut who,
@@ -25910,6 +26042,7 @@ fn wgenl_stage_generation_one() -> WgenlStage {
             Instruction::WithdrawBackingBucket {
                 domain: 2,
                 amount: 700,
+                authority_epoch: backing_withdraw_authority_epoch(&market, 2, &victim.key),
             },
             &mut [
                 &mut victim_co,
@@ -26303,6 +26436,7 @@ fn wgenl_legacy_ledger_is_protected_from_the_next_flip_once_stamped() {
             Instruction::WithdrawBackingBucket {
                 domain: 2,
                 amount: 300,
+                authority_epoch: backing_withdraw_authority_epoch(&s.market, 2, &victim_key),
             },
             &mut [
                 &mut victim_co,
