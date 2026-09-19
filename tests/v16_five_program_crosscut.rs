@@ -821,6 +821,7 @@ impl CrosscutEnv {
                 size_q,
                 fee_bps,
                 limit_price: 0,
+                backing_fee_cap_bps: 10_000,
             }
             .encode(),
         };
@@ -861,6 +862,7 @@ impl CrosscutEnv {
                 size_q,
                 exec_price,
                 fee_bps,
+                backing_fee_cap_bps: 10_000,
             }
             .encode(),
         };

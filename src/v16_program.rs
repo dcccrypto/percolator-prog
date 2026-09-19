@@ -4418,12 +4418,22 @@ pub mod ix {
             size_q: i128,
             exec_price: u64,
             fee_bps: u64,
+            /// ADOPT upstream 2d9eb5e9 ("Bind single trades to backing fee consent"): the
+            /// co-signed cap on the backing-domain fee either side of this direct trade will
+            /// be charged. Both signers agree to the same field on one ix, so it applies
+            /// symmetrically to account_a and account_b.
+            backing_fee_cap_bps: u16,
         },
         TradeCpi {
             asset_index: u16,
             size_q: i128,
             fee_bps: u64,
             limit_price: u64,
+            /// ADOPT upstream 2d9eb5e9: the signing taker's (account_a) own cap on the
+            /// backing-domain fee charged to ITS side of the trade. Independent of the LP's
+            /// (account_b) matcher-CPI-derived cap (`ret.backing_fee_cap_bps()`, e24cf78e) --
+            /// account_a never goes through the matcher, so it had no way to bound this fee.
+            backing_fee_cap_bps: u16,
         },
         /// Atomic multi-leg batch: apply every leg against one taker/LP pair with a single
         /// end-state initial-margin check (interim legs need not be individually margin-feasible).
@@ -4920,12 +4930,14 @@ pub mod ix {
                     size_q: read_i128(&mut rest)?,
                     exec_price: read_u64(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
+                    backing_fee_cap_bps: read_u16(&mut rest)?,
                 },
                 10 => Self::TradeCpi {
                     asset_index: read_u16(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
                     limit_price: read_u64(&mut rest)?,
+                    backing_fee_cap_bps: read_u16(&mut rest)?,
                 },
                 66 => {
                     let n = read_u8(&mut rest)? as usize;
@@ -5319,24 +5331,28 @@ pub mod ix {
                     size_q,
                     exec_price,
                     fee_bps,
+                    backing_fee_cap_bps,
                 } => {
                     out.push(6);
                     push_u16(&mut out, asset_index);
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, exec_price);
                     push_u64(&mut out, fee_bps);
+                    push_u16(&mut out, backing_fee_cap_bps);
                 }
                 Self::TradeCpi {
                     asset_index,
                     size_q,
                     fee_bps,
                     limit_price,
+                    backing_fee_cap_bps,
                 } => {
                     out.push(10);
                     push_u16(&mut out, asset_index);
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, fee_bps);
                     push_u64(&mut out, limit_price);
+                    push_u16(&mut out, backing_fee_cap_bps);
                 }
                 Self::BatchTradeNoCpi { ref legs } => {
                     out.push(66);
@@ -7106,6 +7122,37 @@ pub mod policy_v16 {
     pub fn backing_principal_withdrawal_is_fresh(expiry_slot: u64, authenticated_slot: u64) -> bool {
         authenticated_slot < expiry_slot
     }
+
+    /// sync/w3b-backing-fee-consent (ADOPT upstream `be8516b8`, "Bind backing top-ups to
+    /// provider fee terms" -- fee-policy-change half).
+    ///
+    /// `UpdateBackingFeePolicy` previously let the domain's `insurance_authority` overwrite
+    /// `backing_trade_fee_bps_*` / `backing_trade_fee_insurance_share_bps_*` unconditionally,
+    /// including on a bucket that already holds live counterparty backing. A provider who
+    /// deposited under one fee rate had zero protection against the authority raising it
+    /// afterward -- a rug on already-committed capital, not a future-deposit term.
+    ///
+    /// This is the consent gate: a change is allowed only if it is a no-op (identical rate),
+    /// or the bucket is fully empty (no fresh/valid/consumed/impaired backing and no accrued
+    /// utilization-fee earnings). An authority is always free to set terms on an unfunded
+    /// bucket; once a depositor has actually funded it, the rate they funded under is frozen
+    /// until the bucket empties again (withdrawal, consumption to zero, etc.) -- never
+    /// unilaterally by the authority alone.
+    pub fn backing_fee_policy_change_allowed(
+        current_fee_bps: u16,
+        current_insurance_share_bps: u16,
+        proposed_fee_bps: u16,
+        proposed_insurance_share_bps: u16,
+        bucket: &percolator::BackingBucketV16,
+    ) -> bool {
+        (current_fee_bps, current_insurance_share_bps)
+            == (proposed_fee_bps, proposed_insurance_share_bps)
+            || (bucket.fresh_unliened_backing_num == 0
+                && bucket.valid_liened_backing_num == 0
+                && bucket.consumed_liened_backing_num == 0
+                && bucket.impaired_liened_backing_num == 0
+                && bucket.utilization_fee_earnings == 0)
+    }
 }
 
 pub mod processor {
@@ -8120,6 +8167,7 @@ pub mod processor {
                 size_q,
                 exec_price,
                 fee_bps,
+                backing_fee_cap_bps,
             } => handle_trade_nocpi(
                 program_id,
                 accounts,
@@ -8127,12 +8175,14 @@ pub mod processor {
                 size_q,
                 exec_price,
                 fee_bps,
+                backing_fee_cap_bps,
             ),
             Instruction::TradeCpi {
                 asset_index,
                 size_q,
                 fee_bps,
                 limit_price,
+                backing_fee_cap_bps,
             } => handle_trade_cpi(
                 program_id,
                 accounts,
@@ -8140,6 +8190,7 @@ pub mod processor {
                 size_q,
                 fee_bps,
                 limit_price,
+                backing_fee_cap_bps,
             ),
             Instruction::BatchTradeNoCpi { legs } => {
                 handle_batch_trade_nocpi(program_id, accounts, &legs)
@@ -8911,6 +8962,7 @@ pub mod processor {
         size_q: i128,
         exec_price: u64,
         fee_bps: u64,
+        account_a_backing_fee_cap_bps: Option<u16>,
         account_b_backing_fee_cap_bps: Option<u16>,
         max_market_slots: usize,
     ) -> ProgramResult {
@@ -9110,6 +9162,7 @@ pub mod processor {
                     backing_before_a.as_ref(),
                     &mut account_b,
                     backing_before_b.as_ref(),
+                    account_a_backing_fee_cap_bps,
                     account_b_backing_fee_cap_bps,
                 )?
             };
@@ -9824,6 +9877,7 @@ pub mod processor {
         size_q: i128,
         exec_price: u64,
         fee_bps: u64,
+        backing_fee_cap_bps: u16,
     ) -> ProgramResult {
         let signer_a = account(accounts, 0)?;
         let signer_b = account(accounts, 1)?;
@@ -9851,6 +9905,13 @@ pub mod processor {
         if cfg_pre.trade_fee_base_bps > fee_bps {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // ADOPT upstream 2d9eb5e9 ("Bind single trades to backing fee consent"): both owners
+        // co-sign this single `backing_fee_cap_bps`, so it binds both sides of a direct trade
+        // symmetrically -- previously neither had ANY way to cap the backing-domain fee they
+        // could be charged (only a matcher-CPI counterparty had that option, via e24cf78e).
+        if backing_fee_cap_bps > 10_000 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
         handle_trade_nocpi_zero_copy(
             program_id,
             signer_a.key,
@@ -9862,7 +9923,8 @@ pub mod processor {
             size_q,
             exec_price,
             fee_bps,
-            None,
+            Some(backing_fee_cap_bps),
+            Some(backing_fee_cap_bps),
             max_market_slots,
         )
     }
@@ -10377,6 +10439,7 @@ pub mod processor {
         size_q: i128,
         fee_bps: u64,
         limit_price: u64,
+        backing_fee_cap_bps: u16,
     ) -> ProgramResult {
         let signer_a = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -10435,6 +10498,13 @@ pub mod processor {
         }
         let fee_floor_pre = core::cmp::max(fee_bps, cfg_pre.trade_fee_base_bps);
         if fee_floor_pre > max_trading_fee_bps {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // ADOPT upstream 2d9eb5e9: the signing taker's (account_a) own cap on the
+        // backing-domain fee charged to its side of this CPI trade. Independent of account_b
+        // (the LP)'s matcher-CPI-derived cap below -- account_a never goes through the
+        // matcher, so before this it had no way to bound this fee at all.
+        if backing_fee_cap_bps > 10_000 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         if account_a_header.portfolio_account_id != account_a_ai.key.to_bytes()
@@ -10582,6 +10652,9 @@ pub mod processor {
             // computation to the market's own `cfg_pre.trade_fee_base_bps` instead — the
             // one fee figure account_b implicitly consents to by registering as an LP.
             cfg_pre.trade_fee_base_bps,
+            // ADOPT upstream 2d9eb5e9: account_a's (the signing taker) own declared cap --
+            // separate consent from account_b's below, and from the trade-fee floor above.
+            Some(backing_fee_cap_bps),
             // ADOPT upstream e24cf78e: the backing-domain fee this trade may charge against
             // the LP's own (account_b) side is a SEPARATE consent from the trade fee above —
             // only the matcher can authorize it, via `backing_fee_cap_bps()` on its CPI return.
@@ -15882,12 +15955,23 @@ pub mod processor {
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
-        {
+        let current_policy = {
             let market_data = market_ai.try_borrow_data()?;
             let profile = read_oracle_profile_for_asset(&market_data, &cfg, asset_index)?;
             let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
             expect_live_authority(&authorities.insurance_authority, authority.key)?;
-        }
+            if domain.is_multiple_of(2) {
+                (
+                    profile.backing_trade_fee_bps_long,
+                    profile.backing_trade_fee_insurance_share_bps_long,
+                )
+            } else {
+                (
+                    profile.backing_trade_fee_bps_short,
+                    profile.backing_trade_fee_insurance_share_bps_short,
+                )
+            }
+        };
         if fee_bps > 10_000
             || insurance_share_bps > 10_000
             || (fee_bps == 0 && insurance_share_bps != 0)
@@ -15930,14 +16014,24 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // sync/w3b-backing-fee-consent (ADOPT upstream be8516b8): a rate change on a
+            // FUNDED bucket is bound to depositor consent -- see
+            // `policy_v16::backing_fee_policy_change_allowed`. No-op changes and changes on
+            // an empty bucket remain unrestricted.
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            if !policy_v16::backing_fee_policy_change_allowed(
+                current_policy.0,
+                current_policy.1,
+                fee_bps,
+                insurance_share_bps,
+                &bucket,
+            ) {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
         }
         if asset_index == 0 {
             let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
-            let old_fee = if long_side {
-                cfg.backing_trade_fee_bps_long
-            } else {
-                cfg.backing_trade_fee_bps_short
-            };
+            let old_fee = current_policy.0;
             adjust_policy_count(&mut cfg, old_fee, fee_bps)?;
             if long_side {
                 cfg.backing_trade_fee_bps_long = fee_bps;
@@ -15954,11 +16048,7 @@ pub mod processor {
             state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)
         } else {
             let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
-            let old_fee = if long_side {
-                profile.backing_trade_fee_bps_long
-            } else {
-                profile.backing_trade_fee_bps_short
-            };
+            let old_fee = current_policy.0;
             adjust_policy_count(&mut cfg, old_fee, fee_bps)?;
             if long_side {
                 profile.backing_trade_fee_bps_long = fee_bps;
@@ -20889,9 +20979,12 @@ pub mod processor {
                 )
                 .map_err(map_v16_error)?;
                 if split.total_fee != 0 {
-                    // CPI supplies the unsigned LP's matcher-selected cap. Check only an
-                    // actual debit so fee-free and risk-reducing fills remain executable
-                    // at cap zero.
+                    // ADOPT upstream 2d9eb5e9: single-trade routes (TradeNoCpi/TradeCpi) now
+                    // supply each debited account's own signed or matcher-selected cap here.
+                    // Check only an actual debit so fee-free and risk-reducing fills remain
+                    // executable at cap zero; batch routes currently pass no cap and reject
+                    // active backing-fee policy before this collector (see
+                    // batchcpi_feeconsent_determination.md).
                     if backing_fee_cap_bps.is_some_and(|cap| bps > cap) {
                         return Err(PercolatorError::Unauthorized.into());
                     }
@@ -20998,6 +21091,7 @@ pub mod processor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_backing_domain_fees_after_trade_view(
         cfg: &WrapperConfigV16,
         group: &mut state::MarketViewMutV16<'_>,
@@ -21005,6 +21099,7 @@ pub mod processor {
         before_a: &[(u32, u128)],
         account_b: &mut percolator::PortfolioV16ViewMut<'_>,
         before_b: &[(u32, u128)],
+        account_a_backing_fee_cap_bps: Option<u16>,
         account_b_backing_fee_cap_bps: Option<u16>,
     ) -> Result<u128, ProgramError> {
         let mut fees_a_by_domain: DomainFeeTotals = Vec::new();
@@ -21013,7 +21108,7 @@ pub mod processor {
             cfg,
             account_a,
             before_a,
-            None,
+            account_a_backing_fee_cap_bps,
             &mut fees_a_by_domain,
         )?;
         let mut fees_b_by_domain: DomainFeeTotals = Vec::new();
@@ -22609,6 +22704,7 @@ pub mod processor {
                     before_a,
                     &mut account_b,
                     before_b,
+                    None,
                     None,
                 )
                 .unwrap();
