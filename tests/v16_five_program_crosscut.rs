@@ -747,6 +747,12 @@ impl CrosscutEnv {
         // cfg.matcher_program / .matcher_context / .matcher_delegate. It must also run BEFORE
         // InitMatcherCtx, which requires the triple to be registered already.
         let (portfolio_id, expected_sequence, _) = self.portfolio_identity(maker_account);
+        // W3-matcher (ADOPT upstream `8f62a5c5`): the LIVE asset-generation
+        // frontier this grant must be authorized against.
+        let asset_generation_frontier = state::read_market_asset_generation_frontier(
+            &self.svm.get_account(&self.market).unwrap().data,
+        )
+        .unwrap();
         // TB-1b: `expiry_slot` must be a live future slot for
         // `matcher_capability_config_is_valid`/`matcher_capability_is_live` to accept
         // `enabled: 1` -- the test harness never warps far enough to approach u64::MAX.
@@ -767,6 +773,7 @@ impl CrosscutEnv {
                 data: ProgInstruction::SetMatcherConfig {
                     portfolio_id,
                     expected_sequence,
+                    asset_generation_frontier,
                     enabled: 1,
                     trade_fee_cap_bps: 10_000,
                     expiry_slot,
@@ -830,7 +837,7 @@ impl CrosscutEnv {
     ) -> Result<(), TransactionError> {
         let (account_a_portfolio_id, _, account_a_position_epoch) =
             self.portfolio_identity(account_a);
-        let (account_b_portfolio_id, _, account_b_position_epoch) =
+        let (account_b_portfolio_id, account_b_matcher_sequence, account_b_position_epoch) =
             self.portfolio_identity(account_b);
         let wix = Instruction {
             program_id: self.program_id,
@@ -850,6 +857,7 @@ impl CrosscutEnv {
                 account_a_position_epoch,
                 account_b_portfolio_id,
                 account_b_position_epoch,
+                account_b_matcher_sequence,
                 asset_index,
                 size_q,
                 fee_bps,
