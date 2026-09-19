@@ -9888,7 +9888,8 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         funding_mark_e6: 0,
         funding_mark_pending_e6: 0,
         funding_mark_pending_slot: 0,
-        _padding1: [0u8; 8],
+        price_move_remainder_bps_num: 0,
+        _padding1: [0u8; 6],
         terminal_slab_scan_progress: 0,
     };
     assert!(
@@ -18040,7 +18041,8 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             funding_mark_e6: 100,
             funding_mark_pending_e6: 0,
             funding_mark_pending_slot: 0,
-            _padding1: [0u8; 8],
+            price_move_remainder_bps_num: 0,
+        _padding1: [0u8; 6],
             terminal_slab_scan_progress: 0,
         };
         state::write_asset_oracle_profile(&mut market.data, 1, &profile1).unwrap();
@@ -18265,7 +18267,8 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             funding_mark_e6: 100,
             funding_mark_pending_e6: 0,
             funding_mark_pending_slot: 0,
-            _padding1: [0u8; 8],
+            price_move_remainder_bps_num: 0,
+        _padding1: [0u8; 6],
             terminal_slab_scan_progress: 0,
         };
         state::write_asset_oracle_profile(&mut market.data, 1, &profile1).unwrap();
