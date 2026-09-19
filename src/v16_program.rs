@@ -4978,13 +4978,25 @@ pub mod ix {
         UpdateAssetLifecycle {
             action: u8,
             asset_index: u16,
-            /// W3A-2: ADOPT upstream `dd958393` epoch binding -- the
-            /// within-generation authority axis (A->B->A rotations of
-            /// `marketauth`/`asset_admin`), checked at every one of this
-            /// tag's three authority-gated call sites. Orthogonal to TB-4's
-            /// `market_id`/generation axis (not yet present on this fork's
-            /// `UpdateAssetLifecycle`, which is why there is no `market_id`
-            /// field here); upstream carries both fields side by side.
+            /// W3A-2: ADOPT upstream `dd958393` epoch binding -- checked at
+            /// every one of this tag's three authority-gated call sites.
+            /// W3A-2 IN ISOLATION only closes the within-generation
+            /// `asset_admin` per-asset axis: `UpdateAssetAuthority` always
+            /// advances the rotated asset's own `authority_epoch` lane
+            /// (`advance_authority_epoch_view`), so an `asset_admin`
+            /// A->B->A round-trip on a given `asset_index` is caught here.
+            /// The `marketauth` A->B->A axis is NOT closed by W3A-2 alone:
+            /// `handle_update_authority` (`UpdateAuthority`, tag 32) rotates
+            /// `cfg.marketauth` without touching any `authority_epoch`, so a
+            /// marketauth A->B->A round-trip never advances the asset-0
+            /// lane this tag checks for marketauth-authorized calls.
+            /// Closing that axis requires sibling unit W3A-1 (upstream
+            /// `95d155bc`'s `UpdateAuthority` half) to co-land and wire
+            /// `UpdateAuthority` into `advance_authority_epoch_view` on
+            /// asset 0. Orthogonal to TB-4's `market_id`/generation axis
+            /// (not yet present on this fork's `UpdateAssetLifecycle`, which
+            /// is why there is no `market_id` field here); upstream carries
+            /// both fields side by side.
             authority_epoch: u64,
             now_slot: u64,
             initial_price: u64,
