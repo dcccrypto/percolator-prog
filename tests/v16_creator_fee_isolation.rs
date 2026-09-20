@@ -489,6 +489,9 @@ fn a_fully_drained_backstop_still_leaves_the_creator_claim_payable() {
         Instruction::WithdrawCreatorFee {
             amount: 100,
             asset_index: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut admin,
@@ -545,6 +548,9 @@ fn asset0_admin_cannot_drain_asset1_creator_fees() {
         Instruction::WithdrawCreatorFee {
             amount: 100,
             asset_index: 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut admin,
@@ -579,6 +585,9 @@ fn asset0_admin_cannot_drain_asset1_creator_fees() {
         Instruction::WithdrawCreatorFee {
             amount: 100,
             asset_index: 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut owner,
@@ -619,6 +628,9 @@ fn withdraw_creator_fee_leaves_the_backstop_fully_spendable_by_tag57() {
         Instruction::WithdrawCreatorFee {
             amount: 100,
             asset_index: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut admin,

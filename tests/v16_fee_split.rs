@@ -287,6 +287,7 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
     let encoded = Instruction::WithdrawCreatorFee {
         amount: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
         asset_index: 0x1234,
+        authority_epoch: 0x1112_1314_1516_1718,
     }
     .encode();
     assert_eq!(
@@ -294,15 +295,18 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
         "WithdrawCreatorFee must encode as dispatch tag 90 — the SDK, the keeper \
          and any pre-signed transaction all hard-code this byte"
     );
-    // GH#420: 17 -> 19 bytes. This IS a wire break, and a deliberate one — the
-    // creator claim now names WHICH asset's fees it is claiming, because a single
-    // market-wide counter could only ever pay one admin. `asset_index` is appended
-    // AFTER `amount`, so the tag byte and the u128 keep their offsets and an old
-    // 17-byte caller fails to DECODE rather than being silently read as asset 0.
+    // GH#420: 17 -> 19 bytes. W4-AE-EXTEND: 19 -> 27 bytes (trailing
+    // `authority_epoch: u64`, gate-2-class replay protection bound to
+    // asset_index's own AssetControlSequencesV16 epoch lane). Both are
+    // deliberate wire breaks: `asset_index` is appended after `amount`, and
+    // `authority_epoch` is appended after THAT, so the tag byte / u128 / u16
+    // all keep their offsets and a pre-W4-AE-EXTEND 19-byte caller fails to
+    // DECODE rather than being silently treated as epoch 0.
     assert_eq!(
         encoded.len(),
-        1 + 16 + 2,
-        "tag byte + u128 amount + u16 asset_index; a length change is a wire break"
+        1 + 16 + 2 + 8,
+        "tag byte + u128 amount + u16 asset_index + u64 authority_epoch; \
+         a length change is a wire break"
     );
     assert_eq!(
         &encoded[17..19],
@@ -314,16 +318,23 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
         &0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128.to_le_bytes(),
         "amount is a little-endian u128 immediately after the tag"
     );
+    assert_eq!(
+        &encoded[19..27],
+        &0x1112_1314_1516_1718u64.to_le_bytes(),
+        "authority_epoch is a little-endian u64 immediately after asset_index"
+    );
 
     // Decode direction, built from the literal byte rather than from encode().
     let mut wire = vec![90u8];
     wire.extend_from_slice(&7u128.to_le_bytes());
     wire.extend_from_slice(&3u16.to_le_bytes());
+    wire.extend_from_slice(&5u64.to_le_bytes());
     assert_eq!(
         Instruction::decode(&wire),
         Ok(Instruction::WithdrawCreatorFee {
             amount: 7,
-            asset_index: 3
+            asset_index: 3,
+            authority_epoch: 5,
         }),
         "byte 90 must dispatch to WithdrawCreatorFee"
     );
@@ -336,6 +347,18 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
     assert!(
         Instruction::decode(&stale).is_err(),
         "the pre-GH#420 17-byte payload must fail to decode"
+    );
+
+    // W4-AE-EXTEND: the pre-W4-AE-EXTEND 19-byte form (amount + asset_index,
+    // no authority_epoch) must ALSO be refused, not silently treated as
+    // `authority_epoch: 0` — the same "fail closed on a length change" contract
+    // GH#420 established for the asset_index append above.
+    let mut pre_ae = vec![90u8];
+    pre_ae.extend_from_slice(&7u128.to_le_bytes());
+    pre_ae.extend_from_slice(&3u16.to_le_bytes());
+    assert!(
+        Instruction::decode(&pre_ae).is_err(),
+        "the pre-W4-AE-EXTEND 19-byte payload must fail to decode"
     );
 
     // And 90 must not have been taken from a neighbour: pin the two adjacent
@@ -868,6 +891,13 @@ impl FeeEnv {
     /// is a legal split (sum 8000 == FEE_SHARE_TOTAL_BPS).
     fn set_fee_split(&mut self, creator: u16, lp: u16, insurance: u16) {
         let admin = self.admin.insecure_clone();
+        // W4-AE-EXTEND: LIVE read of `authority_epoch` -- never a hardcoded constant.
+        let authority_epoch = {
+            let market_account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&market_account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
             accounts: vec![
@@ -878,6 +908,7 @@ impl FeeEnv {
                 creator_share_bps: creator,
                 lp_share_bps: lp,
                 insurance_share_bps: insurance,
+                authority_epoch,
             }
             .encode(),
         };
@@ -1998,6 +2029,16 @@ impl FeeEnv {
         lp: u16,
         insurance: u16,
     ) -> Result<(), solana_sdk::transaction::TransactionError> {
+        // W4-AE-EXTEND: LIVE read of `authority_epoch` -- never a hardcoded
+        // constant. The epoch check runs LAST in the handler (after
+        // `validate_fee_split` and the marketauth check), so this cannot mask
+        // any of the negative-case assertions this helper serves.
+        let authority_epoch = {
+            let market_account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&market_account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         let ix = Instruction {
             program_id: PERCOLATOR_MAINNET,
             accounts: vec![
@@ -2008,6 +2049,7 @@ impl FeeEnv {
                 creator_share_bps: creator,
                 lp_share_bps: lp,
                 insurance_share_bps: insurance,
+                authority_epoch,
             }
             .encode(),
         };

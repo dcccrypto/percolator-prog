@@ -19824,6 +19824,9 @@ fn withdraw_creator_fee(
         Instruction::WithdrawCreatorFee {
             amount,
             asset_index: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [authority, market, dest, vault, vault_auth, token_program],
     )
@@ -19851,6 +19854,9 @@ fn withdraw_creator_fee_no_rollback(
         Instruction::WithdrawCreatorFee {
             amount,
             asset_index: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [authority, market, dest, vault, vault_auth, token_program],
     )
@@ -22022,6 +22028,9 @@ fn v16_wrapper_insurance_withdraw_policy_is_settable() {
         Instruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 1,
             cooldown_slots: 100,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [&mut admin, &mut market],
     )
@@ -22037,6 +22046,9 @@ fn v16_wrapper_insurance_withdraw_policy_is_settable() {
         Instruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 0,
             cooldown_slots: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [&mut admin, &mut market],
     )
@@ -22057,6 +22069,9 @@ fn v16_wrapper_insurance_withdraw_cooldown_is_bounded() {
         Instruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 0,
             cooldown_slots: max,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [&mut admin, &mut market],
     )
@@ -22066,6 +22081,9 @@ fn v16_wrapper_insurance_withdraw_cooldown_is_bounded() {
         Instruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 0,
             cooldown_slots: max + 1,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [&mut admin, &mut market],
     );
@@ -22075,6 +22093,9 @@ fn v16_wrapper_insurance_withdraw_cooldown_is_bounded() {
         Instruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 0,
             cooldown_slots: u64::MAX,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [&mut admin, &mut market],
     );
@@ -22095,6 +22116,9 @@ fn v16_wrapper_insurance_withdraw_policy_requires_marketauth() {
         Instruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 1,
             cooldown_slots: 10,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [&mut attacker, &mut market],
     );

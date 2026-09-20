@@ -16098,6 +16098,7 @@ fn v16_bpf_insurance_withdraw_cooldown_now_actually_fires() {
     env.top_up_insurance_domain_with_authority_and_cu(&admin, 0, 500);
 
     // The instruction that did not exist before #427.
+    let authority_epoch = env.control_sequences(0).authority_epoch;
     send_tx(
         &mut env.svm,
         env.program_id,
@@ -16105,6 +16106,7 @@ fn v16_bpf_insurance_withdraw_cooldown_now_actually_fires() {
         ProgInstruction::UpdateInsuranceWithdrawPolicy {
             deposits_only: 0,
             cooldown_slots: 1_000,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -18427,4 +18429,369 @@ fn v16_bpf_update_asset_authority_cas_rejects_held_tx_after_intervening_rotation
     // build-sbf'd revert-of-`handle_update_asset_authority`-only exercise
     // proving this test is genuinely coupled to the CAS (not vacuously true
     // under the pre-fix uniform strictly-increasing nonce too).
+}
+
+// ── W4-AE-EXTEND ─────────────────────────────────────────────────────────────
+//
+// Extends the same "held tx across an intervening rotation" landmine test to
+// three fork-only admin/fund instructions that had ZERO authority_epoch replay
+// protection: `UpdateFeeSplit` (tag 86) and `UpdateInsuranceWithdrawPolicy`
+// (tag 92), both marketauth-gated and bound to the SHARED asset-0
+// `authority_epoch` lane (the same lane `UpdateAuthority`/tag 32 and
+// `UpdateAssetAuthority` advance), and `WithdrawCreatorFee` (tag 90), gated on
+// the TARGET asset's own `asset_admin` and bound to that asset's OWN epoch
+// lane. Each test below: (1) reads the LIVE current `authority_epoch`, (2)
+// builds but does NOT submit a tx against it, (3) a DIFFERENT legitimate
+// `UpdateAssetAuthority` rotation (kind ASSET_AUTH_ORACLE, so it never
+// disturbs the authority the tag under test is itself gated on) lands first
+// and advances the SAME epoch lane, (4) the held tx is submitted and MUST now
+// be rejected with `EngineStale`, then (5) a POSITIVE CONTROL resubmits the
+// same call with the corrected (post-rotation) epoch and MUST succeed.
+//
+// Non-vacuity (each test individually, reported in this unit's handback):
+// neuter the tag's own `require_current_authority_epoch` call site in
+// `src/v16_program.rs` (stub it to always `Ok(())`) -> `cargo build-sbf
+// --features devnet` -> the corresponding test below must FAIL (the held tx
+// is wrongly admitted) -> restore -> `cargo build-sbf --features devnet` ->
+// passes again.
+
+#[test]
+fn v16_bpf_update_fee_split_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) an UpdateFeeSplit against the CURRENT
+    //    asset-0 epoch. 3600/3200/1200 sums to FEE_SHARE_TOTAL_BPS (8000) and
+    //    sits exactly on both floors (creator <= 3600, lp >= 3200,
+    //    insurance >= 1200), so the ONLY thing that can reject this call is
+    //    the epoch check under test.
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_ix = ProgInstruction::UpdateFeeSplit {
+        creator_share_bps: 3600,
+        lp_share_bps: 3200,
+        insurance_share_bps: 1200,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing the SAME asset-0 `authority_epoch`
+    //    counter this tag is bound to. The held tx above is NOT submitted
+    //    here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1).
+    let before = env.svm.get_account(&env.market).unwrap().data;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held UpdateFeeSplit signed against a since-superseded \
+             authority_epoch must be rejected once an intervening rotation \
+             has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        before,
+        "the rejected held tx must leave the market's fee-split config untouched"
+    );
+
+    // 4. POSITIVE CONTROL: the SAME call, corrected to the post-rotation
+    //    epoch, must succeed -- proving the rejection above is solely the
+    //    epoch check, not some other defect in the handler or fixture.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::UpdateFeeSplit {
+            creator_share_bps: 3600,
+            lp_share_bps: 3200,
+            insurance_share_bps: 1200,
+            authority_epoch: held_expected + 1,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("UpdateFeeSplit against the LIVE current epoch must succeed");
+    let (cfg_after, _, _, _) =
+        state::read_market_config_mode_and_capacity(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
+    assert_eq!(cfg_after.creator_share_bps, 3600);
+    assert_eq!(cfg_after.lp_share_bps, 3200);
+    assert_eq!(cfg_after.insurance_share_bps, 1200);
+}
+
+#[test]
+fn v16_bpf_update_insurance_withdraw_policy_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) an UpdateInsuranceWithdrawPolicy against
+    //    the CURRENT asset-0 epoch.
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_ix = ProgInstruction::UpdateInsuranceWithdrawPolicy {
+        deposits_only: 1,
+        cooldown_slots: 1_000,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing the SAME asset-0 `authority_epoch`
+    //    counter this tag is bound to. The held tx above is NOT submitted
+    //    here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1).
+    let before = env.svm.get_account(&env.market).unwrap().data;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held UpdateInsuranceWithdrawPolicy signed against a \
+             since-superseded authority_epoch must be rejected once an \
+             intervening rotation has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        before,
+        "the rejected held tx must leave the market's insurance-withdraw policy untouched"
+    );
+
+    // 4. POSITIVE CONTROL: the SAME call, corrected to the post-rotation
+    //    epoch, must succeed.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::UpdateInsuranceWithdrawPolicy {
+            deposits_only: 1,
+            cooldown_slots: 1_000,
+            authority_epoch: held_expected + 1,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("UpdateInsuranceWithdrawPolicy against the LIVE current epoch must succeed");
+    let (cfg_after, _, _, _) =
+        state::read_market_config_mode_and_capacity(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
+    assert_eq!(cfg_after.insurance_withdraw_deposits_only, 1);
+    assert_eq!(cfg_after.insurance_withdraw_cooldown_slots, 1_000);
+}
+
+#[test]
+fn v16_bpf_withdraw_creator_fee_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    // Asset 0 is bootstrapped by `InitMarket` itself (its `asset_admin`
+    // defaults to the market admin) -- unlike assets 1..N, it is never
+    // ACTIVATEd via a separate call, so `activate_asset` is deliberately NOT
+    // used here (it would reject with `AssetSlotAlreadyConfigured`).
+
+    // Seed a claimable creator-fee pot directly (the accrual path itself is
+    // covered elsewhere; this test is about the epoch binding, not accrual).
+    // `creator_fee_claimable_atoms` lives on `WrapperConfigV16` (the legacy
+    // asset-0 pot); `header.insurance`/`header.vault` are the engine-level
+    // ledgers `withdraw_insurance_surplus_not_atomic` clamps against, and the
+    // SPL vault balance is the actual token leg the transfer moves.
+    let claimable: u64 = 1_000;
+    {
+        let mut market_account = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, group) = state::market_view_mut(&mut market_account.data).unwrap();
+            group.header.insurance = percolator::V16PodU128::new(10_000);
+            group.header.vault = percolator::V16PodU128::new(10_000);
+        }
+        let (mut cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+        cfg.creator_fee_claimable_atoms = claimable;
+        state::write_wrapper_config(&mut market_account.data, &cfg).unwrap();
+        env.svm.set_account(env.market, market_account).unwrap();
+    }
+    // Fund the canonical primary vault so the SPL leg can actually pay out.
+    env.vault_token_for_mint(env.mint, 10_000);
+    let dest = env.token_account_for_mint(env.mint, admin.pubkey(), 0);
+
+    // 1. Sign (build, DON'T submit) a WithdrawCreatorFee against the CURRENT
+    //    asset-0 epoch (asset_index 0's own lane -- the asset it withdraws
+    //    against).
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_ix = ProgInstruction::WithdrawCreatorFee {
+        amount: claimable as u128,
+        asset_index: 0,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing asset 0's `authority_epoch`.
+    //    Deliberately ASSET_AUTH_ORACLE, not ASSET_AUTH_ADMIN -- rotating the
+    //    latter would change `asset_admin` itself and reject the held tx for
+    //    the WRONG reason (Unauthorized, not EngineStale). The held tx above
+    //    is NOT submitted here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1). Were it wrongly admitted, the withdrawal WOULD
+    //    otherwise fully succeed (accounts are genuinely funded/valid, and
+    //    `asset_admin` is untouched) -- proving the rejection is solely the
+    //    epoch check, not some other account-shape defect.
+    let before_market = env.svm.get_account(&env.market).unwrap().data;
+    let before_dest = env.token_amount(dest);
+    let before_vault = env.token_amount(env.vault);
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held WithdrawCreatorFee signed against a since-superseded \
+             authority_epoch must be rejected once an intervening rotation \
+             has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        before_market,
+        "the rejected held tx must leave the market's creator-fee pot untouched"
+    );
+    assert_eq!(
+        env.token_amount(dest),
+        before_dest,
+        "the rejected held tx must not move any tokens to dest"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        before_vault,
+        "the rejected held tx must not move any tokens out of the vault"
+    );
+
+    // 4. POSITIVE CONTROL: the SAME call, corrected to the post-rotation
+    //    epoch, must succeed and actually pay out.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::WithdrawCreatorFee {
+            amount: claimable as u128,
+            asset_index: 0,
+            authority_epoch: held_expected + 1,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&admin],
+    )
+    .expect("WithdrawCreatorFee against the LIVE current epoch must succeed");
+    assert_eq!(
+        env.token_amount(dest),
+        before_dest + claimable,
+        "the successful claim must pay out exactly `claimable` atoms"
+    );
+    let (cfg_after, _, _, _) =
+        state::read_market_config_mode_and_capacity(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
+    assert_eq!(
+        cfg_after.creator_fee_claimable_atoms, 0,
+        "the claimable pot must be fully drained"
+    );
 }
