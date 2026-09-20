@@ -364,7 +364,11 @@ fn withdraw_creator_fee_is_dispatch_tag_90_on_the_wire() {
     // And 90 must not have been taken from a neighbour: pin the two adjacent
     // fee-withdrawal tags this instruction was modelled on.
     assert_eq!(
-        Instruction::WithdrawProtocolFee { amount: 1 }.encode()[0],
+        Instruction::WithdrawProtocolFee {
+            amount: 1,
+            authority_epoch: 0,
+        }
+        .encode()[0],
         84
     );
     assert_eq!(Instruction::WithdrawInsuranceReserveToStake.encode()[0], 87);

@@ -596,6 +596,16 @@ impl V16CuEnv {
             .expect("read control sequences")
     }
 
+    /// W4-AE-84: reads the LIVE market-wide `protocol_fee_authority_epoch`
+    /// counter straight off the on-chain market account bytes, mirroring
+    /// `control_sequences`'s own "never a hardcoded constant" role for
+    /// `WithdrawProtocolFee` (tag 84).
+    fn protocol_fee_authority_epoch(&self) -> u64 {
+        let account = self.svm.get_account(&self.market).expect("market account");
+        state::read_protocol_fee_authority_epoch(&account.data)
+            .expect("read protocol_fee_authority_epoch")
+    }
+
     fn update_market_init_fee_policy_with_cu(&mut self, min_init_fee: u128) -> u64 {
         let policy_sequence = self.control_sequences(0).market_init_fee + 1;
         send_tx(
@@ -18793,5 +18803,216 @@ fn v16_bpf_withdraw_creator_fee_cas_rejects_held_tx_after_intervening_rotation()
     assert_eq!(
         cfg_after.creator_fee_claimable_atoms, 0,
         "the claimable pot must be fully drained"
+    );
+}
+
+// ============================================================================
+// W4-AE-84 (follow-up to W4-AE-EXTEND above): binds `authority_epoch` CAS
+// anti-replay to `WithdrawProtocolFee` (tag 84) -- the one reachable F5-gap
+// tag W4-AE-EXTEND flagged but could not bind, because `cfg.
+// protocol_fee_authority` is market-config-scoped (a `WrapperConfigV16`
+// field), not asset-scoped, so it had no existing `AssetControlSequencesV16.
+// authority_epoch` lane to reuse (reusing asset-0's lane would have been
+// semantically wrong -- that lane tracks `marketauth` rotations via
+// `UpdateAuthority`/tag 32, a disjoint authority). This unit adds a
+// DEDICATED market-wide `protocol_fee_authority_epoch` counter (see
+// `constants::PROTOCOL_FEE_AUTHORITY_EPOCH_OFF`'s doc comment for its
+// placement) that `SetProtocolFeeAuthority` (tag 85) unconditionally
+// advances on every successful rotation and `WithdrawProtocolFee` (tag 84)
+// CAS-checks.
+//
+// Unlike the 3 tests above (which use an UNRELATED `UpdateAssetAuthority`
+// lane just to advance a SHARED counter without disturbing the authority
+// under test), `protocol_fee_authority` is rotated ONLY via tag 85, so tag
+// 85 itself IS the intervening rotation event here -- there is no other
+// instruction that could advance this counter. The rotation targets the SAME
+// value (admin -> admin) so this test isolates the epoch-CAS behaviour from
+// tag 85's OTHER effect (actually changing `cfg.protocol_fee_authority`,
+// which is covered elsewhere by
+// `v16_wrapper_set_protocol_fee_authority_requires_upgrade_authority` and is
+// not this unit's concern).
+//
+// Non-vacuity (reported in this unit's handback report): neuter
+// `require_protocol_fee_authority_epoch_view`'s call site in
+// `handle_withdraw_protocol_fee` (`src/v16_program.rs`, stub it to always
+// `Ok(())`) -> `cargo build-sbf --features devnet` -> this test FAILS (the
+// held tx is wrongly admitted, withdrawing real funds) -> restore -> `cargo
+// build-sbf --features devnet` -> passes again.
+#[test]
+fn v16_bpf_withdraw_protocol_fee_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // Mock the BPF-upgrade-authority `ProgramData` account `SetProtocolFeeAuthority`
+    // (tag 85) is gated on. LiteSVM's `add_program` deploys under the plain
+    // (non-upgradeable) loader, so this PDA has no real account in this
+    // harness; construct one matching `read_program_data_upgrade_authority`'s
+    // exact parse contract (45-byte metadata: 4-byte LE discriminant=3
+    // ("ProgramData"), 8-byte slot, 1-byte Option tag, 32-byte pubkey), with
+    // `admin` as the upgrade authority -- same byte layout
+    // `tests/v16_wrapper.rs::program_data_account` uses for the non-LiteSVM
+    // harness's equivalent tests.
+    let (program_data_key, _) = Pubkey::find_program_address(
+        &[env.program_id.as_ref()],
+        &solana_sdk::bpf_loader_upgradeable::id(),
+    );
+    let mut program_data_bytes = vec![0u8; 45];
+    program_data_bytes[0..4].copy_from_slice(&3u32.to_le_bytes());
+    program_data_bytes[12] = 1;
+    program_data_bytes[13..45].copy_from_slice(admin.pubkey().as_ref());
+    env.svm
+        .set_account(
+            program_data_key,
+            Account {
+                lamports: 1_000_000_000,
+                data: program_data_bytes,
+                owner: solana_sdk::bpf_loader_upgradeable::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Seed `cfg.protocol_fee_authority` to `admin` (`InitMarket` sets it to
+    // the hardcoded `PROTOCOL_FEE_AUTHORITY_DEFAULT`, whose key this test
+    // doesn't hold) plus a claimable protocol-fee pot, mirroring
+    // `v16_bpf_withdraw_creator_fee_cas_rejects_held_tx_after_intervening_rotation`'s
+    // own seeding idiom above.
+    let accrued: u128 = 1_000;
+    {
+        let mut market_account = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, group) = state::market_view_mut(&mut market_account.data).unwrap();
+            group.header.insurance = percolator::V16PodU128::new(10_000);
+            group.header.vault = percolator::V16PodU128::new(10_000);
+        }
+        let (mut cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+        cfg.protocol_fee_authority = admin.pubkey().to_bytes();
+        cfg.protocol_fee_accrued_atoms = accrued;
+        cfg.protocol_fee_withdrawn_atoms = 0;
+        state::write_wrapper_config(&mut market_account.data, &cfg).unwrap();
+        env.svm.set_account(env.market, market_account).unwrap();
+    }
+    // Fund the canonical primary vault so the SPL leg can actually pay out.
+    env.vault_token_for_mint(env.mint, 10_000);
+    let dest = env.token_account_for_mint(env.mint, admin.pubkey(), 0);
+
+    // 1. Sign (build, DON'T submit) a WithdrawProtocolFee against the CURRENT
+    //    market-wide `protocol_fee_authority_epoch`.
+    let held_expected = env.protocol_fee_authority_epoch();
+    let held_ix = ProgInstruction::WithdrawProtocolFee {
+        amount: accrued,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST -- `SetProtocolFeeAuthority`
+    //    (tag 85), rotated to the SAME value (admin -> admin) so it advances
+    //    the epoch WITHOUT changing `cfg.protocol_fee_authority` itself (see
+    //    this block's header comment for why). The held tx above is NOT
+    //    submitted here -- it stays "held".
+    env.send(
+        ProgInstruction::SetProtocolFeeAuthority {
+            new_authority: admin.pubkey().to_bytes(),
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(program_data_key, false),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.protocol_fee_authority_epoch(),
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+    let (cfg_mid, _, _, _) =
+        state::read_market_config_mode_and_capacity(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
+    assert_eq!(
+        cfg_mid.protocol_fee_authority,
+        admin.pubkey().to_bytes(),
+        "self-rotation (admin -> admin) must leave protocol_fee_authority unchanged"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1). Were it wrongly admitted, the withdrawal WOULD
+    //    otherwise fully succeed (accounts are genuinely funded/valid, and
+    //    `protocol_fee_authority` is unchanged post-rotation) -- proving the
+    //    rejection is solely the epoch check, not some other account-shape
+    //    defect.
+    let before_market = env.svm.get_account(&env.market).unwrap().data;
+    let before_dest = env.token_amount(dest);
+    let before_vault = env.token_amount(env.vault);
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held WithdrawProtocolFee signed against a since-superseded \
+             protocol_fee_authority_epoch must be rejected once an \
+             intervening rotation has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        before_market,
+        "the rejected held tx must leave the market's protocol-fee ledger untouched"
+    );
+    assert_eq!(
+        env.token_amount(dest),
+        before_dest,
+        "the rejected held tx must not move any tokens to dest"
+    );
+    assert_eq!(
+        env.token_amount(env.vault),
+        before_vault,
+        "the rejected held tx must not move any tokens out of the vault"
+    );
+
+    // 4. POSITIVE CONTROL: the SAME call, corrected to the post-rotation
+    //    epoch, must succeed and actually pay out.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::WithdrawProtocolFee {
+            amount: accrued,
+            authority_epoch: held_expected + 1,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&admin],
+    )
+    .expect("WithdrawProtocolFee against the LIVE current epoch must succeed");
+    assert_eq!(
+        env.token_amount(dest),
+        before_dest + accrued as u64,
+        "the successful claim must pay out exactly `accrued` atoms"
+    );
+    let (cfg_after, _, _, _) =
+        state::read_market_config_mode_and_capacity(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
+    assert_eq!(
+        cfg_after.protocol_fee_withdrawn_atoms, accrued,
+        "the claim must be fully drained"
     );
 }

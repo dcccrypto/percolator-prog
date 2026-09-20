@@ -286,6 +286,51 @@ pub mod constants {
     /// uses.
     pub const ASSET_CONTROL_SEQUENCES_LEN: usize = 88;
 
+    /// W4-AE-84: byte offset of the market-wide `protocol_fee_authority_epoch`
+    /// CAS counter, gating `WithdrawProtocolFee` (tag 84) against a replayed
+    /// signed withdrawal surviving an intervening `SetProtocolFeeAuthority`
+    /// (tag 85) A->B->A cycle -- the same durable-nonce class the whole
+    /// authority-epoch campaign targets, flagged-but-not-bound by
+    /// W4-AE-EXTEND because `protocol_fee_authority` is market-config-scoped
+    /// (a `WrapperConfigV16` field), not asset-scoped, so it has no existing
+    /// `AssetControlSequencesV16.authority_epoch` lane to reuse -- reusing
+    /// asset-0's lane would be semantically wrong (that lane tracks
+    /// `marketauth` rotations via `UpdateAuthority`/tag 32, a disjoint
+    /// authority from `protocol_fee_authority`, rotated only via tag 85).
+    ///
+    /// PLACEMENT (least-invasive option chosen, per this unit's own
+    /// instructions): carved from the [600, 1024) "spare headroom" region
+    /// `ASSET_ORACLE_WRAPPER_LEN`'s own doc comment documents as fully free
+    /// -- immediately after `AssetControlSequencesV16`, which itself ends at
+    /// exactly 600. This is INSIDE the already-fixed 1024-byte
+    /// `ASSET_ORACLE_WRAPPER_LEN` slot, so `MARKET_ASSET_SLOT_LEN`,
+    /// `MARKET_GROUP_OFF` and every asset-profile offset are UNCHANGED --
+    /// zero offset churn. The counter itself is market-wide, not per-asset:
+    /// following the SAME precedent `AssetOracleProfileV16::
+    /// maintenance_fee_checkpoint_slot` and `::terminal_slab_scan_progress`
+    /// already established ("market-wide value stored in asset 0's wrapper
+    /// slot; only asset 0's copy is ever read or written"), this value lives
+    /// at this fixed offset inside asset 0's slot ONLY -- assets 1..N never
+    /// read or write it.
+    ///
+    /// REJECTED alternative (explicitly the LAST resort per this unit's own
+    /// instructions): growing `WrapperConfigV16`'s own 576-byte tail. Its own
+    /// doc comment states it is already exactly full (the `_padding_split`
+    /// pad was fully consumed by `creator_fee_claimable_atoms`) -- any growth
+    /// there would shift `MARKET_GROUP_OFF` (592) and every downstream
+    /// asset-profile offset, a re-seed-class change. The F-01 re-seed covers
+    /// that safely, but this placement needs it NOT AT ALL, so it is
+    /// strictly less invasive and is chosen instead.
+    pub const PROTOCOL_FEE_AUTHORITY_EPOCH_OFF: usize =
+        ASSET_CONTROL_SEQUENCES_OFF + ASSET_CONTROL_SEQUENCES_LEN;
+    /// A single `u64` counter -- no struct needed.
+    pub const PROTOCOL_FEE_AUTHORITY_EPOCH_LEN: usize = 8;
+
+    const _: () = assert!(PROTOCOL_FEE_AUTHORITY_EPOCH_OFF == 600);
+    const _: () = assert!(
+        PROTOCOL_FEE_AUTHORITY_EPOCH_OFF + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN <= ASSET_ORACLE_WRAPPER_LEN
+    );
+
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
     pub const PORTFOLIO_STATE_LEN: usize = size_of::<PortfolioAccountV16Account>();
@@ -925,7 +970,9 @@ pub mod state {
             ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
             ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
             PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN,
-            PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
+            PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN,
+            PROTOCOL_FEE_AUTHORITY_EPOCH_LEN, PROTOCOL_FEE_AUTHORITY_EPOCH_OFF, VERSION,
+            WRAPPER_CONFIG_LEN,
         },
         error::PercolatorError,
     };
@@ -1958,6 +2005,73 @@ pub mod state {
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(bytemuck::bytes_of(sequences));
         Ok(())
+    }
+
+    /// W4-AE-84: byte range of the market-wide `protocol_fee_authority_epoch`
+    /// counter -- always asset index 0 (see
+    /// `constants::PROTOCOL_FEE_AUTHORITY_EPOCH_OFF`'s doc comment for why
+    /// this is a market-wide, not per-asset, value). Guards against a market
+    /// with zero configured asset slots the same way
+    /// `asset_control_sequences_range` guards `asset_index >= capacity`.
+    #[inline]
+    fn protocol_fee_authority_epoch_range(
+        data: &[u8],
+    ) -> Result<core::ops::Range<usize>, ProgramError> {
+        let capacity = market_slot_capacity(data)?;
+        if capacity == 0 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let start = dynamic_slot_offset(0)?
+            .checked_add(PROTOCOL_FEE_AUTHORITY_EPOCH_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(start..start + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN)
+    }
+
+    /// W4-AE-84: raw-buffer read of the market-wide `protocol_fee_authority_epoch`
+    /// counter, for handlers with no `MarketViewMutV16` in scope (matching
+    /// `handle_update_fee_split`/`handle_update_insurance_withdraw_policy`'s
+    /// own W4-AE-EXTEND idiom of reading `AssetControlSequencesV16` bytes
+    /// directly). Used by `handle_set_protocol_fee_authority` (tag 85).
+    pub fn read_protocol_fee_authority_epoch(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = protocol_fee_authority_epoch_range(data)?;
+        let bytes = data.get(range).ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(bytemuck::pod_read_unaligned::<u64>(bytes))
+    }
+
+    /// W4-AE-84: raw-buffer write counterpart to
+    /// `read_protocol_fee_authority_epoch`, above.
+    pub fn write_protocol_fee_authority_epoch(
+        data: &mut [u8],
+        value: u64,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = protocol_fee_authority_epoch_range(data)?;
+        data.get_mut(range)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(&value));
+        Ok(())
+    }
+
+    /// W4-AE-84: unconditional monotonic increment, no CAS input -- used
+    /// ONLY by `SetProtocolFeeAuthority` (tag 85), which itself carries no
+    /// `expected`/CAS argument (it is gated on the program's BPF upgrade
+    /// authority, an external trust class W4-AE-EXTEND's own per-tag
+    /// analysis found out of scope for this program's epoch mechanism: "A
+    /// theoretical A->B->A cycle of the EXTERNAL upgrade authority is a
+    /// different, out-of-scope trust class, not fixable by our
+    /// authority_epoch mechanism"). This tag's role here is only to ADVANCE
+    /// the counter that `WithdrawProtocolFee` (tag 84) CAS-checks -- the
+    /// same relationship `UpdateAuthority` (tag 32) has with
+    /// `UpdateFeeSplit`/`UpdateInsuranceWithdrawPolicy`'s check-only use of
+    /// the asset-0 `authority_epoch` lane. Distinct from
+    /// `next_authority_epoch`, which additionally validates a caller-supplied
+    /// `expected` -- there is no such input here to validate.
+    #[inline]
+    pub fn bump_protocol_fee_authority_epoch(current: u64) -> Result<u64, ProgramError> {
+        current
+            .checked_add(1)
+            .ok_or_else(|| PercolatorError::EngineCounterOverflow.into())
     }
 
     /// ADOPT upstream `ef3b1a55`/`20f0b9b1`'s helper of the same name,
@@ -5156,6 +5270,22 @@ pub mod ix {
         /// Signer-gated on `cfg.protocol_fee_authority`.
         WithdrawProtocolFee {
             amount: u128,
+            /// W4-AE-84: gate-2-class replay protection. `cfg.
+            /// protocol_fee_authority` is rotated only via
+            /// `SetProtocolFeeAuthority` (tag 85), and before this field
+            /// existed a signed `WithdrawProtocolFee` held via a durable
+            /// nonce (caller-chosen `amount`, bounded only by whatever is
+            /// currently accrued) stayed valid across any A->B->A cycle of
+            /// that authority -- the same durable-nonce class the whole
+            /// authority-epoch campaign targets, just on a
+            /// market-config-scoped authority instead of an asset-scoped
+            /// one. CHECK ONLY (this tag does not itself rotate
+            /// `protocol_fee_authority`) against the market-wide
+            /// `protocol_fee_authority_epoch` counter (see
+            /// `constants::PROTOCOL_FEE_AUTHORITY_EPOCH_OFF`'s doc comment
+            /// for the counter's placement), which `SetProtocolFeeAuthority`
+            /// unconditionally advances on every successful rotation.
+            authority_epoch: u64,
         },
         /// SetProtocolFeeAuthority (tag 85) — rotates `protocol_fee_authority`.
         /// Gated on the program's BPF upgrade authority (a new pattern for
@@ -5657,6 +5787,7 @@ pub mod ix {
                 }
                 84 => Self::WithdrawProtocolFee {
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 85 => Self::SetProtocolFeeAuthority {
                     new_authority: read_bytes32(&mut rest)?,
@@ -6231,9 +6362,13 @@ pub mod ix {
                     out.extend_from_slice(&fee_to_insurance_bps.to_le_bytes());
                     out.extend_from_slice(&skew_spread_mult_bps.to_le_bytes());
                 }
-                Self::WithdrawProtocolFee { amount } => {
+                Self::WithdrawProtocolFee {
+                    amount,
+                    authority_epoch,
+                } => {
                     out.push(84);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::SetProtocolFeeAuthority { new_authority } => {
                     out.push(85);
@@ -8227,6 +8362,45 @@ pub mod processor {
         state::require_current_authority_epoch(sequences.authority_epoch, expected)
     }
 
+    /// W4-AE-84: view variant of `state::read_protocol_fee_authority_epoch`,
+    /// for handlers that already hold a `MarketViewMutV16` (a mutable borrow
+    /// of the same underlying account bytes), matching
+    /// `read_control_sequences_from_view`'s own pattern above for the
+    /// byte-disjoint `AssetControlSequencesV16` region. Always asset index 0
+    /// -- see `constants::PROTOCOL_FEE_AUTHORITY_EPOCH_OFF`'s doc comment for
+    /// why this is a market-wide, not per-asset, counter.
+    fn read_protocol_fee_authority_epoch_view(
+        group: &state::MarketViewMutV16<'_>,
+    ) -> Result<u64, ProgramError> {
+        let market = group
+            .markets
+            .first()
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let bytes = market
+            .wrapper
+            .get(
+                constants::PROTOCOL_FEE_AUTHORITY_EPOCH_OFF
+                    ..constants::PROTOCOL_FEE_AUTHORITY_EPOCH_OFF
+                        + constants::PROTOCOL_FEE_AUTHORITY_EPOCH_LEN,
+            )
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(bytemuck::pod_read_unaligned::<u64>(bytes))
+    }
+
+    /// W4-AE-84: gate-2-class replay protection for `WithdrawProtocolFee`
+    /// (tag 84). CHECK ONLY -- this tag does not itself rotate
+    /// `protocol_fee_authority`, it only spends from it, so it never advances
+    /// the counter (mirroring `require_authority_epoch_view`'s CHECK-ONLY
+    /// role for `UpdateFeeSplit`/`UpdateInsuranceWithdrawPolicy` against the
+    /// asset-0 `authority_epoch` lane -- same idiom, different counter).
+    fn require_protocol_fee_authority_epoch_view(
+        group: &state::MarketViewMutV16<'_>,
+        expected: u64,
+    ) -> ProgramResult {
+        let current = read_protocol_fee_authority_epoch_view(group)?;
+        state::require_current_authority_epoch(current, expected)
+    }
+
     fn mirror_manual_profile_to_base_config(
         cfg: &mut WrapperConfigV16,
         profile: &state::AssetOracleProfileV16,
@@ -9208,9 +9382,10 @@ pub mod processor {
                 fee_to_insurance_bps,
                 skew_spread_mult_bps,
             ),
-            Instruction::WithdrawProtocolFee { amount } => {
-                handle_withdraw_protocol_fee(program_id, accounts, amount)
-            }
+            Instruction::WithdrawProtocolFee {
+                amount,
+                authority_epoch,
+            } => handle_withdraw_protocol_fee(program_id, accounts, amount, authority_epoch),
             Instruction::SetProtocolFeeAuthority { new_authority } => {
                 handle_set_protocol_fee_authority(program_id, accounts, new_authority)
             }
@@ -13820,6 +13995,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -13854,6 +14030,17 @@ pub mod processor {
             if !live_authority_matches(&cfg.protocol_fee_authority, authority.key) {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // W4-AE-84: gate-2-class replay protection -- a direct
+            // fund-withdrawal instruction, signer-gated on
+            // `cfg.protocol_fee_authority` (rotated only via
+            // `SetProtocolFeeAuthority`, tag 85) with zero prior replay
+            // protection. CHECK ONLY against the market-wide
+            // `protocol_fee_authority_epoch` counter -- this tag does not
+            // itself rotate `protocol_fee_authority`, so it never advances
+            // the counter, matching `require_authority_epoch_view`'s
+            // CHECK-ONLY role for `UpdateFeeSplit`/
+            // `UpdateInsuranceWithdrawPolicy`.
+            require_protocol_fee_authority_epoch_view(&group, expected_authority_epoch)?;
             verify_withdrawable_token_accounts(
                 dest_token,
                 authority.key,
@@ -14177,7 +14364,20 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         cfg.protocol_fee_authority = new_authority;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        state::write_wrapper_config(&mut market_data, &cfg)?;
+        // W4-AE-84: advance the market-wide `protocol_fee_authority_epoch`
+        // counter on every successful rotation -- this is the "rotation
+        // event" that invalidates any `WithdrawProtocolFee` (tag 84) held
+        // and signed against the PRE-rotation epoch, the same relationship
+        // `UpdateAuthority` (tag 32) has with the asset-0 `authority_epoch`
+        // lane `UpdateFeeSplit`/`UpdateInsuranceWithdrawPolicy` check-only.
+        // Unconditional (no CAS input here) -- see
+        // `state::bump_protocol_fee_authority_epoch`'s doc comment for why
+        // this tag carries no `expected` argument of its own.
+        let current_epoch = state::read_protocol_fee_authority_epoch(&market_data)?;
+        let next_epoch = state::bump_protocol_fee_authority_epoch(current_epoch)?;
+        state::write_protocol_fee_authority_epoch(&mut market_data, next_epoch)
     }
 
     /// UpdateFeeSplit (tag 86) — marketauth-gated. Validates the shares, then
