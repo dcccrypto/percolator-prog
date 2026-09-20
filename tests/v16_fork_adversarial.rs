@@ -79,6 +79,17 @@ const MAX_PORTFOLIO_ASSETS: u16 = 1;
 /// asset 1; domain = 2*asset_index = 2).
 const ASSET: u16 = 1;
 
+/// GH#496: an UNSIGNED terminal payout (`CloseResolved` tag 45,
+/// `ClaimResolvedPayoutTopup` tag 46) must present this market group's canonical
+/// `NftRegistry` PDA as proof that the portfolio is not NFT-escrowed — otherwise an
+/// escrowed position's whole payout could be routed into the escrow PDA's own token
+/// account, which nothing can ever spend from. These fixtures never register an NFT
+/// program, so the account does not exist and the (System-owned, empty) PDA is
+/// itself the proof.
+fn nft_registry_pda(market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"nft_registry", market.as_ref()], &percolator_prog::id()).0
+}
+
 // ---------------------------------------------------------------------------
 // BPF + SPL-token program paths (mirrors tests/v16_cu.rs:59-99).
 // ---------------------------------------------------------------------------
@@ -737,6 +748,7 @@ impl Env {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&self.market), false),
             ],
             &[],
         );
@@ -760,6 +772,7 @@ impl Env {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&self.market), false),
             ],
             &[],
         )

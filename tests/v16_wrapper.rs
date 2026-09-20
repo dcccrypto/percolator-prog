@@ -16724,6 +16724,11 @@ fn v16_wrapper_close_resolved_is_permissionless_but_pays_only_owner_token_accoun
     let mut vault = vault_token_account(&market, mint, 1_000);
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
+    // GH#496: an UNSIGNED terminal payout now carries one extra read-only account —
+    // this market group's canonical `NftRegistry` PDA — as proof that the portfolio
+    // is not NFT-escrowed. This market never ran `SetNftProgramId`, so the account
+    // does not exist (System-owned, empty), which is itself the proof.
+    let mut registry_proof = uninitialized_nft_registry_account(&market);
     let before_market = market.data.clone();
     let before_portfolio = portfolio.data.clone();
     let wrong_destination = run_ix(
@@ -16738,6 +16743,7 @@ fn v16_wrapper_close_resolved_is_permissionless_but_pays_only_owner_token_accoun
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut registry_proof,
         ],
     );
     assert_err_and_market_unchanged(wrong_destination, &market, &before_market);
@@ -16756,6 +16762,7 @@ fn v16_wrapper_close_resolved_is_permissionless_but_pays_only_owner_token_accoun
             &mut vault,
             &mut vault_auth,
             &mut token_program,
+            &mut registry_proof,
         ],
     )
     .unwrap();
@@ -25867,5 +25874,461 @@ fn wgenl_w19_version18_refuses_a_version17_ledger_before_the_generation_branch()
         Err(ProgramError::Custom(1)),
         "a VERSION-17 ledger is InvalidVersion — the legacy market_id == 0 branch \
          is unreachable for any account the deployed wrapper wrote"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GH#496 — permissionless terminal payouts must not burn an NFT-escrowed
+// position into the escrow PDA.
+//
+// `CloseResolved` (tag 45) and `ClaimResolvedPayoutTopup` (tag 46) are
+// deliberately permissionless: `accounts[0]` need NOT sign and the payout
+// destination is bound to its key. Upstream that is sound because
+// `portfolio.owner` is always the wallet that signed `InitPortfolio`. This fork's
+// NFT escrow-at-mint (#105) makes an escrowed portfolio's owner the NFT program's
+// `mint_authority` PDA, which signs nothing over SPL — so, pre-fix, ANY unsigned
+// caller could route the whole terminal payout into a PDA-owned token account
+// that nobody can ever spend from.
+//
+// These tests pin both halves of the fix:
+//   - escrowed + unsigned  => rejected, no tokens move (the burn is impossible);
+//   - everything else      => unchanged permissionless liveness, and the escrowed
+//                             holder retains a real way out (sign, or unwrap).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The per-market `NftRegistry` PDA, initialized for `nft_program_id` exactly as
+/// `SetNftProgramId` (tag 73) writes it.
+fn nft_registry_account(market: &TestAccount, nft_program_id: &Pubkey) -> TestAccount {
+    let (registry_key, bump) = state::derive_nft_registry(&program_id(), &market.key);
+    let mut data = vec![0u8; state::nft_registry_account_len()];
+    state::init_nft_registry(
+        &mut data,
+        &state::NftRegistryV16 {
+            market_group: market.key.to_bytes(),
+            nft_program_id: nft_program_id.to_bytes(),
+            version: percolator_prog::constants::NFT_REGISTRY_VERSION,
+            bump,
+            _padding: [0u8; 6],
+        },
+    )
+    .unwrap();
+    TestAccount::new_with_data(registry_key, program_id(), data)
+}
+
+/// The same PDA address on a market that never ran `SetNftProgramId`: the account
+/// does not exist, which the runtime presents as System-owned and empty.
+fn uninitialized_nft_registry_account(market: &TestAccount) -> TestAccount {
+    TestAccount::new(
+        state::derive_nft_registry(&program_id(), &market.key).0,
+        solana_program::system_program::ID,
+        0,
+    )
+}
+
+/// Model `MintPositionNft`: B-3 (tag 72) moves `portfolio.owner` to the NFT
+/// program's mint-authority PDA (dual-written with the provenance header).
+fn escrow_portfolio_under(portfolio: &mut TestAccount, escrow: &Pubkey) {
+    let mut account = state::read_portfolio(&portfolio.data).unwrap();
+    account.owner = escrow.to_bytes();
+    account.provenance_header.owner = escrow.to_bytes();
+    state::write_portfolio(&mut portfolio.data, &account).unwrap();
+}
+
+/// Engine-side view of what is still owed/held. The host harness stubs
+/// `sol_invoke_signed`, so SPL balances never move here — the ENGINE ledger is
+/// what proves whether a payout was consumed or not.
+fn engine_vault_and_capital(market: &TestAccount, portfolio: &TestAccount) -> (u128, u128) {
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    (group.vault, account.capital)
+}
+
+/// Resolved market with a 1_000-atom portfolio whose `CloseResolved` pays out.
+fn resolved_market_with_payout(
+    admin: &mut TestAccount,
+    market: &mut TestAccount,
+    owner: &mut TestAccount,
+    portfolio: &mut TestAccount,
+) -> Pubkey {
+    let mint = init_market(admin, market);
+    init_portfolio(owner, market, portfolio);
+    deposit(owner, market, portfolio, 1_000);
+    run_ix(Instruction::ResolveMarket, &mut [admin, market]).unwrap();
+    mint
+}
+
+#[test]
+fn v16_wrapper_close_resolved_refuses_unsigned_payout_for_nft_escrowed_portfolio() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    let mint = resolved_market_with_payout(&mut admin, &mut market, &mut owner, &mut portfolio);
+
+    let nft_program_id = Pubkey::new_unique();
+    let escrow = state::derive_nft_mint_authority(&nft_program_id).0;
+    let mut registry = nft_registry_account(&market, &nft_program_id);
+    escrow_portfolio_under(&mut portfolio, &escrow);
+
+    // The attack: nobody signs. `accounts[0]` is the escrow PDA itself (the key the
+    // bare-key auth branch compares against) and the destination is a freshly
+    // created token account owned by it — unspendable by anyone, forever.
+    let mut unsigned_escrow = TestAccount::new(escrow, Pubkey::new_unique(), 0);
+    let mut dest = user_token_account(escrow, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before_market = market.data.clone();
+    let before_portfolio = portfolio.data.clone();
+
+    // (a) Without the registry proof the permissionless path is refused outright.
+    let no_proof = run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut unsigned_escrow,
+            &mut market,
+            &mut portfolio,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert_eq!(
+        no_proof,
+        Err(ProgramError::Custom(42)), // NftRegistryNotFound
+        "an unsigned terminal payout must PROVE the portfolio is not escrowed"
+    );
+
+    // (b) With the registry — the honest proof — the escrow is detected and the
+    //     burn is refused because nothing signed.
+    let burn = run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut unsigned_escrow,
+            &mut market,
+            &mut portfolio,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut registry,
+        ],
+    );
+    assert_eq!(
+        burn,
+        Err(ProgramError::Custom(6)), // ExpectedSigner
+        "an NFT-escrowed position's terminal payout must never move on an unsigned call"
+    );
+    // The real guard: the terminal payout was NOT consumed. Pre-fix this call
+    // returns Ok and the engine drains the account into an unspendable PDA-owned
+    // token account, so these are the assertions that fail without the fix.
+    assert_eq!(
+        engine_vault_and_capital(&market, &portfolio),
+        (1_000, 1_000),
+        "the escrowed position's capital must still be in the market"
+    );
+    assert_eq!(market.data, before_market);
+    assert_eq!(portfolio.data, before_portfolio);
+
+    // (c) Liveness for the escrowed position is NOT lost: the holder burns the NFT,
+    //     the NFT program releases escrow (tag 82), and the ordinary permissionless
+    //     crank then pays the holder's own token account.
+    let mut mint_auth = TestAccount::new(escrow, Pubkey::new_unique(), 0).signer();
+    run_ix(
+        Instruction::UnwrapEscrowedPortfolio {
+            new_owner: owner.key.to_bytes(),
+        },
+        &mut [&mut mint_auth, &mut portfolio, &mut registry],
+    )
+    .unwrap();
+
+    let mut holder_dest = user_token_account(owner.key, mint, 0);
+    let mut unsigned_cranker_view = TestAccount::new(owner.key, Pubkey::new_unique(), 0);
+    run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut unsigned_cranker_view,
+            &mut market,
+            &mut portfolio,
+            &mut holder_dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut registry,
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        engine_vault_and_capital(&market, &portfolio),
+        (0, 0),
+        "after unwrap the permissionless terminal payout must work exactly as upstream"
+    );
+    assert_eq!(
+        TokenAccount::unpack(&holder_dest.data).unwrap().owner,
+        owner.key,
+        "and it must pay the holder, not the escrow PDA"
+    );
+}
+
+#[test]
+fn v16_wrapper_close_resolved_keeps_permissionless_payout_for_unescrowed_owners() {
+    // Liveness half of GH#496: the fix must not cost upstream's permissionless
+    // wind-down for ordinary, wallet-owned portfolios — including on a market that
+    // HAS an NFT program registered.
+    for market_has_nft_program in [false, true] {
+        let mut admin = signer();
+        let mut market = market_account();
+        let mut owner = signer();
+        let mut portfolio = portfolio_account();
+        let mint = resolved_market_with_payout(&mut admin, &mut market, &mut owner, &mut portfolio);
+
+        let nft_program_id = Pubkey::new_unique();
+        let mut registry = if market_has_nft_program {
+            nft_registry_account(&market, &nft_program_id)
+        } else {
+            uninitialized_nft_registry_account(&market)
+        };
+
+        let mut unsigned_cranker_view = TestAccount::new(owner.key, Pubkey::new_unique(), 0);
+        let mut dest = user_token_account(owner.key, mint, 0);
+        let mut vault = vault_token_account(&market, mint, 1_000);
+        let mut vault_auth = vault_authority_account(&market);
+        let mut token_program = token_program_account();
+
+        run_ix(
+            Instruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            &mut [
+                &mut unsigned_cranker_view,
+                &mut market,
+                &mut portfolio,
+                &mut dest,
+                &mut vault,
+                &mut vault_auth,
+                &mut token_program,
+                &mut registry,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            engine_vault_and_capital(&market, &portfolio),
+            (0, 0),
+            "wallet-owned portfolios keep the permissionless terminal payout \
+             (market_has_nft_program = {market_has_nft_program})"
+        );
+    }
+}
+
+#[test]
+fn v16_wrapper_close_resolved_allows_escrowed_payout_when_the_owner_signs() {
+    // The guard is "unsigned", not "escrowed": a program that CAN sign for the
+    // escrow owner by CPI still gets paid, and so does an NFT holder taking the
+    // NFT-holder auth path (which requires the signer to be `accounts[0]`).
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    let mint = resolved_market_with_payout(&mut admin, &mut market, &mut owner, &mut portfolio);
+
+    let nft_program_id = Pubkey::new_unique();
+    let escrow = state::derive_nft_mint_authority(&nft_program_id).0;
+    let mut registry = nft_registry_account(&market, &nft_program_id);
+    escrow_portfolio_under(&mut portfolio, &escrow);
+
+    let mut signing_escrow = TestAccount::new(escrow, Pubkey::new_unique(), 0).signer();
+    let mut dest = user_token_account(escrow, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut signing_escrow,
+            &mut market,
+            &mut portfolio,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut registry,
+        ],
+    )
+    .unwrap();
+    assert_eq!(engine_vault_and_capital(&market, &portfolio), (0, 0));
+}
+
+#[test]
+fn v16_wrapper_claim_resolved_payout_topup_refuses_unsigned_payout_for_nft_escrowed_portfolio() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    let mint = init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        let mut account = state::read_portfolio(&portfolio.data).unwrap();
+        group.mode = MarketModeV16::Resolved;
+        group.resolved_slot = 1;
+        group.current_slot = 1;
+        group.vault = 60;
+        group.payout_snapshot_captured = true;
+        group.payout_snapshot = 100;
+        group.resolved_payout_ledger = ResolvedPayoutLedgerV16 {
+            snapshot_residual: 100,
+            terminal_claim_exact_receipts_num: 100 * BOUND_SCALE,
+            terminal_claim_bound_unreceipted_num: 0,
+            current_payout_rate_num: 100 * BOUND_SCALE,
+            current_payout_rate_den: 100 * BOUND_SCALE,
+            snapshot_slot: 1,
+            payout_halted: false,
+            finalized: false,
+        };
+        account.resolved_payout_receipt = ResolvedPayoutReceiptV16 {
+            present: true,
+            prior_bound_contribution_num: 100 * BOUND_SCALE,
+            live_released_face_at_receipt: 0,
+            terminal_positive_claim_face: 100,
+            paid_effective: 40,
+            finalized: false,
+        };
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut portfolio.data, &account).unwrap();
+    }
+
+    let nft_program_id = Pubkey::new_unique();
+    let escrow = state::derive_nft_mint_authority(&nft_program_id).0;
+    let mut registry = nft_registry_account(&market, &nft_program_id);
+    escrow_portfolio_under(&mut portfolio, &escrow);
+
+    let mut unsigned_escrow = TestAccount::new(escrow, Pubkey::new_unique(), 0);
+    let mut dest = user_token_account(escrow, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 60);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+    let before_market = market.data.clone();
+    let before_portfolio = portfolio.data.clone();
+
+    let burn = run_ix(
+        Instruction::ClaimResolvedPayoutTopup,
+        &mut [
+            &mut unsigned_escrow,
+            &mut market,
+            &mut portfolio,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut registry,
+        ],
+    );
+    assert_eq!(
+        burn,
+        Err(ProgramError::Custom(6)), // ExpectedSigner
+        "an NFT-escrowed position's resolved-payout top-up must not move on an unsigned call"
+    );
+    // Pre-fix this call returns Ok, the receipt is finalized and the engine vault
+    // drains into an unspendable PDA-owned token account. Post-fix nothing moves.
+    let account_after = state::read_portfolio(&portfolio.data).unwrap();
+    let (_, group_after) = state::read_market(&market.data).unwrap();
+    assert_eq!(group_after.vault, 60, "the top-up must still be owed");
+    assert_eq!(account_after.resolved_payout_receipt.paid_effective, 40);
+    assert!(!account_after.resolved_payout_receipt.finalized);
+    assert_eq!(market.data, before_market);
+    assert_eq!(portfolio.data, before_portfolio);
+
+    // Same liveness proof as tag 45: release escrow, and the permissionless top-up
+    // pays the holder.
+    let mut mint_auth = TestAccount::new(escrow, Pubkey::new_unique(), 0).signer();
+    run_ix(
+        Instruction::UnwrapEscrowedPortfolio {
+            new_owner: owner.key.to_bytes(),
+        },
+        &mut [&mut mint_auth, &mut portfolio, &mut registry],
+    )
+    .unwrap();
+    let mut holder_dest = user_token_account(owner.key, mint, 0);
+    let mut unsigned_cranker_view = TestAccount::new(owner.key, Pubkey::new_unique(), 0);
+    run_ix(
+        Instruction::ClaimResolvedPayoutTopup,
+        &mut [
+            &mut unsigned_cranker_view,
+            &mut market,
+            &mut portfolio,
+            &mut holder_dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut registry,
+        ],
+    )
+    .unwrap();
+    let (_, group_paid) = state::read_market(&market.data).unwrap();
+    let account_paid = state::read_portfolio(&portfolio.data).unwrap();
+    assert_eq!(group_paid.vault, 0);
+    assert_eq!(account_paid.resolved_payout_receipt.paid_effective, 100);
+    assert!(account_paid.resolved_payout_receipt.finalized);
+    assert_eq!(
+        TokenAccount::unpack(&holder_dest.data).unwrap().owner,
+        owner.key
+    );
+}
+
+#[test]
+fn v16_wrapper_escrowed_terminal_payout_guard_rejects_foreign_registry_accounts() {
+    // The proof is unspoofable: the registry is derived from the PORTFOLIO's own
+    // market_group_id, so an attacker cannot present some other market's
+    // (registry-free, or attacker-created) registry to vouch for this portfolio.
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    let mint = resolved_market_with_payout(&mut admin, &mut market, &mut owner, &mut portfolio);
+
+    let nft_program_id = Pubkey::new_unique();
+    let escrow = state::derive_nft_mint_authority(&nft_program_id).0;
+    escrow_portfolio_under(&mut portfolio, &escrow);
+
+    let mut other_admin = signer();
+    let mut other_market = market_account();
+    init_market(&mut other_admin, &mut other_market);
+    let mut foreign_registry = uninitialized_nft_registry_account(&other_market);
+
+    let mut unsigned_escrow = TestAccount::new(escrow, Pubkey::new_unique(), 0);
+    let mut dest = user_token_account(escrow, mint, 0);
+    let mut vault = vault_token_account(&market, mint, 1_000);
+    let mut vault_auth = vault_authority_account(&market);
+    let mut token_program = token_program_account();
+
+    let spoofed = run_ix(
+        Instruction::CloseResolved {
+            fee_rate_per_slot: 0,
+        },
+        &mut [
+            &mut unsigned_escrow,
+            &mut market,
+            &mut portfolio,
+            &mut dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+            &mut foreign_registry,
+        ],
+    );
+    assert_eq!(spoofed, Err(ProgramError::InvalidArgument));
+    assert_eq!(
+        engine_vault_and_capital(&market, &portfolio),
+        (1_000, 1_000)
     );
 }

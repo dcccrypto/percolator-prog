@@ -16755,7 +16755,7 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         expect_owner(portfolio_ai, program_id)?;
 
-        let (cfg_after, payout) = {
+        let (cfg_after, payout, portfolio_owner, market_group) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let max_market_slots = group.header.config.max_market_slots.get() as usize;
@@ -16802,7 +16802,12 @@ pub mod processor {
                 percolator::ResolvedCloseOutcomeV16::ProgressOnly => 0,
                 percolator::ResolvedCloseOutcomeV16::Closed { payout } => payout,
             };
-            (cfg, payout)
+            (
+                cfg,
+                payout,
+                portfolio.header.owner,
+                portfolio.header.provenance_header.market_group_id,
+            )
         };
         if payout != 0 {
             let dest_token = account(accounts, 3)?;
@@ -16822,6 +16827,19 @@ pub mod processor {
                 &cfg_after,
             )?;
             verify_permissionless_payout_dest_token_account(dest_token)?;
+            // GH#496: this payout is permissionless and its destination is bound to an
+            // UNSIGNED `owner` key. An NFT-escrowed portfolio's owner is the NFT
+            // program's mint-authority PDA, which can never sign an SPL transfer, so
+            // paying it burns the position. Escrowed => a signature is required; every
+            // other portfolio keeps the permissionless path (registry proof at index 7).
+            require_signer_for_escrowed_terminal_payout(
+                program_id,
+                accounts,
+                7,
+                owner,
+                &portfolio_owner,
+                &market_group,
+            )?;
             let payout_u64 = amount_to_u64(payout)?;
             require_token_balance(vault_token, payout_u64)?;
             let bump_arr = [bump];
@@ -16854,7 +16872,7 @@ pub mod processor {
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
-        let (cfg, payout) = {
+        let (cfg, payout, portfolio_owner, market_group) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
@@ -16873,7 +16891,12 @@ pub mod processor {
             let payout = group
                 .claim_resolved_payout_topup_not_atomic(&mut portfolio)
                 .map_err(map_v16_error)?;
-            (cfg, payout)
+            (
+                cfg,
+                payout,
+                portfolio.header.owner,
+                portfolio.header.provenance_header.market_group_id,
+            )
         };
         if payout != 0 {
             let dest_token = account(accounts, 3)?;
@@ -16893,6 +16916,16 @@ pub mod processor {
                 &cfg,
             )?;
             verify_permissionless_payout_dest_token_account(dest_token)?;
+            // GH#496 — see the mirror in `handle_close_resolved` above and the doc on
+            // `require_signer_for_escrowed_terminal_payout`. Same shape, same trio base.
+            require_signer_for_escrowed_terminal_payout(
+                program_id,
+                accounts,
+                7,
+                owner,
+                &portfolio_owner,
+                &market_group,
+            )?;
             let payout_u64 = amount_to_u64(payout)?;
             require_token_balance(vault_token, payout_u64)?;
             let bump_arr = [bump];
@@ -22142,6 +22175,74 @@ pub mod processor {
         let dest = unpack_token_account(dest_token_ai)?;
         if dest.delegate.is_some() || dest.close_authority.is_some() {
             return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        Ok(())
+    }
+
+    /// GH#496: a PERMISSIONLESS terminal payout must never be routed to a key that
+    /// cannot spend what lands there.
+    ///
+    /// `CloseResolved` (tag 45) and `ClaimResolvedPayoutTopup` (tag 46) are
+    /// deliberately permissionless: `accounts[0]` (`owner`) need not sign, and the
+    /// payout destination is bound to its key, so an unaffiliated cranker can finish
+    /// an owner-bound terminal payout and let a resolved market wind down. Upstream
+    /// that is sound, because `portfolio.owner` is ALWAYS the wallet that signed
+    /// `InitPortfolio` — a key that can still move the tokens after they land.
+    ///
+    /// This fork broke that premise with NFT escrow-at-mint (#105): `MintPositionNft`
+    /// B-3-transfers `portfolio.owner` (tag 72) to the NFT program's `mint_authority`
+    /// PDA, which is off-curve and signs nothing over SPL. `authorize_owner_or_nft_holder`
+    /// short-circuits on a bare key comparison and never inspects `is_signer`, so an
+    /// unsigned caller could name that PDA as `owner`, hand in a freshly created token
+    /// account owned by it, and burn an escrowed position's ENTIRE terminal payout with
+    /// no signature from anyone.
+    ///
+    /// RULE: an unsigned caller must PROVE the portfolio is not NFT-escrowed, by
+    /// presenting this market group's canonical `NftRegistry` PDA (the slot already
+    /// reserved for the optional NFT-holder trio, index 7 in both handlers). An
+    /// escrowed portfolio's payout requires a real signature — from the holder, who
+    /// can either claim while still wrapped over the NFT-holder auth path, or burn the
+    /// NFT and take ownership back (`UnwrapEscrowedPortfolio`, tag 82, which is
+    /// deliberately NOT gated on a resolved-payout receipt), or from a program that
+    /// signs for the owner by CPI. Non-escrowed portfolios keep upstream's
+    /// permissionless liveness exactly.
+    ///
+    /// FAIL-CLOSED and unspoofable: the registry is derived from the PORTFOLIO's own
+    /// `market_group_id` (engine-validated provenance), never from the passed market
+    /// account, so a foreign registry-free market cannot be substituted; an
+    /// uninitialized PDA at that canonical address proves no NFT program is registered
+    /// for this market group, hence no tag-72 escrow can exist for this portfolio.
+    fn require_signer_for_escrowed_terminal_payout(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        registry_index: usize,
+        owner: &AccountInfo,
+        portfolio_owner: &[u8; 32],
+        market_group: &[u8; 32],
+    ) -> Result<(), ProgramError> {
+        if owner.is_signer {
+            return Ok(());
+        }
+        let market_group_key = Pubkey::new_from_array(*market_group);
+        let (expected_registry, _) = state::derive_nft_registry(program_id, &market_group_key);
+        let registry_ai = accounts
+            .get(registry_index)
+            .ok_or(PercolatorError::NftRegistryNotFound)?;
+        expect_key(registry_ai, &expected_registry)?;
+        // No registry account => no NFT program for this market group => no escrow.
+        if registry_ai.owner == &system_program::ID && registry_ai.data_is_empty() {
+            return Ok(());
+        }
+        expect_owner(registry_ai, program_id)?;
+        let registry = state::read_nft_registry(&registry_ai.try_borrow_data()?)
+            .map_err(|_| PercolatorError::NftRegistryNotFound)?;
+        if registry.market_group != *market_group {
+            return Err(PercolatorError::NftRegistryNotFound.into());
+        }
+        let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
+        let (escrow_authority, _) = state::derive_nft_mint_authority(&nft_program_id);
+        if *portfolio_owner == escrow_authority.to_bytes() {
+            return Err(PercolatorError::ExpectedSigner.into());
         }
         Ok(())
     }
