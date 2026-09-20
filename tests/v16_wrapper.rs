@@ -25869,3 +25869,58 @@ fn wgenl_w19_version18_refuses_a_version17_ledger_before_the_generation_branch()
          is unreachable for any account the deployed wrapper wrote"
     );
 }
+
+#[test]
+fn v16_wrapper_update_maintenance_fee_policy_rejects_after_resolve_to_freeze_unsynced_rewards() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut payer_owner = signer();
+    let mut cranker_owner = signer();
+    let mut payer = portfolio_account();
+    let mut cranker = portfolio_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 5;
+            }
+        }),
+    );
+    init_portfolio(&mut payer_owner, &mut market, &mut payer);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker);
+    deposit(&mut payer_owner, &mut market, &mut payer, 100);
+    configure_base_ewma_mark(&mut admin, &mut market, 10, 100);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    let resolved = market.data.clone();
+
+    let rejected = run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(rejected, &market, &resolved);
+
+    // Ported to current `main`: #399/#400 made the cranker's OWNER a required
+    // signer at accounts[3]. The `sync_maintenance_fee_with_cranker` helper this
+    // test originally used predates that and passes only three accounts.
+    run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 99 },
+        &mut [&mut market, &mut payer, &mut cranker, &mut cranker_owner],
+    )
+    .unwrap();
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let payer = state::read_portfolio(&payer.data).unwrap();
+    let cranker = state::read_portfolio(&cranker.data).unwrap();
+    assert_eq!(payer.capital, 50);
+    assert_eq!(payer.last_fee_slot, 10);
+    assert_eq!(cranker.capital, 0);
+    assert_eq!(group.insurance, 50);
+    assert_eq!(group.c_tot, 50);
+}
