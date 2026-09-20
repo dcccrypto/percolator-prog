@@ -4592,6 +4592,25 @@ pub mod ix {
             backing_bucket_authority: [u8; 32],
             oracle_authority: [u8; 32],
         },
+        /// WithdrawInsurance (tag 41). Terminal (Resolved-only) reserve payout, summed and
+        /// debited across every domain whose recorded `insurance_authority` equals the
+        /// `authority` account's pubkey.
+        ///
+        /// W4-PAYOUT (2026-09-20, upstream d64cdeeb/82f44d11/c162d7c7): PERMISSIONLESS.
+        /// `authority` no longer needs to sign -- any cranker may submit once the market is
+        /// Resolved and fully wound down. This reverses the fork's prior stricter-by-choice
+        /// stance (always signer-required) in favor of liveness: an authority that has gone
+        /// cold, lost its key, or is simply unresponsive can no longer strand its own
+        /// terminal insurance reserve.
+        ///
+        /// BENEFICIARY BINDING: `authority.key` is not a separable "submitter" identity here
+        /// (no admin/marketauth fallback exists on this instruction) -- it IS definitionally
+        /// the beneficiary. The capacity/debit helpers only count domains whose bound
+        /// `insurance_authority` equals `authority.key` (and reject the zero key), and the
+        /// destination check requires `dest_token.owner == authority.key`. A permissionless
+        /// caller can therefore only settle a REAL bound authority's own reserve into that
+        /// authority's own token account -- never redirect it elsewhere, never claim a
+        /// reserve it does not own.
         WithdrawInsurance {
             amount: u128,
         },
@@ -12056,6 +12075,14 @@ pub mod processor {
         let market_data = market_ai.try_borrow_data()?;
         let (cfg, mode, configured_slots, _) =
             state::read_market_config_mode_and_capacity(&market_data)?;
+        // W4-PAYOUT (upstream 82f44d11 "permit beneficiary-bound public terminal reserve
+        // payouts"): once a market is Resolved, reserve payouts on this preflight are
+        // permissionless -- no signature is required from `authority` (any cranker may
+        // submit). Live reserve management still requires consent from the authorized
+        // party, exactly as before.
+        if mode != MarketModeV16::Resolved {
+            expect_signer(authority)?;
+        }
         let asset_index = domain / 2;
         if (require_live_mode && mode != MarketModeV16::Live)
             || domain >= configured_slots.saturating_mul(2)
@@ -12065,15 +12092,22 @@ pub mod processor {
         }
         let profile = read_oracle_profile_for_asset(&market_data, &cfg, asset_index)?;
         let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
-        let local_authorized = match authority_kind {
-            DOMAIN_WITHDRAW_AUTH_INSURANCE => {
-                live_authority_matches(&authorities.insurance_operator, authority.key)
-            }
-            DOMAIN_WITHDRAW_AUTH_BACKING => {
-                live_authority_matches(&authorities.backing_bucket_authority, authority.key)
-            }
+        // W4-PAYOUT (upstream c162d7c7 "preserve shutdown reserve beneficiaries"): the
+        // payout is bound to the domain's RECORDED beneficiary (insurance_operator /
+        // backing_bucket_authority), read from state -- never to whatever pubkey the
+        // caller names in the `authority` account. `authority.key` is still checked
+        // against {beneficiary, marketauth} below for AUTHORIZATION (who may submit /
+        // who a Live-mode signature must come from), but it never determines WHERE the
+        // funds land. This is what makes the marketauth shutdown-drain fallback safe to
+        // make permissionless: a permissionless submitter can name marketauth as the
+        // non-signing `authority` reference to unlock the payout, but cannot redirect
+        // the destination to marketauth (or itself) -- only to the bound beneficiary.
+        let beneficiary = match authority_kind {
+            DOMAIN_WITHDRAW_AUTH_INSURANCE => authorities.insurance_operator,
+            DOMAIN_WITHDRAW_AUTH_BACKING => authorities.backing_bucket_authority,
             _ => return Err(PercolatorError::InvalidInstruction.into()),
         };
+        let local_authorized = live_authority_matches(&beneficiary, authority.key);
         if !local_authorized && !live_authority_matches(&cfg.marketauth, authority.key) {
             return Err(PercolatorError::Unauthorized.into());
         }
@@ -12081,11 +12115,22 @@ pub mod processor {
         expect_key(vault_authority_ai, &vault_authority)?;
         verify_withdrawable_token_accounts(
             dest_token,
-            authority.key,
+            &Pubkey::new_from_array(beneficiary),
             vault_token,
             &vault_authority,
             &cfg,
         )?;
+        // Fork hardening (W5 / upstream b7b6688e / #154): a payout that can complete
+        // without a signature from its recipient must reject a dest_token the recipient
+        // left an active delegate/close_authority on -- otherwise a pre-existing (e.g.
+        // phished) delegate sweeps the funds the instant they land, with no fresh
+        // consent from the beneficiary at payout time. This domain-withdrawal preflight
+        // was signer-gated on every path until this unit; now that Resolved mode can run
+        // it without `authority`'s signature, it needs the same dest_token poisoning
+        // check the other permissionless payout paths already carry.
+        if !authority.is_signer {
+            verify_permissionless_payout_dest_token_account(dest_token)?;
+        }
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(vault_token, amount_u64)?;
         Ok((bump, amount_u64))
@@ -12410,7 +12455,10 @@ pub mod processor {
         // one exists before any withdrawal is possible. Requiring it WITHOUT that creation
         // path (45bba89e) is what stranded funds — see the revert note in git history.
         let ledger_ai = account(accounts, 6)?;
-        expect_signer(authority)?;
+        // W4-PAYOUT: signer requirement moved into `verify_domain_withdrawal_preflight`,
+        // conditional on market mode (Resolved reserve payouts are permissionless; Live
+        // ones still require `authority`'s signature). Do NOT re-add an unconditional
+        // `expect_signer(authority)` here -- that would defeat the permissionless path.
         expect_writable(market_ai)?;
         expect_writable(dest_token)?;
         expect_writable(vault_token)?;
@@ -12475,11 +12523,18 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
-            let ledger_authority = if admin_shutdown_authorized && !local_authorized {
-                cfg.marketauth
-            } else {
-                authorities.backing_bucket_authority
-            };
+            // W4-PAYOUT (upstream c162d7c7): ledger attribution is bound to the recorded
+            // backing_bucket_authority always, never to `cfg.marketauth`. The prior
+            // marketauth-substitution let an admin-shutdown-drain submission attribute
+            // (and, before this unit, redirect) the withdrawal to marketauth itself
+            // instead of the true reserve owner. The F-3/D-STAKE-1 guard above already
+            // forces `admin_shutdown_authorized` false whenever `backing_bucket_authority`
+            // is bound (non-zero), so this branch is only reachable with an UNBOUND
+            // (zero) authority -- attributing to the zero key there is intentional: it
+            // makes the fallback pay out to a destination nobody can practically hold
+            // (equivalent to unreachable), rather than to whichever admin happened to
+            // submit the transaction.
+            let ledger_authority = authorities.backing_bucket_authority;
 
             let (_, bucket) = backing_domain_parts_view(&group, domain_usize)?;
             // W-21 / C-S-10b — adopt upstream's lapsed-bucket refusal
@@ -12555,7 +12610,8 @@ pub mod processor {
         let vault_token = account(accounts, 4)?;
         let vault_authority_ai = account(accounts, 5)?;
         let token_program = account(accounts, 6)?;
-        expect_signer(authority)?;
+        // W4-PAYOUT: signer requirement moved into `verify_domain_withdrawal_preflight`,
+        // conditional on market mode. See handle_withdraw_backing_bucket for the full note.
         expect_writable(market_ai)?;
         expect_writable(ledger_ai)?;
         expect_writable(dest_token)?;
@@ -12618,11 +12674,10 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
-            let ledger_authority = if admin_shutdown_authorized && !local_authorized {
-                cfg.marketauth
-            } else {
-                authorities.backing_bucket_authority
-            };
+            // W4-PAYOUT (upstream c162d7c7): see the identical comment in
+            // handle_withdraw_backing_bucket -- ledger attribution binds to the recorded
+            // backing_bucket_authority, never to `cfg.marketauth`.
+            let ledger_authority = authorities.backing_bucket_authority;
 
             let (_, bucket) = backing_domain_parts_view(&group, domain_usize)?;
             if amount > bucket.utilization_fee_earnings || amount > group.header.vault.get() {
@@ -12742,7 +12797,29 @@ pub mod processor {
         let vault_authority_ai = account(accounts, 4)?;
         let token_program = account(accounts, 5)?;
         let ledger_ai = accounts.get(6);
-        expect_signer(authority)?;
+        // W4-PAYOUT (upstream d64cdeeb "make terminal insurance payout permissionless" +
+        // 82f44d11/c162d7c7): this is our fork's terminal (tag 41) reserve payout -- it
+        // only ever succeeds when `group.header.mode == Resolved` (checked, unconditionally,
+        // just below), so unlike the shared `verify_domain_withdrawal_preflight` helper
+        // there is no Live-mode case to keep signer-gated here. Dropping the unconditional
+        // signer requirement reverses our fork's prior stricter-by-choice stance (this was
+        // always signer-gated even in Resolved mode) so that ANY cranker can settle a
+        // terminal insurance reserve once a market is wound down -- liveness: an authority
+        // that has gone cold, lost its key, or simply never bothers to call this cannot
+        // strand the reserve.
+        //
+        // Beneficiary binding for this specific instruction: `authority.key` is not a
+        // separate "submitter identity" from the recipient the way it is in
+        // `verify_domain_withdrawal_preflight` (no marketauth admin-fallback exists here).
+        // `terminal_insurance_withdraw_capacity_for_authority_view` /
+        // `debit_terminal_insurance_budgets_for_authority_view` below sum and debit
+        // EXACTLY the domains whose recorded `insurance_authority` equals `authority.key`,
+        // and the destination check further down still requires `dest.owner ==
+        // authority.key`. So the key named in the `authority` account IS definitionally
+        // the beneficiary being paid: a permissionless caller can settle any bound
+        // authority's reserve into that authority's own token account, but cannot name a
+        // different destination or redirect to itself -- it would just debit zero (both
+        // helpers reject the zero key and any key that owns no domain's insurance_authority).
         expect_writable(market_ai)?;
         expect_writable(dest_token)?;
         expect_writable(vault_token)?;
@@ -12857,6 +12934,11 @@ pub mod processor {
             &vault_authority,
             &cfg_pre,
         )?;
+        // Fork hardening (W5 / upstream b7b6688e / #154): this payout no longer requires a
+        // signature from `authority`, so guard against a dest_token the recipient left an
+        // active delegate/close_authority on -- see the identical note in
+        // `verify_domain_withdrawal_preflight`.
+        verify_permissionless_payout_dest_token_account(dest_token)?;
 
         // F-1 / F-2: persist the policy update (cooldown slot + deposits-only ceiling decrement).
         // Skipped when no insurance-withdrawal policy is configured, preserving exact prior
@@ -12971,16 +13053,18 @@ pub mod processor {
                 cfg.last_insurance_withdraw_slot,
                 now_slot,
             )?;
-            // The ledger is an operator-held receipt: its authority must equal the executing
-            // signer so that a ledger belonging to the insurance_authority cannot be co-opted
-            // as a withdrawal receipt for the operator (or vice-versa).  In the admin-shutdown
-            // fallback path the marketauth is the executing signer; in the normal path the
-            // insurance_operator is.
-            let ledger_authority = if admin_shutdown_authorized && !local_authorized {
-                cfg.marketauth
-            } else {
-                operator.key.to_bytes()
-            };
+            // W4-PAYOUT (upstream c162d7c7): the ledger authority is bound to the domain's
+            // recorded insurance_operator always, matching `verify_domain_withdrawal_preflight`'s
+            // destination check (also bound to `authorities.insurance_operator`, never to
+            // whichever key executed the instruction). Previously this attributed the
+            // admin-shutdown-fallback withdrawal to `cfg.marketauth` while the destination
+            // check (pre-W4-PAYOUT) verified `dest.owner == operator.key` -- which is
+            // `cfg.marketauth` on that path too, so marketauth could redirect an
+            // insurance_operator's reserve to an account it owned itself whenever
+            // insurance_authority was never bound (D-STAKE-1 unreached). Both destination
+            // and ledger now agree: funds and the receipt both go to insurance_operator: the
+            // admin-shutdown submitter authorizes the payout but is never its recipient.
+            let ledger_authority = authorities.insurance_operator;
             let available = market_insurance_withdraw_capacity_view(&group, asset_index)?;
             if amount > available
                 || amount > group.header.insurance.get()
