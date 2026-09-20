@@ -3395,6 +3395,107 @@ fn v16_bpf_failed_deposit_spl_transfer_rolls_back_engine_credit() {
     assert_eq!(account.capital, 0);
 }
 
+/// sync(W4-TOKEN22, adopt upstream cb1dfd43/49443633): "refactor: canonicalize token account
+/// validation" is a dedup refactor of the classic-SPL-only parser, NOT a Token-2022 capability
+/// addition -- see the divergence note in `tests/v16_w4_token22_boundary_canary.rs` and this
+/// unit's handback. `unpack_token_account` (the one gateway every vault/user/withdrawable
+/// validator goes through, post-refactor) still hard-rejects any token account not owned by
+/// classic `spl_token::ID` before it reads a single mint/owner/balance field. This test proves
+/// BOTH directions against the REAL mainnet Token-2022 program id (not an arbitrary wrong
+/// owner -- `v16_bpf_failed_deposit_spl_transfer_rolls_back_engine_credit` above already covers
+/// that generic case): a source token account owned by Token-2022 is rejected, and
+/// byte-identical data owned by classic spl_token::ID is accepted (Deposit succeeds, moves the
+/// tokens, and rolls back cleanly on the rejected leg). Token-2022 markets remain out of scope
+/// by design; this is the negative half of that boundary proven end-to-end through the real
+/// instruction dispatch, not a unit test against the validator function in isolation.
+#[test]
+fn v16_bpf_deposit_source_owned_by_token2022_is_rejected_classic_spl_accepted() {
+    // The real, canonical mainnet Token-2022 program id (Token2022Program), not a
+    // stand-in/placeholder pubkey -- this makes the "Token-2022 specifically" claim concrete.
+    let token_2022_program_id: Pubkey = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        .parse()
+        .unwrap();
+
+    let mut env = V16CuEnv::new();
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+
+    // --- Reject direction: source token account owned by the Token-2022 program. ---
+    let spoofed_source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            spoofed_source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, owner.pubkey(), 1_000),
+                owner: token_2022_program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let portfolio_before = env.svm.get_account(&portfolio).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let spoofed_source_before = env.svm.get_account(&spoofed_source).unwrap();
+    let reject_result = env.send(
+        ProgInstruction::Deposit { amount: 1_000 },
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new(spoofed_source, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&owner],
+    );
+    assert!(
+        reject_result.is_err(),
+        "a Token-2022-owned source token account must be rejected -- production is \
+         classic-SPL-only by design, this is not a wire/ABI regression"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&portfolio).unwrap(), portfolio_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+    assert_eq!(
+        env.svm.get_account(&spoofed_source).unwrap(),
+        spoofed_source_before
+    );
+
+    // --- Accept direction: byte-identical data, owned by classic spl_token::ID. ---
+    // Regression control: the refactor (returning balance instead of `()`) must not have
+    // broken the classic-SPL happy path this unit is explicitly required to leave unchanged.
+    let real_source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            real_source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, owner.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.send(
+        ProgInstruction::Deposit { amount: 1_000 },
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new(real_source, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&owner],
+    )
+    .expect("deposit from a canonical classic-SPL-owned source must still succeed post-refactor");
+    assert_eq!(env.token_amount(real_source), 0);
+    assert_eq!(env.token_amount(env.vault), 1_000);
+}
+
 #[test]
 fn v16_bpf_failed_insurance_topup_transfer_rolls_back_budget_and_ledger() {
     let mut env = V16CuEnv::new();
