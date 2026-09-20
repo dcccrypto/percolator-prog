@@ -15697,8 +15697,16 @@ pub mod processor {
         if cranker_share_bps > 10_000 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let (mut cfg, _, _, _) =
+        let (mut cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        // #373: freeze the policy once the market leaves Live. `SyncMaintenanceFee`
+        // stays reachable in Resolved (its maturity rejection is Live-only), so a
+        // post-resolve share change would redirect every portfolio's already-accrued
+        // maintenance charge away from the insurance budget. Mirrors the #428 gate on
+        // the sibling `handle_update_maintenance_fee_per_slot`.
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         expect_live_authority(&cfg.marketauth, admin.key)?;
         cfg.maintenance_cranker_fee_share_bps = cranker_share_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
