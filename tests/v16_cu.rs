@@ -38,6 +38,17 @@ const TRADE_CU_LIMIT: u64 = 345_000;
 const MULTI_ASSET_OPEN_TRADE_CU_LIMIT: u64 = 750_000;
 const MATCHER_CONTEXT_LEN: usize = 320;
 
+/// GH#496: an UNSIGNED terminal payout (`CloseResolved` tag 45,
+/// `ClaimResolvedPayoutTopup` tag 46) must present this market group's canonical
+/// `NftRegistry` PDA as proof that the portfolio is not NFT-escrowed — otherwise an
+/// escrowed position's whole payout could be routed into the escrow PDA's own token
+/// account, which nothing can ever spend from. These fixtures never register an NFT
+/// program, so the account does not exist and the (System-owned, empty) PDA is
+/// itself the proof.
+fn nft_registry_pda(market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"nft_registry", market.as_ref()], &percolator_prog::id()).0
+}
+
 /// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market address
 /// reuse"): asserts a just-closed market account carries the permanent
 /// `KIND_CLOSED_MARKET` tombstone -- shrunk to `HEADER_LEN`, non-zero header,
@@ -48,7 +59,6 @@ const MATCHER_CONTEXT_LEN: usize = 320;
 /// the plain-`Vec<u8>` `TestAccount` harness in `tests/v16_wrapper.rs`, where
 /// `realloc` is unsound per `AccountInfo::realloc`'s own safety doc and that
 /// harness's close-slab tests assert on data/lamports without calling it
-/// through to a full close+reinit cycle for that reason).
 fn assert_market_is_closed_market_tombstone(data: &[u8]) {
     assert_eq!(
         data.len(),
@@ -2313,6 +2323,7 @@ impl V16CuEnv {
                     AccountMeta::new(self.vault, false),
                     AccountMeta::new_readonly(self.vault_authority, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(nft_registry_pda(&self.market), false),
                 ],
                 &[],
             )
@@ -3089,6 +3100,7 @@ impl V16CuEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&self.market), false),
             ],
             &[],
         )
@@ -10566,6 +10578,7 @@ fn v16_bpf_failed_close_resolved_transfer_rolls_back_payout_state() {
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
         ],
         &[],
     );
@@ -13425,6 +13438,7 @@ fn v16_attack_close_resolved_ignores_spoofed_fee_rate_param() {
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
         ],
         &[],
     )
@@ -13500,6 +13514,7 @@ fn v16_attack_permissionless_close_resolved_rejects_delegated_dest() {
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
         ],
         &[],
     );
@@ -13560,6 +13575,7 @@ fn v16_attack_permissionless_close_resolved_rejects_delegated_dest() {
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
         ],
         &[],
     );
@@ -13590,6 +13606,7 @@ fn v16_attack_permissionless_close_resolved_rejects_delegated_dest() {
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
         ],
         &[],
     )
@@ -13931,6 +13948,7 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(env.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
             ],
             &[],
         );
@@ -13987,6 +14005,7 @@ fn v16_lien1_shared_bucket_expire_strands_other_winner() {
                 AccountMeta::new(env.vault, false),
                 AccountMeta::new_readonly(env.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
             ],
             &[],
         );
