@@ -11447,10 +11447,10 @@ pub mod processor {
         }
         let mint = primary_collateral_mint(&cfg);
         let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-        verify_user_token_account(source_token, owner.key, &mint)?;
+        let source_balance = verify_user_token_account(source_token, owner.key, &mint)?;
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(source_token, amount_u64)?;
+        require_token_balance(source_balance, amount_u64)?;
 
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
         {
@@ -11537,12 +11537,13 @@ pub mod processor {
         }
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
         expect_key(vault_authority_ai, &vault_authority)?;
-        verify_withdrawable_token_accounts(
+        let vault_balance = verify_withdrawable_token_accounts(
             dest_token,
             owner.key,
             vault_token,
             &vault_authority,
             &cfg,
+            false,
         )?;
         // FIX (ADOPT upstream a84b45dd, folded with d1bff017): the balance check below moves
         // past the fee-crystallization block and is re-derived from the ACTUAL withdrawn
@@ -11616,7 +11617,7 @@ pub mod processor {
             withdrawn_amount
         };
         let amount_u64 = amount_to_u64(withdrawn_amount)?;
-        require_token_balance(vault_token, amount_u64)?;
+        require_token_balance(vault_balance, amount_u64)?;
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
         transfer_tokens_signed(
@@ -14395,10 +14396,10 @@ pub mod processor {
         expect_live_authority(&asset0_insurance_authority, signer.key)?;
         let mint = primary_collateral_mint(&cfg_pre);
         let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-        verify_user_token_account(source_token, signer.key, &mint)?;
+        let source_balance = verify_user_token_account(source_token, signer.key, &mint)?;
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(source_token, amount_u64)?;
+        require_token_balance(source_balance, amount_u64)?;
         let mut cfg_after = None;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -14535,10 +14536,10 @@ pub mod processor {
         expect_live_authority(&authorities.insurance_authority, signer.key)?;
         let mint = primary_collateral_mint(&cfg_pre);
         let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-        verify_user_token_account(source_token, signer.key, &mint)?;
+        let source_balance = verify_user_token_account(source_token, signer.key, &mint)?;
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(source_token, amount_u64)?;
+        require_token_balance(source_balance, amount_u64)?;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -15223,13 +15224,6 @@ pub mod processor {
         }
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
         expect_key(vault_authority_ai, &vault_authority)?;
-        verify_withdrawable_token_accounts(
-            dest_token,
-            &Pubkey::new_from_array(beneficiary),
-            vault_token,
-            &vault_authority,
-            &cfg,
-        )?;
         // Fork hardening (W5 / upstream b7b6688e / #154): a payout that can complete
         // without a signature from its recipient must reject a dest_token the recipient
         // left an active delegate/close_authority on -- otherwise a pre-existing (e.g.
@@ -15238,11 +15232,18 @@ pub mod processor {
         // was signer-gated on every path until this unit; now that Resolved mode can run
         // it without `authority`'s signature, it needs the same dest_token poisoning
         // check the other permissionless payout paths already carry.
-        if !authority.is_signer {
-            verify_permissionless_payout_dest_token_account(dest_token)?;
-        }
+        // sync(W4-TOKEN22): folded into `require_unencumbered_dest` on the widened
+        // `verify_withdrawable_token_accounts` instead of a second standalone call.
+        let vault_balance = verify_withdrawable_token_accounts(
+            dest_token,
+            &Pubkey::new_from_array(beneficiary),
+            vault_token,
+            &vault_authority,
+            &cfg,
+            !authority.is_signer,
+        )?;
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(vault_token, amount_u64)?;
+        require_token_balance(vault_balance, amount_u64)?;
         Ok((bump, amount_u64))
     }
 
@@ -15381,10 +15382,10 @@ pub mod processor {
         expect_live_authority(&authorities.backing_bucket_authority, signer.key)?;
         let mint = primary_collateral_mint(&cfg_pre);
         let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-        verify_user_token_account(source_token, signer.key, &mint)?;
+        let source_balance = verify_user_token_account(source_token, signer.key, &mint)?;
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(source_token, amount_u64)?;
+        require_token_balance(source_balance, amount_u64)?;
         if amount != 0 {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -16106,18 +16107,21 @@ pub mod processor {
 
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
         expect_key(vault_authority_ai, &vault_authority)?;
-        verify_withdrawable_token_accounts(
+        // Fork hardening (W5 / upstream b7b6688e / #154): this payout no longer requires a
+        // signature from `authority`, so guard against a dest_token the recipient left an
+        // active delegate/close_authority on -- see the identical note in
+        // `verify_domain_withdrawal_preflight`. WithdrawInsurance is Resolved-only (always
+        // permissionless), so `require_unencumbered_dest` is unconditionally `true`.
+        // sync(W4-TOKEN22): folded into the widened `verify_withdrawable_token_accounts`
+        // instead of a second standalone call.
+        let vault_balance = verify_withdrawable_token_accounts(
             dest_token,
             authority.key,
             vault_token,
             &vault_authority,
             &cfg_pre,
+            true,
         )?;
-        // Fork hardening (W5 / upstream b7b6688e / #154): this payout no longer requires a
-        // signature from `authority`, so guard against a dest_token the recipient left an
-        // active delegate/close_authority on -- see the identical note in
-        // `verify_domain_withdrawal_preflight`.
-        verify_permissionless_payout_dest_token_account(dest_token)?;
 
         // F-1 / F-2: persist the policy update (cooldown slot + deposits-only ceiling decrement).
         // Skipped when no insurance-withdrawal policy is configured, preserving exact prior
@@ -16126,7 +16130,7 @@ pub mod processor {
             state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_pre)?;
         }
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(vault_token, amount_u64)?;
+        require_token_balance(vault_balance, amount_u64)?;
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
         transfer_tokens_signed(
@@ -16402,12 +16406,13 @@ pub mod processor {
             // CHECK-ONLY role for `UpdateFeeSplit`/
             // `UpdateInsuranceWithdrawPolicy`.
             require_protocol_fee_authority_epoch_view(&group, expected_authority_epoch)?;
-            verify_withdrawable_token_accounts(
+            let vault_balance = verify_withdrawable_token_accounts(
                 dest_token,
                 authority.key,
                 vault_token,
                 &vault_authority,
                 &cfg,
+                false,
             )?;
             // §1.3/N2 clamp: crank rewards (`credit_account_from_insurance_not_atomic`
             // callers) used to share the same unbudgeted-surplus gap the
@@ -16443,7 +16448,7 @@ pub mod processor {
                 group.header.vault.get(),
             )?;
             let transfer_amount_u64 = amount_to_u64(transfer_amount)?;
-            require_token_balance(vault_token, transfer_amount_u64)?;
+            require_token_balance(vault_balance, transfer_amount_u64)?;
             group
                 .withdraw_insurance_surplus_not_atomic(transfer_amount)
                 .map_err(map_v16_error)?;
@@ -16603,12 +16608,13 @@ pub mod processor {
             // epoch must not be invalidated by an unrelated asset 0 rotation,
             // nor survive one on its own asset.
             require_authority_epoch_view(&group, asset_index as usize, expected_authority_epoch)?;
-            verify_withdrawable_token_accounts(
+            let vault_balance = verify_withdrawable_token_accounts(
                 dest_token,
                 authority.key,
                 vault_token,
                 &vault_authority,
                 &cfg,
+                false,
             )?;
             // Exact capacity check, in u128 so an `amount` above u64::MAX is an
             // over-claim (rejected) rather than a `try_from` panic-adjacent
@@ -16642,7 +16648,7 @@ pub mod processor {
                 return Err(PercolatorError::CreatorFeeOverClaim.into());
             }
             let transfer_amount_u64 = amount_to_u64(amount)?;
-            require_token_balance(vault_token, transfer_amount_u64)?;
+            require_token_balance(vault_balance, transfer_amount_u64)?;
             // I-a, V-a: the atoms leave both the insurance fund and the vault.
             // The creator leg was charged into `header.insurance` by the engine
             // and (since the creator-fee-claim change) was never credited to any
@@ -17116,16 +17122,17 @@ pub mod processor {
             // owner is asserted to be the stake pool's `vault_auth` PDA, so a
             // token account that merely happens to sit at `pool.vault` while
             // being owned by someone else is rejected too.
-            verify_withdrawable_token_accounts(
+            // W5: this payout is permissionless, so `require_unencumbered_dest=true`
+            // additionally rejects a poisoned destination (delegate / close_authority)
+            // that could be used as a sweep hook.
+            let vault_balance = verify_withdrawable_token_accounts(
                 stake_vault_ai,
                 &stake_vault_authority,
                 vault_token,
                 &vault_authority,
                 &cfg,
+                true,
             )?;
-            // W5: this payout is permissionless, so a poisoned destination
-            // (delegate / close_authority) must not be usable as a sweep hook.
-            verify_permissionless_payout_dest_token_account(stake_vault_ai)?;
 
             // Claim capacity. Monotonic invariant
             // `insurance_reserve_withdrawn_atoms <= insurance_reserve_accrued_atoms`
@@ -17161,7 +17168,7 @@ pub mod processor {
                 return Err(PercolatorError::NoInsuranceReserveToClaim.into());
             }
             let transfer_amount_u64 = amount_to_u64(transfer_amount)?;
-            require_token_balance(vault_token, transfer_amount_u64)?;
+            require_token_balance(vault_balance, transfer_amount_u64)?;
             // I−a, V−a: the atoms leave both the insurance fund and the vault,
             // because unlike tag 78 they really do leave the program.
             group
@@ -17374,8 +17381,8 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             let primary_mint = primary_collateral_mint(&cfg);
-            verify_vault_token_account(vault_token, &vault_authority, &primary_mint)?;
-            let vault_balance = unpack_token_account(vault_token)?.amount;
+            let vault_balance =
+                verify_vault_token_account(vault_token, &vault_authority, &primary_mint)?;
             verify_user_token_account(dest_token, admin_dest.key, &primary_mint)?;
             let secondary_close = if cfg.secondary_collateral_mint != [0u8; 32] {
                 let secondary_vault_token = account(accounts, 6)?;
@@ -17388,12 +17395,11 @@ pub mod processor {
                     return Err(PercolatorError::InvalidVaultAccount.into());
                 }
                 let secondary_mint = secondary_collateral_mint(&cfg)?;
-                verify_vault_token_account(
+                let secondary_vault_balance = verify_vault_token_account(
                     secondary_vault_token,
                     &vault_authority,
                     &secondary_mint,
                 )?;
-                let secondary_vault_balance = unpack_token_account(secondary_vault_token)?.amount;
                 verify_user_token_account(secondary_dest_token, admin_dest.key, &secondary_mint)?;
                 Some((
                     secondary_vault_token,
@@ -17507,25 +17513,22 @@ pub mod processor {
                 if *residue_dest.key != canonical_vault_address(&authority, &primary_mint) {
                     return Err(PercolatorError::InvalidTokenAccount.into());
                 }
-                // ADAPTATION (not upstream): upstream's current
-                // `verify_withdrawable_token_accounts` has grown a 6th
-                // `require_unencumbered_dest: bool` parameter (and a `u64`
-                // return) that our fork's 5-arg/`()`-returning version --
-                // shared by 7 other call sites -- has not yet absorbed
-                // (a separate, later upstream refactor, out of scope for this
-                // narrow residue-retirement unit). Reproduce the same
-                // security property -- reject a poisoned (delegate/
-                // close_authority-bearing) residue destination -- via this
-                // fork's existing standalone W5 helper instead of widening the
-                // shared signature.
+                // sync(W4-TOKEN22): `verify_withdrawable_token_accounts` is now the
+                // shared 6-arg / `Result<u64, _>` form (adopted upstream cb1dfd43) --
+                // this call site has caught up too, so the standalone
+                // `verify_permissionless_payout_dest_token_account` call this
+                // "ADAPTATION" note used to fall back to is gone; the escheat is
+                // unconditionally permissionless (no signature from `authority`),
+                // so `require_unencumbered_dest` is unconditionally `true`, matching
+                // the other permissionless payout call sites.
                 verify_withdrawable_token_accounts(
                     residue_dest,
                     &authority,
                     vault_token,
                     vault_authority_ai.key,
                     &cfg_pre,
+                    true,
                 )?;
-                verify_permissionless_payout_dest_token_account(residue_dest)?;
                 transfer_tokens_signed(
                     token_program,
                     vault_token,
@@ -17728,10 +17731,10 @@ pub mod processor {
                 state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.0;
             let mint = primary_collateral_mint(&cfg_pre);
             let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-            verify_user_token_account(source_token, owner.key, &mint)?;
+            let source_balance = verify_user_token_account(source_token, owner.key, &mint)?;
             verify_vault_token_account(vault_token, &vault_authority, &mint)?;
             let amount_u64 = amount_to_u64(optional_deposit)?;
-            require_token_balance(source_token, amount_u64)?;
+            require_token_balance(source_balance, amount_u64)?;
             Some((amount_u64, source_token, vault_token, token_program))
         } else {
             None
@@ -18516,12 +18519,14 @@ pub mod processor {
         let secondary_mint = secondary_collateral_mint(&cfg)?;
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
         expect_key(vault_authority_ai, &vault_authority)?;
-        verify_user_token_account(primary_source_token, authority.key, &primary_mint)?;
+        let primary_source_balance =
+            verify_user_token_account(primary_source_token, authority.key, &primary_mint)?;
         verify_vault_token_account(primary_vault_token, &vault_authority, &primary_mint)?;
         verify_user_token_account(secondary_dest_token, authority.key, &secondary_mint)?;
-        verify_vault_token_account(secondary_vault_token, &vault_authority, &secondary_mint)?;
-        require_token_balance(primary_source_token, amount_u64)?;
-        require_token_balance(secondary_vault_token, amount_u64)?;
+        let secondary_vault_balance =
+            verify_vault_token_account(secondary_vault_token, &vault_authority, &secondary_mint)?;
+        require_token_balance(primary_source_balance, amount_u64)?;
+        require_token_balance(secondary_vault_balance, amount_u64)?;
 
         transfer_tokens(
             token_program,
@@ -18768,10 +18773,11 @@ pub mod processor {
                 verify_token_program(token_program)?;
                 let mint = primary_collateral_mint(&cfg_pre);
                 let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-                verify_user_token_account(source_token, authority.key, &mint)?;
+                let source_balance =
+                    verify_user_token_account(source_token, authority.key, &mint)?;
                 verify_vault_token_account(vault_token, &vault_authority, &mint)?;
                 let amount_u64 = amount_to_u64(init_fee)?;
-                require_token_balance(source_token, amount_u64)?;
+                require_token_balance(source_balance, amount_u64)?;
                 Some((source_token, vault_token, token_program, amount_u64))
             };
             if asset_index >= capacity_pre {
@@ -20656,16 +20662,16 @@ pub mod processor {
             verify_token_program(token_program)?;
             let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
             expect_key(vault_authority_ai, &vault_authority)?;
-            verify_withdrawable_token_accounts(
+            let vault_balance = verify_withdrawable_token_accounts(
                 dest_token,
                 owner.key,
                 vault_token,
                 &vault_authority,
                 &cfg_after,
+                true,
             )?;
-            verify_permissionless_payout_dest_token_account(dest_token)?;
             let payout_u64 = amount_to_u64(payout)?;
-            require_token_balance(vault_token, payout_u64)?;
+            require_token_balance(vault_balance, payout_u64)?;
             let bump_arr = [bump];
             let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
             transfer_tokens_signed(
@@ -20727,16 +20733,16 @@ pub mod processor {
             verify_token_program(token_program)?;
             let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
             expect_key(vault_authority_ai, &vault_authority)?;
-            verify_withdrawable_token_accounts(
+            let vault_balance = verify_withdrawable_token_accounts(
                 dest_token,
                 owner.key,
                 vault_token,
                 &vault_authority,
                 &cfg,
+                true,
             )?;
-            verify_permissionless_payout_dest_token_account(dest_token)?;
             let payout_u64 = amount_to_u64(payout)?;
-            require_token_balance(vault_token, payout_u64)?;
+            require_token_balance(vault_balance, payout_u64)?;
             let bump_arr = [bump];
             let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
             transfer_tokens_signed(
@@ -21622,11 +21628,11 @@ pub mod processor {
         // Token-account checks.
         let mint = primary_collateral_mint(&cfg);
         let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-        verify_user_token_account(source_token, depositor.key, &mint)?;
+        let source_balance = verify_user_token_account(source_token, depositor.key, &mint)?;
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         verify_user_token_account(depositor_lp_ata, depositor.key, mint_ai.key)?;
         let amount_u64 = amount_to_u64(amount)?;
-        require_token_balance(source_token, amount_u64)?;
+        require_token_balance(source_balance, amount_u64)?;
 
         // Backing-domain ledger PDA: lazily create on first deposit.
         let (ledger_pda, ledger_bump) =
@@ -21894,10 +21900,11 @@ pub mod processor {
         if lp_mint.key.to_bytes() != registry.lp_mint {
             return Err(PercolatorError::InvalidMint.into());
         }
-        verify_user_token_account(redeemer_lp_ata, redeemer.key, lp_mint.key)?;
+        let redeemer_lp_balance =
+            verify_user_token_account(redeemer_lp_ata, redeemer.key, lp_mint.key)?;
         let shares_u64 =
             u64::try_from(shares).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
-        require_token_balance(redeemer_lp_ata, shares_u64)?;
+        require_token_balance(redeemer_lp_balance, shares_u64)?;
 
         // Escrow ATA (registry-owned, shared per vault): lazily created.
         let (escrow_pda, escrow_bump) = state::derive_lp_escrow(program_id, &market_key);
@@ -26341,7 +26348,12 @@ pub mod processor {
         spl_token::state::Mint::unpack(&data).map_err(|_| PercolatorError::InvalidMint.into())
     }
 
-    fn verify_token_program(token_program: &AccountInfo) -> Result<(), ProgramError> {
+    // sync(W4-TOKEN22): pub(crate) per upstream 49443633 -- exposes a `kani_token_boundary`
+    // shim module (below) that proves this + verify_user_token_account + require_token_balance
+    // compose without re-deriving handler-internal state. This does NOT add Token-2022
+    // acceptance: the `spl_token::ID` comparison is unchanged, so a Token-2022-owned
+    // (or any non-classic-SPL) token_program account is rejected exactly as before.
+    pub(crate) fn verify_token_program(token_program: &AccountInfo) -> Result<(), ProgramError> {
         if *token_program.key != spl_token::ID || !token_program.executable {
             return Err(PercolatorError::InvalidTokenProgram.into());
         }
@@ -26362,11 +26374,18 @@ pub mod processor {
             .map_err(|_| PercolatorError::InvalidTokenAccount.into())
     }
 
-    fn verify_user_token_account(
+    // sync(W4-TOKEN22, adopt upstream cb1dfd43/49443633): returns the already-unpacked
+    // balance instead of `()` so handlers consume validated state from this ONE gateway
+    // parser instead of re-borrowing and re-unpacking the same account bytes downstream
+    // for a balance/empty/encumbrance check. `unpack_token_account` below still hard-gates
+    // `token_ai.owner == spl_token::ID` -- a Token-2022-owned (or any other non-classic-SPL)
+    // account fails here with InvalidTokenAccount before mint/owner/state are even read.
+    // This is a dedup refactor, not a capability change: production remains classic-SPL-only.
+    pub(crate) fn verify_user_token_account(
         token_ai: &AccountInfo,
         expected_owner: &Pubkey,
         expected_mint: &Pubkey,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<u64, ProgramError> {
         let token = unpack_token_account(token_ai)?;
         if token.mint != *expected_mint {
             return Err(PercolatorError::InvalidMint.into());
@@ -26376,7 +26395,7 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
-        Ok(())
+        Ok(token.amount)
     }
 
     fn primary_collateral_mint(cfg: &WrapperConfigV16) -> Pubkey {
@@ -26396,13 +26415,25 @@ pub mod processor {
                 && mint.to_bytes() == cfg.secondary_collateral_mint)
     }
 
+    // sync(W4-TOKEN22, adopt upstream cb1dfd43): `require_unencumbered_dest` folds in what
+    // used to be the separate `verify_permissionless_payout_dest_token_account` call (W5 /
+    // upstream b7b6688e / #154) -- same obligation, same three call sites (CloseResolved,
+    // ClaimResolvedPayoutTopup, WithdrawInsuranceReserveToStake's stake_vault_ai leg), now
+    // gated by one bool instead of a second unpack of the same dest account. Signer-gated
+    // withdraw paths (Withdraw, WithdrawInsurance, WithdrawInsuranceAsset,
+    // WithdrawBackingBucket[Earnings], WithdrawProtocolFee, WithdrawCreatorFee) pass `false`,
+    // unchanged from before -- there the signer picks their own dest_token, so a poisoned
+    // account is self-inflicted, not attacker-injectable. Returns the VAULT balance (not
+    // dest), matching upstream: every call site's downstream `require_token_balance` checks
+    // the vault, never the destination.
     fn verify_withdrawable_token_accounts(
         dest_token_ai: &AccountInfo,
         expected_dest_owner: &Pubkey,
         vault_token_ai: &AccountInfo,
         expected_vault_owner: &Pubkey,
         cfg: &WrapperConfigV16,
-    ) -> Result<(), ProgramError> {
+        require_unencumbered_dest: bool,
+    ) -> Result<u64, ProgramError> {
         let dest = unpack_token_account(dest_token_ai)?;
         let vault = unpack_token_account(vault_token_ai)?;
         if dest.mint != vault.mint || !is_withdrawable_collateral_mint(cfg, &dest.mint) {
@@ -26424,35 +26455,31 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidVaultAccount.into());
         }
-        Ok(())
-    }
-
-    // W5 (upstream b7b6688e / #154): terminal payout paths that are PERMISSIONLESS
-    // (CloseResolved, ClaimResolvedPayoutTopup -- any caller can trigger the payout,
-    // not just the portfolio owner) must additionally reject a `dest_token` that has
-    // an active delegate or close_authority. verify_withdrawable_token_accounts above
-    // only checks dest.mint/owner/state; a pre-poisoned destination (delegate/close_authority
-    // set by an attacker on an account the victim otherwise owns) would let the delegate
-    // sweep the payout the instant it lands, with no signature from the victim required
-    // to trigger the transfer. Signer-gated withdraw paths (Withdraw, WithdrawInsurance,
-    // WithdrawInsuranceAsset, WithdrawBackingBucket[Earnings], WithdrawProtocolFee) are NOT
-    // in scope: there the signer picks their own dest_token, so a poisoned account is
-    // self-inflicted, not attacker-injectable.
-    fn verify_permissionless_payout_dest_token_account(
-        dest_token_ai: &AccountInfo,
-    ) -> Result<(), ProgramError> {
-        let dest = unpack_token_account(dest_token_ai)?;
-        if dest.delegate.is_some() || dest.close_authority.is_some() {
+        // W5 (upstream b7b6688e / #154): terminal payout paths that are PERMISSIONLESS
+        // (CloseResolved, ClaimResolvedPayoutTopup, and the stake leg of
+        // WithdrawInsuranceReserveToStake -- any caller can trigger the payout, not just the
+        // portfolio owner) must additionally reject a `dest_token` that has an active
+        // delegate or close_authority. A pre-poisoned destination (delegate/close_authority
+        // set by an attacker on an account the victim otherwise owns) would let the delegate
+        // sweep the payout the instant it lands, with no signature from the victim required
+        // to trigger the transfer.
+        if require_unencumbered_dest && (dest.delegate.is_some() || dest.close_authority.is_some())
+        {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
-        Ok(())
+        Ok(vault.amount)
     }
 
+    // sync(W4-TOKEN22, adopt upstream cb1dfd43): returns the balance instead of `()`.
+    // `unpack_token_account` still hard-gates `token_ai.owner == spl_token::ID`, so a
+    // Token-2022-owned (or any non-classic-SPL) vault account is rejected before mint/owner/
+    // delegate/canonical-address are even read. F-VAULT-FRAG's canonical-address pin is
+    // fork-only and preserved unchanged.
     fn verify_vault_token_account(
         token_ai: &AccountInfo,
         expected_owner: &Pubkey,
         expected_mint: &Pubkey,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<u64, ProgramError> {
         let token = unpack_token_account(token_ai)?;
         if token.mint != *expected_mint {
             return Err(PercolatorError::InvalidMint.into());
@@ -26466,16 +26493,15 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidVaultAccount.into());
         }
-        Ok(())
+        Ok(token.amount)
     }
 
     /// GH#451: the vault for a mint being switched away from must be EMPTY.
     ///
-    /// Ported from upstream's `require_empty_vault_token_account`. Our
-    /// `verify_vault_token_account` returns `()` rather than the balance, so the
-    /// amount is read here instead of testing a return value — same obligation,
-    /// and it keeps our stricter canonical-address pin (F-VAULT-FRAG), which
-    /// upstream's variant does not carry.
+    /// sync(W4-TOKEN22): `verify_vault_token_account` now returns the balance (matching
+    /// upstream's `require_empty_vault_token_account`), so the zero-check tests that return
+    /// value directly instead of re-unpacking the account. Still keeps our stricter
+    /// canonical-address pin (F-VAULT-FRAG), which upstream's variant does not carry.
     ///
     /// `EngineLockActive` matches upstream's error for this, and matches the
     /// header-counter check in the same handler, so a caller sees one code for
@@ -26485,16 +26511,18 @@ pub mod processor {
         expected_owner: &Pubkey,
         expected_mint: &Pubkey,
     ) -> Result<(), ProgramError> {
-        verify_vault_token_account(token_ai, expected_owner, expected_mint)?;
-        if unpack_token_account(token_ai)?.amount != 0 {
+        if verify_vault_token_account(token_ai, expected_owner, expected_mint)? != 0 {
             return Err(PercolatorError::EngineLockActive.into());
         }
         Ok(())
     }
 
-    fn require_token_balance(token_ai: &AccountInfo, amount: u64) -> Result<(), ProgramError> {
-        let token = unpack_token_account(token_ai)?;
-        if token.amount < amount {
+    // sync(W4-TOKEN22, adopt upstream cb1dfd43): takes the already-validated balance rather
+    // than an AccountInfo, so callers can't re-unpack (and can't accidentally check a
+    // DIFFERENT account's bytes than the one the balance came from -- the u64 signature makes
+    // that a compile error instead of a live bug).
+    pub(crate) fn require_token_balance(balance: u64, amount: u64) -> ProgramResult {
+        if balance < amount {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
         Ok(())
