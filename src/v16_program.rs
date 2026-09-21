@@ -5593,6 +5593,14 @@ pub mod ix {
         UpdateAssetLifecycle {
             action: u8,
             asset_index: u16,
+            /// W3A-2: ADOPT upstream `dd958393` epoch binding -- the
+            /// within-generation authority axis (A->B->A rotations of
+            /// `marketauth`/`asset_admin`), checked at every one of this
+            /// tag's three authority-gated call sites. Orthogonal to TB-4's
+            /// `market_id`/generation axis (not yet present on this fork's
+            /// `UpdateAssetLifecycle`, which is why there is no `market_id`
+            /// field here); upstream carries both fields side by side.
+            authority_epoch: u64,
             now_slot: u64,
             initial_price: u64,
             max_init_fee: u128,
@@ -5669,9 +5677,16 @@ pub mod ix {
         UpdateBaseUnitMints {
             primary_mint: [u8; 32],
             secondary_mint: [u8; 32],
+            /// W3A-2: ADOPT upstream `717206c3` epoch binding -- caller-observed
+            /// `authority_epoch`, checked (not advanced) against the market's
+            /// asset-0 `AssetControlSequencesV16.authority_epoch` at execution.
+            authority_epoch: u64,
         },
         SwapSecondaryForPrimary {
             amount: u128,
+            /// W3A-2: ADOPT upstream `717206c3` epoch binding -- see
+            /// `UpdateBaseUnitMints::authority_epoch`'s doc comment.
+            authority_epoch: u64,
         },
         // ── Fork LP Vault instructions (tags 74-80, v17 renumber from 65-71) ──
         CreateLpVault {
@@ -6085,9 +6100,11 @@ pub mod ix {
                 60 => Self::UpdateBaseUnitMints {
                     primary_mint: read_bytes32(&mut rest)?,
                     secondary_mint: read_bytes32(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 61 => Self::SwapSecondaryForPrimary {
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 62 => Self::ConfigureAuthMark {
                     asset_index: read_u16(&mut rest)?,
@@ -6166,6 +6183,7 @@ pub mod ix {
                 40 => Self::UpdateAssetLifecycle {
                     action: read_u8(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_price: read_u64(&mut rest)?,
                     max_init_fee: read_u128(&mut rest)?,
@@ -6641,14 +6659,20 @@ pub mod ix {
                 Self::UpdateBaseUnitMints {
                     primary_mint,
                     secondary_mint,
+                    authority_epoch,
                 } => {
                     out.push(60);
                     out.extend_from_slice(&primary_mint);
                     out.extend_from_slice(&secondary_mint);
+                    push_u64(&mut out, authority_epoch);
                 }
-                Self::SwapSecondaryForPrimary { amount } => {
+                Self::SwapSecondaryForPrimary {
+                    amount,
+                    authority_epoch,
+                } => {
                     out.push(61);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::WithdrawBackingBucketEarnings {
                     domain,
@@ -6790,6 +6814,7 @@ pub mod ix {
                 Self::UpdateAssetLifecycle {
                     action,
                     asset_index,
+                    authority_epoch,
                     now_slot,
                     initial_price,
                     max_init_fee,
@@ -6801,6 +6826,7 @@ pub mod ix {
                     out.push(40);
                     out.push(action);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, authority_epoch);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_price);
                     push_u128(&mut out, max_init_fee);
@@ -8924,21 +8950,46 @@ pub mod processor {
         write_control_sequences_to_view(group, asset_index, &sequences)
     }
 
-    /// W3A-1 (this unit): ADOPTED from upstream `95d155bc` byte-for-byte
-    /// (`git show 95d155bc:src/v16_program.rs` -- the read-only sibling of
-    /// `advance_authority_epoch_view` above). CHECK-ONLY variant: validates
+    /// DEDUPLICATED at integration (runbook §10b): W3A-1, W3A-2, W3A-3,
+    /// W4-AE-EXTEND and W4-AE-84 each independently define this exact
+    /// function byte-for-byte (all ADOPTED from upstream `95d155bc`,
+    /// `git show 95d155bc:src/v16_program.rs` -- the read-only sibling of
+    /// `advance_authority_epoch_view` above). Landing them as-is would be a
+    /// duplicate-symbol compile error; ONE definition is kept, shared by
+    /// every caller across all five units. CHECK-ONLY variant: validates
     /// the caller's `expected` epoch via the same strict CAS
     /// (`require_current_authority_epoch`) but does NOT increment the
-    /// stored value. Used for the five fund-critical tags this unit binds
-    /// (`UpdateAuthority`'s market-level rotation aside, which DOES rotate
-    /// and so calls `advance_authority_epoch_view` instead): `CloseSlab`
-    /// (terminal/irreversible -- no future rotation to protect),
-    /// `WithdrawBackingBucket[Earnings]`, and `WithdrawInsuranceAsset`
-    /// (fund withdrawals, not authority rotations -- the epoch they check
-    /// is advanced by a SEPARATE `UpdateAuthority`/`UpdateAssetAuthority`
-    /// call, never by the withdrawal itself). A stale signed withdrawal or
-    /// CloseSlab tx built against a since-rotated authority is rejected
-    /// here exactly like a stale `UpdateAssetAuthority` is by the CAS.
+    /// stored value.
+    ///
+    /// Used for every tag bound to the shared asset-0 `authority_epoch`
+    /// lane that only needs to REJECT a stale caller-observed epoch, not
+    /// advance it -- only `UpdateAssetAuthority`'s (tag 65) and
+    /// `UpdateAuthority`'s (tag 32) actual rotations call the sibling
+    /// `advance_authority_epoch_view` instead:
+    /// - W3A-1: `CloseSlab` (terminal/irreversible -- no future rotation to
+    ///   protect), `WithdrawBackingBucket`/`WithdrawEarnings`,
+    ///   `WithdrawInsuranceAsset` (fund withdrawals, not authority
+    ///   rotations -- the epoch they check is advanced by a SEPARATE
+    ///   `UpdateAuthority`/`UpdateAssetAuthority` call, never by the
+    ///   withdrawal itself).
+    /// - W3A-2: `UpdateBaseUnitMints`, `SwapSecondaryForPrimary`,
+    ///   `UpdateAssetLifecycle`.
+    /// - W3A-3: the top-up/resolve tags' pre-check phase also calls
+    ///   `state::read_asset_control_sequences` + `state::
+    ///   require_current_authority_epoch` directly where no
+    ///   `MarketViewMutV16` exists yet -- not a dup of this fn, left as-is
+    ///   (see W3A-3's own merge notes).
+    /// - W4-AE-EXTEND: `UpdateFeeSplit`/`WithdrawCreatorFee`/
+    ///   `UpdateInsuranceWithdrawPolicy` (tags 86/90/92), reusing this SAME
+    ///   asset-0 lane.
+    ///
+    /// A stale signed instruction built against a since-rotated authority is
+    /// rejected here exactly like a stale `UpdateAssetAuthority` is by the
+    /// CAS. NOTE: W4-AE-84 binds a DIFFERENT, DISTINCT lane
+    /// (`protocol_fee_authority_epoch`, not this asset-0 `authority_epoch`
+    /// lane) via its own `require_protocol_fee_authority_epoch_view` --
+    /// that helper is NOT a dup of this one and is kept separate (see its
+    /// own merge notes).
     fn require_authority_epoch_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
@@ -9896,6 +9947,7 @@ pub mod processor {
             Instruction::UpdateAssetLifecycle {
                 action,
                 asset_index,
+                authority_epoch,
                 now_slot,
                 initial_price,
                 max_init_fee,
@@ -9908,6 +9960,7 @@ pub mod processor {
                 accounts,
                 action,
                 asset_index,
+                authority_epoch,
                 now_slot,
                 initial_price,
                 max_init_fee,
@@ -9982,10 +10035,18 @@ pub mod processor {
             Instruction::UpdateBaseUnitMints {
                 primary_mint,
                 secondary_mint,
-            } => handle_update_base_unit_mints(program_id, accounts, primary_mint, secondary_mint),
-            Instruction::SwapSecondaryForPrimary { amount } => {
-                handle_swap_secondary_for_primary(program_id, accounts, amount)
-            }
+                authority_epoch,
+            } => handle_update_base_unit_mints(
+                program_id,
+                accounts,
+                primary_mint,
+                secondary_mint,
+                authority_epoch,
+            ),
+            Instruction::SwapSecondaryForPrimary {
+                amount,
+                authority_epoch,
+            } => handle_swap_secondary_for_primary(program_id, accounts, amount, authority_epoch),
             // ── Fork LP Vault (tags 74-80) ───────────────────────────────────
             Instruction::CreateLpVault {
                 fee_share_bps,
@@ -16864,6 +16925,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         primary_mint: [u8; 32],
         secondary_mint: [u8; 32],
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -16897,6 +16959,14 @@ pub mod processor {
         let mut cfg = {
             let (cfg, group) = state::market_view_mut(&mut data)?;
             expect_live_authority(&cfg.marketauth, authority.key)?;
+            // W3A-2: ADOPT upstream `717206c3` -- gate-2-class replay protection.
+            // This admin op changes the market's accepted collateral mints with
+            // no prior replay protection; a held/durable-nonce signed tx stays
+            // valid indefinitely. Binding it to the LIVE asset-0 authority_epoch
+            // means any intervening rotation (via `UpdateAssetAuthority`)
+            // invalidates it. CHECK ONLY -- this tag does not itself rotate the
+            // epoch (see `require_authority_epoch_view`'s own doc comment).
+            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
             if group.header.vault.get() != 0
                 || group.header.c_tot.get() != 0
                 || group.header.insurance.get() != 0
@@ -16961,6 +17031,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -16986,12 +17057,29 @@ pub mod processor {
         // handle_deposit and every other engine-touching handler. Without this guard the
         // secondary->primary swap stayed callable after ResolveMarket (the handler read the
         // mode but discarded it and never engaged the engine lock).
-        let (cfg, mode, _, _) =
-            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        if mode != MarketModeV16::Live {
-            return Err(PercolatorError::EngineLockActive.into());
-        }
-        expect_live_authority(&cfg.marketauth, authority.key)?;
+        //
+        // W3A-2: ADOPT upstream `717206c3` epoch binding (adapted for our fork's extra
+        // VULN-02 mode check, which upstream's own version of this handler does not have).
+        // Scoped to one immutable borrow so the asset-0 `authority_epoch` read below sees
+        // the same snapshot as `cfg`/`mode` -- no view is already in scope here (unlike
+        // `handle_update_base_unit_mints`, which holds a `market_view_mut` and uses
+        // `require_authority_epoch_view` instead), so this reads the raw control-sequences
+        // bytes directly via `state::read_asset_control_sequences` +
+        // `state::require_current_authority_epoch`. CHECK ONLY -- no advance.
+        let cfg = {
+            let market_data = market_ai.try_borrow_data()?;
+            let (cfg, mode, _, _) = state::read_market_config_mode_and_capacity(&market_data)?;
+            if mode != MarketModeV16::Live {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            expect_live_authority(&cfg.marketauth, authority.key)?;
+            let sequences = state::read_asset_control_sequences(&market_data, 0)?;
+            state::require_current_authority_epoch(
+                sequences.authority_epoch,
+                expected_authority_epoch,
+            )?;
+            cfg
+        };
         let primary_mint = primary_collateral_mint(&cfg);
         let secondary_mint = secondary_collateral_mint(&cfg)?;
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
@@ -17151,6 +17239,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         action: u8,
         asset_index: u16,
+        expected_authority_epoch: u64,
         now_slot: u64,
         initial_price: u64,
         max_init_fee: u128,
@@ -17256,7 +17345,18 @@ pub mod processor {
                     let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
                     let still_asset_authority =
                         cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
-                    if !still_asset_authority {
+                    if still_asset_authority {
+                        // W3A-2: ADOPT upstream `dd958393` -- market-authority reuse of a
+                        // free slot is authority-consent, so it is bound to the LIVE asset-0
+                        // authority_epoch exactly like the other two call sites below.
+                        require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+                    } else {
+                        // W3A-2: ADOPT upstream `dd958393` -- the permissionless reuse path
+                        // below is generation- and fee-bound, not authority consent. Requiring
+                        // the canonical zero value here (rather than skipping the check)
+                        // prevents this wire lane from becoming an unaudited caller-controlled
+                        // payload once `authority_epoch` exists on the wire at all.
+                        state::require_current_authority_epoch(0, expected_authority_epoch)?;
                         let expected_fee = permissionless_market_init_fee_for_asset(
                             cfg.permissionless_market_init_fee,
                             asset_index,
@@ -17399,6 +17499,20 @@ pub mod processor {
                 if !marketauth_authorized && !asset_admin_authorized {
                     return Err(PercolatorError::Unauthorized.into());
                 }
+                // W3A-2: ADOPT upstream `dd958393` -- SHUTDOWN is dual-gated (market
+                // authority OR the per-asset `asset_admin` cold key), so the epoch lane it
+                // is bound to must track WHICHEVER authority actually signed: asset-0's
+                // epoch when `marketauth` authorized it, this asset's own epoch otherwise.
+                // Binding both cases to asset-0 would let an asset_admin rotation (which
+                // only ever touches its own asset's lane) go unenforced here, and binding
+                // both to `asset_index` would wrongly reject a marketauth-signed call after
+                // any unrelated per-asset admin rotation.
+                let epoch_asset_index = if marketauth_authorized {
+                    0
+                } else {
+                    asset_index
+                };
+                require_authority_epoch_view(&group, epoch_asset_index, expected_authority_epoch)?;
                 if authenticated_slot < group.header.current_slot.get() {
                     return Err(PercolatorError::EngineStale.into());
                 }
@@ -17463,6 +17577,11 @@ pub mod processor {
             if !live_authority_matches(&cfg.marketauth, authority.key) {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // W3A-2: ADOPT upstream `dd958393` -- this branch (in-place reactivate /
+            // DRAIN_ONLY / RETIRE) is gated solely on `marketauth`, with no asset_admin
+            // alternative, so it is always bound to asset-0's authority_epoch (unlike
+            // SHUTDOWN's dual-authority `epoch_asset_index` split above).
+            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
             // Pre-collapse this was true only when the *admin* key (distinct from the *asset_authority*
             // key) retired an asset; the market authority itself was always "asset-authorized" so this
             // branch never fired for the init signer. With admin and asset_authority collapsed into the

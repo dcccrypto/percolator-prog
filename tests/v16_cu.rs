@@ -603,6 +603,13 @@ impl V16CuEnv {
         if clock.slot < now_slot {
             self.svm.warp_to_slot(now_slot);
         }
+        // W3A-2: `self.admin` is marketauth, so this call always keys off
+        // asset-0's LIVE authority_epoch (both the append/reuse-by-marketauth
+        // path and the in-place-reactivate path use asset-0 -- see
+        // `handle_update_asset_lifecycle`'s per-call-site comments). Reads it
+        // fresh, mirroring this struct's own `control_sequences` idiom for the
+        // other 14 TB-2b-bound lanes just below -- never a hardcoded constant.
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -610,6 +617,7 @@ impl V16CuEnv {
             ProgInstruction::UpdateAssetLifecycle {
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index,
+                authority_epoch,
                 now_slot,
                 initial_price,
                 max_init_fee: u128::MAX,
@@ -691,6 +699,11 @@ impl V16CuEnv {
         now_slot: u64,
         initial_price: u64,
     ) -> u64 {
+        // W3A-2: `self.admin` is marketauth -- keys off asset-0's LIVE
+        // authority_epoch regardless of `action` (ACTIVATE/DRAIN_ONLY/RETIRE/
+        // SHUTDOWN-by-marketauth all use asset-0; see
+        // `handle_update_asset_lifecycle`'s per-call-site comments).
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -698,6 +711,7 @@ impl V16CuEnv {
             ProgInstruction::UpdateAssetLifecycle {
                 action,
                 asset_index,
+                authority_epoch,
                 now_slot,
                 initial_price,
                 max_init_fee: u128::MAX,
@@ -838,6 +852,9 @@ impl V16CuEnv {
         primary_mint: Pubkey,
         secondary_mint: Pubkey,
     ) -> u64 {
+        // W3A-2: `UpdateBaseUnitMints` keys off asset-0's LIVE authority_epoch
+        // unconditionally (single call site).
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -845,6 +862,7 @@ impl V16CuEnv {
             ProgInstruction::UpdateBaseUnitMints {
                 primary_mint: primary_mint.to_bytes(),
                 secondary_mint: secondary_mint.to_bytes(),
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -865,11 +883,17 @@ impl V16CuEnv {
         secondary_vault: Pubkey,
         amount: u128,
     ) -> u64 {
+        // W3A-2: `SwapSecondaryForPrimary` keys off asset-0's LIVE
+        // authority_epoch unconditionally (single call site).
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::SwapSecondaryForPrimary { amount },
+            ProgInstruction::SwapSecondaryForPrimary {
+                amount,
+                authority_epoch,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new_readonly(self.market, false),
@@ -1136,6 +1160,9 @@ impl V16CuEnv {
             ProgInstruction::UpdateAssetLifecycle {
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index,
+                // W3A-2: `creator` is not marketauth, so this permissionless
+                // lane requires the canonical zero value unconditionally.
+                authority_epoch: 0,
                 now_slot,
                 initial_price,
                 max_init_fee: u128::MAX,
@@ -1183,6 +1210,9 @@ impl V16CuEnv {
             ProgInstruction::UpdateAssetLifecycle {
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index,
+                // W3A-2: `creator` is not marketauth, so this permissionless
+                // lane requires the canonical zero value unconditionally.
+                authority_epoch: 0,
                 now_slot,
                 initial_price,
                 max_init_fee,
@@ -13021,6 +13051,9 @@ fn v16_audit_permissionless_reuse_rejects_zero_insurance_authority() {
             ProgInstruction::UpdateAssetLifecycle {
                 action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
                 asset_index: 1,
+                // W3A-2: `creator` is not marketauth, so this permissionless
+                // reuse lane requires the canonical zero value unconditionally.
+                authority_epoch: 0,
                 now_slot: 4,
                 initial_price: 250,
                 max_init_fee: u128::MAX,
@@ -14711,10 +14744,18 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
 
     let before_drain = env.svm.get_account(&env.market).unwrap();
     env.svm.expire_blockhash();
+    // W3A-2: `admin` is marketauth -- keys off asset-0's LIVE authority_epoch.
+    // This call is expected to reject on `OracleStale` (permissionless-resolve
+    // maturity), which is checked BEFORE the epoch CAS in
+    // `handle_update_asset_lifecycle`'s marketauth-only gate, so the exact
+    // value doesn't gate this assertion either way -- reading it live keeps
+    // the call itself well-formed rather than relying on that ordering.
+    let authority_epoch = env.control_sequences(0).authority_epoch;
     let stale_drain = env.send(
         ProgInstruction::UpdateAssetLifecycle {
             action: percolator_prog::processor::ASSET_ACTION_DRAIN_ONLY,
             asset_index: 2,
+            authority_epoch,
             now_slot: 0,
             initial_price: 0,
             max_init_fee: u128::MAX,
@@ -14741,10 +14782,13 @@ fn v16_attack_marketauth_lifecycle_actions_reject_when_resolve_matured() {
 
     let before_retire = env.svm.get_account(&env.market).unwrap();
     env.svm.expire_blockhash();
+    // W3A-2: see the DrainOnly call above -- same reasoning.
+    let authority_epoch = env.control_sequences(0).authority_epoch;
     let stale_retire = env.send(
         ProgInstruction::UpdateAssetLifecycle {
             action: percolator_prog::processor::ASSET_ACTION_RETIRE,
             asset_index: 2,
+            authority_epoch,
             now_slot: 40,
             initial_price: 0,
             max_init_fee: u128::MAX,
@@ -16310,11 +16354,17 @@ fn v17_activate_already_configured_slot_reports_a_distinct_error() {
     let admin = env.admin.insecure_clone();
     let market = env.market;
     let authority = admin.pubkey().to_bytes();
+    // W3A-2: `admin` is marketauth, and this call must reach the
+    // AssetSlotAlreadyConfigured rejection (inside the marketauth-only match
+    // block, AFTER the epoch CAS) rather than failing earlier on EngineStale
+    // -- must be the genuinely LIVE asset-0 epoch, not a placeholder.
+    let authority_epoch = env.control_sequences(0).authority_epoch;
     let err = env
         .send(
             ProgInstruction::UpdateAssetLifecycle {
                 action: 0, // ACTIVATE
                 asset_index: 1,
+                authority_epoch,
                 now_slot: 1,
                 initial_price: 100,
                 max_init_fee: u128::MAX,
@@ -20448,4 +20498,272 @@ fn v16_bpf_withdraw_insurance_asset_cas_rejects_held_tx_after_intervening_rotati
     )
     .expect("WithdrawInsuranceAsset with the CORRECT epoch must succeed");
     assert_eq!(env.token_amount(dest), 20);
+}
+
+// ── W3A-2 ────────────────────────────────────────────────────────────────────
+//
+// Extends the exact "held tx across an intervening rotation" landmine test
+// above (`v16_bpf_update_asset_authority_cas_rejects_held_tx_after_intervening_rotation`)
+// to the three additional admin instruction groups this unit binds to
+// `authority_epoch`: `UpdateBaseUnitMints` (tag 60), `SwapSecondaryForPrimary`
+// (tag 61, upstream `717206c3`), and `UpdateAssetLifecycle` (tag 40, upstream
+// `dd958393`). Before this unit, none of these three checked `authority_epoch`
+// at all -- a signed tx built against the current epoch stayed valid forever
+// (or until some unrelated action happened to reach whatever value it was
+// signed against), exactly the durable-nonce landmine TB-2b's own CAS closed
+// for `UpdateAssetAuthority`. Each test below: (1) reads the LIVE current
+// `authority_epoch`, (2) builds but does NOT submit a tx against it, (3) a
+// DIFFERENT legitimate `UpdateAssetAuthority` rotation lands first and
+// advances the SAME asset-0 epoch, (4) the held tx is submitted and MUST now
+// be rejected with `EngineStale`.
+//
+// Non-vacuity (each test individually, reported in this unit's handback):
+// neuter the tag's own `require_authority_epoch_view` / `require_current_authority_epoch`
+// call site in `src/v16_program.rs` (comment it out, or stub it to always
+// `Ok(())`) -> `cargo build-sbf --features devnet` -> the corresponding test
+// below must FAIL (the held tx is wrongly admitted) -> restore -> `cargo
+// build-sbf --features devnet` -> passes again.
+
+#[test]
+fn v16_bpf_update_base_unit_mints_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) an UpdateBaseUnitMints against the CURRENT
+    //    asset-0 epoch. Reuses the market's EXISTING primary mint (env.mint)
+    //    unchanged and introduces a brand-new secondary -- previous_secondary
+    //    is None on a fresh market, so no old-vault accounts are required
+    //    (GH#451), isolating this test to the epoch binding alone.
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let secondary_mint = env.create_mint();
+    let held_ix = ProgInstruction::UpdateBaseUnitMints {
+        primary_mint: env.mint.to_bytes(),
+        secondary_mint: secondary_mint.to_bytes(),
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new_readonly(env.mint, false),
+        AccountMeta::new_readonly(secondary_mint, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing the SAME asset-0 `authority_epoch`
+    //    counter this tag is bound to. The held tx above is NOT submitted
+    //    here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 2, // ASSET_AUTH_INSURANCE_OPERATOR
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1).
+    let before = env.svm.get_account(&env.market).unwrap().data;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held UpdateBaseUnitMints signed against a since-superseded \
+             authority_epoch must be rejected once an intervening rotation \
+             has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        before,
+        "the rejected held tx must leave the market's collateral-mint config untouched"
+    );
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // Configure a secondary mint and fund its vault first -- this call itself
+    // carries `authority_epoch` too (W3A-2), but is submitted immediately
+    // (not held), so it is unaffected by the rotation staged below.
+    let secondary_mint = env.create_mint();
+    env.update_base_unit_mints_with_cu(env.mint, secondary_mint);
+    let primary_source = env.token_account_for_mint(env.mint, admin.pubkey(), 50);
+    let secondary_dest = env.token_account_for_mint(secondary_mint, admin.pubkey(), 0);
+    let secondary_vault = env.vault_token_for_mint(secondary_mint, 50);
+
+    // 1. Sign (build, DON'T submit) a SwapSecondaryForPrimary against the
+    //    CURRENT asset-0 epoch.
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_ix = ProgInstruction::SwapSecondaryForPrimary {
+        amount: 50,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new_readonly(env.market, false),
+        AccountMeta::new(primary_source, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new(secondary_dest, false),
+        AccountMeta::new(secondary_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing the SAME asset-0 `authority_epoch`
+    //    counter this tag is bound to. The held tx above is NOT submitted
+    //    here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 2, // ASSET_AUTH_INSURANCE_OPERATOR
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1). Were it wrongly admitted, the swap WOULD
+    //    otherwise fully succeed (accounts are genuinely funded/valid) --
+    //    proving the rejection is solely the epoch check, not some other
+    //    account-shape defect.
+    let before_primary = env.token_amount(primary_source);
+    let before_vault = env.token_amount(env.vault);
+    let before_secondary_dest = env.token_amount(secondary_dest);
+    let before_secondary_vault = env.token_amount(secondary_vault);
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held SwapSecondaryForPrimary signed against a since-superseded \
+             authority_epoch must be rejected once an intervening rotation \
+             has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(env.token_amount(primary_source), before_primary);
+    assert_eq!(env.token_amount(env.vault), before_vault);
+    assert_eq!(env.token_amount(secondary_dest), before_secondary_dest);
+    assert_eq!(env.token_amount(secondary_vault), before_secondary_vault);
+}
+
+#[test]
+fn v16_bpf_update_asset_lifecycle_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) an UpdateAssetLifecycle(DRAIN_ONLY) on
+    //    asset 0 against the CURRENT asset-0 epoch. DRAIN_ONLY by marketauth
+    //    is the marketauth-only gate (call site 3 in
+    //    `handle_update_asset_lifecycle`), which keys off asset-0's epoch
+    //    unconditionally -- the simplest of this tag's three call sites, with
+    //    no token accounts or fee/permissionless branching to entangle.
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_ix = ProgInstruction::UpdateAssetLifecycle {
+        action: processor::ASSET_ACTION_DRAIN_ONLY,
+        asset_index: 0,
+        authority_epoch: held_expected,
+        now_slot: 0,
+        initial_price: 0,
+        max_init_fee: u128::MAX,
+        insurance_authority: admin.pubkey().to_bytes(),
+        insurance_operator: admin.pubkey().to_bytes(),
+        backing_bucket_authority: admin.pubkey().to_bytes(),
+        oracle_authority: admin.pubkey().to_bytes(),
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing the SAME asset-0 `authority_epoch`
+    //    counter this tag is bound to. The held tx above is NOT submitted
+    //    here -- it stays "held".
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 2, // ASSET_AUTH_INSURANCE_OPERATOR
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("legitimate rotation (epoch held_expected -> held_expected + 1) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance the epoch by exactly 1"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals the current stored value
+    //    (held_expected + 1). Asset 0 must therefore still be Active -- had
+    //    the held tx been wrongly admitted, it would have flipped to
+    //    DrainOnly.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&admin])
+        .expect_err(
+            "a held UpdateAssetLifecycle(DRAIN_ONLY) signed against a \
+             since-superseded authority_epoch must be rejected once an \
+             intervening rotation has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.market_state().1.assets[0].lifecycle,
+        AssetLifecycleV16::Active,
+        "the rejected held tx must leave asset 0's lifecycle untouched"
+    );
 }
