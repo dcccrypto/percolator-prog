@@ -2,7 +2,7 @@
 
 extern crate kani;
 
-use percolator_prog::ix::Instruction;
+use percolator_prog::ix::{CrankObservationHint, Instruction};
 use percolator_prog::matcher_abi::{
     validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
 };
@@ -767,50 +767,80 @@ fn kani_v16_matcher_return_accepts_only_bound_echoed_fills() {
     kani::cover!(result.is_ok());
 }
 
-// FIX W3 (upstream #206, pairs with engine E3 / #92): the wire format no
-// longer carries caller-supplied close_q/fee_bps -- liquidation size and fee
-// are fully engine-selected (v16.rs liquidate_account_not_atomic). The
-// payload shrinks from 53 to 29 bytes (1 tag + 1 action + 2 asset_index +
-// 8 now_slot + 16 funding_rate_e9 + 1 recovery_reason).
+// ADOPT upstream Group-B subsystem #2 (AutoCrankObservation): the wire format no longer
+// carries a caller-selected action/funding_rate_e9/recovery_reason at all -- the caller
+// supplies `now_slot` plus a bounded `Vec<CrankObservationHint{asset_index, oracle_accounts}>`
+// and the engine's `AutoCrankPlanV16` selector picks the action (see
+// adopt_autocrank_observation.md). The fixed 29-byte payload this proof pinned (FIX W3: 1 tag +
+// 1 action + 2 asset_index + 8 now_slot + 16 funding_rate_e9 + 1 recovery_reason) is superseded
+// by a variable-length `now_slot(8) + count(1) + count * (asset_index(2) + oracle_accounts(1))`
+// shape, bounded by `CRANK_OBSERVATION_DECODE_MAX` (16). Proven here for a bounded 0/1/2-hint
+// space (the standard Kani pattern for a bounded-loop decode -- the loop body is identical for
+// every iteration, so 0/1/2 iterations exercise every reachable code path the loop can take).
 #[kani::proof]
 fn kani_v16_permissionless_crank_decode_preserves_wire_fields() {
-    let action: u8 = kani::any();
-    let asset_index: u16 = kani::any();
-    let recovery_reason: u8 = kani::any();
     let now_slot: u64 = kani::any();
-    let funding_rate_e9: i128 = kani::any();
+    let n: u8 = kani::any();
+    kani::assume(n <= 2);
+    let hint0_asset_index: u16 = kani::any();
+    let hint0_oracle_accounts: u8 = kani::any();
+    let hint1_asset_index: u16 = kani::any();
+    let hint1_oracle_accounts: u8 = kani::any();
 
-    let mut data = [0u8; 29];
+    let mut data = [0u8; 1 + 8 + 1 + 2 * 3];
     data[0] = 5;
-    data[1] = action;
-    data[2..4].copy_from_slice(&asset_index.to_le_bytes());
-    data[4..12].copy_from_slice(&now_slot.to_le_bytes());
-    data[12..28].copy_from_slice(&funding_rate_e9.to_le_bytes());
-    data[28] = recovery_reason;
+    data[1..9].copy_from_slice(&now_slot.to_le_bytes());
+    data[9] = n;
+    data[10..12].copy_from_slice(&hint0_asset_index.to_le_bytes());
+    data[12] = hint0_oracle_accounts;
+    data[13..15].copy_from_slice(&hint1_asset_index.to_le_bytes());
+    data[15] = hint1_oracle_accounts;
+    let used = 10 + (n as usize) * 3;
 
-    match Instruction::decode(&data).unwrap() {
+    match Instruction::decode(&data[..used]).unwrap() {
         Instruction::PermissionlessCrank {
-            action: got_action,
-            asset_index: got_asset,
             now_slot: got_slot,
-            funding_rate_e9: got_rate,
-            recovery_reason: got_recovery,
+            observations,
         } => {
-            assert_eq!(got_action, action);
-            assert_eq!(got_asset, asset_index);
             assert_eq!(got_slot, now_slot);
-            assert_eq!(got_rate, funding_rate_e9);
-            assert_eq!(got_recovery, recovery_reason);
+            assert_eq!(observations.len(), n as usize);
+            if n >= 1 {
+                assert_eq!(observations[0].asset_index, hint0_asset_index);
+                assert_eq!(observations[0].oracle_accounts, hint0_oracle_accounts);
+            }
+            if n >= 2 {
+                assert_eq!(observations[1].asset_index, hint1_asset_index);
+                assert_eq!(observations[1].oracle_accounts, hint1_oracle_accounts);
+            }
         }
         _ => unreachable!(),
     }
 }
 
-// FIX W3 non-vacuity companion: proves the OLD (pre-fix, 53-byte) wire
-// payload -- the exact shape a keeper would have sent to control close_q/
-// fee_bps -- is now REJECTED by decode as trailing bytes, not silently
-// accepted with the extra 24 bytes ignored. This is the concrete "the
-// keeper-controlled-sizing attack surface is gone at the wire level" proof.
+// Non-vacuity companion: proves a hint count exceeding `CRANK_OBSERVATION_DECODE_MAX` (16) is
+// REJECTED by decode, not silently truncated or accepted -- the concrete "an oversized hint
+// list cannot smuggle unbounded per-transaction oracle-account work past decode" proof. Bounded
+// to n in 17..=18 (immediately past the limit) for the same reason the accept-side proof above
+// bounds its hint count -- the decode loop's rejection check fires identically for every n past
+// the limit, so exhausting all of them adds no coverage.
+#[kani::proof]
+fn kani_v16_permissionless_crank_rejects_oversized_hint_count() {
+    let now_slot: u64 = kani::any();
+    let n: u8 = kani::any();
+    kani::assume(n == 17 || n == 18);
+
+    let mut data = [0u8; 1 + 8 + 1];
+    data[0] = 5;
+    data[1..9].copy_from_slice(&now_slot.to_le_bytes());
+    data[9] = n;
+
+    assert!(Instruction::decode(&data).is_err());
+}
+
+// FIX W3 non-vacuity companion (PRESERVED): proves the OLD (pre-W3, 53-byte, single-asset)
+// wire payload -- the exact shape a keeper would have sent to control close_q/fee_bps, and
+// which also predates this unit's hint-based rewrite -- is REJECTED by decode as trailing
+// bytes, not silently accepted with the extra bytes ignored.
 #[kani::proof]
 fn kani_v16_permissionless_crank_rejects_legacy_close_q_fee_bps_wire_payload() {
     let action: u8 = kani::any();
@@ -1379,12 +1409,9 @@ fn kani_v16_trade_and_crank_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
 
     assert_rejects_trailing_byte(
-        Instruction::PermissionlessCrank {
-            action: 0,
-            asset_index: 0,
+Instruction::PermissionlessCrank {
             now_slot: 1,
-            funding_rate_e9: 0,
-            recovery_reason: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
         },
         extra,
     );
