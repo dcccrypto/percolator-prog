@@ -359,13 +359,23 @@ fn asset_admin_of(market: &TestAccount, asset_index: usize) -> [u8; 32] {
         .asset_admin
 }
 
+// Wave-2 TB-4: `market_id` is read live from the market account rather than
+// hardcoded, because this file's own tests exercise retire-then-reactivate
+// cycles (the generation bumps on every activation, consuming
+// `next_market_id`) and directly-seeded lifecycle states, so no static
+// formula (e.g. `asset_index + 1`) holds in general.
 fn activate_ix(
+    market: &TestAccount,
     asset_index: u16,
     now_slot: u64,
     initial_price: u64,
     authority: [u8; 32],
 ) -> Instruction {
+    let (_current, next_market_id) =
+        state::read_asset_lifecycle_generation_preflight(&market.data, asset_index as usize, true)
+            .unwrap_or((0, 0));
     Instruction::UpdateAssetLifecycle {
+        market_id: next_market_id,
         action: processor::ASSET_ACTION_ACTIVATE,
         asset_index,
         // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this file, so
@@ -383,8 +393,15 @@ fn activate_ix(
     }
 }
 
-fn retire_ix(asset_index: u16, now_slot: u64) -> Instruction {
+fn retire_ix(market: &TestAccount, asset_index: u16, now_slot: u64) -> Instruction {
+    let (current_market_id, _next) = state::read_asset_lifecycle_generation_preflight(
+        &market.data,
+        asset_index as usize,
+        false,
+    )
+    .unwrap_or((0, 0));
     Instruction::UpdateAssetLifecycle {
+        market_id: current_market_id,
         action: processor::ASSET_ACTION_RETIRE,
         asset_index,
         // W3A-2: see `activate_ix`'s comment -- LIVE value, not a hardcode.
@@ -460,7 +477,7 @@ fn asset_zero_seeded_retired_cannot_be_reactivated_by_marketauth() {
     rotate_marketauth(&mut market, stake_pool.key.to_bytes());
 
     let attack = run_ix(
-        activate_ix(0, 4, 100, stake_pool.key.to_bytes()),
+        activate_ix(&market, 0, 4, 100, stake_pool.key.to_bytes()),
         &mut [&mut stake_pool, &mut market],
     );
     assert_eq!(
@@ -504,7 +521,7 @@ fn identical_retired_seed_activates_normally_at_asset_index_one() {
     rotate_marketauth(&mut market, stake_pool.key.to_bytes());
 
     run_ix(
-        activate_ix(1, 4, 100, stake_pool.key.to_bytes()),
+        activate_ix(&market, 1, 4, 100, stake_pool.key.to_bytes()),
         &mut [&mut stake_pool, &mut market],
     )
     .expect("the same seeded retired slot must be activatable at a nonzero index");
@@ -531,7 +548,7 @@ fn retired_nonzero_slot_recycling_still_sets_fresh_domain_authorities() {
     init_two_asset_market(&mut creator, &mut market);
     let new_operator = Pubkey::new_unique().to_bytes();
 
-    run_ix(retire_ix(1, 2), &mut [&mut creator, &mut market])
+    run_ix(retire_ix(&market, 1, 2), &mut [&mut creator, &mut market])
         .expect("marketauth must be able to retire a nonzero asset slot");
     let (cfg_retired, group_retired) = state::read_market(&market.data).unwrap();
     assert_eq!(
@@ -541,7 +558,7 @@ fn retired_nonzero_slot_recycling_still_sets_fresh_domain_authorities() {
     assert_eq!(cfg_retired.free_market_slot_count, 1);
 
     run_ix(
-        activate_ix(1, 1_000, 101, new_operator),
+        activate_ix(&market, 1, 1_000, 101, new_operator),
         &mut [&mut creator, &mut market],
     )
     .expect("a RETIRED nonzero slot must still be recyclable with new authorities");
@@ -578,7 +595,7 @@ fn asset_zero_can_never_be_retired() {
     init_two_asset_market(&mut creator, &mut market);
 
     assert_eq!(
-        run_ix(retire_ix(0, 2), &mut [&mut creator, &mut market]),
+        run_ix(retire_ix(&market, 0, 2), &mut [&mut creator, &mut market]),
         Err(ERR_INVALID_INSTRUCTION),
         "asset 0 must not be retirable — a retired asset 0 is re-activatable, \
          and re-activation rewrites the creator-fee authority"
@@ -602,7 +619,7 @@ fn activate_on_a_live_asset_zero_is_rejected_before_the_guard_is_reached() {
 
     assert_eq!(
         run_ix(
-            activate_ix(0, 4, 100, stake_pool.key.to_bytes()),
+            activate_ix(&market, 0, 4, 100, stake_pool.key.to_bytes()),
             &mut [&mut stake_pool, &mut market]
         ),
         Err(ERR_ASSET_SLOT_ALREADY_CONFIGURED)

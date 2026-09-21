@@ -356,8 +356,17 @@ impl Env {
 
     fn activate_asset(&mut self, asset_index: u16, now_slot: u64, initial_price: u64) {
         let admin = self.admin.insecure_clone();
+        // Wave-2 TB-4: an ACTIVATE binds against the market's live `next_market_id`
+        // frontier -- read it, don't hardcode it.
+        let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            true,
+        )
+        .unwrap_or((0, 0));
         self.send_ok(
             ProgInstruction::UpdateAssetLifecycle {
+                market_id,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index,
                 // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this
@@ -516,6 +525,7 @@ impl Env {
                 account_a_position_epoch,
                 account_b_portfolio_id,
                 account_b_position_epoch,
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (ASSET) as usize).unwrap().3,
                 asset_index: ASSET,
                 size_q,
                 exec_price,
@@ -579,7 +589,7 @@ impl Env {
                 .authority_epoch
         };
         self.try_send(
-            ProgInstruction::TopUpInsurance {
+            ProgInstruction::TopUpInsurance { market_id: 1,
                 intent_id: next_intent_id(),
                 amount,
                 authority_epoch,
@@ -613,6 +623,7 @@ impl Env {
         let observation_sequence = self.control_sequences().oracle_observation + 1;
         self.try_send(
             ProgInstruction::ConfigureEwmaMark {
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (ASSET) as usize).unwrap().3,
                 asset_index: ASSET,
                 now_slot,
                 initial_mark_e6,
@@ -634,6 +645,7 @@ impl Env {
         let observation_sequence = self.control_sequences().oracle_observation + 1;
         self.try_send(
             ProgInstruction::PushEwmaMark {
+            market_id: state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, (ASSET) as usize).unwrap().3,
                 asset_index: ASSET,
                 now_slot,
                 mark_e6,
@@ -658,7 +670,7 @@ impl Env {
                 .authority_epoch
         };
         self.try_send(
-            ProgInstruction::ResolveMarket { authority_epoch },
+            ProgInstruction::ResolveMarket { asset_generation_frontier: state::read_asset_generation_frontier(&self.svm.get_account(&self.market).unwrap().data).unwrap(), authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),

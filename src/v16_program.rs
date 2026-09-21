@@ -1082,6 +1082,20 @@ pub mod error {
         /// every deployed client.
         /// SDK agent: add `RentExemptRequired = 64` to the client error map.
         RentExemptRequired, // Custom(64)
+        // ── Wave-2 TB-4: asset-generation binding (adopts upstream a61000f9 +
+        // 47a3c86f + 5d9e4cb3 + 9a138bdf + 4c100ca6 + e50784d8 + f5c2c6bb) ────
+        // INTEGRATION: TB-4's own ordinal (64) collided with S1b's
+        // RentExemptRequired, which landed on `origin/main` (#495) before
+        // TB-4 merged onto this branch -- moved here, to 65, per runbook §4
+        // ("err ord 64->65, S1b took 64"). Still appended at the true end.
+        /// A caller-supplied `market_id`/`expected_market_id`/`asset_generation_frontier`
+        /// param did not match the asset slot's (or market's) current generation
+        /// counter (`AssetStateV16::market_id` / `header.next_market_id`). Asset
+        /// indices and slot addresses are reusable after `CloseSlab` retires a
+        /// slot; this rejects a stale signed instruction captured against an old
+        /// generation from landing against whatever now occupies the same slot.
+        /// SDK agent: add `AssetGenerationMismatch = 65` to the client error map.
+        AssetGenerationMismatch, // Custom(65)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -3686,6 +3700,15 @@ pub mod state {
         ))
     }
 
+    /// Lightweight read of the market-wide asset-generation frontier (`header.next_market_id`),
+    /// for handlers that don't otherwise need a full `market_view_mut` (e.g.
+    /// `ConfigurePermissionlessResolve`). Wave-2 TB-4 (adopts upstream `4c100ca6`).
+    pub fn read_asset_generation_frontier(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let header = market_header(data)?;
+        Ok(header.next_market_id.get())
+    }
+
     pub fn write_asset_oracle_profile(
         data: &mut [u8],
         asset_index: usize,
@@ -4807,10 +4830,57 @@ pub mod state {
         Ok((config, market_from_wire_boxed(data, false)?))
     }
 
+    // ── Wave-2 TB-4: asset-generation binding helpers (adopts upstream a61000f9
+    // + e50784d8 + f5c2c6bb) ─────────────────────────────────────────────────
+    #[inline]
+    pub fn asset_generation_binding_matches(
+        current_market_id: u64,
+        expected_market_id: u64,
+    ) -> bool {
+        current_market_id == expected_market_id
+    }
+
+    #[inline]
+    pub fn asset_lifecycle_generation_binding_matches(
+        current_market_id: u64,
+        next_market_id: u64,
+        is_activation: bool,
+        expected_market_id: u64,
+    ) -> bool {
+        let bound_market_id = if is_activation {
+            next_market_id
+        } else {
+            current_market_id
+        };
+        bound_market_id == expected_market_id
+    }
+
+    /// Preflight generation read for `UpdateAssetLifecycle`: an activation binds
+    /// against the market's `next_market_id` frontier (the generation about to be
+    /// assigned), any other action binds against the slot's current `market_id`.
+    pub fn read_asset_lifecycle_generation_preflight(
+        data: &[u8],
+        asset_index: usize,
+        is_activation: bool,
+    ) -> Result<(u64, u64), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let header = market_header(data)?;
+        let configured = header.config.max_market_slots.get() as usize;
+        if asset_index > configured || (!is_activation && asset_index == configured) {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let current_market_id = if asset_index < configured {
+            asset_slot_wire(data, asset_index)?.asset.market_id.get()
+        } else {
+            0
+        };
+        Ok((current_market_id, header.next_market_id.get()))
+    }
+
     pub fn read_market_trade_preflight(
         data: &[u8],
         asset_index: usize,
-    ) -> Result<(WrapperConfigV16, MarketModeV16, u64, u64, u64), ProgramError> {
+    ) -> Result<(WrapperConfigV16, MarketModeV16, u64, u64, u64, u64), ProgramError> {
         if data.len() < MIN_MARKET_ACCOUNT_LEN {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
@@ -4829,6 +4899,7 @@ pub mod state {
             config,
             decode_market_mode(wire.mode)?,
             wire.current_slot.get(),
+            slot.asset.market_id.get(),
             slot.asset.effective_price.get(),
             engine_config.max_trading_fee_bps,
         ))
@@ -4837,10 +4908,20 @@ pub mod state {
     /// Batch oracle-price read for a multi-leg trade: parse the header/config ONCE, then read each
     /// requested asset's effective price. Avoids the O(N^2) cost of calling
     /// `read_market_trade_preflight` per leg (which re-parses the config every time).
+    #[allow(clippy::type_complexity)]
     pub fn read_asset_effective_prices(
         data: &[u8],
         asset_indices: &[u16],
-    ) -> Result<(WrapperConfigV16, MarketModeV16, u64, alloc::vec::Vec<u64>), ProgramError> {
+    ) -> Result<
+        (
+            WrapperConfigV16,
+            MarketModeV16,
+            u64,
+            alloc::vec::Vec<u64>,
+            alloc::vec::Vec<u64>,
+        ),
+        ProgramError,
+    > {
         if data.len() < MIN_MARKET_ACCOUNT_LEN {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
@@ -4852,11 +4933,13 @@ pub mod state {
             .try_to_runtime()
             .map_err(map_account_wire_error)?;
         let mut prices = alloc::vec::Vec::with_capacity(asset_indices.len());
+        let mut market_ids = alloc::vec::Vec::with_capacity(asset_indices.len());
         for &asset_index in asset_indices {
             if asset_index as usize >= engine_config.max_market_slots as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             let slot = asset_slot_wire(data, asset_index as usize)?;
+            market_ids.push(slot.asset.market_id.get());
             prices.push(slot.asset.effective_price.get());
         }
         Ok((
@@ -4864,6 +4947,7 @@ pub mod state {
             decode_market_mode(wire.mode)?,
             wire.current_slot.get(),
             prices,
+            market_ids,
         ))
     }
 
@@ -5414,6 +5498,8 @@ pub mod ix {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct BatchTradeLeg {
         pub asset_index: u16,
+        /// Asset generation expected by the signers. Asset indices are reusable after retirement.
+        pub market_id: u64,
         pub size_q: i128,
         pub exec_price: u64,
         pub fee_bps: u64,
@@ -5425,6 +5511,8 @@ pub mod ix {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct BatchTradeCpiLeg {
         pub asset_index: u16,
+        /// Asset generation expected by the taker. Asset indices are reusable after retirement.
+        pub market_id: u64,
         pub size_q: i128,
         pub fee_bps: u64,
         pub limit_price: u64,
@@ -5486,6 +5574,7 @@ pub mod ix {
             account_b_portfolio_id: u64,
             account_b_position_epoch: u64,
             asset_index: u16,
+            market_id: u64,
             size_q: i128,
             exec_price: u64,
             fee_bps: u64,
@@ -5496,6 +5585,7 @@ pub mod ix {
             account_b_portfolio_id: u64,
             account_b_position_epoch: u64,
             asset_index: u16,
+            market_id: u64,
             size_q: i128,
             fee_bps: u64,
             limit_price: u64,
@@ -5553,6 +5643,7 @@ pub mod ix {
         /// effect. See that helper's own doc comment for the durable-nonce replay
         /// this closes for market-authority round-trips.
         TopUpInsurance {
+            market_id: u64,
             intent_id: u64,
             authority_epoch: u64,
             amount: u128,
@@ -5564,6 +5655,7 @@ pub mod ix {
         /// `UpdateAssetAuthority`'s per-asset lane), not asset-0's.
         TopUpInsuranceDomain {
             domain: u16,
+            market_id: u64,
             intent_id: u64,
             authority_epoch: u64,
             amount: u128,
@@ -5581,7 +5673,17 @@ pub mod ix {
         /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`,
         /// checked (NOT advanced) against `marketauth`'s own epoch lane, mirroring
         /// `UpdateAuthority`'s asset-0 slot.
+        /// TB-4: `asset_generation_frontier` (upstream) -- one of the "two
+        /// market-wide controls" TB-4 binds via a LEADING generation-frontier
+        /// field rather than a per-asset trailing `market_id` (this
+        /// instruction is not scoped to one asset slot). INTEGRATION: placed
+        /// before `authority_epoch` -- no runbook-locked order exists for
+        /// this specific combination (only the market_id/intent_id/
+        /// authority_epoch/amount cluster is locked), so the same
+        /// identity-before-authority convention used everywhere else is
+        /// applied here too.
         ResolveMarket {
+            asset_generation_frontier: u64,
             authority_epoch: u64,
         },
         /// sync/w2-tb3: see `TopUpInsurance`'s `intent_id` doc comment --
@@ -5590,6 +5692,7 @@ pub mod ix {
         /// against the TARGET DOMAIN's own asset epoch (`domain / 2`).
         TopUpBackingBucket {
             domain: u16,
+            market_id: u64,
             intent_id: u64,
             authority_epoch: u64,
             amount: u128,
@@ -5603,6 +5706,7 @@ pub mod ix {
         /// `handle_withdraw_backing_bucket`'s call site.
         WithdrawBackingBucket {
             domain: u16,
+            market_id: u64,
             amount: u128,
             authority_epoch: u64,
         },
@@ -5650,6 +5754,7 @@ pub mod ix {
         /// (still a trailing `u64`, same position) -- only its meaning did.
         UpdateAssetAuthority {
             asset_index: u16,
+            market_id: u64,
             kind: u8,
             new_pubkey: [u8; 32],
             authority_epoch: u64,
@@ -5664,6 +5769,7 @@ pub mod ix {
         },
         UpdateBackingFeePolicy {
             domain: u16,
+            market_id: u64,
             fee_bps: u16,
             insurance_share_bps: u16,
             policy_sequence: u64,
@@ -5702,6 +5808,7 @@ pub mod ix {
         /// `epoch_asset_index` selection as `WithdrawBackingBucket`, above.
         WithdrawBackingBucketEarnings {
             domain: u16,
+            market_id: u64,
             amount: u128,
             authority_epoch: u64,
         },
@@ -5710,6 +5817,7 @@ pub mod ix {
         },
         SyncInsuranceLedger,
         ConfigurePermissionlessResolve {
+            asset_generation_frontier: u64,
             stale_slots: u64,
             force_close_delay_slots: u64,
             policy_sequence: u64,
@@ -5719,6 +5827,7 @@ pub mod ix {
         },
         ConfigureHybridOracle {
             asset_index: u16,
+            market_id: u64,
             now_slot: u64,
             now_unix_ts: i64,
             oracle_leg_count: u8,
@@ -5735,6 +5844,7 @@ pub mod ix {
         },
         ConfigureEwmaMark {
             asset_index: u16,
+            market_id: u64,
             now_slot: u64,
             initial_mark_e6: u64,
             mark_ewma_halflife_slots: u64,
@@ -5743,18 +5853,21 @@ pub mod ix {
         },
         PushEwmaMark {
             asset_index: u16,
+            market_id: u64,
             now_slot: u64,
             mark_e6: u64,
             observation_sequence: u64,
         },
         ConfigureAuthMark {
             asset_index: u16,
+            market_id: u64,
             now_slot: u64,
             initial_mark_e6: u64,
             observation_sequence: u64,
         },
         PushAuthMark {
             asset_index: u16,
+            market_id: u64,
             now_slot: u64,
             mark_e6: u64,
             observation_sequence: u64,
@@ -5766,6 +5879,7 @@ pub mod ix {
         },
         RestartAssetOracle {
             asset_index: u16,
+            market_id: u64,
             now_slot: u64,
             initial_price: u64,
             observation_sequence: u64,
@@ -5773,13 +5887,18 @@ pub mod ix {
         UpdateAssetLifecycle {
             action: u8,
             asset_index: u16,
+            /// TB-4: `market_id` -- the asset-slot generation/reuse axis
+            /// (`AssetStateV16::market_id`), checked against a stale signed
+            /// instruction captured against an old occupant of this slot.
+            market_id: u64,
             /// W3A-2: ADOPT upstream `dd958393` epoch binding -- the
             /// within-generation authority axis (A->B->A rotations of
             /// `marketauth`/`asset_admin`), checked at every one of this
             /// tag's three authority-gated call sites. Orthogonal to TB-4's
-            /// `market_id`/generation axis (not yet present on this fork's
-            /// `UpdateAssetLifecycle`, which is why there is no `market_id`
-            /// field here); upstream carries both fields side by side.
+            /// `market_id`/generation axis above -- upstream carries both
+            /// fields side by side; INTEGRATION places `market_id` first
+            /// (identity/generation before authority, the same convention
+            /// used for the tag 9/56/24 cluster).
             authority_epoch: u64,
             now_slot: u64,
             initial_price: u64,
@@ -5798,6 +5917,7 @@ pub mod ix {
         /// See `handle_withdraw_insurance_asset`'s call site.
         WithdrawInsuranceAsset {
             asset_index: u16,
+            market_id: u64,
             amount: u128,
             authority_epoch: u64,
         },
@@ -6185,6 +6305,7 @@ pub mod ix {
                     account_b_portfolio_id: read_u64(&mut rest)?,
                     account_b_position_epoch: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
                     exec_price: read_u64(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
@@ -6195,6 +6316,7 @@ pub mod ix {
                     account_b_portfolio_id: read_u64(&mut rest)?,
                     account_b_position_epoch: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
                     limit_price: read_u64(&mut rest)?,
@@ -6205,6 +6327,7 @@ pub mod ix {
                     for _ in 0..n {
                         legs.push(BatchTradeLeg {
                             asset_index: read_u16(&mut rest)?,
+                            market_id: read_u64(&mut rest)?,
                             size_q: read_i128(&mut rest)?,
                             exec_price: read_u64(&mut rest)?,
                             fee_bps: read_u64(&mut rest)?,
@@ -6224,6 +6347,7 @@ pub mod ix {
                     for _ in 0..n {
                         legs.push(BatchTradeCpiLeg {
                             asset_index: read_u16(&mut rest)?,
+                            market_id: read_u64(&mut rest)?,
                             size_q: read_i128(&mut rest)?,
                             fee_bps: read_u64(&mut rest)?,
                             limit_price: read_u64(&mut rest)?,
@@ -6259,12 +6383,14 @@ pub mod ix {
                 // fields present at THIS integration point (market_id lands
                 // later, with TB-4): intent_id, authority_epoch, amount.
                 9 => Self::TopUpInsurance {
+                    market_id: read_u64(&mut rest)?,
                     intent_id: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                 },
                 56 => Self::TopUpInsuranceDomain {
                     domain: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     intent_id: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
@@ -6273,10 +6399,12 @@ pub mod ix {
                     authority_epoch: read_u64(&mut rest)?,
                 },
                 19 => Self::ResolveMarket {
+                    asset_generation_frontier: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                 },
                 24 => Self::TopUpBackingBucket {
                     domain: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     intent_id: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
@@ -6284,6 +6412,7 @@ pub mod ix {
                 },
                 50 => Self::WithdrawBackingBucket {
                     domain: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                 },
@@ -6301,6 +6430,7 @@ pub mod ix {
                 },
                 65 => Self::UpdateAssetAuthority {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     kind: read_u8(&mut rest)?,
                     new_pubkey: read_bytes32(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
@@ -6315,6 +6445,7 @@ pub mod ix {
                 },
                 51 => Self::UpdateBackingFeePolicy {
                     domain: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     fee_bps: read_u16(&mut rest)?,
                     insurance_share_bps: read_u16(&mut rest)?,
                     policy_sequence: read_u64(&mut rest)?,
@@ -6347,12 +6478,14 @@ pub mod ix {
                 },
                 62 => Self::ConfigureAuthMark {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_mark_e6: read_u64(&mut rest)?,
                     observation_sequence: read_u64(&mut rest)?,
                 },
                 63 => Self::PushAuthMark {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     mark_e6: read_u64(&mut rest)?,
                     observation_sequence: read_u64(&mut rest)?,
@@ -6364,12 +6497,14 @@ pub mod ix {
                 },
                 69 => Self::RestartAssetOracle {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_price: read_u64(&mut rest)?,
                     observation_sequence: read_u64(&mut rest)?,
                 },
                 52 => Self::WithdrawBackingBucketEarnings {
                     domain: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                 },
@@ -6378,6 +6513,7 @@ pub mod ix {
                 },
                 54 => Self::SyncInsuranceLedger,
                 38 => Self::ConfigurePermissionlessResolve {
+                    asset_generation_frontier: read_u64(&mut rest)?,
                     stale_slots: read_u64(&mut rest)?,
                     force_close_delay_slots: read_u64(&mut rest)?,
                     policy_sequence: read_u64(&mut rest)?,
@@ -6387,6 +6523,7 @@ pub mod ix {
                 },
                 34 => Self::ConfigureHybridOracle {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     now_unix_ts: read_i64(&mut rest)?,
                     oracle_leg_count: read_u8(&mut rest)?,
@@ -6407,6 +6544,7 @@ pub mod ix {
                 },
                 35 => Self::ConfigureEwmaMark {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_mark_e6: read_u64(&mut rest)?,
                     mark_ewma_halflife_slots: read_u64(&mut rest)?,
@@ -6415,6 +6553,7 @@ pub mod ix {
                 },
                 36 => Self::PushEwmaMark {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     mark_e6: read_u64(&mut rest)?,
                     observation_sequence: read_u64(&mut rest)?,
@@ -6422,6 +6561,7 @@ pub mod ix {
                 40 => Self::UpdateAssetLifecycle {
                     action: read_u8(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_price: read_u64(&mut rest)?,
@@ -6436,6 +6576,7 @@ pub mod ix {
                 },
                 57 => Self::WithdrawInsuranceAsset {
                     asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                 },
@@ -6658,6 +6799,7 @@ pub mod ix {
                     account_b_portfolio_id,
                     account_b_position_epoch,
                     asset_index,
+                    market_id,
                     size_q,
                     exec_price,
                     fee_bps,
@@ -6668,6 +6810,7 @@ pub mod ix {
                     push_u64(&mut out, account_b_portfolio_id);
                     push_u64(&mut out, account_b_position_epoch);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, exec_price);
                     push_u64(&mut out, fee_bps);
@@ -6678,6 +6821,7 @@ pub mod ix {
                     account_b_portfolio_id,
                     account_b_position_epoch,
                     asset_index,
+                    market_id,
                     size_q,
                     fee_bps,
                     limit_price,
@@ -6688,6 +6832,7 @@ pub mod ix {
                     push_u64(&mut out, account_b_portfolio_id);
                     push_u64(&mut out, account_b_position_epoch);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, fee_bps);
                     push_u64(&mut out, limit_price);
@@ -6703,6 +6848,7 @@ pub mod ix {
                     out.push(legs.len() as u8);
                     for leg in legs.iter() {
                         push_u16(&mut out, leg.asset_index);
+                        push_u64(&mut out, leg.market_id);
                         push_i128(&mut out, leg.size_q);
                         push_u64(&mut out, leg.exec_price);
                         push_u64(&mut out, leg.fee_bps);
@@ -6725,6 +6871,7 @@ pub mod ix {
                     out.push(legs.len() as u8);
                     for leg in legs.iter() {
                         push_u16(&mut out, leg.asset_index);
+                        push_u64(&mut out, leg.market_id);
                         push_i128(&mut out, leg.size_q);
                         push_u64(&mut out, leg.fee_bps);
                         push_u64(&mut out, leg.limit_price);
@@ -6761,23 +6908,27 @@ pub mod ix {
                     push_u64(&mut out, position_epoch);
                 }
                 Self::TopUpInsurance {
+                    market_id,
                     intent_id,
                     authority_epoch,
                     amount,
                 } => {
                     out.push(9);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, intent_id);
                     push_u64(&mut out, authority_epoch);
                     push_u128(&mut out, amount);
                 }
                 Self::TopUpInsuranceDomain {
                     domain,
+                    market_id,
                     intent_id,
                     authority_epoch,
                     amount,
                 } => {
                     out.push(56);
                     push_u16(&mut out, domain);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, intent_id);
                     push_u64(&mut out, authority_epoch);
                     push_u128(&mut out, amount);
@@ -6786,8 +6937,12 @@ pub mod ix {
                     out.push(13);
                     push_u64(&mut out, authority_epoch);
                 }
-                Self::ResolveMarket { authority_epoch } => {
+                Self::ResolveMarket {
+                    asset_generation_frontier,
+                    authority_epoch,
+                } => {
                     out.push(19);
+                    push_u64(&mut out, asset_generation_frontier);
                     push_u64(&mut out, authority_epoch);
                 }
                 Self::RebalanceLpVaultBacking {
@@ -6802,6 +6957,7 @@ pub mod ix {
                 }
                 Self::TopUpBackingBucket {
                     domain,
+                    market_id,
                     intent_id,
                     authority_epoch,
                     amount,
@@ -6809,6 +6965,7 @@ pub mod ix {
                 } => {
                     out.push(24);
                     push_u16(&mut out, domain);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, intent_id);
                     push_u64(&mut out, authority_epoch);
                     push_u128(&mut out, amount);
@@ -6816,11 +6973,13 @@ pub mod ix {
                 }
                 Self::WithdrawBackingBucket {
                     domain,
+                    market_id,
                     amount,
                     authority_epoch,
                 } => {
                     out.push(50);
                     push_u16(&mut out, domain);
+                    push_u64(&mut out, market_id);
                     push_u128(&mut out, amount);
                     push_u64(&mut out, authority_epoch);
                 }
@@ -6848,12 +7007,14 @@ pub mod ix {
                 }
                 Self::UpdateAssetAuthority {
                     asset_index,
+                    market_id,
                     kind,
                     new_pubkey,
                     authority_epoch,
                 } => {
                     out.push(65);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     out.push(kind);
                     out.extend_from_slice(&new_pubkey);
                     push_u64(&mut out, authority_epoch);
@@ -6876,12 +7037,14 @@ pub mod ix {
                 }
                 Self::UpdateBackingFeePolicy {
                     domain,
+                    market_id,
                     fee_bps,
                     insurance_share_bps,
                     policy_sequence,
                 } => {
                     out.push(51);
                     push_u16(&mut out, domain);
+                    push_u64(&mut out, market_id);
                     push_u16(&mut out, fee_bps);
                     push_u16(&mut out, insurance_share_bps);
                     push_u64(&mut out, policy_sequence);
@@ -6940,11 +7103,13 @@ pub mod ix {
                 }
                 Self::WithdrawBackingBucketEarnings {
                     domain,
+                    market_id,
                     amount,
                     authority_epoch,
                 } => {
                     out.push(52);
                     push_u16(&mut out, domain);
+                    push_u64(&mut out, market_id);
                     push_u128(&mut out, amount);
                     push_u64(&mut out, authority_epoch);
                 }
@@ -6954,11 +7119,13 @@ pub mod ix {
                 }
                 Self::SyncInsuranceLedger => out.push(54),
                 Self::ConfigurePermissionlessResolve {
+                    asset_generation_frontier,
                     stale_slots,
                     force_close_delay_slots,
                     policy_sequence,
                 } => {
                     out.push(38);
+                    push_u64(&mut out, asset_generation_frontier);
                     push_u64(&mut out, stale_slots);
                     push_u64(&mut out, force_close_delay_slots);
                     push_u64(&mut out, policy_sequence);
@@ -6969,6 +7136,7 @@ pub mod ix {
                 }
                 Self::ConfigureHybridOracle {
                     asset_index,
+                    market_id,
                     now_slot,
                     now_unix_ts,
                     oracle_leg_count,
@@ -6985,6 +7153,7 @@ pub mod ix {
                 } => {
                     out.push(34);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, now_slot);
                     push_i64(&mut out, now_unix_ts);
                     out.push(oracle_leg_count);
@@ -7003,6 +7172,7 @@ pub mod ix {
                 }
                 Self::ConfigureEwmaMark {
                     asset_index,
+                    market_id,
                     now_slot,
                     initial_mark_e6,
                     mark_ewma_halflife_slots,
@@ -7011,6 +7181,7 @@ pub mod ix {
                 } => {
                     out.push(35);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_mark_e6);
                     push_u64(&mut out, mark_ewma_halflife_slots);
@@ -7019,36 +7190,42 @@ pub mod ix {
                 }
                 Self::PushEwmaMark {
                     asset_index,
+                    market_id,
                     now_slot,
                     mark_e6,
                     observation_sequence,
                 } => {
                     out.push(36);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, mark_e6);
                     push_u64(&mut out, observation_sequence);
                 }
                 Self::ConfigureAuthMark {
                     asset_index,
+                    market_id,
                     now_slot,
                     initial_mark_e6,
                     observation_sequence,
                 } => {
                     out.push(62);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_mark_e6);
                     push_u64(&mut out, observation_sequence);
                 }
                 Self::PushAuthMark {
                     asset_index,
+                    market_id,
                     now_slot,
                     mark_e6,
                     observation_sequence,
                 } => {
                     out.push(63);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, mark_e6);
                     push_u64(&mut out, observation_sequence);
@@ -7065,12 +7242,14 @@ pub mod ix {
                 }
                 Self::RestartAssetOracle {
                     asset_index,
+                    market_id,
                     now_slot,
                     initial_price,
                     observation_sequence,
                 } => {
                     out.push(69);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_price);
                     push_u64(&mut out, observation_sequence);
@@ -7078,6 +7257,7 @@ pub mod ix {
                 Self::UpdateAssetLifecycle {
                     action,
                     asset_index,
+                    market_id,
                     authority_epoch,
                     now_slot,
                     initial_price,
@@ -7090,6 +7270,7 @@ pub mod ix {
                     out.push(40);
                     out.push(action);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u64(&mut out, authority_epoch);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_price);
@@ -7105,11 +7286,13 @@ pub mod ix {
                 }
                 Self::WithdrawInsuranceAsset {
                     asset_index,
+                    market_id,
                     amount,
                     authority_epoch,
                 } => {
                     out.push(57);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
                     push_u128(&mut out, amount);
                     push_u64(&mut out, authority_epoch);
                 }
@@ -8768,6 +8951,89 @@ pub mod processor {
                     >= cfg.permissionless_resolve_stale_slots)
     }
 
+    // ── Wave-2 TB-4: asset-generation binding (adopts upstream a61000f9 +
+    // 47a3c86f + 5d9e4cb3 + 9a138bdf + 4c100ca6 + e50784d8 + f5c2c6bb) ──────────
+    //
+    // Asset indices/slots are reusable after `CloseSlab` retires a slot (S1a's
+    // terminal-slab scan cursor, already adopted, makes the slot eligible for a
+    // fresh `InitMarket`/activation with a NEW `market_id` generation). Without
+    // this binding, a stale signed instruction captured against the OLD
+    // generation could land against whatever now occupies the same slot. Every
+    // checked instruction carries a caller-supplied `market_id` (or, for the two
+    // market-wide controls, `asset_generation_frontier`) that must match the
+    // asset's live generation counter (`AssetStateV16::market_id`) or the
+    // market's live frontier counter (`header.next_market_id`) — both counters
+    // already exist and are already used internally; this only adds the
+    // caller-supplied-vs-live comparison.
+    /// Per-asset generation check: `asset_index` must be in range and its live
+    /// `market_id` must equal the caller-supplied `expected_market_id`.
+    fn require_asset_generation_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        expected_market_id: u64,
+    ) -> ProgramResult {
+        if asset_index >= group.header.config.max_market_slots.get() as usize
+            || asset_index >= group.markets.len()
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if !state::asset_generation_binding_matches(
+            group.markets[asset_index].engine.asset.market_id.get(),
+            expected_market_id,
+        ) {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
+        }
+        Ok(())
+    }
+
+    /// Market-wide frontier check (`ResolveMarket`/`ConfigurePermissionlessResolve`):
+    /// the caller-supplied `expected_frontier` must equal the market's live
+    /// `next_market_id` counter — the generation that will be assigned to the NEXT
+    /// asset activation in this slab.
+    fn require_asset_generation_frontier_view(
+        group: &state::MarketViewMutV16<'_>,
+        expected_frontier: u64,
+    ) -> ProgramResult {
+        if group.header.next_market_id.get() != expected_frontier {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
+        }
+        Ok(())
+    }
+
+    /// Lifecycle-aware generation check for `UpdateAssetLifecycle`: an ACTIVATION
+    /// (asset_index == configured slot count, or reactivating a Retired slot) binds
+    /// against the market's `next_market_id` frontier (the generation the slot is
+    /// ABOUT to receive); any other lifecycle action binds against the slot's
+    /// current live `market_id`.
+    fn require_asset_lifecycle_generation_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        is_activation: bool,
+        expected_market_id: u64,
+    ) -> ProgramResult {
+        let configured = group.header.config.max_market_slots.get() as usize;
+        if asset_index > configured
+            || (!is_activation && asset_index == configured)
+            || asset_index >= group.markets.len()
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let current_market_id = if asset_index < configured {
+            group.markets[asset_index].engine.asset.market_id.get()
+        } else {
+            0
+        };
+        if !state::asset_lifecycle_generation_binding_matches(
+            current_market_id,
+            group.header.next_market_id.get(),
+            is_activation,
+            expected_market_id,
+        ) {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
+        }
+        Ok(())
+    }
+
     fn reject_permissionless_resolve_matured_live_view(
         cfg: &WrapperConfigV16,
         group: &state::MarketViewMutV16<'_>,
@@ -9905,6 +10171,7 @@ pub mod processor {
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 asset_index,
+                market_id,
                 size_q,
                 exec_price,
                 fee_bps,
@@ -9916,6 +10183,7 @@ pub mod processor {
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 asset_index,
+                market_id,
                 size_q,
                 exec_price,
                 fee_bps,
@@ -9926,6 +10194,7 @@ pub mod processor {
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 asset_index,
+                market_id,
                 size_q,
                 fee_bps,
                 limit_price,
@@ -9937,6 +10206,7 @@ pub mod processor {
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 asset_index,
+                market_id,
                 size_q,
                 fee_bps,
                 limit_price,
@@ -10002,12 +10272,21 @@ pub mod processor {
                 position_epoch,
             ),
             Instruction::TopUpInsurance {
+                market_id,
                 intent_id,
                 authority_epoch,
                 amount,
-            } => handle_top_up_insurance(program_id, accounts, intent_id, authority_epoch, amount),
+            } => handle_top_up_insurance(
+                program_id,
+                accounts,
+                market_id,
+                intent_id,
+                authority_epoch,
+                amount,
+            ),
             Instruction::TopUpInsuranceDomain {
                 domain,
+                market_id,
                 intent_id,
                 authority_epoch,
                 amount,
@@ -10015,6 +10294,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 domain,
+                market_id,
                 intent_id,
                 authority_epoch,
                 amount,
@@ -10022,11 +10302,18 @@ pub mod processor {
             Instruction::CloseSlab { authority_epoch } => {
                 handle_close_slab(program_id, accounts, authority_epoch)
             }
-            Instruction::ResolveMarket { authority_epoch } => {
-                handle_resolve_market(program_id, accounts, authority_epoch)
-            }
+            Instruction::ResolveMarket {
+                asset_generation_frontier,
+                authority_epoch,
+            } => handle_resolve_market(
+                program_id,
+                accounts,
+                asset_generation_frontier,
+                authority_epoch,
+            ),
             Instruction::TopUpBackingBucket {
                 domain,
+                market_id,
                 intent_id,
                 authority_epoch,
                 amount,
@@ -10035,6 +10322,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 domain,
+                market_id,
                 intent_id,
                 authority_epoch,
                 amount,
@@ -10044,15 +10332,19 @@ pub mod processor {
             // (portfolio_id/position_epoch) and W3A-1's WithdrawBackingBucket
             // authority_epoch CAS are two independent field-additions to two
             // different instructions that only collided textually (adjacent
-            // match arms) -- both kept.
+            // match arms) -- both kept. TB-4 additionally adds `market_id` to
+            // WithdrawBackingBucket only (ConvertReleasedPnl is not one of
+            // TB-4's ~18 bound tags).
             Instruction::WithdrawBackingBucket {
                 domain,
+                market_id,
                 amount,
                 authority_epoch,
             } => handle_withdraw_backing_bucket(
                 program_id,
                 accounts,
                 domain,
+                market_id,
                 amount,
                 authority_epoch,
             ),
@@ -10076,6 +10368,7 @@ pub mod processor {
             } => handle_update_authority(program_id, accounts, new_pubkey, authority_epoch),
             Instruction::UpdateAssetAuthority {
                 asset_index,
+                market_id,
                 kind,
                 new_pubkey,
                 authority_epoch,
@@ -10083,6 +10376,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 kind,
                 new_pubkey,
                 authority_epoch,
@@ -10107,6 +10401,7 @@ pub mod processor {
             ),
             Instruction::UpdateBackingFeePolicy {
                 domain,
+                market_id,
                 fee_bps,
                 insurance_share_bps,
                 policy_sequence,
@@ -10114,6 +10409,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 domain,
+                market_id,
                 fee_bps,
                 insurance_share_bps,
                 policy_sequence,
@@ -10153,12 +10449,14 @@ pub mod processor {
             ),
             Instruction::WithdrawBackingBucketEarnings {
                 domain,
+                market_id,
                 amount,
                 authority_epoch,
             } => handle_withdraw_backing_bucket_earnings(
                 program_id,
                 accounts,
                 domain,
+                market_id,
                 amount,
                 authority_epoch,
             ),
@@ -10167,12 +10465,14 @@ pub mod processor {
             }
             Instruction::SyncInsuranceLedger => handle_sync_insurance_ledger(program_id, accounts),
             Instruction::ConfigurePermissionlessResolve {
+                asset_generation_frontier,
                 stale_slots,
                 force_close_delay_slots,
                 policy_sequence,
             } => handle_configure_permissionless_resolve(
                 program_id,
                 accounts,
+                asset_generation_frontier,
                 stale_slots,
                 force_close_delay_slots,
                 policy_sequence,
@@ -10182,6 +10482,7 @@ pub mod processor {
             }
             Instruction::ConfigureHybridOracle {
                 asset_index,
+                market_id,
                 now_slot,
                 now_unix_ts,
                 oracle_leg_count,
@@ -10199,6 +10500,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 now_slot,
                 now_unix_ts,
                 oracle_leg_count,
@@ -10215,6 +10517,7 @@ pub mod processor {
             ),
             Instruction::ConfigureEwmaMark {
                 asset_index,
+                market_id,
                 now_slot,
                 initial_mark_e6,
                 mark_ewma_halflife_slots,
@@ -10224,6 +10527,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 now_slot,
                 initial_mark_e6,
                 mark_ewma_halflife_slots,
@@ -10232,6 +10536,7 @@ pub mod processor {
             ),
             Instruction::PushEwmaMark {
                 asset_index,
+                market_id,
                 now_slot,
                 mark_e6,
                 observation_sequence,
@@ -10239,12 +10544,14 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 now_slot,
                 mark_e6,
                 observation_sequence,
             ),
             Instruction::ConfigureAuthMark {
                 asset_index,
+                market_id,
                 now_slot,
                 initial_mark_e6,
                 observation_sequence,
@@ -10252,12 +10559,14 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 now_slot,
                 initial_mark_e6,
                 observation_sequence,
             ),
             Instruction::PushAuthMark {
                 asset_index,
+                market_id,
                 now_slot,
                 mark_e6,
                 observation_sequence,
@@ -10265,6 +10574,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 now_slot,
                 mark_e6,
                 observation_sequence,
@@ -10282,6 +10592,7 @@ pub mod processor {
             ),
             Instruction::RestartAssetOracle {
                 asset_index,
+                market_id,
                 now_slot,
                 initial_price,
                 observation_sequence,
@@ -10289,6 +10600,7 @@ pub mod processor {
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 now_slot,
                 initial_price,
                 observation_sequence,
@@ -10296,6 +10608,7 @@ pub mod processor {
             Instruction::UpdateAssetLifecycle {
                 action,
                 asset_index,
+                market_id,
                 authority_epoch,
                 now_slot,
                 initial_price,
@@ -10309,6 +10622,7 @@ pub mod processor {
                 accounts,
                 action,
                 asset_index,
+                market_id,
                 authority_epoch,
                 now_slot,
                 initial_price,
@@ -10323,12 +10637,14 @@ pub mod processor {
             }
             Instruction::WithdrawInsuranceAsset {
                 asset_index,
+                market_id,
                 amount,
                 authority_epoch,
             } => handle_withdraw_insurance_asset(
                 program_id,
                 accounts,
                 asset_index,
+                market_id,
                 amount,
                 authority_epoch,
             ),
@@ -10985,6 +11301,7 @@ pub mod processor {
         account_b_portfolio_id: u64,
         account_b_position_epoch: u64,
         asset_index: u16,
+        expected_market_id: u64,
         size_q: i128,
         exec_price: u64,
         fee_bps: u64,
@@ -10997,6 +11314,7 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            require_asset_generation_view(&group, asset_index as usize, expected_market_id)?;
             let mut oracle_profile =
                 read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
             reject_permissionless_resolve_matured_live_for_profile_view(
@@ -11591,6 +11909,7 @@ pub mod processor {
                 if requests.iter().any(|r| r.asset_index == asset_index) {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
+                require_asset_generation_view(&group, asset_index, leg.market_id)?;
                 let mut oracle_profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
                 reject_permissionless_resolve_matured_live_for_profile_view(
                     &cfg,
@@ -11970,6 +12289,7 @@ pub mod processor {
         account_b_portfolio_id: u64,
         account_b_position_epoch: u64,
         asset_index: u16,
+        market_id: u64,
         size_q: i128,
         exec_price: u64,
         fee_bps: u64,
@@ -12023,6 +12343,7 @@ pub mod processor {
             account_b_portfolio_id,
             account_b_position_epoch,
             asset_index,
+            market_id,
             size_q,
             exec_price,
             fee_bps,
@@ -12563,6 +12884,7 @@ pub mod processor {
         account_b_portfolio_id: u64,
         account_b_position_epoch: u64,
         asset_index: u16,
+        expected_market_id: u64,
         size_q: i128,
         fee_bps: u64,
         limit_price: u64,
@@ -12593,11 +12915,14 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
 
-        let (cfg_pre, mode_pre, current_slot_pre, oracle_price, max_trading_fee_bps) =
+        let (cfg_pre, mode_pre, current_slot_pre, market_id, oracle_price, max_trading_fee_bps) =
             state::read_market_trade_preflight(
                 &market_ai.try_borrow_data()?,
                 asset_index as usize,
             )?;
+        if !state::asset_generation_binding_matches(market_id, expected_market_id) {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
+        }
         let (account_a_header, account_a_owner) =
             state::read_portfolio_owner_preflight(&account_a_ai.try_borrow_data()?)?;
         let (account_b_header, account_b_owner) =
@@ -12774,6 +13099,7 @@ pub mod processor {
             account_b_portfolio_id,
             account_b_position_epoch,
             asset_index,
+            expected_market_id,
             ret.exec_size,
             ret.exec_price_e6,
             // ADOPT upstream 42e70c84 (#489, wrapper-only, logic-only): account_b (the
@@ -13265,8 +13591,15 @@ pub mod processor {
         // only caught after the CPI returned, inside handle_batch_execute_zero_copy).
         let (mode_pre, oracle_prices, stale_matured, trade_fee_base_bps_pre) = {
             let market_data = market_ai.try_borrow_data()?;
-            let (cfg_pre, mode_pre, current_slot_pre, oracle_prices) =
+            let (cfg_pre, mode_pre, current_slot_pre, oracle_prices, market_ids) =
                 state::read_asset_effective_prices(&market_data, &asset_indices)?;
+            if legs
+                .iter()
+                .zip(market_ids.iter())
+                .any(|(leg, market_id)| leg.market_id != *market_id)
+            {
+                return Err(PercolatorError::AssetGenerationMismatch.into());
+            }
             let authenticated_slot = authenticated_slot_or_fallback(current_slot_pre);
             let mut stale_matured = false;
             for &asset_index in &asset_indices {
@@ -13456,6 +13789,7 @@ pub mod processor {
             )?;
             exec_legs.push(ix::BatchTradeLeg {
                 asset_index: leg.asset_index,
+                market_id: leg.market_id,
                 size_q: ret.exec_size,
                 exec_price: ret.exec_price_e6,
                 // ADOPT upstream 42e70c84 (wrapper-only, logic-only): as in the single-CPI
@@ -13599,6 +13933,7 @@ pub mod processor {
     fn handle_top_up_insurance<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_market_id: u64,
         intent_id: u64,
         expected_authority_epoch: u64,
         amount: u128,
@@ -13621,7 +13956,13 @@ pub mod processor {
         verify_token_program(token_program)?;
         let (cfg_pre, mode, asset0_insurance_authority) = {
             let market_data = market_ai.try_borrow_data()?;
-            let (cfg_pre, mode, _, _) = state::read_market_config_mode_and_capacity(&market_data)?;
+            // TB-4: asset-generation binding -- rejects a stale signed
+            // instruction captured against an old occupant of asset-0's slot.
+            let (cfg_pre, mode, _, market_id, _, _) =
+                state::read_market_trade_preflight(&market_data, 0)?;
+            if !state::asset_generation_binding_matches(market_id, expected_market_id) {
+                return Err(PercolatorError::AssetGenerationMismatch.into());
+            }
             // W3A-3: CHECK-only (mirrors upstream `238436c5`'s first
             // `require_authority_epoch_view` call site in
             // `handle_top_up_insurance`, adapted here to the fork's own
@@ -13658,6 +13999,10 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // TB-4: re-checked in this second, independently re-borrowed
+            // scope, right before mutation -- belt-and-suspenders against a
+            // stale first-borrow read.
+            require_asset_generation_view(&group, 0, expected_market_id)?;
             // W3A-3: re-checked in this second, independently re-borrowed
             // scope, right before mutation -- mirrors upstream's second
             // `require_authority_epoch_view` call site in the same function
@@ -13734,6 +14079,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
+        expected_market_id: u64,
         intent_id: u64,
         expected_authority_epoch: u64,
         amount: u128,
@@ -13766,6 +14112,8 @@ pub mod processor {
             {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            // TB-4: asset-generation binding for this domain's asset.
+            require_asset_generation_view(&group, asset_index, expected_market_id)?;
             // W3A-3: mirrors upstream `238436c5`'s first
             // `require_authority_epoch_view` call site for
             // `InsuranceTopUpScope::Domain`, keyed to the TARGET DOMAIN's own
@@ -13790,6 +14138,8 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // TB-4: re-checked in this second, independently re-borrowed scope.
+            require_asset_generation_view(&group, domain / 2, expected_market_id)?;
             // W3A-3: re-checked in this second, independently re-borrowed
             // scope, right before mutation -- the authoritative check for
             // THIS deposit, strictly preceding
@@ -14416,6 +14766,7 @@ pub mod processor {
         vault_authority_ai: &AccountInfo<'a>,
         domain: usize,
         amount: u128,
+        expected_market_id: u64,
         require_live_mode: bool,
         authority_kind: u8,
     ) -> Result<(u8, u64), ProgramError> {
@@ -14428,6 +14779,11 @@ pub mod processor {
             || asset_index >= configured_slots
         {
             return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (_, _, _, current_market_id, _, _) =
+            state::read_market_trade_preflight(&market_data, asset_index)?;
+        if !state::asset_generation_binding_matches(current_market_id, expected_market_id) {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
         }
         let profile = read_oracle_profile_for_asset(&market_data, &cfg, asset_index)?;
         let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
@@ -14462,6 +14818,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
+        expected_market_id: u64,
         intent_id: u64,
         expected_authority_epoch: u64,
         amount: u128,
@@ -14525,6 +14882,8 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // TB-4: asset-generation binding for this domain's asset.
+            require_asset_generation_view(&group, asset_index, expected_market_id)?;
             // W3A-3: `authority_epoch` (upstream `238436c5`) -- mirrors its
             // first `require_authority_epoch_view` call site in
             // `handle_top_up_backing_bucket`, checked (NOT advanced) BEFORE
@@ -14599,6 +14958,8 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // TB-4: re-checked in this second, independently re-borrowed scope.
+            require_asset_generation_view(&group, domain_usize / 2, expected_market_id)?;
             // W3A-3: re-checked in this second, independently re-borrowed
             // scope -- mirrors upstream's second `require_authority_epoch_view`
             // call site, strictly preceding
@@ -14786,6 +15147,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
+        expected_market_id: u64,
         amount: u128,
         expected_authority_epoch: u64,
     ) -> ProgramResult {
@@ -14840,6 +15202,7 @@ pub mod processor {
             vault_authority_ai,
             domain_usize,
             amount,
+            expected_market_id,
             false,
             DOMAIN_WITHDRAW_AUTH_BACKING,
         )?;
@@ -14847,6 +15210,7 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            require_asset_generation_view(&group, domain_usize / 2, expected_market_id)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain_usize)?;
             let shutdown_drain = match group.header.mode {
                 0 => live_domain_withdraw_health_or_shutdown_view(&cfg, &group, domain_usize)?,
@@ -14964,6 +15328,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
+        expected_market_id: u64,
         amount: u128,
         expected_authority_epoch: u64,
     ) -> ProgramResult {
@@ -14996,6 +15361,7 @@ pub mod processor {
             vault_authority_ai,
             domain_usize,
             amount,
+            expected_market_id,
             false,
             DOMAIN_WITHDRAW_AUTH_BACKING,
         )?;
@@ -15003,6 +15369,7 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            require_asset_generation_view(&group, domain_usize / 2, expected_market_id)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain_usize)?;
             let shutdown_drain = match group.header.mode {
                 0 => live_domain_withdraw_health_or_shutdown_view(&cfg, &group, domain_usize)?,
@@ -15308,6 +15675,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         amount: u128,
         expected_authority_epoch: u64,
     ) -> ProgramResult {
@@ -15347,6 +15715,7 @@ pub mod processor {
             vault_authority_ai,
             long_domain,
             amount,
+            expected_market_id,
             true,
             DOMAIN_WITHDRAW_AUTH_INSURANCE,
         )?;
@@ -15360,6 +15729,7 @@ pub mod processor {
             if asset_index >= configured_slots || asset_index >= group.markets.len() {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index, expected_market_id)?;
             let shutdown_drain =
                 live_domain_withdraw_health_or_shutdown_view(&cfg, &group, long_domain)?;
             let authorities = domain_authorities_from_view(&group, &cfg, long_domain)?;
@@ -17196,6 +17566,7 @@ pub mod processor {
     fn handle_resolve_market<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_asset_generation_frontier: u64,
         expected_authority_epoch: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
@@ -17205,6 +17576,7 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        require_asset_generation_frontier_view(&group, expected_asset_generation_frontier)?;
         if group.header.mode != 0 {
             return Err(PercolatorError::EngineLockActive.into());
         }
@@ -17278,6 +17650,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         kind: u8,
         new_pubkey: [u8; 32],
         authority_epoch: u64,
@@ -17309,6 +17682,7 @@ pub mod processor {
         if asset_index >= group.header.config.max_market_slots.get() as usize {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        require_asset_generation_view(&group, asset_index, expected_market_id)?;
         let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
 
         // The asset's own cold-storage admin may rotate ANY of its authorities, and only the admin
@@ -17686,6 +18060,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         now_slot: u64,
         initial_price: u64,
         observation_sequence: u64,
@@ -17710,6 +18085,7 @@ pub mod processor {
             if asset_index >= configured_slots || asset_index >= group.markets.len() {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index, expected_market_id)?;
             if authenticated_slot < group.header.current_slot.get() {
                 return Err(PercolatorError::EngineStale.into());
             }
@@ -17758,6 +18134,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         action: u8,
         asset_index: u16,
+        expected_market_id: u64,
         expected_authority_epoch: u64,
         now_slot: u64,
         initial_price: u64,
@@ -17774,6 +18151,27 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
 
         let asset_index = asset_index as usize;
+        // Wave-2 TB-4 (adopts upstream f5c2c6bb): an ACTIVATE (append OR reuse of a
+        // retired slot) binds against the market's `next_market_id` frontier — the
+        // generation about to be stamped onto this slot. Any other action binds
+        // against the slot's current live `market_id`. Checked once, up front,
+        // against every reachable branch below (append, permissionless reuse,
+        // marketauth-privileged reuse/retire/drain-only, and this fork's SHUTDOWN
+        // action further down).
+        let is_activation = action == ASSET_ACTION_ACTIVATE;
+        {
+            let data = market_ai.try_borrow_data()?;
+            let (current_market_id, next_market_id) =
+                state::read_asset_lifecycle_generation_preflight(&data, asset_index, is_activation)?;
+            if !state::asset_lifecycle_generation_binding_matches(
+                current_market_id,
+                next_market_id,
+                is_activation,
+                expected_market_id,
+            ) {
+                return Err(PercolatorError::AssetGenerationMismatch.into());
+            }
+        }
         let (cfg_pre, mode_pre, configured_slots_pre, capacity_pre) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode_pre != MarketModeV16::Live {
@@ -17862,6 +18260,12 @@ pub mod processor {
                 let mut reuse_activated = false;
                 {
                     let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
+                    require_asset_lifecycle_generation_view(
+                        &group,
+                        asset_index,
+                        true,
+                        expected_market_id,
+                    )?;
                     let still_asset_authority =
                         cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
                     if still_asset_authority {
@@ -18011,6 +18415,10 @@ pub mod processor {
                 if asset_index >= configured_slots || asset_index >= group.markets.len() {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
+                // Fork-specific SHUTDOWN action (not in upstream's f5c2c6bb pre-image, which only
+                // had ACTIVATE/DRAIN_ONLY/RETIRE at this point) — extended the same generation
+                // binding here for consistency: SHUTDOWN is never an activation.
+                require_asset_lifecycle_generation_view(&group, asset_index, false, expected_market_id)?;
                 let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
                 let marketauth_authorized = live_authority_matches(&cfg.marketauth, authority.key);
                 let asset_admin_authorized =
@@ -18107,6 +18515,8 @@ pub mod processor {
             backing_bucket_authority,
             oracle_authority,
             expected_authority_epoch,
+            is_activation,
+            expected_market_id,
         )
     }
 
@@ -18130,6 +18540,8 @@ pub mod processor {
         backing_bucket_authority: [u8; 32],
         oracle_authority: [u8; 32],
         expected_authority_epoch: u64,
+        is_activation: bool,
+        expected_market_id: u64,
     ) -> ProgramResult {
         if !live_authority_matches(&cfg_pre.marketauth, authority.key) {
             return Err(PercolatorError::Unauthorized.into());
@@ -18143,6 +18555,12 @@ pub mod processor {
             let mut data = market_ai.try_borrow_mut_data()?;
             let existing_profile = state::read_asset_oracle_profile(&data, asset_index)?;
             let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
+            require_asset_lifecycle_generation_view(
+                &group,
+                asset_index,
+                is_activation,
+                expected_market_id,
+            )?;
             if !live_authority_matches(&cfg.marketauth, authority.key) {
                 return Err(PercolatorError::Unauthorized.into());
             }
@@ -18593,6 +19011,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
+        expected_market_id: u64,
         fee_bps: u16,
         insurance_share_bps: u16,
         policy_sequence: u64,
@@ -18604,8 +19023,11 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         let domain = domain as usize;
         let asset_index = domain / 2;
-        let (mut cfg, mode, _, _, max_trading_fee_bps) =
+        let (mut cfg, mode, _, market_id, _, max_trading_fee_bps) =
             state::read_market_trade_preflight(&market_ai.try_borrow_data()?, asset_index)?;
+        if !state::asset_generation_binding_matches(market_id, expected_market_id) {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
+        }
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
@@ -18651,6 +19073,7 @@ pub mod processor {
             if asset_index >= group.markets.len() {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            require_asset_generation_view(&group, asset_index, expected_market_id)?;
             let lifecycle = group.markets[asset_index].engine.asset.lifecycle;
             if lifecycle == ASSET_LIFECYCLE_RETIRED
                 || (fee_bps != 0 && lifecycle != ASSET_LIFECYCLE_ACTIVE)
@@ -18739,7 +19162,7 @@ pub mod processor {
         // `trade_fee_base_bps` writable by nobody.
         let (mut cfg, max_trading_fee_bps) = {
             let market_data = market_ai.try_borrow_data()?;
-            let (cfg, _, _, _, max_trading_fee_bps) =
+            let (cfg, _, _, _, _, max_trading_fee_bps) =
                 state::read_market_trade_preflight(&market_data, 0)?;
             (cfg, max_trading_fee_bps)
         };
@@ -18861,6 +19284,7 @@ pub mod processor {
     fn handle_configure_permissionless_resolve<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_asset_generation_frontier: u64,
         stale_slots: u64,
         force_close_delay_slots: u64,
         policy_sequence: u64,
@@ -18879,6 +19303,11 @@ pub mod processor {
         }
         let (mut cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if state::read_asset_generation_frontier(&market_ai.try_borrow_data()?)?
+            != expected_asset_generation_frontier
+        {
+            return Err(PercolatorError::AssetGenerationMismatch.into());
+        }
         expect_live_authority(&cfg.marketauth, admin.key)?;
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
@@ -18931,6 +19360,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         now_slot: u64,
         now_unix_ts: i64,
         oracle_leg_count: u8,
@@ -18981,6 +19411,7 @@ pub mod processor {
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index_usize, expected_market_id)?;
             if authenticated_slot < group.header.current_slot.get() {
                 return Err(PercolatorError::EngineStale.into());
             }
@@ -19122,6 +19553,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         now_slot: u64,
         initial_mark_e6: u64,
         mark_ewma_halflife_slots: u64,
@@ -19147,6 +19579,7 @@ pub mod processor {
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index_usize, expected_market_id)?;
             if authenticated_slot < group.header.current_slot.get() {
                 return Err(PercolatorError::EngineStale.into());
             }
@@ -19265,6 +19698,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         now_slot: u64,
         initial_mark_e6: u64,
         observation_sequence: u64,
@@ -19285,6 +19719,7 @@ pub mod processor {
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index_usize, expected_market_id)?;
             if authenticated_slot < group.header.current_slot.get() {
                 return Err(PercolatorError::EngineStale.into());
             }
@@ -19404,6 +19839,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         now_slot: u64,
         mark_e6: u64,
         observation_sequence: u64,
@@ -19424,6 +19860,7 @@ pub mod processor {
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index_usize, expected_market_id)?;
             let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
@@ -19507,6 +19944,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
+        expected_market_id: u64,
         now_slot: u64,
         mark_e6: u64,
         observation_sequence: u64,
@@ -19527,6 +19965,7 @@ pub mod processor {
             if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            require_asset_generation_view(&group, asset_index_usize, expected_market_id)?;
             let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
@@ -26333,6 +26772,7 @@ pub mod processor {
                 account_b_portfolio_id: 3,
                 account_b_position_epoch: 4,
                 asset_index: 5,
+                market_id: 9,
                 size_q: -6,
                 exec_price: 7,
                 fee_bps: 8,
@@ -26346,6 +26786,7 @@ pub mod processor {
                     account_b_portfolio_id,
                     account_b_position_epoch,
                     asset_index,
+                    market_id,
                     size_q,
                     exec_price,
                     fee_bps,
@@ -26355,6 +26796,7 @@ pub mod processor {
                     assert_eq!(account_b_portfolio_id, 3);
                     assert_eq!(account_b_position_epoch, 4);
                     assert_eq!(asset_index, 5);
+                    assert_eq!(market_id, 9);
                     assert_eq!(size_q, -6);
                     assert_eq!(exec_price, 7);
                     assert_eq!(fee_bps, 8);
@@ -26377,6 +26819,7 @@ pub mod processor {
                 max_fee_atoms: 200,
                 legs: alloc::vec![ix::BatchTradeCpiLeg {
                     asset_index: 0,
+                    market_id: 4,
                     size_q: 1,
                     fee_bps: 2,
                     limit_price: 3,

@@ -355,7 +355,7 @@ fn setup_vault(cooldown_slots: u64) -> Env {
         program_id,
         &payer,
         vec![(
-            ProgInstruction::UpdateAssetLifecycle {
+            ProgInstruction::UpdateAssetLifecycle { market_id: 2,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index: APPEND_ASSET_INDEX,
                 // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this
@@ -595,12 +595,15 @@ fn resolve_market(env: &mut Env) -> Result<(), String> {
             .expect("read control sequences")
             .authority_epoch
     };
+    let asset_generation_frontier =
+        state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket { authority_epoch },
+            ProgInstruction::ResolveMarket { asset_generation_frontier: asset_generation_frontier, authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),

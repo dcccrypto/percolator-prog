@@ -301,7 +301,7 @@ fn setup_vault_oi(cooldown_slots: u64, oi_reservation_threshold_bps: u16) -> Env
         program_id,
         &payer,
         vec![(
-            ProgInstruction::UpdateAssetLifecycle {
+            ProgInstruction::UpdateAssetLifecycle { market_id: 2,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index: APPEND_ASSET_INDEX,
                 // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this
@@ -536,12 +536,15 @@ fn resolve_market(env: &mut Env) -> Result<(), String> {
             .expect("read control sequences")
             .authority_epoch
     };
+    let asset_generation_frontier =
+        state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket { authority_epoch },
+            ProgInstruction::ResolveMarket { asset_generation_frontier: asset_generation_frontier, authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),
@@ -957,7 +960,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
         pid_a,
         &payer_a,
         vec![(
-            ProgInstruction::TopUpBackingBucket {
+            ProgInstruction::TopUpBackingBucket { market_id: 2,
                 intent_id: next_intent_id(),
                 domain: DOMAIN,
                 amount: DEPOSIT,
@@ -992,7 +995,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
         pid_a,
         &payer_a,
         vec![(
-            ProgInstruction::WithdrawBackingBucket {
+            ProgInstruction::WithdrawBackingBucket { market_id: 2,
                 domain: DOMAIN,
                 amount: MINTED,
                 authority_epoch: backing_withdraw_authority_epoch_a,
@@ -1125,7 +1128,7 @@ fn setup_vault_admin_authority() -> Env {
         program_id,
         &payer,
         vec![(
-            ProgInstruction::UpdateAssetLifecycle {
+            ProgInstruction::UpdateAssetLifecycle { market_id: 2,
                 action: ASSET_ACTION_ACTIVATE,
                 asset_index: APPEND_ASSET_INDEX,
                 // W3A-2: no `UpdateAssetAuthority` rotation occurs anywhere in this
@@ -2413,7 +2416,7 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
         pid,
         &payer,
         vec![(
-            ProgInstruction::WithdrawInsuranceAsset {
+            ProgInstruction::WithdrawInsuranceAsset { market_id: 2,
                 asset_index: APPEND_ASSET_INDEX,
                 amount: 199_800,
                 authority_epoch: drain_authority_epoch,
@@ -2463,12 +2466,15 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
             .expect("read control sequences")
             .authority_epoch
     };
+    let asset_generation_frontier2 =
+        state::read_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap();
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket { authority_epoch },
+            ProgInstruction::ResolveMarket { asset_generation_frontier: asset_generation_frontier2, authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),
