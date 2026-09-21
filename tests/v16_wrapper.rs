@@ -25869,3 +25869,113 @@ fn wgenl_w19_version18_refuses_a_version17_ledger_before_the_generation_branch()
          is unreachable for any account the deployed wrapper wrote"
     );
 }
+
+
+/// POC: a NON-BASE asset's oracle update refreshes the MARKET-WIDE stale clock.
+///
+/// `cfg.last_good_oracle_slot` is the base/global stale-resolution clock: it is
+/// the sole input to `permissionless_stale_matured` (the permissionless terminal
+/// exit) and `hybrid_soft_stale_matured` (the liveness guard on value movement).
+/// Per-asset liveness has its own home in `AssetOracleProfileV16`.
+///
+/// Every oracle-update handler writes the market-wide field BEFORE its
+/// `if asset_index_usize == 0` block, so an update for asset 1+ pollutes the
+/// base clock. The consequence is that a base market whose own feed has died
+/// never matures: `ResolveStalePermissionless` keeps rejecting as "not matured"
+/// and asset-0 value movement keeps passing the hard-stale guard, for as long as
+/// anyone keeps a non-base asset refreshed.
+///
+/// This drives the authority-gated `PushAuthMark` path. The same unguarded write
+/// also sits in `handle_permissionless_crank_zero_copy`, which requires no
+/// authority at all.
+///
+/// The control is the second assertion: asset 0's own push DOES move the clock,
+/// so the field is live and the first assertion is measuring isolation, not a
+/// dead write.
+#[test]
+fn poc_non_base_oracle_push_must_not_refresh_the_base_stale_clock() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+
+    // Bring asset 1 up with its own authority-pushed mark.
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        100,
+    )
+    .unwrap();
+    run_ix(
+        Instruction::ConfigureAuthMark {
+            asset_index: 1,
+            now_slot: 2,
+            initial_mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    let (cfg_before, _) = state::read_market(&market.data).unwrap();
+    let base_clock_before = cfg_before.last_good_oracle_slot;
+
+    // Asset 1 only. Nothing about asset 0 / the base market is touched.
+    run_ix(
+        Instruction::PushAuthMark {
+            asset_index: 1,
+            now_slot: 5_000,
+            mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert_eq!(
+        cfg_after.last_good_oracle_slot, base_clock_before,
+        "a NON-BASE asset's oracle push must not refresh the market-wide stale \
+         clock (was {}, now {}) — this is the clock that gates \
+         ResolveStalePermissionless and the base hard-stale guard",
+        base_clock_before, cfg_after.last_good_oracle_slot
+    );
+}
+
+/// CONTROL for the test above: asset 0's own push DOES advance the market-wide
+/// clock. Without this, the assertion above would also pass if the field had
+/// simply stopped being written at all.
+#[test]
+fn poc_base_asset_push_does_advance_the_base_stale_clock_control() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+
+    run_ix(
+        Instruction::ConfigureAuthMark {
+            asset_index: 0,
+            now_slot: 2,
+            initial_mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    let (cfg_before, _) = state::read_market(&market.data).unwrap();
+
+    run_ix(
+        Instruction::PushAuthMark {
+            asset_index: 0,
+            now_slot: 5_000,
+            mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    let (cfg_after, _) = state::read_market(&market.data).unwrap();
+    assert!(
+        cfg_after.last_good_oracle_slot > cfg_before.last_good_oracle_slot,
+        "control: the BASE asset's push must advance the market-wide clock, or \
+         the isolation test above proves nothing"
+    );
+}
