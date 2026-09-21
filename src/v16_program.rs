@@ -5407,16 +5407,31 @@ pub mod ix {
             domain: u16,
             amount: u128,
         },
-        CloseSlab,
+        /// W3A-1: `authority_epoch` (upstream `238436c5`) -- the caller's EXPECTED
+        /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`,
+        /// checked (NOT advanced -- CloseSlab is terminal/irreversible, so there is
+        /// no future rotation to protect) via `require_authority_epoch_view` before
+        /// any fund-sweep or state mutation. See that helper's own doc comment for
+        /// the durable-nonce replay this closes for market-authority round-trips.
+        CloseSlab {
+            authority_epoch: u64,
+        },
         ResolveMarket,
         TopUpBackingBucket {
             domain: u16,
             amount: u128,
             expiry_slot: u64,
         },
+        /// W3A-1: `authority_epoch` (upstream `ade6f9fa`) -- CAS-checked (not
+        /// advanced) against the withdrawing domain's asset epoch when the
+        /// per-domain `backing_bucket_authority` signs, or asset-0's epoch when the
+        /// admin shutdown-drain fallback signs instead (mirrors `marketauth`'s own
+        /// asset-0 epoch lane from `UpdateAuthority`). See
+        /// `handle_withdraw_backing_bucket`'s call site.
         WithdrawBackingBucket {
             domain: u16,
             amount: u128,
+            authority_epoch: u64,
         },
         ConvertReleasedPnl {
             portfolio_id: u64,
@@ -5428,8 +5443,18 @@ pub mod ix {
         },
         /// Rotate the single market-level authority (`marketauth`). The current `marketauth` must sign;
         /// the non-zero replacement must co-sign. Burning `marketauth` to zero is rejected.
+        ///
+        /// `authority_epoch` (W3A-1, upstream `95d155bc`): the caller's EXPECTED
+        /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`
+        /// (the SAME per-asset lane `UpdateAssetAuthority` uses at `asset_index ==
+        /// 0` -- upstream reuses that exact slot for the market-level authority
+        /// rather than adding a new one; see `advance_authority_epoch_view`'s call
+        /// site in `handle_update_authority`). Validated via strict CAS
+        /// (`require_current_authority_epoch`) and auto-incremented by exactly 1 on
+        /// success, same semantics as `UpdateAssetAuthority`'s own lane.
         UpdateAuthority {
             new_pubkey: [u8; 32],
+            authority_epoch: u64,
         },
         /// Rotate one of an asset's per-asset authorities. Gated by the asset's own `asset_admin`
         /// (rotates any; only the admin authority itself is burnable) or the current holder of that
@@ -5493,9 +5518,12 @@ pub mod ix {
             min_init_fee: u128,
             policy_sequence: u64,
         },
+        /// W3A-1: `authority_epoch` (upstream `ade6f9fa`) -- same CAS mechanism and
+        /// `epoch_asset_index` selection as `WithdrawBackingBucket`, above.
         WithdrawBackingBucketEarnings {
             domain: u16,
             amount: u128,
+            authority_epoch: u64,
         },
         SyncBackingDomainLedger {
             domain: u16,
@@ -5576,9 +5604,14 @@ pub mod ix {
         WithdrawInsurance {
             amount: u128,
         },
+        /// W3A-1: `authority_epoch` (upstream `ade6f9fa`) -- CAS-checked against
+        /// `asset_index`'s epoch when the local `insurance_operator` signs, or
+        /// asset-0's epoch when the admin shutdown-drain fallback signs instead.
+        /// See `handle_withdraw_insurance_asset`'s call site.
         WithdrawInsuranceAsset {
             asset_index: u16,
             amount: u128,
+            authority_epoch: u64,
         },
         CureAndCancelClose {
             portfolio_id: u64,
@@ -5987,7 +6020,9 @@ pub mod ix {
                     domain: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                 },
-                13 => Self::CloseSlab,
+                13 => Self::CloseSlab {
+                    authority_epoch: read_u64(&mut rest)?,
+                },
                 19 => Self::ResolveMarket,
                 24 => Self::TopUpBackingBucket {
                     domain: read_u16(&mut rest)?,
@@ -5997,6 +6032,7 @@ pub mod ix {
                 50 => Self::WithdrawBackingBucket {
                     domain: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 28 => Self::ConvertReleasedPnl {
                     portfolio_id: read_u64(&mut rest)?,
@@ -6008,6 +6044,7 @@ pub mod ix {
                 },
                 32 => Self::UpdateAuthority {
                     new_pubkey: read_bytes32(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 65 => Self::UpdateAssetAuthority {
                     asset_index: read_u16(&mut rest)?,
@@ -6078,6 +6115,7 @@ pub mod ix {
                 52 => Self::WithdrawBackingBucketEarnings {
                     domain: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 53 => Self::SyncBackingDomainLedger {
                     domain: read_u16(&mut rest)?,
@@ -6142,6 +6180,7 @@ pub mod ix {
                 57 => Self::WithdrawInsuranceAsset {
                     asset_index: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 42 => Self::CureAndCancelClose {
                     portfolio_id: read_u64(&mut rest)?,
@@ -6470,7 +6509,10 @@ pub mod ix {
                     push_u16(&mut out, domain);
                     push_u128(&mut out, amount);
                 }
-                Self::CloseSlab => out.push(13),
+                Self::CloseSlab { authority_epoch } => {
+                    out.push(13);
+                    push_u64(&mut out, authority_epoch);
+                }
                 Self::ResolveMarket => out.push(19),
                 Self::RebalanceLpVaultBacking {
                     from_domain,
@@ -6492,10 +6534,15 @@ pub mod ix {
                     push_u128(&mut out, amount);
                     push_u64(&mut out, expiry_slot);
                 }
-                Self::WithdrawBackingBucket { domain, amount } => {
+                Self::WithdrawBackingBucket {
+                    domain,
+                    amount,
+                    authority_epoch,
+                } => {
                     out.push(50);
                     push_u16(&mut out, domain);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::ConvertReleasedPnl {
                     portfolio_id,
@@ -6511,9 +6558,13 @@ pub mod ix {
                     out.push(30);
                     push_u128(&mut out, fee_rate_per_slot);
                 }
-                Self::UpdateAuthority { new_pubkey } => {
+                Self::UpdateAuthority {
+                    new_pubkey,
+                    authority_epoch,
+                } => {
                     out.push(32);
                     out.extend_from_slice(&new_pubkey);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::UpdateAssetAuthority {
                     asset_index,
@@ -6599,10 +6650,15 @@ pub mod ix {
                     out.push(61);
                     push_u128(&mut out, amount);
                 }
-                Self::WithdrawBackingBucketEarnings { domain, amount } => {
+                Self::WithdrawBackingBucketEarnings {
+                    domain,
+                    amount,
+                    authority_epoch,
+                } => {
                     out.push(52);
                     push_u16(&mut out, domain);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::SyncBackingDomainLedger { domain } => {
                     out.push(53);
@@ -6760,10 +6816,12 @@ pub mod ix {
                 Self::WithdrawInsuranceAsset {
                     asset_index,
                     amount,
+                    authority_epoch,
                 } => {
                     out.push(57);
                     push_u16(&mut out, asset_index);
                     push_u128(&mut out, amount);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::CureAndCancelClose {
                     portfolio_id,
@@ -8866,6 +8924,30 @@ pub mod processor {
         write_control_sequences_to_view(group, asset_index, &sequences)
     }
 
+    /// W3A-1 (this unit): ADOPTED from upstream `95d155bc` byte-for-byte
+    /// (`git show 95d155bc:src/v16_program.rs` -- the read-only sibling of
+    /// `advance_authority_epoch_view` above). CHECK-ONLY variant: validates
+    /// the caller's `expected` epoch via the same strict CAS
+    /// (`require_current_authority_epoch`) but does NOT increment the
+    /// stored value. Used for the five fund-critical tags this unit binds
+    /// (`UpdateAuthority`'s market-level rotation aside, which DOES rotate
+    /// and so calls `advance_authority_epoch_view` instead): `CloseSlab`
+    /// (terminal/irreversible -- no future rotation to protect),
+    /// `WithdrawBackingBucket[Earnings]`, and `WithdrawInsuranceAsset`
+    /// (fund withdrawals, not authority rotations -- the epoch they check
+    /// is advanced by a SEPARATE `UpdateAuthority`/`UpdateAssetAuthority`
+    /// call, never by the withdrawal itself). A stale signed withdrawal or
+    /// CloseSlab tx built against a since-rotated authority is rejected
+    /// here exactly like a stale `UpdateAssetAuthority` is by the CAS.
+    fn require_authority_epoch_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        expected: u64,
+    ) -> ProgramResult {
+        let sequences = read_control_sequences_from_view(group, asset_index)?;
+        state::require_current_authority_epoch(sequences.authority_epoch, expected)
+    }
+
     fn mirror_manual_profile_to_base_config(
         cfg: &mut WrapperConfigV16,
         profile: &state::AssetOracleProfileV16,
@@ -9551,16 +9633,31 @@ pub mod processor {
             Instruction::TopUpInsuranceDomain { domain, amount } => {
                 handle_top_up_insurance_domain(program_id, accounts, domain, amount)
             }
-            Instruction::CloseSlab => handle_close_slab(program_id, accounts),
+            Instruction::CloseSlab { authority_epoch } => {
+                handle_close_slab(program_id, accounts, authority_epoch)
+            }
             Instruction::ResolveMarket => handle_resolve_market(program_id, accounts),
             Instruction::TopUpBackingBucket {
                 domain,
                 amount,
                 expiry_slot,
             } => handle_top_up_backing_bucket(program_id, accounts, domain, amount, expiry_slot),
-            Instruction::WithdrawBackingBucket { domain, amount } => {
-                handle_withdraw_backing_bucket(program_id, accounts, domain, amount)
-            }
+            // INTEGRATION: TB-1b's ConvertReleasedPnl identity binding
+            // (portfolio_id/position_epoch) and W3A-1's WithdrawBackingBucket
+            // authority_epoch CAS are two independent field-additions to two
+            // different instructions that only collided textually (adjacent
+            // match arms) -- both kept.
+            Instruction::WithdrawBackingBucket {
+                domain,
+                amount,
+                authority_epoch,
+            } => handle_withdraw_backing_bucket(
+                program_id,
+                accounts,
+                domain,
+                amount,
+                authority_epoch,
+            ),
             Instruction::ConvertReleasedPnl {
                 portfolio_id,
                 position_epoch,
@@ -9575,9 +9672,10 @@ pub mod processor {
             Instruction::CloseResolved { fee_rate_per_slot } => {
                 handle_close_resolved(program_id, accounts, fee_rate_per_slot)
             }
-            Instruction::UpdateAuthority { new_pubkey } => {
-                handle_update_authority(program_id, accounts, new_pubkey)
-            }
+            Instruction::UpdateAuthority {
+                new_pubkey,
+                authority_epoch,
+            } => handle_update_authority(program_id, accounts, new_pubkey, authority_epoch),
             Instruction::UpdateAssetAuthority {
                 asset_index,
                 kind,
@@ -9653,9 +9751,17 @@ pub mod processor {
                 deposits_only,
                 cooldown_slots,
             ),
-            Instruction::WithdrawBackingBucketEarnings { domain, amount } => {
-                handle_withdraw_backing_bucket_earnings(program_id, accounts, domain, amount)
-            }
+            Instruction::WithdrawBackingBucketEarnings {
+                domain,
+                amount,
+                authority_epoch,
+            } => handle_withdraw_backing_bucket_earnings(
+                program_id,
+                accounts,
+                domain,
+                amount,
+                authority_epoch,
+            ),
             Instruction::SyncBackingDomainLedger { domain } => {
                 handle_sync_backing_domain_ledger(program_id, accounts, domain)
             }
@@ -9816,7 +9922,14 @@ pub mod processor {
             Instruction::WithdrawInsuranceAsset {
                 asset_index,
                 amount,
-            } => handle_withdraw_insurance_asset(program_id, accounts, asset_index, amount),
+                authority_epoch,
+            } => handle_withdraw_insurance_asset(
+                program_id,
+                accounts,
+                asset_index,
+                amount,
+                authority_epoch,
+            ),
             Instruction::CureAndCancelClose {
                 portfolio_id,
                 position_epoch,
@@ -14149,6 +14262,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -14242,6 +14356,18 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // W3A-1 (upstream `ade6f9fa`): bound AFTER both authorization gates settle
+            // (so the D-STAKE-1 narrowing above is already reflected in
+            // `local_authorized`), BEFORE `ledger_authority` is chosen or any state is
+            // touched. `local_authorized` reads the WITHDRAWING DOMAIN's own asset
+            // epoch (`domain_usize / 2`, matching `UpdateAssetAuthority`'s per-asset
+            // lane); the admin shutdown-drain fallback instead reads asset-0's epoch
+            // (the same slot `UpdateAuthority`/marketauth rotation advances), so an
+            // admin-path withdrawal is invalidated by a marketauth rotation exactly
+            // like a local-authority withdrawal is invalidated by an asset-authority
+            // rotation.
+            let epoch_asset_index = if local_authorized { domain_usize / 2 } else { 0 };
+            require_authority_epoch_view(&group, epoch_asset_index, expected_authority_epoch)?;
             let ledger_authority = if admin_shutdown_authorized && !local_authorized {
                 cfg.marketauth
             } else {
@@ -14314,6 +14440,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -14385,6 +14512,11 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // W3A-1 (upstream `ade6f9fa`): same `epoch_asset_index` selection and
+            // position as `handle_withdraw_backing_bucket` above -- see that call
+            // site's doc comment.
+            let epoch_asset_index = if local_authorized { domain_usize / 2 } else { 0 };
+            require_authority_epoch_view(&group, epoch_asset_index, expected_authority_epoch)?;
             let ledger_authority = if admin_shutdown_authorized && !local_authorized {
                 cfg.marketauth
             } else {
@@ -14652,6 +14784,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
         amount: u128,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let operator = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -14729,6 +14862,15 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // W3A-1 (upstream `ade6f9fa`): bound after both authorization gates settle,
+            // before any further state is touched (cooldown check, ledger, budget
+            // debit). `local_authorized` is already scoped to THIS `asset_index`
+            // (`long_domain = asset_index * 2`), so the local path reads that asset's
+            // own epoch; the admin shutdown-drain fallback reads asset-0's epoch (the
+            // marketauth-rotation lane), matching `WithdrawBackingBucket[Earnings]`'s
+            // identical `epoch_asset_index` selection above.
+            let epoch_asset_index = if local_authorized { asset_index } else { 0 };
+            require_authority_epoch_view(&group, epoch_asset_index, expected_authority_epoch)?;
             // #396: enforce the market-wide insurance-withdrawal cooldown on this per-asset path
             // too — it shares insurance_withdraw_cooldown_slots / last_insurance_withdraw_slot with
             // the terminal handle_withdraw_insurance. (The deposits-only ceiling stays terminal-only;
@@ -15677,6 +15819,7 @@ pub mod processor {
     fn handle_close_slab<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let admin_dest = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -15710,11 +15853,13 @@ pub mod processor {
         // carrying our I2/K fix, PR #258, previously dormant because nothing
         // called it) and its recredit/expiry bookkeeping.
         //
-        // NOT ported: upstream's `expected_authority_epoch` parameter /
-        // `require_authority_epoch_view` call on this tag (Track-B AE binding,
-        // ABI_OVERHAUL_SCOPE.md §1) -- logically orthogonal to the scan mechanism,
-        // deliberately deferred so this stays a wire-compatible, non-Track-B unit.
-        // Tag 13 (`CloseSlab`) keeps its existing bare, payload-free wire shape.
+        // W3A-1 (this unit, upstream `238436c5`): ADOPTS the `expected_authority_epoch`
+        // parameter / `require_authority_epoch_view` call this tag previously deferred
+        // (Track-B AE binding, ABI_OVERHAUL_SCOPE.md §1) -- see the CAS call site below,
+        // right after the `expect_live_authority` check it binds. `CloseSlab` no longer
+        // keeps a bare, payload-free wire shape; tag 13 now carries a trailing
+        // `authority_epoch: u64`, logically orthogonal to the windowed-scan mechanism
+        // this unit's own port activated (unaffected by this change).
         //
         // NOT ported: upstream `236b4f85` "retire native booked residue without
         // burn" (a LATER, separate fix for markets whose primary collateral is
@@ -15797,6 +15942,14 @@ pub mod processor {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             expect_live_authority(&cfg.marketauth, admin_dest.key)?;
+            // W3A-1: strictly precedes every mutation below (the mode check, the
+            // scan, and the fund sweep) -- matches upstream `238436c5`'s position,
+            // right after the authority check it binds. CHECK-ONLY (asset-0's
+            // `authority_epoch` is not advanced here): CloseSlab is terminal --
+            // once it succeeds the market's own reserve invariant guards the rest
+            // of teardown, so there is no future rotation on THIS market left to
+            // protect against a still-held stale intent.
+            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
             if group.header.mode != 1 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -16500,6 +16653,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         new_pubkey: [u8; 32],
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let current = account(accounts, 0)?;
         let new_authority = account(accounts, 1)?;
@@ -16517,11 +16671,26 @@ pub mod processor {
             return Err(PercolatorError::Unauthorized.into());
         }
 
-        let (mut cfg, _, _, _) =
-            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        expect_live_authority(&cfg.marketauth, current.key)?;
-        cfg.marketauth = new_pubkey;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        // W3A-1: was `read_market_config_mode_and_capacity` + `write_wrapper_config`
+        // (config-only, no `AssetControlSequencesV16` access). Upgraded to
+        // `market_view_mut` so this handler can reach asset-0's control-sequences
+        // region for the epoch CAS below -- `cfg` is still read out by value and
+        // written back exactly as before; no other behavior changes.
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let cfg = {
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            expect_live_authority(&cfg.marketauth, current.key)?;
+            // Bind to asset-0's `authority_epoch` lane -- the SAME per-asset slot
+            // `UpdateAssetAuthority` uses at `asset_index == 0` (upstream `95d155bc`
+            // reuses that exact field for the market-level authority rather than
+            // adding a new one; see `UpdateAuthority`'s own doc comment). Strict CAS
+            // + auto-increment: closes the A->B->A durable-nonce replay hole this
+            // rotation previously had ZERO epoch binding against.
+            advance_authority_epoch_view(&mut group, 0, expected_authority_epoch)?;
+            cfg.marketauth = new_pubkey;
+            cfg
+        };
+        state::write_wrapper_config(&mut market_data, &cfg)
     }
 
     #[inline(never)]

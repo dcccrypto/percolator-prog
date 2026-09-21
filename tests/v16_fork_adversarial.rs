@@ -836,8 +836,17 @@ impl Env {
             )
             .unwrap();
         let admin = self.admin.insecure_clone();
+        // W3A-1: CloseSlab binds asset-0's `authority_epoch` (CHECK-only), regardless
+        // of this harness's own `ASSET` constant (its business asset, not necessarily
+        // index 0).
+        let authority_epoch = {
+            let account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         self.try_send(
-            ProgInstruction::CloseSlab,
+            ProgInstruction::CloseSlab { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),

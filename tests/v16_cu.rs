@@ -638,6 +638,33 @@ impl V16CuEnv {
             .expect("read control sequences")
     }
 
+    /// W3A-1: mirrors `handle_withdraw_insurance_asset`'s own `epoch_asset_index`
+    /// selection (`if local_authorized { asset_index } else { 0 }`) so every
+    /// insurance-withdrawal helper below supplies the LIVE `authority_epoch` for
+    /// whichever lane the handler will actually check -- reading the on-chain
+    /// `insurance_operator` for `asset_index` directly, rather than assuming which
+    /// path a given `authority` takes.
+    fn insurance_withdraw_authority_epoch(&self, asset_index: u16, authority: &Pubkey) -> u64 {
+        let account = self.svm.get_account(&self.market).expect("market account");
+        let profile = state::read_asset_oracle_profile(&account.data, asset_index as usize)
+            .expect("read oracle profile");
+        let local_authorized = profile.insurance_operator == authority.to_bytes();
+        let epoch_asset_index = if local_authorized { asset_index } else { 0 };
+        self.control_sequences(epoch_asset_index).authority_epoch
+    }
+
+    /// W3A-1: same idea as `insurance_withdraw_authority_epoch`, for
+    /// `WithdrawBackingBucket[Earnings]`'s `epoch_asset_index` selection
+    /// (`if local_authorized { domain_usize / 2 } else { 0 }`).
+    fn backing_withdraw_authority_epoch(&self, domain: u16, authority: &Pubkey) -> u64 {
+        let account = self.svm.get_account(&self.market).expect("market account");
+        let profile = state::read_asset_oracle_profile(&account.data, (domain / 2) as usize)
+            .expect("read oracle profile");
+        let local_authorized = profile.backing_bucket_authority == authority.to_bytes();
+        let epoch_asset_index = if local_authorized { domain / 2 } else { 0 };
+        self.control_sequences(epoch_asset_index).authority_epoch
+    }
+
     fn update_market_init_fee_policy_with_cu(&mut self, min_init_fee: u128) -> u64 {
         let policy_sequence = self.control_sequences(0).market_init_fee + 1;
         send_tx(
@@ -785,12 +812,16 @@ impl V16CuEnv {
         // the v17 single-authority design.
         // Matrix row: v17-auth-overhaul (UpdateAuthority API change, `kind` field removed).
         self.ensure_signer_account(new_authority.pubkey());
+        // W3A-1: `UpdateAuthority` now binds asset-0's `authority_epoch` lane (the
+        // same slot `UpdateAssetAuthority` uses at asset_index == 0) via strict CAS.
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
             ProgInstruction::UpdateAuthority {
                 new_pubkey: new_authority.pubkey().to_bytes(),
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -1923,11 +1954,13 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        // W3A-1: CloseSlab binds asset-0's `authority_epoch` (CHECK-only, not advanced).
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::CloseSlab,
+            ProgInstruction::CloseSlab { authority_epoch },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2746,6 +2779,8 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch =
+            self.insurance_withdraw_authority_epoch(0, &self.admin.pubkey());
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
@@ -2759,6 +2794,7 @@ impl V16CuEnv {
             ProgInstruction::WithdrawInsuranceAsset {
                 asset_index: 0,
                 amount,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2811,6 +2847,8 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch =
+            self.insurance_withdraw_authority_epoch(asset_index, &authority.pubkey());
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
@@ -2818,6 +2856,7 @@ impl V16CuEnv {
             ProgInstruction::WithdrawInsuranceAsset {
                 asset_index,
                 amount,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
@@ -2840,6 +2879,8 @@ impl V16CuEnv {
         amount: u128,
     ) -> u64 {
         self.ensure_signer_account(authority.pubkey());
+        let authority_epoch =
+            self.insurance_withdraw_authority_epoch(asset_index, &authority.pubkey());
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2847,6 +2888,7 @@ impl V16CuEnv {
             ProgInstruction::WithdrawInsuranceAsset {
                 asset_index,
                 amount,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
@@ -2868,11 +2910,16 @@ impl V16CuEnv {
         amount: u128,
     ) -> u64 {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
+        let authority_epoch = self.backing_withdraw_authority_epoch(domain, &self.admin.pubkey());
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            ProgInstruction::WithdrawBackingBucket {
+                domain,
+                amount,
+                authority_epoch,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2894,11 +2941,16 @@ impl V16CuEnv {
         amount: u128,
     ) -> Result<u64, String> {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
+        let authority_epoch = self.backing_withdraw_authority_epoch(domain, &self.admin.pubkey());
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            ProgInstruction::WithdrawBackingBucket {
+                domain,
+                amount,
+                authority_epoch,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2929,11 +2981,16 @@ impl V16CuEnv {
     ) -> u64 {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
         self.ensure_signer_account(authority.pubkey());
+        let authority_epoch = self.backing_withdraw_authority_epoch(domain, &authority.pubkey());
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucket { domain, amount },
+            ProgInstruction::WithdrawBackingBucket {
+                domain,
+                amount,
+                authority_epoch,
+            },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2971,11 +3028,16 @@ impl V16CuEnv {
         domain: u16,
         amount: u128,
     ) -> u64 {
+        let authority_epoch = self.backing_withdraw_authority_epoch(domain, &self.admin.pubkey());
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::WithdrawBackingBucketEarnings { domain, amount },
+            ProgInstruction::WithdrawBackingBucketEarnings {
+                domain,
+                amount,
+                authority_epoch,
+            },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -3030,6 +3092,8 @@ impl V16CuEnv {
         // will reach asset_index = domain/2 which maps to the same asset, not the short side.
         // Callers that expect rejection (.is_err()) remain correct since the auth check is
         // per-asset regardless of side. Matrix row: v17-auth-overhaul.
+        let authority_epoch =
+            self.insurance_withdraw_authority_epoch(domain / 2, &authority.pubkey());
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
@@ -3037,6 +3101,7 @@ impl V16CuEnv {
             ProgInstruction::WithdrawInsuranceAsset {
                 asset_index: domain / 2,
                 amount,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
@@ -4032,11 +4097,12 @@ fn v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry() {
             },
         )
         .unwrap();
+    let authority_epoch = env.control_sequences(0).authority_epoch;
     send_tx(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::CloseSlab,
+        ProgInstruction::CloseSlab { authority_epoch },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
             AccountMeta::new(env.market, false),
@@ -4561,11 +4627,16 @@ fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
         accounts
     };
 
+    let omit_authority_epoch = env.backing_withdraw_authority_epoch(domain, &env.admin.pubkey());
     let omitted = send_tx(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            amount: 40,
+            authority_epoch: omit_authority_epoch,
+        },
         withdraw_accounts(None),
         &[&env.admin],
     );
@@ -4578,11 +4649,17 @@ fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
     assert!(omitted.is_err(), "omitting the ledger must fail closed");
 
     env.svm.expire_blockhash();
+    let substituted_authority_epoch =
+        env.backing_withdraw_authority_epoch(domain, &env.admin.pubkey());
     let substituted = send_tx(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            amount: 40,
+            authority_epoch: substituted_authority_epoch,
+        },
         withdraw_accounts(Some(impostor)),
         &[&env.admin],
     );
@@ -4601,11 +4678,17 @@ fn v16_bpf_withdraw_backing_bucket_requires_canonical_ledger() {
     assert_eq!(env.token_amount(dest), dest_before);
 
     env.svm.expire_blockhash();
+    let canonical_authority_epoch =
+        env.backing_withdraw_authority_epoch(domain, &env.admin.pubkey());
     send_tx(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::WithdrawBackingBucket { domain, amount: 40 },
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            amount: 40,
+            authority_epoch: canonical_authority_epoch,
+        },
         withdraw_accounts(Some(ledger)),
         &[&env.admin],
     )
@@ -6415,6 +6498,8 @@ fn v16_bpf_cross_margin_positive_pnl_allows_backed_risk_increase_on_negative_leg
 
     let backing_withdraw_dest = env.token_account(env.admin.pubkey(), 0);
     let market_before_withdraw = env.svm.get_account(&env.market).unwrap();
+    let over_watermark_authority_epoch =
+        env.backing_withdraw_authority_epoch(1, &env.admin.pubkey());
     let backing_withdraw = send_tx(
         &mut env.svm,
         env.program_id,
@@ -6422,6 +6507,7 @@ fn v16_bpf_cross_margin_positive_pnl_allows_backed_risk_increase_on_negative_leg
         ProgInstruction::WithdrawBackingBucket {
             domain: 1,
             amount: over_watermark_amount,
+            authority_epoch: over_watermark_authority_epoch,
         },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
@@ -10889,6 +10975,8 @@ fn v16_bpf_failed_backing_withdraw_transfer_rolls_back_bucket_and_ledger() {
     let ledger_before = env.svm.get_account(&ledger).unwrap();
     let dest_before = env.svm.get_account(&dest).unwrap();
     let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let corrupted_vault_authority_epoch =
+        env.backing_withdraw_authority_epoch(1, &env.admin.pubkey());
     let result = send_tx(
         &mut env.svm,
         env.program_id,
@@ -10896,6 +10984,7 @@ fn v16_bpf_failed_backing_withdraw_transfer_rolls_back_bucket_and_ledger() {
         ProgInstruction::WithdrawBackingBucket {
             domain: 1,
             amount: 40,
+            authority_epoch: corrupted_vault_authority_epoch,
         },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
@@ -12784,12 +12873,19 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
     .expect("init market");
 
     svm.expire_blockhash();
+    let rotate_authority_epoch = state::read_asset_control_sequences(
+        &svm.get_account(&market.pubkey()).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .authority_epoch;
     send_tx(
         &mut svm,
         program_id,
         &payer,
         ProgInstruction::UpdateAuthority {
             new_pubkey: market.pubkey().to_bytes(),
+            authority_epoch: rotate_authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -12831,11 +12927,19 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
     let dest_before = svm.get_account(&dest).unwrap();
 
     svm.expire_blockhash();
+    let close_slab_authority_epoch = state::read_asset_control_sequences(
+        &svm.get_account(&market.pubkey()).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .authority_epoch;
     let rejected = send_tx(
         &mut svm,
         program_id,
         &payer,
-        ProgInstruction::CloseSlab,
+        ProgInstruction::CloseSlab {
+            authority_epoch: close_slab_authority_epoch,
+        },
         vec![
             AccountMeta::new(market.pubkey(), true),
             AccountMeta::new(market.pubkey(), false),
@@ -13161,10 +13265,12 @@ fn v16_attack_resolved_backing_withdraw_requires_full_user_wind_down() {
     let dest_before = env.token_amount(dest);
     let ledger = env.canonical_backing_domain_ledger_account(1);
     env.svm.expire_blockhash();
+    let resolved_authority_epoch = env.backing_withdraw_authority_epoch(1, &env.admin.pubkey());
     let r = env.send(
         ProgInstruction::WithdrawBackingBucket {
             domain: 1,
             amount: 100,
+            authority_epoch: resolved_authority_epoch,
         },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
@@ -16464,6 +16570,7 @@ fn withdraw_insurance_asset_result(env: &mut V16CuEnv, amount: u128) -> Result<u
     let market = env.market;
     let vault = env.vault;
     let vault_authority = env.vault_authority;
+    let authority_epoch = env.insurance_withdraw_authority_epoch(0, &admin.pubkey());
     send_tx(
         &mut env.svm,
         pid,
@@ -16471,6 +16578,7 @@ fn withdraw_insurance_asset_result(env: &mut V16CuEnv, amount: u128) -> Result<u
         ProgInstruction::WithdrawInsuranceAsset {
             asset_index: 0,
             amount,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -16626,6 +16734,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
 
     env.svm.expire_blockhash();
     let dest = env.token_account(admin.pubkey(), 0);
+    let authority_epoch = env.backing_withdraw_authority_epoch(1, &admin.pubkey());
     send_tx(
         &mut env.svm,
         pid,
@@ -16633,6 +16742,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
         ProgInstruction::WithdrawBackingBucket {
             domain: 1,
             amount: 40,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -16825,6 +16935,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
     // The 60 atoms that are actually fresh must remain withdrawable.
     env.svm.expire_blockhash();
     let dest = env.token_account(admin.pubkey(), 0);
+    let authority_epoch = env.backing_withdraw_authority_epoch(DOMAIN, &admin.pubkey());
 
     send_tx(
         &mut env.svm,
@@ -16833,6 +16944,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
         ProgInstruction::WithdrawBackingBucket {
             domain: DOMAIN,
             amount: 60,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17058,6 +17170,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
     // making withdrawn earnings exceed recognized earnings.
     env.svm.expire_blockhash();
     let dest = env.token_account(admin.pubkey(), 0);
+    let authority_epoch = env.backing_withdraw_authority_epoch(DOMAIN, &admin.pubkey());
 
     send_tx(
         &mut env.svm,
@@ -17066,6 +17179,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
         ProgInstruction::WithdrawBackingBucketEarnings {
             domain: DOMAIN,
             amount: 20,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17229,6 +17343,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     env.svm.expire_blockhash();
 
     let dest = env.token_account(admin.pubkey(), 0);
+    let authority_epoch = env.backing_withdraw_authority_epoch(DOMAIN, &admin.pubkey());
 
     send_tx(
         &mut env.svm,
@@ -17237,6 +17352,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
         ProgInstruction::WithdrawBackingBucket {
             domain: DOMAIN,
             amount: 40,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -19846,4 +19962,490 @@ fn v16_bpf_update_asset_authority_cas_rejects_held_tx_after_intervening_rotation
     // build-sbf'd revert-of-`handle_update_asset_authority`-only exercise
     // proving this test is genuinely coupled to the CAS (not vacuously true
     // under the pre-fix uniform strictly-increasing nonce too).
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// W3A-1: PERMANENT adversarial replay tests for the five fund-critical tags
+// this unit binds to the authority-epoch CAS (`UpdateAuthority` tag 32,
+// `CloseSlab` tag 13, `WithdrawBackingBucket` tag 50,
+// `WithdrawBackingBucketEarnings` tag 52, `WithdrawInsuranceAsset` tag 57).
+// Each mirrors `v16_bpf_update_asset_authority_cas_rejects_held_tx_after_
+// intervening_rotation` above exactly: sign a held tx against the CURRENT
+// epoch, let an intervening legitimate rotation (through `UpdateAssetAuthority`
+// asset-0/ORACLE, a DIFFERENT tag sharing the SAME asset-0 `authority_epoch`
+// lane per this unit's storage decision) land first, then submit the held tx
+// and require the SPECIFIC `EngineStale` CAS-mismatch code -- not just
+// `is_err()` -- which is what makes each test non-vacuous against a build
+// where the check is neutered (see this unit's handback report for the
+// build-sbf'd revert-and-restore proof per tag). Each also carries a positive
+// control: the identical call with the CORRECT (post-rotation) epoch either
+// succeeds outright (the three withdrawals) or fails with a DIFFERENT,
+// specific error code (CloseSlab's mode gate) -- proving the epoch check is
+// the actual, isolated cause of the rejection above it, not a coincidental
+// side effect of some other account/state condition.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// `UpdateAuthority` (tag 32, market-level `marketauth` rotation) previously
+/// had ZERO epoch binding at all (a bare `expect_live_authority`, no replay
+/// protection whatsoever) -- the exact A->B->A durable-nonce hole named in
+/// this unit's mandate.
+#[test]
+fn v16_bpf_update_authority_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) a marketauth rotation against the CURRENT
+    //    asset-0 epoch -- the same lane `UpdateAssetAuthority` uses at
+    //    asset_index == 0 (see `UpdateAuthority`'s own doc comment).
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_target = Keypair::new();
+    env.ensure_signer_account(held_target.pubkey());
+    let held_ix = ProgInstruction::UpdateAuthority {
+        new_pubkey: held_target.pubkey().to_bytes(),
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(held_target.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    // 2. An intervening legitimate rotation lands first -- through the
+    //    DIFFERENT `UpdateAssetAuthority` tag (asset_index 0, ORACLE kind),
+    //    which shares the same asset-0 `authority_epoch` lane and advances
+    //    it. `marketauth` itself is untouched, so `admin` is still live for
+    //    the held tx.
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation (shares asset-0's authority_epoch lane) succeeds");
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        held_expected + 1,
+        "the intervening rotation must advance the SAME asset-0 epoch lane \
+         UpdateAuthority binds"
+    );
+
+    // 3. Submit the held marketauth rotation. Under the CAS this unit adds it
+    //    MUST be rejected -- before this fix it had NO epoch binding at all
+    //    and would have succeeded here, silently reusing a stale intent.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin, &held_target])
+        .expect_err(
+            "a held UpdateAuthority signed against a since-superseded \
+             authority_epoch must be rejected once an intervening rotation \
+             has advanced the epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+    let (cfg, _) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(
+        cfg.marketauth,
+        admin.pubkey().to_bytes(),
+        "rejected UpdateAuthority must not mutate marketauth"
+    );
+
+    // Positive control: the SAME rotation with the CORRECT (post-rotation)
+    // epoch succeeds -- proving the rejection above was genuinely the epoch,
+    // not the held tx's accounts/signers being otherwise broken.
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::UpdateAuthority {
+            new_pubkey: held_target.pubkey().to_bytes(),
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin, &held_target],
+    )
+    .expect("UpdateAuthority with the CORRECT epoch must succeed");
+    let (cfg, _) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(cfg.marketauth, held_target.pubkey().to_bytes());
+}
+
+/// `CloseSlab` (tag 13) previously had ZERO epoch binding. Binds asset-0's
+/// `authority_epoch` (CHECK-only, not advanced -- CloseSlab is terminal) as
+/// the FIRST thing after the `marketauth` signer check, strictly before the
+/// mode/fund-sweep checks.
+#[test]
+fn v16_bpf_close_slab_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::CloseSlab {
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    // Market is still Live (mode != 1) -- WITHOUT the epoch gate this held tx
+    // would fail on the mode check (EngineLockActive) instead. It must fail
+    // on EngineStale, proving the epoch gate runs FIRST and is the actual
+    // cause.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err("a held CloseSlab against a since-superseded epoch must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch), not the mode gate; got {err}"
+    );
+
+    // Positive control: the SAME call with the CORRECT epoch clears the
+    // epoch gate and fails for the market's OWN reason instead (still Live) --
+    // a DIFFERENT, specific error code, proving the gate above was genuinely
+    // about the epoch and not coincidentally blocking every CloseSlab here.
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    let err2 = env
+        .send(
+            ProgInstruction::CloseSlab {
+                authority_epoch: current_expected,
+            },
+            held_accounts,
+            &[&admin],
+        )
+        .expect_err("CloseSlab on a still-Live market must fail regardless of epoch");
+    assert_eq!(
+        custom_code(&err2),
+        Some(PercolatorError::EngineLockActive as u32),
+        "with the CORRECT epoch, rejection must come from the mode gate \
+         (EngineLockActive), not the epoch gate: {err2}"
+    );
+}
+
+/// `WithdrawBackingBucket` (tag 50) previously had ZERO epoch binding. Binds
+/// `epoch_asset_index = domain/2`'s `authority_epoch` (CHECK-only) after both
+/// authorization gates settle, before the ledger/fund checks.
+#[test]
+fn v16_bpf_withdraw_backing_bucket_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    let domain: u16 = 1; // domain/2 == asset_index 0
+    let ledger = env.canonical_backing_domain_ledger_account(domain);
+    env.top_up_backing_bucket(domain, 100, 100_000);
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::WithdrawBackingBucket {
+        domain,
+        amount: 10,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(ledger, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err(
+            "a held WithdrawBackingBucket against a since-superseded epoch must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    // Positive control: the SAME withdrawal with the CORRECT epoch actually
+    // succeeds and moves real tokens -- proving the rejection above was
+    // genuinely about the epoch, not the account list / funding being broken.
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            amount: 10,
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("WithdrawBackingBucket with the CORRECT epoch must succeed");
+    assert_eq!(env.token_amount(dest), 10);
+}
+
+/// `WithdrawBackingBucketEarnings` (tag 52) previously had ZERO epoch
+/// binding. Same `epoch_asset_index` selection and position as
+/// `WithdrawBackingBucket` above.
+#[test]
+fn v16_bpf_withdraw_backing_bucket_earnings_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    let domain: u16 = 1; // domain/2 == asset_index 0
+    let ledger = env.canonical_backing_domain_ledger_account(domain);
+
+    // A real TopUpBackingBucket first (matches
+    // `v16_wrapper_backing_domain_ledger_tracks_authority_topup_earnings_and_withdraw`'s
+    // pattern) establishes a genuinely Fresh bucket the engine's own
+    // `validate_source_domain_ledger`/`validate_shape` accept -- seeding
+    // `utilization_fee_earnings` directly on a never-funded (Empty) bucket
+    // trips `EngineInvalidConfig` in `withdraw_backing_provider_earnings_not_atomic`,
+    // which is not the property under test here.
+    env.top_up_backing_bucket(domain, 100, 100_000);
+    // Seed 5 atoms of earnings on top of that real bucket and bump `env.vault`'s
+    // real SPL balance to match, so the correctly-epoched call below is a
+    // genuine positive control, not just "didn't hit the epoch gate".
+    env.mutate_market(|_, group| {
+        group.source_backing_buckets[domain as usize].utilization_fee_earnings = 5;
+        group.vault += 5;
+    });
+    let vault_amount = env.token_amount(env.vault) + 5;
+    env.set_token_account_amount(env.vault, env.mint, env.vault_authority, vault_amount);
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::WithdrawBackingBucketEarnings {
+        domain,
+        amount: 5,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(ledger, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err(
+            "a held WithdrawBackingBucketEarnings against a since-superseded epoch \
+             must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::WithdrawBackingBucketEarnings {
+            domain,
+            amount: 5,
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("WithdrawBackingBucketEarnings with the CORRECT epoch must succeed");
+    assert_eq!(env.token_amount(dest), 5);
+}
+
+/// `WithdrawInsuranceAsset` (tag 57) previously had ZERO epoch binding. Binds
+/// `epoch_asset_index = asset_index` (`local_authorized`) or `0` (admin
+/// shutdown-drain fallback) after both authorization gates settle, before the
+/// cooldown/ledger/budget-debit steps.
+#[test]
+fn v16_bpf_withdraw_insurance_asset_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+    let asset_index: u16 = 0;
+
+    env.top_up_insurance_domain_with_authority(&admin, 0, 20);
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::WithdrawInsuranceAsset {
+        asset_index,
+        amount: 20,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err(
+            "a held WithdrawInsuranceAsset against a since-superseded epoch must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::WithdrawInsuranceAsset {
+            asset_index,
+            amount: 20,
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("WithdrawInsuranceAsset with the CORRECT epoch must succeed");
+    assert_eq!(env.token_amount(dest), 20);
 }

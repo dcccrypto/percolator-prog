@@ -408,6 +408,9 @@ fn withdraw_insurance_asset_cannot_reduce_the_creator_claim() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 0,
             amount: 120,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut admin,
@@ -464,6 +467,9 @@ fn a_fully_drained_backstop_still_leaves_the_creator_claim_payable() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 0,
             amount: 100,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut admin,
@@ -648,6 +654,9 @@ fn withdraw_creator_fee_leaves_the_backstop_fully_spendable_by_tag57() {
         Instruction::WithdrawInsuranceAsset {
             asset_index: 0,
             amount: 240,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             &mut admin,
