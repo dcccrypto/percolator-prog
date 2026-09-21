@@ -17147,13 +17147,11 @@ pub mod processor {
         // `authority_epoch: u64`, logically orthogonal to the windowed-scan mechanism
         // this unit's own port activated (unaffected by this change).
         //
-        // NOT ported: upstream `236b4f85` "retire native booked residue without
-        // burn" (a LATER, separate fix for markets whose primary collateral is
-        // wrapped SOL, which can't be `burn`ed) -- out of scope for this unit; the
-        // burn below matches upstream's OWN shape as of `547847ed`, before that
-        // follow-up landed. A market whose primary collateral is the native mint
-        // will fail this burn CPI if it ever accumulates unbudgeted terminal
-        // residue -- flagged for a follow-up sync unit, not silently dropped.
+        // ADOPTED (Wave-3 W3C-residue): upstream `236b4f85` "retire native booked
+        // residue without burn" -- the follow-up fix for markets whose primary
+        // collateral is wrapped SOL, which can't be `burn`ed. See the
+        // `native_residue_authority` computation below (inside the scan scope)
+        // and its dispatch at the retirement call site.
         //
         // OPTION-(B) SCOPE GATE (this unit, NOT upstream): preserves the existing
         // "CloseSlab permanently blocked by the LP-vault dead-share floor"
@@ -17223,7 +17221,13 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
 
-        let (cfg_pre, retired_unbudgeted_insurance, vault_balance, secondary_close) = {
+        let (
+            cfg_pre,
+            retired_unbudgeted_insurance,
+            vault_balance,
+            secondary_close,
+            native_residue_authority,
+        ) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             expect_live_authority(&cfg.marketauth, admin_dest.key)?;
@@ -17326,7 +17330,28 @@ pub mod processor {
             };
             cursor_profile.terminal_slab_scan_progress = 0;
             write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
-            (cfg, retired, vault_balance, secondary_close)
+            // ADOPT upstream `236b4f85` "retire native booked residue without burn"
+            // (Wave-3 W3C-residue, completing the `NOT ported` gap this fork's
+            // 547847ed/d134c64d port (Wave-1 S1a) left flagged below the account
+            // list at the top of this function). Native SPL tokens (wrapped SOL,
+            // `spl_token::native_mint::id()`) CANNOT be burned -- the real
+            // spl-token program's `process_burn` unconditionally rejects a
+            // native source account with `TokenError::NativeNotSupported`
+            // (Custom(10)). A market whose primary collateral is the native
+            // mint that ever accumulates unbudgeted terminal residue would
+            // permanently fail this CPI, bricking `CloseSlab` for that market
+            // forever (no other code path clears `retired_unbudgeted_insurance`
+            // once the scan reaches `ReadyToClose`). Mirrors upstream exactly:
+            // decide HERE, while `group`/`cfg` are still in scope, whether the
+            // retirement below must escheat via transfer instead of burn.
+            let native_residue_authority = if retired != 0
+                && primary_mint == spl_token::native_mint::id()
+            {
+                Some(domain_authorities_from_view(&group, &cfg, 0)?.insurance_authority)
+            } else {
+                None
+            };
+            (cfg, retired, vault_balance, secondary_close, native_residue_authority)
         };
 
         let primary_mint = primary_collateral_mint(&cfg_pre);
@@ -17342,14 +17367,56 @@ pub mod processor {
             expect_writable(primary_mint_ai)?;
             expect_key(primary_mint_ai, &primary_mint)?;
             verify_mint(primary_mint_ai)?;
-            burn_tokens_signed(
-                token_program,
-                vault_token,
-                primary_mint_ai,
-                vault_authority_ai,
-                retired_u64,
-                signer_seeds,
-            )?;
+            if let Some(authority) = native_residue_authority {
+                // Native tokens cannot be burned (spl-token's `process_burn`
+                // unconditionally rejects a native source with
+                // `TokenError::NativeNotSupported`). Claim-free booked residue
+                // instead escheats to the canonical asset-0 insurance
+                // authority's unencumbered ATA, without that role signing --
+                // upstream `236b4f85`'s fix, ported verbatim in mechanism.
+                let authority = Pubkey::new_from_array(authority);
+                let residue_dest = account(accounts, primary_mint_index + 1)?;
+                expect_writable(residue_dest)?;
+                if *residue_dest.key != canonical_vault_address(&authority, &primary_mint) {
+                    return Err(PercolatorError::InvalidTokenAccount.into());
+                }
+                // ADAPTATION (not upstream): upstream's current
+                // `verify_withdrawable_token_accounts` has grown a 6th
+                // `require_unencumbered_dest: bool` parameter (and a `u64`
+                // return) that our fork's 5-arg/`()`-returning version --
+                // shared by 7 other call sites -- has not yet absorbed
+                // (a separate, later upstream refactor, out of scope for this
+                // narrow residue-retirement unit). Reproduce the same
+                // security property -- reject a poisoned (delegate/
+                // close_authority-bearing) residue destination -- via this
+                // fork's existing standalone W5 helper instead of widening the
+                // shared signature.
+                verify_withdrawable_token_accounts(
+                    residue_dest,
+                    &authority,
+                    vault_token,
+                    vault_authority_ai.key,
+                    &cfg_pre,
+                )?;
+                verify_permissionless_payout_dest_token_account(residue_dest)?;
+                transfer_tokens_signed(
+                    token_program,
+                    vault_token,
+                    residue_dest,
+                    vault_authority_ai,
+                    retired_u64,
+                    signer_seeds,
+                )?;
+            } else {
+                burn_tokens_signed(
+                    token_program,
+                    vault_token,
+                    primary_mint_ai,
+                    vault_authority_ai,
+                    retired_u64,
+                    signer_seeds,
+                )?;
+            }
         }
         if primary_sweep_amount > 0 {
             transfer_tokens_signed(

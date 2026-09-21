@@ -4526,6 +4526,238 @@ fn v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry() {
     );
 }
 
+/// ADOPT upstream `236b4f85` "retire native booked residue without burn"
+/// (Wave-3 W3C-residue). Regression for the gap the S1a port above left
+/// flagged (`NOT ported: upstream 236b4f85`, above `handle_close_slab`'s
+/// account list): the real spl-token program's `process_burn`
+/// unconditionally rejects a native (wrapped-SOL) source account with
+/// `TokenError::NativeNotSupported` (Custom(10)) -- a market whose primary
+/// collateral is the native mint that ever accumulates unbudgeted terminal
+/// residue would permanently fail `CloseSlab`'s burn CPI, since nothing else
+/// clears `retired_unbudgeted_insurance` once the scan reaches
+/// `ReadyToClose`.
+///
+/// Reuses `v16_bpf_terminal_scan_prefix_invalidated_after_backing_expiry`'s
+/// exact setup through the point where the THIRD `CloseSlab` call is the one
+/// that performs the actual unbudgeted-residue retirement (asset 0 carries no
+/// backing -> `Continue`; asset 1's long domain, 2, parks on `Wait` then
+/// `Expire`s after warping past its bucket's `expiry_slot`, releasing 100
+/// atoms of claim-free residue nobody ever liened against). That setup is
+/// mint-identity-agnostic -- the engine's backing-bucket bookkeeping never
+/// touches the collateral mint -- so it is reused verbatim up to the final
+/// call, at which point this test swaps the market's primary collateral to
+/// `spl_token::native_mint::id()` and fabricates a native vault holding
+/// exactly the 100-atom residue, matching the amount the classic-mint flow
+/// already established.
+///
+/// THE FIX under test: `native_residue_authority` (computed inside the scan
+/// scope, while `group`/`cfg` are in scope) routes the retirement through
+/// `transfer_tokens_signed` to the canonical asset-0 insurance authority's
+/// ATA instead of `burn_tokens_signed`, when the primary collateral is native.
+/// Domain 0 (asset 0's long side) is activated with `insurance_authority =
+/// env.admin.pubkey()` up front specifically so this destination is a real,
+/// non-degenerate authority rather than the zeroed default an unconfigured
+/// asset slot would carry.
+#[test]
+fn v16_bpf_close_slab_retires_native_residue_via_transfer_not_burn() {
+    const DOMAIN: u16 = 2; // asset-1 long (domain = asset_index * 2 + side; side 0 = long)
+    const EXPIRY_SLOT: u64 = 50;
+    const RESIDUE_ATOMS: u64 = 100;
+
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(1);
+    // Domain 0 (asset 0, long) already carries a real, non-degenerate
+    // `insurance_authority` -- `InitMarket` bootstraps EVERY pre-configured
+    // slot's oracle profile with `insurance_authority: config.marketauth`
+    // (`asset_oracle_profile_from_config`), i.e. `env.admin.pubkey()` here.
+    // `handle_close_slab`'s native-residue escheat always targets domain 0
+    // regardless of which domain the residue actually originated from
+    // (README: "canonical asset-0 insurance authority"). Asset 0 is otherwise
+    // untouched (no backing, no trades), matching the base test's "asset 0
+    // carries no backing at all" setup.
+    env.top_up_backing_bucket(DOMAIN, RESIDUE_ATOMS as u128, EXPIRY_SLOT);
+    let (_, group) = env.market_state();
+    assert_eq!(
+        group.source_credit[DOMAIN as usize].fresh_reserved_backing_num,
+        (RESIDUE_ATOMS as u128) * BOUND_SCALE,
+        "backing bucket topup must make source_fresh_backing_total_num nonzero"
+    );
+
+    env.resolve();
+
+    // First call: asset 0 -> Continue, asset 1 -> Wait (bucket Fresh, not yet
+    // lapsed). Parks cursor = 1.
+    env.close_slab_with_cu();
+    // Second call, after warping past the bucket's expiry: Expire's domain 2,
+    // resetting cursor to 0 (S1a's `547847ed` fix under regression elsewhere).
+    env.svm.warp_to_slot(EXPIRY_SLOT);
+    env.close_slab_with_cu();
+    let market_data = env.svm.get_account(&env.market).unwrap().data;
+    assert!(
+        !market_data.iter().all(|b| *b == 0),
+        "market must NOT be closed yet -- only the third call retires the \
+         now-unbudgeted residue and completes the scan"
+    );
+
+    // Swap the market's primary collateral to the native mint and fabricate a
+    // native vault holding exactly the residue amount. The engine's backing
+    // bookkeeping (checked above) is already fixed regardless of collateral
+    // identity, so this substitution only affects the SPL retirement leg the
+    // third call is about to exercise.
+    let native_mint = spl_token::native_mint::id();
+    {
+        let mut market_account = env.svm.get_account(&env.market).unwrap();
+        let (mut cfg, _) = state::market_view_mut(&mut market_account.data).unwrap();
+        cfg.collateral_mint = native_mint.to_bytes();
+        state::write_wrapper_config(&mut market_account.data, &cfg).unwrap();
+        env.svm.set_account(env.market, market_account).unwrap();
+    }
+    let mint_rent = env
+        .svm
+        .minimum_balance_for_rent_exemption(Mint::LEN);
+    env.svm
+        .set_account(
+            native_mint,
+            Account {
+                lamports: mint_rent,
+                data: {
+                    let mut d = vec![0u8; Mint::LEN];
+                    Mint::pack(
+                        Mint {
+                            mint_authority: COption::None,
+                            supply: RESIDUE_ATOMS,
+                            decimals: 9,
+                            is_initialized: true,
+                            freeze_authority: COption::None,
+                        },
+                        &mut d,
+                    )
+                    .unwrap();
+                    d
+                },
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let token_rent = env
+        .svm
+        .minimum_balance_for_rent_exemption(TokenAccount::LEN);
+    let native_token_account = |owner: Pubkey, amount: u64| -> Account {
+        let mut d = vec![0u8; TokenAccount::LEN];
+        TokenAccount::pack(
+            TokenAccount {
+                mint: native_mint,
+                owner,
+                amount,
+                delegate: COption::None,
+                state: AccountState::Initialized,
+                is_native: COption::Some(token_rent),
+                delegated_amount: 0,
+                close_authority: COption::None,
+            },
+            &mut d,
+        )
+        .unwrap();
+        Account {
+            lamports: token_rent + amount,
+            data: d,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+    };
+
+    let native_vault = canonical_vault_ata(&env.vault_authority, &native_mint);
+    env.svm
+        .set_account(
+            native_vault,
+            native_token_account(env.vault_authority, RESIDUE_ATOMS),
+        )
+        .unwrap();
+
+    // Domain 0's insurance_authority, set by `activate_asset` above.
+    let insurance_authority = env.admin.pubkey();
+    let residue_dest = canonical_vault_ata(&insurance_authority, &native_mint);
+    env.svm
+        .set_account(residue_dest, native_token_account(insurance_authority, 0))
+        .unwrap();
+
+    // Admin's ordinary sweep-destination ATA for the (now native) primary
+    // mint -- never actually transferred into here since
+    // `primary_sweep_amount == vault_balance - retired_u64 == 0`, but the
+    // pre-scan `verify_user_token_account(dest_token, ...)` check still
+    // requires it to exist with the right mint/owner.
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(native_mint, env.admin.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let result = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::CloseSlab,
+        vec![
+            AccountMeta::new(env.admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(native_vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(native_mint, false),
+            AccountMeta::new(residue_dest, false),
+        ],
+        &[&env.admin],
+    );
+
+    // NEGATIVE-CONTROL HOOK: with the fix reverted (unconditional
+    // `burn_tokens_signed` restored), this `.expect(...)` fails here --
+    // spl-token's real `process_burn` rejects the native vault with
+    // `TokenError::NativeNotSupported` (Custom(10)), surfaced through the CPI
+    // as `Custom(10)` on this instruction. See the sync report for the
+    // observed pre-fix error string.
+    result.expect("close slab retires native residue via transfer, not burn");
+
+    let market_account = env.svm.get_account(&env.market).unwrap();
+    assert_market_is_closed_market_tombstone(&market_account.data);
+    assert_eq!(
+        market_account.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS,
+        "third call completes the scan and closes the market post-fix, exactly \
+         like the classic-mint case"
+    );
+
+    let vault_after = env.svm.get_account(&native_vault);
+    assert!(
+        vault_after.is_none_or(|a| a.data.is_empty() || a.lamports == 0),
+        "native vault must be closed (amount fully retired, no sweep remainder)"
+    );
+
+    let residue_after = TokenAccount::unpack(
+        &env.svm.get_account(&residue_dest).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(
+        residue_after.amount, RESIDUE_ATOMS,
+        "FIX (adopt upstream 236b4f85): the native residue must land in the \
+         canonical asset-0 insurance authority's ATA via transfer, not vanish \
+         via a (impossible) native burn"
+    );
+    assert_eq!(residue_after.mint, native_mint);
+    assert_eq!(residue_after.owner, insurance_authority);
+}
+
 /// Wave-1 S1a v2 griefing regression (Gate-2 REJECT, verifier `abe30333`).
 ///
 /// THE HOLE: the terminal-slab scan's option-(b) `CloseSlab` gate (see the
