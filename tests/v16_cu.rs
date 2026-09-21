@@ -24512,3 +24512,291 @@ fn v16_bpf_update_asset_lifecycle_shutdown_asset_admin_leg_cas_rejects_held_tx_a
          would otherwise have flipped it to Recovery)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W4-PAYOUT (2026-09-20): adopt upstream d64cdeeb / 82f44d11 / c162d7c7 --
+// permissionless, beneficiary-bound terminal/reserve payouts. Reverses the
+// fork's prior stricter-by-choice stance (WithdrawInsurance / WithdrawBackingBucket
+// / WithdrawBackingBucketEarnings were unconditionally signer-gated, even once the
+// market was Resolved). These are PERMANENT adversarial tests, run against a
+// freshly `cargo build-sbf`'d .so (V16CuEnv loads the prebuilt
+// `target/deploy/percolator_prog.so`, not a `cargo build` rlib -- see
+// `tests/v16_cu.rs::program_path`).
+//
+// Each test below proves the SAME two-part safety property the unit exists for:
+//   1. LIVENESS: a caller who never signs (simulating an authority that is cold,
+//      offline, or has lost its key) can still trigger the payout once the market
+//      is Resolved.
+//   2. BENEFICIARY BINDING: no matter who submits, the destination token account
+//      is bound to the pre-recorded on-chain beneficiary -- an attacker naming a
+//      real, legitimate authority's pubkey in the (now non-signing) `authority`
+//      slot cannot redirect the payout to a token account THEY own.
+//
+// Negative control (manual, per WRAPPER_SYNC_LOOP.md addendum 4 -- not baked into
+// this file): revert the `beneficiary`/`authorities.X` lines in
+// `verify_domain_withdrawal_preflight` and `handle_withdraw_insurance` back to
+// `authority.key`, `cargo build-sbf --features devnet`, and confirm
+// `v16_attack_withdraw_backing_bucket_permissionless_cannot_redirect_beneficiary`
+// and `v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_beneficiary`
+// below both FAIL (the redirect that should be rejected instead succeeds) --
+// then restore the fix and rebuild before trusting any other result in this file.
+
+/// WithdrawInsurance (tag 41), upstream d64cdeeb + c162d7c7's target. Asset 0's
+/// `insurance_authority` defaults to `env.admin` at InitMarket (see
+/// `v16_bpf_failed_terminal_insurance_withdraw_rolls_back_market_and_ledger` above,
+/// which funds/withdraws domain-0 insurance the same way), so this test needs no
+/// extra asset activation.
+#[test]
+fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_beneficiary() {
+    let mut env = V16CuEnv::new();
+    env.top_up_insurance(1_000);
+    env.resolve();
+    assert_eq!(env.market_state().1.mode, MarketModeV16::Resolved);
+
+    let beneficiary = env.admin.pubkey(); // the recorded domain-0 insurance_authority
+    let attacker = Keypair::new();
+    env.ensure_signer_account(attacker.pubkey());
+    let attacker_dest = env.token_account(attacker.pubkey(), 0);
+    let beneficiary_dest = env.token_account(beneficiary, 0);
+
+    // ATTACK: a permissionless caller (fee-payer only, no signature from
+    // `beneficiary`) names the REAL bound authority in the non-signing `authority`
+    // slot -- required so the withdrawal-capacity lookup matches a real domain --
+    // but tries to steer the payout to a token account the attacker owns.
+    let redirect = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawInsurance { amount: 100 },
+        vec![
+            AccountMeta::new_readonly(beneficiary, false), // NOT a signer
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(attacker_dest, false), // attacker-owned destination
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[], // no extra signers -- only env.payer signs, as any cranker would
+    );
+    let msg = redirect.expect_err(
+        "W4-PAYOUT beneficiary binding: a permissionless terminal insurance payout \
+         must reject a destination not owned by the recorded insurance_authority, \
+         even when `authority` names a real bound authority as a non-signing \
+         reference",
+    );
+    assert!(
+        msg.contains("Custom(11)") || msg.contains("custom program error: 0xb"),
+        "expected InvalidTokenAccount (Custom(11)) for the mismatched destination, got: {msg}"
+    );
+    assert_eq!(
+        env.token_amount(attacker_dest),
+        0,
+        "the rejected redirect must not move any funds to the attacker"
+    );
+
+    // LIVENESS + correct beneficiary: the SAME permissionless, unsigned submission
+    // succeeds once the destination is owned by the true beneficiary -- the
+    // beneficiary itself never has to be online or sign anything.
+    let vault_before = env.token_amount(env.vault);
+    let cu = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawInsurance { amount: 100 },
+        vec![
+            AccountMeta::new_readonly(beneficiary, false), // still NOT a signer
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(beneficiary_dest, false), // beneficiary-owned destination
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    )
+    .expect(
+        "W4-PAYOUT liveness: a permissionless caller must be able to settle the \
+         beneficiary's own terminal insurance reserve without the beneficiary's \
+         signature",
+    );
+    println!("v16 W4-PAYOUT permissionless WithdrawInsurance CU: {cu}");
+    assert_eq!(
+        env.token_amount(beneficiary_dest),
+        100,
+        "the payout must land exactly at the recorded beneficiary's own account"
+    );
+    assert_eq!(env.token_amount(attacker_dest), 0, "the attacker still receives nothing");
+    assert_eq!(env.token_amount(env.vault), vault_before - 100);
+}
+
+/// WithdrawBackingBucket, upstream 82f44d11 + c162d7c7's shared
+/// `verify_domain_withdrawal_preflight` helper (also used, with
+/// `DOMAIN_WITHDRAW_AUTH_INSURANCE`, by `WithdrawInsuranceAsset` -- so this test's
+/// beneficiary-binding property covers that call site's destination check too).
+/// Uses a domain whose `backing_bucket_authority` is bound to a DISTINCT keypair
+/// that never signs the withdrawal, proving the fix does not merely piggyback on
+/// admin/marketauth being both submitter and beneficiary.
+#[test]
+fn v16_attack_withdraw_backing_bucket_permissionless_cannot_redirect_beneficiary() {
+    let mut env = V16CuEnv::new();
+    let backing_authority = Keypair::new();
+    env.ensure_signer_account(backing_authority.pubkey());
+    env.activate_asset_with_authorities(
+        1,
+        0,
+        100,
+        env.admin.pubkey(),
+        env.admin.pubkey(),
+        backing_authority.pubkey(),
+        env.admin.pubkey(),
+    );
+    let domain = 2u16; // asset 1, long side
+    env.top_up_backing_bucket_with_authority(&backing_authority, domain, 500, 1_000_000);
+    env.resolve();
+    assert_eq!(env.market_state().1.mode, MarketModeV16::Resolved);
+
+    let ledger = env.canonical_backing_domain_ledger_account(domain);
+    let attacker = Keypair::new();
+    env.ensure_signer_account(attacker.pubkey());
+    let attacker_dest = env.token_account(attacker.pubkey(), 0);
+    let beneficiary_dest = env.token_account(backing_authority.pubkey(), 0);
+
+    // ATTACK: permissionless (unsigned) submission naming the real bound
+    // backing_bucket_authority as a non-signing reference, trying to redirect the
+    // payout to an attacker-owned destination.
+    let market_id = state::read_market_trade_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        (domain as usize) / 2,
+    )
+    .unwrap()
+    .3;
+    let authority_epoch = env.control_sequences(domain / 2).authority_epoch;
+    let redirect = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            market_id,
+            amount: 200,
+            authority_epoch,
+        },
+        vec![
+            AccountMeta::new_readonly(backing_authority.pubkey(), false), // NOT a signer
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(attacker_dest, false), // attacker-owned destination
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ],
+        &[],
+    );
+    let msg = redirect.expect_err(
+        "W4-PAYOUT beneficiary binding: a permissionless backing-bucket payout must \
+         reject a destination not owned by the recorded backing_bucket_authority",
+    );
+    assert!(
+        msg.contains("Custom(11)") || msg.contains("custom program error: 0xb"),
+        "expected InvalidTokenAccount (Custom(11)) for the mismatched destination, got: {msg}"
+    );
+    assert_eq!(env.token_amount(attacker_dest), 0);
+
+    // LIVENESS + correct beneficiary: same unsigned submission, correct
+    // beneficiary-owned destination -- succeeds without backing_authority ever
+    // signing anything in this test.
+    let vault_before = env.token_amount(env.vault);
+    let cu = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            market_id,
+            amount: 200,
+            authority_epoch,
+        },
+        vec![
+            AccountMeta::new_readonly(backing_authority.pubkey(), false), // still NOT a signer
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(beneficiary_dest, false), // beneficiary-owned destination
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ],
+        &[],
+    )
+    .expect(
+        "W4-PAYOUT liveness: a permissionless caller must be able to settle a \
+         Resolved market's backing reserve to its bound authority without that \
+         authority's signature",
+    );
+    println!("v16 W4-PAYOUT permissionless WithdrawBackingBucket CU: {cu}");
+    assert_eq!(env.token_amount(beneficiary_dest), 200);
+    assert_eq!(env.token_amount(attacker_dest), 0);
+    assert_eq!(env.token_amount(env.vault), vault_before - 200);
+}
+
+/// Live-mode control: BEFORE resolution, the same unsigned submission must still
+/// be rejected outright (Live reserve management keeps requiring consent) -- proves
+/// the permissionless path is Resolved-only, not a blanket signer removal.
+#[test]
+fn v16_attack_withdraw_backing_bucket_live_mode_still_requires_signer() {
+    let mut env = V16CuEnv::new();
+    let backing_authority = Keypair::new();
+    env.ensure_signer_account(backing_authority.pubkey());
+    env.activate_asset_with_authorities(
+        1,
+        0,
+        100,
+        env.admin.pubkey(),
+        env.admin.pubkey(),
+        backing_authority.pubkey(),
+        env.admin.pubkey(),
+    );
+    let domain = 2u16;
+    env.top_up_backing_bucket_with_authority(&backing_authority, domain, 500, 1_000_000);
+    assert_eq!(env.market_state().1.mode, MarketModeV16::Live);
+
+    let ledger = env.canonical_backing_domain_ledger_account(domain);
+    let beneficiary_dest = env.token_account(backing_authority.pubkey(), 0);
+    let market_id = state::read_market_trade_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        (domain as usize) / 2,
+    )
+    .unwrap()
+    .3;
+    let authority_epoch = env.control_sequences(domain / 2).authority_epoch;
+    let result = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawBackingBucket {
+            domain,
+            market_id,
+            amount: 200,
+            authority_epoch,
+        },
+        vec![
+            AccountMeta::new_readonly(backing_authority.pubkey(), false), // NOT a signer
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(beneficiary_dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ],
+        &[],
+    );
+    let msg = result.expect_err(
+        "Live reserve management must still require a signature from the bound \
+         authority -- only Resolved reserve payments became permissionless",
+    );
+    assert!(
+        msg.contains("Custom(6)")
+            || msg.contains("MissingRequiredSignature")
+            || msg.to_lowercase().contains("signature"),
+        "expected a missing-signer rejection while Live, got: {msg}"
+    );
+    assert_eq!(env.token_amount(beneficiary_dest), 0);
+}
