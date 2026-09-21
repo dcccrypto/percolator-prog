@@ -595,6 +595,10 @@ fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
     let size_q: i128 = kani::any();
     let exec_price: u64 = kani::any();
     let fee_bps: u64 = kani::any();
+    // ADOPT upstream 2d9eb5e9 ("Bind single trades to backing fee consent"): new trailing
+    // wire field. Symbolic (not a fixed sentinel) so the round-trip is proven over the full
+    // u16 domain, not just one value.
+    let backing_fee_cap_bps: u16 = kani::any();
 
     let data = Instruction::TradeNoCpi {
         account_a_portfolio_id,
@@ -606,6 +610,7 @@ fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
         size_q,
         exec_price,
         fee_bps,
+        backing_fee_cap_bps,
     }
     .encode();
 
@@ -620,6 +625,7 @@ fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
             size_q: got_size,
             exec_price: got_price,
             fee_bps: got_fee,
+            backing_fee_cap_bps: got_cap,
         } => {
             assert_eq!(got_a_id, account_a_portfolio_id);
             assert_eq!(got_a_epoch, account_a_position_epoch);
@@ -630,6 +636,7 @@ fn kani_v16_tradenocpi_decode_preserves_wire_fields() {
             assert_eq!(got_size, size_q);
             assert_eq!(got_price, exec_price);
             assert_eq!(got_fee, fee_bps);
+            assert_eq!(got_cap, backing_fee_cap_bps);
         }
         _ => unreachable!(),
     }
@@ -643,9 +650,13 @@ fn kani_v16_tradecpi_decode_preserves_wire_fields() {
     let account_b_position_epoch: u64 = kani::any();
     let asset_index: u16 = kani::any();
     let market_id: u64 = kani::any();
+    // W3-matcher: pre-existing gap in this proof, backfilled at integration.
+    let account_b_matcher_sequence: u64 = kani::any();
     let size_q: i128 = kani::any();
     let fee_bps: u64 = kani::any();
     let limit_price: u64 = kani::any();
+    // ADOPT upstream 2d9eb5e9: new trailing wire field, symbolic for the same reason as above.
+    let backing_fee_cap_bps: u16 = kani::any();
 
     let data = Instruction::TradeCpi {
         account_a_portfolio_id,
@@ -654,9 +665,11 @@ fn kani_v16_tradecpi_decode_preserves_wire_fields() {
         account_b_position_epoch,
         asset_index,
         market_id,
+        account_b_matcher_sequence,
         size_q,
         fee_bps,
         limit_price,
+        backing_fee_cap_bps,
     }
     .encode();
 
@@ -667,22 +680,76 @@ fn kani_v16_tradecpi_decode_preserves_wire_fields() {
             account_b_portfolio_id: got_b_id,
             account_b_position_epoch: got_b_epoch,
             market_id: got_market_id,
+            account_b_matcher_sequence: got_seq,
             asset_index: got_asset,
             size_q: got_size,
             fee_bps: got_fee,
             limit_price: got_limit,
+            backing_fee_cap_bps: got_cap,
         } => {
             assert_eq!(got_a_id, account_a_portfolio_id);
             assert_eq!(got_a_epoch, account_a_position_epoch);
             assert_eq!(got_b_id, account_b_portfolio_id);
             assert_eq!(got_b_epoch, account_b_position_epoch);
             assert_eq!(got_market_id, market_id);
+            assert_eq!(got_seq, account_b_matcher_sequence);
             assert_eq!(got_asset, asset_index);
             assert_eq!(got_size, size_q);
             assert_eq!(got_fee, fee_bps);
             assert_eq!(got_limit, limit_price);
+            assert_eq!(got_cap, backing_fee_cap_bps);
         }
         _ => unreachable!(),
+    }
+}
+
+// sync/w3b-backing-fee-consent (ADOPT upstream be8516b8): tight equivalence proof for the new
+// depositor-consent predicate. Also checks non-vacuity directly -- both the "allowed" and
+// "rejected" outcomes must be reachable, not just the boolean equality.
+#[kani::proof]
+fn kani_v16_backing_fee_policy_change_allowed_requires_noop_or_empty() {
+    let current_fee_bps: u16 = kani::any();
+    let current_insurance_share_bps: u16 = kani::any();
+    let proposed_fee_bps: u16 = kani::any();
+    let proposed_insurance_share_bps: u16 = kani::any();
+    let bucket = percolator::BackingBucketV16 {
+        fresh_unliened_backing_num: kani::any(),
+        valid_liened_backing_num: kani::any(),
+        consumed_liened_backing_num: kani::any(),
+        impaired_liened_backing_num: kani::any(),
+        utilization_fee_earnings: kani::any(),
+        ..percolator::BackingBucketV16::EMPTY
+    };
+
+    let is_noop = (current_fee_bps, current_insurance_share_bps)
+        == (proposed_fee_bps, proposed_insurance_share_bps);
+    let is_empty = bucket.fresh_unliened_backing_num == 0
+        && bucket.valid_liened_backing_num == 0
+        && bucket.consumed_liened_backing_num == 0
+        && bucket.impaired_liened_backing_num == 0
+        && bucket.utilization_fee_earnings == 0;
+
+    let allowed = policy_v16::backing_fee_policy_change_allowed(
+        current_fee_bps,
+        current_insurance_share_bps,
+        proposed_fee_bps,
+        proposed_insurance_share_bps,
+        &bucket,
+    );
+
+    assert_eq!(
+        allowed,
+        is_noop || is_empty,
+        "the guard must allow a change iff it is a no-op or the bucket is empty"
+    );
+    if !is_noop && !is_empty {
+        kani::cover!(!allowed, "a real rate change on a funded bucket is reachable and rejected");
+    }
+    if is_noop && !is_empty {
+        kani::cover!(allowed, "a no-op re-assert on a funded bucket is reachable and allowed");
+    }
+    if is_empty && !is_noop {
+        kani::cover!(allowed, "a real rate change on an empty bucket is reachable and allowed");
     }
 }
 
@@ -1426,6 +1493,7 @@ Instruction::PermissionlessCrank {
             size_q: 1,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         extra,
     );
@@ -1440,6 +1508,7 @@ Instruction::PermissionlessCrank {
             size_q: 1,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         extra,
     );

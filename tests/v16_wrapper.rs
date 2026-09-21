@@ -10,13 +10,12 @@ use percolator::{
 use percolator_prog::{
     constants::{
         ASSET_ORACLE_WRAPPER_LEN, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS,
-        DEFAULT_MARKET_SLOT_CAPACITY, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-        HEADER_LEN, KIND_CLOSED_MARKET, MAGIC, MARKET_ACCOUNT_LEN, MARKET_ASSET_SLOT_LEN,
-        MARKET_GROUP_LEN, ORACLE_LEG_CAP,
-        ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3, ORACLE_MODE_AUTH_MARK,
-        ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL,
-        PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN,
-        PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
+        DEFAULT_MARKET_SLOT_CAPACITY, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED, HEADER_LEN,
+        KIND_CLOSED_MARKET, MAGIC, MARKET_ACCOUNT_LEN, MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN,
+        ORACLE_LEG_CAP, ORACLE_LEG_FLAG_DIVIDE_LEG2, ORACLE_LEG_FLAG_DIVIDE_LEG3,
+        ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS,
+        ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN,
+        PORTFOLIO_SOURCE_DOMAIN_LEN, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
     },
     ix::{CrankObservationHint, Instruction},
     oracle_v16, policy_v16, processor,
@@ -660,6 +659,7 @@ fn run_trade_cpi_with_matcher(
             size_q: req_size,
             fee_bps,
             limit_price,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             owner_a,
@@ -1957,6 +1957,7 @@ fn v16_wrapper_underfunded_flat_sync_sweeps_remaining_capital_once() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -2380,6 +2381,7 @@ fn v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_b
             size_q: size_q as i128,
             exec_price,
             fee_bps,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -3011,6 +3013,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
             size_q: POS_SCALE as i128,
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -3044,6 +3047,7 @@ fn v16_wrapper_permissionless_dynamic_market_drains_after_positions_close() {
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -3233,6 +3237,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
             size_q: (POS_SCALE * 2) as i128,
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -3288,6 +3293,7 @@ fn v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot() {
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -3654,6 +3660,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -3691,6 +3698,7 @@ fn v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_s
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -4439,6 +4447,7 @@ fn v16_wrapper_backing_fee_policy_does_not_floor_trades_without_new_backing_lien
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -4461,7 +4470,12 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     let mut admin = signer();
     let mut market = market_account();
     init_market(&mut admin, &mut market);
-    top_up_backing_bucket(&mut admin, &mut market, 1, 1_000, 10);
+    // sync/w3b-backing-fee-consent (ADOPT upstream be8516b8): fee terms must be set BEFORE a
+    // domain is funded -- `policy_v16::backing_fee_policy_change_allowed` now freezes an
+    // already-FUNDED bucket's rate (no depositor consent to change it otherwise). Set the
+    // policy first, matching upstream's own INV-014
+    // `v16_program_backing_provider_exit_unfreezes_policy_change` ordering ("install
+    // provider-approved fee terms" before "fund under provider-approved terms").
     run_ix(
         Instruction::UpdateBackingFeePolicy {
             market_id: 1,
@@ -4481,6 +4495,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
         &mut [&mut admin, &mut market],
     )
     .unwrap();
+    top_up_backing_bucket(&mut admin, &mut market, 1, 1_000, 10);
 
     let mut owner_a = signer();
     let mut owner_b = signer();
@@ -4506,6 +4521,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -4524,21 +4540,11 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
     assert_eq!(account_a.data, before_a);
     assert_eq!(account_b.data, before_b);
 
-    run_ix(
-        Instruction::UpdateBackingFeePolicy {
-            market_id: 1,
-            domain: 1,
-            fee_bps: 100,
-            // Fee-split floor enforcement, see note above.
-            insurance_share_bps: 2_500,
-            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
-                .unwrap()
-                .backing_fee_short
-                + 1,
-        },
-        &mut [&mut admin, &mut market],
-    )
-    .unwrap();
+    // sync/w3b-backing-fee-consent: the fee rate can no longer be lowered here either -- the
+    // bucket is still funded, so any rate change (including a reduction) is frozen by the same
+    // depositor-consent guard until the bucket empties. Cover the shortfall with capital
+    // instead, at the SAME 1_000bps rate: this still proves the target behavior below (no new
+    // lien -> no fee charged), independent of the rate.
     deposit(&mut owner_a, &mut market, &mut account_a, 900);
 
     run_ix(
@@ -4552,6 +4558,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -4588,6 +4595,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
             size_q: -(5 * POS_SCALE as i128),
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -4606,7 +4614,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
 
     let mut cpi_market = market_account();
     init_market(&mut admin, &mut cpi_market);
-    top_up_backing_bucket(&mut admin, &mut cpi_market, 1, 1_000, 10);
+    // sync/w3b-backing-fee-consent: policy before funding, same reason as above.
     run_ix(
         Instruction::UpdateBackingFeePolicy {
             market_id: 1,
@@ -4622,6 +4630,7 @@ fn v16_wrapper_backing_fee_rejects_unsafe_charge_and_skips_without_new_lien_nocp
         &mut [&mut admin, &mut cpi_market],
     )
     .unwrap();
+    top_up_backing_bucket(&mut admin, &mut cpi_market, 1, 1_000, 10);
     let mut cpi_owner_a = signer();
     let mut cpi_owner_b = signer();
     let mut cpi_account_a = portfolio_account();
@@ -4831,6 +4840,7 @@ fn v16_wrapper_maintenance_fee_sync_charges_recurring_fee_without_forcing_local_
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -4948,6 +4958,7 @@ fn v16_wrapper_asset_authority_can_append_activate_and_trade_assets() {
             size_q: POS_SCALE as i128,
             exec_price: 250,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -4996,6 +5007,7 @@ fn v16_wrapper_asset_authority_can_append_activate_and_trade_assets() {
             size_q: POS_SCALE as i128,
             exec_price: 250,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5077,6 +5089,7 @@ fn v16_wrapper_trade_rejects_corrupt_unconfigured_tail_capacity_fail_closed() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5273,6 +5286,7 @@ fn v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5294,6 +5308,7 @@ fn v16_wrapper_one_portfolio_can_hold_multiple_asset_positions_independently() {
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5450,6 +5465,7 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
             size_q: POS_SCALE as i128,
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5486,6 +5502,7 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
             size_q: -(POS_SCALE as i128),
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5520,6 +5537,7 @@ fn v16_wrapper_asset_drain_only_and_retire_enforce_engine_lifecycle() {
             size_q: POS_SCALE as i128,
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5598,6 +5616,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5619,6 +5638,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5651,6 +5671,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -5861,6 +5882,7 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
             size_q: prediction_q as i128,
             exec_price: 500_000,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6150,6 +6172,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6171,6 +6194,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6192,6 +6216,7 @@ fn v16_wrapper_three_asset_hybrid_prediction_shutdown_reuses_only_prediction_slo
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 250,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6262,6 +6287,7 @@ Instruction::PermissionlessCrank {
             size_q: prediction_q as i128,
             exec_price: 1_000_000,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6402,6 +6428,7 @@ Instruction::PermissionlessCrank {
             size_q: prediction_q as i128,
             exec_price: 750_000,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6640,6 +6667,7 @@ Instruction::PermissionlessCrank {
             size_q: POS_SCALE as i128,
             exec_price: 250,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -6756,6 +6784,7 @@ Instruction::PermissionlessCrank {
             size_q: POS_SCALE as i128,
             exec_price: 250,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -11204,6 +11233,7 @@ fn v16_wrapper_ewma_mark_trade_updates_mark_and_charges_dynamic_fee_without_orac
             size_q: size_q as i128,
             exec_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -11293,6 +11323,7 @@ fn v16_wrapper_auth_mark_trade_cannot_update_authority_mark() {
             size_q: size_q as i128,
             exec_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -11829,6 +11860,7 @@ fn v16_wrapper_multiple_portfolios_same_owner_stay_isolated_and_totals_match() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner,
@@ -13077,6 +13109,7 @@ Instruction::PermissionlessCrank {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -13147,6 +13180,7 @@ fn v16_wrapper_same_owner_can_trade_independent_positions_across_markets() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner,
@@ -13177,6 +13211,7 @@ fn v16_wrapper_same_owner_can_trade_independent_positions_across_markets() {
             size_q: -(2 * POS_SCALE as i128),
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner,
@@ -13333,6 +13368,7 @@ fn v16_wrapper_portfolio_key_mismatch_and_self_trade_are_rejected() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -13373,6 +13409,7 @@ fn v16_wrapper_tradenocpi_negative_size_flips_long_short_roles() {
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut signer_a,
@@ -13424,6 +13461,7 @@ fn v16_wrapper_tradenocpi_accepts_consented_wide_exec_price_without_moving_index
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
             fee_bps: 100,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -13727,6 +13765,7 @@ Instruction::PermissionlessCrank {
             size_q: POS_SCALE as i128,
             exec_price: 200,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14099,6 +14138,7 @@ fn v16_wrapper_configure_hybrid_oracle_rejects_after_positions_enter_market() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14186,6 +14226,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14255,6 +14296,7 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
             size_q: -(POS_SCALE as i128),
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14439,6 +14481,7 @@ Instruction::PermissionlessCrank {
             size_q: size_q as i128,
             exec_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14536,6 +14579,7 @@ fn v16_wrapper_hybrid_regular_hours_wide_trade_keeps_mark_pinned_to_external_ora
             size_q: size_q as i128,
             exec_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14642,6 +14686,7 @@ fn v16_wrapper_hybrid_after_hours_downward_mark_moves_effective_price() {
             size_q: size_q as i128,
             exec_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14767,6 +14812,7 @@ fn v16_wrapper_hybrid_after_hours_fee_floor_scales_with_next_crank_segment_budge
             size_q: size_q as i128,
             exec_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14863,6 +14909,7 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
             size_q: (100 * POS_SCALE) as i128,
             exec_price: initial_price,
             fee_bps: 1,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14927,6 +14974,7 @@ fn v16_wrapper_hybrid_after_hours_max_caller_fee_does_not_bypass_dynamic_fee_rej
             size_q: probe_size as i128,
             exec_price: probe_price,
             fee_bps: 10_000,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -14982,6 +15030,7 @@ fn v16_wrapper_tradenocpi_applies_static_base_fee_floor() {
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 150,
             fee_bps: 100,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -15029,6 +15078,7 @@ fn v16_wrapper_tradenocpi_rejects_when_consented_price_would_break_margin() {
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -15076,6 +15126,7 @@ fn v16_wrapper_convert_released_pnl_respects_cap_and_unlocks_withdrawal() {
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -15106,6 +15157,7 @@ Instruction::PermissionlessCrank {
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 101,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut short_owner,
@@ -15224,6 +15276,7 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15248,6 +15301,7 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
             size_q: 0,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15272,6 +15326,7 @@ fn v16_wrapper_tradenocpi_rejects_bad_size_and_missing_signer_before_mutation() 
             size_q: i128::MIN,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15316,6 +15371,7 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut attacker,
@@ -15340,6 +15396,7 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 10_001,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15364,6 +15421,7 @@ fn v16_wrapper_tradenocpi_rejects_wrong_owner_fee_cap_and_invalid_asset() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15775,6 +15833,7 @@ fn v16_wrapper_tradecpi_requires_bilateral_signatures_before_matcher_cpi() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut non_signer_a,
@@ -15830,6 +15889,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15866,6 +15926,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -15916,6 +15977,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
                 size_q: POS_SCALE as i128,
                 fee_bps: 0,
                 limit_price: 0,
+                backing_fee_cap_bps: 10_000,
             }
             .encode(),
         )
@@ -15981,6 +16043,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -16075,6 +16138,7 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -16115,6 +16179,7 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -16178,6 +16243,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -16239,6 +16305,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_fee_above_cap_before_success() {
             size_q: POS_SCALE as i128,
             fee_bps: 10_001,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -16313,6 +16380,7 @@ fn v16_wrapper_tradecpi_rejects_corrupt_backing_fee_policy_before_later_checks()
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -16360,6 +16428,7 @@ fn v16_wrapper_permissionless_crank_advances_account_local_market_progress() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -16505,6 +16574,7 @@ fn v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -16635,6 +16705,7 @@ fn v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -16768,6 +16839,7 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -17009,6 +17081,7 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
             size_q: (100 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -17150,6 +17223,7 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -17448,6 +17522,7 @@ fn v16_wrapper_rebalance_reduce_is_owner_signed_and_strictly_reduces_risk() {
             size_q: (2 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -17521,6 +17596,7 @@ fn v16_wrapper_dead_leg_forfeit_is_owner_signed_and_detaches_recovery_leg() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -17906,6 +17982,7 @@ fn v16_wrapper_resolve_market_is_admin_only_and_blocks_live_trade() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -17978,6 +18055,7 @@ fn v16_wrapper_permissionless_stale_resolve_requires_hard_stale_maturity() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -18104,6 +18182,7 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut owner_a,
@@ -18575,6 +18654,7 @@ fn v16_wrapper_close_resolved_active_position_pays_when_engine_clears_exposure()
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -18646,6 +18726,7 @@ fn v16_wrapper_close_resolved_payout_requires_token_accounts_after_exposure_clea
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -18866,6 +18947,7 @@ fn v16_wrapper_hybrid_hard_stale_blocks_live_value_movement_until_resolved() {
             size_q: POS_SCALE as i128,
             exec_price: 133_333,
             fee_bps: 10_000,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -19525,6 +19607,7 @@ fn v16_wrapper_oracle_attacker_cannot_drain_other_domains() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut attacker,
@@ -19701,6 +19784,7 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut a0_long_owner,
@@ -19741,6 +19825,7 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut a1_long_owner,
@@ -19971,6 +20056,7 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut a0_long_owner,
@@ -20076,6 +20162,7 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut a1_long_owner,
@@ -20137,6 +20224,7 @@ fn v16_wrapper_tradenocpi_accepts_degenerate_exec_price_billing_on_mark() {
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price,
                 fee_bps: 100,
+                backing_fee_cap_bps: 10_000,
             },
             &mut [
                 &mut long_owner,
@@ -20198,6 +20286,7 @@ fn v16_attack_tradenocpi_fee_cannot_be_evaded_via_exec_price() {
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price,
                 fee_bps: 100,
+                backing_fee_cap_bps: 10_000,
             },
             &mut [
                 &mut long_owner,
@@ -20435,6 +20524,7 @@ fn v16_wrapper_protocol_fee_tradenocpi_skims_20pct_and_accrues_creator_leg_off_t
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 1_000,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -21422,6 +21512,7 @@ fn v16_wrapper_creator_fee_accrual_is_written_back_to_the_account_and_accumulate
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 1_000,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -21494,6 +21585,7 @@ fn v16_wrapper_creator_fee_accrual_overflow_rejects_the_trade_instead_of_wrappin
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 1_000,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -22129,6 +22221,7 @@ fn v16_wrapper_creator_fee_end_to_end_trade_accrues_then_creator_claims_exactly_
             size_q: (10 * POS_SCALE) as i128,
             exec_price: 100,
             fee_bps: 1_000,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -23919,6 +24012,7 @@ fn v16_wrapper_rebalance_reduce_is_blocked_once_resolve_has_matured() {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -24020,6 +24114,7 @@ fn v16_wrapper_force_close_abandoned_asset_is_blocked_once_resolve_has_matured()
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -24897,6 +24992,7 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut victim_owner,
@@ -24919,6 +25015,7 @@ fn cw04_fixture_with(absorbing_side_empty: bool, principal: u128, debt_b: u128) 
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [&mut ba_owner, &mut bb_owner, &mut market, &mut ba, &mut bb],
     )
@@ -25539,6 +25636,7 @@ fn cw02_adl_recovery_pair() -> (
             size_q: (POS_SCALE * 2) as i128,
             exec_price: 150,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,
@@ -26011,6 +26109,7 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
             size_q: POS_SCALE as i128,
             exec_price: 100,
             fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
         },
         &mut [
             &mut long_owner,

@@ -1414,6 +1414,7 @@ impl V16CuEnv {
                 size_q,
                 exec_price,
                 fee_bps,
+                backing_fee_cap_bps: 10_000,
             },
             vec![
                 AccountMeta::new(owner_a.pubkey(), true),
@@ -1967,6 +1968,7 @@ impl V16CuEnv {
                 size_q,
                 fee_bps,
                 limit_price: 0,
+                backing_fee_cap_bps: 10_000,
             },
             vec![
                 AccountMeta::new(owner_a.pubkey(), true),
@@ -4250,7 +4252,10 @@ ProgInstruction::PermissionlessCrank {
     env.close_slab_with_cu();
     let market_account = env.svm.get_account(&env.market).unwrap();
     assert_market_is_closed_market_tombstone(&market_account.data);
-    assert_eq!(market_account.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS);
+    assert_eq!(
+        market_account.lamports,
+        CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS
+    );
 }
 
 /// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market address
@@ -4293,7 +4298,10 @@ fn v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected() {
     env.close_slab_with_cu();
     let market_account = env.svm.get_account(&env.market).unwrap();
     assert_market_is_closed_market_tombstone(&market_account.data);
-    assert_eq!(market_account.lamports, CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS);
+    assert_eq!(
+        market_account.lamports,
+        CLOSED_MARKET_TOMBSTONE_RENT_LAMPORTS
+    );
 
     // Same market pubkey (still owned by the program, never transferred),
     // same admin, same mint -- everything an attacker or an honest client
@@ -4339,8 +4347,7 @@ fn v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected() {
         ],
         &[&env.admin],
     );
-    let err =
-        reinit.expect_err("InitMarket must refuse to reinitialize a closed market's pubkey");
+    let err = reinit.expect_err("InitMarket must refuse to reinitialize a closed market's pubkey");
     assert!(
         err.contains("Custom(2)"),
         "expected PercolatorError::AlreadyInitialized (Custom(2)), got: {err}"
@@ -6181,6 +6188,7 @@ fn v16_bpf_stale_market_id_against_reused_slot_is_rejected_current_id_succeeds()
                 size_q: (10 * POS_SCALE) as i128,
                 exec_price: 100,
                 fee_bps: 0,
+                backing_fee_cap_bps: 10_000,
             },
             vec![
                 AccountMeta::new(long_owner.pubkey(), true),
@@ -8950,6 +8958,248 @@ fn v16_attack_trade_cpi_rejects_backing_domain_fee_without_matcher_cap_consent()
     );
 }
 
+// sync/w3b-backing-fee-consent (ADOPT upstream be8516b8, "Bind backing top-ups to provider
+// fee terms" -- fee-policy-change half): `UpdateBackingFeePolicy` previously let the domain's
+// `insurance_authority` overwrite `backing_trade_fee_bps_*` / `..._insurance_share_bps_*`
+// unconditionally, including on a bucket that already holds live counterparty backing. A
+// provider who deposited backing under one fee rate had ZERO protection against the
+// authority raising it afterward -- a rug on already-committed capital. The fix
+// (`policy_v16::backing_fee_policy_change_allowed`) rejects any rate change on a FUNDED
+// bucket unless it is a no-op; an authority remains free to set terms on an unfunded bucket.
+#[test]
+fn v16_attack_update_backing_fee_policy_requires_depositor_consent_on_funded_bucket() {
+    let mut env = V16CuEnv::new();
+
+    // domain 1 = asset-0 SHORT-side backing (`backing_fee_policy_for_domain_view`:
+    // long_side = domain % 2 == 0). Fund it -- this is the "existing depositor" whose
+    // committed capital the fee-rate rug would otherwise target.
+    env.update_backing_fee_policy_with_cu(1, 50, 5_000);
+    env.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+
+    // Prove the bucket is genuinely funded (non-vacuous setup) before attacking it.
+    let (_, group_before) = env.market_state();
+    let bucket_before = &group_before.source_backing_buckets[1];
+    assert!(
+        bucket_before.fresh_unliened_backing_num != 0,
+        "setup must actually fund domain 1's backing bucket, or this test proves nothing"
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let admin_clone = env.admin.insecure_clone();
+
+    // ATTACK: the insurance authority tries to RAISE the fee rate (50 -> 100 bps) on the
+    // now-FUNDED bucket, with no depositor consent whatsoever. Must be REJECTED.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::UpdateBackingFeePolicy {
+                market_id: 1,
+                domain: 1,
+                fee_bps: 100,
+                insurance_share_bps: 5_000,
+                policy_sequence: env.control_sequences(0).backing_fee_short + 1,
+            },
+            vec![
+                AccountMeta::new(admin_clone.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin_clone],
+        )
+        .expect_err(
+            "raising the backing-fee rate on a FUNDED bucket must be rejected -- the \
+             authority cannot unilaterally change fee terms a depositor already funded under",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineLockActive as u32),
+        "expected EngineLockActive from the depositor-consent guard; got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected fee-policy change must not mutate market state at all"
+    );
+
+    // A no-op re-assert of the SAME rate is always allowed (identity is not a rate change).
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::UpdateBackingFeePolicy {
+            market_id: 1,
+            domain: 1,
+            fee_bps: 50,
+            insurance_share_bps: 5_000,
+            policy_sequence: env.control_sequences(0).backing_fee_short + 1,
+        },
+        vec![
+            AccountMeta::new(admin_clone.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin_clone],
+    )
+    .expect("a no-op fee-policy re-assert (identical rate) must remain allowed");
+
+    // CONTROL: the SAME rate change is allowed on domain 0 (asset-0 LONG side), which this
+    // test never funds -- proving the guard is scoped to FUNDED buckets specifically, not a
+    // blanket freeze on UpdateBackingFeePolicy.
+    let (_, group_empty) = env.market_state();
+    let bucket_empty = &group_empty.source_backing_buckets[0];
+    assert!(
+        bucket_empty.fresh_unliened_backing_num == 0
+            && bucket_empty.valid_liened_backing_num == 0
+            && bucket_empty.consumed_liened_backing_num == 0
+            && bucket_empty.impaired_liened_backing_num == 0
+            && bucket_empty.utilization_fee_earnings == 0,
+        "domain 0 must be genuinely unfunded for this control to be meaningful"
+    );
+    env.svm.expire_blockhash();
+    env.update_backing_fee_policy_with_cu(0, 100, 5_000);
+    let (cfg_after, _) = env.market_state();
+    assert_eq!(
+        cfg_after.backing_trade_fee_bps_long, 100,
+        "an authority remains free to set fee terms on an unfunded bucket"
+    );
+}
+
+// sync/w3b-backing-fee-consent (ADOPT upstream 2d9eb5e9, "Bind single trades to backing fee
+// consent"): before this fix, `backing_fee_cap_bps` consent existed ONLY as an `Option<u16>`
+// sourced from a CPI/matcher counterparty (e24cf78e, merged; see the CPI-side test directly
+// above). A direct/self-directed `TradeNoCpi` trader had NO way to cap the backing-domain
+// fee they could be charged at all -- the same fee-consent class as the already-merged
+// base-fee consent (93dd8719/7f319c6b) and the matcher backing-fee consent (e24cf78e), just
+// missing for this one route. Both TradeNoCpi co-signers now agree to one shared
+// `backing_fee_cap_bps` on the ix itself.
+#[test]
+fn v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap() {
+    let mut env = V16CuEnv::new();
+
+    // Same fixture shape as `v16_attack_trade_cpi_rejects_backing_domain_fee_without_matcher_cap_consent`
+    // above, with the matcher/CPI legs swapped for a plain two-signer TradeNoCpi: domain 1
+    // (asset-0 short side) carries a real 50bps fee, and account_b is capitalized far short
+    // of the margin this trade needs so the engine must draw a NEW counterparty-backed lien
+    // from domain 1 to cover it.
+    env.update_backing_fee_policy_with_cu(1, 50, 5_000);
+
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let maker_account = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker_account, 1_000_000);
+    env.deposit(&maker_owner, maker_account, 100);
+    env.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+    env.add_source_positive_pnl(maker_account, 1, 500_000);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let maker_before = env.svm.get_account(&maker_account).unwrap();
+
+    // ATTACK: taker declares a cap (10 bps) BELOW the domain's real 50bps fee. The trade
+    // would incur a real backing-domain fee above what was consented to -- must be REJECTED.
+    env.svm.expire_blockhash();
+    let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
+    let (maker_portfolio_id, _, maker_position_epoch) = env.portfolio_identity(maker_account);
+    let err = env
+        .send(
+            ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id: taker_portfolio_id,
+                account_a_position_epoch: taker_position_epoch,
+                account_b_portfolio_id: maker_portfolio_id,
+                account_b_position_epoch: maker_position_epoch,
+                market_id: 1,
+                asset_index: 0,
+                size_q: -(3 * POS_SCALE as i128),
+                exec_price: 100,
+                fee_bps: 0,
+                backing_fee_cap_bps: 10,
+            },
+            vec![
+                AccountMeta::new(taker_owner.pubkey(), true),
+                AccountMeta::new(maker_owner.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(maker_account, false),
+            ],
+            &[&taker_owner, &maker_owner],
+        )
+        .expect_err(
+            "a direct TradeNoCpi that would incur a backing-domain fee ABOVE the trader's \
+             declared cap must be REJECTED, not silently charged",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::Unauthorized as u32),
+        "expected Unauthorized from the backing-fee-cap consent check; got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected TradeNoCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected TradeNoCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&maker_account).unwrap(),
+        maker_before,
+        "a rejected TradeNoCpi must not mutate the maker's portfolio -- in particular it \
+         must not create the new counterparty-backed lien"
+    );
+
+    // CONTROL: identical setup, but the declared cap (50 bps) sits AT the domain's real
+    // fee -- the trade must SUCCEED and actually draw the lien, proving the setup is
+    // non-vacuous (the rejection above was the cap check, not something else blocking the
+    // lien draw itself).
+    let mut env2 = V16CuEnv::new();
+    env2.update_backing_fee_policy_with_cu(1, 50, 5_000);
+    let taker_owner2 = Keypair::new();
+    let maker_owner2 = Keypair::new();
+    let taker_account2 = env2.create_portfolio(&taker_owner2);
+    let maker_account2 = env2.create_portfolio(&maker_owner2);
+    env2.deposit(&taker_owner2, taker_account2, 1_000_000);
+    env2.deposit(&maker_owner2, maker_account2, 100);
+    env2.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+    env2.add_source_positive_pnl(maker_account2, 1, 500_000);
+
+    env2.svm.expire_blockhash();
+    let (taker_portfolio_id2, _, taker_position_epoch2) =
+        env2.portfolio_identity(taker_account2);
+    let (maker_portfolio_id2, _, maker_position_epoch2) =
+        env2.portfolio_identity(maker_account2);
+    env2.send(
+        ProgInstruction::TradeNoCpi {
+            account_a_portfolio_id: taker_portfolio_id2,
+            account_a_position_epoch: taker_position_epoch2,
+            account_b_portfolio_id: maker_portfolio_id2,
+            account_b_position_epoch: maker_position_epoch2,
+            market_id: 1,
+            asset_index: 0,
+            size_q: -(3 * POS_SCALE as i128),
+            exec_price: 100,
+            fee_bps: 0,
+            backing_fee_cap_bps: 50,
+        },
+        vec![
+            AccountMeta::new(taker_owner2.pubkey(), true),
+            AccountMeta::new(maker_owner2.pubkey(), true),
+            AccountMeta::new(env2.market, false),
+            AccountMeta::new(taker_account2, false),
+            AccountMeta::new(maker_account2, false),
+        ],
+        &[&taker_owner2, &maker_owner2],
+    )
+    .expect("a TradeNoCpi declaring a cap AT the real backing-domain fee must succeed");
+    let maker_after2 = env2.portfolio_state(maker_account2);
+    assert!(
+        maker_after2
+            .source_lien_counterparty_backing_num
+            .iter()
+            .any(|amount| *amount != 0),
+        "control: at-cap TradeNoCpi must still draw the counterparty-backed lien (proving \
+         the setup is non-vacuous) while succeeding since the fee is within consent"
+    );
+}
+
 // Wave-2 unit W2-6b627b43: adopts upstream 6b627b43 "require LP consent for CPI base
 // fees". Bit-packs a new `trade_fee_cap_bps` (14 bits, bits 50..63) into
 // PortfolioMatcherConfigV16.control (formerly `enabled: u64`, bit 0 unchanged) -- the LP
@@ -9277,7 +9527,9 @@ fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
         accounts,
         &[&taker],
     )
-    .expect("BatchTradeCpi leg routed through an LP whose cap covers the live base fee must succeed");
+    .expect(
+        "BatchTradeCpi leg routed through an LP whose cap covers the live base fee must succeed",
+    );
     let (_, g1) = env.market_state();
     assert!(
         g1.insurance > ins0,
@@ -9389,6 +9641,7 @@ fn v16_w3_attack_trade_cpi_rejects_stale_matcher_incarnation() {
             size_q: POS_SCALE as i128,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         vec![
             AccountMeta::new(taker.pubkey(), true),
@@ -11669,6 +11922,7 @@ fn ecu_send_trade_cpi(
             size_q,
             fee_bps: 0,
             limit_price: 0,
+            backing_fee_cap_bps: 10_000,
         },
         vec![
             AccountMeta::new(taker.pubkey(), true),
@@ -16013,6 +16267,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
             size_q: sz,
             fee_bps: 0,
             limit_price: PRICE,
+            backing_fee_cap_bps: 10_000,
         },
         accounts.clone(),
         &[&taker],
@@ -16063,6 +16318,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
             size_q: sz,
             fee_bps: 0,
             limit_price: PRICE,
+            backing_fee_cap_bps: 10_000,
         },
         accounts.clone(),
         &[&taker],
@@ -16385,6 +16641,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
                     limit_price: 0,
+                    backing_fee_cap_bps: 10_000,
                 },
                 hostile_accounts.clone(),
                 &[&taker, &tail_signer],
@@ -16451,6 +16708,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
                     limit_price: 0,
+                    backing_fee_cap_bps: 10_000,
                 },
                 ok_accounts,
                 &[&taker],
@@ -16582,6 +16840,7 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
                         size_q: POS_SCALE as i128,
                         fee_bps: 0,
                         limit_price: 0,
+                        backing_fee_cap_bps: 10_000,
                     },
                     accounts,
                     &[&taker],
@@ -16698,6 +16957,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
                     limit_price: 0,
+                    backing_fee_cap_bps: 10_000,
                 },
                 accounts,
                 &[&taker],
@@ -19804,6 +20064,7 @@ fn v16_attack_trade_nocpi_rejects_stale_position_epoch() {
                 size_q: POS_SCALE as i128,
                 exec_price: 100,
                 fee_bps: 0,
+                backing_fee_cap_bps: 10_000,
             },
             vec![
                 AccountMeta::new(owner_a.pubkey(), true),
@@ -19895,6 +20156,7 @@ fn v16_attack_trade_cpi_rejects_stale_position_epoch() {
                 size_q: POS_SCALE as i128,
                 fee_bps: 0,
                 limit_price: 0,
+                backing_fee_cap_bps: 10_000,
             },
             accounts,
             &[&taker_owner],
@@ -20531,6 +20793,7 @@ fn v16_attack_set_matcher_config_preserves_position_epoch_across_disable() {
                 size_q: POS_SCALE as i128,
                 exec_price: 100,
                 fee_bps: 0,
+                backing_fee_cap_bps: 10_000,
             },
             vec![
                 AccountMeta::new(owner.pubkey(), true),

@@ -1059,6 +1059,7 @@ impl FeeEnv {
                 size_q,
                 exec_price,
                 fee_bps,
+                backing_fee_cap_bps: 10_000,
             }
             .encode(),
         };
