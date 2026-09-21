@@ -23691,3 +23691,168 @@ fn v16_w2_autocrank_hint_crank_drives_engine_selected_plan() {
         "engine vault and SPL vault must stay synced through purely engine-selected dispatch"
     );
 }
+
+/// W3A-2 follow-up (gate-2 verifier track item): the SHUTDOWN action inside
+/// `handle_update_asset_lifecycle` is dual-gated -- `marketauth` OR the
+/// TARGET asset's own `asset_admin` -- and its `epoch_asset_index` split
+/// (`if marketauth_authorized { 0 } else { asset_index }`) is supposed to
+/// bind an `asset_admin`-authorized SHUTDOWN to that asset's OWN epoch lane,
+/// not asset 0's. Every SHUTDOWN test above (and the permissionless-market
+/// SHUTDOWN test earlier in this file, `v16_bpf_permissionless_market_shutdown_
+/// force_closes_recovers_and_reuses_slot`, via `update_asset_lifecycle_as_admin_
+/// with_cu`) signs with `marketauth` on asset-0's lane -- none exercises the
+/// `asset_admin`-authorized branch on a non-zero `asset_index`. This test
+/// closes that gap, mirroring the exact "held tx across an intervening
+/// rotation" shape used throughout this unit, but on the `asset_admin` leg:
+/// (1) activate asset_index=1 permissionlessly so its `asset_admin`
+/// bootstraps to a key distinct from marketauth, (2) read asset 1's OWN
+/// LIVE `authority_epoch`, (3) build but do NOT submit a SHUTDOWN on asset
+/// 1 signed by its `asset_admin`, (4) a legitimate `UpdateAssetAuthority`
+/// rotation of a DIFFERENT kind (ORACLE, not ADMIN) on the SAME asset_index
+/// advances asset 1's epoch without touching `asset_admin` itself (so the
+/// held tx's signer stays authorized -- isolating the rejection to the
+/// epoch mismatch alone), (5) the held tx is submitted and must now be
+/// rejected with `EngineStale`.
+///
+/// Non-vacuity (reported in this follow-up's handback): neuter this SHUTDOWN
+/// branch's own `require_authority_epoch_view(&group, epoch_asset_index,
+/// expected_authority_epoch)` call in `src/v16_program.rs` (stub it to
+/// always `Ok(())`) -> `cargo build-sbf --features devnet` -> this test must
+/// FAIL (the held tx is wrongly admitted, flipping asset 1 to Recovery) ->
+/// restore -> `cargo build-sbf --features devnet` -> passes again.
+#[test]
+fn v16_bpf_update_asset_lifecycle_shutdown_asset_admin_leg_cas_rejects_held_tx_after_intervening_rotation(
+) {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // SHUTDOWN requires a configured (non-zero) `force_close_delay_slots`,
+    // and permissionless activation requires a configured init-fee policy --
+    // same setup as `v16_bpf_permissionless_market_shutdown_force_closes_
+    // recovers_and_reuses_slot` above.
+    env.configure_permissionless_resolve_with_cu(9000, 5);
+    env.update_market_init_fee_policy_with_cu(25);
+
+    env.svm.warp_to_slot(1);
+    let asset1_admin = Keypair::new();
+    let insurance_authority = Keypair::new();
+    let insurance_operator = Keypair::new();
+    let backing_authority = Keypair::new();
+    env.svm
+        .airdrop(&insurance_operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Activate asset_index=1 permissionlessly, signed by `asset1_admin`. Per
+    // `handle_update_asset_lifecycle`'s ACTIVATE branch ("Per-asset
+    // cold-storage admin: bootstrap to the activator"), `asset1_admin`
+    // becomes asset 1's OWN `asset_admin` -- distinct from `admin`
+    // (marketauth). `oracle_authority` is set to `admin` here so `admin` can
+    // legitimately rotate it below without needing a third keypair.
+    env.activate_permissionless_asset_with_fee(
+        &asset1_admin,
+        1,
+        1,
+        100,
+        insurance_authority.pubkey(),
+        insurance_operator.pubkey(),
+        backing_authority.pubkey(),
+        admin.pubkey(),
+        25,
+    );
+    let asset0_epoch_before = env.control_sequences(0).authority_epoch;
+
+    env.svm.warp_to_slot(2);
+
+    // 1. Sign (build, DON'T submit) a SHUTDOWN on asset_index=1, signed by
+    //    `asset1_admin` -- asset 1's OWN `asset_admin`, NOT marketauth --
+    //    against asset 1's CURRENT (own) `authority_epoch`. This is the
+    //    non-zero-index leg of SHUTDOWN's `epoch_asset_index` dual-authority
+    //    split (`epoch_asset_index = asset_index` when `asset_admin`, not
+    //    `marketauth`, authorized the call).
+    let held_expected = env.control_sequences(1).authority_epoch;
+    let asset1_market_id =
+        state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1)
+            .unwrap()
+            .3;
+    let held_ix = ProgInstruction::UpdateAssetLifecycle {
+        action: processor::ASSET_ACTION_SHUTDOWN,
+        asset_index: 1,
+        market_id: asset1_market_id,
+        authority_epoch: held_expected,
+        now_slot: 2,
+        initial_price: 0,
+        max_init_fee: u128::MAX,
+        insurance_authority: asset1_admin.pubkey().to_bytes(),
+        insurance_operator: asset1_admin.pubkey().to_bytes(),
+        backing_bucket_authority: asset1_admin.pubkey().to_bytes(),
+        oracle_authority: asset1_admin.pubkey().to_bytes(),
+    };
+    let held_accounts = vec![
+        AccountMeta::new(asset1_admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST, advancing asset 1's OWN
+    //    `authority_epoch` lane via `UpdateAssetAuthority` -- signed by
+    //    `admin`, the CURRENT holder of asset 1's `oracle_authority` (set at
+    //    activation above), rotating a DIFFERENT kind (ORACLE, not ADMIN) so
+    //    `asset1_admin` itself is left untouched and stays authorized for
+    //    the held SHUTDOWN below -- isolating the rejection to the epoch
+    //    mismatch alone, not a signer/authority mismatch. The held tx above
+    //    is NOT submitted here -- it stays "held".
+    let new_oracle = Keypair::new();
+    env.ensure_signer_account(new_oracle.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 1,
+            market_id: asset1_market_id,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: new_oracle.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(new_oracle.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &new_oracle],
+    )
+    .expect(
+        "legitimate rotation of asset 1's oracle_authority (epoch held_expected -> held_expected + 1) succeeds",
+    );
+    assert_eq!(
+        env.control_sequences(1).authority_epoch,
+        held_expected + 1,
+        "the legitimate rotation must advance ASSET 1's epoch by exactly 1"
+    );
+    assert_eq!(
+        env.control_sequences(0).authority_epoch,
+        asset0_epoch_before,
+        "a rotation scoped to asset 1 must leave asset 0's epoch lane untouched \
+         -- proving SHUTDOWN's asset_admin leg is bound to asset 1's OWN lane, \
+         not asset-0's"
+    );
+
+    // 3. NOW submit the held tx. It must be rejected: its `authority_epoch`
+    //    (held_expected) no longer equals asset 1's current stored value
+    //    (held_expected + 1).
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts, &[&asset1_admin])
+        .expect_err(
+            "a held SHUTDOWN signed by asset 1's own asset_admin against a \
+             since-superseded authority_epoch must be rejected once an \
+             intervening rotation has advanced asset 1's epoch",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (authority_epoch mismatch); got {err}"
+    );
+    assert_eq!(
+        env.market_state().1.assets[1].lifecycle,
+        AssetLifecycleV16::Active,
+        "the rejected held tx must leave asset 1's lifecycle untouched (SHUTDOWN \
+         would otherwise have flipped it to Recovery)"
+    );
+}

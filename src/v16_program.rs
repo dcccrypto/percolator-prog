@@ -5982,10 +5982,23 @@ pub mod ix {
             /// (`AssetStateV16::market_id`), checked against a stale signed
             /// instruction captured against an old occupant of this slot.
             market_id: u64,
-            /// W3A-2: ADOPT upstream `dd958393` epoch binding -- the
-            /// within-generation authority axis (A->B->A rotations of
-            /// `marketauth`/`asset_admin`), checked at every one of this
-            /// tag's three authority-gated call sites. Orthogonal to TB-4's
+            /// W3A-2: ADOPT upstream `dd958393` epoch binding -- checked at
+            /// every one of this tag's three authority-gated call sites.
+            /// W3A-2 IN ISOLATION only closes the within-generation
+            /// `asset_admin` per-asset axis: `UpdateAssetAuthority` always
+            /// advances the rotated asset's own `authority_epoch` lane
+            /// (`advance_authority_epoch_view`), so an `asset_admin`
+            /// A->B->A round-trip on a given `asset_index` is caught here.
+            /// The `marketauth` A->B->A axis is NOT closed by W3A-2 alone:
+            /// `handle_update_authority` (`UpdateAuthority`, tag 32) rotates
+            /// `cfg.marketauth` without touching any `authority_epoch`, so a
+            /// marketauth A->B->A round-trip never advances the asset-0
+            /// lane this tag checks for marketauth-authorized calls.
+            /// Closing that axis requires sibling unit W3A-1 (upstream
+            /// `95d155bc`'s `UpdateAuthority` half) to co-land and wire
+            /// `UpdateAuthority` into `advance_authority_epoch_view` on
+            /// asset 0 -- CO-LANDED in this integration (see the W3A-1 merge
+            /// commit), so that axis IS closed here. Orthogonal to TB-4's
             /// `market_id`/generation axis above -- upstream carries both
             /// fields side by side; INTEGRATION places `market_id` first
             /// (identity/generation before authority, the same convention
