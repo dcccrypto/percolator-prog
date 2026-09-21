@@ -542,6 +542,18 @@ impl CrosscutEnv {
         portfolio
     }
 
+    /// TB-1b: read the account's CURRENT portfolio_id/sequence/position_epoch
+    /// directly off the live SVM account bytes, right before building an
+    /// instruction that binds to them.
+    fn portfolio_identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
+        let data = self.svm.get_account(&portfolio).unwrap().data;
+        (
+            state::read_portfolio_id(&data).unwrap(),
+            state::read_portfolio_matcher_sequence(&data).unwrap(),
+            state::read_portfolio_position_epoch(&data).unwrap(),
+        )
+    }
+
     /// Deposit `amount` collateral; returns the (now-drained) source token account.
     fn deposit(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Pubkey {
         let source = Pubkey::new_unique();
@@ -557,8 +569,13 @@ impl CrosscutEnv {
                 },
             )
             .unwrap();
+        let (portfolio_id, expected_sequence, _) = self.portfolio_identity(portfolio);
         self.try_wrapper(
-            ProgInstruction::Deposit { amount },
+            ProgInstruction::Deposit {
+                portfolio_id,
+                expected_sequence,
+                amount,
+            },
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -729,6 +746,11 @@ impl CrosscutEnv {
         // Required before TradeCpi: matcher_tail_start_or_verify_lp_config checks
         // cfg.matcher_program / .matcher_context / .matcher_delegate. It must also run BEFORE
         // InitMatcherCtx, which requires the triple to be registered already.
+        let (portfolio_id, expected_sequence, _) = self.portfolio_identity(maker_account);
+        // TB-1b: `expiry_slot` must be a live future slot for
+        // `matcher_capability_config_is_valid`/`matcher_capability_is_live` to accept
+        // `enabled: 1` -- the test harness never warps far enough to approach u64::MAX.
+        let expiry_slot = u64::MAX;
         send_ixs(
             &mut self.svm,
             &self.payer,
@@ -743,8 +765,11 @@ impl CrosscutEnv {
                     AccountMeta::new_readonly(delegate, false),
                 ],
                 data: ProgInstruction::SetMatcherConfig {
+                    portfolio_id,
+                    expected_sequence,
                     enabled: 1,
                     trade_fee_cap_bps: 10_000,
+                    expiry_slot,
                 }
                 .encode(),
             }],
@@ -803,6 +828,10 @@ impl CrosscutEnv {
         size_q: i128,
         fee_bps: u64,
     ) -> Result<(), TransactionError> {
+        let (account_a_portfolio_id, _, account_a_position_epoch) =
+            self.portfolio_identity(account_a);
+        let (account_b_portfolio_id, _, account_b_position_epoch) =
+            self.portfolio_identity(account_b);
         let wix = Instruction {
             program_id: self.program_id,
             // v17 account layout: [signer_a, market, account_a, account_b,
@@ -817,6 +846,10 @@ impl CrosscutEnv {
                 AccountMeta::new_readonly(delegate, false),
             ],
             data: ProgInstruction::TradeCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index,
                 size_q,
                 fee_bps,
@@ -847,6 +880,10 @@ impl CrosscutEnv {
         exec_price: u64,
         fee_bps: u64,
     ) -> Result<(), TransactionError> {
+        let (account_a_portfolio_id, _, account_a_position_epoch) =
+            self.portfolio_identity(account_a);
+        let (account_b_portfolio_id, _, account_b_position_epoch) =
+            self.portfolio_identity(account_b);
         let wix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -857,6 +894,10 @@ impl CrosscutEnv {
                 AccountMeta::new(account_b, false),
             ],
             data: ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index: CROSSCUT_ASSET,
                 size_q,
                 exec_price,
@@ -2825,8 +2866,13 @@ fn x0_e2_nft_holder_withdraws_escrowed_position_to_self_at_mainnet() {
 
     // E2: the NFT HOLDER withdraws the escrowed position — funds must reach the holder.
     let dest = make_dest_ata(&mut env, holder.pubkey());
+    let (portfolio_id, expected_sequence, _) = env.portfolio_identity(portfolio);
     let res = env.try_wrapper(
-        ProgInstruction::Withdraw { amount },
+        ProgInstruction::Withdraw {
+            portfolio_id,
+            expected_sequence,
+            amount,
+        },
         e2_withdraw_accounts(
             &env,
             &holder,
@@ -2869,8 +2915,13 @@ fn x0_e2_escrowed_position_rejects_non_holder_at_mainnet() {
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
     let dest = make_dest_ata(&mut env, attacker.pubkey());
+    let (portfolio_id, expected_sequence, _) = env.portfolio_identity(portfolio);
     let res = env.try_wrapper(
-        ProgInstruction::Withdraw { amount },
+        ProgInstruction::Withdraw {
+            portfolio_id,
+            expected_sequence,
+            amount,
+        },
         e2_withdraw_accounts(
             &env,
             &attacker,

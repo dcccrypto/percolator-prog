@@ -2302,6 +2302,44 @@ pub mod state {
             .ok_or(PercolatorError::EngineCounterOverflow.into())
     }
 
+    /// TB-1b: pure comparator for the `ClosePortfolio` 3-way binding (ADOPT
+    /// upstream `d60f15a1`, "bind portfolio close to funded state"). A close
+    /// must match the account's CURRENT portfolio_id, matcher_sequence, AND
+    /// position_epoch all at once -- any one of the three moving on (a Deposit
+    /// bumping sequence, a trade/cure/forfeit bumping position_epoch, or a
+    /// prior close+re-init bumping portfolio_id) invalidates a stale close
+    /// built against the old triple.
+    #[inline]
+    pub fn portfolio_close_binding_matches(
+        current_portfolio_id: u64,
+        current_sequence: u64,
+        current_position_epoch: u64,
+        expected_portfolio_id: u64,
+        expected_sequence: u64,
+        expected_position_epoch: u64,
+    ) -> bool {
+        current_portfolio_id == expected_portfolio_id
+            && current_sequence == expected_sequence
+            && current_position_epoch == expected_position_epoch
+    }
+
+    /// TB-1b: pure comparator for the retained-action position-episode binding
+    /// (ADOPT upstream `7453c7cd`, "bind retained actions to position
+    /// episodes"). Used by `ConvertReleasedPnl`, `CureAndCancelClose`,
+    /// `ForfeitRecoveryLeg`, and `RebalanceReduce` -- all of which mutate a
+    /// SPECIFIC funded episode of the portfolio and must not silently apply to
+    /// whatever episode happens to be live when the transaction lands.
+    #[inline]
+    pub fn portfolio_position_binding_matches(
+        current_portfolio_id: u64,
+        current_position_epoch: u64,
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
+    ) -> bool {
+        current_portfolio_id == expected_portfolio_id
+            && current_position_epoch == expected_position_epoch
+    }
+
     /// Upstream's `expiry_slot` (ADOPT upstream `0b838425`; upstream's own
     /// helper name is `read_portfolio_matcher_expiry`, kept verbatim for grep
     /// parity). Slot at which a matcher capability granted via
@@ -2312,12 +2350,7 @@ pub mod state {
         read_u64(data, PORTFOLIO_MATCHER_EXPIRY_OFF)
     }
 
-    // TB-1a: infra-only in this unit -- no handler wires expiry_slot writes yet
-    // (that's TB-1b's `SetMatcherConfig` binding). Exercised directly by this
-    // unit's own inline roundtrip test, but `cargo build --lib`/`build-sbf`
-    // (which don't compile `#[cfg(test)]` code) would otherwise flag it
-    // dead_code until TB-1b's handler calls it for real.
-    #[allow(dead_code)]
+    // TB-1b: wired into `handle_set_matcher_config` below.
     #[inline]
     pub(crate) fn write_portfolio_matcher_expiry(
         data: &mut [u8],
@@ -2333,9 +2366,11 @@ pub mod state {
     }
 
     /// Pure predicate (ADOPT upstream `0b838425`): whether a granted matcher
-    /// capability is still live at `current_slot`. Provided as infra for TB-1b
-    /// to wire into the CPI trade-authorization check (`handle_batch_trade_cpi`
-    /// and friends) -- not called from any handler in this unit.
+    /// capability is still live at `current_slot`. Wired into the CPI
+    /// trade-authorization check in `matcher_tail_start_or_verify_lp_config`
+    /// (see call site below) -- an expired (or never-granted, `expiry_slot ==
+    /// 0`) matcher capability no longer authorizes a CPI trade even when
+    /// `enabled == 1` and the program/context/delegate triple still matches.
     #[inline]
     pub fn matcher_capability_is_live(expiry_slot: u64, current_slot: u64) -> bool {
         expiry_slot != 0 && current_slot < expiry_slot
@@ -2343,8 +2378,9 @@ pub mod state {
 
     /// Pure predicate (ADOPT upstream `0b838425`): whether a `SetMatcherConfig`
     /// payload's `(enabled, trade_fee_cap_bps, expiry_slot)` triple is
-    /// internally consistent. Provided as infra for TB-1b to wire into
-    /// `handle_set_matcher_config` -- not called from any handler in this unit.
+    /// internally consistent. Wired into `handle_set_matcher_config` (see call
+    /// site below), which rejects with `InvalidInstruction` when this predicate
+    /// returns false.
     #[inline]
     pub fn matcher_capability_config_is_valid(
         enabled: u8,
@@ -4792,9 +4828,13 @@ pub mod ix {
         },
         InitPortfolio,
         Deposit {
+            portfolio_id: u64,
+            expected_sequence: u64,
             amount: u128,
         },
         Withdraw {
+            portfolio_id: u64,
+            expected_sequence: u64,
             amount: u128,
         },
         /// FIX W3 (upstream #206, pairs with engine E3 / upstream #92): liquidation
@@ -4811,12 +4851,20 @@ pub mod ix {
             recovery_reason: u8,
         },
         TradeNoCpi {
+            account_a_portfolio_id: u64,
+            account_a_position_epoch: u64,
+            account_b_portfolio_id: u64,
+            account_b_position_epoch: u64,
             asset_index: u16,
             size_q: i128,
             exec_price: u64,
             fee_bps: u64,
         },
         TradeCpi {
+            account_a_portfolio_id: u64,
+            account_a_position_epoch: u64,
+            account_b_portfolio_id: u64,
+            account_b_position_epoch: u64,
             asset_index: u16,
             size_q: i128,
             fee_bps: u64,
@@ -4825,18 +4873,28 @@ pub mod ix {
         /// Atomic multi-leg batch: apply every leg against one taker/LP pair with a single
         /// end-state initial-margin check (interim legs need not be individually margin-feasible).
         BatchTradeNoCpi {
+            account_a_portfolio_id: u64,
+            account_a_position_epoch: u64,
+            account_b_portfolio_id: u64,
+            account_b_position_epoch: u64,
             legs: Vec<BatchTradeLeg>,
         },
         /// Atomic multi-leg batch routed through an external matcher: one batched matcher CPI fills
         /// every leg against a single LP, then all fills apply with one end-state margin check.
         BatchTradeCpi {
+            account_a_portfolio_id: u64,
+            account_a_position_epoch: u64,
+            account_b_portfolio_id: u64,
+            account_b_position_epoch: u64,
             /// Maximum aggregate adverse execution-price movement from the authenticated
             /// landing-state prices the signing taker consents to, measured in quote atoms
             /// summed across all legs (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi
-            /// consent" -- adapted: upstream also carries `account_b_portfolio_id`/
-            /// `account_b_position_epoch`/`account_b_matcher_sequence` on this variant; we lack
-            /// all three (no TB-1 portfolio-identity bloc in this fork yet) so only the two new
-            /// consent-cap fields are ported).
+            /// consent"; TB-1b now also ports upstream's `account_{a,b}_portfolio_id`/
+            /// `account_{a,b}_position_epoch` identity fields onto this variant -- upstream
+            /// additionally carries an `account_b_matcher_sequence`, which this fork's
+            /// `PortfolioMatcherConfigV16` design does not need since CPI matcher-capability
+            /// liveness is bound separately via `expiry_slot`, wired in `handle_set_matcher_config`
+            /// / `matcher_tail_start_or_verify_lp_config`).
             max_slippage_atoms: u128,
             /// Maximum aggregate engine fee charged to the signing taker (account_a) across all
             /// legs.
@@ -4844,10 +4902,17 @@ pub mod ix {
             legs: Vec<BatchTradeCpiLeg>,
         },
         SetMatcherConfig {
+            portfolio_id: u64,
+            expected_sequence: u64,
             enabled: u8,
             trade_fee_cap_bps: u16,
+            expiry_slot: u64,
         },
-        ClosePortfolio,
+        ClosePortfolio {
+            portfolio_id: u64,
+            expected_sequence: u64,
+            position_epoch: u64,
+        },
         TopUpInsurance {
             amount: u128,
         },
@@ -4867,6 +4932,8 @@ pub mod ix {
             amount: u128,
         },
         ConvertReleasedPnl {
+            portfolio_id: u64,
+            position_epoch: u64,
             amount: u128,
         },
         CloseResolved {
@@ -4997,6 +5064,8 @@ pub mod ix {
             amount: u128,
         },
         CureAndCancelClose {
+            portfolio_id: u64,
+            position_epoch: u64,
             optional_deposit: u128,
         },
         /// Tag 43 — owner-signed dead-leg forfeit.
@@ -5025,10 +5094,14 @@ pub mod ix {
         /// (`percolator-prog upstream/main:src/v16_program.rs:3255`) with the same
         /// atom-reading engine; this rename is ours, and the layout is identical to theirs.
         ForfeitRecoveryLeg {
+            portfolio_id: u64,
+            position_epoch: u64,
             asset_index: u16,
             b_loss_atom_budget: u128,
         },
         RebalanceReduce {
+            portfolio_id: u64,
+            position_epoch: u64,
             asset_index: u16,
             reduce_q: u128,
         },
@@ -5300,9 +5373,13 @@ pub mod ix {
                 },
                 1 => Self::InitPortfolio,
                 3 => Self::Deposit {
+                    portfolio_id: read_u64(&mut rest)?,
+                    expected_sequence: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                 },
                 4 => Self::Withdraw {
+                    portfolio_id: read_u64(&mut rest)?,
+                    expected_sequence: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                 },
                 5 => Self::PermissionlessCrank {
@@ -5313,12 +5390,20 @@ pub mod ix {
                     recovery_reason: read_u8(&mut rest)?,
                 },
                 6 => Self::TradeNoCpi {
+                    account_a_portfolio_id: read_u64(&mut rest)?,
+                    account_a_position_epoch: read_u64(&mut rest)?,
+                    account_b_portfolio_id: read_u64(&mut rest)?,
+                    account_b_position_epoch: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
                     exec_price: read_u64(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
                 },
                 10 => Self::TradeCpi {
+                    account_a_portfolio_id: read_u64(&mut rest)?,
+                    account_a_position_epoch: read_u64(&mut rest)?,
+                    account_b_portfolio_id: read_u64(&mut rest)?,
+                    account_b_position_epoch: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
                     fee_bps: read_u64(&mut rest)?,
@@ -5335,7 +5420,13 @@ pub mod ix {
                             fee_bps: read_u64(&mut rest)?,
                         });
                     }
-                    Self::BatchTradeNoCpi { legs }
+                    Self::BatchTradeNoCpi {
+                        account_a_portfolio_id: read_u64(&mut rest)?,
+                        account_a_position_epoch: read_u64(&mut rest)?,
+                        account_b_portfolio_id: read_u64(&mut rest)?,
+                        account_b_position_epoch: read_u64(&mut rest)?,
+                        legs,
+                    }
                 }
                 67 => {
                     let n = read_u8(&mut rest)? as usize;
@@ -5351,27 +5442,27 @@ pub mod ix {
                     let max_slippage_atoms = read_u128(&mut rest)?;
                     let max_fee_atoms = read_u128(&mut rest)?;
                     Self::BatchTradeCpi {
+                        account_a_portfolio_id: read_u64(&mut rest)?,
+                        account_a_position_epoch: read_u64(&mut rest)?,
+                        account_b_portfolio_id: read_u64(&mut rest)?,
+                        account_b_position_epoch: read_u64(&mut rest)?,
                         max_slippage_atoms,
                         max_fee_atoms,
                         legs,
                     }
                 }
-                68 => {
-                    let enabled = read_u8(&mut rest)?;
-                    // Backward-compat decode: a legacy-length payload (no trailing bytes)
-                    // decodes as trade_fee_cap_bps=0, which fails closed against any
-                    // nonzero market base fee until the LP reauthorizes with an explicit cap.
-                    let trade_fee_cap_bps = if rest.is_empty() {
-                        0
-                    } else {
-                        read_u16(&mut rest)?
-                    };
-                    Self::SetMatcherConfig {
-                        enabled,
-                        trade_fee_cap_bps,
-                    }
-                }
-                8 => Self::ClosePortfolio,
+                68 => Self::SetMatcherConfig {
+                    portfolio_id: read_u64(&mut rest)?,
+                    expected_sequence: read_u64(&mut rest)?,
+                    enabled: read_u8(&mut rest)?,
+                    trade_fee_cap_bps: read_u16(&mut rest)?,
+                    expiry_slot: read_u64(&mut rest)?,
+                },
+                8 => Self::ClosePortfolio {
+                    portfolio_id: read_u64(&mut rest)?,
+                    expected_sequence: read_u64(&mut rest)?,
+                    position_epoch: read_u64(&mut rest)?,
+                },
                 9 => Self::TopUpInsurance {
                     amount: read_u128(&mut rest)?,
                 },
@@ -5391,6 +5482,8 @@ pub mod ix {
                     amount: read_u128(&mut rest)?,
                 },
                 28 => Self::ConvertReleasedPnl {
+                    portfolio_id: read_u64(&mut rest)?,
+                    position_epoch: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                 },
                 30 => Self::CloseResolved {
@@ -5520,13 +5613,19 @@ pub mod ix {
                     amount: read_u128(&mut rest)?,
                 },
                 42 => Self::CureAndCancelClose {
+                    portfolio_id: read_u64(&mut rest)?,
+                    position_epoch: read_u64(&mut rest)?,
                     optional_deposit: read_u128(&mut rest)?,
                 },
                 43 => Self::ForfeitRecoveryLeg {
+                    portfolio_id: read_u64(&mut rest)?,
+                    position_epoch: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
                     b_loss_atom_budget: read_u128(&mut rest)?,
                 },
                 44 => Self::RebalanceReduce {
+                    portfolio_id: read_u64(&mut rest)?,
+                    position_epoch: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
                     reduce_q: read_u128(&mut rest)?,
                 },
@@ -5689,12 +5788,24 @@ pub mod ix {
                     push_u128(&mut out, maintenance_fee_per_slot);
                 }
                 Self::InitPortfolio => out.push(1),
-                Self::Deposit { amount } => {
+                Self::Deposit {
+                    portfolio_id,
+                    expected_sequence,
+                    amount,
+                } => {
                     out.push(3);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, expected_sequence);
                     push_u128(&mut out, amount);
                 }
-                Self::Withdraw { amount } => {
+                Self::Withdraw {
+                    portfolio_id,
+                    expected_sequence,
+                    amount,
+                } => {
                     out.push(4);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, expected_sequence);
                     push_u128(&mut out, amount);
                 }
                 Self::PermissionlessCrank {
@@ -5712,30 +5823,52 @@ pub mod ix {
                     out.push(recovery_reason);
                 }
                 Self::TradeNoCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
                     asset_index,
                     size_q,
                     exec_price,
                     fee_bps,
                 } => {
                     out.push(6);
+                    push_u64(&mut out, account_a_portfolio_id);
+                    push_u64(&mut out, account_a_position_epoch);
+                    push_u64(&mut out, account_b_portfolio_id);
+                    push_u64(&mut out, account_b_position_epoch);
                     push_u16(&mut out, asset_index);
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, exec_price);
                     push_u64(&mut out, fee_bps);
                 }
                 Self::TradeCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
                     asset_index,
                     size_q,
                     fee_bps,
                     limit_price,
                 } => {
                     out.push(10);
+                    push_u64(&mut out, account_a_portfolio_id);
+                    push_u64(&mut out, account_a_position_epoch);
+                    push_u64(&mut out, account_b_portfolio_id);
+                    push_u64(&mut out, account_b_position_epoch);
                     push_u16(&mut out, asset_index);
                     push_i128(&mut out, size_q);
                     push_u64(&mut out, fee_bps);
                     push_u64(&mut out, limit_price);
                 }
-                Self::BatchTradeNoCpi { ref legs } => {
+                Self::BatchTradeNoCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    ref legs,
+                } => {
                     out.push(66);
                     out.push(legs.len() as u8);
                     for leg in legs.iter() {
@@ -5744,8 +5877,16 @@ pub mod ix {
                         push_u64(&mut out, leg.exec_price);
                         push_u64(&mut out, leg.fee_bps);
                     }
+                    push_u64(&mut out, account_a_portfolio_id);
+                    push_u64(&mut out, account_a_position_epoch);
+                    push_u64(&mut out, account_b_portfolio_id);
+                    push_u64(&mut out, account_b_position_epoch);
                 }
                 Self::BatchTradeCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
                     max_slippage_atoms,
                     max_fee_atoms,
                     ref legs,
@@ -5760,16 +5901,35 @@ pub mod ix {
                     }
                     push_u128(&mut out, max_slippage_atoms);
                     push_u128(&mut out, max_fee_atoms);
+                    push_u64(&mut out, account_a_portfolio_id);
+                    push_u64(&mut out, account_a_position_epoch);
+                    push_u64(&mut out, account_b_portfolio_id);
+                    push_u64(&mut out, account_b_position_epoch);
                 }
                 Self::SetMatcherConfig {
+                    portfolio_id,
+                    expected_sequence,
                     enabled,
                     trade_fee_cap_bps,
+                    expiry_slot,
                 } => {
                     out.push(68);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, expected_sequence);
                     out.push(enabled);
                     push_u16(&mut out, trade_fee_cap_bps);
+                    push_u64(&mut out, expiry_slot);
                 }
-                Self::ClosePortfolio => out.push(8),
+                Self::ClosePortfolio {
+                    portfolio_id,
+                    expected_sequence,
+                    position_epoch,
+                } => {
+                    out.push(8);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, expected_sequence);
+                    push_u64(&mut out, position_epoch);
+                }
                 Self::TopUpInsurance { amount } => {
                     out.push(9);
                     push_u128(&mut out, amount);
@@ -5806,8 +5966,14 @@ pub mod ix {
                     push_u16(&mut out, domain);
                     push_u128(&mut out, amount);
                 }
-                Self::ConvertReleasedPnl { amount } => {
+                Self::ConvertReleasedPnl {
+                    portfolio_id,
+                    position_epoch,
+                    amount,
+                } => {
                     out.push(28);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, position_epoch);
                     push_u128(&mut out, amount);
                 }
                 Self::CloseResolved { fee_rate_per_slot } => {
@@ -6030,23 +6196,37 @@ pub mod ix {
                     push_u16(&mut out, asset_index);
                     push_u128(&mut out, amount);
                 }
-                Self::CureAndCancelClose { optional_deposit } => {
+                Self::CureAndCancelClose {
+                    portfolio_id,
+                    position_epoch,
+                    optional_deposit,
+                } => {
                     out.push(42);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, position_epoch);
                     push_u128(&mut out, optional_deposit);
                 }
                 Self::ForfeitRecoveryLeg {
+                    portfolio_id,
+                    position_epoch,
                     asset_index,
                     b_loss_atom_budget,
                 } => {
                     out.push(43);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, position_epoch);
                     push_u16(&mut out, asset_index);
                     push_u128(&mut out, b_loss_atom_budget);
                 }
                 Self::RebalanceReduce {
+                    portfolio_id,
+                    position_epoch,
                     asset_index,
                     reduce_q,
                 } => {
                     out.push(44);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, position_epoch);
                     push_u16(&mut out, asset_index);
                     push_u128(&mut out, reduce_q);
                 }
@@ -8502,8 +8682,16 @@ pub mod processor {
                 maintenance_fee_per_slot,
             ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
-            Instruction::Deposit { amount } => handle_deposit(program_id, accounts, amount),
-            Instruction::Withdraw { amount } => handle_withdraw(program_id, accounts, amount),
+            Instruction::Deposit {
+                portfolio_id,
+                expected_sequence,
+                amount,
+            } => handle_deposit(program_id, accounts, portfolio_id, expected_sequence, amount),
+            Instruction::Withdraw {
+                portfolio_id,
+                expected_sequence,
+                amount,
+            } => handle_withdraw(program_id, accounts, portfolio_id, expected_sequence, amount),
             Instruction::PermissionlessCrank {
                 action,
                 asset_index,
@@ -8520,6 +8708,10 @@ pub mod processor {
                 recovery_reason,
             ),
             Instruction::TradeNoCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index,
                 size_q,
                 exec_price,
@@ -8527,12 +8719,20 @@ pub mod processor {
             } => handle_trade_nocpi(
                 program_id,
                 accounts,
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index,
                 size_q,
                 exec_price,
                 fee_bps,
             ),
             Instruction::TradeCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index,
                 size_q,
                 fee_bps,
@@ -8540,30 +8740,75 @@ pub mod processor {
             } => handle_trade_cpi(
                 program_id,
                 accounts,
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 asset_index,
                 size_q,
                 fee_bps,
                 limit_price,
             ),
-            Instruction::BatchTradeNoCpi { legs } => {
-                handle_batch_trade_nocpi(program_id, accounts, &legs)
-            }
+            Instruction::BatchTradeNoCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
+                legs,
+            } => handle_batch_trade_nocpi(
+                program_id,
+                accounts,
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
+                &legs,
+            ),
             Instruction::BatchTradeCpi {
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 max_slippage_atoms,
                 max_fee_atoms,
                 legs,
             } => handle_batch_trade_cpi(
                 program_id,
                 accounts,
+                account_a_portfolio_id,
+                account_a_position_epoch,
+                account_b_portfolio_id,
+                account_b_position_epoch,
                 max_slippage_atoms,
                 max_fee_atoms,
                 &legs,
             ),
             Instruction::SetMatcherConfig {
+                portfolio_id,
+                expected_sequence,
                 enabled,
                 trade_fee_cap_bps,
-            } => handle_set_matcher_config(program_id, accounts, enabled, trade_fee_cap_bps),
-            Instruction::ClosePortfolio => handle_close_portfolio(program_id, accounts),
+                expiry_slot,
+            } => handle_set_matcher_config(
+                program_id,
+                accounts,
+                portfolio_id,
+                expected_sequence,
+                enabled,
+                trade_fee_cap_bps,
+                expiry_slot,
+            ),
+            Instruction::ClosePortfolio {
+                portfolio_id,
+                expected_sequence,
+                position_epoch,
+            } => handle_close_portfolio(
+                program_id,
+                accounts,
+                portfolio_id,
+                expected_sequence,
+                position_epoch,
+            ),
             Instruction::TopUpInsurance { amount } => {
                 handle_top_up_insurance(program_id, accounts, amount)
             }
@@ -8580,9 +8825,17 @@ pub mod processor {
             Instruction::WithdrawBackingBucket { domain, amount } => {
                 handle_withdraw_backing_bucket(program_id, accounts, domain, amount)
             }
-            Instruction::ConvertReleasedPnl { amount } => {
-                handle_convert_released_pnl(program_id, accounts, amount)
-            }
+            Instruction::ConvertReleasedPnl {
+                portfolio_id,
+                position_epoch,
+                amount,
+            } => handle_convert_released_pnl(
+                program_id,
+                accounts,
+                portfolio_id,
+                position_epoch,
+                amount,
+            ),
             Instruction::CloseResolved { fee_rate_per_slot } => {
                 handle_close_resolved(program_id, accounts, fee_rate_per_slot)
             }
@@ -8767,17 +9020,43 @@ pub mod processor {
                 asset_index,
                 amount,
             } => handle_withdraw_insurance_asset(program_id, accounts, asset_index, amount),
-            Instruction::CureAndCancelClose { optional_deposit } => {
-                handle_cure_and_cancel_close(program_id, accounts, optional_deposit)
-            }
+            Instruction::CureAndCancelClose {
+                portfolio_id,
+                position_epoch,
+                optional_deposit,
+            } => handle_cure_and_cancel_close(
+                program_id,
+                accounts,
+                portfolio_id,
+                position_epoch,
+                optional_deposit,
+            ),
             Instruction::ForfeitRecoveryLeg {
+                portfolio_id,
+                position_epoch,
                 asset_index,
                 b_loss_atom_budget,
-            } => handle_forfeit_recovery_leg(program_id, accounts, asset_index, b_loss_atom_budget),
+            } => handle_forfeit_recovery_leg(
+                program_id,
+                accounts,
+                portfolio_id,
+                position_epoch,
+                asset_index,
+                b_loss_atom_budget,
+            ),
             Instruction::RebalanceReduce {
+                portfolio_id,
+                position_epoch,
                 asset_index,
                 reduce_q,
-            } => handle_rebalance_reduce(program_id, accounts, asset_index, reduce_q),
+            } => handle_rebalance_reduce(
+                program_id,
+                accounts,
+                portfolio_id,
+                position_epoch,
+                asset_index,
+                reduce_q,
+            ),
             Instruction::FinalizeResetSide { asset_index, side } => {
                 handle_finalize_reset_side(program_id, accounts, asset_index, side)
             }
@@ -9149,6 +9428,8 @@ pub mod processor {
     fn handle_deposit<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_sequence: u64,
         amount: u128,
     ) -> ProgramResult {
         let owner = account(accounts, 0)?;
@@ -9165,6 +9446,14 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         expect_owner(portfolio_ai, program_id)?;
         verify_token_program(token_program)?;
+        // TB-1b (ADOPT upstream 0492ebbc): fail fast, before any token-account
+        // verification work, if this Deposit was built against an
+        // incarnation/sequence this account has since moved past.
+        expect_portfolio_sequence_binding(
+            &portfolio_ai.try_borrow_data()?,
+            expected_portfolio_id,
+            expected_sequence,
+        )?;
 
         let (cfg, mode, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
@@ -9187,23 +9476,40 @@ pub mod processor {
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
-            let mut portfolio =
-                state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
-            expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            // E2: owner==signer OR the signer holds the bound NFT (escrowed position).
-            // Optional trailing accounts [6]=nft_registry [7]=PositionNft PDA [8]=signer NFT ATA.
-            // Lets an NFT holder margin-defend a wrapped position (#146).
-            let nft = optional_nft_holder_accounts(accounts, 6);
-            authorize_owner_or_nft_holder(
-                &portfolio,
-                portfolio_ai.key,
-                owner.key,
-                nft,
-                program_id,
+            // TB-1b: live re-check right before mutation, against the current bytes
+            // (the account may have grown via `ensure_portfolio_storage_for_market_slots`
+            // above, and this is the read that actually gates the mutation below).
+            expect_portfolio_sequence_binding(
+                &portfolio_data,
+                expected_portfolio_id,
+                expected_sequence,
             )?;
-            group
-                .deposit_not_atomic(&mut portfolio, amount)
-                .map_err(map_v16_error)?;
+            {
+                let mut portfolio = state::portfolio_view_mut_for_market_slots(
+                    &mut portfolio_data,
+                    max_market_slots,
+                )?;
+                expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                // E2: owner==signer OR the signer holds the bound NFT (escrowed position).
+                // Optional trailing accounts [6]=nft_registry [7]=PositionNft PDA [8]=signer NFT ATA.
+                // Lets an NFT holder margin-defend a wrapped position (#146).
+                let nft = optional_nft_holder_accounts(accounts, 6);
+                authorize_owner_or_nft_holder(
+                    &portfolio,
+                    portfolio_ai.key,
+                    owner.key,
+                    nft,
+                    program_id,
+                )?;
+                group
+                    .deposit_not_atomic(&mut portfolio, amount)
+                    .map_err(map_v16_error)?;
+            }
+            // TB-1b (ADOPT upstream 0492ebbc): one-shot -- a landed Deposit always
+            // advances the shared retained-owner-state sequence, so a stale
+            // Deposit/Withdraw/SetMatcherConfig/ClosePortfolio built against the
+            // pre-deposit sequence can never replay against this account again.
+            state::advance_portfolio_matcher_sequence(&mut portfolio_data, expected_sequence)?;
         }
         transfer_tokens(token_program, source_token, vault_token, owner, amount_u64)?;
         Ok(())
@@ -9213,6 +9519,8 @@ pub mod processor {
     fn handle_withdraw<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_sequence: u64,
         amount: u128,
     ) -> ProgramResult {
         let owner = account(accounts, 0)?;
@@ -9230,6 +9538,12 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         expect_owner(portfolio_ai, program_id)?;
         verify_token_program(token_program)?;
+        // TB-1b (ADOPT upstream 0492ebbc): same fail-fast binding check as Deposit.
+        expect_portfolio_sequence_binding(
+            &portfolio_ai.try_borrow_data()?,
+            expected_portfolio_id,
+            expected_sequence,
+        )?;
 
         let (cfg, mode, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
@@ -9263,43 +9577,57 @@ pub mod processor {
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
-            let mut portfolio =
-                state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
-            expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            // E2: owner==signer OR signer holds the bound NFT. Optional trailing
-            // accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
-            // FUND-SAFETY: the dest-token check uses `owner.key` (the SIGNER), so an
-            // NFT-holder withdrawal pays the HOLDER, never the escrow PDA.
-            let nft = optional_nft_holder_accounts(accounts, 7);
-            authorize_owner_or_nft_holder(
-                &portfolio,
-                portfolio_ai.key,
-                owner.key,
-                nft,
-                program_id,
+            // TB-1b: live re-check right before mutation.
+            expect_portfolio_sequence_binding(
+                &portfolio_data,
+                expected_portfolio_id,
+                expected_sequence,
             )?;
-            // FIX (ADOPT upstream a84b45dd/d1bff017, "collect maintenance before value
-            // debits"): crystallize this account's accrued maintenance fee against its
-            // capital BEFORE the withdraw below debits that same capital. Without this a
-            // Withdraw could dodge every maintenance fee accrued since the account's last
-            // sync -- an ongoing insurance-funding leak. A revert here (including
-            // `EngineBStale`) is acceptable: this is a user-initiated action, and the caller
-            // can crank the account current and retry.
-            let capital_before_fee = portfolio.header.capital.get();
-            collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)?;
-            // Preserve an atomic withdraw-all path when the submitted balance became stale
-            // only because this instruction just crystallized its fee: a caller who asked to
-            // withdraw exactly their pre-fee capital still gets everything left after the
-            // fee, in one instruction, instead of hitting `EngineLockActive` because `amount`
-            // now exceeds the freshly-reduced capital. Partial withdrawals remain exact.
-            let withdrawn_amount = if amount == capital_before_fee {
-                portfolio.header.capital.get()
-            } else {
-                amount
+            let withdrawn_amount = {
+                let mut portfolio = state::portfolio_view_mut_for_market_slots(
+                    &mut portfolio_data,
+                    max_market_slots,
+                )?;
+                expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                // E2: owner==signer OR signer holds the bound NFT. Optional trailing
+                // accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+                // FUND-SAFETY: the dest-token check uses `owner.key` (the SIGNER), so an
+                // NFT-holder withdrawal pays the HOLDER, never the escrow PDA.
+                let nft = optional_nft_holder_accounts(accounts, 7);
+                authorize_owner_or_nft_holder(
+                    &portfolio,
+                    portfolio_ai.key,
+                    owner.key,
+                    nft,
+                    program_id,
+                )?;
+                // FIX (ADOPT upstream a84b45dd/d1bff017, "collect maintenance before value
+                // debits"): crystallize this account's accrued maintenance fee against its
+                // capital BEFORE the withdraw below debits that same capital. Without this a
+                // Withdraw could dodge every maintenance fee accrued since the account's last
+                // sync -- an ongoing insurance-funding leak. A revert here (including
+                // `EngineBStale`) is acceptable: this is a user-initiated action, and the caller
+                // can crank the account current and retry.
+                let capital_before_fee = portfolio.header.capital.get();
+                collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)?;
+                // Preserve an atomic withdraw-all path when the submitted balance became stale
+                // only because this instruction just crystallized its fee: a caller who asked to
+                // withdraw exactly their pre-fee capital still gets everything left after the
+                // fee, in one instruction, instead of hitting `EngineLockActive` because `amount`
+                // now exceeds the freshly-reduced capital. Partial withdrawals remain exact.
+                let withdrawn_amount = if amount == capital_before_fee {
+                    portfolio.header.capital.get()
+                } else {
+                    amount
+                };
+                group
+                    .withdraw_not_atomic(&mut portfolio, withdrawn_amount)
+                    .map_err(map_v16_error)?;
+                withdrawn_amount
             };
-            group
-                .withdraw_not_atomic(&mut portfolio, withdrawn_amount)
-                .map_err(map_v16_error)?;
+            // TB-1b (ADOPT upstream 0492ebbc): one-shot -- a landed nonzero Withdraw
+            // also advances the shared sequence (same rationale as Deposit).
+            state::advance_portfolio_matcher_sequence(&mut portfolio_data, expected_sequence)?;
             withdrawn_amount
         };
         let amount_u64 = amount_to_u64(withdrawn_amount)?;
@@ -9317,6 +9645,10 @@ pub mod processor {
     }
 
     #[inline(never)]
+    // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
+    // binding params (account_{a,b}_portfolio_id/position_epoch); matches the
+    // existing allow on this file's other multi-account trade handlers.
+    #[allow(clippy::too_many_arguments)]
     fn handle_trade_nocpi_zero_copy<'a>(
         _program_id: &Pubkey,
         account_a_owner_key: &Pubkey,
@@ -9324,6 +9656,10 @@ pub mod processor {
         market_ai: &AccountInfo<'a>,
         account_a_ai: &AccountInfo<'a>,
         account_b_ai: &AccountInfo<'a>,
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
         asset_index: u16,
         size_q: i128,
         exec_price: u64,
@@ -9346,6 +9682,19 @@ pub mod processor {
             )?;
             let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
             let mut account_b_data = account_b_ai.try_borrow_mut_data()?;
+            // TB-1b (ADOPT upstream 0492ebbc): live re-check right before mutation --
+            // this is the shared low-level executor both TradeNoCpi and TradeCpi funnel
+            // through, so this is where the binding actually gates the engine call.
+            expect_portfolio_position_binding(
+                &account_a_data,
+                account_a_portfolio_id,
+                account_a_position_epoch,
+            )?;
+            expect_portfolio_position_binding(
+                &account_b_data,
+                account_b_portfolio_id,
+                account_b_position_epoch,
+            )?;
             let mut account_a =
                 state::portfolio_view_mut_for_market_slots(&mut account_a_data, max_market_slots)?;
             let mut account_b =
@@ -9759,6 +10108,10 @@ pub mod processor {
     fn handle_batch_trade_nocpi<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
         legs: &[ix::BatchTradeLeg],
     ) -> ProgramResult {
         let signer_a = account(accounts, 0)?;
@@ -9777,6 +10130,18 @@ pub mod processor {
         if account_a_ai.key == account_b_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // TB-1b (ADOPT upstream 0492ebbc): fail fast, before any market-state
+        // work, if either side's leg-binding is stale.
+        expect_portfolio_position_binding(
+            &account_a_ai.try_borrow_data()?,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+        )?;
+        expect_portfolio_position_binding(
+            &account_b_ai.try_borrow_data()?,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+        )?;
         let (cfg_pre, mode_pre, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode_pre != MarketModeV16::Live {
@@ -9797,6 +10162,10 @@ pub mod processor {
             market_ai,
             account_a_ai,
             account_b_ai,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
             legs,
             max_market_slots,
             None,
@@ -9811,6 +10180,10 @@ pub mod processor {
         market_ai: &AccountInfo<'a>,
         account_a_ai: &AccountInfo<'a>,
         account_b_ai: &AccountInfo<'a>,
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
         legs: &[ix::BatchTradeLeg],
         max_market_slots: usize,
         // ADOPT upstream 42ec8ab6: the signing taker's (account_a's) caller-supplied ceiling on
@@ -9836,6 +10209,19 @@ pub mod processor {
             }
             let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
             let mut account_b_data = account_b_ai.try_borrow_mut_data()?;
+            // TB-1b (ADOPT upstream 0492ebbc): live re-check right before mutation --
+            // shared by BatchTradeNoCpi and BatchTradeCpi (both funnel through this
+            // helper), same as the outer handlers' fail-fast checks above.
+            expect_portfolio_position_binding(
+                &account_a_data,
+                account_a_portfolio_id,
+                account_a_position_epoch,
+            )?;
+            expect_portfolio_position_binding(
+                &account_b_data,
+                account_b_portfolio_id,
+                account_b_position_epoch,
+            )?;
             let mut account_a =
                 state::portfolio_view_mut_for_market_slots(&mut account_a_data, max_market_slots)?;
             let mut account_b =
@@ -10234,9 +10620,16 @@ pub mod processor {
     }
 
     #[inline(never)]
+    // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
+    // binding params.
+    #[allow(clippy::too_many_arguments)]
     fn handle_trade_nocpi<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
         asset_index: u16,
         size_q: i128,
         exec_price: u64,
@@ -10258,6 +10651,17 @@ pub mod processor {
         if account_a_ai.key == account_b_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // TB-1b (ADOPT upstream 0492ebbc): fail fast, before any market-state work.
+        expect_portfolio_position_binding(
+            &account_a_ai.try_borrow_data()?,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+        )?;
+        expect_portfolio_position_binding(
+            &account_b_ai.try_borrow_data()?,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+        )?;
         let (cfg_pre, mode_pre, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode_pre != MarketModeV16::Live {
@@ -10275,6 +10679,10 @@ pub mod processor {
             market_ai,
             account_a_ai,
             account_b_ai,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
             asset_index,
             size_q,
             exec_price,
@@ -10734,12 +11142,30 @@ pub mod processor {
         matcher_ctx_key: &Pubkey,
         matcher_delegate_key: &Pubkey,
     ) -> Result<(usize, u16), ProgramError> {
-        let cfg = state::read_portfolio_matcher_config(&account_b_ai.try_borrow_data()?)?;
+        let account_b_data = account_b_ai.try_borrow_data()?;
+        let cfg = state::read_portfolio_matcher_config(&account_b_data)?;
         if cfg.enabled() != 1
             || cfg.matcher_program != matcher_prog_key.to_bytes()
             || cfg.matcher_context != matcher_ctx_key.to_bytes()
             || cfg.matcher_delegate != matcher_delegate_key.to_bytes()
         {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        // TB-1b (ADOPT upstream 0b838425, "expire matcher capabilities"): a
+        // `SetMatcherConfig` grant is only live while the current slot is
+        // strictly before the LP's own signed `expiry_slot` -- an expired grant
+        // (or one that was never given a `expiry_slot`, i.e. still 0) must not
+        // authorize a CPI trade even though `enabled == 1` and the
+        // program/context/delegate triple still matches.
+        //
+        // `authenticated_slot_or_fallback(0)` (never a bare `Clock::get()?`):
+        // a native/LiteSVM test harness with no Clock sysvar installed must not
+        // hard-fail every CPI trade through an already-configured, non-expiring
+        // matcher -- falling back to slot 0 preserves "live" for any nonzero
+        // `expiry_slot` (the common case) while still enforcing real expiry
+        // wherever the Clock sysvar IS available (devnet/mainnet/LiteSVM).
+        let expiry_slot = state::read_portfolio_matcher_expiry(&account_b_data)?;
+        if !state::matcher_capability_is_live(expiry_slot, authenticated_slot_or_fallback(0)) {
             return Err(PercolatorError::Unauthorized.into());
         }
         Ok((7, cfg.trade_fee_cap_bps()))
@@ -10787,9 +11213,16 @@ pub mod processor {
     }
 
     #[inline(never)]
+    // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
+    // binding params.
+    #[allow(clippy::too_many_arguments)]
     fn handle_trade_cpi<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
         asset_index: u16,
         size_q: i128,
         fee_bps: u64,
@@ -10859,6 +11292,20 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineProvenanceMismatch.into());
         }
+        // TB-1b (ADOPT upstream 0492ebbc): incarnation + position-episode binding,
+        // in addition to the account-KEY binding just above. Re-borrows are cheap
+        // (both accounts' data was already borrowed transiently for the preflight
+        // reads above, and those borrows have already been dropped).
+        expect_portfolio_position_binding(
+            &account_a_ai.try_borrow_data()?,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+        )?;
+        expect_portfolio_position_binding(
+            &account_b_ai.try_borrow_data()?,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+        )?;
         // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
         // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
         // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
@@ -10983,6 +11430,10 @@ pub mod processor {
             market_ai,
             account_a_ai,
             account_b_ai,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
             asset_index,
             ret.exec_size,
             ret.exec_price_e6,
@@ -11013,10 +11464,27 @@ pub mod processor {
     fn handle_set_matcher_config<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        portfolio_id: u64,
+        expected_sequence: u64,
         enabled: u8,
         trade_fee_cap_bps: u16,
+        expiry_slot: u64,
     ) -> ProgramResult {
-        if enabled > 1 || trade_fee_cap_bps > 10_000 || (enabled == 0 && trade_fee_cap_bps != 0) {
+        // TB-1b (ADOPT upstream 0b838425, "expire matcher capabilities"): replaces
+        // the old bespoke `enabled > 1 || ... ` bound check with the shared
+        // predicate that also enforces the `expiry_slot` shape (0 when disabling,
+        // a live future slot when granting). `authenticated_slot_or_fallback(0)`
+        // (never a bare `Clock::get()?`) -- see the matching comment on
+        // `matcher_tail_start_or_verify_lp_config` above for why: a native/
+        // LiteSVM test harness with no Clock sysvar must not hard-fail every
+        // SetMatcherConfig call.
+        let current_slot = authenticated_slot_or_fallback(0);
+        if !state::matcher_capability_config_is_valid(
+            enabled,
+            trade_fee_cap_bps,
+            expiry_slot,
+            current_slot,
+        ) {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let lp_owner = account(accounts, 0)?;
@@ -11034,13 +11502,43 @@ pub mod processor {
         {
             return Err(PercolatorError::Unauthorized.into());
         }
+        // TB-1b (ADOPT upstream 597f8dcc, "sequence-bind matcher consent
+        // mutations"): a SetMatcherConfig granting/revoking matcher trust must
+        // supply the account's CURRENT portfolio_id + sequence -- otherwise a
+        // stale/replayed authorization (e.g. one built before the LP itself
+        // revoked and re-registered a matcher) could re-grant trust the LP no
+        // longer intends. Shares the same retained-owner-state sequence lane as
+        // Deposit/Withdraw.
+        expect_portfolio_sequence_binding(
+            &lp_portfolio_ai.try_borrow_data()?,
+            portfolio_id,
+            expected_sequence,
+        )?;
         // ADOPT upstream 2c8c5ba3 (LENGTH half only): consolidate onto the shared
         // `ensure_portfolio_storage_for_market_slots` helper instead of a bespoke
         // grow-only check, so this call site also picks up the oversized-account
         // rejection added there.
         ensure_portfolio_storage_for_market_slots(lp_portfolio_ai, 0)?;
+        // TB-1b (ADOPT upstream's current `prior_control` pattern, beyond the 5
+        // named SHAs but load-bearing for this unit): the branches below used to
+        // rebuild the WHOLE control word from `0`/`default()`, which silently
+        // reset `position_epoch` to 0 on every SetMatcherConfig call. That would
+        // let a portfolio owner rewind their own position-episode counter and
+        // resurrect a stale signed Trade/ForfeitRecoveryLeg/RebalanceReduce/
+        // ConvertReleasedPnl/CureAndCancelClose built against the old (lower)
+        // episode -- defeating the position_epoch binding this unit wires
+        // everywhere else. Carry the account's CURRENT control word forward so
+        // only the ENABLED_MASK/TRADE_FEE_CAP_MASK bits `set_enabled`/
+        // `set_trade_fee_cap_bps` below actually touch change; POSITION_EPOCH_MASK
+        // is untouched (the two mask ranges are disjoint, per the compile-time
+        // guard above).
+        let prior_control =
+            state::read_portfolio_matcher_config(&lp_portfolio_ai.try_borrow_data()?)?.control;
         let mut cfg = if enabled == 0 {
-            state::PortfolioMatcherConfigV16::default()
+            state::PortfolioMatcherConfigV16 {
+                control: prior_control,
+                ..state::PortfolioMatcherConfigV16::default()
+            }
         } else {
             let matcher_prog = account(accounts, 3)?;
             let matcher_ctx = account(accounts, 4)?;
@@ -11066,12 +11564,21 @@ pub mod processor {
                 matcher_program: matcher_prog.key.to_bytes(),
                 matcher_context: matcher_ctx.key.to_bytes(),
                 matcher_delegate: matcher_delegate.key.to_bytes(),
-                control: 0,
+                control: prior_control,
             }
         };
         cfg.set_enabled(enabled)?;
         cfg.set_trade_fee_cap_bps(trade_fee_cap_bps)?;
-        state::write_portfolio_matcher_config(&mut lp_portfolio_ai.try_borrow_mut_data()?, &cfg)
+        let mut data = lp_portfolio_ai.try_borrow_mut_data()?;
+        state::write_portfolio_matcher_config(&mut data, &cfg)?;
+        // TB-1b (ADOPT upstream 0b838425): persist the caller's `expiry_slot`
+        // grant (already validated live-or-zero above by
+        // `matcher_capability_config_is_valid`).
+        state::write_portfolio_matcher_expiry(&mut data, expiry_slot)?;
+        // TB-1b (ADOPT upstream 597f8dcc): one-shot -- advance the shared
+        // sequence so this authorization cannot replay.
+        state::advance_portfolio_matcher_sequence(&mut data, expected_sequence)?;
+        Ok(())
     }
 
     /// InitMatcherCtx (tag 83) — bootstrap a matcher context via CPI.
@@ -11343,14 +11850,20 @@ pub mod processor {
     /// anti-spoof binding as the single-fill path, and all fills then apply through the batch
     /// engine path with one end-state margin check.
     #[inline(never)]
+    // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
+    // binding params.
+    #[allow(clippy::too_many_arguments)]
     fn handle_batch_trade_cpi<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
         // ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent": the taker's signed
-        // aggregate ceilings across every leg of this batch. Upstream's variant also carries
-        // `account_b_portfolio_id`/`account_b_position_epoch`/`account_b_matcher_sequence`
-        // (TB-1's portfolio-identity bloc); this fork has none of those fields yet, so only the
-        // two consent-cap fields are ported (see `ADOPTION_ROADMAP.md`).
+        // aggregate ceilings across every leg of this batch. TB-1b now also ports upstream's
+        // `account_{a,b}_portfolio_id`/`account_{a,b}_position_epoch` identity fields onto
+        // this variant (see the `BatchTradeCpi` doc comment).
         max_slippage_atoms: u128,
         max_fee_atoms: u128,
         legs: &[ix::BatchTradeCpiLeg],
@@ -11383,6 +11896,17 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // TB-1b (ADOPT upstream 0492ebbc): fail fast, before any market-state work.
+        expect_portfolio_position_binding(
+            &account_a_ai.try_borrow_data()?,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+        )?;
+        expect_portfolio_position_binding(
+            &account_b_ai.try_borrow_data()?,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+        )?;
 
         // Preflight: market must be Live, the taker owner must sign, and each leg's oracle price
         // is read for matcher request/return binding.
@@ -11611,6 +12135,10 @@ pub mod processor {
             market_ai,
             account_a_ai,
             account_b_ai,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
             &exec_legs,
             max_market_slots,
             Some(max_fee_atoms),
@@ -11623,6 +12151,9 @@ pub mod processor {
     fn handle_close_portfolio<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_sequence: u64,
+        expected_position_epoch: u64,
     ) -> ProgramResult {
         let closer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -11640,6 +12171,28 @@ pub mod processor {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+            // TB-1b (ADOPT upstream d60f15a1, "bind portfolio close to funded
+            // state"): live re-check right before mutation, against ALL THREE
+            // identity fields at once. Without this, a ClosePortfolio built while
+            // the account was empty could still land -- and deregister the
+            // portfolio as an "empty" close -- after a Deposit/trade/cure/forfeit
+            // funded or re-opened it in the meantime, since
+            // `deregister_empty_materialized_portfolio_not_atomic` only validates
+            // the engine's OWN emptiness invariant, not that the caller's mental
+            // model of "empty" is still current.
+            let current_portfolio_id = state::read_portfolio_id(&portfolio_data)?;
+            let current_sequence = state::read_portfolio_matcher_sequence(&portfolio_data)?;
+            let current_position_epoch = state::read_portfolio_position_epoch(&portfolio_data)?;
+            if !state::portfolio_close_binding_matches(
+                current_portfolio_id,
+                current_sequence,
+                current_position_epoch,
+                expected_portfolio_id,
+                expected_sequence,
+                expected_position_epoch,
+            ) {
+                return Err(PercolatorError::EngineStale.into());
+            }
             let portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
@@ -14662,12 +15215,19 @@ pub mod processor {
     fn handle_convert_released_pnl<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
         amount: u128,
     ) -> ProgramResult {
         if amount == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, cfg| {
+        with_one_portfolio_view(
+            program_id,
+            accounts,
+            true,
+            Some((expected_portfolio_id, expected_position_epoch)),
+            |group, portfolio, cfg| {
             if group.header.mode != 0 {
                 return Err(V16Error::LockActive);
             }
@@ -14689,6 +15249,8 @@ pub mod processor {
     fn handle_cure_and_cancel_close<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
         optional_deposit: u128,
     ) -> ProgramResult {
         let owner = account(accounts, 0)?;
@@ -14703,6 +15265,26 @@ pub mod processor {
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
+        // TB-1b (ADOPT upstream 7453c7cd, "bind retained actions to position
+        // episodes"): a Cure is retained-value-mutating (it cancels a pending
+        // close and can accept a top-up deposit), so it binds to the SAME
+        // position_epoch as the trade family and the other with_one_portfolio_view
+        // callers -- not the matcher-consent sequence (Deposit/Withdraw/
+        // SetMatcherConfig's lane), since Cure has nothing to do with matcher
+        // trust.
+        {
+            let portfolio_data = portfolio_ai.try_borrow_data()?;
+            let current_portfolio_id = state::read_portfolio_id(&portfolio_data)?;
+            let current_position_epoch = state::read_portfolio_position_epoch(&portfolio_data)?;
+            if !state::portfolio_position_binding_matches(
+                current_portfolio_id,
+                current_position_epoch,
+                expected_portfolio_id,
+                expected_position_epoch,
+            ) {
+                return Err(PercolatorError::EngineProvenanceMismatch.into());
+            }
+        }
 
         let amount_u64 = if optional_deposit != 0 {
             let source_token = account(accounts, 3)?;
@@ -14732,21 +15314,44 @@ pub mod processor {
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
-            let mut portfolio =
-                state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
-            expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 6.
-            let nft = optional_nft_holder_accounts(accounts, 6);
-            authorize_owner_or_nft_holder(
-                &portfolio,
-                portfolio_ai.key,
-                owner.key,
-                nft,
-                program_id,
-            )?;
-            group
-                .cure_and_cancel_close_not_atomic(&mut portfolio, optional_deposit)
-                .map_err(map_v16_error)?;
+            // TB-1b: live re-check right before mutation.
+            {
+                let current_portfolio_id = state::read_portfolio_id(&portfolio_data)?;
+                let current_position_epoch =
+                    state::read_portfolio_position_epoch(&portfolio_data)?;
+                if !state::portfolio_position_binding_matches(
+                    current_portfolio_id,
+                    current_position_epoch,
+                    expected_portfolio_id,
+                    expected_position_epoch,
+                ) {
+                    return Err(PercolatorError::EngineProvenanceMismatch.into());
+                }
+            }
+            {
+                let mut portfolio = state::portfolio_view_mut_for_market_slots(
+                    &mut portfolio_data,
+                    max_market_slots,
+                )?;
+                expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 6.
+                let nft = optional_nft_holder_accounts(accounts, 6);
+                authorize_owner_or_nft_holder(
+                    &portfolio,
+                    portfolio_ai.key,
+                    owner.key,
+                    nft,
+                    program_id,
+                )?;
+                group
+                    .cure_and_cancel_close_not_atomic(&mut portfolio, optional_deposit)
+                    .map_err(map_v16_error)?;
+            }
+            // TB-1b (ADOPT upstream 7453c7cd): one-shot -- a landed Cure always
+            // advances the position_epoch, so a stale Trade/ForfeitRecoveryLeg/
+            // RebalanceReduce/ConvertReleasedPnl/CureAndCancelClose built against
+            // the pre-cure episode can never replay against this account again.
+            state::bump_portfolio_position_epoch(&mut portfolio_data)?;
         }
 
         if let Some((amount_u64, source_token, vault_token, token_program)) = amount_u64 {
@@ -14765,13 +15370,20 @@ pub mod processor {
     fn handle_forfeit_recovery_leg<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
         asset_index: u16,
         b_loss_atom_budget: u128,
     ) -> ProgramResult {
         if b_loss_atom_budget == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, cfg| {
+        with_one_portfolio_view(
+            program_id,
+            accounts,
+            true,
+            Some((expected_portfolio_id, expected_position_epoch)),
+            |group, portfolio, cfg| {
             // W-23(b, maturity half): restore the upstream maturity gate dropped in
             // our port. Once a market has matured into a permissionless resolve, an
             // owner-signed forfeit must not still mutate positions — the same gate
@@ -14807,13 +15419,20 @@ pub mod processor {
     fn handle_rebalance_reduce<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
         asset_index: u16,
         reduce_q: u128,
     ) -> ProgramResult {
         if reduce_q == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        with_one_portfolio_view(program_id, accounts, true, |group, portfolio, cfg| {
+        with_one_portfolio_view(
+            program_id,
+            accounts,
+            true,
+            Some((expected_portfolio_id, expected_position_epoch)),
+            |group, portfolio, cfg| {
             // #446: restore the upstream maturity gate dropped in our port. Once a
             // market has matured into a permissionless resolve, an owner-signed
             // rebalance-reduce must not still mutate positions — the same gate guards
@@ -20862,6 +21481,63 @@ pub mod processor {
         Ok(())
     }
 
+    /// TB-1b: the base portfolio-INCARNATION binding (ADOPT upstream `cf0ce5d3`).
+    /// `expect_portfolio_view_account_key` above binds an instruction to the
+    /// ACCOUNT (pubkey); this binds it to the specific INCARNATION currently
+    /// living in that account -- `portfolio_id` is reassigned every
+    /// `InitPortfolio`, so a caller-supplied `portfolio_id` that no longer
+    /// matches the account's live value means this instruction was built
+    /// against a portfolio that has since been closed and replaced.
+    fn expect_portfolio_id(
+        data: &[u8],
+        expected_portfolio_id: u64,
+    ) -> Result<(), ProgramError> {
+        if state::read_portfolio_id(data)? != expected_portfolio_id {
+            return Err(PercolatorError::EngineProvenanceMismatch.into());
+        }
+        Ok(())
+    }
+
+    /// TB-1b: incarnation + matcher-consent-sequence binding (ADOPT upstream
+    /// `0492ebbc`'s `expect_portfolio_sequence_binding`). `Deposit`, `Withdraw`,
+    /// and `SetMatcherConfig` all consume the SAME shared retained-owner-state
+    /// sequence: each caller must supply the account's CURRENT sequence value,
+    /// and the instruction advances it by one on success, so a replayed or
+    /// out-of-order retained-value mutation (built against a since-superseded
+    /// sequence) is rejected rather than silently reapplied.
+    fn expect_portfolio_sequence_binding(
+        data: &[u8],
+        expected_portfolio_id: u64,
+        expected_sequence: u64,
+    ) -> Result<(), ProgramError> {
+        expect_portfolio_id(data, expected_portfolio_id)?;
+        state::next_portfolio_matcher_sequence(
+            state::read_portfolio_matcher_sequence(data)?,
+            expected_sequence,
+        )?;
+        Ok(())
+    }
+
+    /// TB-1b: incarnation + position-episode binding (ADOPT upstream
+    /// `0492ebbc`'s `expect_portfolio_position_binding`). The trade family
+    /// (`TradeNoCpi`/`TradeCpi`/`BatchTradeNoCpi`/`BatchTradeCpi`) binds each
+    /// side to that account's CURRENT `position_epoch` -- an episode counter
+    /// that only advances on a retained action that can change what "this
+    /// portfolio's positions" even means (close, cure, forfeit, rebalance) --
+    /// so a trade cannot land against a stale mental model of the account's
+    /// open positions.
+    fn expect_portfolio_position_binding(
+        data: &[u8],
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
+    ) -> Result<(), ProgramError> {
+        expect_portfolio_id(data, expected_portfolio_id)?;
+        if state::read_portfolio_position_epoch(data)? != expected_position_epoch {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        Ok(())
+    }
+
     fn portfolio_has_active_asset_view(
         group: &state::MarketViewMutV16<'_>,
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
@@ -21198,6 +21874,14 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         owner_must_sign: bool,
+        // TB-1b (ADOPT upstream 7453c7cd, "bind retained actions to position
+        // episodes"): `Some((expected_portfolio_id, expected_position_epoch))`
+        // binds this call to a SPECIFIC funded episode of the portfolio -- used
+        // by every current caller (`ConvertReleasedPnl`, `ForfeitRecoveryLeg`,
+        // `RebalanceReduce`), all of which mutate a specific episode's residual/
+        // position state and must not silently apply to whatever episode happens
+        // to be live when the transaction lands.
+        position_binding: Option<(u64, u64)>,
         f: F,
     ) -> ProgramResult
     where
@@ -21223,6 +21907,27 @@ pub mod processor {
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
         let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+        if let Some((expected_portfolio_id, expected_position_epoch)) = position_binding {
+            // TB-1b: live re-check right before mutation. Uses
+            // `portfolio_position_binding_matches` directly (not the
+            // `expect_portfolio_position_binding` helper the trade routes use)
+            // so a binding mismatch here reports `EngineProvenanceMismatch`,
+            // matching `CureAndCancelClose`'s own inline check below (this
+            // fork's `ClosePortfolio` uses `EngineStale` for its 3-way close
+            // binding, and the trade routes use `EngineStale` for their
+            // position binding -- both intentionally distinct error surfaces
+            // ported verbatim from the upstream commits that introduced them).
+            let current_portfolio_id = state::read_portfolio_id(&portfolio_data)?;
+            let current_position_epoch = state::read_portfolio_position_epoch(&portfolio_data)?;
+            if !state::portfolio_position_binding_matches(
+                current_portfolio_id,
+                current_position_epoch,
+                expected_portfolio_id,
+                expected_position_epoch,
+            ) {
+                return Err(PercolatorError::EngineProvenanceMismatch.into());
+            }
+        }
         let mut portfolio =
             state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
         expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
@@ -23483,6 +24188,369 @@ pub mod processor {
                 9_999,
                 "position_epoch bumps must not touch bits50..63"
             );
+        }
+
+        // ── TB-1b: the 12-tag portfolio-identity BINDING enforcement (ADOPT
+        // upstream cf0ce5d3/d60f15a1/381c408a/7453c7cd/0492ebbc, adapted to this
+        // fork's tree/naming). These prove the composed binding helpers wired
+        // into every tag handler actually reject stale/mismatched identity
+        // (inv_002/004/008/012-equivalent), and that the wire format for a
+        // representative sample of the 12 tags round-trips its new identity
+        // fields exactly. ──────────────────────────────────────────────────
+
+        #[test]
+        fn expect_portfolio_id_rejects_stale_incarnation_accepts_current() {
+            let data = init_test_portfolio(7);
+            assert_eq!(expect_portfolio_id(&data, 7), Ok(()));
+            assert_eq!(
+                expect_portfolio_id(&data, 6),
+                Err(PercolatorError::EngineProvenanceMismatch.into()),
+                "a portfolio_id built against a since-closed-and-reopened incarnation must be rejected"
+            );
+            assert_eq!(
+                expect_portfolio_id(&data, 8),
+                Err(PercolatorError::EngineProvenanceMismatch.into())
+            );
+        }
+
+        #[test]
+        fn expect_portfolio_sequence_binding_rejects_stale_sequence_and_wrong_id() {
+            let mut data = init_test_portfolio(3);
+            // Current sequence is 0 at InitPortfolio.
+            assert_eq!(expect_portfolio_sequence_binding(&data, 3, 0), Ok(()));
+            // Wrong portfolio_id, even with the correct sequence, is rejected.
+            assert_eq!(
+                expect_portfolio_sequence_binding(&data, 4, 0),
+                Err(PercolatorError::EngineProvenanceMismatch.into())
+            );
+            // Correct portfolio_id but stale sequence (as if a Deposit already
+            // landed and advanced it) is rejected with EngineStale, not silently
+            // re-applied.
+            state::advance_portfolio_matcher_sequence(&mut data, 0).unwrap();
+            assert_eq!(
+                expect_portfolio_sequence_binding(&data, 3, 0),
+                Err(PercolatorError::EngineStale.into()),
+                "a Deposit/Withdraw/SetMatcherConfig built against the pre-advance sequence must not replay"
+            );
+            assert_eq!(expect_portfolio_sequence_binding(&data, 3, 1), Ok(()));
+        }
+
+        #[test]
+        fn expect_portfolio_position_binding_rejects_stale_episode_and_wrong_id() {
+            let mut data = init_test_portfolio(5);
+            assert_eq!(expect_portfolio_position_binding(&data, 5, 0), Ok(()));
+            assert_eq!(
+                expect_portfolio_position_binding(&data, 9, 0),
+                Err(PercolatorError::EngineProvenanceMismatch.into())
+            );
+            // A Trade/TradeCpi/BatchTrade{NoCpi,Cpi} signed against position_epoch
+            // 0 must be rejected with EngineStale once a retained action (cure/
+            // forfeit/rebalance/close) has advanced the episode -- NOT silently
+            // admitted against the new episode's positions.
+            state::bump_portfolio_position_epoch(&mut data).unwrap();
+            assert_eq!(
+                expect_portfolio_position_binding(&data, 5, 0),
+                Err(PercolatorError::EngineStale.into()),
+                "a trade signed against the pre-cure/forfeit/rebalance episode must not land against the new one"
+            );
+            assert_eq!(expect_portfolio_position_binding(&data, 5, 1), Ok(()));
+        }
+
+        #[test]
+        fn portfolio_close_binding_matches_requires_all_three_fields_simultaneously() {
+            // ClosePortfolio (d60f15a1) binds portfolio_id + sequence + position_epoch
+            // all at once -- ANY one moving on (a Deposit bumping sequence, a
+            // trade/cure/forfeit/rebalance bumping position_epoch, or a prior
+            // close+reopen bumping portfolio_id) must invalidate a stale close.
+            assert!(state::portfolio_close_binding_matches(1, 2, 3, 1, 2, 3));
+            assert!(!state::portfolio_close_binding_matches(1, 2, 3, 9, 2, 3));
+            assert!(!state::portfolio_close_binding_matches(1, 2, 3, 1, 9, 3));
+            assert!(!state::portfolio_close_binding_matches(1, 2, 3, 1, 2, 9));
+        }
+
+        #[test]
+        fn close_portfolio_rejects_stale_close_after_a_deposit_advances_sequence() {
+            // Reproduces the exact upstream d60f15a1 scenario this binding exists
+            // for: an attacker/racer builds a ClosePortfolio while the account is
+            // empty (sequence=0, position_epoch=0), then a Deposit lands first and
+            // advances the sequence -- the stale close must now be rejected rather
+            // than tearing down a freshly-funded account.
+            let mut data = init_test_portfolio(1);
+            let (portfolio_id, sequence, position_epoch) = (
+                state::read_portfolio_id(&data).unwrap(),
+                state::read_portfolio_matcher_sequence(&data).unwrap(),
+                state::read_portfolio_position_epoch(&data).unwrap(),
+            );
+            assert!(state::portfolio_close_binding_matches(
+                portfolio_id,
+                sequence,
+                position_epoch,
+                portfolio_id,
+                sequence,
+                position_epoch,
+            ));
+            // A Deposit lands: advances the shared sequence.
+            state::advance_portfolio_matcher_sequence(&mut data, sequence).unwrap();
+            let current_sequence = state::read_portfolio_matcher_sequence(&data).unwrap();
+            assert_ne!(current_sequence, sequence);
+            assert!(
+                !state::portfolio_close_binding_matches(
+                    portfolio_id,
+                    current_sequence,
+                    position_epoch,
+                    portfolio_id,
+                    sequence, // the STALE, pre-deposit sequence the close was built against
+                    position_epoch,
+                ),
+                "a ClosePortfolio built before the Deposit landed must not match post-deposit state"
+            );
+        }
+
+        #[test]
+        fn portfolio_position_binding_matches_requires_both_fields() {
+            assert!(state::portfolio_position_binding_matches(1, 2, 1, 2));
+            assert!(!state::portfolio_position_binding_matches(1, 2, 9, 2));
+            assert!(!state::portfolio_position_binding_matches(1, 2, 1, 9));
+        }
+
+        #[test]
+        fn deposit_wire_roundtrip_carries_portfolio_id_and_sequence() {
+            let ix = ix::Instruction::Deposit {
+                portfolio_id: 11,
+                expected_sequence: 4,
+                amount: 12345,
+            };
+            let bytes = ix.encode();
+            let decoded = ix::Instruction::decode(&bytes).unwrap();
+            match decoded {
+                ix::Instruction::Deposit {
+                    portfolio_id,
+                    expected_sequence,
+                    amount,
+                } => {
+                    assert_eq!(portfolio_id, 11);
+                    assert_eq!(expected_sequence, 4);
+                    assert_eq!(amount, 12345);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn close_portfolio_wire_roundtrip_carries_three_way_binding() {
+            let ix = ix::Instruction::ClosePortfolio {
+                portfolio_id: 3,
+                expected_sequence: 7,
+                position_epoch: 2,
+            };
+            let bytes = ix.encode();
+            let decoded = ix::Instruction::decode(&bytes).unwrap();
+            match decoded {
+                ix::Instruction::ClosePortfolio {
+                    portfolio_id,
+                    expected_sequence,
+                    position_epoch,
+                } => {
+                    assert_eq!(portfolio_id, 3);
+                    assert_eq!(expected_sequence, 7);
+                    assert_eq!(position_epoch, 2);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn trade_nocpi_wire_roundtrip_carries_both_accounts_identity() {
+            let ix = ix::Instruction::TradeNoCpi {
+                account_a_portfolio_id: 1,
+                account_a_position_epoch: 2,
+                account_b_portfolio_id: 3,
+                account_b_position_epoch: 4,
+                asset_index: 5,
+                size_q: -6,
+                exec_price: 7,
+                fee_bps: 8,
+            };
+            let bytes = ix.encode();
+            let decoded = ix::Instruction::decode(&bytes).unwrap();
+            match decoded {
+                ix::Instruction::TradeNoCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    asset_index,
+                    size_q,
+                    exec_price,
+                    fee_bps,
+                } => {
+                    assert_eq!(account_a_portfolio_id, 1);
+                    assert_eq!(account_a_position_epoch, 2);
+                    assert_eq!(account_b_portfolio_id, 3);
+                    assert_eq!(account_b_position_epoch, 4);
+                    assert_eq!(asset_index, 5);
+                    assert_eq!(size_q, -6);
+                    assert_eq!(exec_price, 7);
+                    assert_eq!(fee_bps, 8);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn batch_trade_cpi_wire_roundtrip_carries_identity_and_fork_only_consent_caps() {
+            // Confirms TB-1b's new identity fields coexist with this fork's
+            // pre-existing (upstream 42ec8ab6) `max_slippage_atoms`/`max_fee_atoms`
+            // consent-cap fields without clobbering them.
+            let ix = ix::Instruction::BatchTradeCpi {
+                account_a_portfolio_id: 21,
+                account_a_position_epoch: 22,
+                account_b_portfolio_id: 23,
+                account_b_position_epoch: 24,
+                max_slippage_atoms: 100,
+                max_fee_atoms: 200,
+                legs: alloc::vec![ix::BatchTradeCpiLeg {
+                    asset_index: 0,
+                    size_q: 1,
+                    fee_bps: 2,
+                    limit_price: 3,
+                }],
+            };
+            let bytes = ix.encode();
+            let decoded = ix::Instruction::decode(&bytes).unwrap();
+            match decoded {
+                ix::Instruction::BatchTradeCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    max_slippage_atoms,
+                    max_fee_atoms,
+                    legs,
+                } => {
+                    assert_eq!(account_a_portfolio_id, 21);
+                    assert_eq!(account_a_position_epoch, 22);
+                    assert_eq!(account_b_portfolio_id, 23);
+                    assert_eq!(account_b_position_epoch, 24);
+                    assert_eq!(max_slippage_atoms, 100);
+                    assert_eq!(max_fee_atoms, 200);
+                    assert_eq!(legs.len(), 1);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn set_matcher_config_wire_roundtrip_carries_sequence_and_expiry() {
+            let ix = ix::Instruction::SetMatcherConfig {
+                portfolio_id: 9,
+                expected_sequence: 1,
+                enabled: 1,
+                trade_fee_cap_bps: 250,
+                expiry_slot: 999,
+            };
+            let bytes = ix.encode();
+            let decoded = ix::Instruction::decode(&bytes).unwrap();
+            match decoded {
+                ix::Instruction::SetMatcherConfig {
+                    portfolio_id,
+                    expected_sequence,
+                    enabled,
+                    trade_fee_cap_bps,
+                    expiry_slot,
+                } => {
+                    assert_eq!(portfolio_id, 9);
+                    assert_eq!(expected_sequence, 1);
+                    assert_eq!(enabled, 1);
+                    assert_eq!(trade_fee_cap_bps, 250);
+                    assert_eq!(expiry_slot, 999);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn forfeit_recovery_leg_and_rebalance_reduce_wire_roundtrip_carry_position_binding() {
+            let forfeit = ix::Instruction::ForfeitRecoveryLeg {
+                portfolio_id: 6,
+                position_epoch: 2,
+                asset_index: 1,
+                b_loss_atom_budget: 500,
+            };
+            match ix::Instruction::decode(&forfeit.encode()).unwrap() {
+                ix::Instruction::ForfeitRecoveryLeg {
+                    portfolio_id,
+                    position_epoch,
+                    asset_index,
+                    b_loss_atom_budget,
+                } => {
+                    assert_eq!(portfolio_id, 6);
+                    assert_eq!(position_epoch, 2);
+                    assert_eq!(asset_index, 1);
+                    assert_eq!(b_loss_atom_budget, 500);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+
+            let rebalance = ix::Instruction::RebalanceReduce {
+                portfolio_id: 6,
+                position_epoch: 2,
+                asset_index: 1,
+                reduce_q: 500,
+            };
+            match ix::Instruction::decode(&rebalance.encode()).unwrap() {
+                ix::Instruction::RebalanceReduce {
+                    portfolio_id,
+                    position_epoch,
+                    asset_index,
+                    reduce_q,
+                } => {
+                    assert_eq!(portfolio_id, 6);
+                    assert_eq!(position_epoch, 2);
+                    assert_eq!(asset_index, 1);
+                    assert_eq!(reduce_q, 500);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn cure_and_cancel_close_and_convert_released_pnl_wire_roundtrip_carry_position_binding() {
+            let cure = ix::Instruction::CureAndCancelClose {
+                portfolio_id: 8,
+                position_epoch: 1,
+                optional_deposit: 77,
+            };
+            match ix::Instruction::decode(&cure.encode()).unwrap() {
+                ix::Instruction::CureAndCancelClose {
+                    portfolio_id,
+                    position_epoch,
+                    optional_deposit,
+                } => {
+                    assert_eq!(portfolio_id, 8);
+                    assert_eq!(position_epoch, 1);
+                    assert_eq!(optional_deposit, 77);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+
+            let convert = ix::Instruction::ConvertReleasedPnl {
+                portfolio_id: 8,
+                position_epoch: 1,
+                amount: 33,
+            };
+            match ix::Instruction::decode(&convert.encode()).unwrap() {
+                ix::Instruction::ConvertReleasedPnl {
+                    portfolio_id,
+                    position_epoch,
+                    amount,
+                } => {
+                    assert_eq!(portfolio_id, 8);
+                    assert_eq!(position_epoch, 1);
+                    assert_eq!(amount, 33);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
         }
     }
 }
