@@ -4143,6 +4143,16 @@ fn v16_bpf_permissionless_asset_cannot_withdraw_unrelated_domain_insurance() {
     let attacker = Keypair::new();
     env.update_market_init_fee_policy_with_cu(1);
     env.svm.warp_to_slot(3);
+    // Pre-grow the market account's raw byte buffer through the harness path (see
+    // `grow_market_capacity_for_test`'s doc comment): the account was injected via
+    // `svm.set_account()`, so it cannot cross the ~10,240-byte LiteSVM realloc ceiling
+    // through `ActivateAsset`'s own on-chain `market_ai.realloc()` -- this market is
+    // already at capacity 3 (assets 0..2) and asset_index 3 needs capacity 4, which
+    // crosses that ceiling at the current `MARKET_ASSET_SLOT_LEN`. This only pre-sizes
+    // the raw account length; `ActivateAsset` still performs every one of its usual
+    // checks and writes, it just finds `asset_index < capacity_pre` already true and
+    // skips its own (here-unusable) realloc call.
+    env.grow_market_capacity_for_test(4);
     let (_fee_source, _cu) = env.activate_permissionless_asset_with_fee(
         &attacker,
         3,
@@ -4588,6 +4598,16 @@ fn v16_bpf_permissionless_oracle_liquidation_uses_only_its_own_domain_insurance(
 
     env.update_market_init_fee_policy_with_cu(1);
     env.svm.warp_to_slot(3);
+    // Pre-grow the market account's raw byte buffer through the harness path (see
+    // `grow_market_capacity_for_test`'s doc comment): the account was injected via
+    // `svm.set_account()`, so it cannot cross the ~10,240-byte LiteSVM realloc ceiling
+    // through `ActivateAsset`'s own on-chain `market_ai.realloc()` -- this market is
+    // already at capacity 3 (assets 0..2) and asset_index 3 needs capacity 4, which
+    // crosses that ceiling at the current `MARKET_ASSET_SLOT_LEN`. This only pre-sizes
+    // the raw account length; `ActivateAsset` still performs every one of its usual
+    // checks and writes, it just finds `asset_index < capacity_pre` already true and
+    // skips its own (here-unusable) realloc call.
+    env.grow_market_capacity_for_test(4);
     env.activate_permissionless_asset_with_fee(
         &attacker,
         3,
