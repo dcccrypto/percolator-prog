@@ -9200,6 +9200,148 @@ fn v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap() {
     );
 }
 
+// Follow-up to `v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap` above
+// (sync/w3b-backing-fee-consent gate-2 follow-up): that test only ever exercises account_b's
+// (the maker's) `backing_fee_cap_bps` check -- it is account_b who is capitalized short and
+// draws the NEW counterparty-backed lien from domain 1, so account_b's
+// `collect_backing_domain_fees_for_account_view` call is the only one that ever sees a
+// nonzero delta (`after > before_val`) there. account_a's (the taker's) own call in that same
+// test always observes a zero delta and passes vacuously -- it never actually exercises the
+// `backing_fee_cap_bps.is_some_and(|cap| bps > cap)` comparison on account_a's side, even
+// though `apply_backing_domain_fees_after_trade_view` threads a genuinely separate
+// `account_a_backing_fee_cap_bps` argument through `handle_trade_nocpi_zero_copy` for exactly
+// this case. This test mirrors the attack above with capitalization swapped so the TAKER
+// (account_a) is the side that draws the lien instead, forcing a nonzero delta through
+// account_a's own cap check.
+#[test]
+fn v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap_taker_draws_lien() {
+    let mut env = V16CuEnv::new();
+
+    // Same fixture shape as `v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap`
+    // above, but capitalization is SWAPPED: the taker (account_a) is now the side capitalized
+    // far short of the margin this trade needs (and holds the domain-1 source positive PnL),
+    // so the engine must draw the NEW counterparty-backed lien from domain 1 onto account_a's
+    // side, not account_b's. Both signers still co-sign the SAME `backing_fee_cap_bps` value
+    // on the ix (TradeNoCpi has no separate per-account cap field), but the engine enforces it
+    // via two independent per-account calls -- this exercises the account_a one.
+    env.update_backing_fee_policy_with_cu(1, 50, 5_000);
+
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker_account = env.create_portfolio(&taker_owner);
+    let maker_account = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker_account, 100);
+    env.deposit(&maker_owner, maker_account, 1_000_000);
+    env.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+    env.add_source_positive_pnl(taker_account, 1, 500_000);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let maker_before = env.svm.get_account(&maker_account).unwrap();
+
+    // ATTACK: the co-signed cap (10 bps) sits BELOW the domain's real 50bps fee. The trade
+    // would incur a real backing-domain fee on account_a's (taker's) own new lien draw above
+    // what was consented to -- must be REJECTED.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: -(3 * POS_SCALE as i128),
+                exec_price: 100,
+                fee_bps: 0,
+                backing_fee_cap_bps: 10,
+            },
+            vec![
+                AccountMeta::new(taker_owner.pubkey(), true),
+                AccountMeta::new(maker_owner.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(maker_account, false),
+            ],
+            &[&taker_owner, &maker_owner],
+        )
+        .expect_err(
+            "a direct TradeNoCpi where the TAKER's own new backing-domain lien draw would \
+             incur a fee ABOVE the co-signed cap must be REJECTED, not silently charged",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::Unauthorized as u32),
+        "expected Unauthorized from account_a's backing-fee-cap consent check; got {err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected TradeNoCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected TradeNoCpi must not mutate the taker's portfolio -- in particular it must \
+         not create the new counterparty-backed lien"
+    );
+    assert_eq!(
+        env.svm.get_account(&maker_account).unwrap(),
+        maker_before,
+        "a rejected TradeNoCpi must not mutate the maker's portfolio"
+    );
+
+    // CONTROL: identical setup, but the declared cap (50 bps) sits AT the domain's real
+    // fee -- the trade must SUCCEED and actually draw the lien ON THE TAKER'S side, proving
+    // the setup is non-vacuous (the rejection above was account_a's cap check, not something
+    // else blocking the lien draw itself).
+    let mut env2 = V16CuEnv::new();
+    env2.update_backing_fee_policy_with_cu(1, 50, 5_000);
+    let taker_owner2 = Keypair::new();
+    let maker_owner2 = Keypair::new();
+    let taker_account2 = env2.create_portfolio(&taker_owner2);
+    let maker_account2 = env2.create_portfolio(&maker_owner2);
+    env2.deposit(&taker_owner2, taker_account2, 100);
+    env2.deposit(&maker_owner2, maker_account2, 1_000_000);
+    env2.top_up_backing_bucket(1, 1_000_000, 1_000_000);
+    env2.add_source_positive_pnl(taker_account2, 1, 500_000);
+
+    env2.svm.expire_blockhash();
+    env2.send(
+        ProgInstruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: -(3 * POS_SCALE as i128),
+            exec_price: 100,
+            fee_bps: 0,
+            backing_fee_cap_bps: 50,
+        },
+        vec![
+            AccountMeta::new(taker_owner2.pubkey(), true),
+            AccountMeta::new(maker_owner2.pubkey(), true),
+            AccountMeta::new(env2.market, false),
+            AccountMeta::new(taker_account2, false),
+            AccountMeta::new(maker_account2, false),
+        ],
+        &[&taker_owner2, &maker_owner2],
+    )
+    .expect("a TradeNoCpi declaring a cap AT the real backing-domain fee must succeed");
+    let taker_after2 = env2.portfolio_state(taker_account2);
+    assert!(
+        taker_after2
+            .source_lien_counterparty_backing_num
+            .iter()
+            .any(|amount| *amount != 0),
+        "control: at-cap TradeNoCpi must still draw the counterparty-backed lien on the \
+         TAKER's side (proving the setup is non-vacuous) while succeeding since the fee is \
+         within consent"
+    );
+    let maker_after2 = env2.portfolio_state(maker_account2);
+    assert!(
+        maker_after2
+            .source_lien_counterparty_backing_num
+            .iter()
+            .all(|amount| *amount == 0),
+        "control: the maker's side must draw NO new backing lien -- confirms this test \
+         genuinely swaps which account draws it, unlike the maker-draws-lien test above"
+    );
+}
+
 // Wave-2 unit W2-6b627b43: adopts upstream 6b627b43 "require LP consent for CPI base
 // fees". Bit-packs a new `trade_fee_cap_bps` (14 bits, bits 50..63) into
 // PortfolioMatcherConfigV16.control (formerly `enabled: u64`, bit 0 unchanged) -- the LP
