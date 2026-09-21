@@ -9243,9 +9243,16 @@ fn v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap_taker_dra
     // would incur a real backing-domain fee on account_a's (taker's) own new lien draw above
     // what was consented to -- must be REJECTED.
     env.svm.expire_blockhash();
+    let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
+    let (maker_portfolio_id, _, maker_position_epoch) = env.portfolio_identity(maker_account);
     let err = env
         .send(
             ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id: taker_portfolio_id,
+                account_a_position_epoch: taker_position_epoch,
+                account_b_portfolio_id: maker_portfolio_id,
+                account_b_position_epoch: maker_position_epoch,
+                market_id: 1,
                 asset_index: 0,
                 size_q: -(3 * POS_SCALE as i128),
                 exec_price: 100,
@@ -9303,8 +9310,17 @@ fn v16_attack_trade_nocpi_rejects_backing_domain_fee_over_declared_cap_taker_dra
     env2.add_source_positive_pnl(taker_account2, 1, 500_000);
 
     env2.svm.expire_blockhash();
+    let (taker_portfolio_id2, _, taker_position_epoch2) =
+        env2.portfolio_identity(taker_account2);
+    let (maker_portfolio_id2, _, maker_position_epoch2) =
+        env2.portfolio_identity(maker_account2);
     env2.send(
         ProgInstruction::TradeNoCpi {
+            account_a_portfolio_id: taker_portfolio_id2,
+            account_a_position_epoch: taker_position_epoch2,
+            account_b_portfolio_id: maker_portfolio_id2,
+            account_b_position_epoch: maker_position_epoch2,
+            market_id: 1,
             asset_index: 0,
             size_q: -(3 * POS_SCALE as i128),
             exec_price: 100,
