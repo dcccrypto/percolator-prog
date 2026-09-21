@@ -1968,14 +1968,21 @@ pub mod state {
     /// reads every lane as `0`, meaning the first valid caller-supplied
     /// sequence value for any lane must be `>= 1`).
     ///
-    /// SCOPE (infra only -- this unit does NOT wire these lanes to any tag):
-    /// no instruction currently reads or writes this struct. Binding it to
-    /// the ~20 admin/observation tag sites (`UpdateLiquidationFeePolicy`,
-    /// `ConfigureHybridOracle`, `PushAuthMark`, etc., matching `ef3b1a55`'s
-    /// `Instruction` diff) is `sync/w2-tb2b`'s job; TB-5's watermark work
-    /// also builds on this struct. Every accessor below is therefore
-    /// `#[allow(dead_code)]` with a `TB-2b future consumer` marker, exactly
-    /// like TB-1a/TB-3 left their own not-yet-wired infra.
+    /// SCOPE: TB-2a landed this struct/its accessors as infra only (every
+    /// instruction site read/wrote nothing). `sync/w2-tb2b` (this revision)
+    /// wires it to the 14 admin/policy/observation tags that mutate an
+    /// authority, a fee/policy, or an oracle observation
+    /// (`UpdateLiquidationFeePolicy`, `UpdateMaintenanceFeePolicy`,
+    /// `UpdateBackingFeePolicy`, `UpdateTradeFeePolicy`,
+    /// `UpdateFeeRedirectPolicy`, `UpdateMarketInitFeePolicy`,
+    /// `ConfigurePermissionlessResolve`, `ConfigureHybridOracle`,
+    /// `ConfigureEwmaMark`, `PushEwmaMark`, `ConfigureAuthMark`,
+    /// `PushAuthMark`, `RestartAssetOracle`, `UpdateAssetAuthority`), each via
+    /// its own `advance_control_sequence`/`advance_control_sequence_view`
+    /// call site in the `processor` module below, matching `ef3b1a55`'s
+    /// `Instruction` diff plus this fork's own `authority_epoch` lane (see
+    /// that field's own doc comment). TB-5's watermark work also builds on
+    /// this struct.
     ///
     /// REPRESENTATION CHOICE: this is a struct/byte-region INDEPENDENT of
     /// `AssetOracleProfileV16` (matching upstream's own `ef3b1a55` design:
@@ -2013,14 +2020,49 @@ pub mod state {
         pub fee_redirect: u64,
         pub market_init_fee: u64,
         pub permissionless_resolve: u64,
+        /// TB-2b: carved from the 16B `_reserved` tail TB-2a left for exactly
+        /// this purpose (see the removed doc note on `_reserved`, below).
+        /// Strict per-asset authority-rotation watermark bound to
+        /// `UpdateAssetAuthority` (tag 65).
+        ///
+        /// Gate-2 fix (sync/w2-tb2b follow-up, post-review): originally
+        /// shipped as a TENTH lane using the SAME strictly-increasing-nonce
+        /// mechanism as the other nine (`require_newer_control_sequence`).
+        /// An independent gate-2 verifier found that mechanism WEAKER than
+        /// upstream's for an authority-handoff lane specifically: it rejects
+        /// only a NON-INCREASING proposal, not an INFLATED one, so a signer
+        /// could hold a durable-nonce `UpdateAssetAuthority` with an
+        /// inflated `authority_epoch` (e.g. 999 while current = 5) that
+        /// survives every legitimate rotation in between (5->6->7->... all
+        /// still `< 999`) until something happens to reach that value.
+        ///
+        /// This lane now uses upstream `95d155bc`'s OWN mechanism instead
+        /// (`require_current_authority_epoch` / `next_authority_epoch`,
+        /// below): a strict `current == expected` compare-and-swap,
+        /// auto-incremented by exactly 1 per successful rotation. The
+        /// caller reads the CURRENT stored value and passes it back as
+        /// `expected`; the program alone decides the next value. ANY
+        /// intervening rotation invalidates every other previously-signed
+        /// intent from the prior incarnation, closing the durable-nonce
+        /// landmine. See `require_current_authority_epoch`'s own doc
+        /// comment for the full attack and fix rationale.
+        ///
+        /// This does NOT adopt upstream's other `95d155bc` change (merging
+        /// `backing_fee_long`/`backing_fee_short` into one `backing_fee`
+        /// lane) -- that merge is incompatible with this fork's
+        /// task-directed lane mapping (`UpdateBackingFeePolicy` -> TWO
+        /// separate `backing_fee_long`/`backing_fee_short` lanes) and is
+        /// out of scope for this narrowly-targeted fix. Every OTHER of the
+        /// 13 non-authority tags bound by this struct keeps
+        /// `require_newer_control_sequence` unchanged -- they were verified
+        /// sound and don't carry the single-incarnation claim this lane
+        /// does.
+        pub authority_epoch: u64,
         /// Explicit, asserted-zero headroom (see `validate_asset_control_
-        /// sequences`) matching upstream `ef3b1a55` byte-for-byte. Deliberately
-        /// left spare rather than immediately assigned: upstream's OWN later
-        /// history (commits after `ef3b1a55`, out of this unit's scope) grows
-        /// this exact struct further by consuming this same reserved tail
-        /// (e.g. an `authority_epoch` lane), so keeping it unassigned here
-        /// gives a future unit the same option without another slot resize.
-        pub _reserved: [u8; 16],
+        /// sequences`), shrunk from `ef3b1a55`'s original 16B by exactly the
+        /// 8B `authority_epoch` carved out above. Total struct size is
+        /// unchanged (88B / `ASSET_CONTROL_SEQUENCES_LEN`).
+        pub _reserved: [u8; 8],
     }
 
     const _: () = assert!(
@@ -2084,21 +2126,20 @@ pub mod state {
         Ok(start..start + ASSET_CONTROL_SEQUENCES_LEN)
     }
 
-    /// TB-2b future consumer: no instruction site validates a caller-supplied
-    /// `AssetControlSequencesV16` yet.
-    #[allow(dead_code)]
+    /// TB-2b: validates the shrunk `_reserved` tail (8B, post-`authority_epoch`
+    /// carve-out -- see the struct's own doc comment). Now consumed by every
+    /// `read_asset_control_sequences`/`write_asset_control_sequences` call
+    /// from the ~14 tag handlers this unit binds.
     #[inline]
     pub fn validate_asset_control_sequences(
         sequences: &AssetControlSequencesV16,
     ) -> Result<(), ProgramError> {
-        if sequences._reserved != [0u8; 16] {
+        if sequences._reserved != [0u8; 8] {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
     }
 
-    /// TB-2b future consumer: no instruction site reads this struct yet.
-    #[allow(dead_code)]
     pub fn read_asset_control_sequences(
         data: &[u8],
         asset_index: usize,
@@ -2111,8 +2152,6 @@ pub mod state {
         Ok(sequences)
     }
 
-    /// TB-2b future consumer: no instruction site writes this struct yet.
-    #[allow(dead_code)]
     pub fn write_asset_control_sequences(
         data: &mut [u8],
         asset_index: usize,
@@ -2136,18 +2175,70 @@ pub mod state {
     /// helper). Rejects a caller-supplied sequence value that is not
     /// STRICTLY greater than the stored watermark -- `current == 0` is the
     /// legacy "never used" sentinel, so the first valid value for a fresh
-    /// lane must be `>= 1`.
-    ///
-    /// TB-2b future consumer: no instruction site calls this for an
-    /// `AssetControlSequencesV16` lane yet (only `sync/w2-tb3`'s own
-    /// separate top-up-nonce fields call the identical logic above).
-    #[allow(dead_code)]
+    /// lane must be `>= 1`. Now consumed by every one of this unit's ~14
+    /// tag bindings (`sync/w2-tb3`'s own separate top-up-nonce fields call
+    /// the identical logic above; the two copies are expected to be
+    /// de-duplicated into one at the Wave-2 integration pass).
     #[inline]
     pub fn require_newer_control_sequence(current: u64, proposed: u64) -> Result<(), ProgramError> {
         if proposed <= current {
             return Err(PercolatorError::EngineStale.into());
         }
         Ok(())
+    }
+
+    /// Gate-2 fix (sync/w2-tb2b follow-up): ADOPT upstream `95d155bc`'s
+    /// `require_current_authority_epoch` byte-for-byte (`git show
+    /// 95d155bc:src/v16_program.rs`). Used ONLY for the `authority_epoch`
+    /// lane on `UpdateAssetAuthority` -- a strict compare-and-swap, NOT the
+    /// uniform strictly-increasing nonce `require_newer_control_sequence`
+    /// above (which remains, unmodified, the mechanism for the other 13
+    /// control-sequence tags this fork binds).
+    ///
+    /// Why: `require_newer_control_sequence` only rejects a
+    /// NON-INCREASING proposal; it does not reject an INFLATED one. An
+    /// authorized signer (or a since-revoked delegate) can sign an
+    /// `UpdateAssetAuthority` today with `authority_epoch` set far ahead of
+    /// the current value (e.g. 999 while current = 5), hold it via a
+    /// Solana durable nonce, and it stays valid to rotate or BURN that
+    /// asset's authority at ANY future point -- surviving every legitimate
+    /// rotation in between (5->6->7->...) because `6 < 999` still satisfies
+    /// `proposed > current`. It only dies if some action happens to reach
+    /// epoch >= 999 first. That is a single-signature landmine with no
+    /// expiry, on the instruction that rotates (or permanently burns) an
+    /// asset's own authorities.
+    ///
+    /// The CAS closes this: `expected` must equal the CURRENT stored value
+    /// exactly, and the caller must read that current value immediately
+    /// before signing. ANY intervening rotation -- legitimate or not --
+    /// advances the stored epoch, which makes every other previously-signed
+    /// `expected` stale and therefore rejected. A held/durable-nonce
+    /// intent can no longer wait out a chain of rotations; the FIRST
+    /// rotation to land invalidates every other pending signed intent from
+    /// the prior incarnation.
+    #[inline]
+    pub fn require_current_authority_epoch(
+        current: u64,
+        expected: u64,
+    ) -> Result<(), ProgramError> {
+        if current != expected {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        Ok(())
+    }
+
+    /// Gate-2 fix companion to `require_current_authority_epoch` above,
+    /// ADOPTED from upstream `95d155bc` byte-for-byte. Validates `expected`
+    /// against `current` via the CAS, then returns `current + 1` --
+    /// auto-increment by EXACTLY 1 per successful rotation, matching
+    /// upstream's own semantics (never caller-supplied, so the stored value
+    /// can never jump ahead of the true rotation count).
+    #[inline]
+    pub fn next_authority_epoch(current: u64, expected: u64) -> Result<u64, ProgramError> {
+        require_current_authority_epoch(current, expected)?;
+        current
+            .checked_add(1)
+            .ok_or_else(|| PercolatorError::EngineCounterOverflow.into())
     }
 
     /// Aggregate backing-domain accounting for an authority-controlled vault.
@@ -5343,27 +5434,49 @@ pub mod ix {
         /// Rotate one of an asset's per-asset authorities. Gated by the asset's own `asset_admin`
         /// (rotates any; only the admin authority itself is burnable) or the current holder of that
         /// authority (self-rotation). Isolated to the given asset_index.
+        ///
+        /// `authority_epoch` (gate-2 fix, sync/w2-tb2b follow-up): the caller's
+        /// EXPECTED CURRENT value of `AssetControlSequencesV16::authority_epoch`
+        /// for this asset -- NOT a new/proposed value. The caller must read the
+        /// live current value immediately before signing and pass it back
+        /// unchanged; the program validates it via strict compare-and-swap
+        /// (`require_current_authority_epoch`: `current == expected`, ADOPTED
+        /// from upstream `95d155bc`) and on success auto-increments the stored
+        /// value to `expected + 1` itself -- the caller never chooses the next
+        /// value. This closes a durable-nonce landmine the field's original
+        /// strictly-increasing-nonce semantics allowed: with "proposed must
+        /// exceed current", a signer could pre-sign an inflated epoch that
+        /// stayed valid across every legitimate rotation in between. Under the
+        /// CAS, ANY intervening rotation invalidates a held/durable-nonce
+        /// intent signed against the prior incarnation. Wire shape unchanged
+        /// (still a trailing `u64`, same position) -- only its meaning did.
         UpdateAssetAuthority {
             asset_index: u16,
             kind: u8,
             new_pubkey: [u8; 32],
+            authority_epoch: u64,
         },
         UpdateLiquidationFeePolicy {
             cranker_share_bps: u16,
+            policy_sequence: u64,
         },
         UpdateMaintenanceFeePolicy {
             cranker_share_bps: u16,
+            policy_sequence: u64,
         },
         UpdateBackingFeePolicy {
             domain: u16,
             fee_bps: u16,
             insurance_share_bps: u16,
+            policy_sequence: u64,
         },
         UpdateTradeFeePolicy {
             trade_fee_base_bps: u64,
+            policy_sequence: u64,
         },
         UpdateFeeRedirectPolicy {
             redirect_bps: u16,
+            policy_sequence: u64,
         },
         /// #427 — make the insurance-withdrawal rate limit SETTABLE.
         ///
@@ -5378,6 +5491,7 @@ pub mod ix {
         },
         UpdateMarketInitFeePolicy {
             min_init_fee: u128,
+            policy_sequence: u64,
         },
         WithdrawBackingBucketEarnings {
             domain: u16,
@@ -5390,6 +5504,7 @@ pub mod ix {
         ConfigurePermissionlessResolve {
             stale_slots: u64,
             force_close_delay_slots: u64,
+            policy_sequence: u64,
         },
         ResolveStalePermissionless {
             now_slot: u64,
@@ -5408,6 +5523,7 @@ pub mod ix {
             unit_scale: u32,
             conf_filter_bps: u16,
             oracle_leg_feeds: [[u8; 32]; 3],
+            observation_sequence: u64,
         },
         ConfigureEwmaMark {
             asset_index: u16,
@@ -5415,21 +5531,25 @@ pub mod ix {
             initial_mark_e6: u64,
             mark_ewma_halflife_slots: u64,
             mark_min_fee: u64,
+            observation_sequence: u64,
         },
         PushEwmaMark {
             asset_index: u16,
             now_slot: u64,
             mark_e6: u64,
+            observation_sequence: u64,
         },
         ConfigureAuthMark {
             asset_index: u16,
             now_slot: u64,
             initial_mark_e6: u64,
+            observation_sequence: u64,
         },
         PushAuthMark {
             asset_index: u16,
             now_slot: u64,
             mark_e6: u64,
+            observation_sequence: u64,
         },
         ForceCloseAbandonedAsset {
             asset_index: u16,
@@ -5440,6 +5560,7 @@ pub mod ix {
             asset_index: u16,
             now_slot: u64,
             initial_price: u64,
+            observation_sequence: u64,
         },
         UpdateAssetLifecycle {
             action: u8,
@@ -5892,23 +6013,29 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     kind: read_u8(&mut rest)?,
                     new_pubkey: read_bytes32(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 37 => Self::UpdateLiquidationFeePolicy {
                     cranker_share_bps: read_u16(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 49 => Self::UpdateMaintenanceFeePolicy {
                     cranker_share_bps: read_u16(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 51 => Self::UpdateBackingFeePolicy {
                     domain: read_u16(&mut rest)?,
                     fee_bps: read_u16(&mut rest)?,
                     insurance_share_bps: read_u16(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 55 => Self::UpdateTradeFeePolicy {
                     trade_fee_base_bps: read_u64(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 58 => Self::UpdateFeeRedirectPolicy {
                     redirect_bps: read_u16(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 92 => Self::UpdateInsuranceWithdrawPolicy {
                     deposits_only: read_u8(&mut rest)?,
@@ -5916,6 +6043,7 @@ pub mod ix {
                 },
                 59 => Self::UpdateMarketInitFeePolicy {
                     min_init_fee: read_u128(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 60 => Self::UpdateBaseUnitMints {
                     primary_mint: read_bytes32(&mut rest)?,
@@ -5928,11 +6056,13 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_mark_e6: read_u64(&mut rest)?,
+                    observation_sequence: read_u64(&mut rest)?,
                 },
                 63 => Self::PushAuthMark {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     mark_e6: read_u64(&mut rest)?,
+                    observation_sequence: read_u64(&mut rest)?,
                 },
                 64 => Self::ForceCloseAbandonedAsset {
                     asset_index: read_u16(&mut rest)?,
@@ -5943,6 +6073,7 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     initial_price: read_u64(&mut rest)?,
+                    observation_sequence: read_u64(&mut rest)?,
                 },
                 52 => Self::WithdrawBackingBucketEarnings {
                     domain: read_u16(&mut rest)?,
@@ -5955,6 +6086,7 @@ pub mod ix {
                 38 => Self::ConfigurePermissionlessResolve {
                     stale_slots: read_u64(&mut rest)?,
                     force_close_delay_slots: read_u64(&mut rest)?,
+                    policy_sequence: read_u64(&mut rest)?,
                 },
                 39 => Self::ResolveStalePermissionless {
                     now_slot: read_u64(&mut rest)?,
@@ -5977,6 +6109,7 @@ pub mod ix {
                         read_bytes32(&mut rest)?,
                         read_bytes32(&mut rest)?,
                     ],
+                    observation_sequence: read_u64(&mut rest)?,
                 },
                 35 => Self::ConfigureEwmaMark {
                     asset_index: read_u16(&mut rest)?,
@@ -5984,11 +6117,13 @@ pub mod ix {
                     initial_mark_e6: read_u64(&mut rest)?,
                     mark_ewma_halflife_slots: read_u64(&mut rest)?,
                     mark_min_fee: read_u64(&mut rest)?,
+                    observation_sequence: read_u64(&mut rest)?,
                 },
                 36 => Self::PushEwmaMark {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
                     mark_e6: read_u64(&mut rest)?,
+                    observation_sequence: read_u64(&mut rest)?,
                 },
                 40 => Self::UpdateAssetLifecycle {
                     action: read_u8(&mut rest)?,
@@ -6384,37 +6519,57 @@ pub mod ix {
                     asset_index,
                     kind,
                     new_pubkey,
+                    authority_epoch,
                 } => {
                     out.push(65);
                     push_u16(&mut out, asset_index);
                     out.push(kind);
                     out.extend_from_slice(&new_pubkey);
+                    push_u64(&mut out, authority_epoch);
                 }
-                Self::UpdateLiquidationFeePolicy { cranker_share_bps } => {
+                Self::UpdateLiquidationFeePolicy {
+                    cranker_share_bps,
+                    policy_sequence,
+                } => {
                     out.push(37);
                     push_u16(&mut out, cranker_share_bps);
+                    push_u64(&mut out, policy_sequence);
                 }
-                Self::UpdateMaintenanceFeePolicy { cranker_share_bps } => {
+                Self::UpdateMaintenanceFeePolicy {
+                    cranker_share_bps,
+                    policy_sequence,
+                } => {
                     out.push(49);
                     push_u16(&mut out, cranker_share_bps);
+                    push_u64(&mut out, policy_sequence);
                 }
                 Self::UpdateBackingFeePolicy {
                     domain,
                     fee_bps,
                     insurance_share_bps,
+                    policy_sequence,
                 } => {
                     out.push(51);
                     push_u16(&mut out, domain);
                     push_u16(&mut out, fee_bps);
                     push_u16(&mut out, insurance_share_bps);
+                    push_u64(&mut out, policy_sequence);
                 }
-                Self::UpdateTradeFeePolicy { trade_fee_base_bps } => {
+                Self::UpdateTradeFeePolicy {
+                    trade_fee_base_bps,
+                    policy_sequence,
+                } => {
                     out.push(55);
                     push_u64(&mut out, trade_fee_base_bps);
+                    push_u64(&mut out, policy_sequence);
                 }
-                Self::UpdateFeeRedirectPolicy { redirect_bps } => {
+                Self::UpdateFeeRedirectPolicy {
+                    redirect_bps,
+                    policy_sequence,
+                } => {
                     out.push(58);
                     push_u16(&mut out, redirect_bps);
+                    push_u64(&mut out, policy_sequence);
                 }
                 Self::UpdateInsuranceWithdrawPolicy {
                     deposits_only,
@@ -6424,9 +6579,13 @@ pub mod ix {
                     out.push(deposits_only);
                     push_u64(&mut out, cooldown_slots);
                 }
-                Self::UpdateMarketInitFeePolicy { min_init_fee } => {
+                Self::UpdateMarketInitFeePolicy {
+                    min_init_fee,
+                    policy_sequence,
+                } => {
                     out.push(59);
                     push_u128(&mut out, min_init_fee);
+                    push_u64(&mut out, policy_sequence);
                 }
                 Self::UpdateBaseUnitMints {
                     primary_mint,
@@ -6453,10 +6612,12 @@ pub mod ix {
                 Self::ConfigurePermissionlessResolve {
                     stale_slots,
                     force_close_delay_slots,
+                    policy_sequence,
                 } => {
                     out.push(38);
                     push_u64(&mut out, stale_slots);
                     push_u64(&mut out, force_close_delay_slots);
+                    push_u64(&mut out, policy_sequence);
                 }
                 Self::ResolveStalePermissionless { now_slot } => {
                     out.push(39);
@@ -6476,6 +6637,7 @@ pub mod ix {
                     unit_scale,
                     conf_filter_bps,
                     oracle_leg_feeds,
+                    observation_sequence,
                 } => {
                     out.push(34);
                     push_u16(&mut out, asset_index);
@@ -6493,6 +6655,7 @@ pub mod ix {
                     for feed in oracle_leg_feeds {
                         out.extend_from_slice(&feed);
                     }
+                    push_u64(&mut out, observation_sequence);
                 }
                 Self::ConfigureEwmaMark {
                     asset_index,
@@ -6500,6 +6663,7 @@ pub mod ix {
                     initial_mark_e6,
                     mark_ewma_halflife_slots,
                     mark_min_fee,
+                    observation_sequence,
                 } => {
                     out.push(35);
                     push_u16(&mut out, asset_index);
@@ -6507,36 +6671,43 @@ pub mod ix {
                     push_u64(&mut out, initial_mark_e6);
                     push_u64(&mut out, mark_ewma_halflife_slots);
                     push_u64(&mut out, mark_min_fee);
+                    push_u64(&mut out, observation_sequence);
                 }
                 Self::PushEwmaMark {
                     asset_index,
                     now_slot,
                     mark_e6,
+                    observation_sequence,
                 } => {
                     out.push(36);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, mark_e6);
+                    push_u64(&mut out, observation_sequence);
                 }
                 Self::ConfigureAuthMark {
                     asset_index,
                     now_slot,
                     initial_mark_e6,
+                    observation_sequence,
                 } => {
                     out.push(62);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_mark_e6);
+                    push_u64(&mut out, observation_sequence);
                 }
                 Self::PushAuthMark {
                     asset_index,
                     now_slot,
                     mark_e6,
+                    observation_sequence,
                 } => {
                     out.push(63);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, mark_e6);
+                    push_u64(&mut out, observation_sequence);
                 }
                 Self::ForceCloseAbandonedAsset {
                     asset_index,
@@ -6552,11 +6723,13 @@ pub mod ix {
                     asset_index,
                     now_slot,
                     initial_price,
+                    observation_sequence,
                 } => {
                     out.push(69);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, now_slot);
                     push_u64(&mut out, initial_price);
+                    push_u64(&mut out, observation_sequence);
                 }
                 Self::UpdateAssetLifecycle {
                     action,
@@ -8526,6 +8699,173 @@ pub mod processor {
         Ok(())
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // TB-2b (W2): `AssetControlSequencesV16` binding. TB-2a shipped the
+    // struct/accessors as infra only (ADOPTS upstream `ef3b1a55` byte-for-
+    // byte); this unit wires the ~14 authority/policy/observation tags to
+    // it, ADOPTING `ef3b1a55`'s own `ControlSequenceLane` framework
+    // (`git show ef3b1a55:src/v16_program.rs`, processor module) plus the
+    // `authority_epoch` lane this fork carves from TB-2a's `_reserved` tail.
+    //
+    // Gate-2 fix (sync/w2-tb2b follow-up): `authority_epoch` originally used
+    // this same `ControlSequenceLane` strictly-increasing-nonce framework;
+    // it now uses upstream `95d155bc`'s compare-and-swap mechanism instead
+    // (`require_current_authority_epoch` / `next_authority_epoch` /
+    // `advance_authority_epoch_view`, below) and so is NOT a
+    // `ControlSequenceLane` variant any more -- see
+    // `AssetControlSequencesV16::authority_epoch`'s doc comment for why.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // `authority_epoch` (asset authority handoffs, `UpdateAssetAuthority`)
+    // is deliberately NOT a `ControlSequenceLane` variant: gate-2 fix
+    // (sync/w2-tb2b follow-up) moved it off the uniform strictly-increasing
+    // nonce these lanes share and onto upstream `95d155bc`'s own CAS
+    // mechanism (`require_current_authority_epoch` / `next_authority_epoch`,
+    // `advance_authority_epoch_view` below) -- see `AssetControlSequencesV16
+    // ::authority_epoch`'s doc comment for the attack this closes. The other
+    // 13 tags below are UNCHANGED by that fix.
+    #[derive(Clone, Copy)]
+    enum ControlSequenceLane {
+        OracleObservation,
+        BackingFeeLong,
+        BackingFeeShort,
+        TradeFee,
+        LiquidationFee,
+        MaintenanceFee,
+        FeeRedirect,
+        MarketInitFee,
+        PermissionlessResolve,
+    }
+
+    fn control_sequence(sequences: &state::AssetControlSequencesV16, lane: ControlSequenceLane) -> u64 {
+        match lane {
+            ControlSequenceLane::OracleObservation => sequences.oracle_observation,
+            ControlSequenceLane::BackingFeeLong => sequences.backing_fee_long,
+            ControlSequenceLane::BackingFeeShort => sequences.backing_fee_short,
+            ControlSequenceLane::TradeFee => sequences.trade_fee,
+            ControlSequenceLane::LiquidationFee => sequences.liquidation_fee,
+            ControlSequenceLane::MaintenanceFee => sequences.maintenance_fee,
+            ControlSequenceLane::FeeRedirect => sequences.fee_redirect,
+            ControlSequenceLane::MarketInitFee => sequences.market_init_fee,
+            ControlSequenceLane::PermissionlessResolve => sequences.permissionless_resolve,
+        }
+    }
+
+    fn set_control_sequence(
+        sequences: &mut state::AssetControlSequencesV16,
+        lane: ControlSequenceLane,
+        value: u64,
+    ) {
+        match lane {
+            ControlSequenceLane::OracleObservation => sequences.oracle_observation = value,
+            ControlSequenceLane::BackingFeeLong => sequences.backing_fee_long = value,
+            ControlSequenceLane::BackingFeeShort => sequences.backing_fee_short = value,
+            ControlSequenceLane::TradeFee => sequences.trade_fee = value,
+            ControlSequenceLane::LiquidationFee => sequences.liquidation_fee = value,
+            ControlSequenceLane::MaintenanceFee => sequences.maintenance_fee = value,
+            ControlSequenceLane::FeeRedirect => sequences.fee_redirect = value,
+            ControlSequenceLane::MarketInitFee => sequences.market_init_fee = value,
+            ControlSequenceLane::PermissionlessResolve => sequences.permissionless_resolve = value,
+        }
+    }
+
+    /// Raw-account-buffer variant: for handlers that operate on `&mut [u8]`
+    /// directly (the majority -- they never construct a `MarketViewMutV16`).
+    /// Checks strictly BEFORE any caller-visible mutation and advances the
+    /// lane only on success, matching `require_newer_control_sequence`'s
+    /// contract.
+    fn advance_control_sequence(
+        data: &mut [u8],
+        asset_index: usize,
+        lane: ControlSequenceLane,
+        proposed: u64,
+    ) -> ProgramResult {
+        let mut sequences = state::read_asset_control_sequences(data, asset_index)?;
+        state::require_newer_control_sequence(control_sequence(&sequences, lane), proposed)?;
+        set_control_sequence(&mut sequences, lane, proposed);
+        state::write_asset_control_sequences(data, asset_index, &sequences)
+    }
+
+    /// View variant, ADOPTED from upstream `ef3b1a55` byte-for-byte: for
+    /// handlers that already hold a `MarketViewMutV16` (a mutable borrow of
+    /// the same underlying account bytes), so a second independent borrow via
+    /// the raw-buffer accessors above would not typecheck. Reads/writes
+    /// directly through `market.wrapper`, matching
+    /// `read_oracle_profile_from_view`/`write_oracle_profile_to_view`'s own
+    /// pattern for the byte-disjoint profile region above.
+    fn read_control_sequences_from_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<state::AssetControlSequencesV16, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let bytes = market
+            .wrapper
+            .get(
+                constants::ASSET_CONTROL_SEQUENCES_OFF
+                    ..constants::ASSET_CONTROL_SEQUENCES_OFF
+                        + constants::ASSET_CONTROL_SEQUENCES_LEN,
+            )
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let sequences: state::AssetControlSequencesV16 = bytemuck::pod_read_unaligned(bytes);
+        state::validate_asset_control_sequences(&sequences)?;
+        Ok(sequences)
+    }
+
+    fn write_control_sequences_to_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        sequences: &state::AssetControlSequencesV16,
+    ) -> ProgramResult {
+        state::validate_asset_control_sequences(sequences)?;
+        let market = group
+            .markets
+            .get_mut(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        market.wrapper[constants::ASSET_CONTROL_SEQUENCES_OFF
+            ..constants::ASSET_CONTROL_SEQUENCES_OFF + constants::ASSET_CONTROL_SEQUENCES_LEN]
+            .copy_from_slice(bytemuck::bytes_of(sequences));
+        Ok(())
+    }
+
+    fn advance_control_sequence_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        lane: ControlSequenceLane,
+        proposed: u64,
+    ) -> ProgramResult {
+        let mut sequences = read_control_sequences_from_view(group, asset_index)?;
+        state::require_newer_control_sequence(control_sequence(&sequences, lane), proposed)?;
+        set_control_sequence(&mut sequences, lane, proposed);
+        write_control_sequences_to_view(group, asset_index, &sequences)
+    }
+
+    /// Gate-2 fix (sync/w2-tb2b follow-up): ADOPTED from upstream
+    /// `95d155bc` byte-for-byte (`advance_authority_epoch_view`,
+    /// `git show 95d155bc:src/v16_program.rs`). REPLACES the
+    /// `advance_control_sequence_view(..., ControlSequenceLane::
+    /// AuthorityEpoch, ...)` uniform-nonce call this unit's single call
+    /// site (`handle_update_asset_authority`) used before this fix -- the
+    /// ONLY lane this fix touches; the other 13 tags still go through
+    /// `advance_control_sequence_view` above, unchanged.
+    ///
+    /// `expected` is the caller-supplied "current value as I last read it";
+    /// the stored `authority_epoch` becomes `expected + 1` on success, via
+    /// `state::next_authority_epoch`'s own CAS + auto-increment. See
+    /// `AssetControlSequencesV16::authority_epoch`'s doc comment for why.
+    fn advance_authority_epoch_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        expected: u64,
+    ) -> ProgramResult {
+        let mut sequences = read_control_sequences_from_view(group, asset_index)?;
+        sequences.authority_epoch =
+            state::next_authority_epoch(sequences.authority_epoch, expected)?;
+        write_control_sequences_to_view(group, asset_index, &sequences)
+    }
+
     fn mirror_manual_profile_to_base_config(
         cfg: &mut WrapperConfigV16,
         profile: &state::AssetOracleProfileV16,
@@ -9242,33 +9582,68 @@ pub mod processor {
                 asset_index,
                 kind,
                 new_pubkey,
-            } => handle_update_asset_authority(program_id, accounts, asset_index, kind, new_pubkey),
-            Instruction::UpdateLiquidationFeePolicy { cranker_share_bps } => {
-                handle_update_liquidation_fee_policy(program_id, accounts, cranker_share_bps)
-            }
-            Instruction::UpdateMaintenanceFeePolicy { cranker_share_bps } => {
-                handle_update_maintenance_fee_policy(program_id, accounts, cranker_share_bps)
-            }
+                authority_epoch,
+            } => handle_update_asset_authority(
+                program_id,
+                accounts,
+                asset_index,
+                kind,
+                new_pubkey,
+                authority_epoch,
+            ),
+            Instruction::UpdateLiquidationFeePolicy {
+                cranker_share_bps,
+                policy_sequence,
+            } => handle_update_liquidation_fee_policy(
+                program_id,
+                accounts,
+                cranker_share_bps,
+                policy_sequence,
+            ),
+            Instruction::UpdateMaintenanceFeePolicy {
+                cranker_share_bps,
+                policy_sequence,
+            } => handle_update_maintenance_fee_policy(
+                program_id,
+                accounts,
+                cranker_share_bps,
+                policy_sequence,
+            ),
             Instruction::UpdateBackingFeePolicy {
                 domain,
                 fee_bps,
                 insurance_share_bps,
+                policy_sequence,
             } => handle_update_backing_fee_policy(
                 program_id,
                 accounts,
                 domain,
                 fee_bps,
                 insurance_share_bps,
+                policy_sequence,
             ),
-            Instruction::UpdateTradeFeePolicy { trade_fee_base_bps } => {
-                handle_update_trade_fee_policy(program_id, accounts, trade_fee_base_bps)
-            }
-            Instruction::UpdateFeeRedirectPolicy { redirect_bps } => {
-                handle_update_fee_redirect_policy(program_id, accounts, redirect_bps)
-            }
-            Instruction::UpdateMarketInitFeePolicy { min_init_fee } => {
-                handle_update_market_init_fee_policy(program_id, accounts, min_init_fee)
-            }
+            Instruction::UpdateTradeFeePolicy {
+                trade_fee_base_bps,
+                policy_sequence,
+            } => handle_update_trade_fee_policy(
+                program_id,
+                accounts,
+                trade_fee_base_bps,
+                policy_sequence,
+            ),
+            Instruction::UpdateFeeRedirectPolicy {
+                redirect_bps,
+                policy_sequence,
+            } => handle_update_fee_redirect_policy(program_id, accounts, redirect_bps, policy_sequence),
+            Instruction::UpdateMarketInitFeePolicy {
+                min_init_fee,
+                policy_sequence,
+            } => handle_update_market_init_fee_policy(
+                program_id,
+                accounts,
+                min_init_fee,
+                policy_sequence,
+            ),
             Instruction::UpdateInsuranceWithdrawPolicy {
                 deposits_only,
                 cooldown_slots,
@@ -9288,11 +9663,13 @@ pub mod processor {
             Instruction::ConfigurePermissionlessResolve {
                 stale_slots,
                 force_close_delay_slots,
+                policy_sequence,
             } => handle_configure_permissionless_resolve(
                 program_id,
                 accounts,
                 stale_slots,
                 force_close_delay_slots,
+                policy_sequence,
             ),
             Instruction::ResolveStalePermissionless { now_slot } => {
                 handle_resolve_stale_permissionless(program_id, accounts, now_slot)
@@ -9311,6 +9688,7 @@ pub mod processor {
                 unit_scale,
                 conf_filter_bps,
                 oracle_leg_feeds,
+                observation_sequence,
             } => handle_configure_hybrid_oracle(
                 program_id,
                 accounts,
@@ -9327,6 +9705,7 @@ pub mod processor {
                 unit_scale,
                 conf_filter_bps,
                 oracle_leg_feeds,
+                observation_sequence,
             ),
             Instruction::ConfigureEwmaMark {
                 asset_index,
@@ -9334,6 +9713,7 @@ pub mod processor {
                 initial_mark_e6,
                 mark_ewma_halflife_slots,
                 mark_min_fee,
+                observation_sequence,
             } => handle_configure_ewma_mark(
                 program_id,
                 accounts,
@@ -9342,28 +9722,47 @@ pub mod processor {
                 initial_mark_e6,
                 mark_ewma_halflife_slots,
                 mark_min_fee,
+                observation_sequence,
             ),
             Instruction::PushEwmaMark {
                 asset_index,
                 now_slot,
                 mark_e6,
-            } => handle_push_ewma_mark(program_id, accounts, asset_index, now_slot, mark_e6),
+                observation_sequence,
+            } => handle_push_ewma_mark(
+                program_id,
+                accounts,
+                asset_index,
+                now_slot,
+                mark_e6,
+                observation_sequence,
+            ),
             Instruction::ConfigureAuthMark {
                 asset_index,
                 now_slot,
                 initial_mark_e6,
+                observation_sequence,
             } => handle_configure_auth_mark(
                 program_id,
                 accounts,
                 asset_index,
                 now_slot,
                 initial_mark_e6,
+                observation_sequence,
             ),
             Instruction::PushAuthMark {
                 asset_index,
                 now_slot,
                 mark_e6,
-            } => handle_push_auth_mark(program_id, accounts, asset_index, now_slot, mark_e6),
+                observation_sequence,
+            } => handle_push_auth_mark(
+                program_id,
+                accounts,
+                asset_index,
+                now_slot,
+                mark_e6,
+                observation_sequence,
+            ),
             Instruction::ForceCloseAbandonedAsset {
                 asset_index,
                 now_slot,
@@ -9379,12 +9778,14 @@ pub mod processor {
                 asset_index,
                 now_slot,
                 initial_price,
+                observation_sequence,
             } => handle_restart_asset_oracle(
                 program_id,
                 accounts,
                 asset_index,
                 now_slot,
                 initial_price,
+                observation_sequence,
             ),
             Instruction::UpdateAssetLifecycle {
                 action,
@@ -16130,6 +16531,7 @@ pub mod processor {
         asset_index: u16,
         kind: u8,
         new_pubkey: [u8; 32],
+        authority_epoch: u64,
     ) -> ProgramResult {
         let current = account(accounts, 0)?;
         let new_authority = account(accounts, 1)?;
@@ -16270,6 +16672,11 @@ pub mod processor {
         if !admin_bypass_permitted {
             expect_live_authority(&current_value, current.key)?;
         }
+        // Gate-2 fix (sync/w2-tb2b follow-up): CAS, not the uniform
+        // strictly-increasing nonce -- `authority_epoch` here is the
+        // caller's belief about the CURRENT stored value, not a proposed
+        // new one. See `advance_authority_epoch_view`'s own doc comment.
+        advance_authority_epoch_view(&mut group, asset_index, authority_epoch)?;
         match kind {
             ASSET_AUTH_ADMIN => profile.asset_admin = new_pubkey,
             ASSET_AUTH_INSURANCE => profile.insurance_authority = new_pubkey,
@@ -16505,6 +16912,7 @@ pub mod processor {
         asset_index: u16,
         now_slot: u64,
         initial_price: u64,
+        observation_sequence: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -16534,6 +16942,12 @@ pub mod processor {
             }
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
             expect_live_authority(&existing_profile.asset_admin, authority.key)?;
+            advance_control_sequence_view(
+                &mut group,
+                asset_index,
+                ControlSequenceLane::OracleObservation,
+                observation_sequence,
+            )?;
             group
                 .restart_empty_asset_preserving_insurance_budget_not_atomic(
                     asset_index,
@@ -17106,6 +17520,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         cranker_share_bps: u16,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17118,8 +17533,15 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        let mut data = market_ai.try_borrow_mut_data()?;
+        advance_control_sequence(
+            &mut data,
+            0,
+            ControlSequenceLane::LiquidationFee,
+            policy_sequence,
+        )?;
         cfg.liquidation_cranker_fee_share_bps = cranker_share_bps;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     #[inline(never)]
@@ -17127,6 +17549,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         cranker_share_bps: u16,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17139,8 +17562,15 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        let mut data = market_ai.try_borrow_mut_data()?;
+        advance_control_sequence(
+            &mut data,
+            0,
+            ControlSequenceLane::MaintenanceFee,
+            policy_sequence,
+        )?;
         cfg.maintenance_cranker_fee_share_bps = cranker_share_bps;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     /// UpdateMaintenanceFeePerSlot (tag 88) — marketauth-gated.
@@ -17308,6 +17738,7 @@ pub mod processor {
         domain: u16,
         fee_bps: u16,
         insurance_share_bps: u16,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17370,6 +17801,12 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
         }
+        let lane = if long_side {
+            ControlSequenceLane::BackingFeeLong
+        } else {
+            ControlSequenceLane::BackingFeeShort
+        };
+        advance_control_sequence(&mut market_data, asset_index, lane, policy_sequence)?;
         if asset_index == 0 {
             let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
             let old_fee = if long_side {
@@ -17416,6 +17853,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         trade_fee_base_bps: u64,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17463,8 +17901,10 @@ pub mod processor {
         // are unchanged. Removing the scan also makes this handler O(1)
         // again, retiring the W11 multi-asset-bypass concern along with the
         // check it guarded.
+        let mut data = market_ai.try_borrow_mut_data()?;
+        advance_control_sequence(&mut data, 0, ControlSequenceLane::TradeFee, policy_sequence)?;
         cfg.trade_fee_base_bps = trade_fee_base_bps;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     #[inline(never)]
@@ -17472,6 +17912,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         redirect_bps: u16,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17484,8 +17925,10 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        let mut data = market_ai.try_borrow_mut_data()?;
+        advance_control_sequence(&mut data, 0, ControlSequenceLane::FeeRedirect, policy_sequence)?;
         cfg.fee_redirect_to_market_0_bps = redirect_bps;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     #[inline(never)]
@@ -17493,6 +17936,7 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         min_init_fee: u128,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17503,8 +17947,15 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        let mut data = market_ai.try_borrow_mut_data()?;
+        advance_control_sequence(
+            &mut data,
+            0,
+            ControlSequenceLane::MarketInitFee,
+            policy_sequence,
+        )?;
         cfg.permissionless_market_init_fee = min_init_fee;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     /// #427 — the missing writer for the insurance-withdrawal rate limit.
@@ -17549,6 +18000,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         stale_slots: u64,
         force_close_delay_slots: u64,
+        policy_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17571,9 +18023,16 @@ pub mod processor {
         if oracle_v16::permissionless_stale_matured(&cfg, authenticated_slot_or_fallback(0)) {
             return Err(PercolatorError::OracleStale.into());
         }
+        let mut data = market_ai.try_borrow_mut_data()?;
+        advance_control_sequence(
+            &mut data,
+            0,
+            ControlSequenceLane::PermissionlessResolve,
+            policy_sequence,
+        )?;
         cfg.permissionless_resolve_stale_slots = stale_slots;
         cfg.force_close_delay_slots = force_close_delay_slots;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     #[inline(never)]
@@ -17621,6 +18080,7 @@ pub mod processor {
         unit_scale: u32,
         conf_filter_bps: u16,
         oracle_leg_feeds: [[u8; 32]; constants::ORACLE_LEG_CAP],
+        observation_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17669,6 +18129,12 @@ pub mod processor {
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
             expect_live_authority(&existing_profile.oracle_authority, admin.key)?;
+            advance_control_sequence_view(
+                &mut group,
+                asset_index_usize,
+                ControlSequenceLane::OracleObservation,
+                observation_sequence,
+            )?;
 
             let mut profile = state::AssetOracleProfileV16 {
                 oracle_mode: constants::ORACLE_MODE_HYBRID_AFTER_HOURS,
@@ -17776,6 +18242,13 @@ pub mod processor {
     }
 
     #[inline(never)]
+    // TB-2b: `observation_sequence` is the 8th argument, crossing clippy's
+    // default 7-arg threshold. Matches the existing `#[allow(clippy::
+    // too_many_arguments)]` idiom already used on other many-arg handlers/
+    // helpers in this file (e.g. `try_configure_hybrid_asset_with_cu` in the
+    // test harness) rather than introducing a params struct just for this one
+    // handler.
+    #[allow(clippy::too_many_arguments)]
     fn handle_configure_ewma_mark<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -17784,6 +18257,7 @@ pub mod processor {
         initial_mark_e6: u64,
         mark_ewma_halflife_slots: u64,
         mark_min_fee: u64,
+        observation_sequence: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17815,6 +18289,12 @@ pub mod processor {
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
             expect_live_authority(&existing_profile.oracle_authority, admin.key)?;
+            advance_control_sequence_view(
+                &mut group,
+                asset_index_usize,
+                ControlSequenceLane::OracleObservation,
+                observation_sequence,
+            )?;
 
             let profile = state::AssetOracleProfileV16 {
                 oracle_mode: constants::ORACLE_MODE_EWMA_MARK,
@@ -17914,6 +18394,7 @@ pub mod processor {
         asset_index: u16,
         now_slot: u64,
         initial_mark_e6: u64,
+        observation_sequence: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -17942,6 +18423,12 @@ pub mod processor {
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
             expect_live_authority(&existing_profile.oracle_authority, authority.key)?;
+            advance_control_sequence_view(
+                &mut group,
+                asset_index_usize,
+                ControlSequenceLane::OracleObservation,
+                observation_sequence,
+            )?;
 
             let profile = state::AssetOracleProfileV16 {
                 oracle_mode: constants::ORACLE_MODE_AUTH_MARK,
@@ -18042,6 +18529,7 @@ pub mod processor {
         asset_index: u16,
         now_slot: u64,
         mark_e6: u64,
+        observation_sequence: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -18074,6 +18562,12 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineStale.into());
             }
+            advance_control_sequence_view(
+                &mut group,
+                asset_index_usize,
+                ControlSequenceLane::OracleObservation,
+                observation_sequence,
+            )?;
             let full_weight_fee = if profile.mark_min_fee == 0 {
                 0
             } else {
@@ -18138,6 +18632,7 @@ pub mod processor {
         asset_index: u16,
         now_slot: u64,
         mark_e6: u64,
+        observation_sequence: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -18170,6 +18665,12 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineStale.into());
             }
+            advance_control_sequence_view(
+                &mut group,
+                asset_index_usize,
+                ControlSequenceLane::OracleObservation,
+                observation_sequence,
+            )?;
             // FIX (ADOPT upstream 06192caa, adapted): same non-retroactive
             // checkpoint recording as `handle_push_ewma_mark` above.
             if mark_e6 != profile.mark_ewma_e6 {
@@ -23881,7 +24382,9 @@ pub mod processor {
                 fee_redirect: 77,
                 market_init_fee: 88,
                 permissionless_resolve: 99,
-                _reserved: [0u8; 16],
+                // TB-2b: carved from TB-2a's 16B `_reserved` tail.
+                authority_epoch: 111,
+                _reserved: [0u8; 8],
             }
         }
 
@@ -23924,6 +24427,7 @@ pub mod processor {
             assert_eq!(roundtripped.fee_redirect, 77);
             assert_eq!(roundtripped.market_init_fee, 88);
             assert_eq!(roundtripped.permissionless_resolve, 99);
+            assert_eq!(roundtripped.authority_epoch, 111);
         }
 
         #[test]
@@ -23942,7 +24446,8 @@ pub mod processor {
             assert_eq!(seq.fee_redirect, 0);
             assert_eq!(seq.market_init_fee, 0);
             assert_eq!(seq.permissionless_resolve, 0);
-            assert_eq!(seq._reserved, [0u8; 16]);
+            assert_eq!(seq.authority_epoch, 0);
+            assert_eq!(seq._reserved, [0u8; 8]);
             assert!(state::validate_asset_control_sequences(&seq).is_ok());
 
             // bytemuck::Zeroable's all-zero bit pattern must agree with

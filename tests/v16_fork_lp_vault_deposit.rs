@@ -997,6 +997,15 @@ fn try_rotate_backing_authority(
     new_authority: &Keypair,
     registry: Option<Pubkey>,
 ) -> Result<(), String> {
+    // TB-2b (gate-2 fix, sync/w2-tb2b follow-up): LIVE read of the CURRENT
+    // `authority_epoch` so this CAS-bound call always supplies the value the
+    // program expects, never a hardcoded/stale constant.
+    let authority_epoch = {
+        let market_account = env.svm.get_account(&env.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, asset_index as usize)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     let mut accounts = vec![
         AccountMeta::new(signer.pubkey(), true),
         AccountMeta::new_readonly(new_authority.pubkey(), true),
@@ -1017,6 +1026,7 @@ fn try_rotate_backing_authority(
             asset_index,
             kind: ASSET_AUTH_BACKING_BUCKET,
             new_pubkey: new_authority.pubkey().to_bytes(),
+            authority_epoch,
         },
         accounts,
         &signers,
@@ -1135,6 +1145,12 @@ fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
 
     let manager = Keypair::new();
     env.svm.airdrop(&manager.pubkey(), 100_000_000_000).unwrap();
+    let authority_epoch = {
+        let market_account = env.svm.get_account(&env.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, APPEND_ASSET_INDEX as usize)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send(
         &mut env.svm,
         env.program_id,
@@ -1143,6 +1159,7 @@ fn delegated_asset_admin_cannot_rotate_a_live_lp_vault_backing_authority() {
             asset_index: APPEND_ASSET_INDEX,
             kind: percolator_prog::processor::ASSET_AUTH_ADMIN,
             new_pubkey: manager.pubkey().to_bytes(),
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
