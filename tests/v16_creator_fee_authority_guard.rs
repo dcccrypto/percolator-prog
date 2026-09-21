@@ -414,6 +414,9 @@ fn withdraw_creator_fee(
         Instruction::WithdrawCreatorFee {
             amount,
             asset_index: 0,
+            authority_epoch: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .authority_epoch,
         },
         &mut [
             authority,

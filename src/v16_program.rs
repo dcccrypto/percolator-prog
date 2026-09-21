@@ -5533,6 +5533,13 @@ pub mod ix {
         UpdateInsuranceWithdrawPolicy {
             deposits_only: u8,
             cooldown_slots: u64,
+            /// W4-AE-EXTEND: gate-2-class replay protection, matching the
+            /// W3A-2 idiom for the neighbouring marketauth-gated single-field
+            /// policy setters. CHECK ONLY, against the market's shared
+            /// asset-0 `AssetControlSequencesV16.authority_epoch` lane (the
+            /// same lane `UpdateAuthority`/tag 32 advances on every
+            /// marketauth rotation).
+            authority_epoch: u64,
         },
         UpdateMarketInitFeePolicy {
             min_init_fee: u128,
@@ -5825,6 +5832,21 @@ pub mod ix {
             creator_share_bps: u16,
             lp_share_bps: u16,
             insurance_share_bps: u16,
+            /// W4-AE-EXTEND: gate-2-class replay protection, matching the
+            /// W3A-2 idiom for the other marketauth-gated single-field policy
+            /// setters (`UpdateBaseUnitMints`/`SwapSecondaryForPrimary`).
+            /// Before this, a signed `UpdateFeeSplit` held via a durable
+            /// nonce stayed valid across any number of intervening
+            /// `UpdateAuthority` marketauth rotations (the A->B->A landmine
+            /// the whole authority-epoch campaign targets) -- purely
+            /// `expect_live_authority`-gated ops re-validate ONLY the
+            /// signer's raw pubkey against the CURRENT `cfg.marketauth`, not
+            /// that nothing has changed since the tx was signed. CHECK ONLY
+            /// (this tag does not itself rotate any authority) against the
+            /// market's asset-0 `AssetControlSequencesV16.authority_epoch`
+            /// -- the SAME shared lane `UpdateAuthority` (tag 32) already
+            /// advances on every marketauth rotation (W3A-1).
+            authority_epoch: u64,
         },
         /// WithdrawInsuranceReserveToStake (tag 87) — permissionless. Pushes
         /// the accrued insurance/staker leg into the stake vault, producing
@@ -5923,6 +5945,20 @@ pub mod ix {
             /// wire grows 1+16 -> 1+16+2 = 19 bytes and an old 17-byte caller fails
             /// to decode rather than being silently treated as asset 0.
             asset_index: u16,
+            /// W4-AE-EXTEND: gate-2-class replay protection. A direct
+            /// fund-withdrawal instruction, signer-gated on `asset_index`'s
+            /// own `asset_admin` (rotated via `UpdateAssetAuthority`) with
+            /// zero prior replay protection -- the exact class upstream
+            /// `ade6f9fa` bound for the sibling direct-withdrawal tags
+            /// `WithdrawBackingBucket`/`WithdrawBackingBucketEarnings`/
+            /// `WithdrawInsuranceAsset` (ported by W3A-1). CHECK ONLY,
+            /// against `asset_index`'s OWN
+            /// `AssetControlSequencesV16.authority_epoch` -- the withdrawing
+            /// asset's own lane, not a hardcoded asset-0 (this tag's
+            /// authority is per-asset, unlike `UpdateFeeSplit`/
+            /// `UpdateInsuranceWithdrawPolicy`, which gate on marketauth and
+            /// share asset-0's lane instead).
+            authority_epoch: u64,
         },
     }
 
@@ -6117,6 +6153,7 @@ pub mod ix {
                 92 => Self::UpdateInsuranceWithdrawPolicy {
                     deposits_only: read_u8(&mut rest)?,
                     cooldown_slots: read_u64(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 59 => Self::UpdateMarketInitFeePolicy {
                     min_init_fee: read_u128(&mut rest)?,
@@ -6329,6 +6366,7 @@ pub mod ix {
                     creator_share_bps: read_u16(&mut rest)?,
                     lp_share_bps: read_u16(&mut rest)?,
                     insurance_share_bps: read_u16(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 87 => Self::WithdrawInsuranceReserveToStake,
                 88 => Self::UpdateMaintenanceFeePerSlot {
@@ -6340,6 +6378,7 @@ pub mod ix {
                 90 => Self::WithdrawCreatorFee {
                     amount: read_u128(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -6682,10 +6721,12 @@ pub mod ix {
                 Self::UpdateInsuranceWithdrawPolicy {
                     deposits_only,
                     cooldown_slots,
+                    authority_epoch,
                 } => {
                     out.push(92);
                     out.push(deposits_only);
                     push_u64(&mut out, cooldown_slots);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::UpdateMarketInitFeePolicy {
                     min_init_fee,
@@ -7025,11 +7066,13 @@ pub mod ix {
                     creator_share_bps,
                     lp_share_bps,
                     insurance_share_bps,
+                    authority_epoch,
                 } => {
                     out.push(86);
                     push_u16(&mut out, creator_share_bps);
                     push_u16(&mut out, lp_share_bps);
                     push_u16(&mut out, insurance_share_bps);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::WithdrawInsuranceReserveToStake => out.push(87),
                 Self::UpdateMaintenanceFeePerSlot {
@@ -7045,10 +7088,12 @@ pub mod ix {
                 Self::WithdrawCreatorFee {
                     amount,
                     asset_index,
+                    authority_epoch,
                 } => {
                     out.push(90);
                     push_u128(&mut out, amount);
                     push_u16(&mut out, asset_index);
+                    push_u64(&mut out, authority_epoch);
                 }
             }
             out
@@ -9848,11 +9893,13 @@ pub mod processor {
             Instruction::UpdateInsuranceWithdrawPolicy {
                 deposits_only,
                 cooldown_slots,
+                authority_epoch,
             } => handle_update_insurance_withdraw_policy(
                 program_id,
                 accounts,
                 deposits_only,
                 cooldown_slots,
+                authority_epoch,
             ),
             Instruction::WithdrawBackingBucketEarnings {
                 domain,
@@ -10187,12 +10234,14 @@ pub mod processor {
                 creator_share_bps,
                 lp_share_bps,
                 insurance_share_bps,
+                authority_epoch,
             } => handle_update_fee_split(
                 program_id,
                 accounts,
                 creator_share_bps,
                 lp_share_bps,
                 insurance_share_bps,
+                authority_epoch,
             ),
             Instruction::WithdrawInsuranceReserveToStake => {
                 handle_withdraw_insurance_reserve_to_stake(program_id, accounts)
@@ -10210,7 +10259,8 @@ pub mod processor {
             Instruction::WithdrawCreatorFee {
                 amount,
                 asset_index,
-            } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index),
+                authority_epoch,
+            } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
         }
     }
 
@@ -15318,6 +15368,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         amount: u128,
         asset_index: u16,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let authority = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -15381,6 +15432,17 @@ pub mod processor {
             if !live_authority_matches(&claim_profile.asset_admin, authority.key) {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // W4-AE-EXTEND: gate-2-class replay protection -- a direct
+            // fund-withdrawal instruction, signer-gated on this asset's OWN
+            // `asset_admin` with zero prior replay protection (the same
+            // class upstream `ade6f9fa` bound for `WithdrawBackingBucket`/
+            // `WithdrawBackingBucketEarnings`/`WithdrawInsuranceAsset`,
+            // ported by W3A-1). CHECK ONLY, against THIS asset's own epoch
+            // lane (not asset-0's) -- `asset_admin` is rotated per-asset via
+            // `UpdateAssetAuthority`, so a held tx signed against asset 5's
+            // epoch must not be invalidated by an unrelated asset 0 rotation,
+            // nor survive one on its own asset.
+            require_authority_epoch_view(&group, asset_index as usize, expected_authority_epoch)?;
             verify_withdrawable_token_accounts(
                 dest_token,
                 authority.key,
@@ -15525,6 +15587,7 @@ pub mod processor {
         creator_share_bps: u16,
         lp_share_bps: u16,
         insurance_share_bps: u16,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -15535,6 +15598,14 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // W4-AE-EXTEND: gate-2-class replay protection (see `UpdateFeeSplit`'s
+        // wire-field doc comment) -- CHECK ONLY against the shared asset-0
+        // `authority_epoch` lane, matching the W3A-2 idiom for handlers that
+        // hold no `MarketViewMutV16` (no view is in scope here, unlike
+        // `handle_update_base_unit_mints`), reading raw control-sequence
+        // bytes directly.
+        let sequences = state::read_asset_control_sequences(&market_ai.try_borrow_data()?, 0)?;
+        state::require_current_authority_epoch(sequences.authority_epoch, expected_authority_epoch)?;
         cfg.creator_share_bps = creator_share_bps;
         cfg.lp_share_bps = lp_share_bps;
         cfg.insurance_share_bps = insurance_share_bps;
@@ -18381,6 +18452,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         deposits_only: u8,
         cooldown_slots: u64,
+        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -18393,6 +18465,11 @@ pub mod processor {
         let (mut cfg, _, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // W4-AE-EXTEND: gate-2-class replay protection, same idiom as
+        // `handle_update_fee_split` -- CHECK ONLY against the shared asset-0
+        // `authority_epoch` lane, read directly since no view is in scope.
+        let sequences = state::read_asset_control_sequences(&market_ai.try_borrow_data()?, 0)?;
+        state::require_current_authority_epoch(sequences.authority_epoch, expected_authority_epoch)?;
         cfg.insurance_withdraw_deposits_only = deposits_only;
         cfg.insurance_withdraw_cooldown_slots = cooldown_slots;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
