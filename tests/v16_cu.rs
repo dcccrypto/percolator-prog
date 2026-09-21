@@ -4704,11 +4704,12 @@ fn v16_bpf_close_slab_retires_native_residue_via_transfer_not_burn() {
         )
         .unwrap();
 
+    let authority_epoch = env.control_sequences(0).authority_epoch;
     let result = send_tx(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::CloseSlab,
+        ProgInstruction::CloseSlab { authority_epoch },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
             AccountMeta::new(env.market, false),
