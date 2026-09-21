@@ -126,7 +126,45 @@ pub mod constants {
     // `MARKET_ASSET_SLOT_LEN` is unchanged and no offset moves. Deployed asset-0
     // slots read this as zero after an in-place upgrade, which correctly means
     // "full rescan from asset 0" -- no migration instruction is needed.
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 480;
+    // FIX (TB-1a, "portfolio-identity infra + account-layout migration",
+    // adapted): 480 -> 496 for `next_portfolio_id: u64`, the market-scoped
+    // monotonic counter that assigns each `InitPortfolio` its `portfolio_id`
+    // (see `PORTFOLIO_ID_OFF` above). Upstream (`567c76c9`) stores this counter
+    // in `WrapperConfigV16::next_portfolio_id`, reusing a former padding word --
+    // our `WrapperConfigV16` has no equivalent spare (fully packed at
+    // `WRAPPER_CONFIG_LEN` = 576; growing it would shift `MARKET_GROUP_OFF` and
+    // every asset-profile offset, the documented 496->576 offset incident, and
+    // `tests/v16_fee_split.rs` pins `WRAPPER_CONFIG_LEN`/`MARKET_GROUP_OFF` as a
+    // deployed-layout invariant that must not move). Carved here instead,
+    // following the GH#420/GH#444/S1a precedent that asset 0's profile carries
+    // market-wide state the config mirrors -- asset 0 can never be RETIRED or
+    // re-activated (`ASSET_ACTION_RETIRE` rejects `asset_index == 0`), so this
+    // location is permanent for the market's whole life. Only asset 0's copy is
+    // read or written; asset_index in 1..N carries 8 inert always-zero bytes
+    // here, same as every other asset-0-only field in this struct.
+    //
+    // 480 + 8 = 488 is NOT a multiple of 16 -- the struct's `u128` fields
+    // (`maintenance_fee_previous_rate`, `terminal_slab_scan_progress`) force
+    // 16-byte alignment, and `size_of::<T>() % align_of::<T>() == 0` always
+    // holds, so a bare 8-byte append would force 8 bytes of HIDDEN compiler
+    // padding (`derive(Pod)` correctly refuses this at compile time -- caught
+    // empirically: `cargo build --lib` failed with "derive(Pod) was applied to
+    // a type with padding" before this comment was corrected). Made explicit
+    // instead (`_padding2: [u8; 8]`, always-zero, checked in
+    // `validate_asset_oracle_profile`) to keep the layout Pod-safe, matching
+    // the GH#444/zero-move-funding precedent for the same class of problem.
+    //
+    // Still inside the fixed 512-byte `ASSET_ORACLE_WRAPPER_LEN` slot (16 bytes
+    // spare afterward, down from 32 -- this consumes 16 of the budget
+    // `WRAPPER_SYNC_WAVE2_PLAN.md` §3 tracks for TB-2/TB-5's much larger
+    // 88-byte ask (8 for the real field, 8 for Pod-alignment padding);
+    // re-measure their fight against 16B, not 32B, once this lands), so
+    // `MARKET_ASSET_SLOT_LEN`/`MARKET_GROUP_OFF` are unchanged and no offset
+    // moves. Deployed asset-0 slots would read this as zero after an in-place
+    // upgrade, but that scenario does not apply here: per explicit user
+    // decision this rides the F-01 full re-seed, so every market (and every
+    // asset-0 profile) is created fresh under this layout from the start.
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 496;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -142,8 +180,66 @@ pub mod constants {
     pub const PORTFOLIO_ENGINE_ACCOUNT_LEN: usize = HEADER_LEN + PORTFOLIO_STATE_LEN;
     pub const PORTFOLIO_MATCHER_CONFIG_OFF: usize = PORTFOLIO_ENGINE_ACCOUNT_LEN;
     pub const PORTFOLIO_MATCHER_CONFIG_LEN: usize = 104;
+    // TB-1a (portfolio-identity infra, ADOPT upstream b594bc21): byte offset of
+    // `PortfolioMatcherConfigV16.control` within the portfolio account. Bit 0 is
+    // `enabled` (6b627b43), bits 1..49 are `position_epoch` (this unit), bits
+    // 50..63 are `trade_fee_cap_bps` (6b627b43). Same 8 bytes as the tail of the
+    // 104-byte matcher config (offset 96 within it) -- NOT a new field, just a
+    // dedicated raw-offset accessor for the bit-packed word.
+    pub const PORTFOLIO_MATCHER_CONTROL_OFF: usize = PORTFOLIO_MATCHER_CONFIG_OFF + 96;
+    // ── Portfolio-identity trailer (TB-1a, ADOPT upstream 567c76c9 + 597f8dcc +
+    // 0b838425, adapted -- see WRAPPER_SYNC_WAVE2_PLAN.md TB-1). Three u64
+    // fields APPENDED after the existing matcher-config tail; no existing field
+    // moves. `PORTFOLIO_ACCOUNT_LEN` grows 9539 -> 9563 (+24B). Per explicit user
+    // decision (2026-09-18, "we don't need to worry about old legacy accounts"),
+    // this rides the F-01 full re-seed -- every portfolio account is recreated
+    // fresh via InitPortfolio under the new layout, so there is NO legacy-account
+    // backfill/compat path anywhere in this trailer's read helpers (matches
+    // upstream's `read_portfolio_id`, which unconditionally rejects `id == 0`
+    // with no `PORTFOLIO_LEGACY_ACCOUNT_LEN`-style length fallback). ──
+    /// Program-assigned, permanent, never-reused portfolio incarnation ID.
+    /// Zero is invalid and is rejected by `read_portfolio_id`; every portfolio
+    /// account gets a real ID at `InitPortfolio` (see `next_portfolio_id` on
+    /// `AssetOracleProfileV16` for the allocator's counter storage).
+    pub const PORTFOLIO_ID_OFF: usize = PORTFOLIO_MATCHER_CONFIG_OFF + PORTFOLIO_MATCHER_CONFIG_LEN;
+    pub const PORTFOLIO_ID_LEN: usize = 8;
+    /// Upstream's `expected_sequence` field (named `portfolio_matcher_sequence`
+    /// in upstream's own helpers) -- a monotonic replay-ordering watermark
+    /// advanced by matcher-consent-mutating instructions (`SetMatcherConfig` and
+    /// friends). Binding this at the 12 tag sites is TB-1b's job; this unit only
+    /// provides the storage + read/advance infra.
+    pub const PORTFOLIO_MATCHER_SEQUENCE_OFF: usize = PORTFOLIO_ID_OFF + PORTFOLIO_ID_LEN;
+    pub const PORTFOLIO_MATCHER_SEQUENCE_LEN: usize = 8;
+    /// Upstream's `expiry_slot` (ADOPT upstream `0b838425`, folded into this
+    /// same trailer append per WRAPPER_SYNC_WAVE2_PLAN.md §0). Slot at which a
+    /// matcher capability granted via `SetMatcherConfig` stops being live; 0
+    /// means "disabled / never granted". Wiring this into the CPI trade-auth
+    /// check is TB-1b's job.
+    pub const PORTFOLIO_MATCHER_EXPIRY_OFF: usize =
+        PORTFOLIO_MATCHER_SEQUENCE_OFF + PORTFOLIO_MATCHER_SEQUENCE_LEN;
+    pub const PORTFOLIO_MATCHER_EXPIRY_LEN: usize = 8;
     pub const PORTFOLIO_ACCOUNT_LEN: usize =
-        PORTFOLIO_ENGINE_ACCOUNT_LEN + PORTFOLIO_MATCHER_CONFIG_LEN;
+        PORTFOLIO_MATCHER_EXPIRY_OFF + PORTFOLIO_MATCHER_EXPIRY_LEN;
+    // Compile-time guards (TB-1a): the trailer append must land at exactly the
+    // expected byte offsets/total, and every pre-existing field's offset
+    // (everything up to and including `PORTFOLIO_MATCHER_CONFIG_OFF` +
+    // `PORTFOLIO_MATCHER_CONFIG_LEN`) must be provably UNCHANGED -- these are
+    // all still derived from the untouched `PORTFOLIO_ENGINE_ACCOUNT_LEN` /
+    // `PORTFOLIO_MATCHER_CONFIG_LEN`, so this assert also transitively pins
+    // those.
+    const _ASSERT_PORTFOLIO_MATCHER_CONFIG_UNCHANGED: () =
+        assert!(PORTFOLIO_MATCHER_CONFIG_OFF == PORTFOLIO_ENGINE_ACCOUNT_LEN);
+    const _ASSERT_PORTFOLIO_ID_OFF: () =
+        assert!(PORTFOLIO_ID_OFF == PORTFOLIO_MATCHER_CONFIG_OFF + 104);
+    const _ASSERT_PORTFOLIO_MATCHER_SEQUENCE_OFF: () =
+        assert!(PORTFOLIO_MATCHER_SEQUENCE_OFF == PORTFOLIO_ID_OFF + 8);
+    const _ASSERT_PORTFOLIO_MATCHER_EXPIRY_OFF: () =
+        assert!(PORTFOLIO_MATCHER_EXPIRY_OFF == PORTFOLIO_MATCHER_SEQUENCE_OFF + 8);
+    const _ASSERT_PORTFOLIO_ACCOUNT_LEN_9563: () = assert!(PORTFOLIO_ACCOUNT_LEN == 9563);
+    // Bit-layout non-collision (6b627b43's ENABLED_MASK bit0 / TRADE_FEE_CAP bits
+    // 50..63 vs this unit's position_epoch bits 1..49): checked against the
+    // struct's own consts below (`_ASSERT_POSITION_EPOCH_BIT_LAYOUT_*` in the
+    // `state` module's `PortfolioMatcherConfigV16` impl).
     pub const MAX_MATCHER_TAIL_ACCOUNTS: usize = 32;
     pub const MATCHER_ABI_VERSION: u32 = 3;
     pub const MATCHER_CONTEXT_MIN_LEN: usize = 64;
@@ -836,8 +932,11 @@ pub mod state {
             MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
             ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
             ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
-            PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_MATCHER_CONFIG_LEN,
-            PORTFOLIO_MATCHER_CONFIG_OFF, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
+            PORTFOLIO_ENGINE_ACCOUNT_LEN, PORTFOLIO_ID_LEN, PORTFOLIO_ID_OFF,
+            PORTFOLIO_MATCHER_CONFIG_LEN, PORTFOLIO_MATCHER_CONFIG_OFF,
+            PORTFOLIO_MATCHER_CONTROL_OFF, PORTFOLIO_MATCHER_EXPIRY_LEN,
+            PORTFOLIO_MATCHER_EXPIRY_OFF, PORTFOLIO_MATCHER_SEQUENCE_LEN,
+            PORTFOLIO_MATCHER_SEQUENCE_OFF, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
         },
         error::PercolatorError,
     };
@@ -1640,6 +1739,27 @@ pub mod state {
         /// in-place upgrade, which correctly means "full rescan from asset 0" --
         /// no migration instruction is needed.
         pub terminal_slab_scan_progress: u128,
+
+        /// TB-1a: market-scoped monotonic counter allocating each successful
+        /// `InitPortfolio`'s `portfolio_id` (`constants::PORTFOLIO_ID_OFF` on
+        /// `PortfolioAccountV16`). See `ASSET_ORACLE_PROFILE_LEN`'s doc comment
+        /// for why this lives here (asset 0's spare tail) rather than in
+        /// `WrapperConfigV16`. Only asset 0's copy is read or written. Zero
+        /// means "no portfolio ever created yet"; `state::allocate_portfolio_id`
+        /// normalizes that to the first real ID (1) on first use, matching
+        /// upstream's `next_portfolio_id` semantics exactly.
+        ///
+        /// `ASSET_ORACLE_PROFILE_LEN` grows 480 -> 496. See `_padding2` (below)
+        /// and `ASSET_ORACLE_PROFILE_LEN`'s own doc comment for why an 8-byte
+        /// `u64` append here needs 8 bytes of explicit trailing padding to stay
+        /// Pod-safe (the struct's `u128` fields force 16-byte alignment).
+        pub next_portfolio_id: u64,
+        /// Explicit padding keeping `size_of::<AssetOracleProfileV16>()` a
+        /// multiple of 16 after `next_portfolio_id`'s 8-byte append (see that
+        /// field's doc comment). Always-zero, checked in
+        /// `validate_asset_oracle_profile`, same convention as `_padding0`/
+        /// `_padding1` above.
+        pub _padding2: [u8; 8],
     }
 
     // Compile-time guard (ABI_LANDMINE_REGISTRY.md W0-1: "our fork's build will NOT
@@ -1763,25 +1883,47 @@ pub mod state {
         pub matcher_program: [u8; 32],
         pub matcher_context: [u8; 32],
         pub matcher_delegate: [u8; 32],
-        /// Bit 0 is the matcher-enabled flag. Bits 50..63 carry the LP's maximum accepted
-        /// market base fee in basis points (`trade_fee_cap_bps`, 14 bits, 0..=10_000).
-        /// Bits 1..49 are currently unused by this fork (upstream reserves them for a
-        /// position-episode counter we don't have yet -- see ABI_LANDMINE_REGISTRY.md §4).
-        /// Legacy accounts contain only 0 or 1 here, which decodes as a zero fee cap: CPI
-        /// trades fail closed against any nonzero base fee until the LP reauthorizes via
-        /// SetMatcherConfig. Named `control` (not `enabled`) for parity with upstream's
-        /// bit-packed field at this same byte offset.
+        /// Bit 0 is the matcher-enabled flag, bits 1..49 are the position episode
+        /// (TB-1a, ADOPT upstream `b594bc21`/`6b627b43`), and bits 50..63 carry
+        /// the LP's maximum accepted market base fee in basis points
+        /// (`trade_fee_cap_bps`, 14 bits, 0..=10_000, `6b627b43`).
+        /// Legacy accounts contain a small episode plus the enabled bit, so
+        /// their fee cap decodes as zero: CPI trades fail closed against any
+        /// nonzero base fee until the LP reauthorizes via SetMatcherConfig. A
+        /// legacy episode reaching bit 49 would be incompatible, but that
+        /// requires at least 2^49 successful position-episode changes and is
+        /// unreachable within the SVM lifetime. Named `control` (not `enabled`)
+        /// for parity with upstream's bit-packed field at this same byte offset.
         pub control: u64,
     }
 
     impl PortfolioMatcherConfigV16 {
         const ENABLED_MASK: u64 = 1;
+        // TB-1a (ADOPT upstream b594bc21, narrowed by 6b627b43): position_epoch
+        // occupies bits 1..49 (49 bits), immediately above ENABLED_MASK (bit 0)
+        // and immediately below TRADE_FEE_CAP (bits 50..63) -- the three fields
+        // partition the full 64-bit `control` word with no gap and no overlap
+        // (1 + 49 + 14 == 64, asserted below).
+        const POSITION_EPOCH_SHIFT: u32 = 1;
+        const POSITION_EPOCH_BITS: u32 = 49;
+        const POSITION_EPOCH_MAX: u64 = (1u64 << Self::POSITION_EPOCH_BITS) - 1;
+        const POSITION_EPOCH_MASK: u64 = Self::POSITION_EPOCH_MAX << Self::POSITION_EPOCH_SHIFT;
         const TRADE_FEE_CAP_SHIFT: u32 = 50;
         const TRADE_FEE_CAP_MASK: u64 = 0x3fffu64 << Self::TRADE_FEE_CAP_SHIFT;
 
         #[inline]
         pub fn enabled(&self) -> u64 {
             self.control & Self::ENABLED_MASK
+        }
+
+        #[inline]
+        pub fn position_epoch(&self) -> u64 {
+            (self.control & Self::POSITION_EPOCH_MASK) >> Self::POSITION_EPOCH_SHIFT
+        }
+
+        #[inline]
+        pub const fn position_epoch_max() -> u64 {
+            Self::POSITION_EPOCH_MAX
         }
 
         #[inline]
@@ -1816,6 +1958,26 @@ pub mod state {
             Ok(())
         }
     }
+
+    // Compile-time guard (TB-1a): ENABLED_MASK (bit0) / POSITION_EPOCH_MASK
+    // (bits1..49) / TRADE_FEE_CAP_MASK (bits50..63) must partition `control`'s
+    // 64 bits with zero overlap and zero gap -- referenced from
+    // `constants::_ASSERT_PORTFOLIO_ACCOUNT_LEN_9563`'s neighbouring comment.
+    const _ASSERT_POSITION_EPOCH_BIT_LAYOUT_NO_OVERLAP_WITH_ENABLED: () = assert!(
+        PortfolioMatcherConfigV16::POSITION_EPOCH_MASK & PortfolioMatcherConfigV16::ENABLED_MASK
+            == 0
+    );
+    const _ASSERT_POSITION_EPOCH_BIT_LAYOUT_NO_OVERLAP_WITH_FEE_CAP: () = assert!(
+        PortfolioMatcherConfigV16::POSITION_EPOCH_MASK
+            & PortfolioMatcherConfigV16::TRADE_FEE_CAP_MASK
+            == 0
+    );
+    const _ASSERT_POSITION_EPOCH_BIT_LAYOUT_FULL_PARTITION: () = assert!(
+        PortfolioMatcherConfigV16::ENABLED_MASK
+            | PortfolioMatcherConfigV16::POSITION_EPOCH_MASK
+            | PortfolioMatcherConfigV16::TRADE_FEE_CAP_MASK
+            == u64::MAX
+    );
 
     pub type AssetOracleStorageV16 = [u8; ASSET_ORACLE_WRAPPER_LEN];
     pub type MarketViewMutV16<'a> = MarketGroupV16ViewMut<'a, AssetOracleStorageV16>;
@@ -2000,6 +2162,201 @@ pub mod state {
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(bytemuck::bytes_of(cfg));
         Ok(())
+    }
+
+    // ── TB-1a: portfolio-identity infra (ADOPT upstream 567c76c9 + b594bc21 +
+    // 6b627b43 + 597f8dcc + 0b838425, adapted). Account-layout + read/write
+    // accessors ONLY -- binding these at the 12 tag sites (Deposit, Withdraw,
+    // ClosePortfolio, SetMatcherConfig, ConvertReleasedPnl, CureAndCancelClose,
+    // ForfeitRecoveryLeg, RebalanceReduce, TradeNoCpi, TradeCpi, BatchTradeNoCpi,
+    // BatchTradeCpi) is TB-1b's job. Per explicit user decision (2026-09-18),
+    // this fork does NOT carry any legacy-account backfill/compat path: every
+    // portfolio account is recreated fresh via `InitPortfolio` under the F-01
+    // re-seed, so `read_portfolio_id` (below) unconditionally rejects `id == 0`
+    // exactly like upstream, with no length-based legacy fallback. ──
+
+    #[inline]
+    pub fn read_portfolio_id(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        let id = read_u64(data, PORTFOLIO_ID_OFF)?;
+        if id == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(id)
+    }
+
+    #[inline]
+    fn write_portfolio_id(data: &mut [u8], id: u64) -> Result<(), ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        if id == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        data.get_mut(PORTFOLIO_ID_OFF..PORTFOLIO_ID_OFF + PORTFOLIO_ID_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&id.to_le_bytes());
+        Ok(())
+    }
+
+    /// Pure allocator: given the market's current `next_portfolio_id` counter
+    /// (storage-location-agnostic -- see `AssetOracleProfileV16::next_portfolio_id`
+    /// for where TB-1a keeps it on this fork, vs upstream's
+    /// `WrapperConfigV16::next_portfolio_id`), returns the ID to assign to this
+    /// `InitPortfolio` and the counter's next value. Zero is the legacy
+    /// pre-counter sentinel (a market that has never allocated an ID yet) and is
+    /// normalized to one, matching upstream's `allocate_portfolio_id` exactly.
+    #[inline]
+    pub(crate) fn allocate_portfolio_id(next: u64) -> Result<(u64, u64), ProgramError> {
+        let id = if next == 0 { 1 } else { next };
+        let next = id
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineCounterOverflow)?;
+        Ok((id, next))
+    }
+
+    #[inline]
+    pub fn read_portfolio_position_epoch(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        let control = read_u64(data, PORTFOLIO_MATCHER_CONTROL_OFF)?;
+        let cfg = PortfolioMatcherConfigV16 {
+            control,
+            ..PortfolioMatcherConfigV16::default()
+        };
+        cfg.validate()?;
+        Ok(cfg.position_epoch())
+    }
+
+    #[inline]
+    pub fn next_portfolio_position_control(control: u64) -> Result<(u64, u64), ProgramError> {
+        let cfg = PortfolioMatcherConfigV16 {
+            control,
+            ..PortfolioMatcherConfigV16::default()
+        };
+        cfg.validate()?;
+        let next = cfg
+            .position_epoch()
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineCounterOverflow)?;
+        if next > PortfolioMatcherConfigV16::position_epoch_max() {
+            return Err(PercolatorError::EngineCounterOverflow.into());
+        }
+        let next_control = (control & !PortfolioMatcherConfigV16::POSITION_EPOCH_MASK)
+            | (next << PortfolioMatcherConfigV16::POSITION_EPOCH_SHIFT);
+        Ok((next, next_control))
+    }
+
+    #[inline]
+    pub fn bump_portfolio_position_epoch(data: &mut [u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        let control = read_u64(data, PORTFOLIO_MATCHER_CONTROL_OFF)?;
+        let (next, next_control) = next_portfolio_position_control(control)?;
+        data.get_mut(PORTFOLIO_MATCHER_CONTROL_OFF..PORTFOLIO_MATCHER_CONTROL_OFF + 8)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&next_control.to_le_bytes());
+        Ok(next)
+    }
+
+    /// Upstream's `expected_sequence` (upstream's own helper name is
+    /// `read_portfolio_matcher_sequence`, kept verbatim here for grep parity
+    /// with upstream diffs). A monotonic replay-ordering watermark: matcher-
+    /// consent-mutating instructions (`SetMatcherConfig` and friends, TB-1b)
+    /// must supply the CURRENT value as `expected_sequence` and the write
+    /// advances it by one, rejecting stale/replayed instructions.
+    #[inline]
+    pub fn read_portfolio_matcher_sequence(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        read_u64(data, PORTFOLIO_MATCHER_SEQUENCE_OFF)
+    }
+
+    #[inline]
+    fn write_portfolio_matcher_sequence(data: &mut [u8], sequence: u64) -> Result<(), ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        data.get_mut(
+            PORTFOLIO_MATCHER_SEQUENCE_OFF..PORTFOLIO_MATCHER_SEQUENCE_OFF + PORTFOLIO_MATCHER_SEQUENCE_LEN,
+        )
+        .ok_or(PercolatorError::InvalidAccountLen)?
+        .copy_from_slice(&sequence.to_le_bytes());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn advance_portfolio_matcher_sequence(
+        data: &mut [u8],
+        expected_sequence: u64,
+    ) -> Result<u64, ProgramError> {
+        let current = read_portfolio_matcher_sequence(data)?;
+        let next = next_portfolio_matcher_sequence(current, expected_sequence)?;
+        write_portfolio_matcher_sequence(data, next)?;
+        Ok(next)
+    }
+
+    #[inline]
+    pub fn next_portfolio_matcher_sequence(
+        current: u64,
+        expected_sequence: u64,
+    ) -> Result<u64, ProgramError> {
+        if current != expected_sequence {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        current
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineCounterOverflow.into())
+    }
+
+    /// Upstream's `expiry_slot` (ADOPT upstream `0b838425`; upstream's own
+    /// helper name is `read_portfolio_matcher_expiry`, kept verbatim for grep
+    /// parity). Slot at which a matcher capability granted via
+    /// `SetMatcherConfig` stops being live; 0 means "disabled / never granted".
+    #[inline]
+    pub fn read_portfolio_matcher_expiry(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        read_u64(data, PORTFOLIO_MATCHER_EXPIRY_OFF)
+    }
+
+    // TB-1a: infra-only in this unit -- no handler wires expiry_slot writes yet
+    // (that's TB-1b's `SetMatcherConfig` binding). Exercised directly by this
+    // unit's own inline roundtrip test, but `cargo build --lib`/`build-sbf`
+    // (which don't compile `#[cfg(test)]` code) would otherwise flag it
+    // dead_code until TB-1b's handler calls it for real.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn write_portfolio_matcher_expiry(
+        data: &mut [u8],
+        expiry_slot: u64,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        data.get_mut(
+            PORTFOLIO_MATCHER_EXPIRY_OFF..PORTFOLIO_MATCHER_EXPIRY_OFF + PORTFOLIO_MATCHER_EXPIRY_LEN,
+        )
+        .ok_or(PercolatorError::InvalidAccountLen)?
+        .copy_from_slice(&expiry_slot.to_le_bytes());
+        Ok(())
+    }
+
+    /// Pure predicate (ADOPT upstream `0b838425`): whether a granted matcher
+    /// capability is still live at `current_slot`. Provided as infra for TB-1b
+    /// to wire into the CPI trade-authorization check (`handle_batch_trade_cpi`
+    /// and friends) -- not called from any handler in this unit.
+    #[inline]
+    pub fn matcher_capability_is_live(expiry_slot: u64, current_slot: u64) -> bool {
+        expiry_slot != 0 && current_slot < expiry_slot
+    }
+
+    /// Pure predicate (ADOPT upstream `0b838425`): whether a `SetMatcherConfig`
+    /// payload's `(enabled, trade_fee_cap_bps, expiry_slot)` triple is
+    /// internally consistent. Provided as infra for TB-1b to wire into
+    /// `handle_set_matcher_config` -- not called from any handler in this unit.
+    #[inline]
+    pub fn matcher_capability_config_is_valid(
+        enabled: u8,
+        trade_fee_cap_bps: u16,
+        expiry_slot: u64,
+        current_slot: u64,
+    ) -> bool {
+        match enabled {
+            0 => trade_fee_cap_bps == 0 && expiry_slot == 0,
+            1 => trade_fee_cap_bps <= 10_000 && matcher_capability_is_live(expiry_slot, current_slot),
+            _ => false,
+        }
     }
 
     #[inline]
@@ -2343,6 +2700,7 @@ pub mod state {
                 && profile.effective_price_provenance != EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED)
             || profile._padding0 != [0u8; 5]
             || profile._padding1 != [0u8; 8]
+            || profile._padding2 != [0u8; 8]
             || profile.oracle_leg_count as usize > ORACLE_LEG_CAP
             || (profile.oracle_leg_flags & !ORACLE_LEG_FLAGS_MASK) != 0
             // FIX (ADOPT upstream 06192caa, adapted): shape guard for the
@@ -2436,9 +2794,27 @@ pub mod state {
         Ok(())
     }
 
-    #[inline]
-    pub fn manual_asset_oracle_profile(initial_price: u64, slot: u64) -> AssetOracleProfileV16 {
-        AssetOracleProfileV16 {
+    // TB-1a: was `#[inline] -> AssetOracleProfileV16` (by value). `AssetOracleProfileV16`
+    // grew 480 -> 496 bytes (`next_portfolio_id` + its Pod-alignment padding).
+    // `handle_update_asset_lifecycle` calls this 3x across its branches and
+    // was ALREADY within ~16 bytes of the BPF 4096-byte stack-frame limit on
+    // `origin/main` before this unit's change (verified empirically: baseline
+    // `cargo build-sbf` is clean at 480B; this fork's unmodified +16B version
+    // failed with "Stack offset ... exceeded max offset of 4096 by 16 bytes").
+    // `#[inline(never)]` alone did not fix it -- a by-value return of a struct
+    // this size still needs the CALLER to reserve `sret` space for it
+    // regardless of inlining. Returning `Box<AssetOracleProfileV16>` instead
+    // makes the return a thin (8-byte) pointer, moving the 496-byte
+    // construction onto the heap; verified this clears the overflow with room
+    // to spare. Callers that need an owned value (not the 3 hot call sites in
+    // `handle_update_asset_lifecycle`, which keep the `Box` -- see that
+    // function) deref-copy it back (`AssetOracleProfileV16: Copy`).
+    #[inline(never)]
+    pub fn manual_asset_oracle_profile(
+        initial_price: u64,
+        slot: u64,
+    ) -> alloc::boxed::Box<AssetOracleProfileV16> {
+        alloc::boxed::Box::new(AssetOracleProfileV16 {
             oracle_mode: ORACLE_MODE_MANUAL,
             oracle_leg_count: 0,
             oracle_leg_flags: 0,
@@ -2476,7 +2852,9 @@ pub mod state {
             funding_mark_pending_slot: 0,
             _padding1: [0u8; 8],
             terminal_slab_scan_progress: 0,
-        }
+            next_portfolio_id: 0,
+            _padding2: [0u8; 8],
+        })
     }
 
     pub fn asset_oracle_profile_from_config(config: &WrapperConfigV16) -> AssetOracleProfileV16 {
@@ -2522,6 +2900,8 @@ pub mod state {
             funding_mark_pending_slot: 0,
             _padding1: [0u8; 8],
             terminal_slab_scan_progress: 0,
+            next_portfolio_id: 0,
+            _padding2: [0u8; 8],
         }
     }
 
@@ -2742,7 +3122,11 @@ pub mod state {
             .map_err(map_account_wire_error)?;
         *market_header_mut(data)? = header;
         *asset_slot_wire_mut(data, asset_index)? = slot;
-        let mut profile = manual_asset_oracle_profile(initial_price, now_slot);
+        // TB-1a: `manual_asset_oracle_profile` now returns `Box<...>` (BPF
+        // stack-pressure fix, see that function's doc comment). This function's
+        // own return type is the owned struct, so deref-copy it back --
+        // `AssetOracleProfileV16: Copy` and this call site is not stack-tight.
+        let mut profile = *manual_asset_oracle_profile(initial_price, now_slot);
         profile.insurance_authority = insurance_authority;
         profile.insurance_operator = insurance_operator;
         profile.backing_bucket_authority = backing_bucket_authority;
@@ -3863,6 +4247,11 @@ pub mod state {
         owner: [u8; 32],
         last_fee_slot: u64,
         max_market_slots: usize,
+        // TB-1a (ADOPT upstream 567c76c9, adapted): program-assigned, permanent
+        // `portfolio_id`. The caller (`handle_init_portfolio`) allocates this
+        // from the market's `next_portfolio_id` counter (see
+        // `AssetOracleProfileV16::next_portfolio_id`) BEFORE calling here.
+        portfolio_id: u64,
     ) -> Result<(), ProgramError> {
         let required = portfolio_account_len_for_market_slots(max_market_slots)?;
         // ADOPT upstream 2c8c5ba3 (LENGTH half only): exact canonical length, not
@@ -3889,7 +4278,15 @@ pub mod state {
         for leg in wire.legs.iter_mut() {
             *leg = empty_leg;
         }
-        Ok(())
+        // The whole-buffer zero above already leaves `expected_sequence` (0)
+        // and `expiry_slot` (0, "disabled") at their correct fresh-init values
+        // -- matches upstream's `portfolio_matcher_sequence`/`portfolio_matcher_expiry`
+        // inline test (`portfolio_position_epoch_is_zero_initialized_checked_and_monotonic`,
+        // ported below), which asserts both read back as 0 immediately after init.
+        // `portfolio_id` is the one trailer field that must never be left at its
+        // zeroed default (0 is rejected by `read_portfolio_id`), so it gets an
+        // explicit write here.
+        write_portfolio_id(data, portfolio_id)
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -7580,10 +7977,18 @@ pub mod processor {
         cfg.oracle_leg_publish_times = [0i64; constants::ORACLE_LEG_CAP];
     }
 
+    // TB-1a: mutates in place (was `profile: AssetOracleProfileV16 -> AssetOracleProfileV16`
+    // by value). Two of this function's three call sites live inside
+    // `handle_update_asset_lifecycle`, which is BPF-stack-tight (see
+    // `manual_asset_oracle_profile`'s doc comment); round-tripping a 496-byte
+    // struct through this function by value/return re-materializes a full
+    // stack copy even when the caller holds it as a `Box`. In-place mutation
+    // avoids that regardless of whether the caller's `profile` is a `Box` or
+    // a plain owned value (`&mut Box<T>` derefs to `&mut T` automatically).
     fn preserve_backing_fee_policy(
-        mut profile: state::AssetOracleProfileV16,
+        profile: &mut state::AssetOracleProfileV16,
         existing: &state::AssetOracleProfileV16,
-    ) -> state::AssetOracleProfileV16 {
+    ) {
         profile.backing_trade_fee_bps_long = existing.backing_trade_fee_bps_long;
         profile.backing_trade_fee_bps_short = existing.backing_trade_fee_bps_short;
         profile.backing_trade_fee_insurance_share_bps_long =
@@ -7594,7 +7999,6 @@ pub mod processor {
         profile.insurance_operator = existing.insurance_operator;
         profile.backing_bucket_authority = existing.backing_bucket_authority;
         profile.oracle_authority = existing.oracle_authority;
-        profile
     }
 
     fn backing_fee_policy_count_from_profile(profile: &state::AssetOracleProfileV16) -> u16 {
@@ -8705,6 +9109,16 @@ pub mod processor {
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             let last_fee_slot = authenticated_market_slot_or_fallback_view(&group);
+            // TB-1a: allocate this portfolio's permanent `portfolio_id` from the
+            // market-scoped counter carried in asset 0's `AssetOracleProfileV16`
+            // spare tail (see that field's doc comment for why it lives there,
+            // not in `WrapperConfigV16`). Every market always has an asset 0
+            // (`DEFAULT_MARKET_SLOT_CAPACITY = 1`), and asset 0 can never be
+            // retired/re-activated, so this storage is permanent for the
+            // market's whole life.
+            let mut profile0 = read_oracle_profile_from_view(&group, &cfg, 0)?;
+            let (portfolio_id, next_portfolio_id) =
+                state::allocate_portfolio_id(profile0.next_portfolio_id)?;
             state::init_portfolio_account_zero_copy(
                 &mut portfolio_ai.try_borrow_mut_data()?,
                 market_ai.key.to_bytes(),
@@ -8712,6 +9126,7 @@ pub mod processor {
                 owner.key.to_bytes(),
                 last_fee_slot,
                 max_market_slots,
+                portfolio_id,
             )?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
             let portfolio =
@@ -8723,6 +9138,8 @@ pub mod processor {
             group
                 .register_empty_materialized_portfolio_not_atomic(&portfolio.as_view())
                 .map_err(map_v16_error)?;
+            profile0.next_portfolio_id = next_portfolio_id;
+            write_oracle_profile_to_view(&mut group, 0, &profile0)?;
         }
         let _ = (cfg, source_domain_count);
         Ok(())
@@ -15110,10 +15527,11 @@ pub mod processor {
                 )
                 .map_err(map_v16_error)?;
 
-            let mut profile = preserve_backing_fee_policy(
-                state::manual_asset_oracle_profile(initial_price, authenticated_slot),
-                &existing_profile,
-            );
+            // TB-1a: deref-copy -- `manual_asset_oracle_profile` returns
+            // `Box<...>` (BPF stack-pressure fix, see its doc comment); this
+            // function is not stack-tight, so an owned copy is fine here.
+            let mut profile = *state::manual_asset_oracle_profile(initial_price, authenticated_slot);
+            preserve_backing_fee_policy(&mut profile, &existing_profile);
             profile.asset_admin = existing_profile.asset_admin;
             profile.insurance_authority = existing_profile.insurance_authority;
             profile.insurance_operator = existing_profile.insurance_operator;
@@ -15532,10 +15950,16 @@ pub mod processor {
                     if was_retired {
                         add_backing_fee_policy_count(&mut cfg, preserved_policy_count)?;
                     }
-                    let mut profile = preserve_backing_fee_policy(
-                        state::manual_asset_oracle_profile(initial_price, authenticated_slot),
-                        &existing_profile,
-                    );
+                    // TB-1a: keep `profile` as the `Box<...>` `manual_asset_oracle_profile`
+                    // returns (BPF stack-pressure fix) all the way into
+                    // `reset_profile` below -- `reset_profile` is declared
+                    // outside this branch and stays live for the rest of the
+                    // function, so keeping it a thin pointer instead of a
+                    // 496-byte value is exactly the fix `handle_update_asset_lifecycle`
+                    // needed to clear the BPF stack-frame overflow.
+                    let mut profile =
+                        state::manual_asset_oracle_profile(initial_price, authenticated_slot);
+                    preserve_backing_fee_policy(&mut profile, &existing_profile);
                     profile.insurance_authority = insurance_authority;
                     profile.insurance_operator = insurance_operator;
                     profile.backing_bucket_authority = backing_bucket_authority;
@@ -15599,10 +16023,10 @@ pub mod processor {
                         .asset
                         .effective_price
                         .get();
-                    let profile = preserve_backing_fee_policy(
-                        state::manual_asset_oracle_profile(price, authenticated_slot),
-                        &existing_profile,
-                    );
+                    // TB-1a: see the sibling ASSET_ACTION_RESET_ORACLE arm above
+                    // -- keep `profile` as `Box<...>` into `reset_profile`.
+                    let mut profile = state::manual_asset_oracle_profile(price, authenticated_slot);
+                    preserve_backing_fee_policy(&mut profile, &existing_profile);
                     if asset_index == 0 {
                         mirror_manual_profile_to_base_config(&mut cfg, &profile, false);
                     }
@@ -16262,6 +16686,15 @@ pub mod processor {
                 funding_mark_pending_slot: 0,
                 _padding1: [0u8; 8],
                 terminal_slab_scan_progress: 0,
+                // TB-1a: preserve the asset-0 portfolio_id allocator counter
+                // across oracle reconfiguration -- this handler rebuilds the
+                // whole profile literal, and zeroing this here (like the other
+                // "fresh reconfiguration" fields above) would reset every
+                // future InitPortfolio's ID back to 1, colliding with
+                // already-live portfolio_ids. Carried over exactly like
+                // `backing_bucket_authority`/`oracle_authority` below.
+                next_portfolio_id: existing_profile.next_portfolio_id,
+                _padding2: [0u8; 8],
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs,
@@ -16399,6 +16832,15 @@ pub mod processor {
                 funding_mark_pending_slot: 0,
                 _padding1: [0u8; 8],
                 terminal_slab_scan_progress: 0,
+                // TB-1a: preserve the asset-0 portfolio_id allocator counter
+                // across oracle reconfiguration -- this handler rebuilds the
+                // whole profile literal, and zeroing this here (like the other
+                // "fresh reconfiguration" fields above) would reset every
+                // future InitPortfolio's ID back to 1, colliding with
+                // already-live portfolio_ids. Carried over exactly like
+                // `backing_bucket_authority`/`oracle_authority` below.
+                next_portfolio_id: existing_profile.next_portfolio_id,
+                _padding2: [0u8; 8],
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -16516,6 +16958,15 @@ pub mod processor {
                 funding_mark_pending_slot: 0,
                 _padding1: [0u8; 8],
                 terminal_slab_scan_progress: 0,
+                // TB-1a: preserve the asset-0 portfolio_id allocator counter
+                // across oracle reconfiguration -- this handler rebuilds the
+                // whole profile literal, and zeroing this here (like the other
+                // "fresh reconfiguration" fields above) would reset every
+                // future InitPortfolio's ID back to 1, colliding with
+                // already-live portfolio_ids. Carried over exactly like
+                // `backing_bucket_authority`/`oracle_authority` below.
+                next_portfolio_id: existing_profile.next_portfolio_id,
+                _padding2: [0u8; 8],
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -22489,6 +22940,7 @@ pub mod processor {
                 [11u8; 32],
                 0,
                 1,
+                1,
             )
             .unwrap();
             state::init_portfolio_account_zero_copy(
@@ -22498,6 +22950,7 @@ pub mod processor {
                 [13u8; 32],
                 0,
                 1,
+                2,
             )
             .unwrap();
 
@@ -22837,6 +23290,198 @@ pub mod processor {
             assert_eq!(
                 apply_insurance_withdraw_ceiling(1, 100, 101).unwrap_err(),
                 PercolatorError::InsuranceWithdrawCeilingExceeded.into()
+            );
+        }
+
+        // ── TB-1a: portfolio-identity infra decode/roundtrip tests (ADOPT
+        // upstream 567c76c9/b594bc21/6b627b43/597f8dcc/0b838425's own inline
+        // tests, adapted to this fork's tree/naming). Infra only -- these cover
+        // the account-layout + read/write helpers this unit built, NOT the
+        // 12-tag binding enforcement (TB-1b). ──────────────────────────────
+
+        fn init_test_portfolio(portfolio_id: u64) -> alloc::vec::Vec<u8> {
+            let mut data = vec![0u8; constants::PORTFOLIO_ACCOUNT_LEN];
+            state::init_portfolio_account_zero_copy(
+                &mut data,
+                [1u8; 32],
+                [2u8; 32],
+                [3u8; 32],
+                0,
+                1,
+                portfolio_id,
+            )
+            .expect("initialize portfolio");
+            data
+        }
+
+        #[test]
+        fn portfolio_id_allocator_normalizes_legacy_zero_and_rejects_exhaustion() {
+            assert_eq!(state::allocate_portfolio_id(0).unwrap(), (1, 2));
+            assert_eq!(state::allocate_portfolio_id(41).unwrap(), (41, 42));
+            assert_eq!(
+                state::allocate_portfolio_id(u64::MAX),
+                Err(PercolatorError::EngineCounterOverflow.into())
+            );
+        }
+
+        #[test]
+        fn portfolio_account_len_is_9563_with_full_identity_trailer() {
+            let data = init_test_portfolio(7);
+            assert_eq!(
+                data.len(),
+                constants::PORTFOLIO_ACCOUNT_LEN,
+                "the wrapper tail contains matcher config, portfolio ID, sequence, and expiry"
+            );
+            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 9563);
+            assert_eq!(state::read_portfolio_id(&data).unwrap(), 7);
+            assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 0);
+            assert_eq!(state::read_portfolio_matcher_sequence(&data).unwrap(), 0);
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 0);
+        }
+
+        #[test]
+        fn read_portfolio_id_rejects_zero_old_bytes_do_not_decode() {
+            let mut data = init_test_portfolio(7);
+            assert_eq!(state::read_portfolio_id(&data).unwrap(), 7);
+            // Old-bytes-don't-decode property: even though this fork carries no
+            // legacy-account backfill path (every account is created fresh under
+            // F-01), the decoder itself must still unconditionally refuse a
+            // zeroed ID trailer rather than silently treating it as a valid,
+            // reserved sentinel ID.
+            let off = constants::PORTFOLIO_ID_OFF;
+            data[off..off + constants::PORTFOLIO_ID_LEN].copy_from_slice(&0u64.to_le_bytes());
+            assert_eq!(
+                state::read_portfolio_id(&data),
+                Err(ProgramError::InvalidAccountData)
+            );
+        }
+
+        #[test]
+        fn portfolio_position_epoch_is_zero_initialized_checked_and_monotonic() {
+            let mut data = init_test_portfolio(1);
+            assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 0);
+            assert_eq!(state::bump_portfolio_position_epoch(&mut data).unwrap(), 1);
+            assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 1);
+
+            // Bumping the episode must not disturb `enabled`/`trade_fee_cap_bps`
+            // -- the three fields share one `control` word (6b627b43) and must
+            // stay independently addressable.
+            let mut matcher = state::read_portfolio_matcher_config(&data).unwrap();
+            matcher.set_enabled(1).unwrap();
+            matcher.set_trade_fee_cap_bps(250).unwrap();
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 1);
+
+            assert_eq!(state::bump_portfolio_position_epoch(&mut data).unwrap(), 2);
+            let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(matcher_after.enabled(), 1, "enabled bit must survive a position_epoch bump");
+            assert_eq!(
+                matcher_after.trade_fee_cap_bps(),
+                250,
+                "trade_fee_cap_bps must survive a position_epoch bump"
+            );
+            assert_eq!(matcher_after.position_epoch(), 2);
+        }
+
+        #[test]
+        fn portfolio_position_epoch_rejects_exhaustion_at_max() {
+            let mut data = init_test_portfolio(1);
+            let mut matcher = state::read_portfolio_matcher_config(&data).unwrap();
+            // Bit 0 (enabled) = 0, bits 1..49 = POSITION_EPOCH_MAX, bits 50..63 = 0.
+            matcher.control = state::PortfolioMatcherConfigV16::position_epoch_max() << 1;
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), state::PortfolioMatcherConfigV16::position_epoch_max());
+            assert_eq!(
+                state::bump_portfolio_position_epoch(&mut data),
+                Err(PercolatorError::EngineCounterOverflow.into())
+            );
+        }
+
+        #[test]
+        fn portfolio_matcher_sequence_is_zero_initialized_and_advances_with_replay_protection() {
+            let mut data = init_test_portfolio(1);
+            assert_eq!(state::read_portfolio_matcher_sequence(&data).unwrap(), 0);
+            assert_eq!(
+                state::advance_portfolio_matcher_sequence(&mut data, 0).unwrap(),
+                1
+            );
+            let sequence_before = data.clone();
+            assert_eq!(
+                state::advance_portfolio_matcher_sequence(&mut data, 0),
+                Err(PercolatorError::EngineStale.into()),
+                "a stale/replayed expected_sequence must be rejected"
+            );
+            assert_eq!(
+                data, sequence_before,
+                "a rejected advance must not mutate any state"
+            );
+            assert_eq!(
+                state::advance_portfolio_matcher_sequence(&mut data, 1).unwrap(),
+                2
+            );
+        }
+
+        #[test]
+        fn portfolio_matcher_expiry_is_zero_initialized_and_round_trips() {
+            let mut data = init_test_portfolio(1);
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 0);
+            state::write_portfolio_matcher_expiry(&mut data, 42).unwrap();
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 42);
+        }
+
+        #[test]
+        fn matcher_capability_is_live_checks_expiry_against_current_slot() {
+            assert!(
+                !state::matcher_capability_is_live(0, 100),
+                "expiry_slot == 0 is the disabled sentinel, never live"
+            );
+            assert!(state::matcher_capability_is_live(101, 100));
+            assert!(
+                !state::matcher_capability_is_live(100, 100),
+                "a capability expires AT its expiry_slot, not after it"
+            );
+            assert!(!state::matcher_capability_is_live(50, 100));
+        }
+
+        #[test]
+        fn matcher_capability_config_is_valid_enforces_shape() {
+            // Disabled: cap and expiry must both be the zero sentinel.
+            assert!(state::matcher_capability_config_is_valid(0, 0, 0, 100));
+            assert!(!state::matcher_capability_config_is_valid(0, 1, 0, 100));
+            assert!(!state::matcher_capability_config_is_valid(0, 0, 200, 100));
+            // Enabled: cap must be <= 10_000 bps AND the capability must be live.
+            assert!(state::matcher_capability_config_is_valid(1, 250, 200, 100));
+            assert!(!state::matcher_capability_config_is_valid(1, 250, 0, 100));
+            assert!(!state::matcher_capability_config_is_valid(1, 10_001, 200, 100));
+            // Any `enabled` value other than 0/1 is invalid.
+            assert!(!state::matcher_capability_config_is_valid(2, 0, 0, 100));
+        }
+
+        #[test]
+        fn portfolio_matcher_control_bit_layout_partitions_cleanly() {
+            // Runtime companion to the compile-time
+            // `_ASSERT_POSITION_EPOCH_BIT_LAYOUT_*` guards: enabled (bit0),
+            // position_epoch (bits1..49), and trade_fee_cap_bps (bits50..63)
+            // must never bleed into one another through the public setters.
+            let mut matcher = state::PortfolioMatcherConfigV16::default();
+            matcher.set_enabled(1).unwrap();
+            matcher.set_trade_fee_cap_bps(9_999).unwrap();
+            assert_eq!(matcher.enabled(), 1);
+            assert_eq!(matcher.trade_fee_cap_bps(), 9_999);
+            assert_eq!(matcher.position_epoch(), 0);
+
+            let mut data = init_test_portfolio(1);
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            for _ in 0..3 {
+                state::bump_portfolio_position_epoch(&mut data).unwrap();
+            }
+            let after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(after.position_epoch(), 3);
+            assert_eq!(after.enabled(), 1, "position_epoch bumps must not touch bit0");
+            assert_eq!(
+                after.trade_fee_cap_bps(),
+                9_999,
+                "position_epoch bumps must not touch bits50..63"
             );
         }
     }

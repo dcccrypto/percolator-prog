@@ -6117,10 +6117,21 @@ fn v16_wrapper_account_layout_constants_match_serialized_state() {
     // v17: PORTFOLIO_ACCOUNT_LEN is FIXED (O(1)) — source-domain storage uses a sparse embedded
     // array inside PORTFOLIO_STATE_LEN (drop runtime-vec / zero-copy convergence). The account
     // size does NOT grow with the number of market asset slots.
+    //
+    // TB-1a: +24B identity trailer (portfolio_id/expected_sequence/expiry_slot,
+    // ADOPT upstream 567c76c9/597f8dcc/0b838425) appended after the matcher
+    // config -- 9539 -> 9563. `position_epoch` is NOT a new field (packed into
+    // the existing matcher-config `control` word, 6b627b43), so it adds no
+    // bytes here.
     assert_eq!(
         PORTFOLIO_ACCOUNT_LEN,
-        HEADER_LEN + PORTFOLIO_STATE_LEN + PORTFOLIO_MATCHER_CONFIG_LEN,
-        "PORTFOLIO_ACCOUNT_LEN covers fixed engine+matcher header"
+        HEADER_LEN + PORTFOLIO_STATE_LEN + PORTFOLIO_MATCHER_CONFIG_LEN + 24,
+        "PORTFOLIO_ACCOUNT_LEN covers fixed engine+matcher header plus the TB-1a identity trailer \
+         (portfolio_id + expected_sequence + expiry_slot, 8B each)"
+    );
+    assert_eq!(
+        PORTFOLIO_ACCOUNT_LEN, 9563,
+        "TB-1a: canonical portfolio account length is now 9563 (was 9539)"
     );
     // portfolio_account_len_for_market_slots returns PORTFOLIO_ACCOUNT_LEN regardless of slots.
     assert_eq!(
@@ -9890,6 +9901,8 @@ fn v16_wrapper_ewma_mark_profiles_reject_prices_above_engine_max() {
         funding_mark_pending_slot: 0,
         _padding1: [0u8; 8],
         terminal_slab_scan_progress: 0,
+        next_portfolio_id: 0,
+        _padding2: [0u8; 8],
     };
     assert!(
         state::validate_asset_oracle_profile(&profile).is_err(),
@@ -18042,6 +18055,8 @@ fn setup_pinned_group_fresh_asset1(target_mark_e6: u64) -> (TestAccount, TestAcc
             funding_mark_pending_slot: 0,
             _padding1: [0u8; 8],
             terminal_slab_scan_progress: 0,
+            next_portfolio_id: 0,
+            _padding2: [0u8; 8],
         };
         state::write_asset_oracle_profile(&mut market.data, 1, &profile1).unwrap();
     }
@@ -18267,6 +18282,8 @@ fn v16_wrapper_trade_fee_floor_uses_per_asset_dt_not_group_dt() {
             funding_mark_pending_slot: 0,
             _padding1: [0u8; 8],
             terminal_slab_scan_progress: 0,
+            next_portfolio_id: 0,
+            _padding2: [0u8; 8],
         };
         state::write_asset_oracle_profile(&mut market.data, 1, &profile1).unwrap();
     }
