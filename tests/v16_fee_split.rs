@@ -3,6 +3,17 @@
 
 use percolator_prog::policy_v16::{split_trade_fee, FeeSplitParts};
 
+// sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only): test-only
+// monotonic nonce generator. Every call returns a value strictly greater
+// than the last, guaranteeing intent_id uniqueness across every top-up in
+// this test binary regardless of loops, shared helper functions, or how
+// many tests run -- so no existing test's outcome changes by acquiring a
+// fresh nonce (only a genuine same-value REPLAY is ever rejected).
+fn next_intent_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const P: u16 = 2000;
 const C: u16 = 1600;
 const L: u16 = 4800;
@@ -758,6 +769,7 @@ impl FeeEnv {
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
             ],
             data: ProgInstruction::TopUpInsurance {
+                intent_id: next_intent_id(),
                 amount: amount as u128,
                 authority_epoch,
             }

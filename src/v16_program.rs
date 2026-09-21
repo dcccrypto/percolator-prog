@@ -158,14 +158,10 @@ pub mod constants {
     // `_padding2` land at [480, 496) as literal `AssetOracleProfileV16`
     // struct fields (below). TB-2a (merged next) independently grows the
     // OUTER per-asset wrapper slot 512 -> 1024 to make room for
-    // `AssetControlSequencesV16`, and reserves a 16B placeholder at
-    // [496, 512) for `sync/w2-tb3`'s `insurance_top_up`/`backing_top_up`
-    // lanes (TB-3 has not merged onto this branch yet -- see
-    // `ASSET_RESERVED_TB3_TOPUP_OFF` below; when TB-3 lands it will replace
-    // this placeholder with 2 real `u64` struct fields at the same offset,
-    // growing `ASSET_ORACLE_PROFILE_LEN` 496 -> 512 and collapsing the
-    // reservation away, exactly as TB-2a's own comment anticipated -- just
-    // with TB-1a/TB-3 swapped in landing order since TB-1a merged first).
+    // `AssetControlSequencesV16`. TB-3 (merged after TB-2a, at integration)
+    // appends its own `insurance_top_up`/`backing_top_up: u64` pair right
+    // after TB-1a's tail, [496, 512) -- both sibling tails are now real
+    // struct fields, growing `ASSET_ORACLE_PROFILE_LEN` 480 -> 512 in total.
     // `MARKET_ASSET_SLOT_LEN`/`MARKET_GROUP_OFF` do not move as a result of
     // this field (only `ASSET_ORACLE_WRAPPER_LEN`'s TB-2a growth moves
     // `MARKET_ASSET_SLOT_LEN`, tracked separately below). Deployed asset-0
@@ -173,7 +169,7 @@ pub mod constants {
     // scenario does not apply here: per explicit user decision this rides
     // the F-01 full re-seed, so every market (and every asset-0 profile) is
     // created fresh under this layout from the start.
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 496;
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 512;
 
     // TB-2a (W2, "asset control-sequences INFRA"; ADOPTS upstream `ef3b1a55`
     // "fix: sequence-bind retained market controls", the commit that
@@ -270,19 +266,20 @@ pub mod constants {
     //     of explicit Pod-alignment padding (16B), 480 -> 496.
     //
     // INTEGRATION (sync/integration-v16): TB-1a merged onto this branch
-    // BEFORE TB-2a, so its 16B already landed as real struct fields at
-    // [480, 496) (see `ASSET_ORACLE_PROFILE_LEN`'s own doc comment above --
-    // the landing order is TB-1a first, TB-3 second, the reverse of this
-    // unit's original assumption, which is immaterial: both sibling diffs
-    // still splice into the SAME final 32-byte region, 480 -> 512). Only
-    // TB-3's 16B remains reserved-and-not-yet-landed at merge time;
-    // `ASSET_RESERVED_TB3_TOPUP_OFF` below reserves exactly that range --
-    // inert, asserted-zero padding until TB-3 merges -- so
-    // `AssetControlSequencesV16` does not have to move either now or when
-    // TB-3 lands (`ASSET_CONTROL_SEQUENCES_OFF` is pinned to 512 either
-    // way). See `ASSET_CONTROL_SEQUENCES_OFF` for that struct's own offset
-    // and `read_asset_control_sequences`/`write_asset_control_sequences`
-    // for its accessors.
+    // BEFORE TB-2a and TB-3, so all 32B of the two siblings' tails now land
+    // as real `AssetOracleProfileV16` struct fields, 480 -> 512 (see
+    // `ASSET_ORACLE_PROFILE_LEN`'s own doc comment above): TB-1a's
+    // `next_portfolio_id`/`_padding2` at [480, 496), then TB-3's
+    // `insurance_top_up`/`backing_top_up` at [496, 512) -- the reverse of
+    // this unit's original landing-order assumption, which is immaterial:
+    // both sibling diffs still splice into the SAME final 32-byte region.
+    // `AssetControlSequencesV16` never has to move as a result
+    // (`ASSET_CONTROL_SEQUENCES_OFF` collapses directly to
+    // `= ASSET_ORACLE_PROFILE_LEN`, matching upstream `ef3b1a55`'s own
+    // definition, now that both reservations are gone). See
+    // `ASSET_CONTROL_SEQUENCES_OFF` for that struct's own offset and
+    // `read_asset_control_sequences`/`write_asset_control_sequences` for its
+    // accessors.
     //
     // Layout inside the new 1024-byte `ASSET_ORACLE_WRAPPER_LEN` slot (the
     // smallest engine-precedented size above 512, per constraint (1) above
@@ -292,41 +289,24 @@ pub mod constants {
     //   [   0,  480) AssetOracleProfileV16 original body (UNCHANGED)
     //   [ 480,  496) AssetOracleProfileV16 tail: TB-1a's `next_portfolio_id`
     //                                     + `_padding2` (REAL fields, 16B)
-    //   [ 496,  512) reserved for TB-3's 2 lanes         (16B, asserted zero
-    //                                     until TB-3 merges)
+    //   [ 496,  512) AssetOracleProfileV16 tail: TB-3's `insurance_top_up`
+    //                                     + `backing_top_up` (REAL fields, 16B)
     //   [ 512,  600) AssetControlSequencesV16            (88B, THIS unit;
     //                                     also carries TB-2b's
     //                                     `authority_epoch` lane @584 once
     //                                     TB-2b merges, from TB-2a's own
     //                                     16B `_reserved` tail -- no size
     //                                     change)
-    //   [ 600,  608) reserved for W4-AE-84's
-    //                                     `protocol_fee_authority_epoch`
-    //                                     (8B, asserted zero until W4-AE-84
-    //                                     merges)
+    //   [ 600,  608) W4-AE-84's `protocol_fee_authority_epoch`  (8B)
     //   [ 608, 1024) spare headroom                      (416B)
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
 
-    /// TB-2a (INTEGRATION-adjusted): start of the reserved placeholder for
-    /// `sync/w2-tb3`'s `insurance_top_up`/`backing_top_up` lanes (not
-    /// merged onto this branch yet -- see `ASSET_ORACLE_WRAPPER_LEN`'s doc
-    /// comment). Always exactly `ASSET_ORACLE_PROFILE_LEN` (496, which
-    /// already includes TB-1a's real fields) so the reserved region begins
-    /// the instant the current profile struct ends.
-    pub const ASSET_RESERVED_TB3_TOPUP_OFF: usize = ASSET_ORACLE_PROFILE_LEN;
-    /// 2 lanes x u64 = 16 bytes, matching TB-3's actual append size exactly.
-    pub const ASSET_RESERVED_TB3_TOPUP_LEN: usize = 16;
-
     /// TB-2a: byte offset of `AssetControlSequencesV16` within each asset's
     /// `ASSET_ORACLE_WRAPPER_LEN`-byte wrapper slot. Sits immediately after
-    /// the TB-3 reservation, at exactly the offset `AssetOracleProfileV16`
-    /// will end at once TB-3 is integrated (496 + 16 = 512) -- so
-    /// integrating it is a pure constant simplification
-    /// (`ASSET_CONTROL_SEQUENCES_OFF` collapses to `= ASSET_ORACLE_PROFILE_LEN`,
-    /// matching upstream's own definition in `ef3b1a55`) and never requires
-    /// moving this struct's bytes.
-    pub const ASSET_CONTROL_SEQUENCES_OFF: usize =
-        ASSET_RESERVED_TB3_TOPUP_OFF + ASSET_RESERVED_TB3_TOPUP_LEN;
+    /// `AssetOracleProfileV16` ends (512, now that TB-1a's and TB-3's tails
+    /// are both real fields -- see `ASSET_ORACLE_PROFILE_LEN`), matching
+    /// upstream's own definition in `ef3b1a55`.
+    pub const ASSET_CONTROL_SEQUENCES_OFF: usize = ASSET_ORACLE_PROFILE_LEN;
     /// `size_of::<state::AssetControlSequencesV16>()`: 9 x u64 lanes (72B)
     /// plus TB-2b's `authority_epoch` lane + an 8B reserved tail, matching
     /// upstream `ef3b1a55`'s struct size exactly (88B total). Asserted
@@ -1144,7 +1124,6 @@ pub mod state {
     use crate::{
         constants::{
             ASSET_CONTROL_SEQUENCES_LEN, ASSET_CONTROL_SEQUENCES_OFF, ASSET_ORACLE_PROFILE_LEN,
-            ASSET_RESERVED_TB3_TOPUP_LEN, ASSET_RESERVED_TB3_TOPUP_OFF,
             ASSET_ORACLE_WRAPPER_LEN, EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
             EFFECTIVE_PRICE_PROVENANCE_TRADE_DRIVEN, HEADER_LEN,
             KIND_BACKING_DOMAIN_LEDGER, KIND_CLOSED_MARKET, KIND_INSURANCE_LEDGER, KIND_MARKET,
@@ -1982,6 +1961,35 @@ pub mod state {
         /// `validate_asset_oracle_profile`, same convention as `_padding0`/
         /// `_padding1` above.
         pub _padding2: [u8; 8],
+
+        /// sync/w2-tb3 (ADOPT upstream `20f0b9b1`, "make retained top-ups
+        /// one-shot", adapted -- INTENT_ID SLICE ONLY, see
+        /// ABI_LANDMINE_REGISTRY.md row TB-3): per-asset one-shot replay
+        /// nonces for the top-up-class instructions. Caller supplies a
+        /// strictly-increasing `intent_id: u64`; a value that is not
+        /// strictly greater than the stored lane is rejected with
+        /// `EngineStale` by `require_newer_control_sequence`, so a captured
+        /// top-up transaction cannot be replayed.
+        ///
+        /// `insurance_top_up` is asset-0-only and shared by BOTH
+        /// TopUpInsurance(9) and TopUpInsuranceDomain(56) -- matching
+        /// upstream's own doc comment ("Both insurance top-up entrypoints
+        /// share `insurance_top_up` so an intent cannot be replayed through
+        /// the alternate route"). `backing_top_up` is per-asset (keyed by
+        /// `domain / 2`) and used by TopUpBackingBucket(24).
+        ///
+        /// Upstream carves these into a separate `AssetControlSequencesV16`
+        /// struct (introduced by `ef3b1a55`) alongside `authority_epoch`/
+        /// `policy_sequence`/`observation_sequence` and 7 other lanes --
+        /// that struct and its sibling lanes are W2-TB-1/TB-2/TB-5 scope,
+        /// NOT adopted here (this unit was confirmed independent: the
+        /// intent_id check itself reads/writes only these two fields and
+        /// does not touch `market_id`/`authority_epoch`). The two lanes are
+        /// appended directly to this existing spare tail instead of
+        /// introducing that struct, so this unit stays a pure field-add
+        /// with zero new account layout.
+        pub insurance_top_up: u64,
+        pub backing_top_up: u64,
     }
 
     // Compile-time guard (ABI_LANDMINE_REGISTRY.md W0-1: "our fork's build will NOT
@@ -1992,7 +2000,8 @@ pub mod state {
     // `ASSET_ORACLE_PROFILE_LEN` now fails the build instead of silently desyncing
     // the fixed-offset zero-copy layout inside the 512-byte `ASSET_ORACLE_WRAPPER_LEN`
     // slot.
-    const _: () = assert!(core::mem::size_of::<AssetOracleProfileV16>() == ASSET_ORACLE_PROFILE_LEN);
+    const _: () =
+        assert!(core::mem::size_of::<AssetOracleProfileV16>() == ASSET_ORACLE_PROFILE_LEN);
 
     /// TB-2a (W2, "asset control-sequences INFRA"; ADOPTS upstream `ef3b1a55`
     /// "fix: sequence-bind retained market controls" byte-for-byte -- see
@@ -2124,12 +2133,11 @@ pub mod state {
     //   [   0,  480) AssetOracleProfileV16 original body (untouched)
     //   [ 480,  496) AssetOracleProfileV16 tail: TB-1a's `next_portfolio_id`
     //                                     + `_padding2`   (16B, real fields)
-    //   [ 496,  512) reserved for TB-3's 2 lanes         (16B)
+    //   [ 496,  512) AssetOracleProfileV16 tail: TB-3's `insurance_top_up`
+    //                                     + `backing_top_up` (16B, real fields)
     //   [ 512,  600) AssetControlSequencesV16            (88B)
     //   [ 600, 1024) spare headroom                      (424B)
-    const _: () = assert!(ASSET_RESERVED_TB3_TOPUP_OFF == ASSET_ORACLE_PROFILE_LEN);
-    const _: () = assert!(ASSET_RESERVED_TB3_TOPUP_OFF == 496);
-    const _: () = assert!(ASSET_RESERVED_TB3_TOPUP_LEN == 16);
+    const _: () = assert!(ASSET_ORACLE_PROFILE_LEN == 512);
     const _: () = assert!(ASSET_CONTROL_SEQUENCES_OFF == 512);
     const _: () = assert!(ASSET_CONTROL_SEQUENCES_LEN == 88);
     const _: () = assert!(ASSET_ORACLE_WRAPPER_LEN == 1024);
@@ -3431,19 +3439,28 @@ pub mod state {
         Ok(())
     }
 
+    // DEDUPLICATED at integration (mirrors runbook §10b for
+    // `require_authority_epoch_view`): `sync/w2-tb3` independently defined
+    // this exact function byte-for-byte (both TB-2a and TB-3 adopt the same
+    // upstream `require_newer_control_sequence` helper) -- TB-2a's own copy
+    // above (its doc comment explicitly anticipated this dedup) is kept as
+    // the single definition, now also consumed by TB-3's `insurance_top_up`/
+    // `backing_top_up` one-shot nonce checks.
+
     // TB-1a: was `#[inline] -> AssetOracleProfileV16` (by value). `AssetOracleProfileV16`
-    // grew 480 -> 496 bytes (`next_portfolio_id` + its Pod-alignment padding).
-    // `handle_update_asset_lifecycle` calls this 3x across its branches and
-    // was ALREADY within ~16 bytes of the BPF 4096-byte stack-frame limit on
-    // `origin/main` before this unit's change (verified empirically: baseline
-    // `cargo build-sbf` is clean at 480B; this fork's unmodified +16B version
-    // failed with "Stack offset ... exceeded max offset of 4096 by 16 bytes").
-    // `#[inline(never)]` alone did not fix it -- a by-value return of a struct
-    // this size still needs the CALLER to reserve `sret` space for it
-    // regardless of inlining. Returning `Box<AssetOracleProfileV16>` instead
-    // makes the return a thin (8-byte) pointer, moving the 496-byte
-    // construction onto the heap; verified this clears the overflow with room
-    // to spare. Callers that need an owned value (not the 3 hot call sites in
+    // grew 480 -> 512 bytes (TB-1a's `next_portfolio_id` + padding, TB-3's
+    // `insurance_top_up`/`backing_top_up`). `handle_update_asset_lifecycle`
+    // calls this 3x across its branches and was ALREADY within ~16 bytes of
+    // the BPF 4096-byte stack-frame limit on `origin/main` before this
+    // unit's change (verified empirically: baseline `cargo build-sbf` is
+    // clean at 480B; this fork's unmodified +16B version failed with "Stack
+    // offset ... exceeded max offset of 4096 by 16 bytes"). `#[inline(never)]`
+    // alone did not fix it -- a by-value return of a struct this size still
+    // needs the CALLER to reserve `sret` space for it regardless of
+    // inlining. Returning `Box<AssetOracleProfileV16>` instead makes the
+    // return a thin (8-byte) pointer, moving the (now 512-byte) construction
+    // onto the heap; verified this clears the overflow with room to spare.
+    // Callers that need an owned value (not the 3 hot call sites in
     // `handle_update_asset_lifecycle`, which keep the `Box` -- see that
     // function) deref-copy it back (`AssetOracleProfileV16: Copy`).
     #[inline(never)]
@@ -3491,6 +3508,11 @@ pub mod state {
             terminal_slab_scan_progress: 0,
             next_portfolio_id: 0,
             _padding2: [0u8; 8],
+            // sync/w2-tb3: fresh asset, no top-up ever seen -- 0 is the
+            // correct "never used" sentinel (see the field's own doc
+            // comment).
+            insurance_top_up: 0,
+            backing_top_up: 0,
         })
     }
 
@@ -3539,6 +3561,13 @@ pub mod state {
             terminal_slab_scan_progress: 0,
             next_portfolio_id: 0,
             _padding2: [0u8; 8],
+            // sync/w2-tb3: fresh asset (InitMarket) or off-chain-only test
+            // fixture rebuild (`write_market`, `cfg(not(target_os =
+            // "solana"))` -- not part of the on-chain program) -- 0 is
+            // correct in both cases; there is no `existing_profile` to
+            // preserve state from here.
+            insurance_top_up: 0,
+            backing_top_up: 0,
         }
     }
 
@@ -5514,6 +5543,9 @@ pub mod ix {
             expected_sequence: u64,
             position_epoch: u64,
         },
+        /// sync/w2-tb3 (ADOPT upstream `20f0b9b1`, intent_id slice only):
+        /// `intent_id` is a caller-supplied, strictly-increasing one-shot
+        /// replay nonce -- see `AssetOracleProfileV16::insurance_top_up`.
         /// W3A-3: `authority_epoch` (upstream `238436c5`) -- the caller's EXPECTED
         /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`
         /// (this market-wide top-up always deposits into asset 0), checked (NOT
@@ -5521,16 +5553,20 @@ pub mod ix {
         /// effect. See that helper's own doc comment for the durable-nonce replay
         /// this closes for market-authority round-trips.
         TopUpInsurance {
-            amount: u128,
+            intent_id: u64,
             authority_epoch: u64,
+            amount: u128,
         },
+        /// sync/w2-tb3: see `TopUpInsurance`'s `intent_id` doc comment --
+        /// shares the SAME `insurance_top_up` lane as tag 9.
         /// W3A-3: `authority_epoch` (upstream `238436c5`) -- checked (NOT advanced)
         /// against the TARGET DOMAIN's own asset epoch (`domain / 2`, matching
         /// `UpdateAssetAuthority`'s per-asset lane), not asset-0's.
         TopUpInsuranceDomain {
             domain: u16,
-            amount: u128,
+            intent_id: u64,
             authority_epoch: u64,
+            amount: u128,
         },
         /// W3A-1: `authority_epoch` (upstream `238436c5`) -- the caller's EXPECTED
         /// CURRENT value of asset-0's `AssetControlSequencesV16::authority_epoch`,
@@ -5548,13 +5584,16 @@ pub mod ix {
         ResolveMarket {
             authority_epoch: u64,
         },
+        /// sync/w2-tb3: see `TopUpInsurance`'s `intent_id` doc comment --
+        /// uses the per-asset `AssetOracleProfileV16::backing_top_up` lane.
         /// W3A-3: `authority_epoch` (upstream `238436c5`) -- checked (NOT advanced)
         /// against the TARGET DOMAIN's own asset epoch (`domain / 2`).
         TopUpBackingBucket {
             domain: u16,
+            intent_id: u64,
+            authority_epoch: u64,
             amount: u128,
             expiry_slot: u64,
-            authority_epoch: u64,
         },
         /// W3A-1: `authority_epoch` (upstream `ade6f9fa`) -- CAS-checked (not
         /// advanced) against the withdrawing domain's asset epoch when the
@@ -6214,14 +6253,21 @@ pub mod ix {
                     expected_sequence: read_u64(&mut rest)?,
                     position_epoch: read_u64(&mut rest)?,
                 },
+                // Locked wire field order for the identity-binding cluster
+                // (runbook §4: "FINAL combined order (upstream market_id,
+                // intent_id, authority_epoch, amount)"), applied here to the
+                // fields present at THIS integration point (market_id lands
+                // later, with TB-4): intent_id, authority_epoch, amount.
                 9 => Self::TopUpInsurance {
-                    amount: read_u128(&mut rest)?,
+                    intent_id: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
+                    amount: read_u128(&mut rest)?,
                 },
                 56 => Self::TopUpInsuranceDomain {
                     domain: read_u16(&mut rest)?,
-                    amount: read_u128(&mut rest)?,
+                    intent_id: read_u64(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
+                    amount: read_u128(&mut rest)?,
                 },
                 13 => Self::CloseSlab {
                     authority_epoch: read_u64(&mut rest)?,
@@ -6231,9 +6277,10 @@ pub mod ix {
                 },
                 24 => Self::TopUpBackingBucket {
                     domain: read_u16(&mut rest)?,
+                    intent_id: read_u64(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                     expiry_slot: read_u64(&mut rest)?,
-                    authority_epoch: read_u64(&mut rest)?,
                 },
                 50 => Self::WithdrawBackingBucket {
                     domain: read_u16(&mut rest)?,
@@ -6714,22 +6761,26 @@ pub mod ix {
                     push_u64(&mut out, position_epoch);
                 }
                 Self::TopUpInsurance {
-                    amount,
+                    intent_id,
                     authority_epoch,
+                    amount,
                 } => {
                     out.push(9);
-                    push_u128(&mut out, amount);
+                    push_u64(&mut out, intent_id);
                     push_u64(&mut out, authority_epoch);
+                    push_u128(&mut out, amount);
                 }
                 Self::TopUpInsuranceDomain {
                     domain,
-                    amount,
+                    intent_id,
                     authority_epoch,
+                    amount,
                 } => {
                     out.push(56);
                     push_u16(&mut out, domain);
-                    push_u128(&mut out, amount);
+                    push_u64(&mut out, intent_id);
                     push_u64(&mut out, authority_epoch);
+                    push_u128(&mut out, amount);
                 }
                 Self::CloseSlab { authority_epoch } => {
                     out.push(13);
@@ -6751,15 +6802,17 @@ pub mod ix {
                 }
                 Self::TopUpBackingBucket {
                     domain,
+                    intent_id,
+                    authority_epoch,
                     amount,
                     expiry_slot,
-                    authority_epoch,
                 } => {
                     out.push(24);
                     push_u16(&mut out, domain);
+                    push_u64(&mut out, intent_id);
+                    push_u64(&mut out, authority_epoch);
                     push_u128(&mut out, amount);
                     push_u64(&mut out, expiry_slot);
-                    push_u64(&mut out, authority_epoch);
                 }
                 Self::WithdrawBackingBucket {
                     domain,
@@ -8552,7 +8605,10 @@ pub mod policy_v16 {
     /// The engine-side half (adding `now_slot < expiry_slot` to `:2815-2819`) is
     /// tracked separately as engine row Q2 / `fix/Q`; the two are complementary, and
     /// this predicate stays correct whether or not the engine gate is tightened.
-    pub fn backing_principal_withdrawal_is_fresh(expiry_slot: u64, authenticated_slot: u64) -> bool {
+    pub fn backing_principal_withdrawal_is_fresh(
+        expiry_slot: u64,
+        authenticated_slot: u64,
+    ) -> bool {
         authenticated_slot < expiry_slot
     }
 }
@@ -9306,6 +9362,15 @@ pub mod processor {
         profile.insurance_operator = existing.insurance_operator;
         profile.backing_bucket_authority = existing.backing_bucket_authority;
         profile.oracle_authority = existing.oracle_authority;
+        // sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only):
+        // PRESERVE, do not reset -- every call site here re-derives `profile`
+        // fresh from `manual_asset_oracle_profile` (which zeroes both lanes)
+        // then restores existing state; the one-shot replay nonces are
+        // exactly that kind of state. Resetting them on
+        // asset-restart/reactivation would reopen replay of any
+        // previously-consumed intent_id for this asset.
+        profile.insurance_top_up = existing.insurance_top_up;
+        profile.backing_top_up = existing.backing_top_up;
     }
 
     fn backing_fee_policy_count_from_profile(profile: &state::AssetOracleProfileV16) -> u16 {
@@ -9937,14 +10002,23 @@ pub mod processor {
                 position_epoch,
             ),
             Instruction::TopUpInsurance {
-                amount,
+                intent_id,
                 authority_epoch,
-            } => handle_top_up_insurance(program_id, accounts, amount, authority_epoch),
+                amount,
+            } => handle_top_up_insurance(program_id, accounts, intent_id, authority_epoch, amount),
             Instruction::TopUpInsuranceDomain {
                 domain,
-                amount,
+                intent_id,
                 authority_epoch,
-            } => handle_top_up_insurance_domain(program_id, accounts, domain, amount, authority_epoch),
+                amount,
+            } => handle_top_up_insurance_domain(
+                program_id,
+                accounts,
+                domain,
+                intent_id,
+                authority_epoch,
+                amount,
+            ),
             Instruction::CloseSlab { authority_epoch } => {
                 handle_close_slab(program_id, accounts, authority_epoch)
             }
@@ -9953,16 +10027,18 @@ pub mod processor {
             }
             Instruction::TopUpBackingBucket {
                 domain,
+                intent_id,
+                authority_epoch,
                 amount,
                 expiry_slot,
-                authority_epoch,
             } => handle_top_up_backing_bucket(
                 program_id,
                 accounts,
                 domain,
+                intent_id,
+                authority_epoch,
                 amount,
                 expiry_slot,
-                authority_epoch,
             ),
             // INTEGRATION: TB-1b's ConvertReleasedPnl identity binding
             // (portfolio_id/position_epoch) and W3A-1's WithdrawBackingBucket
@@ -11035,18 +11111,20 @@ pub mod processor {
             let account_b_needs_source_capacity =
                 trade_delta_may_require_source_domain_capacity(account_b_position, -size_q)?;
             if account_a_needs_source_capacity || account_b_needs_source_capacity {
-                let mut admitted_source_domains_a = reserved_source_domains_snapshot_for_trade_view(
-                    &group,
-                    &account_a,
-                    core::slice::from_ref(&req),
-                    size_q < 0,
-                )?;
-                let mut admitted_source_domains_b = reserved_source_domains_snapshot_for_trade_view(
-                    &group,
-                    &account_b,
-                    core::slice::from_ref(&req),
-                    size_q > 0,
-                )?;
+                let mut admitted_source_domains_a =
+                    reserved_source_domains_snapshot_for_trade_view(
+                        &group,
+                        &account_a,
+                        core::slice::from_ref(&req),
+                        size_q < 0,
+                    )?;
+                let mut admitted_source_domains_b =
+                    reserved_source_domains_snapshot_for_trade_view(
+                        &group,
+                        &account_b,
+                        core::slice::from_ref(&req),
+                        size_q > 0,
+                    )?;
                 ensure_trade_delta_source_domain_capacity_view(
                     &mut admitted_source_domains_a,
                     asset_index as usize,
@@ -11574,13 +11652,12 @@ pub mod processor {
                     signed_position_for_asset_view(&group, &account_a, asset_index)?;
                 let account_b_position =
                     signed_position_for_asset_view(&group, &account_b, asset_index)?;
-                needs_source_domain_capacity |= trade_delta_may_require_source_domain_capacity(
-                    account_a_position,
-                    leg.size_q,
-                )? || trade_delta_may_require_source_domain_capacity(
-                    account_b_position,
-                    -leg.size_q,
-                )?;
+                needs_source_domain_capacity |=
+                    trade_delta_may_require_source_domain_capacity(account_a_position, leg.size_q)?
+                        || trade_delta_may_require_source_domain_capacity(
+                            account_b_position,
+                            -leg.size_q,
+                        )?;
                 leg_ctx.push((
                     asset_index,
                     oracle_profile,
@@ -11609,14 +11686,22 @@ pub mod processor {
             // releases its latent pair while a leg only touched (not closed) keeps both reserved
             // -- a per-leg-in-isolation check cannot make that distinction within one batch.
             if needs_source_domain_capacity {
-                let mut admitted_source_domains_a = reserved_source_domains_snapshot_for_trade_view(
-                    &group, &account_a, &requests, false,
-                )?;
-                let mut admitted_source_domains_b = reserved_source_domains_snapshot_for_trade_view(
-                    &group, &account_b, &requests, true,
-                )?;
-                for (asset_index, _oracle_profile, _reported_price, _fee_leg, account_a_position, account_b_position) in
-                    leg_ctx.iter()
+                let mut admitted_source_domains_a =
+                    reserved_source_domains_snapshot_for_trade_view(
+                        &group, &account_a, &requests, false,
+                    )?;
+                let mut admitted_source_domains_b =
+                    reserved_source_domains_snapshot_for_trade_view(
+                        &group, &account_b, &requests, true,
+                    )?;
+                for (
+                    asset_index,
+                    _oracle_profile,
+                    _reported_price,
+                    _fee_leg,
+                    account_a_position,
+                    account_b_position,
+                ) in leg_ctx.iter()
                 {
                     let request = requests
                         .iter()
@@ -11728,8 +11813,14 @@ pub mod processor {
             let mut lp_cut_running_total: u128 = 0;
             let mut insurance_cut_running_total: u128 = 0;
             let mut creator_cut_running_total: u128 = 0;
-            for (asset_index, oracle_profile, reported_price, fee_leg, _account_a_position, _account_b_position) in
-                leg_ctx.iter_mut()
+            for (
+                asset_index,
+                oracle_profile,
+                reported_price,
+                fee_leg,
+                _account_a_position,
+                _account_b_position,
+            ) in leg_ctx.iter_mut()
             {
                 let fee_leg = *fee_leg;
                 if fee_leg != 0 {
@@ -13190,7 +13281,12 @@ pub mod processor {
                     break;
                 }
             }
-            (mode_pre, oracle_prices, stale_matured, cfg_pre.trade_fee_base_bps)
+            (
+                mode_pre,
+                oracle_prices,
+                stale_matured,
+                cfg_pre.trade_fee_base_bps,
+            )
         };
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
@@ -13201,10 +13297,7 @@ pub mod processor {
         // The taker signs each leg's fee_bps independently of the LP's matcher capability cap
         // (mirrors handle_batch_trade_nocpi's and handle_trade_cpi's guards — adopts
         // upstream 93dd8719/7f319c6b's base-fee-consent reject at this 4th trade entry point).
-        if legs
-            .iter()
-            .any(|leg| trade_fee_base_bps_pre > leg.fee_bps)
-        {
+        if legs.iter().any(|leg| trade_fee_base_bps_pre > leg.fee_bps) {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let (account_a_header, account_a_owner) =
@@ -13506,8 +13599,9 @@ pub mod processor {
     fn handle_top_up_insurance<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
-        amount: u128,
+        intent_id: u64,
         expected_authority_epoch: u64,
+        amount: u128,
     ) -> ProgramResult {
         let signer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -13575,6 +13669,11 @@ pub mod processor {
             let asset0_insurance_authority =
                 domain_authorities_from_view(&group, &cfg, 0)?.insurance_authority;
             expect_live_authority(&asset0_insurance_authority, signer.key)?;
+            // sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only):
+            // one-shot replay-nonce check, shared with TopUpInsuranceDomain
+            // via the same asset-0 `insurance_top_up` lane.
+            let mut profile0 = read_oracle_profile_from_view(&group, &cfg, 0)?;
+            state::require_newer_control_sequence(profile0.insurance_top_up, intent_id)?;
             let mut ledger_data = if let Some(ledger_ai) = ledger_ai {
                 Some(ledger_ai.try_borrow_mut_data()?)
             } else {
@@ -13614,6 +13713,8 @@ pub mod processor {
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 cfg_after = Some(cfg);
             }
+            profile0.insurance_top_up = intent_id;
+            write_oracle_profile_to_view(&mut group, 0, &profile0)?;
             group.validate_shape().map_err(map_v16_error)?;
             if let (Some(data), Some((ledger, initialized))) =
                 (ledger_data.as_deref_mut(), ledger_state.as_ref())
@@ -13633,8 +13734,9 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
-        amount: u128,
+        intent_id: u64,
         expected_authority_epoch: u64,
+        amount: u128,
     ) -> ProgramResult {
         let signer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -13697,6 +13799,14 @@ pub mod processor {
             require_domain_accepts_live_topup_view(&group, domain)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
             expect_live_authority(&authorities.insurance_authority, signer.key)?;
+            // sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only):
+            // one-shot replay-nonce check on THIS domain's asset's
+            // `insurance_top_up` lane -- when `domain / 2 == 0` this is the
+            // SAME lane TopUpInsurance(9) advances, so an intent cannot be
+            // replayed through the alternate route.
+            let asset_index = domain / 2;
+            let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
+            state::require_newer_control_sequence(profile.insurance_top_up, intent_id)?;
             let mut ledger_data = if let Some(ledger_ai) = ledger_ai {
                 Some(ledger_ai.try_borrow_mut_data()?)
             } else {
@@ -13732,6 +13842,8 @@ pub mod processor {
                     .checked_add(amount)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             }
+            profile.insurance_top_up = intent_id;
+            write_oracle_profile_to_view(&mut group, asset_index, &profile)?;
             group.validate_shape().map_err(map_v16_error)?;
             if let (Some(data), Some((ledger, initialized))) =
                 (ledger_data.as_deref_mut(), ledger_state.as_ref())
@@ -14350,9 +14462,10 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         domain: u16,
+        intent_id: u64,
+        expected_authority_epoch: u64,
         amount: u128,
         expiry_slot: u64,
-        expected_authority_epoch: u64,
     ) -> ProgramResult {
         let signer = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -14511,6 +14624,12 @@ pub mod processor {
             require_domain_accepts_live_topup_view(&group, domain_usize)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain_usize)?;
             expect_live_authority(&authorities.backing_bucket_authority, signer.key)?;
+            // sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only):
+            // one-shot replay-nonce check on this asset's per-asset
+            // `backing_top_up` lane.
+            let asset_index = domain_usize / 2;
+            let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
+            state::require_newer_control_sequence(profile.backing_top_up, intent_id)?;
             let mut ledger_data = Some(ledger_ai.try_borrow_mut_data()?);
             let mut ledger_state = if let Some(data) = ledger_data.as_deref() {
                 let (_, bucket) = backing_domain_parts_view(&group, domain as usize)?;
@@ -14554,6 +14673,8 @@ pub mod processor {
                         backing_unavailable_principal_atoms(&bucket_after)?;
                 }
             }
+            profile.backing_top_up = intent_id;
+            write_oracle_profile_to_view(&mut group, asset_index, &profile)?;
             group.validate_shape().map_err(map_v16_error)?;
             if let (Some(data), Some((ledger, initialized))) =
                 (ledger_data.as_deref_mut(), ledger_state.as_ref())
@@ -14563,7 +14684,7 @@ pub mod processor {
         }
         if amount == 0 {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             // W3A-3: mirrors upstream's third `require_authority_epoch_view`
             // call site (the `amount == 0` reconciliation branch), checked
             // immediately upon obtaining this borrow's `group`, before any
@@ -14571,6 +14692,14 @@ pub mod processor {
             require_authority_epoch_view(&group, domain_usize / 2, expected_authority_epoch)?;
             let authorities = domain_authorities_from_view(&group, &cfg, domain_usize)?;
             expect_live_authority(&authorities.backing_bucket_authority, signer.key)?;
+            // sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only):
+            // this is the reconciliation-only path (upstream's diff added an
+            // `else` branch here too, see the commit) -- the nonce must
+            // still advance even though no capital moves, or a captured
+            // zero-amount reconciliation call could be replayed forever.
+            let asset_index = domain_usize / 2;
+            let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
+            state::require_newer_control_sequence(profile.backing_top_up, intent_id)?;
 
             let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
             if !state::is_initialized(&ledger_data) {
@@ -14587,6 +14716,8 @@ pub mod processor {
                 group.validate_shape().map_err(map_v16_error)?;
                 write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
             }
+            profile.backing_top_up = intent_id;
+            write_oracle_profile_to_view(&mut group, asset_index, &profile)?;
         }
 
         transfer_tokens(token_program, source_token, vault_token, signer, amount_u64)?;
@@ -16355,10 +16486,9 @@ pub mod processor {
         let lp_vault_dead_share_floor_present = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_, group) = state::market_view_mut(&mut market_data)?;
-            let configured_domains = v16_domain_count_for_market_slots(
-                group.header.config.max_market_slots.get(),
-            )
-            .map_err(map_v16_error)?;
+            let configured_domains =
+                v16_domain_count_for_market_slots(group.header.config.max_market_slots.get())
+                    .map_err(map_v16_error)?;
             let mut found = false;
             for domain in 0..configured_domains {
                 let (_, bucket) = backing_domain_parts_view(&group, domain)?;
@@ -16412,7 +16542,11 @@ pub mod processor {
                     return Err(PercolatorError::InvalidVaultAccount.into());
                 }
                 let secondary_mint = secondary_collateral_mint(&cfg)?;
-                verify_vault_token_account(secondary_vault_token, &vault_authority, &secondary_mint)?;
+                verify_vault_token_account(
+                    secondary_vault_token,
+                    &vault_authority,
+                    &secondary_mint,
+                )?;
                 let secondary_vault_balance = unpack_token_account(secondary_vault_token)?.amount;
                 verify_user_token_account(secondary_dest_token, admin_dest.key, &secondary_mint)?;
                 Some((
@@ -16473,9 +16607,7 @@ pub mod processor {
                     write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
                     return Ok(());
                 }
-                TerminalSlabOutcomeV16::ReadyToClose { retired } => {
-                    retired
-                }
+                TerminalSlabOutcomeV16::ReadyToClose { retired } => retired,
             };
             cursor_profile.terminal_slab_scan_progress = 0;
             write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
@@ -17949,11 +18081,61 @@ pub mod processor {
             return state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after);
         }
         // Activate (privileged, fee-free) / retire are gated solely on `marketauth`.
+        //
+        // sync/w2-tb3 (stack-budget fix, no logic change): this whole tail was
+        // previously inline here. Growing `AssetOracleProfileV16` by 16 bytes
+        // (see its own doc comment) pushed this function's combined frame --
+        // this block's `existing_profile`/`reset_profile` locals PLUS the
+        // earlier append/permissionless-reuse block's `profile` local, all in
+        // one `#[inline(never)]` frame -- over the BPF 4096-byte stack budget
+        // (`build-sbf` reported "A function call ... overwrites values in the
+        // frame" for `handle_update_asset_lifecycle`; confirmed absent on the
+        // unmodified baseline). Extracting it into its own `#[inline(never)]`
+        // function gives it a separate, smaller frame instead of accumulating
+        // into this one -- pure stack-budget fix, the extracted code is
+        // byte-for-byte the same logic, just moved.
+        handle_update_asset_lifecycle_privileged(
+            market_ai,
+            authority,
+            &cfg_pre,
+            action,
+            asset_index,
+            now_slot,
+            initial_price,
+            insurance_authority,
+            insurance_operator,
+            backing_bucket_authority,
+            oracle_authority,
+            expected_authority_epoch,
+        )
+    }
+
+    // sync/w2-tb3: same 11-argument shape as the caller this was extracted
+    // from (`handle_update_asset_lifecycle`, itself already over clippy's
+    // default 7-arg threshold pre-adoption) -- matches the existing
+    // `#[allow(clippy::too_many_arguments)]` precedent used elsewhere in
+    // this file for other wide handler signatures.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn handle_update_asset_lifecycle_privileged<'a>(
+        market_ai: &'a AccountInfo<'a>,
+        authority: &'a AccountInfo<'a>,
+        cfg_pre: &WrapperConfigV16,
+        action: u8,
+        asset_index: usize,
+        now_slot: u64,
+        initial_price: u64,
+        insurance_authority: [u8; 32],
+        insurance_operator: [u8; 32],
+        backing_bucket_authority: [u8; 32],
+        oracle_authority: [u8; 32],
+        expected_authority_epoch: u64,
+    ) -> ProgramResult {
         if !live_authority_matches(&cfg_pre.marketauth, authority.key) {
             return Err(PercolatorError::Unauthorized.into());
         }
         let authenticated_slot = authenticated_slot_or_fallback(now_slot);
-        if oracle_v16::permissionless_stale_matured(&cfg_pre, authenticated_slot) {
+        if oracle_v16::permissionless_stale_matured(cfg_pre, authenticated_slot) {
             return Err(PercolatorError::OracleStale.into());
         }
 
@@ -18857,6 +19039,12 @@ pub mod processor {
                 // `backing_bucket_authority`/`oracle_authority` below.
                 next_portfolio_id: existing_profile.next_portfolio_id,
                 _padding2: [0u8; 8],
+                // sync/w2-tb3: PRESERVE, do not reset -- these are one-shot
+                // replay-nonces (see the field's own doc comment), unrelated
+                // to oracle configuration. Resetting to 0 here would reopen
+                // replay of any previously-consumed intent_id.
+                insurance_top_up: existing_profile.insurance_top_up,
+                backing_top_up: existing_profile.backing_top_up,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs,
@@ -19017,6 +19205,10 @@ pub mod processor {
                 // `backing_bucket_authority`/`oracle_authority` below.
                 next_portfolio_id: existing_profile.next_portfolio_id,
                 _padding2: [0u8; 8],
+                // sync/w2-tb3: PRESERVE, do not reset -- see the Hybrid
+                // reconfiguration handler's identical comment above.
+                insurance_top_up: existing_profile.insurance_top_up,
+                backing_top_up: existing_profile.backing_top_up,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -19150,6 +19342,10 @@ pub mod processor {
                 // `backing_bucket_authority`/`oracle_authority` below.
                 next_portfolio_id: existing_profile.next_portfolio_id,
                 _padding2: [0u8; 8],
+                // sync/w2-tb3: PRESERVE, do not reset -- see the Hybrid
+                // reconfiguration handler's identical comment above.
+                insurance_top_up: existing_profile.insurance_top_up,
+                backing_top_up: existing_profile.backing_top_up,
                 backing_bucket_authority: existing_profile.backing_bucket_authority,
                 oracle_authority: existing_profile.oracle_authority,
                 max_staleness_secs: 0,
@@ -24021,7 +24217,8 @@ pub mod processor {
             // `liquidation_penalty_reclaimable_from_profile_view`), and keeps the
             // stored provenance meaningful rather than permanently poisoned by one
             // past trade.
-            profile.effective_price_provenance = constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
+            profile.effective_price_provenance =
+                constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
             return Ok(price);
         }
         if !oracle_v16::profile_is_hybrid(profile) {
@@ -24096,7 +24293,8 @@ pub mod processor {
         // gets liquidated is still being evaluated against a price that has not fully
         // caught up to the authenticated feed.
         if fresh_oracle_read && price == target {
-            profile.effective_price_provenance = constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
+            profile.effective_price_provenance =
+                constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
         }
         // FIX (ADOPT upstream 06192caa, adapted): route the Hybrid crank-price
         // mark update through the same non-retroactive checkpoint recording as
