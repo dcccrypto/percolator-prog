@@ -20639,8 +20639,14 @@ fn v16_wrapper_withdraw_protocol_fee_unauthorized_signer_rejected() {
     let mut token_program = token_program_account();
     let before = market.data.clone();
 
+    // W4-AE-84: LIVE read of `protocol_fee_authority_epoch` -- never a
+    // hardcoded constant.
+    let authority_epoch = state::read_protocol_fee_authority_epoch(&market.data).unwrap();
     let rejected = run_ix(
-        Instruction::WithdrawProtocolFee { amount: 50 },
+        Instruction::WithdrawProtocolFee {
+            amount: 50,
+            authority_epoch,
+        },
         &mut [
             &mut attacker,
             &mut market,
@@ -20677,8 +20683,14 @@ fn v16_wrapper_withdraw_protocol_fee_clamps_to_surplus_and_double_withdraw_bound
     let mut token_program = token_program_account();
 
     // amount=0 means "withdraw all currently-available capacity".
+    // W4-AE-84: LIVE read of `protocol_fee_authority_epoch` -- never a
+    // hardcoded constant.
+    let authority_epoch = state::read_protocol_fee_authority_epoch(&market.data).unwrap();
     run_ix(
-        Instruction::WithdrawProtocolFee { amount: 0 },
+        Instruction::WithdrawProtocolFee {
+            amount: 0,
+            authority_epoch,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -20703,8 +20715,14 @@ fn v16_wrapper_withdraw_protocol_fee_clamps_to_surplus_and_double_withdraw_bound
     // A second withdrawal attempt: claim capacity is now accrued(100) -
     // withdrawn(60) = 40, but there's zero surplus left on-chain -- must be
     // rejected (transfer_amount == 0), never allowed to exceed accrued.
+    // W4-AE-84: LIVE read of `protocol_fee_authority_epoch` -- never a
+    // hardcoded constant.
+    let authority_epoch = state::read_protocol_fee_authority_epoch(&market.data).unwrap();
     let over_claim = run_ix(
-        Instruction::WithdrawProtocolFee { amount: 1 },
+        Instruction::WithdrawProtocolFee {
+            amount: 1,
+            authority_epoch,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -20744,8 +20762,14 @@ fn v16_wrapper_withdraw_protocol_fee_rejects_amount_exceeding_accrued_claim() {
 
     // Plenty of on-chain surplus (1000) but the LEDGER only allows 100 --
     // the ledger, not just the engine surplus check, must bound the payout.
+    // W4-AE-84: LIVE read of `protocol_fee_authority_epoch` -- never a
+    // hardcoded constant.
+    let authority_epoch = state::read_protocol_fee_authority_epoch(&market.data).unwrap();
     let rejected = run_ix(
-        Instruction::WithdrawProtocolFee { amount: 101 },
+        Instruction::WithdrawProtocolFee {
+            amount: 101,
+            authority_epoch,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -20786,8 +20810,14 @@ fn v16_wrapper_withdraw_protocol_fee_succeeds_after_resolve_when_fully_wound_dow
     let mut vault = vault_token_account(&market, mint, 100);
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
+    // W4-AE-84: LIVE read of `protocol_fee_authority_epoch` -- never a
+    // hardcoded constant.
+    let authority_epoch = state::read_protocol_fee_authority_epoch(&market.data).unwrap();
     run_ix(
-        Instruction::WithdrawProtocolFee { amount: 0 },
+        Instruction::WithdrawProtocolFee {
+            amount: 0,
+            authority_epoch,
+        },
         &mut [
             &mut admin,
             &mut market,
@@ -20847,8 +20877,14 @@ fn v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed() {
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
     let before = market.data.clone();
+    // W4-AE-84: LIVE read of `protocol_fee_authority_epoch` -- never a
+    // hardcoded constant.
+    let authority_epoch = state::read_protocol_fee_authority_epoch(&market.data).unwrap();
     let rejected = run_ix(
-        Instruction::WithdrawProtocolFee { amount: 1 },
+        Instruction::WithdrawProtocolFee {
+            amount: 1,
+            authority_epoch,
+        },
         &mut [
             &mut admin,
             &mut market,
