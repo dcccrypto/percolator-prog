@@ -518,12 +518,19 @@ fn resolve_market(env: &mut Env) -> Result<(), String> {
     let pid = env.program_id;
     let payer = env.payer.insecure_clone();
     let admin = env.admin.insecure_clone();
+    // W3A-3: LIVE read of asset-0's `authority_epoch`.
+    let authority_epoch = {
+        let market_account = env.svm.get_account(&env.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, 0)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),
@@ -927,6 +934,13 @@ fn execute_redemption_backing_state_matches_withdraw() {
     );
     let pid_a = env_a.program_id;
     let payer_a = env_a.payer.insecure_clone();
+    // W3A-3: LIVE read of the target domain's own asset epoch.
+    let authority_epoch = {
+        let market_account = env_a.svm.get_account(&env_a.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, (DOMAIN as usize) / 2)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send(
         &mut env_a.svm,
         pid_a,
@@ -943,6 +957,7 @@ fn execute_redemption_backing_state_matches_withdraw() {
                 // itself), so any valid large future expiry preserves the exact comparison --
                 // use SENTINEL - 1 rather than the reserved sentinel.
                 expiry_slot: percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT - 1,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(admin_a.pubkey(), true),
@@ -2429,12 +2444,19 @@ fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
 
     // ── ResolveMarket → terminal mode; CloseSlab is now PERMANENTLY blocked. ──
     env.svm.expire_blockhash();
+    // W3A-3: LIVE read of asset-0's `authority_epoch`.
+    let authority_epoch = {
+        let market_account = env.svm.get_account(&env.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, 0)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send(
         &mut env.svm,
         pid,
         &payer,
         vec![(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.market, false),

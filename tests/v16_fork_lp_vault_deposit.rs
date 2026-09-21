@@ -865,6 +865,13 @@ fn lp_deposit_backing_state_matches_top_up() {
             },
         )
         .unwrap();
+    // W3A-3: LIVE read of the target domain's own asset epoch.
+    let authority_epoch = {
+        let market_account = env_a.svm.get_account(&env_a.market).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, (DOMAIN as usize) / 2)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send(
         &mut env_a.svm,
         env_a.program_id,
@@ -880,6 +887,7 @@ fn lp_deposit_backing_state_matches_top_up() {
             // itself), so any valid large future expiry preserves the exact comparison --
             // use SENTINEL - 1 rather than the reserved sentinel.
             expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT - 1,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin_a.pubkey(), true),

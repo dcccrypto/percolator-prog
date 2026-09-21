@@ -1956,11 +1956,14 @@ impl V16CuEnv {
     }
 
     fn resolve(&mut self) -> u64 {
+        // W3A-3: LIVE read of asset-0's `authority_epoch` via the existing
+        // `control_sequences` helper.
+        let authority_epoch = self.control_sequences(0).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { authority_epoch },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2518,11 +2521,12 @@ impl V16CuEnv {
     }
 
     fn top_up_insurance_from_admin_token_with_cu(&mut self, source: Pubkey, amount: u128) -> u64 {
+        let authority_epoch = self.control_sequences((0) as u16).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { amount , authority_epoch },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2543,6 +2547,7 @@ impl V16CuEnv {
         expiry_slot: u64,
     ) -> u64 {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
+        let authority_epoch = self.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2551,6 +2556,7 @@ impl V16CuEnv {
                 domain,
                 amount,
                 expiry_slot,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2580,11 +2586,12 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch = self.control_sequences((0) as u16).authority_epoch;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { amount , authority_epoch },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2616,11 +2623,12 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch = self.control_sequences((0) as u16).authority_epoch;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance { amount , authority_epoch },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2655,11 +2663,12 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch = self.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
             &self.payer,
-            ProgInstruction::TopUpInsuranceDomain { domain, amount },
+            ProgInstruction::TopUpInsuranceDomain { domain, amount , authority_epoch },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -2693,6 +2702,7 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch = self.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
@@ -2701,6 +2711,7 @@ impl V16CuEnv {
                 domain,
                 amount,
                 expiry_slot,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2737,6 +2748,7 @@ impl V16CuEnv {
                 },
             )
             .unwrap();
+        let authority_epoch = self.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
         let cu = send_tx(
             &mut self.svm,
             self.program_id,
@@ -2745,6 +2757,7 @@ impl V16CuEnv {
                 domain,
                 amount,
                 expiry_slot,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(self.admin.pubkey(), true),
@@ -2771,6 +2784,7 @@ impl V16CuEnv {
         let ledger = self.canonical_backing_domain_ledger_account(domain);
         self.ensure_signer_account(authority.pubkey());
         let source = self.token_account(authority.pubkey(), amount as u64);
+        let authority_epoch = self.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
         send_tx(
             &mut self.svm,
             self.program_id,
@@ -2779,6 +2793,7 @@ impl V16CuEnv {
                 domain,
                 amount,
                 expiry_slot,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(authority.pubkey(), true),
@@ -3646,11 +3661,12 @@ fn v16_bpf_failed_insurance_topup_transfer_rolls_back_budget_and_ledger() {
     let ledger_before = env.svm.get_account(&ledger).unwrap();
     let source_before = env.svm.get_account(&source).unwrap();
     let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let authority_epoch = env.control_sequences((0) as u16).authority_epoch;
     let result = send_tx(
         &mut env.svm,
         env.program_id,
         &env.payer,
-        ProgInstruction::TopUpInsurance { amount: 100 },
+        ProgInstruction::TopUpInsurance { amount: 100 , authority_epoch },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
             AccountMeta::new(env.market, false),
@@ -3699,6 +3715,7 @@ fn v16_bpf_failed_backing_topup_transfer_rolls_back_bucket_and_ledger() {
     let ledger_before = env.svm.get_account(&ledger).unwrap();
     let source_before = env.svm.get_account(&source).unwrap();
     let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let authority_epoch = env.control_sequences(((1 as usize) / 2) as u16).authority_epoch;
     let result = send_tx(
         &mut env.svm,
         env.program_id,
@@ -3707,6 +3724,7 @@ fn v16_bpf_failed_backing_topup_transfer_rolls_back_bucket_and_ledger() {
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
@@ -4206,12 +4224,14 @@ fn v16_bpf_topup_backing_bucket_rejects_lp_vault_sentinel_expiry() {
 
     // POSITIVE CONTROL (the fix under test): the exact sentinel must be
     // rejected at the top-up itself.
+    let authority_epoch = env.control_sequences(((1 as usize) / 2) as u16).authority_epoch;
     let err = env
         .send(
             ProgInstruction::TopUpBackingBucket {
                 domain: 1,
                 amount: 1_000,
                 expiry_slot: sentinel,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
@@ -12927,11 +12947,18 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
     .expect("rotate marketauth to signing market key");
 
     svm.expire_blockhash();
+    // W3A-3: LIVE read of asset-0's `authority_epoch`.
+    let authority_epoch = {
+        let market_account = svm.get_account(&market.pubkey()).expect("market account");
+        state::read_asset_control_sequences(&market_account.data, 0)
+            .expect("read control sequences")
+            .authority_epoch
+    };
     send_tx(
         &mut svm,
         program_id,
         &payer,
-        ProgInstruction::ResolveMarket,
+        ProgInstruction::ResolveMarket { authority_epoch },
         vec![
             AccountMeta::new(market.pubkey(), true),
             AccountMeta::new(market.pubkey(), false),
@@ -16062,12 +16089,14 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
         .unwrap();
     let market = env.market;
     let vault = env.vault;
+    let authority_epoch = env.control_sequences(((0 as usize) / 2) as u16).authority_epoch;
     let refund = env
         .send(
             ProgInstruction::TopUpBackingBucket {
                 domain: 0,
                 amount: 500,
                 expiry_slot: lapsed_slot + 10_000,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
@@ -16755,6 +16784,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
     let vault_authority = env.vault_authority;
     let source = env.token_account(admin.pubkey(), 100);
 
+    let authority_epoch = env.control_sequences(((1 as usize) / 2) as u16).authority_epoch;
     send_tx(
         &mut env.svm,
         pid,
@@ -16763,6 +16793,7 @@ fn v16_bpf_backing_topup_then_withdraw_works_without_an_lp_vault() {
             domain: 1,
             amount: 100,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -16935,6 +16966,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
     // backing withdrawable. Build the migration instruction BY HAND.
     let zero_source = env.token_account(admin.pubkey(), 0);
 
+    let authority_epoch = env.control_sequences(((DOMAIN as usize) / 2) as u16).authority_epoch;
     send_tx(
         &mut env.svm,
         pid,
@@ -16943,6 +16975,7 @@ fn v16_bpf_legacy_ledgerless_backing_zero_topup_reconciles_before_withdraw() {
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17046,6 +17079,7 @@ fn v16_bpf_legacy_ledgerless_nonzero_topup_does_not_book_refill_as_recovery() {
     // receivable, so consumed falls 40 -> 20 while fresh rises 60 -> 80.
     let source = env.token_account(admin.pubkey(), 20);
 
+    let authority_epoch = env.control_sequences(((DOMAIN as usize) / 2) as u16).authority_epoch;
     send_tx(
         &mut env.svm,
         pid,
@@ -17054,6 +17088,7 @@ fn v16_bpf_legacy_ledgerless_nonzero_topup_does_not_book_refill_as_recovery() {
             domain: DOMAIN,
             amount: 20,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17172,6 +17207,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
 
     // Migration must snapshot BOTH principal/loss and already-outstanding
     // provider earnings.
+    let authority_epoch = env.control_sequences(((DOMAIN as usize) / 2) as u16).authority_epoch;
     send_tx(
         &mut env.svm,
         pid,
@@ -17180,6 +17216,7 @@ fn v16_bpf_legacy_ledgerless_migration_seeds_outstanding_backing_earnings() {
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17306,6 +17343,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     let source = env.token_account(admin.pubkey(), 1);
     let vault_before = env.token_amount(vault);
 
+    let authority_epoch = env.control_sequences(((DOMAIN as usize) / 2) as u16).authority_epoch;
     let nonzero = send_tx(
         &mut env.svm,
         pid,
@@ -17314,6 +17352,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
             domain: DOMAIN,
             amount: 1,
             expiry_slot: 20,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17341,6 +17380,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
     // Positive case: amount == 0 is accounting migration only.
     env.svm.expire_blockhash();
 
+    let authority_epoch = env.control_sequences(((DOMAIN as usize) / 2) as u16).authority_epoch;
     send_tx(
         &mut env.svm,
         pid,
@@ -17349,6 +17389,7 @@ fn v16_bpf_legacy_ledgerless_resolved_zero_topup_reconciles_without_reopening_de
             domain: DOMAIN,
             amount: 0,
             expiry_slot: 20,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -17588,6 +17629,7 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
     // Fresh bucket cannot take a deposit at a different expiry — so the assertion
     // below passed while proving nothing about the authority guard. The negative
     // control caught it: removing the guard entirely left this test green.
+    let authority_epoch = env.control_sequences(((1 as usize) / 2) as u16).authority_epoch;
     let err = send_tx(
         &mut env.svm,
         pid,
@@ -17596,6 +17638,7 @@ fn v16_bpf_a_funded_backing_ledger_is_still_refused_to_a_new_authority() {
             domain: 1,
             amount: 50,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(successor.pubkey(), true),
@@ -17818,12 +17861,14 @@ fn v16_bpf_topup_backing_bucket_rejects_expiry_at_or_before_now() {
     let admin = env.admin.insecure_clone();
     let market = env.market;
     let vault = env.vault;
+    let authority_epoch = env.control_sequences(((1 as usize) / 2) as u16).authority_epoch;
     let err = env
         .send(
             ProgInstruction::TopUpBackingBucket {
                 domain: 1,
                 amount: 1_000,
                 expiry_slot: 10,
+                authority_epoch,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
@@ -18026,6 +18071,7 @@ fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
     let market = env.market;
     let vault = env.vault;
     let payer = env.payer.insecure_clone();
+    let authority_epoch = env.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
     let res = send_tx(
         &mut env.svm,
         pid,
@@ -18034,6 +18080,7 @@ fn v16_bpf_oversized_backing_domain_ledger_account_is_rejected() {
             domain,
             amount: 50,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -18097,6 +18144,7 @@ fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
     let market = env.market;
     let vault = env.vault;
     let payer = env.payer.insecure_clone();
+    let authority_epoch = env.control_sequences(((domain as usize) / 2) as u16).authority_epoch;
     let res = send_tx(
         &mut env.svm,
         pid,
@@ -18105,6 +18153,7 @@ fn v16_bpf_nonzero_garbage_backing_domain_ledger_account_is_rejected() {
             domain,
             amount: 50,
             expiry_slot: 10,
+            authority_epoch,
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
@@ -18147,11 +18196,12 @@ fn v16_bpf_oversized_insurance_ledger_account_is_rejected() {
     let market = env.market;
     let vault = env.vault;
     let payer = env.payer.insecure_clone();
+    let authority_epoch = env.control_sequences((0) as u16).authority_epoch;
     let res = send_tx(
         &mut env.svm,
         pid,
         &payer,
-        ProgInstruction::TopUpInsurance { amount: 50 },
+        ProgInstruction::TopUpInsurance { amount: 50 , authority_epoch },
         vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(market, false),
@@ -18196,11 +18246,12 @@ fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
     let market = env.market;
     let vault = env.vault;
     let payer = env.payer.insecure_clone();
+    let authority_epoch = env.control_sequences((0) as u16).authority_epoch;
     let res = send_tx(
         &mut env.svm,
         pid,
         &payer,
-        ProgInstruction::TopUpInsurance { amount: 50 },
+        ProgInstruction::TopUpInsurance { amount: 50 , authority_epoch },
         vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(market, false),
@@ -20765,5 +20816,356 @@ fn v16_bpf_update_asset_lifecycle_cas_rejects_held_tx_after_intervening_rotation
         env.market_state().1.assets[0].lifecycle,
         AssetLifecycleV16::Active,
         "the rejected held tx must leave asset 0's lifecycle untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W3A-3: authority-epoch residual -- TopUpInsurance(9)/TopUpInsuranceDomain(56)/
+// TopUpBackingBucket(24)/ResolveMarket(19). AE-only (this fork's MID/IID/AGF
+// halves for these tags live on other held branches, reconciled at
+// integration -- see ABI_OVERHAUL_SCOPE.md §1). Reuses the SAME
+// `require_authority_epoch_view` CHECK-only helper W3A-1/W3A-2 each
+// independently add on top of this branch (de-dups to one definition at
+// integration). Style mirrors `v16_bpf_close_slab_cas_rejects_held_tx_after_
+// intervening_rotation` above (also CHECK-only, terminal/no-advance).
+// ---------------------------------------------------------------------------
+
+/// `TopUpInsurance` (tag 9) previously had ZERO epoch binding. Binds asset-0's
+/// `authority_epoch` (CHECK-only, checked TWICE -- once in the pre-check read
+/// phase, once again immediately before the deposit mutation, mirroring
+/// upstream `238436c5`) as the caller's expected CURRENT value.
+#[test]
+fn v16_bpf_top_up_insurance_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    // 1. Sign (build, DON'T submit) a TopUpInsurance against the CURRENT
+    //    epoch -- exactly what a legitimately-authorized signer (or a
+    //    durable-nonce holder) would do.
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::TopUpInsurance {
+        amount: 100,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(source, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    // 2. A legitimate rotation happens FIRST (epoch held_expected ->
+    //    held_expected + 1), advancing the SAME asset-0 `authority_epoch`
+    //    counter. Uses ASSET_AUTH_ORACLE (kind 4) -- disjoint from
+    //    `insurance_authority` (kind 1), the authority TopUpInsurance itself
+    //    checks -- so the rejection below is isolated to the epoch/CAS
+    //    mismatch alone. The held tx above is NOT submitted here.
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    // 3. NOW submit the held tx. Under the CAS it MUST be rejected: its
+    //    `expected` (held_expected) no longer equals the current stored
+    //    value (held_expected + 1).
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err("a held TopUpInsurance against a since-superseded epoch must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    // Positive control: the SAME call with the CORRECT (post-rotation) epoch
+    // succeeds -- proving the rejection above was genuinely the epoch, not
+    // the held tx's accounts/signers being otherwise broken.
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::TopUpInsurance {
+            amount: 100,
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("TopUpInsurance with the CORRECT epoch must succeed");
+}
+
+/// `TopUpInsuranceDomain` (tag 56) previously had ZERO epoch binding. Binds
+/// the target domain's own asset epoch (`domain / 2`, matching
+/// `UpdateAssetAuthority`'s per-asset lane) -- domain 0 -> asset 0 here, so
+/// this exercises the same asset-0 lane as the other three tests, but via
+/// the DOMAIN-scoped handler path (`handle_top_up_insurance_domain`, a
+/// separate function from the market-wide `handle_top_up_insurance` above).
+#[test]
+fn v16_bpf_top_up_insurance_domain_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::TopUpInsuranceDomain {
+        domain: 0,
+        amount: 100,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(source, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err(
+            "a held TopUpInsuranceDomain against a since-superseded epoch must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::TopUpInsuranceDomain {
+            domain: 0,
+            amount: 100,
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("TopUpInsuranceDomain with the CORRECT epoch must succeed");
+}
+
+/// `TopUpBackingBucket` (tag 24) previously had ZERO epoch binding. Binds
+/// the target domain's own asset epoch (`domain / 2`), checked at all three
+/// of upstream `238436c5`'s call sites (pre-check, `amount != 0` mutation,
+/// `amount == 0` reconciliation) -- this test drives the `amount != 0` path.
+#[test]
+fn v16_bpf_top_up_backing_bucket_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let ledger = env.canonical_backing_domain_ledger_account(0);
+    let source = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            source,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, admin.pubkey(), 1_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let held_ix = ProgInstruction::TopUpBackingBucket {
+        domain: 0,
+        amount: 100,
+        expiry_slot: 10,
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(source, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(ledger, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err(
+            "a held TopUpBackingBucket against a since-superseded epoch must be rejected",
+        );
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::TopUpBackingBucket {
+            domain: 0,
+            amount: 100,
+            expiry_slot: 10,
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("TopUpBackingBucket with the CORRECT epoch must succeed");
+}
+
+/// `ResolveMarket` (tag 19) previously had ZERO epoch binding. Binds asset-0's
+/// `authority_epoch` (CHECK-only -- only `UpdateAuthority`/
+/// `UpdateAssetAuthority` advance it), checked right after `marketauth`
+/// authorization and strictly before the slot-staleness gate / terminal
+/// `resolve_market_not_atomic` mutation (mirrors upstream `95d155bc`'s exact
+/// placement).
+#[test]
+fn v16_bpf_resolve_market_cas_rejects_held_tx_after_intervening_rotation() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.insecure_clone();
+
+    let held_expected = env.control_sequences(0).authority_epoch;
+    let held_ix = ProgInstruction::ResolveMarket {
+        authority_epoch: held_expected,
+    };
+    let held_accounts = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+
+    let legit_target = Keypair::new();
+    env.ensure_signer_account(legit_target.pubkey());
+    env.send(
+        ProgInstruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 4, // ASSET_AUTH_ORACLE
+            new_pubkey: legit_target.pubkey().to_bytes(),
+            authority_epoch: held_expected,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(legit_target.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin, &legit_target],
+    )
+    .expect("intervening rotation succeeds");
+    assert_eq!(env.control_sequences(0).authority_epoch, held_expected + 1);
+
+    // Market is still Live (mode == 0) -- WITHOUT the epoch gate this held
+    // tx would succeed outright (ResolveMarket has no other gate blocking a
+    // Live market). It must fail on EngineStale, proving the epoch gate is
+    // the actual cause, not some unrelated rejection.
+    env.svm.expire_blockhash();
+    let err = env
+        .send(held_ix, held_accounts.clone(), &[&admin])
+        .expect_err("a held ResolveMarket against a since-superseded epoch must be rejected");
+    assert_eq!(
+        custom_code(&err),
+        Some(PercolatorError::EngineStale as u32),
+        "expected EngineStale (CAS mismatch); got {err}"
+    );
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(
+        group.mode,
+        MarketModeV16::Live,
+        "rejected ResolveMarket must not mutate market mode"
+    );
+
+    // Positive control: the SAME call with the CORRECT epoch succeeds and
+    // actually resolves the market.
+    env.svm.expire_blockhash();
+    let current_expected = env.control_sequences(0).authority_epoch;
+    env.send(
+        ProgInstruction::ResolveMarket {
+            authority_epoch: current_expected,
+        },
+        held_accounts,
+        &[&admin],
+    )
+    .expect("ResolveMarket with the CORRECT epoch must succeed");
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(
+        group.mode,
+        MarketModeV16::Resolved,
+        "market must now be Resolved"
     );
 }

@@ -558,8 +558,19 @@ impl Env {
                 },
             )
             .unwrap();
+        // W3A-3: LIVE read of asset-0's `authority_epoch` (this market-wide
+        // top-up always deposits into asset 0, not `ASSET`).
+        let authority_epoch = {
+            let account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         self.try_send(
-            ProgInstruction::TopUpInsurance { amount },
+            ProgInstruction::TopUpInsurance {
+                amount,
+                authority_epoch,
+            },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
@@ -625,8 +636,16 @@ impl Env {
 
     fn resolve(&mut self) -> Result<(), TransactionError> {
         let admin = self.admin.insecure_clone();
+        // W3A-3: asset-0 lane (marketauth's own epoch slot), not `ASSET`
+        // (this fixture's primary trading asset, which may be non-zero).
+        let authority_epoch = {
+            let account = self.svm.get_account(&self.market).expect("market account");
+            state::read_asset_control_sequences(&account.data, 0)
+                .expect("read control sequences")
+                .authority_epoch
+        };
         self.try_send(
-            ProgInstruction::ResolveMarket,
+            ProgInstruction::ResolveMarket { authority_epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.market, false),
