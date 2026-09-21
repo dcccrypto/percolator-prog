@@ -595,10 +595,15 @@ fn run_trade_cpi_with_matcher(
     // returns Unauthorized.  Register now; the SetMatcherConfig call is idempotent per trade.
     let (matcher_config_portfolio_id, matcher_config_expected_sequence, _) =
         portfolio_identity(account_b);
+    // W3-matcher (ADOPT upstream `8f62a5c5`): the LIVE asset-generation frontier
+    // this SetMatcherConfig grant must be authorized against.
+    let matcher_config_asset_frontier =
+        state::read_market_asset_generation_frontier(&market.data).unwrap();
     run_ix(
         Instruction::SetMatcherConfig {
             portfolio_id: matcher_config_portfolio_id,
             expected_sequence: matcher_config_expected_sequence,
+            asset_generation_frontier: matcher_config_asset_frontier,
             enabled: 1,
             trade_fee_cap_bps: 10_000,
             // TB-1b: a live future slot -- the harness's native `run_ix` has no
@@ -636,7 +641,8 @@ fn run_trade_cpi_with_matcher(
     // matcher_prog, matcher_ctx, matcher_delegate]. owner_b is the B-side signer but is NOT
     // passed as a separate account; account_b must already be writable.
     let (account_a_portfolio_id, _, account_a_position_epoch) = portfolio_identity(account_a);
-    let (account_b_portfolio_id, _, account_b_position_epoch) = portfolio_identity(account_b);
+    let (account_b_portfolio_id, account_b_matcher_sequence, account_b_position_epoch) =
+        portfolio_identity(account_b);
     // Wave-2 TB-4: read the live market_id -- this helper is shared across every
     // asset_index the suite trades on.
     let market_id = state::read_market_trade_preflight(&market.data, asset_index as usize)
@@ -649,6 +655,7 @@ fn run_trade_cpi_with_matcher(
             account_b_portfolio_id,
             account_b_position_epoch,
             market_id,
+            account_b_matcher_sequence,
             asset_index,
             size_q: req_size,
             fee_bps,
@@ -15763,6 +15770,7 @@ fn v16_wrapper_tradecpi_requires_bilateral_signatures_before_matcher_cpi() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -15817,6 +15825,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -15852,6 +15861,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -15880,7 +15890,8 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
         // account_a/account_b into `infos` below (those borrows live until
         // `process_instruction` returns, so reading afterward would conflict).
         let (account_a_portfolio_id, _, account_a_position_epoch) = portfolio_identity(&account_a);
-        let (account_b_portfolio_id, _, account_b_position_epoch) = portfolio_identity(&account_b);
+        let (account_b_portfolio_id, account_b_matcher_sequence, account_b_position_epoch) =
+            portfolio_identity(&account_b);
         let mut infos = vec![
             owner_a.to_info(),
             market.to_info(),
@@ -15900,6 +15911,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_delegate_and_unsafe_tail_before_cpi() {
                 account_b_portfolio_id,
                 account_b_position_epoch,
             market_id: 1,
+                account_b_matcher_sequence,
                 asset_index: 0,
                 size_q: POS_SCALE as i128,
                 fee_bps: 0,
@@ -15964,6 +15976,7 @@ fn v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -16011,10 +16024,13 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
 
     {
         let (portfolio_id, expected_sequence, _) = portfolio_identity(&account_b);
+        let asset_generation_frontier =
+            state::read_market_asset_generation_frontier(&market.data).unwrap();
         run_ix(
             Instruction::SetMatcherConfig {
                 portfolio_id,
                 expected_sequence,
+                asset_generation_frontier,
                 enabled: 1,
                 trade_fee_cap_bps: 10_000,
                 expiry_slot: u64::MAX,
@@ -16054,6 +16070,7 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -16093,6 +16110,7 @@ fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -16155,6 +16173,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_resolved_market_before_success() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -16215,6 +16234,7 @@ fn v16_wrapper_tradecpi_zero_fill_rejects_fee_above_cap_before_success() {
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 10_001,
@@ -16288,6 +16308,7 @@ fn v16_wrapper_tradecpi_rejects_corrupt_backing_fee_policy_before_later_checks()
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
             market_id: 1,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             asset_index: 0,
             size_q: POS_SCALE as i128,
             fee_bps: 0,
@@ -20760,6 +20781,8 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
         Instruction::SetMatcherConfig {
             portfolio_id: portfolio_identity(&account_b).0,
             expected_sequence: portfolio_identity(&account_b).1,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(&market.data)
+                .unwrap(),
             enabled: 1,
             trade_fee_cap_bps: 10_000,
             expiry_slot: u64::MAX,
@@ -20800,6 +20823,7 @@ fn v16_wrapper_protocol_fee_batchtradecpi_skims_20pct_and_accrues_creator_leg_of
             account_a_position_epoch: portfolio_identity(&account_a).2,
             account_b_portfolio_id: portfolio_identity(&account_b).0,
             account_b_position_epoch: portfolio_identity(&account_b).2,
+            account_b_matcher_sequence: portfolio_identity(&account_b).1,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![percolator_prog::ix::BatchTradeCpiLeg {

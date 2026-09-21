@@ -1785,6 +1785,12 @@ impl V16CuEnv {
         // and InitMatcherCtx requires the (matcher_prog, matcher_ctx, delegate) triple to
         // already be registered on the LP portfolio.
         let (portfolio_id, expected_sequence, _) = self.portfolio_identity(maker_account);
+        // W3-matcher (ADOPT upstream `8f62a5c5`): the LIVE asset-generation
+        // frontier this grant must be authorized against.
+        let asset_generation_frontier = state::read_market_asset_generation_frontier(
+            &self.svm.get_account(&self.market).unwrap().data,
+        )
+        .unwrap();
         // TB-1b: `expiry_slot` must be a live future slot for
         // `matcher_capability_config_is_valid`/`matcher_capability_is_live` to accept
         // `enabled: 1` -- this harness never warps anywhere near u64::MAX.
@@ -1795,6 +1801,7 @@ impl V16CuEnv {
             ProgInstruction::SetMatcherConfig {
                 portfolio_id,
                 expected_sequence,
+                asset_generation_frontier,
                 enabled: 1,
                 trade_fee_cap_bps: 10_000,
                 expiry_slot: u64::MAX,
@@ -1939,7 +1946,7 @@ impl V16CuEnv {
         let _ = owner_b; // signer_b no longer needed in v17 TradeCpi
         let (account_a_portfolio_id, _, account_a_position_epoch) =
             self.portfolio_identity(account_a);
-        let (account_b_portfolio_id, _, account_b_position_epoch) =
+        let (account_b_portfolio_id, account_b_matcher_sequence, account_b_position_epoch) =
             self.portfolio_identity(account_b);
         // Wave-2 TB-4: read live, this helper is shared by every asset_index.
         let market_id = state::read_market_trade_preflight(
@@ -1955,6 +1962,7 @@ impl V16CuEnv {
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 market_id,
+                account_b_matcher_sequence,
                 asset_index,
                 size_q,
                 fee_bps,
@@ -8975,6 +8983,10 @@ fn v16_attack_trade_cpi_requires_lp_fee_cap_consent() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id: mc_portfolio_id,
             expected_sequence: mc_expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 1,
             trade_fee_cap_bps: 100,
             expiry_slot: u64::MAX,
@@ -9047,6 +9059,10 @@ fn v16_attack_trade_cpi_requires_lp_fee_cap_consent() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id: mc_portfolio_id,
             expected_sequence: mc_expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 1,
             trade_fee_cap_bps: 500,
             expiry_slot: u64::MAX,
@@ -9120,6 +9136,10 @@ fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id: mc_portfolio_id,
             expected_sequence: mc_expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 1,
             trade_fee_cap_bps: 100,
             expiry_slot: u64::MAX,
@@ -9162,13 +9182,14 @@ fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
         limit_price: 0,
     };
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let r = env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![over_cap_leg],
@@ -9211,6 +9232,10 @@ fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id: mc_portfolio_id,
             expected_sequence: mc_expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 1,
             trade_fee_cap_bps: 500,
             expiry_slot: u64::MAX,
@@ -9237,13 +9262,14 @@ fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
         limit_price: 0,
     };
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![at_cap_leg],
@@ -9263,6 +9289,298 @@ fn v16_attack_batch_trade_cpi_requires_lp_fee_cap_consent() {
         g1.vault,
         g1.c_tot + g1.insurance,
         "exact conservation after the consented LP-fee-cap BatchTradeCpi"
+    );
+}
+
+// W3-matcher unit -- ADOPT upstream `edc8ce74` ("bind cpi trades to matcher incarnation"):
+// closes a stale-matcher-grant replay gap that TB-1b's `expiry_slot`-only liveness check
+// (upstream 0b838425) did NOT cover. A prior comment on `BatchTradeCpi` claimed
+// `expiry_slot` liveness was sufficient and an `account_b_matcher_sequence` field was
+// unneeded -- that reasoning was wrong: `expiry_slot` only proves the LP's CURRENT grant
+// has not timed out, not that it is the SAME incarnation the taker signed against. If the
+// LP reconfigures under the SAME matcher tuple (program/context/delegate unchanged) --
+// e.g. just raising `trade_fee_cap_bps` or extending `expiry_slot` -- a taker's held
+// TradeCpi signed against the OLD incarnation still passes the tuple check AND the
+// liveness check, and would still land. `account_b_matcher_sequence` closes this: it must
+// match the LP's LIVE `read_portfolio_matcher_sequence` at landing time, checked in
+// `matcher_tail_start_or_verify_lp_config` strictly before any state mutation.
+#[test]
+fn v16_w3_attack_trade_cpi_rejects_stale_matcher_incarnation() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+    env.svm.add_program(matcher_program, &matcher_bytes);
+
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_account = env.create_portfolio(&taker);
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&taker, taker_account, 1_000_000);
+    env.deposit(&lp, lp_account, 1_000_000);
+
+    let (ctx, delegate, _init_cu) = env.init_matcher_context(&lp, matcher_program, lp_account);
+
+    // The taker observes the LP's matcher grant at THIS incarnation (the sequence
+    // `init_matcher_context`'s own SetMatcherConfig call just advanced to) and signs a
+    // TradeCpi against it.
+    let stale_matcher_sequence = env.portfolio_identity(lp_account).1;
+
+    // The LP reconfigures under the SAME tuple (matcher_program/matcher_ctx/delegate
+    // unchanged) -- only trade_fee_cap_bps changes. This advances the LP's matcher
+    // sequence (the retained-owner-state lane TB-1b already wires for
+    // SetMatcherConfig/Deposit/Withdraw), which is exactly the "incarnation" edc8ce74
+    // binds CPI trades to.
+    env.svm.expire_blockhash();
+    let (mc_portfolio_id, mc_expected_sequence, _) = env.portfolio_identity(lp_account);
+    let asset_generation_frontier = state::read_market_asset_generation_frontier(
+        &env.svm.get_account(&env.market).unwrap().data,
+    )
+    .unwrap();
+    env.send(
+        ProgInstruction::SetMatcherConfig {
+            portfolio_id: mc_portfolio_id,
+            expected_sequence: mc_expected_sequence,
+            asset_generation_frontier,
+            enabled: 1,
+            trade_fee_cap_bps: 9_999,
+            expiry_slot: u64::MAX,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new_readonly(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[&lp],
+    )
+    .expect("LP reconfigures under the SAME matcher tuple -- sequence must advance");
+
+    let live_matcher_sequence = env.portfolio_identity(lp_account).1;
+    assert_ne!(
+        stale_matcher_sequence, live_matcher_sequence,
+        "test setup must actually advance the LP's matcher sequence between the taker's \
+         signature and the reject attempt, or this test is vacuous"
+    );
+
+    // The taker's held TradeCpi, signed against the OLD incarnation, submitted now -- after
+    // the reconfigure. Tuple still matches (same matcher_program/ctx/delegate) and
+    // expiry_slot is still live -- only account_b_matcher_sequence is stale.
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    env.svm.expire_blockhash();
+    let (account_a_portfolio_id, _, account_a_position_epoch) =
+        env.portfolio_identity(taker_account);
+    let (account_b_portfolio_id, _, account_b_position_epoch) =
+        env.portfolio_identity(lp_account);
+    let stale = env.send(
+        ProgInstruction::TradeCpi {
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+            market_id: 1,
+            account_b_matcher_sequence: stale_matcher_sequence,
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            fee_bps: 0,
+            limit_price: 0,
+        },
+        vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp_account, false),
+            AccountMeta::new_readonly(matcher_program, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ],
+        &[&taker],
+    );
+    assert!(
+        stale.is_err() && stale.as_ref().unwrap_err().contains("Custom(19)"),
+        "TradeCpi signed under a stale matcher incarnation (stale account_b_matcher_sequence=\
+         {stale_matcher_sequence}, live={live_matcher_sequence}) must reject with EngineStale \
+         (Custom(19)): {stale:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected stale-incarnation TradeCpi must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&taker_account).unwrap(),
+        taker_before,
+        "a rejected stale-incarnation TradeCpi must not mutate the taker's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&lp_account).unwrap(),
+        lp_before,
+        "a rejected stale-incarnation TradeCpi must not mutate the LP's portfolio"
+    );
+    assert_eq!(
+        env.svm.get_account(&ctx).unwrap(),
+        ctx_before,
+        "matcher context must be untouched -- proves the real matcher CPI was never invoked \
+         for a trade signed under a stale matcher incarnation"
+    );
+
+    // Control: the identical trade, but with the LIVE (current) matcher sequence, succeeds
+    // through a real matcher CPI -- proves the rejection above is specifically about the
+    // stale incarnation, not some unrelated fixture mistake.
+    let ins0 = env.market_state().1.insurance;
+    env.svm.expire_blockhash();
+    env.trade_cpi_with_cu_on_asset(
+        &taker,
+        taker_account,
+        &lp,
+        lp_account,
+        matcher_program,
+        ctx,
+        delegate,
+        0,
+        POS_SCALE as i128,
+        0,
+    );
+    let (_, g1) = env.market_state();
+    assert!(
+        g1.vault >= g1.c_tot + g1.insurance,
+        "control TradeCpi at the LIVE matcher incarnation must actually land (vault/c_tot/\
+         insurance moved): vault={} c_tot={} insurance={} (was {ins0})",
+        g1.vault,
+        g1.c_tot,
+        g1.insurance
+    );
+}
+
+// W3-matcher unit -- ADOPT upstream `8f62a5c5` ("bind matcher grants to asset frontier"):
+// SetMatcherConfig(68) must bind against the market's LIVE asset-generation frontier
+// (`next_market_id`), checked strictly before any mutation. TB-1b's SetMatcherConfig only
+// bound portfolio_id/sequence/position_epoch identity (upstream 597f8dcc) -- nothing
+// stopped an authorization signed against a stale frontier from landing after the market's
+// asset set moved on (an asset slot retired and reactivated into a new generation).
+#[test]
+fn v16_w3_attack_set_matcher_config_rejects_stale_asset_frontier() {
+    let mut env = V16CuEnv::new();
+    env.activate_asset(1, 1, 100);
+
+    let lp = Keypair::new();
+    let lp_account = env.create_portfolio(&lp);
+    env.deposit(&lp, lp_account, 1_000_000);
+
+    // The LP observes the market's asset-generation frontier NOW, before asset 1 is
+    // retired and reactivated into a new generation.
+    let stale_frontier = state::read_market_asset_generation_frontier(
+        &env.svm.get_account(&env.market).unwrap().data,
+    )
+    .unwrap();
+
+    // Retire + reactivate asset 1 -- this is the SAME cycle
+    // `v16_bpf_privileged_reactivate_uses_authenticated_slot` (above) already proves
+    // advances `next_market_id` by exactly 1 on this branch (no TB-4 dependency: the
+    // increment itself lives in the shared engine's asset-lifecycle state machine, wired
+    // through the wrapper's existing `UpdateAssetLifecycle` -- TB-4 only adds NEW callers
+    // that read this already-advancing counter).
+    env.svm.warp_to_slot(3);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_RETIRE,
+        1,
+        3,
+        0,
+    );
+    env.svm.warp_to_slot(4);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_ACTIVATE,
+        1,
+        4,
+        250,
+    );
+
+    let live_frontier = state::read_market_asset_generation_frontier(
+        &env.svm.get_account(&env.market).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(
+        live_frontier,
+        stale_frontier + 1,
+        "test setup must actually advance the market's asset-generation frontier by \
+         retiring+reactivating asset 1, or this test is vacuous"
+    );
+
+    // The LP's SetMatcherConfig, authorized against the OLD (now-stale) frontier, submitted
+    // now -- after the frontier advanced. portfolio_id/expected_sequence are CURRENT and
+    // correct; only asset_generation_frontier is stale. `enabled: 0` (revoke) keeps this
+    // test self-contained -- no real matcher program/context accounts are needed since the
+    // frontier check (checked BEFORE the enabled==1 matcher-account branch) is what this
+    // test exercises.
+    let (portfolio_id, expected_sequence, _) = env.portfolio_identity(lp_account);
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    env.svm.expire_blockhash();
+    let stale = env.send(
+        ProgInstruction::SetMatcherConfig {
+            portfolio_id,
+            expected_sequence,
+            asset_generation_frontier: stale_frontier,
+            enabled: 0,
+            trade_fee_cap_bps: 0,
+            expiry_slot: 0,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(lp_account, false),
+        ],
+        &[&lp],
+    );
+    assert!(
+        stale.is_err() && stale.as_ref().unwrap_err().contains("Custom(19)"),
+        "SetMatcherConfig authorized against a stale asset_generation_frontier \
+         (stale={stale_frontier}, live={live_frontier}) must reject with EngineStale \
+         (Custom(19)): {stale:?}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "a rejected stale-frontier SetMatcherConfig must not mutate market state"
+    );
+    assert_eq!(
+        env.svm.get_account(&lp_account).unwrap(),
+        lp_before,
+        "a rejected stale-frontier SetMatcherConfig must not mutate the LP's portfolio -- \
+         in particular the matcher sequence must NOT have advanced"
+    );
+
+    // Control: the identical call with the LIVE (current) frontier succeeds and advances
+    // the LP's matcher sequence -- proves the rejection above is specifically about the
+    // stale frontier, not some unrelated fixture mistake.
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SetMatcherConfig {
+            portfolio_id,
+            expected_sequence,
+            asset_generation_frontier: live_frontier,
+            enabled: 0,
+            trade_fee_cap_bps: 0,
+            expiry_slot: 0,
+        },
+        vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(lp_account, false),
+        ],
+        &[&lp],
+    )
+    .expect("SetMatcherConfig authorized against the LIVE asset_generation_frontier must succeed");
+    let new_sequence = env.portfolio_identity(lp_account).1;
+    assert_eq!(
+        new_sequence,
+        expected_sequence + 1,
+        "a successful SetMatcherConfig must advance the matcher sequence by exactly one"
     );
 }
 
@@ -9321,13 +9639,14 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
         limit_price: 0,
     };
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let r = env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![under_base_leg],
@@ -9373,13 +9692,14 @@ fn v16_attack_batch_trade_cpi_requires_signed_base_fee_consent() {
         limit_price: 0,
     };
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![at_base_leg],
@@ -9471,13 +9791,14 @@ fn v16_attack_batch_trade_cpi_rejects_over_bound_aggregate_fee() {
     let lp_before = env.svm.get_account(&lp_account).unwrap();
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let over = env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: expected_fee - 1,
             legs: vec![leg],
@@ -9512,13 +9833,14 @@ fn v16_attack_batch_trade_cpi_rejects_over_bound_aggregate_fee() {
     let ins0 = env.market_state().1.insurance;
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: expected_fee,
             legs: vec![leg],
@@ -11327,7 +11649,7 @@ fn ecu_send_trade_cpi(
     env.svm.expire_blockhash();
     let (account_a_portfolio_id, _, account_a_position_epoch) =
         env.portfolio_identity(taker_account);
-    let (account_b_portfolio_id, _, account_b_position_epoch) =
+    let (account_b_portfolio_id, account_b_matcher_sequence, account_b_position_epoch) =
         env.portfolio_identity(lp_account);
     let market_id = state::read_market_trade_preflight(
         &env.svm.get_account(&env.market).unwrap().data,
@@ -11342,6 +11664,7 @@ fn ecu_send_trade_cpi(
             account_b_portfolio_id,
             account_b_position_epoch,
             market_id,
+            account_b_matcher_sequence,
             asset_index,
             size_q,
             fee_bps: 0,
@@ -15677,7 +16000,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
     // Non-vacuous fresh control: the real matcher fills a non-base TradeCpi before any staleness.
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let fresh = env.send(
         ProgInstruction::TradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
@@ -15685,6 +16008,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
             market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
+            account_b_matcher_sequence: lp_matcher_sequence,
             asset_index: 1,
             size_q: sz,
             fee_bps: 0,
@@ -15726,7 +16050,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
 
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let stale = env.send(
         ProgInstruction::TradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
@@ -15734,6 +16058,7 @@ fn v16_attack_non_base_tradecpi_rejects_before_matcher_after_base_resolve_mature
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
             market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
+            account_b_matcher_sequence: lp_matcher_sequence,
             asset_index: 1,
             size_q: sz,
             fee_bps: 0,
@@ -15805,13 +16130,14 @@ fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_m
     // the real matcher's batch fill does with a single leg is orthogonal to this fix.
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let fresh = env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![leg.clone()],
@@ -15848,13 +16174,14 @@ fn v16_attack_non_base_batchtradecpi_rejects_before_matcher_after_base_resolve_m
 
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let stale = env.send(
         ProgInstruction::BatchTradeCpi {
             account_a_portfolio_id: taker_portfolio_id,
             account_a_position_epoch: taker_position_epoch,
             account_b_portfolio_id: lp_portfolio_id,
             account_b_position_epoch: lp_position_epoch,
+            account_b_matcher_sequence: lp_matcher_sequence,
             max_slippage_atoms: u128::MAX,
             max_fee_atoms: u128::MAX,
             legs: vec![leg],
@@ -16029,7 +16356,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         };
         let (taker_portfolio_id, _, taker_position_epoch) =
             env.portfolio_identity(taker_account);
-        let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+        let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
         let err = if route_is_batch {
             env.send(
                 ProgInstruction::BatchTradeCpi {
@@ -16037,6 +16364,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
                     account_a_position_epoch: taker_position_epoch,
                     account_b_portfolio_id: lp_portfolio_id,
                     account_b_position_epoch: lp_position_epoch,
+                    account_b_matcher_sequence: lp_matcher_sequence,
                     max_slippage_atoms: u128::MAX,
                     max_fee_atoms: u128::MAX,
                     legs: vec![leg],
@@ -16052,6 +16380,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
                     account_b_portfolio_id: lp_portfolio_id,
                     account_b_position_epoch: lp_position_epoch,
             market_id: 1,
+            account_b_matcher_sequence: lp_matcher_sequence,
                     asset_index: 0,
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
@@ -16093,7 +16422,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
         };
         let (taker_portfolio_id, _, taker_position_epoch) =
             env.portfolio_identity(taker_account);
-        let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+        let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
         let ok_result = if route_is_batch {
             env.send(
                 ProgInstruction::BatchTradeCpi {
@@ -16101,6 +16430,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
                     account_a_position_epoch: taker_position_epoch,
                     account_b_portfolio_id: lp_portfolio_id,
                     account_b_position_epoch: lp_position_epoch,
+                    account_b_matcher_sequence: lp_matcher_sequence,
                     max_slippage_atoms: u128::MAX,
                     max_fee_atoms: u128::MAX,
                     legs: vec![leg],
@@ -16116,6 +16446,7 @@ fn v16_fix_w1_matcher_tail_rejects_signer_account() {
                     account_b_portfolio_id: lp_portfolio_id,
                     account_b_position_epoch: lp_position_epoch,
             market_id: 1,
+            account_b_matcher_sequence: lp_matcher_sequence,
                     asset_index: 0,
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
@@ -16216,7 +16547,7 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
             ];
             let (taker_portfolio_id, _, taker_position_epoch) =
                 env.portfolio_identity(taker_account);
-            let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+            let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
             let err = if route_is_batch {
                 env.send(
                     ProgInstruction::BatchTradeCpi {
@@ -16224,6 +16555,7 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
                         account_a_position_epoch: taker_position_epoch,
                         account_b_portfolio_id: lp_portfolio_id,
                         account_b_position_epoch: lp_position_epoch,
+                        account_b_matcher_sequence: lp_matcher_sequence,
                         max_slippage_atoms: u128::MAX,
                         max_fee_atoms: u128::MAX,
                         legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
@@ -16245,6 +16577,7 @@ fn v16_fix_w2_inactive_asset_cpi_trade_rejects_before_matcher() {
                         account_b_portfolio_id: lp_portfolio_id,
                         account_b_position_epoch: lp_position_epoch,
             market_id: state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 1).map(|t| t.3).unwrap_or(0),
+            account_b_matcher_sequence: lp_matcher_sequence,
                         asset_index: 1,
                         size_q: POS_SCALE as i128,
                         fee_bps: 0,
@@ -16330,7 +16663,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
         // Taker is already long; requesting MORE long (same direction) is a risk INCREASE.
         let (taker_portfolio_id, _, taker_position_epoch) =
             env.portfolio_identity(taker_account);
-        let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+        let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
         let err = if route_is_batch {
             env.send(
                 ProgInstruction::BatchTradeCpi {
@@ -16338,6 +16671,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
                     account_a_position_epoch: taker_position_epoch,
                     account_b_portfolio_id: lp_portfolio_id,
                     account_b_position_epoch: lp_position_epoch,
+                    account_b_matcher_sequence: lp_matcher_sequence,
                     max_slippage_atoms: u128::MAX,
                     max_fee_atoms: u128::MAX,
                     legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
@@ -16359,6 +16693,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
                     account_b_portfolio_id: lp_portfolio_id,
                     account_b_position_epoch: lp_position_epoch,
             market_id: 1,
+            account_b_matcher_sequence: lp_matcher_sequence,
                     asset_index: 0,
                     size_q: POS_SCALE as i128,
                     fee_bps: 0,
@@ -16495,7 +16830,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     let ctx_before = env.svm.get_account(&ctx).unwrap();
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let over = env
         .send(
             ProgInstruction::BatchTradeCpi {
@@ -16503,6 +16838,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
                 account_a_position_epoch: taker_position_epoch,
                 account_b_portfolio_id: lp_portfolio_id,
                 account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
                 max_slippage_atoms: u128::MAX,
                 max_fee_atoms: u128::MAX,
                 legs: mk_legs(OVER_LEGS),
@@ -16533,7 +16869,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     let reject_tail = add_benign_tail_accounts(&mut env, REJECT_TAIL);
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let rejected = env
         .send(
             ProgInstruction::BatchTradeCpi {
@@ -16541,6 +16877,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
                 account_a_position_epoch: taker_position_epoch,
                 account_b_portfolio_id: lp_portfolio_id,
                 account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
                 max_slippage_atoms: u128::MAX,
                 max_fee_atoms: u128::MAX,
                 legs: mk_legs(MAX_LEGS),
@@ -16574,7 +16911,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     let allow_tail = add_benign_tail_accounts(&mut env, ALLOW_TAIL);
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
     let allowed_cu = env
         .send(
             ProgInstruction::BatchTradeCpi {
@@ -16582,6 +16919,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
                 account_a_position_epoch: taker_position_epoch,
                 account_b_portfolio_id: lp_portfolio_id,
                 account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
                 max_slippage_atoms: u128::MAX,
                 max_fee_atoms: u128::MAX,
                 legs: mk_legs(MAX_LEGS),
@@ -17293,13 +17631,14 @@ fn v16_bpf_batch_trade_cpi_fanout_budget_characterisation() {
         env.svm.expire_blockhash();
         let (taker_portfolio_id, _, taker_position_epoch) =
             env.portfolio_identity(taker_account);
-        let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+        let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) = env.portfolio_identity(lp_account);
         env.send(
             ProgInstruction::BatchTradeCpi {
                 account_a_portfolio_id: taker_portfolio_id,
                 account_a_position_epoch: taker_position_epoch,
                 account_b_portfolio_id: lp_portfolio_id,
                 account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
                 max_slippage_atoms: u128::MAX,
                 max_fee_atoms: u128::MAX,
                 legs,
@@ -19526,7 +19865,8 @@ fn v16_attack_trade_cpi_rejects_stale_position_epoch() {
     let lp_account = env.create_portfolio(&lp_owner);
     env.deposit(&lp_owner, lp_account, 1_000_000);
     let (ctx, delegate, _) = env.init_matcher_context(&lp_owner, matcher_program, lp_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) =
+        env.portfolio_identity(lp_account);
 
     let accounts = vec![
         AccountMeta::new(taker_owner.pubkey(), true),
@@ -19550,6 +19890,7 @@ fn v16_attack_trade_cpi_rejects_stale_position_epoch() {
                 account_a_position_epoch: stale_epoch_taker,
                 account_b_portfolio_id: lp_portfolio_id,
                 account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
                 asset_index: 0,
                 size_q: POS_SCALE as i128,
                 fee_bps: 0,
@@ -19672,7 +20013,8 @@ fn v16_attack_batch_trade_cpi_rejects_stale_position_epoch() {
     let lp_account = env.create_portfolio(&lp_owner);
     env.deposit(&lp_owner, lp_account, 1_000_000);
     let (ctx, delegate, _) = env.init_matcher_context(&lp_owner, matcher_program, lp_account);
-    let (lp_portfolio_id, _, lp_position_epoch) = env.portfolio_identity(lp_account);
+    let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) =
+        env.portfolio_identity(lp_account);
 
     let accounts = vec![
         AccountMeta::new(taker_owner.pubkey(), true),
@@ -19702,6 +20044,7 @@ fn v16_attack_batch_trade_cpi_rejects_stale_position_epoch() {
                 account_a_position_epoch: stale_epoch_taker,
                 account_b_portfolio_id: lp_portfolio_id,
                 account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
                 max_slippage_atoms: u128::MAX,
                 max_fee_atoms: u128::MAX,
                 legs: vec![leg],
@@ -19978,6 +20321,10 @@ fn v16_attack_matcher_capability_expiry_fails_closed() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id: mc_portfolio_id,
             expected_sequence: mc_expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 1,
             trade_fee_cap_bps: 10_000,
             expiry_slot: short_expiry,
@@ -20070,6 +20417,10 @@ fn v16_attack_matcher_capability_expiry_fails_closed() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id: mc_portfolio_id,
             expected_sequence: mc_expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 0,
             trade_fee_cap_bps: 0,
             expiry_slot: 0,
@@ -20134,6 +20485,10 @@ fn v16_attack_set_matcher_config_preserves_position_epoch_across_disable() {
         ProgInstruction::SetMatcherConfig {
             portfolio_id,
             expected_sequence,
+            asset_generation_frontier: state::read_market_asset_generation_frontier(
+                &env.svm.get_account(&env.market).unwrap().data,
+            )
+            .unwrap(),
             enabled: 0,
             trade_fee_cap_bps: 0,
             expiry_slot: 0,

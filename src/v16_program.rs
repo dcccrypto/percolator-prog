@@ -3867,6 +3867,26 @@ pub mod state {
         ))
     }
 
+    /// W3-matcher (ADOPT upstream `8f62a5c5`, "bind matcher grants to asset
+    /// frontier"): the market's asset-generation frontier, i.e. the
+    /// `next_market_id` an about-to-be-activated asset slot would be assigned.
+    /// `SetMatcherConfig`(68) binds against this value (checked LIVE, before
+    /// any mutation, in `handle_set_matcher_config`) so a grant/renewal
+    /// authorized against a stale frontier cannot land after the market's
+    /// asset set has moved on.
+    ///
+    /// Deliberately NOT `sync/w2-tb4`'s `read_asset_lifecycle_generation_
+    /// preflight` (not on this branch's base) -- that helper additionally
+    /// bounds-checks one specific asset slot and returns its CURRENT
+    /// `market_id`, machinery this call site does not need: SetMatcherConfig
+    /// binds only against the frontier itself, not any one asset. This is a
+    /// minimal, self-contained read built from the same `check_header`/
+    /// `market_header` primitives `read_engine_funding_bounds` (above) uses.
+    pub fn read_market_asset_generation_frontier(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        Ok(market_header(data)?.next_market_id.get())
+    }
+
     #[inline]
     fn market_header_mut(
         data: &mut [u8],
@@ -5616,6 +5636,15 @@ pub mod ix {
             account_a_position_epoch: u64,
             account_b_portfolio_id: u64,
             account_b_position_epoch: u64,
+            /// W3-matcher (ADOPT upstream `edc8ce74`, "bind cpi trades to matcher
+            /// incarnation"): the CURRENT `read_portfolio_matcher_sequence` value
+            /// the signing taker observed on account_b at authorization time.
+            /// `matcher_tail_start_or_verify_lp_config` checks this against the
+            /// LIVE sequence before honoring the CPI trade -- closing the replay
+            /// gap where `expiry_slot`-liveness alone let a trade signed under an
+            /// OLD matcher grant incarnation (same tuple, since-reconfigured
+            /// trade_fee_cap_bps/expiry) still execute post-reconfigure.
+            account_b_matcher_sequence: u64,
             asset_index: u16,
             market_id: u64,
             size_q: i128,
@@ -5642,20 +5671,40 @@ pub mod ix {
             /// landing-state prices the signing taker consents to, measured in quote atoms
             /// summed across all legs (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi
             /// consent"; TB-1b now also ports upstream's `account_{a,b}_portfolio_id`/
-            /// `account_{a,b}_position_epoch` identity fields onto this variant -- upstream
-            /// additionally carries an `account_b_matcher_sequence`, which this fork's
-            /// `PortfolioMatcherConfigV16` design does not need since CPI matcher-capability
-            /// liveness is bound separately via `expiry_slot`, wired in `handle_set_matcher_config`
-            /// / `matcher_tail_start_or_verify_lp_config`).
+            /// `account_{a,b}_position_epoch` identity fields onto this variant).
             max_slippage_atoms: u128,
             /// Maximum aggregate engine fee charged to the signing taker (account_a) across all
             /// legs.
             max_fee_atoms: u128,
+            /// W3-matcher (ADOPT upstream `edc8ce74`, "bind cpi trades to matcher
+            /// incarnation"): the CURRENT `read_portfolio_matcher_sequence` value
+            /// the signing taker observed on account_b at authorization time. A
+            /// prior comment on this variant claimed `expiry_slot`-based
+            /// liveness alone was sufficient and this field unneeded -- that
+            /// reasoning was WRONG: `expiry_slot` only proves the grant has not
+            /// timed out, not that it is the SAME incarnation the taker signed
+            /// against. A reconfigure that keeps the same matcher tuple but
+            /// advances `expected_sequence`/`trade_fee_cap_bps`/`expiry_slot`
+            /// would still pass the old tuple+liveness checks, letting a stale
+            /// held trade replay under the new grant. Checked in
+            /// `matcher_tail_start_or_verify_lp_config` against the LIVE
+            /// sequence before honoring the batch CPI.
+            account_b_matcher_sequence: u64,
             legs: Vec<BatchTradeCpiLeg>,
         },
         SetMatcherConfig {
             portfolio_id: u64,
             expected_sequence: u64,
+            /// W3-matcher (ADOPT upstream `8f62a5c5`, "bind matcher grants to
+            /// asset frontier"): the CURRENT market `next_market_id` asset-
+            /// generation frontier the LP observed. Checked (LIVE, before any
+            /// mutation) against `state::read_market_asset_generation_frontier`
+            /// in `handle_set_matcher_config` -- closes the gap where an LP's
+            /// SetMatcherConfig authorization built against a stale asset
+            /// frontier could still land after the market's asset set moved on
+            /// (e.g. an asset slot recycled into a new generation), granting/
+            /// renewing matcher trust under assumptions that no longer hold.
+            asset_generation_frontier: u64,
             enabled: u8,
             trade_fee_cap_bps: u16,
             expiry_slot: u64,
@@ -6358,6 +6407,7 @@ pub mod ix {
                     account_a_position_epoch: read_u64(&mut rest)?,
                     account_b_portfolio_id: read_u64(&mut rest)?,
                     account_b_position_epoch: read_u64(&mut rest)?,
+                    account_b_matcher_sequence: read_u64(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
                     market_id: read_u64(&mut rest)?,
                     size_q: read_i128(&mut rest)?,
@@ -6405,12 +6455,14 @@ pub mod ix {
                         account_b_position_epoch: read_u64(&mut rest)?,
                         max_slippage_atoms,
                         max_fee_atoms,
+                        account_b_matcher_sequence: read_u64(&mut rest)?,
                         legs,
                     }
                 }
                 68 => Self::SetMatcherConfig {
                     portfolio_id: read_u64(&mut rest)?,
                     expected_sequence: read_u64(&mut rest)?,
+                    asset_generation_frontier: read_u64(&mut rest)?,
                     enabled: read_u8(&mut rest)?,
                     trade_fee_cap_bps: read_u16(&mut rest)?,
                     expiry_slot: read_u64(&mut rest)?,
@@ -6861,6 +6913,7 @@ pub mod ix {
                     account_a_position_epoch,
                     account_b_portfolio_id,
                     account_b_position_epoch,
+                    account_b_matcher_sequence,
                     asset_index,
                     market_id,
                     size_q,
@@ -6872,6 +6925,7 @@ pub mod ix {
                     push_u64(&mut out, account_a_position_epoch);
                     push_u64(&mut out, account_b_portfolio_id);
                     push_u64(&mut out, account_b_position_epoch);
+                    push_u64(&mut out, account_b_matcher_sequence);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, market_id);
                     push_i128(&mut out, size_q);
@@ -6906,6 +6960,7 @@ pub mod ix {
                     account_b_position_epoch,
                     max_slippage_atoms,
                     max_fee_atoms,
+                    account_b_matcher_sequence,
                     ref legs,
                 } => {
                     out.push(67);
@@ -6923,10 +6978,12 @@ pub mod ix {
                     push_u64(&mut out, account_a_position_epoch);
                     push_u64(&mut out, account_b_portfolio_id);
                     push_u64(&mut out, account_b_position_epoch);
+                    push_u64(&mut out, account_b_matcher_sequence);
                 }
                 Self::SetMatcherConfig {
                     portfolio_id,
                     expected_sequence,
+                    asset_generation_frontier,
                     enabled,
                     trade_fee_cap_bps,
                     expiry_slot,
@@ -6934,6 +6991,7 @@ pub mod ix {
                     out.push(68);
                     push_u64(&mut out, portfolio_id);
                     push_u64(&mut out, expected_sequence);
+                    push_u64(&mut out, asset_generation_frontier);
                     out.push(enabled);
                     push_u16(&mut out, trade_fee_cap_bps);
                     push_u64(&mut out, expiry_slot);
@@ -10348,6 +10406,7 @@ pub mod processor {
                 account_a_position_epoch,
                 account_b_portfolio_id,
                 account_b_position_epoch,
+                account_b_matcher_sequence,
                 asset_index,
                 market_id,
                 size_q,
@@ -10360,6 +10419,7 @@ pub mod processor {
                 account_a_position_epoch,
                 account_b_portfolio_id,
                 account_b_position_epoch,
+                account_b_matcher_sequence,
                 asset_index,
                 market_id,
                 size_q,
@@ -10388,6 +10448,7 @@ pub mod processor {
                 account_b_position_epoch,
                 max_slippage_atoms,
                 max_fee_atoms,
+                account_b_matcher_sequence,
                 legs,
             } => handle_batch_trade_cpi(
                 program_id,
@@ -10398,11 +10459,13 @@ pub mod processor {
                 account_b_position_epoch,
                 max_slippage_atoms,
                 max_fee_atoms,
+                account_b_matcher_sequence,
                 &legs,
             ),
             Instruction::SetMatcherConfig {
                 portfolio_id,
                 expected_sequence,
+                asset_generation_frontier,
                 enabled,
                 trade_fee_cap_bps,
                 expiry_slot,
@@ -10411,6 +10474,7 @@ pub mod processor {
                 accounts,
                 portfolio_id,
                 expected_sequence,
+                asset_generation_frontier,
                 enabled,
                 trade_fee_cap_bps,
                 expiry_slot,
@@ -12953,11 +13017,21 @@ pub mod processor {
 
     fn matcher_tail_start_or_verify_lp_config<'a>(
         account_b_ai: &AccountInfo<'a>,
+        expected_matcher_sequence: u64,
         matcher_prog_key: &Pubkey,
         matcher_ctx_key: &Pubkey,
         matcher_delegate_key: &Pubkey,
     ) -> Result<(usize, u16), ProgramError> {
         let account_b_data = account_b_ai.try_borrow_data()?;
+        // W3-matcher (ADOPT upstream `edc8ce74`, "bind cpi trades to matcher
+        // incarnation"): must be checked BEFORE reading/trusting `cfg` below --
+        // the signing taker's `account_b_matcher_sequence` has to match the
+        // LIVE sequence on account_b, or a CPI trade signed under an OLD
+        // matcher-config incarnation (tuple/cap/expiry may still coincidentally
+        // match post-reconfigure) could otherwise still execute.
+        if state::read_portfolio_matcher_sequence(&account_b_data)? != expected_matcher_sequence {
+            return Err(PercolatorError::EngineStale.into());
+        }
         let cfg = state::read_portfolio_matcher_config(&account_b_data)?;
         if cfg.enabled() != 1
             || cfg.matcher_program != matcher_prog_key.to_bytes()
@@ -13038,6 +13112,7 @@ pub mod processor {
         account_a_position_epoch: u64,
         account_b_portfolio_id: u64,
         account_b_position_epoch: u64,
+        account_b_matcher_sequence: u64,
         asset_index: u16,
         expected_market_id: u64,
         size_q: i128,
@@ -13149,6 +13224,7 @@ pub mod processor {
         expect_key(matcher_delegate, &delegate)?;
         let (tail_start, lp_trade_fee_cap_bps) = matcher_tail_start_or_verify_lp_config(
             account_b_ai,
+            account_b_matcher_sequence,
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
@@ -13281,11 +13357,13 @@ pub mod processor {
     }
 
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn handle_set_matcher_config<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         portfolio_id: u64,
         expected_sequence: u64,
+        asset_generation_frontier: u64,
         enabled: u8,
         trade_fee_cap_bps: u16,
         expiry_slot: u64,
@@ -13321,6 +13399,18 @@ pub mod processor {
             || owner != lp_owner.key.to_bytes()
         {
             return Err(PercolatorError::Unauthorized.into());
+        }
+        // W3-matcher (ADOPT upstream `8f62a5c5`, "bind matcher grants to asset
+        // frontier"): checked LIVE, before any mutation, against
+        // `market_ai`'s CURRENT `next_market_id` frontier -- a SetMatcherConfig
+        // grant/renewal authorized against a stale asset frontier must not
+        // land after the market's asset set has moved on.
+        {
+            let data = market_ai.try_borrow_data()?;
+            let live_frontier = state::read_market_asset_generation_frontier(&data)?;
+            if live_frontier != asset_generation_frontier {
+                return Err(PercolatorError::EngineStale.into());
+            }
         }
         // TB-1b (ADOPT upstream 597f8dcc, "sequence-bind matcher consent
         // mutations"): a SetMatcherConfig granting/revoking matcher trust must
@@ -13507,8 +13597,18 @@ pub mod processor {
         // Verify the LP's stored matcher config matches — this prevents an LP owner
         // from re-initializing with a different (matcher_prog, matcher_ctx) pair than
         // they registered via SetMatcherConfig.
+        //
+        // W3-matcher: `matcher_tail_start_or_verify_lp_config` now also requires the
+        // LIVE matcher sequence (ADOPT upstream `edc8ce74`). InitMatcherCtx is signed
+        // live by `lp_owner` in this same transaction (unlike TradeCpi/BatchTradeCpi,
+        // which honor a taker's OFF-CHAIN-signed message against an LP grant it does
+        // not control), so there is no stale-replay surface here -- read the account's
+        // CURRENT sequence immediately before the call and pass it straight through.
+        let account_b_matcher_sequence =
+            state::read_portfolio_matcher_sequence(&lp_portfolio_ai.try_borrow_data()?)?;
         matcher_tail_start_or_verify_lp_config(
             lp_portfolio_ai,
+            account_b_matcher_sequence,
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
@@ -13686,6 +13786,9 @@ pub mod processor {
         // this variant (see the `BatchTradeCpi` doc comment).
         max_slippage_atoms: u128,
         max_fee_atoms: u128,
+        // W3-matcher (ADOPT upstream `edc8ce74`, "bind cpi trades to matcher
+        // incarnation"): see the `BatchTradeCpi` doc comment.
+        account_b_matcher_sequence: u64,
         legs: &[ix::BatchTradeCpiLeg],
     ) -> ProgramResult {
         if legs.is_empty() || legs.len() > MATCHER_BATCH_MAX_LEGS {
@@ -13821,6 +13924,7 @@ pub mod processor {
         expect_key(matcher_delegate, &delegate)?;
         let (tail_start, lp_trade_fee_cap_bps) = matcher_tail_start_or_verify_lp_config(
             account_b_ai,
+            account_b_matcher_sequence,
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
@@ -27083,6 +27187,7 @@ pub mod processor {
                 account_b_position_epoch: 24,
                 max_slippage_atoms: 100,
                 max_fee_atoms: 200,
+                account_b_matcher_sequence: 25,
                 legs: alloc::vec![ix::BatchTradeCpiLeg {
                     asset_index: 0,
                     market_id: 4,
@@ -27101,6 +27206,7 @@ pub mod processor {
                     account_b_position_epoch,
                     max_slippage_atoms,
                     max_fee_atoms,
+                    account_b_matcher_sequence,
                     legs,
                 } => {
                     assert_eq!(account_a_portfolio_id, 21);
@@ -27109,6 +27215,7 @@ pub mod processor {
                     assert_eq!(account_b_position_epoch, 24);
                     assert_eq!(max_slippage_atoms, 100);
                     assert_eq!(max_fee_atoms, 200);
+                    assert_eq!(account_b_matcher_sequence, 25);
                     assert_eq!(legs.len(), 1);
                 }
                 other => panic!("unexpected decode: {other:?}"),
@@ -27120,6 +27227,7 @@ pub mod processor {
             let ix = ix::Instruction::SetMatcherConfig {
                 portfolio_id: 9,
                 expected_sequence: 1,
+                asset_generation_frontier: 5,
                 enabled: 1,
                 trade_fee_cap_bps: 250,
                 expiry_slot: 999,
@@ -27130,15 +27238,64 @@ pub mod processor {
                 ix::Instruction::SetMatcherConfig {
                     portfolio_id,
                     expected_sequence,
+                    asset_generation_frontier,
                     enabled,
                     trade_fee_cap_bps,
                     expiry_slot,
                 } => {
                     assert_eq!(portfolio_id, 9);
                     assert_eq!(expected_sequence, 1);
+                    assert_eq!(asset_generation_frontier, 5);
                     assert_eq!(enabled, 1);
                     assert_eq!(trade_fee_cap_bps, 250);
                     assert_eq!(expiry_slot, 999);
+                }
+                other => panic!("unexpected decode: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn trade_cpi_wire_roundtrip_carries_matcher_sequence() {
+            // W3-matcher (ADOPT upstream `edc8ce74`): confirms the new
+            // `account_b_matcher_sequence` field round-trips on the tag-10
+            // `TradeCpi` wire alongside the pre-existing identity fields.
+            let ix = ix::Instruction::TradeCpi {
+                account_a_portfolio_id: 1,
+                account_a_position_epoch: 2,
+                account_b_portfolio_id: 3,
+                account_b_position_epoch: 4,
+                market_id: 10,
+                account_b_matcher_sequence: 5,
+                asset_index: 6,
+                size_q: 7,
+                fee_bps: 8,
+                limit_price: 9,
+            };
+            let bytes = ix.encode();
+            let decoded = ix::Instruction::decode(&bytes).unwrap();
+            match decoded {
+                ix::Instruction::TradeCpi {
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    market_id,
+                    account_b_matcher_sequence,
+                    asset_index,
+                    size_q,
+                    fee_bps,
+                    limit_price,
+                } => {
+                    assert_eq!(account_a_portfolio_id, 1);
+                    assert_eq!(account_a_position_epoch, 2);
+                    assert_eq!(account_b_portfolio_id, 3);
+                    assert_eq!(account_b_position_epoch, 4);
+                    assert_eq!(market_id, 10);
+                    assert_eq!(account_b_matcher_sequence, 5);
+                    assert_eq!(asset_index, 6);
+                    assert_eq!(size_q, 7);
+                    assert_eq!(fee_bps, 8);
+                    assert_eq!(limit_price, 9);
                 }
                 other => panic!("unexpected decode: {other:?}"),
             }
