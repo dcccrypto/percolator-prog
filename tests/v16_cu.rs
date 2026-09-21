@@ -7836,6 +7836,429 @@ ProgInstruction::PermissionlessCrank {
     );
 }
 
+/// W3C-accrual (ADOPT upstream `18f3ae94`/`2669bf1b`, "preserve canonical accrual
+/// carry across interleaved trades"): shared setup for the adversarial test below.
+/// Reuses the exact proven constants/mechanics from
+/// `v16_bpf_zero_move_funding_accrues_across_trade_without_crank` immediately
+/// above -- an EWMA_MARK asset opened at `INITIAL_PRICE`, a mark pushed to
+/// `PUSHED_MARK` at `PUSH_AND_SETUP_CRANK_SLOT` (landing PENDING, not promoted:
+/// `funding_mark_pending_slot == PUSH_AND_SETUP_CRANK_SLOT`), and one ordinary
+/// crank that converges `effective_price` to the new mark while leaving the
+/// funding CHECKPOINT (`funding_mark_e6`) stale at `INITIAL_PRICE` and the
+/// engine's own `asset.slot_last` capped at `MAX_ACCRUAL_DT_SLOTS` (50) -- one
+/// slot BEHIND the pending mark's own activation slot (51). From this point,
+/// the pending checkpoint transition sits exactly ONE slot into the caller's
+/// next elapsed accrual window, and no further crank of any kind runs: only
+/// the "before position change" hook (this unit's port) can ever settle it.
+struct AccrualCarryWorld {
+    env: V16CuEnv,
+    long_owner: Keypair,
+    long_account: Pubkey,
+    short_owner: Keypair,
+    short_account: Pubkey,
+    wash_long_owner: Keypair,
+    wash_long_account: Pubkey,
+    wash_short_owner: Keypair,
+    wash_short_account: Pubkey,
+}
+
+/// Also opens a SEPARATE "wash" long/short pair alongside the main position --
+/// used by the "stepped" branch below to tick the asset's accrual forward one
+/// slot at a time WITHOUT touching the main position at all, so the main
+/// position's own eventual close is the IDENTICAL single instruction (same
+/// accounts, same size, same price) in both branches, isolating the
+/// comparison to the accrual mechanism itself rather than confounding it with
+/// independent per-partial-close rounding.
+fn setup_accrual_carry_world(
+    initial_price: u64,
+    pushed_mark: u64,
+    deposit: u128,
+    cap_bps: u64,
+    max_accrual_dt_slots: u64,
+    max_abs_funding_e9_per_slot: u64,
+    push_and_setup_crank_slot: u64,
+    wash_open_size: i128,
+) -> AccrualCarryWorld {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price,
+        max_price_move_bps_per_slot: cap_bps,
+        max_accrual_dt_slots,
+        max_abs_funding_e9_per_slot,
+        min_funding_lifetime_slots: max_accrual_dt_slots,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    // AUTH_MARK, not EWMA_MARK: `update_hybrid_mark_after_trade_view` drags
+    // `mark_ewma_e6` toward EVERY trade's own `exec_price` whenever
+    // `oracle_v16::profile_is_ewma_mark` is true, which -- since every trade
+    // below executes at a FIXED `initial_price`, not the live converged
+    // price -- would repeatedly re-perturb the funding-mark checkpoint on
+    // every wash step, an entirely separate mechanism from the canonical
+    // accrual carry this test isolates. AUTH_MARK is exempt (`profile_is_
+    // ewma_mark` is false and it is not Hybrid either), and its `PushAuthMark`
+    // sets `mark_ewma_e6` directly with no EWMA blending, giving an exact,
+    // deterministic pending-mark value instead of a halflife-blended
+    // approximation.
+    env.configure_auth_mark_with_cu(0, initial_price);
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, deposit);
+    env.deposit(&short_owner, short_account, deposit);
+
+    let wash_long_owner = Keypair::new();
+    let wash_short_owner = Keypair::new();
+    let wash_long_account = env.create_portfolio(&wash_long_owner);
+    let wash_short_account = env.create_portfolio(&wash_short_owner);
+    env.deposit(&wash_long_owner, wash_long_account, deposit);
+    env.deposit(&wash_short_owner, wash_short_account, deposit);
+
+    // Open both pairs at slot 0. No open interest existed before these
+    // trades, so the zero-move hook is a strict no-op here regardless of
+    // mark/price state.
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        initial_price,
+        0,
+    );
+    env.svm.expire_blockhash();
+    env.trade_with_cu(
+        &wash_long_owner,
+        wash_long_account,
+        &wash_short_owner,
+        wash_short_account,
+        wash_open_size,
+        initial_price,
+        0,
+    );
+
+    env.svm.warp_to_slot(push_and_setup_crank_slot);
+    env.push_auth_mark_with_cu(push_and_setup_crank_slot, pushed_mark);
+
+    // ONE ordinary (non-liquidation) crank converges `effective_price` all the
+    // way to the pushed mark; the checkpoint stays PENDING (see the doc
+    // comment above and the base test this mirrors) and `asset.slot_last`
+    // lands at `max_accrual_dt_slots`, one slot short of the pending mark's
+    // own activation slot.
+    env.crank(
+        long_account,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: push_and_setup_crank_slot,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 0,
+            }],
+        },
+    );
+    let (_, group_after_setup_crank) = env.market_state();
+    assert_eq!(
+        group_after_setup_crank.assets[0].slot_last, max_accrual_dt_slots,
+        "setup crank's own dt must be capped at max_accrual_dt_slots"
+    );
+    assert_ne!(
+        group_after_setup_crank.assets[0].effective_price, initial_price,
+        "setup crank must converge effective_price toward the pushed mark"
+    );
+    assert_eq!(
+        group_after_setup_crank.funding_epoch, 0,
+        "setup crank's own segment must charge zero funding -- the checkpoint \
+         has not promoted yet"
+    );
+    let setup_profile =
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap();
+    eprintln!(
+        "DEBUG after setup crank: effective_price={} funding_mark_e6={} pending_e6={} pending_slot={} mark_ewma_e6={}",
+        group_after_setup_crank.assets[0].effective_price,
+        setup_profile.funding_mark_e6,
+        setup_profile.funding_mark_pending_e6,
+        setup_profile.funding_mark_pending_slot,
+        setup_profile.mark_ewma_e6,
+    );
+
+    AccrualCarryWorld {
+        env,
+        long_owner,
+        long_account,
+        short_owner,
+        short_account,
+        wash_long_owner,
+        wash_long_account,
+        wash_short_owner,
+        wash_short_account,
+    }
+}
+
+/// W3C-accrual adversarial regression (ADOPT upstream `18f3ae94`/`2669bf1b`,
+/// "preserve canonical accrual carry across interleaved trades"): the SAME
+/// elapsed zero-move-funding interval, straddling a pending funding-mark
+/// checkpoint transition, must accrue the IDENTICAL total funding whether it
+/// is settled by ONE big position-changing call ("coalesced") or by SEVERAL
+/// small ones landing at every intermediate slot ("stepped") -- closing a
+/// funding-timing arbitrage where an attacker could choose transaction
+/// boundaries (e.g. interleaving small risk-reducing trades) to under-accrue
+/// or mis-time the checkpoint promotion relative to a single-shot settlement.
+///
+/// PRE-FIX (single-segment `accrue_asset_to_not_atomic`, ONE flat
+/// `(effective_price, funding_rate_e9)` pair for the WHOLE elapsed segment_dt):
+/// the coalesced call computes its ONE rate from `permissionless_funding_rate_
+/// e9_view`'s pending-mark "counterfactual" branch using the FULL segment_dt
+/// (5) as the projection cap, then books that ONE rate for all 5 slots. The
+/// stepped calls instead each see `segment_dt == 1`: the FIRST (landing
+/// exactly at slot 51, the pending mark's own activation slot) is the only one
+/// that observes `has_pending == true` and books a real rate; the remaining
+/// four see `has_pending == false` (checkpoint already promoted, `effective_
+/// price == active_mark`, so `funding_index == effective_price_after ==
+/// active_mark`) and book ZERO. These two schedules are NOT the same total --
+/// proving this divergence is the whole point of this unit's non-vacuity
+/// check (see the source-revert step this test's own doc references).
+///
+/// POST-FIX (canonical stepped-path `accrue_asset_path_to_not_atomic`): both
+/// schedules build/commit the SAME underlying one-slot-step decomposition --
+/// the coalesced call's internal path has exactly the same 5 steps, each with
+/// its own checkpoint-advance/promotion and its own per-step rate, as the
+/// stepped calls compute one at a time -- so total funding transferred, the
+/// terminal effective price, and the terminal `price_move_remainder_bps_num`
+/// carry are IDENTICAL regardless of call-boundary placement.
+#[test]
+fn v16_bpf_canonical_accrual_path_matches_regardless_of_call_split_across_pending_mark_transition()
+{
+    const INITIAL_PRICE: u64 = 1_000_000;
+    const PUSHED_MARK: u64 = 1_100_000;
+    const DEPOSIT: u128 = 10_000_000;
+    const CAP_BPS: u64 = 25;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    // Five 1-slot steps starting exactly at the pending mark's own activation
+    // slot (51..=55).
+    const STEPS: u64 = 5;
+    const FINAL_SLOT: u64 = PUSH_AND_SETUP_CRANK_SLOT + STEPS - 1;
+    const WASH_STEP_Q: i128 = 200_000;
+    const WASH_OPEN_SIZE: i128 = WASH_STEP_Q * STEPS as i128;
+
+    // Coalesced world: the wash pair opens but is never touched again -- the
+    // MAIN position's single close at FINAL_SLOT is the only call that ever
+    // settles the elapsed interval, as ONE segment_dt = FINAL_SLOT - 50 = 5
+    // call.
+    let mut coalesced = setup_accrual_carry_world(
+        INITIAL_PRICE,
+        PUSHED_MARK,
+        DEPOSIT,
+        CAP_BPS,
+        MAX_ACCRUAL_DT_SLOTS,
+        MAX_ABS_FUNDING_E9_PER_SLOT,
+        PUSH_AND_SETUP_CRANK_SLOT,
+        WASH_OPEN_SIZE,
+    );
+    coalesced.env.svm.warp_to_slot(FINAL_SLOT);
+    coalesced.env.svm.expire_blockhash();
+    coalesced.env.trade_with_cu(
+        &coalesced.long_owner,
+        coalesced.long_account,
+        &coalesced.short_owner,
+        coalesced.short_account,
+        -(POS_SCALE as i128),
+        INITIAL_PRICE,
+        0,
+    );
+
+    // Stepped world: the WASH pair (not the main position) is reduced by one
+    // step at EACH of the five slots 51..=55, ticking the shared per-asset
+    // accrual forward one slot at a time. The main position is untouched
+    // until the very end, where it closes via the SAME single instruction
+    // (same accounts, size, price) as the coalesced world -- isolating this
+    // comparison to the accrual mechanism itself, not to independent
+    // per-partial-close rounding.
+    let mut stepped = setup_accrual_carry_world(
+        INITIAL_PRICE,
+        PUSHED_MARK,
+        DEPOSIT,
+        CAP_BPS,
+        MAX_ACCRUAL_DT_SLOTS,
+        MAX_ABS_FUNDING_E9_PER_SLOT,
+        PUSH_AND_SETUP_CRANK_SLOT,
+        WASH_OPEN_SIZE,
+    );
+    for slot in PUSH_AND_SETUP_CRANK_SLOT..=FINAL_SLOT {
+        stepped.env.svm.warp_to_slot(slot);
+        stepped.env.svm.expire_blockhash();
+        stepped.env.trade_with_cu(
+            &stepped.wash_long_owner,
+            stepped.wash_long_account,
+            &stepped.wash_short_owner,
+            stepped.wash_short_account,
+            -WASH_STEP_Q,
+            INITIAL_PRICE,
+            0,
+        );
+    }
+    stepped.env.svm.expire_blockhash();
+    stepped.env.trade_with_cu(
+        &stepped.long_owner,
+        stepped.long_account,
+        &stepped.short_owner,
+        stepped.short_account,
+        -(POS_SCALE as i128),
+        INITIAL_PRICE,
+        0,
+    );
+
+    let (_, coalesced_group) = coalesced.env.market_state();
+    let (_, stepped_group) = stepped.env.market_state();
+    let coalesced_profile = state::read_asset_oracle_profile(
+        &coalesced
+            .env
+            .svm
+            .get_account(&coalesced.env.market)
+            .unwrap()
+            .data,
+        0,
+    )
+    .unwrap();
+    let stepped_profile = state::read_asset_oracle_profile(
+        &stepped.env.svm.get_account(&stepped.env.market).unwrap().data,
+        0,
+    )
+    .unwrap();
+
+    eprintln!(
+        "DEBUG coalesced profile: funding_mark_e6={} pending_e6={} pending_slot={}",
+        coalesced_profile.funding_mark_e6,
+        coalesced_profile.funding_mark_pending_e6,
+        coalesced_profile.funding_mark_pending_slot
+    );
+    eprintln!(
+        "DEBUG stepped profile: funding_mark_e6={} pending_e6={} pending_slot={}",
+        stepped_profile.funding_mark_e6,
+        stepped_profile.funding_mark_pending_e6,
+        stepped_profile.funding_mark_pending_slot
+    );
+    eprintln!(
+        "coalesced: effective_price={} remainder={} f_long_num={} f_short_num={} k_long={} k_short={} funding_epoch={}",
+        coalesced_group.assets[0].effective_price,
+        coalesced_profile.price_move_remainder_bps_num,
+        coalesced_group.assets[0].f_long_num,
+        coalesced_group.assets[0].f_short_num,
+        coalesced_group.assets[0].k_long,
+        coalesced_group.assets[0].k_short,
+        coalesced_group.funding_epoch,
+    );
+    eprintln!(
+        "stepped:   effective_price={} remainder={} f_long_num={} f_short_num={} k_long={} k_short={} funding_epoch={}",
+        stepped_group.assets[0].effective_price,
+        stepped_profile.price_move_remainder_bps_num,
+        stepped_group.assets[0].f_long_num,
+        stepped_group.assets[0].f_short_num,
+        stepped_group.assets[0].k_long,
+        stepped_group.assets[0].k_short,
+        stepped_group.funding_epoch,
+    );
+
+    // Both MAIN positions are now fully closed on both sides.
+    let coalesced_long_final = coalesced.env.portfolio_state(coalesced.long_account);
+    let coalesced_short_final = coalesced.env.portfolio_state(coalesced.short_account);
+    let stepped_long_final = stepped.env.portfolio_state(stepped.long_account);
+    let stepped_short_final = stepped.env.portfolio_state(stepped.short_account);
+    assert!(percolator::active_bitmap_is_empty(
+        coalesced_long_final.active_bitmap
+    ));
+    assert!(percolator::active_bitmap_is_empty(
+        stepped_long_final.active_bitmap
+    ));
+
+    let coalesced_long_total = coalesced_long_final.capital as i128 + coalesced_long_final.pnl;
+    let coalesced_short_total = coalesced_short_final.capital as i128 + coalesced_short_final.pnl;
+    let stepped_long_total = stepped_long_final.capital as i128 + stepped_long_final.pnl;
+    let stepped_short_total = stepped_short_final.capital as i128 + stepped_short_final.pnl;
+    // Informational only (see the note above the strict-equality invariants
+    // below): the MAIN position's own close trade is byte-identical (same
+    // accounts/size/price/slot) in both worlds, but this market's real
+    // EWMA_MARK externality-floor trade fee and any ADL-scaling term are
+    // ADDITIONALLY sensitive to the WASH pair's own open-interest trajectory
+    // (open throughout in the coalesced world vs progressively closed to zero
+    // in the stepped world) -- a confound belonging entirely to the
+    // fee/ADL-scaling subsystem, orthogonal to the canonical accrual carry
+    // this unit ports. Reported for visibility, not asserted equal.
+    eprintln!(
+        "coalesced: long_total={coalesced_long_total} short_total={coalesced_short_total}"
+    );
+    eprintln!("stepped:   long_total={stepped_long_total} short_total={stepped_short_total}");
+
+    // The whole point of the fix: a genuinely stationary interval that
+    // straddles a pending funding-mark transition must transfer funding, so
+    // neither schedule can settle at exactly the deposited amount.
+    assert_ne!(coalesced_long_total, DEPOSIT as i128);
+    assert_ne!(stepped_long_total, DEPOSIT as i128);
+
+    // THE CANONICAL-CARRY INVARIANT (the direct, fee/ADL-unconfounded evidence
+    // for this unit's fix): identical elapsed interval, straddling the
+    // identical pending-mark-transition boundary, must reach IDENTICAL
+    // terminal per-ASSET accrual state -- effective price, the price-move-cap
+    // remainder carry, and both raw K/F accrual indices -- regardless of how
+    // many position-changing calls (one coalesced vs five stepped) settled
+    // it. This is exactly the state `canonical_accrual_path_for_target_view`/
+    // `zero_move_funding_path_for_profile_view` own.
+    assert_eq!(
+        coalesced_group.assets[0].effective_price, stepped_group.assets[0].effective_price,
+        "terminal effective price must not depend on call-boundary placement"
+    );
+    assert_eq!(
+        coalesced_profile.price_move_remainder_bps_num,
+        stepped_profile.price_move_remainder_bps_num,
+        "terminal price-move-cap remainder carry must not depend on call-boundary placement"
+    );
+    assert_eq!(
+        coalesced_group.assets[0].f_long_num, stepped_group.assets[0].f_long_num,
+        "terminal long funding index must not depend on call-boundary placement -- \
+         pre-fix, the coalesced (one 5-slot segment) and stepped (five 1-slot \
+         segments) schedules diverge because the single-segment primitive books \
+         ONE flat rate for the whole window instead of the canonical per-slot \
+         checkpoint promotion"
+    );
+    assert_eq!(
+        coalesced_group.assets[0].f_short_num, stepped_group.assets[0].f_short_num,
+        "terminal short funding index must not depend on call-boundary placement"
+    );
+    assert_eq!(
+        coalesced_group.assets[0].k_long, stepped_group.assets[0].k_long,
+        "terminal long price index must not depend on call-boundary placement"
+    );
+    assert_eq!(
+        coalesced_group.assets[0].k_short, stepped_group.assets[0].k_short,
+        "terminal short price index must not depend on call-boundary placement"
+    );
+
+    // Conservation: the engine's own funding INDEX is a zero-sum ledger --
+    // whatever the long side's index accrues, the short side's accrues the
+    // exact negation -- in BOTH worlds. This is the direct engine-level
+    // "funding paid == funding received" evidence (the two portfolios' own
+    // capital+pnl totals additionally reflect this market's real EWMA_MARK
+    // externality-floor trade fee on the four opening/closing trades above,
+    // so a dollar-total conservation check across just these two accounts
+    // would need to account for that fee/insurance leg separately; the index
+    // itself has no such confound).
+    assert_eq!(
+        coalesced_group.assets[0].f_long_num, -coalesced_group.assets[0].f_short_num,
+        "coalesced world: funding index must be conserved between the two sides"
+    );
+    assert_eq!(
+        stepped_group.assets[0].f_long_num, -stepped_group.assets[0].f_short_num,
+        "stepped world: funding index must be conserved between the two sides"
+    );
+    assert_ne!(
+        coalesced_group.assets[0].f_long_num, 0,
+        "a real, nonzero funding index must have moved for this to be a \
+         meaningful non-vacuous regression"
+    );
+}
+
 #[test]
 fn v16_bpf_stale_asset_does_not_block_current_unrelated_trade() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 1_000, 1_000, 500);
