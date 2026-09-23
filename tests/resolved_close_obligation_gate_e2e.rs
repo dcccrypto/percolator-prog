@@ -65,12 +65,13 @@
 //! ## HARNESS PROVENANCE
 //! `V16CuEnv` lives in `tests/v16_cu.rs`, which is its own integration-test crate: its items are
 //! private to that crate root and cannot be imported here, and `include!`-ing the file would
-//! recompile and re-run its ~150 BPF tests inside this binary. The subset below is therefore
-//! ported from `tests/v16_cu.rs`, each item carrying the `file:line` it came from. Three of them
+//! recompile and re-run its 151 BPF tests inside this binary. The subset below is therefore
+//! ported from `tests/v16_cu.rs`, each item carrying the `file:line` it came from. Four of them
 //! collapse a forwarding wrapper into the single body it calls (`new`, `create_portfolio`,
-//! `deposit`); each says so at its definition and none changes an argument. The only body whose
-//! CONTENT differs from the original is `close_resolved_owner_signed_with_cu`, and its one delta
-//! is called out at its definition.
+//! `deposit`, `trade_asset_with_cu`); each says so at its definition and none changes an argument.
+//! The only body whose CONTENT differs from the original is `close_resolved_owner_signed_with_cu`:
+//! it signs as the owner, passes the owner as an extra signer, and returns `Result` instead of
+//! unwrapping. All three deltas are called out at its definition.
 //!
 //! ## LINE NUMBERS
 //! `percolator:src/v16.rs:NNN` here is the PATCHED tree (`7606c678` and later); #267's own engine

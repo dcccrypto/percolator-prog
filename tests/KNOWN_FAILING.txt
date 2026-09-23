@@ -130,7 +130,8 @@ v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
 # allowlisted.
 # =========================================================================================
 
-# 2026-09-22 -- resolved_close_obligation_gate_e2e::e2e_resolved_close_must_not_release_a_gated_recovery_obligation
+# 2026-09-22 -- e2e_resolved_close_must_not_release_a_gated_recovery_obligation
+#              (tests/resolved_close_obligation_gate_e2e.rs)
 #
 # ENGINE-PIN BLOCKED, not a defect in the test. It asserts the guard added by
 # dcccrypto/percolator#267 (percolator/src/v16.rs, detach_solvent_active_legs_for_resolved_close),
@@ -148,4 +149,4 @@ v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
 # The other two tests in that file (…_releases_once_the_opposite_side_has_cleared and
 # …_an_ordinary_leg_on_the_same_recovery_asset_still_closes_in_one_call) are pin-independent:
 # they pass on both engines and are NOT allowlisted.
-resolved_close_obligation_gate_e2e::e2e_resolved_close_must_not_release_a_gated_recovery_obligation
+e2e_resolved_close_must_not_release_a_gated_recovery_obligation
