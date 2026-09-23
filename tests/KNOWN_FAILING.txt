@@ -129,3 +129,24 @@ v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
 # 11x6=66 -> Custom(9) from the product bound, 11x5 -> executes. It passes; it is not
 # allowlisted.
 # =========================================================================================
+
+# 2026-09-22 -- e2e_resolved_close_must_not_release_a_gated_recovery_obligation
+#              (tests/resolved_close_obligation_gate_e2e.rs)
+#
+# ENGINE-PIN BLOCKED, not a defect in the test. It asserts the guard added by
+# dcccrypto/percolator#267 (percolator/src/v16.rs, detach_solvent_active_legs_for_resolved_close),
+# which is NOT in the engine this checkout builds against: ci/deployed-refs.env pins
+# ENGINE_CI_SIBLING=c141d47fad9b745e9f855649b1999aecce07bd86, two commits BEFORE the guard.
+#
+# Against that pinned engine the test fails exactly as designed -- tag 30 CloseResolved detaches a
+# zero-basis Recovery obligation whose side has not earned release, pending_obligation_count_long
+# 1 -> 0 (left: 0, right: 1) -- which is the defect #267 fixes.
+#
+# DELETE THIS ENTRY when ENGINE_CI_SIBLING advances past the merge of #267. The test then passes,
+# and per this file's own rule an allowlisted test that starts passing is itself RED, so the
+# cleanup is forced rather than optional.
+#
+# The other two tests in that file (…_releases_once_the_opposite_side_has_cleared and
+# …_an_ordinary_leg_on_the_same_recovery_asset_still_closes_in_one_call) are pin-independent:
+# they pass on both engines and are NOT allowlisted.
+e2e_resolved_close_must_not_release_a_gated_recovery_obligation
