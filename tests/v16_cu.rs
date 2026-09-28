@@ -59,6 +59,7 @@ fn nft_registry_pda(market: &Pubkey) -> Pubkey {
 /// the plain-`Vec<u8>` `TestAccount` harness in `tests/v16_wrapper.rs`, where
 /// `realloc` is unsound per `AccountInfo::realloc`'s own safety doc and that
 /// harness's close-slab tests assert on data/lamports without calling it
+/// through to a full close+reinit cycle for that reason).
 fn assert_market_is_closed_market_tombstone(data: &[u8]) {
     assert_eq!(
         data.len(),
