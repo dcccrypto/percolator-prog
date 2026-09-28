@@ -16799,9 +16799,20 @@ pub mod processor {
             if group.header.mode != 1 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // GH#506 (ADOPT upstream 25fe770b "Authenticate resolved backing
+            // expiry"): admit authenticated Clock time into the resolved clock
+            // before the terminal close. `resolve_market_not_atomic` pins
+            // `current_slot = resolved_slot`, and without this advance it stays
+            // pinned while any portfolio is materialized, so no Fresh backing
+            // bucket can ever reach `expiry_slot` after resolution. Monotonic and
+            // value-neutral in the engine (`kernel_advance_resolved_slot`); the
+            // fallback is `max(Clock, current_slot)`, so it can never go Stale.
+            let authenticated_slot = authenticated_market_slot_or_fallback_view(&group);
+            group
+                .advance_resolved_slot_not_atomic(authenticated_slot)
+                .map_err(map_v16_error)?;
             if cfg.force_close_delay_slots != 0
-                && authenticated_market_slot_or_fallback_view(&group)
-                    .saturating_sub(group.header.resolved_slot.get())
+                && authenticated_slot.saturating_sub(group.header.resolved_slot.get())
                     < cfg.force_close_delay_slots
             {
                 expect_signer(owner)?;
@@ -16911,6 +16922,13 @@ pub mod processor {
                 nft,
                 program_id,
             )?;
+            // GH#506 (ADOPT upstream 25fe770b): same resolved-clock admission as
+            // CloseResolved, immediately before the top-up (upstream
+            // `ClaimResolvedPayoutTopup`, v16_program.rs:13754-13756 @5cb331dd).
+            let authenticated_slot = authenticated_market_slot_or_fallback_view(&group);
+            group
+                .advance_resolved_slot_not_atomic(authenticated_slot)
+                .map_err(map_v16_error)?;
             let payout = group
                 .claim_resolved_payout_topup_not_atomic(&mut portfolio)
                 .map_err(map_v16_error)?;

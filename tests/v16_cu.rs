@@ -12343,6 +12343,84 @@ fn v16_bpf_recovery_and_reset_tags_are_bounded_and_update_state() {
     assert_eq!(group.assets[0].mode_long, SideModeV16::Normal);
 }
 
+/// GH#506 (ADOPT upstream 25fe770b "Authenticate resolved backing expiry"):
+/// `ClaimResolvedPayoutTopup` (tag 46) must admit authenticated Clock time into
+/// the resolved clock via `advance_resolved_slot_not_atomic` before the top-up,
+/// exactly as upstream does. Without it `header.current_slot` stays pinned at
+/// `resolved_slot` while any portfolio is materialized, so a Fresh backing bucket
+/// can never lapse after resolution. RED on unpatched source: current_slot stays 1.
+#[test]
+fn v16_bpf_gh506_claim_resolved_payout_topup_advances_resolved_clock() {
+    let mut claim_env = V16CuEnv::new();
+    let owner = Keypair::new();
+    let portfolio = claim_env.create_portfolio(&owner);
+    {
+        let mut market_account = claim_env
+            .svm
+            .get_account(&claim_env.market)
+            .expect("market account");
+        let mut portfolio_account = claim_env
+            .svm
+            .get_account(&portfolio)
+            .expect("portfolio account");
+        let (cfg, mut group) = state::read_market(&market_account.data).unwrap();
+        let mut account = state::read_portfolio(&portfolio_account.data).unwrap();
+        group.mode = MarketModeV16::Resolved;
+        group.resolved_slot = 1;
+        group.current_slot = 1;
+        group.vault = 60;
+        group.payout_snapshot_captured = true;
+        group.payout_snapshot = 100;
+        group.resolved_payout_ledger = ResolvedPayoutLedgerV16 {
+            snapshot_residual: 100,
+            terminal_claim_exact_receipts_num: 100 * BOUND_SCALE,
+            terminal_claim_bound_unreceipted_num: 0,
+            current_payout_rate_num: 100 * BOUND_SCALE,
+            current_payout_rate_den: 100 * BOUND_SCALE,
+            snapshot_slot: 1,
+            payout_halted: false,
+            finalized: false,
+        };
+        account.resolved_payout_receipt = ResolvedPayoutReceiptV16 {
+            present: true,
+            prior_bound_contribution_num: 100 * BOUND_SCALE,
+            live_released_face_at_receipt: 0,
+            terminal_positive_claim_face: 100,
+            paid_effective: 40,
+            finalized: false,
+        };
+        state::write_market(&mut market_account.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut portfolio_account.data, &account).unwrap();
+        claim_env
+            .svm
+            .set_account(claim_env.market, market_account)
+            .unwrap();
+        claim_env
+            .svm
+            .set_account(portfolio, portfolio_account)
+            .unwrap();
+    }
+    claim_env.set_token_account_amount(
+        claim_env.vault,
+        claim_env.mint,
+        claim_env.vault_authority,
+        60,
+    );
+    let later: u64 = 7_777;
+    claim_env.svm.warp_to_slot(later);
+    let dest = claim_env.token_account_for_mint(claim_env.mint, owner.pubkey(), 0);
+    claim_env.claim_resolved_payout_topup_with_cu(owner.pubkey(), portfolio, dest);
+    let (_, group) = claim_env.market_state();
+    assert_eq!(
+        group.current_slot, later,
+        "tag 46 must advance the resolved clock to authenticated Clock (GH#506)"
+    );
+    assert_eq!(group.resolved_slot, 1, "resolved_slot itself never moves");
+    // Value-neutral: the top-up pays exactly what it paid before the port.
+    assert_eq!(claim_env.token_amount(dest), 60);
+    assert_eq!(group.vault, 0);
+}
+
 #[test]
 fn v16_bpf_resolved_payout_tags_are_bounded_and_update_state() {
     let mut claim_env = V16CuEnv::new();

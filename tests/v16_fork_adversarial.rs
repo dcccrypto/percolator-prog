@@ -2241,3 +2241,58 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     )
     .0
 }
+
+// ===========================================================================
+// GH#506 — resolved-mode clock advance on CloseResolved (ADOPT upstream
+// 25fe770b "Authenticate resolved backing expiry").
+//
+// `resolve_market_not_atomic` pins `header.current_slot = resolved_slot`. Upstream
+// admits authenticated Clock time on BOTH terminal routes (CloseResolved, and
+// ClaimResolvedPayoutTopup — see tests/v16_cu.rs) via
+// `advance_resolved_slot_not_atomic` before the terminal work runs. Without it the
+// resolved clock is frozen for as long as any portfolio is materialized, so no
+// Fresh backing bucket can ever reach `expiry_slot` after resolution and every
+// `Expired`/`Impaired` escape hatch is dead in production.
+//
+// RED on unpatched source: `current_slot` stays at the resolve slot (20).
+// ===========================================================================
+#[test]
+fn adv_gh506_close_resolved_advances_resolved_clock_to_authenticated_slot() {
+    let mut env = Env::new(0);
+    let user = Keypair::new();
+    let other = Keypair::new();
+    let ua = env.create_portfolio(&user);
+    let oa = env.create_portfolio(&other);
+    env.deposit(&user, ua, 1_000_000);
+    env.deposit(&other, oa, 1_000_000);
+
+    env.warp(20);
+    env.resolve().expect("resolve market");
+    let g = env.group();
+    assert_eq!(g.mode, percolator::MarketModeV16::Resolved);
+    let resolved_slot = g.resolved_slot;
+    assert_eq!(
+        g.current_slot, resolved_slot,
+        "resolution pins current_slot to resolved_slot"
+    );
+
+    // Authenticated Clock moves well past resolution while a portfolio is
+    // still materialized (`oa` stays open throughout).
+    let later = resolved_slot + 5_000;
+    env.warp(later);
+    let (dest, res) = env.try_close_resolved(&user, ua);
+    res.expect("CloseResolved on a flat depositor must succeed");
+
+    let g = env.group();
+    assert_eq!(
+        g.current_slot, later,
+        "CloseResolved must admit authenticated Clock time into the resolved clock (GH#506)"
+    );
+    assert_eq!(
+        g.resolved_slot, resolved_slot,
+        "resolved_slot itself never moves"
+    );
+    // Value-neutral: the flat depositor gets exactly its capital back.
+    assert_eq!(env.token_amount(dest), 1_000_000);
+    assert_eq!(env.group().vault as u64, env.token_amount(env.vault));
+}
