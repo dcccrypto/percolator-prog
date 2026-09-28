@@ -20084,10 +20084,13 @@ pub mod processor {
                     authenticated_slot,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
+                // write to asset 0 keeps a non-base refresh from masking base hard-stale
+                // resolution (`permissionless_stale_matured` / `hybrid_soft_stale_matured`).
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.oracle_mode = profile.oracle_mode;
                 cfg.oracle_leg_count = profile.oracle_leg_count;
                 cfg.oracle_leg_flags = profile.oracle_leg_flags;
@@ -20237,10 +20240,13 @@ pub mod processor {
                     authenticated_slot,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
+                // write to asset 0 keeps a non-base refresh from masking base hard-stale
+                // resolution (`permissionless_stale_matured` / `hybrid_soft_stale_matured`).
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.oracle_mode = profile.oracle_mode;
                 cfg.oracle_leg_count = 0;
                 cfg.oracle_leg_flags = 0;
@@ -20377,12 +20383,15 @@ pub mod processor {
                     authenticated_slot,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             // Asset 0 now carries a real stored profile: persist it like 1..N, and ALSO mirror the
             // oracle/mark fields into the market-wide config (other code paths still read cfg for asset 0).
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
+                // write to asset 0 keeps a non-base refresh from masking base hard-stale
+                // resolution (`permissionless_stale_matured` / `hybrid_soft_stale_matured`).
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.oracle_mode = profile.oracle_mode;
                 cfg.oracle_leg_count = 0;
                 cfg.oracle_leg_flags = 0;
@@ -20497,10 +20506,13 @@ pub mod processor {
             profile.oracle_target_price_e6 = next_mark;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
+                // write to asset 0 keeps a non-base refresh from masking base hard-stale
+                // resolution (`permissionless_stale_matured` / `hybrid_soft_stale_matured`).
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.mark_ewma_e6 = profile.mark_ewma_e6;
                 cfg.mark_ewma_last_slot = profile.mark_ewma_last_slot;
                 cfg.oracle_target_price_e6 = profile.oracle_target_price_e6;
@@ -20580,10 +20592,13 @@ pub mod processor {
             profile.oracle_target_price_e6 = mark_e6;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
+                // write to asset 0 keeps a non-base refresh from masking base hard-stale
+                // resolution (`permissionless_stale_matured` / `hybrid_soft_stale_matured`).
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.mark_ewma_e6 = profile.mark_ewma_e6;
                 cfg.mark_ewma_last_slot = profile.mark_ewma_last_slot;
                 cfg.mark_ewma_halflife_slots = 0;
@@ -20994,10 +21009,15 @@ pub mod processor {
                         oracle_profile.oracle_target_price_e6,
                     )
                     .map_err(map_v16_error)?;
-                cfg.last_good_oracle_slot = core::cmp::max(
-                    cfg.last_good_oracle_slot,
-                    oracle_profile.last_good_oracle_slot,
-                );
+                // #379/#501: base-only, as above. NOTE the existing guard below also requires
+                // `profile_is_price_managed`, so this cannot simply move into it — that would
+                // newly withhold the clock from a base asset that is not price-managed.
+                if hint_asset_index == 0 {
+                    cfg.last_good_oracle_slot = core::cmp::max(
+                        cfg.last_good_oracle_slot,
+                        oracle_profile.last_good_oracle_slot,
+                    );
+                }
                 if hint_asset_index == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
                     cfg.oracle_mode = oracle_profile.oracle_mode;
                     cfg.oracle_leg_count = oracle_profile.oracle_leg_count;
