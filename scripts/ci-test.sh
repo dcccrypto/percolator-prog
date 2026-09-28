@@ -119,6 +119,26 @@ else
   echo "engine sibling verified: ENGINE_CI_SIBLING -> ${have_engine}"
 fi
 
+# --- PROOF OF LIFE: the SOLANA TOOLCHAIN too ------------------------------------------
+# Every .so the suite loads is produced by this cargo build-sbf. ci.yml installed the Anza
+# `stable` channel until 2026-09-28, when `stable` moved v4.2 -> v4.3 and the resulting .so
+# files stopped loading under litesvm 0.1.0 (add_program -> InvalidAccountData), turning every
+# open PR red at once. The pin lives in ci/deployed-refs.env; assert it took.
+have_solana="$(solana --version 2>/dev/null | awk '{print $2}')"
+if [ -z "${SOLANA_CLI_VERSION:-}" ]; then
+  echo "WARNING: SOLANA_CLI_VERSION is empty — running on solana ${have_solana:-<none>} unpinned; this is a local experiment, not the CI verdict"
+elif [ "$have_solana" != "$SOLANA_CLI_VERSION" ]; then
+  if [ -n "${CI:-}" ]; then
+    echo "FATAL: SOLANA_CLI_VERSION is ${SOLANA_CLI_VERSION} but the installed toolchain is '${have_solana:-<none>}'."
+    echo "       Refusing to run: the allowlist was measured with the pinned toolchain."
+    exit 1
+  fi
+  echo "WARNING: local toolchain is solana ${have_solana:-<none>}, CI pins ${SOLANA_CLI_VERSION} — local experiment, not the CI verdict"
+else
+  echo "solana toolchain verified: SOLANA_CLI_VERSION -> ${have_solana}"
+fi
+cargo build-sbf --version 2>/dev/null | sed 's/^/  /'
+
 echo "::group::build sibling program BPFs"
 for sib in percolator-match percolator-nft percolator-stake; do
   if [ -d "../$sib" ]; then
