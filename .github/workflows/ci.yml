@@ -173,9 +173,12 @@ jobs:
         with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
 
       - uses: dtolnay/rust-toolchain@stable
-      - name: install solana toolchain (cargo build-sbf)
+      # PINNED to SOLANA_CLI_VERSION in ci/deployed-refs.env, never the `stable` channel: on
+      # 2026-09-28 `stable` moved v4.2 -> v4.3 and every open PR (docs-only included) went from
+      # 712 passed to 411 passed / 322 failed with no change of its own. See the refs file.
+      - name: install solana toolchain (cargo build-sbf, pinned)
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          sh -c "$(curl -sSfL "https://release.anza.xyz/v${{ steps.refs.outputs.SOLANA_CLI_VERSION }}/install")"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: percolator-prog }
