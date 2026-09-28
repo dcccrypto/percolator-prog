@@ -121,8 +121,9 @@ fi
 
 # --- PROOF OF LIFE: the SOLANA TOOLCHAIN too ------------------------------------------
 # Every .so the suite loads is produced by this cargo build-sbf. ci.yml installed the Anza
-# `stable` channel until 2026-09-28, when `stable` moved v4.2 -> v4.3 and the resulting .so
-# files stopped loading under litesvm 0.1.0 (add_program -> InvalidAccountData), turning every
+# `stable` channel until 2026-09-28, when `stable` began shipping cargo-build-sbf 4.4.0, which
+# emits SBPF v3 by default; litesvm 0.1.0 cannot load SBPF v3 (add_program ->
+# InvalidAccountData at accounts_db.rs:80:62), turning every
 # open PR red at once. The pin lives in ci/deployed-refs.env; assert it took.
 have_solana="$(solana --version 2>/dev/null | awk '{print $2}')"
 if [ -z "${SOLANA_CLI_VERSION:-}" ]; then
