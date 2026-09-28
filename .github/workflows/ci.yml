@@ -174,7 +174,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       # PINNED to SOLANA_CLI_VERSION in ci/deployed-refs.env, never the `stable` channel: on
-      # 2026-09-28 `stable` moved v4.2 -> v4.3 and every open PR (docs-only included) went from
+      # 2026-09-28 `stable` started shipping cargo-build-sbf 4.4.0 (SBPF v3 by default, which
+      # litesvm 0.1.0 cannot load) and every open PR (docs-only included) went from
       # 712 passed to 411 passed / 322 failed with no change of its own. See the refs file.
       - name: install solana toolchain (cargo build-sbf, pinned)
         run: |
