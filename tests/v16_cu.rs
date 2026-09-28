@@ -113,15 +113,104 @@ fn program_path() -> PathBuf {
 }
 
 fn matcher_program_path() -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.push("percolator-match/target/deploy/percolator_match.so");
+    let mut repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    repo.pop();
+    repo.push("percolator-match");
+    let path = repo.join("target/deploy/percolator_match.so");
     assert!(
         path.exists(),
         "matcher BPF not found at {:?}. Run `cd ../percolator-match && cargo build-sbf` first",
         path
     );
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| assert_matcher_sibling_is_pinned(&repo, &path));
     path
+}
+
+/// GH#508: the matcher `.so` is a SIBLING artifact, so every matcher-CPI test in this file
+/// used to depend silently on whatever a developer last built in `../percolator-match` --
+/// two machines could get two verdicts from the same wrapper commit. This binds the
+/// artifact to `MATCHER_DEPLOYED` in `ci/deployed-refs.env` (the same pin ci.yml checks the
+/// sibling out at), the way `scripts/ci-test.sh` already binds the engine sibling:
+///   1. `../percolator-match` must be a git checkout whose HEAD is the pinned commit,
+///   2. with no uncommitted changes, and
+///   3. the `.so` must be newer than the moment HEAD last moved (reflog; commit time when the
+///      reflog is empty) -- a `.so` older than that was built from some other checkout and is
+///      exactly the stale-artifact case #508 describes, even when it is newer than the commit.
+///
+/// `PERCOLATOR_MATCH_UNPINNED=1` runs against an arbitrary matcher build and says so; such a
+/// run is a local experiment, not the CI verdict.
+fn assert_matcher_sibling_is_pinned(repo: &std::path::Path, so: &std::path::Path) {
+    if std::env::var_os("PERCOLATOR_MATCH_UNPINNED").is_some() {
+        eprintln!(
+            "WARNING: PERCOLATOR_MATCH_UNPINNED set -- matcher-CPI tests run against an unpinned \
+             matcher build at {:?}; this is a local experiment, not the CI verdict",
+            so
+        );
+        return;
+    }
+    let refs_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ci/deployed-refs.env");
+    let refs = std::fs::read_to_string(&refs_file).expect("read ci/deployed-refs.env");
+    let pin = refs
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("MATCHER_DEPLOYED="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .expect("MATCHER_DEPLOYED missing from ci/deployed-refs.env");
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git on the matcher sibling");
+        assert!(
+            out.status.success(),
+            "git {:?} failed in {:?}: the matcher sibling must be a git checkout so its .so has an \
+             identifiable source (set PERCOLATOR_MATCH_UNPINNED=1 to override locally)",
+            args,
+            repo
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let head = git(&["rev-parse", "HEAD"]);
+    assert_eq!(
+        head, pin,
+        "matcher sibling {:?} is at {} but ci/deployed-refs.env pins MATCHER_DEPLOYED={}. \
+         Check out the pin and `cargo build-sbf` there (or set PERCOLATOR_MATCH_UNPINNED=1 for \
+         a local experiment)",
+        repo, head, pin
+    );
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]);
+    assert!(
+        dirty.is_empty(),
+        "matcher sibling {:?} has uncommitted changes -- its .so is not the pinned source:\n{}",
+        repo,
+        dirty
+    );
+    let commit_time: u64 = git(&["log", "-1", "--format=%ct"]).parse().unwrap();
+    // `HEAD@{<unix>}`: when HEAD was last checked out / moved in this checkout.
+    let moved_time: u64 = git(&["reflog", "-1", "--date=unix", "--format=%gd", "HEAD"])
+        .strip_prefix("HEAD@{")
+        .and_then(|t| t.strip_suffix('}'))
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+    let built_after = commit_time.max(moved_time);
+    let so_time = std::fs::metadata(so)
+        .and_then(|m| m.modified())
+        .expect("matcher .so mtime")
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        so_time >= built_after,
+        "matcher .so {:?} (mtime {}) predates checking out the pinned commit {} (at {}) -- it is \
+         a stale artifact built from another commit. Run `cd {:?} && cargo build-sbf`",
+        so,
+        so_time,
+        pin,
+        built_after,
+        repo
+    );
 }
 
 fn spl_token_program_path() -> PathBuf {
