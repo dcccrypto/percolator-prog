@@ -166,11 +166,19 @@ jobs:
           path: percolator-nft
           ref: ${{ steps.refs.outputs.NFT_CI_SIBLING }}
           token: '${{ secrets.GITHUB_TOKEN }}'
-      # Stake likewise, and for an extra reason: main carries the 408-byte StakePool
-      # layout that is deliberately NOT deployed (25 live pools are 392 bytes).
-      - name: checkout stake (pinned to the deployed commit)
+      # 2026-09-28: this step mounts STAKE_CI_SIBLING, not STAKE_DEPLOYED -- the same split the
+      # nft step above uses, for the same reason. The v18 stake on chain (e62aa4a) speaks the
+      # LOCKED integration wire (stake d687e9b/c3b821c), which pairs with the DEPLOYED wrapper
+      # lineage (deploy/v18.2-wrapper, built from sync/integration-v16), not with this tree:
+      # percolator-prog main does not contain that lineage. Mounting e62aa4a under main was
+      # measured to add 26 failures (22 v16_fee_split + 4 v16_five_program_crosscut, all
+      # `BindInsuranceAuthority ... InvalidInstructionData`); d0c6ecb (the stake this tree's wire
+      # was written against) reproduces the allowlist exactly. STAKE_DEPLOYED keeps its meaning
+      # and keeps driving scripts/parity-check.sh's DEPLOYED rows. Collapse back to
+      # STAKE_DEPLOYED once main is reconciled with the deployed wrapper lineage.
+      - name: checkout stake (pinned to the CI sibling the wrapper ships against)
         uses: actions/checkout@v4
-        with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+        with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
 
       - uses: dtolnay/rust-toolchain@stable
       - name: install solana toolchain (cargo build-sbf)
