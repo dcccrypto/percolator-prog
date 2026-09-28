@@ -637,6 +637,13 @@ Recovery is "by design impossible" (this is a one-way governance lock).
 
 ## Build & test
 
+The risk engine is a path dependency on a sibling checkout (`../percolator`). `build.rs`
+refuses to build unless that checkout's HEAD equals `ENGINE_CI_SIBLING` in
+`ci/deployed-refs.env` and its `src/`, `Cargo.toml` and `build.rs` are clean (GH#503), so
+every build states which engine it compiled. For a deliberate local experiment against
+another engine, set `PERCOLATOR_ENGINE_UNPINNED=1`; the build warns and the artifact is not
+a deploy candidate.
+
 ```bash
 # Default deployable Anchor v2 / Pinocchio entrypoint.
 # Requires platform-tools v1.52 or newer; review any stack-frame diagnostics

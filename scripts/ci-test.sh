@@ -99,8 +99,11 @@ echo "nft sibling verified: NFT_PIN=${NFT_PIN} -> ${have_nft}"
 # nothing in this script could say which engine had produced the verdict, because nothing
 # recorded it. Now ci.yml pins ENGINE_CI_SIBLING and this asserts the pin actually took.
 #
-# Set ENGINE_CI_SIBLING= (empty) to run against an arbitrary local engine worktree; the
-# result is then a local experiment and not the CI verdict, and this says so.
+# ENGINE_CI_SIBLING cannot be emptied from the environment: the refs file sourced above
+# overrides it (GH#503 PoC-B). Since GH#503 the same pin is also enforced by build.rs on
+# every cargo build, not only here; a local run against another engine needs
+# PERCOLATOR_ENGINE_UNPINNED=1 for build.rs AND an edited pin for this check, and is then a
+# local experiment, not the CI verdict.
 have_engine="$(git -C ../percolator rev-parse HEAD 2>/dev/null || true)"
 if [ -z "$have_engine" ]; then
   echo "FATAL: ../percolator is not a git checkout — the wrapper's path dependency has no identifiable source"; exit 1
