@@ -2087,3 +2087,177 @@ fn p3_r3_textit_one_sided_reconstruction() {
     env.trade(&long, &lp, -3 * POS).expect("long closes");
     env.assert_conserved("R3");
 }
+
+impl Env {
+    fn release_surplus_resolved(&mut self, signer: &Keypair, lp: Pubkey, amount: u128, dest: Pubkey) -> Result<(), String> {
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::VaultLpReleaseSurplus { amount, source_domain: DOMAIN },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new_readonly(self.registry, false),
+                AccountMeta::new(self.vault_lp, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new(self.ledger, false),
+                AccountMeta::new(self.sibling, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault_token, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&signer.insecure_clone()],
+        )
+    }
+}
+
+/// Independent QA F-8 (MEDIUM): the vault LP WINS against a trader and the market resolves. Before
+/// the fix tag 101 saw a phantom senior shortfall (the Earn ledger books the LP's win against
+/// the pot as a "loss" while the trader's loss lands in the same pot unattributed), refilled it
+/// out of the junior's payout, and 900,000 atoms stayed in the vault after every party exited.
+/// Now: settle values the pots physically, and the junior sweeps any terminal surplus (tag 102,
+/// Resolved path). Nothing but dead-share dust is left behind.
+#[test]
+fn p3_f8_vault_lp_win_reaches_the_junior_at_resolution() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 3_000_000).expect("junior");
+    let t = env.new_trader(5_000_000);
+    env.trade(&t, &lp, 3 * POS).expect("trader long 3 vs vault LP");
+    env.move_price(700_000, &[lp.portfolio, t.portfolio]);
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let tr = env.trader_close_resolved(&t);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+    let after_settle = env.tok(junior_dest);
+    // Terminal cleanup (F-4 path), senior exit, then the junior's terminal sweep.
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
+    let towner = t.kp.pubkey();
+    env.permissionless_close_portfolio(t.portfolio, towner).expect("cleanup trader");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    let senior = env.earn_execute(&d, Some(lp.portfolio)).expect("senior redeems");
+    let (_, g) = env.market_state();
+    let physical_left = (g.source_backing_buckets[0].fresh_unliened_backing_num
+        + g.source_backing_buckets[1].fresh_unliened_backing_num)
+        / percolator::BOUND_SCALE;
+    let c_left = env.vlp().senior_claim_atoms;
+    let sweep = physical_left.saturating_sub(c_left);
+    if sweep > 0 {
+        env.release_surplus_resolved(&admin, lp.portfolio, sweep, junior_dest).expect("junior sweeps the terminal surplus");
+    }
+    let junior_total = env.tok(junior_dest);
+    env.paid_out += junior_total as u128;
+    let (_, g2) = env.market_state();
+    println!(
+        "F-8: trader {tr}; junior after settle {after_settle}, after sweep {junior_total}; senior {senior}; left in vault {} (C left {c_left})",
+        g2.vault
+    );
+    assert_eq!(junior_total, 3_900_000, "junior receives principal 3,000,000 + the 900,000 win");
+    assert_eq!(senior as u128, 10_000_000 * shares / (shares + 1_000), "senior redeems its full claim (less dead shares)");
+    assert!(g2.vault <= 1_000, "only dead-share dust may remain, got {}", g2.vault);
+    env.assert_conserved("F-8 terminal");
+}
+
+/// F-8, settle-FIRST order (the QA order variants): the vault LP's settlement runs before the
+/// losing trader closes, so the trader's loss lands in the pot AFTER tag 101. The junior's win
+/// then sits in backing as terminal surplus, which the Resolved path of tag 102 sweeps to it.
+#[test]
+fn p3_f8_settle_first_then_terminal_sweep_pays_the_junior_its_win() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 3_000_000).expect("junior");
+    let t = env.new_trader(5_000_000);
+    env.trade(&t, &lp, 3 * POS).expect("trader long 3 vs vault LP");
+    env.move_price(700_000, &[lp.portfolio, t.portfolio]);
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    // Settle the (winning) vault LP first; repeat until its resolved close completes.
+    for _ in 0..3 {
+        env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+        let p = env.portfolio(lp.portfolio);
+        if p.capital == 0 && p.pnl == 0 && percolator::active_bitmap_is_empty(p.active_bitmap) {
+            break;
+        }
+        env.trader_close_resolved(&t);
+    }
+    for _ in 0..3 {
+        let p = env.portfolio(t.portfolio);
+        if p.capital == 0 && p.pnl == 0 {
+            break;
+        }
+        env.trader_close_resolved(&t);
+    }
+    let after_settle = env.tok(junior_dest);
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
+    let towner = t.kp.pubkey();
+    env.permissionless_close_portfolio(t.portfolio, towner).expect("cleanup trader");
+    // Before the seniors leave the junior may already take the surplus over C.
+    let (_, g) = env.market_state();
+    let physical = (g.source_backing_buckets[0].fresh_unliened_backing_num
+        + g.source_backing_buckets[1].fresh_unliened_backing_num)
+        / percolator::BOUND_SCALE;
+    let c = env.vlp().senior_claim_atoms;
+    let sweep = physical.saturating_sub(c);
+    err_has(
+        &env.release_surplus_resolved(&admin, lp.portfolio, sweep + 1, junior_dest),
+        PercolatorError::VaultLpReleaseRefused,
+    );
+    if sweep > 0 {
+        env.release_surplus_resolved(&admin, lp.portfolio, sweep, junior_dest).expect("terminal sweep");
+    }
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    let senior = env.earn_execute(&d, Some(lp.portfolio)).expect("senior redeems after the sweep");
+    let junior_total = env.tok(junior_dest);
+    env.paid_out += junior_total as u128;
+    let (_, g2) = env.market_state();
+    println!("F-8 settle-first: junior after settle {after_settle}, swept {sweep}, total {junior_total}; senior {senior}; left {}", g2.vault);
+    assert_eq!(junior_total, 3_900_000);
+    assert_eq!(senior as u128, 10_000_000 * shares / (shares + 1_000));
+    assert!(g2.vault <= 1_000);
+    env.assert_conserved("F-8 settle-first");
+}
+
+/// Tag 102's Resolved terminal path, positive case: with a terminal surplus over C the junior
+/// takes exactly `physical - C` in SPL (1 atom more is refused), and the senior still redeems C.
+#[test]
+fn p3_f8_terminal_sweep_pays_exactly_the_surplus_over_c() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 3_000_000).expect("junior");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
+    // Live-mode sweep would need the LP; Resolved-but-not-terminal is refused (covered by F-4
+    // flow); here the market IS terminal-flat.
+    // STATE POKE (see poke_senior_claim): C lowered by 2M, standing in for terminal junior
+    // surplus that sits in backing (e.g. a counterparty loss landing after settlement).
+    poke_senior_claim(&mut env, 8_000_000);
+    err_has(&env.release_surplus_resolved(&admin, lp.portfolio, 2_000_001, junior_dest), PercolatorError::VaultLpReleaseRefused);
+    let stranger = Keypair::new();
+    env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    err_has(&env.release_surplus_resolved(&stranger, lp.portfolio, 1, junior_dest), PercolatorError::Unauthorized);
+    let before = env.tok(junior_dest);
+    env.release_surplus_resolved(&admin, lp.portfolio, 2_000_000, junior_dest).expect("sweep exactly the surplus");
+    assert_eq!(env.tok(junior_dest) - before, 2_000_000);
+    env.paid_out += env.tok(junior_dest) as u128;
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    let senior = env.earn_execute(&d, Some(lp.portfolio)).expect("senior redeems C");
+    assert_eq!(senior as u128, 8_000_000 * shares / (shares + 1_000));
+    env.assert_conserved("terminal sweep");
+}
