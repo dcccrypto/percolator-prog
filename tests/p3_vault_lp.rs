@@ -526,7 +526,6 @@ impl Env {
                 },
             )
             .unwrap();
-        self.approve_matcher();
         let (_, expected_sequence, _) = self.identity(lp);
         let frontier = state::read_market_asset_generation_frontier(
             &self.svm.get_account(&self.market).unwrap().data,
@@ -628,6 +627,7 @@ impl Env {
     /// Bound vault: create + bind vault LP + matcher. Returns the LP handle.
     fn bind(&mut self, floor_bps: u16) -> Lp {
         let lp = self.init_vault_lp(floor_bps);
+        self.approve_matcher();
         let admin = self.admin.insecure_clone();
         self.vault_lp_set_matcher_as(&admin, lp).expect("vault lp set matcher")
     }
@@ -1151,6 +1151,7 @@ fn p3_vault_lp_owner_signed_paths_are_unreachable() {
 fn p3_vault_lp_set_matcher_then_real_trade_cpi_fill() {
     let mut env = Env::new(Params::default());
     let lp_key = env.init_vault_lp(1_000);
+    env.approve_matcher();
     let stranger = Keypair::new();
     env.svm.airdrop(&stranger.pubkey(), 10_000_000_000).unwrap();
     err_has(
@@ -1404,4 +1405,280 @@ fn p3_recall_is_permissionless_and_bounded_by_the_senior_shortfall() {
     let paid = env.earn_execute(&d, Some(lp.portfolio)).expect("redeem after recall");
     assert_eq!(paid as u128, shares * 14_000_000 / s);
     env.assert_conserved("recall");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Security-review blockers (Sentinel, 2026-09-29): P3-H1 resolved-market exit, P3-H2 creator
+// option on seniors. Each test is a PoC that FAILS on the pre-fix program (c7437518 / the
+// negative controls below) and passes on the fix.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn resolve(&mut self) {
+        let data = self.svm.get_account(&self.market).unwrap().data;
+        let authority_epoch = state::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+        let frontier = state::read_asset_generation_frontier(&data).unwrap();
+        let admin = self.admin.insecure_clone();
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::ResolveMarket {
+                asset_generation_frontier: frontier,
+                authority_epoch,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            &[&admin],
+        )
+        .expect("resolve market");
+    }
+
+    /// Tag 30 exactly as a stranger would send it against the vault LP, paying into a
+    /// collateral account OWNED BY THE REGISTRY PDA (the stranding PoC shape).
+    fn close_resolved_into_registry_ata(&mut self, lp: Pubkey) -> (Result<(), String>, Pubkey) {
+        let dest = self.token_account(self.mint, self.registry, 0);
+        let r = self.send(
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new_readonly(self.registry, false),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault_token, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(
+                    Pubkey::find_program_address(&[b"nft_registry", self.market.as_ref()], &self.pid)
+                        .0,
+                    false,
+                ),
+            ],
+            &[],
+        );
+        (r, dest)
+    }
+
+    fn settle_resolved(&mut self, caller: &Keypair, lp: Pubkey, topup: u8, junior_dest: Pubkey) -> Result<(), String> {
+        self.svm.airdrop(&caller.pubkey(), 10_000_000_000).unwrap();
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::VaultLpSettleResolved { topup },
+            vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new_readonly(self.registry, false),
+                AccountMeta::new(self.vault_lp, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new(self.ledger, false),
+                AccountMeta::new_readonly(self.sibling, false),
+                AccountMeta::new(junior_dest, false),
+                AccountMeta::new(self.vault_token, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&caller.insecure_clone()],
+        )
+    }
+
+    /// Backing NAV of the vault's two pots as the program computes it (principal - net
+    /// impairment + fee-share earnings), read from the ledgers.
+    fn backing_nav(&self) -> u128 {
+        let mut nav = 0u128;
+        for key in [self.ledger, self.sibling] {
+            if let Some(a) = self.svm.get_account(&key) {
+                if let Ok(l) = state::read_backing_domain_ledger(&a.data) {
+                    nav += l.total_principal_atoms
+                        - (l.cumulative_loss_atoms - l.cumulative_recovery_atoms);
+                }
+            }
+        }
+        nav
+    }
+}
+
+/// P3-H1 PoC 1. Before the fix a stranger could CloseResolved the vault LP into a
+/// registry-owned token account (from which nothing can ever move it). Now refused.
+#[test]
+fn p3_h1_close_resolved_refuses_the_vault_lp() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    env.resolve();
+    let (r, stuck) = env.close_resolved_into_registry_ata(lp.portfolio);
+    println!("P3-H1 tag 30 on vault LP: {r:?}; registry-ATA balance {}", env.tok(stuck));
+    err_has(&r, PercolatorError::VaultLpUseSettleResolved);
+    assert_eq!(env.tok(stuck), 0, "nothing may reach a registry-owned token account");
+}
+
+/// P3-H1 PoC 2. Resolved exit, no senior shortfall: the whole vault-LP payout reaches the
+/// junior owner; seniors keep their backing; everything conserves.
+#[test]
+fn p3_h1_settle_resolved_pays_the_junior_when_seniors_are_covered() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let stranger = Keypair::new();
+    env.settle_resolved(&stranger, lp.portfolio, 0, junior_dest).expect("permissionless settle");
+    let got = env.tok(junior_dest) as u128;
+    env.paid_out += got;
+    println!("P3-H1 settle (covered): junior received {got}, C={} nav={}", env.vlp().senior_claim_atoms, env.backing_nav());
+    assert_eq!(got, 20_000_000, "junior receives its full capital");
+    assert_eq!(env.backing_nav(), 10_000_000, "senior backing untouched");
+    env.assert_conserved("settle resolved, covered");
+}
+
+/// P3-H1 PoC 3. Resolved exit WITH a senior shortfall: the shortfall is refilled into backing
+/// FIRST, only the residual reaches the junior, and the Earn holder then redeems the full C.
+#[test]
+fn p3_h1_settle_resolved_refills_the_senior_shortfall_before_the_junior() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    // STATE POKE (see poke_senior_claim): stands in for backing consumed by LP gains the LP still
+    // holds (C = 13M, backing 10M => 3M senior shortfall that the vault LP's value must cover).
+    poke_senior_claim(&mut env, 13_000_000);
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let stranger = Keypair::new();
+    env.settle_resolved(&stranger, lp.portfolio, 0, junior_dest).expect("settle");
+    let got = env.tok(junior_dest) as u128;
+    env.paid_out += got;
+    println!("P3-H1 settle (shortfall): junior {got}, nav {}", env.backing_nav());
+    assert_eq!(got, 17_000_000, "junior gets the payout minus the 3M senior shortfall");
+    assert_eq!(env.backing_nav(), 13_000_000, "backing refilled to exactly C");
+    env.assert_conserved("settle resolved, shortfall");
+    let (_, g) = env.market_state();
+    println!("after settle: c_tot {} materialized {}", g.c_tot, g.materialized_portfolio_count);
+    // Terminal cleanup (existing rule for EVERY portfolio): resolved redemption needs a
+    // terminal-flat market, so marketauth deregisters the now-empty vault LP (tag 8, allowed to
+    // marketauth in Resolved mode).
+    let (pid_, seq, epoch) = env.identity(lp.portfolio);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::ClosePortfolio {
+            portfolio_id: pid_,
+            expected_sequence: seq,
+            position_epoch: epoch,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(lp.portfolio, false),
+        ],
+        &[&admin],
+    )
+    .expect("terminal cleanup of the settled vault LP");
+    // The Earn holder now redeems against the refilled backing (resolved, terminal-flat).
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    let s = env.registry_state().total_lp_shares_outstanding;
+    let paid = env.earn_execute(&d, Some(lp.portfolio)).expect("resolved redemption");
+    println!("P3-H1 senior redemption after settle: {paid} for {shares}/{s} shares");
+    assert_eq!(paid as u128, shares * 13_000_000 / s);
+    env.assert_conserved("resolved redemption");
+}
+
+/// P3-H2 PoC 1. The creator (marketauth, NOT the upgrade authority) can no longer configure the
+/// vault LP's matcher, and even the protocol can only use the approved program with finite caps.
+#[test]
+fn p3_h2_vault_lp_matcher_is_protocol_only_and_approved() {
+    let mut env = Env::new(Params::default());
+    let lp = env.init_vault_lp(1_000);
+    let admin = env.admin.insecure_clone();
+    // Protocol approves the matcher; ProgramData authority = admin here...
+    env.approve_matcher();
+    // ...now hand the upgrade authority to a separate protocol key: the creator is refused.
+    let protocol = Keypair::new();
+    env.svm.airdrop(&protocol.pubkey(), 10_000_000_000).unwrap();
+    let (pd, _) = Pubkey::find_program_address(&[env.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
+    let mut acct = env.svm.get_account(&pd).unwrap();
+    acct.data[13..45].copy_from_slice(protocol.pubkey().as_ref()); // STATE POKE: ProgramData authority
+    env.svm.set_account(pd, acct).unwrap();
+    env.svm.expire_blockhash();
+    err_has(&env.vault_lp_set_matcher_as(&admin, lp).map(|_| ()), PercolatorError::Unauthorized);
+    // An unapproved matcher program is refused even for the protocol.
+    let approved = env.matcher;
+    let other = Pubkey::new_unique();
+    env.svm.add_program(other, &std::fs::read(matcher_program_path()).unwrap());
+    env.matcher = other;
+    env.svm.expire_blockhash();
+    err_has(&env.vault_lp_set_matcher_as(&protocol, lp).map(|_| ()), PercolatorError::VaultLpMatcherNotApproved);
+    env.matcher = approved;
+    env.svm.expire_blockhash();
+    env.vault_lp_set_matcher_as(&protocol, lp).expect("protocol + approved matcher");
+}
+
+/// P3-H2 PoC 2. The vault LP cannot take more exposure than 1x its junior-funded equity by
+/// default, so a creator's second wallet cannot load it beyond the first-loss capital.
+#[test]
+fn p3_h2_vault_lp_exposure_capped_at_its_equity() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 20 * POS).expect("20 units = 1x the $20 junior");
+    env.svm.expire_blockhash();
+    let r = env.trade(&t, &lp, POS);
+    println!("P3-H2 21st unit vs vault LP: {r:?}");
+    err_has(&r, PercolatorError::VaultLpExposureCapExceeded);
+    // Reducing is always allowed.
+    env.svm.expire_blockhash();
+    env.trade(&t, &lp, -5 * POS).expect("reduce");
+}
+
+/// P3-H2 open question (Sentinel): does a trader's win against the vault LP consume SENIOR
+/// backing while the junior is solvent? Measured end to end with real price moves: the creator's
+/// second wallet goes long vs the vault LP, the price rises, it closes and withdraws.
+#[test]
+fn p3_h2_trader_win_is_paid_by_the_junior_not_the_seniors() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 50_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let creator_wallet2 = env.new_trader(10_000_000);
+    env.trade(&creator_wallet2, &lp, 10 * POS).expect("open long vs vault LP");
+    let nav0 = env.backing_nav();
+    let c0 = env.vlp().senior_claim_atoms;
+    let lp_cap0 = env.portfolio(lp.portfolio).capital;
+    let t_cap0 = env.portfolio(creator_wallet2.portfolio).capital;
+    // +10%: the trader is up ~$1 on 10 units, the vault LP down the same.
+    env.move_price(1_100_000, &[lp.portfolio, creator_wallet2.portfolio]);
+    env.svm.expire_blockhash();
+    env.trade(&creator_wallet2, &lp, -10 * POS).expect("close");
+    for _ in 0..3 {
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        let _ = env.crank(lp.portfolio);
+        let _ = env.crank(creator_wallet2.portfolio);
+    }
+    let trader = env.portfolio(creator_wallet2.portfolio);
+    let lpp = env.portfolio(lp.portfolio);
+    let nav1 = env.backing_nav();
+    println!(
+        "P3-H2 win: trader cap {}->{} pnl {} | vaultLP cap {}->{} pnl {} | backing nav {}->{} | C {}->{}",
+        t_cap0, trader.capital, trader.pnl, lp_cap0, lpp.capital, lpp.pnl, nav0, nav1, c0,
+        env.vlp().senior_claim_atoms
+    );
+    let trader_gain = trader.capital as i128 + trader.pnl - t_cap0 as i128;
+    let lp_loss = lp_cap0 as i128 - (lpp.capital as i128 + lpp.pnl);
+    assert!(trader_gain > 0, "the creator's second wallet won ({trader_gain})");
+    assert_eq!(env.vlp().senior_claim_atoms, c0, "the senior claim never moves on trading PnL");
+    assert_eq!(nav1, nav0, "senior backing must not pay the winner while the junior is solvent");
+    assert_eq!(lp_loss, trader_gain, "the winner is paid exactly by the vault LP (junior)");
 }
