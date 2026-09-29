@@ -18361,14 +18361,21 @@ pub mod processor {
         // checks the close itself performs.
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
-            expect_live_authority(&cfg.marketauth, admin_dest.key)?;
-            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
-            if terminal_empty_resolved_view(&group)
-                && rebook_orphaned_fee_legs_view(market_ai.key, &mut cfg, &mut group)?
             {
-                group.validate_shape().map_err(map_v16_error)?;
-                drop(group);
+                let (cfg, group) = state::market_view_mut(&mut market_data)?;
+                expect_live_authority(&cfg.marketauth, admin_dest.key)?;
+                require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+            }
+            let rebooked = {
+                let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+                let moved = terminal_empty_resolved_view(&group)
+                    && rebook_orphaned_fee_legs_view(market_ai.key, &mut cfg, &mut group)?;
+                if moved {
+                    group.validate_shape().map_err(map_v16_error)?;
+                }
+                moved.then_some(cfg)
+            };
+            if let Some(cfg) = rebooked {
                 state::write_wrapper_config(&mut market_data, &cfg)?;
                 return Ok(());
             }
@@ -25745,21 +25752,23 @@ pub mod processor {
         Ok(())
     }
 
-    /// Account-borrowing wrapper for the two pre-matcher gates -- builds the market + both
-    /// portfolio views, runs the per-asset lifecycle gate AND the currentness gate, then drops
-    /// every borrow before returning so the caller is free to CPI into the matcher immediately
-    /// after.
-    ///
-    /// FIX E-CU-C: the currentness half is restored here. Upstream runs both gates before the
-    /// matcher CPI -- `ensure_cpi_trade_portfolios_current_before_matcher`
-    /// (`aeyakovenko/percolator-prog upstream/main:src/v16_program.rs:14560`) calls the lifecycle
-    /// gate at `:14586` and `ensure_trade_portfolios_current_for_requests_view` at `:14592`, from
-    /// `handle_trade_cpi` and the batch-CPI route. Upstream added the currentness half on
-    /// 2026-06-15 in `ba1e8d5f` "Reject active-stale CPI trades before matcher". Our `3a189159`
-    /// (2026-07-16, upstream #147 + #160) adopted only the lifecycle half, so until now
-    /// `TradeCpi`/`BatchTradeCpi` reached the 2N stale-leg settlement cliff even for an asset the
-    /// portfolio already holds -- the case the `TradeNoCpi` route has refused since `9cc574ea`.
-    /// The function is renamed to upstream's name so `git log -S` finds it on both trees.
+    // (Doc of the former `ensure_cpi_trade_portfolios_current_before_matcher`; since P1 its body
+    // is the first half of `p1_cpi_preflight_before_matcher`, which both CPI routes call.)
+    // Account-borrowing wrapper for the two pre-matcher gates -- builds the market + both
+    // portfolio views, runs the per-asset lifecycle gate AND the currentness gate, then drops
+    // every borrow before returning so the caller is free to CPI into the matcher immediately
+    // after.
+    //
+    // FIX E-CU-C: the currentness half is restored here. Upstream runs both gates before the
+    // matcher CPI -- `ensure_cpi_trade_portfolios_current_before_matcher`
+    // (`aeyakovenko/percolator-prog upstream/main:src/v16_program.rs:14560`) calls the lifecycle
+    // gate at `:14586` and `ensure_trade_portfolios_current_for_requests_view` at `:14592`, from
+    // `handle_trade_cpi` and the batch-CPI route. Upstream added the currentness half on
+    // 2026-06-15 in `ba1e8d5f` "Reject active-stale CPI trades before matcher". Our `3a189159`
+    // (2026-07-16, upstream #147 + #160) adopted only the lifecycle half, so until now
+    // `TradeCpi`/`BatchTradeCpi` reached the 2N stale-leg settlement cliff even for an asset the
+    // portfolio already holds -- the case the `TradeNoCpi` route has refused since `9cc574ea`.
+    // The function is renamed to upstream's name so `git log -S` finds it on both trees.
     // FIX (ADOPT upstream 3496acf0, "enforce side OI caps with generated public
     // conformance" -- Wave-1 Track-A). The engine's `validate_asset_shape_for_view`
     // asserts `oi_eff_long_q`/`oi_eff_short_q` against `MAX_OI_SIDE_Q`, but that
