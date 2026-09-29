@@ -14676,6 +14676,10 @@ pub mod processor {
             max_market_slots_pre,
             &cpi_requests,
         )?;
+        // P1 item 5 (BatchTradeCpi): pre-matcher floor/auto-halt per leg, same predicate as
+        // TradeCpi, so a floored LP is refused with the NAMED `LpFloorHalt` (not the engine's
+        // Custom(49) from inside the batch execute) and a flip past flat is refused on both
+        // routes alike. No clip here -- a batch is atomic; the post-fill cap check still runs.
 
         invoke_matcher_batch(
             matcher_prog,

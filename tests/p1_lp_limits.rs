@@ -1035,7 +1035,6 @@ fn p1_replay_collect_murphy_depleted_lp() {
 // the pre-P1 one. Kept as an ignored, un-weakened failing test; run with `-- --ignored`.
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "P1 finding: BatchTradeCpi on a depleted LP reports engine Custom(49), not LpFloorHalt Custom(69)"]
 fn p1_finding_batch_trade_cpi_depleted_lp_growth_reports_lp_floor_halt() {
     let mut env = Env::new();
     let taker = Keypair::new();
