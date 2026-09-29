@@ -174,8 +174,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - name: install solana toolchain (cargo build-sbf)
+        env:
+          SOLANA_CLI_VERSION: "4.2.2"
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          # Pinned: `stable` moved to an SBPF-v3 toolchain whose .so litesvm 0.1 cannot load.
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: percolator-prog }
