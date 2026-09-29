@@ -9265,7 +9265,11 @@ pub mod risk_limits_v17 {
             return false;
         }
         let diff = exec_price.abs_diff(reference_price) as u128;
-        diff * BPS_DENOM <= (reference_price as u128) * (band_bps as u128)
+        // `diff <= ceil(ref * band / 1e4)`: the band edge rounds OUT to the next whole atom, so
+        // a matcher that prices exactly at the edge with LP-favourable rounding (P2 EXEC_BAND
+        // clamp; fee-channel lane finding at off-grid prices) is not refused for one atom.
+        // Band 0 still admits only the exact reference.
+        diff * BPS_DENOM <= (reference_price as u128) * (band_bps as u128) + (BPS_DENOM - 1)
     }
 
     /// Default LP exposure multiplier when unset: the asset's own max leverage,
@@ -9316,6 +9320,27 @@ pub mod risk_limits_v17 {
             Some(num) => num / den,
             None => u128::MAX,
         }
+    }
+
+    /// Exact, division-free form of `abs_q <= lp_exposure_cap_q(equity, k, price, pos_scale)`
+    /// (for integers `a <= floor(n / d)` iff `a * d <= n`): `Some(verdict)` when both products
+    /// fit in u128, `None` otherwise (the caller falls back to the division form). CU: BPF u128
+    /// division is a software routine; the common, non-binding case needs none.
+    pub fn exposure_within_cap_fast(
+        abs_q: u128,
+        equity_atoms: u128,
+        k_bps: u32,
+        price_e6: u64,
+        pos_scale: u128,
+    ) -> Option<bool> {
+        if price_e6 == 0 {
+            return None;
+        }
+        let lhs = abs_q.checked_mul(BPS_DENOM * price_e6 as u128)?;
+        let rhs = equity_atoms
+            .checked_mul(k_bps as u128)?
+            .checked_mul(pos_scale)?;
+        Some(lhs <= rhs)
     }
 
     /// Initial-margin-lane equity clamped at zero, as an unsigned amount.
@@ -25837,17 +25862,24 @@ pub mod processor {
         let a_after = position_a.checked_add(size_q).ok_or_else(overflow)?;
         let b_after = position_b.checked_sub(size_q).ok_or_else(overflow)?;
         // Counterparty reduce-only (a trader's close) is exempt -- see `lp_fill_gate`.
-        if roles.b_is_lp && !risk_limits_v17::position_change_reduce_only(position_a, a_after) {
-            let (floor, _) = lp_floor_and_cap_q_view(group, account_b, asset_index)?;
-            if floor && !risk_limits_v17::floored_lp_move_allowed(position_b, b_after) {
-                return Err(PercolatorError::LpFloorHalt.into());
-            }
+        // On the CPI routes account_b's floor was already enforced by
+        // `p1_cpi_preflight_before_matcher` with the identical predicate on identical state (the
+        // matcher CPI in between cannot write wrapper-owned accounts), so it is not re-derived
+        // here (CU). The post-fill gate still re-checks account_b on every route.
+        if roles.b_is_lp
+            && !roles.cpi
+            && risk_limits_v17::lp_risk_increasing(position_b, b_after)
+            && !risk_limits_v17::position_change_reduce_only(position_a, a_after)
+            && lp_floor_breached_view(group, account_b, asset_index)?
+        {
+            return Err(PercolatorError::LpFloorHalt.into());
         }
-        if roles.a_is_lp && !risk_limits_v17::position_change_reduce_only(position_b, b_after) {
-            let (floor, _) = lp_floor_and_cap_q_view(group, account_a, asset_index)?;
-            if floor && !risk_limits_v17::floored_lp_move_allowed(position_a, a_after) {
-                return Err(PercolatorError::LpFloorHalt.into());
-            }
+        if roles.a_is_lp
+            && risk_limits_v17::lp_risk_increasing(position_a, a_after)
+            && !risk_limits_v17::position_change_reduce_only(position_b, b_after)
+            && lp_floor_breached_view(group, account_a, asset_index)?
+        {
+            return Err(PercolatorError::LpFloorHalt.into());
         }
         Ok(())
     }
@@ -25867,30 +25899,36 @@ pub mod processor {
         position_b_before: i128,
         roles: P1TradeRoles,
     ) -> ProgramResult {
+        let lp_involved = roles.cpi || roles.a_is_lp || roles.b_is_lp;
+        if !lp_involved {
+            return Ok(());
+        }
+        // One position read per side (each walks the leg table -- CU).
+        let a_after = signed_position_for_asset_view(group, account_a, asset_index)?;
+        let b_after = signed_position_for_asset_view(group, account_b, asset_index)?;
         if roles.b_is_lp {
             ensure_lp_limits_after_fill_view(
                 group,
                 account_b,
-                account_a,
                 asset_index,
                 position_b_before,
+                b_after,
                 position_a_before,
+                a_after,
             )?;
         }
         if roles.a_is_lp {
             ensure_lp_limits_after_fill_view(
                 group,
                 account_a,
-                account_b,
                 asset_index,
                 position_a_before,
+                a_after,
                 position_b_before,
+                b_after,
             )?;
         }
-        let lp_involved = roles.cpi || roles.a_is_lp || roles.b_is_lp;
-        if lp_involved && account_a.header.owner == account_b.header.owner {
-            let a_after = signed_position_for_asset_view(group, account_a, asset_index)?;
-            let b_after = signed_position_for_asset_view(group, account_b, asset_index)?;
+        if account_a.header.owner == account_b.header.owner {
             let a_reduce = risk_limits_v17::position_change_reduce_only(position_a_before, a_after);
             let b_reduce = risk_limits_v17::position_change_reduce_only(position_b_before, b_after);
             let ok = if roles.cpi {
@@ -25945,22 +25983,23 @@ pub mod processor {
     }
 
     /// Items 3 + 5 on the matcher LP (account_b of a CPI route), post-fill.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_lp_limits_after_fill_view(
         group: &state::MarketViewMutV16<'_>,
         lp: &percolator::PortfolioV16ViewMut<'_>,
-        counterparty: &percolator::PortfolioV16ViewMut<'_>,
         asset_index: usize,
         position_before: i128,
+        position_after: i128,
         counterparty_before: i128,
+        counterparty_after: i128,
     ) -> ProgramResult {
-        let position_after = signed_position_for_asset_view(group, lp, asset_index)?;
-        let counterparty_after = signed_position_for_asset_view(group, counterparty, asset_index)?;
         if !risk_limits_v17::lp_risk_increasing(position_before, position_after)
             || risk_limits_v17::position_change_reduce_only(counterparty_before, counterparty_after)
         {
             return Ok(());
         }
-        let (floor, cap) = lp_floor_and_cap_q_view(group, lp, asset_index)?;
+        let (floor, cap) =
+            lp_floor_and_cap_q_for_target_view(group, lp, asset_index, position_after.unsigned_abs())?;
         match risk_limits_v17::lp_fill_gate(
             counterparty_before,
             counterparty_after,
@@ -25980,15 +26019,34 @@ pub mod processor {
     /// `(floor_breached, exposure_cap_q)` for the LP on `asset_index`, from its
     /// initial-margin-lane equity (capital + min(pnl, 0) - fee debt: NO credit for positive,
     /// backing-dependent PnL).
-    fn lp_floor_and_cap_q_view(
+    /// Floor predicate only (no u128 cap arithmetic -- CU).
+    fn lp_floor_breached_view(
         group: &state::MarketViewMutV16<'_>,
         lp: &percolator::PortfolioV16ViewMut<'_>,
         asset_index: usize,
+    ) -> Result<bool, ProgramError> {
+        let limits = asset_risk_limits_view(group, asset_index)?;
+        let equity = percolator::fork_facade::account_equity_init_raw(&lp.as_view())
+            .map_err(map_v16_error)?;
+        Ok(risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true))
+    }
+
+    /// `(floor_breached, cap_q)`, but the u128 cap division is only performed when
+    /// `target_abs_q` is NOT already provably within the cap (`exposure_within_cap_fast`); in
+    /// that case `u128::MAX` is returned as the cap, which yields the identical verdict for any
+    /// position of magnitude <= `target_abs_q` (CU).
+    fn lp_floor_and_cap_q_for_target_view(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        target_abs_q: u128,
     ) -> Result<(bool, u128), ProgramError> {
         let limits = asset_risk_limits_view(group, asset_index)?;
         let equity = percolator::fork_facade::account_equity_init_raw(&lp.as_view())
             .map_err(map_v16_error)?;
-        let floor = risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true);
+        if risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true) {
+            return Ok((true, 0));
+        }
         let k = risk_limits_v17::effective_lp_exposure_k_bps(
             limits.lp_exposure_k_bps,
             group.header.config.initial_margin_bps.get(),
@@ -26001,13 +26059,21 @@ pub mod processor {
             .asset
             .effective_price
             .get();
-        let cap = risk_limits_v17::lp_exposure_cap_q(
-            risk_limits_v17::nonneg_equity(equity),
+        let equity = risk_limits_v17::nonneg_equity(equity);
+        if risk_limits_v17::exposure_within_cap_fast(
+            target_abs_q,
+            equity,
             k,
             price,
             percolator::POS_SCALE,
-        );
-        Ok((floor, cap))
+        ) == Some(true)
+        {
+            return Ok((false, u128::MAX));
+        }
+        Ok((
+            false,
+            risk_limits_v17::lp_exposure_cap_q(equity, k, price, percolator::POS_SCALE),
+        ))
     }
 
     /// Per-leg output of `p1_cpi_preflight_before_matcher`.
@@ -26077,15 +26143,16 @@ pub mod processor {
                 .markets
                 .get(asset_index)
                 .ok_or(PercolatorError::InvalidInstruction)?;
-            // `asset_admin` only (raw 32-byte read; the profile was validated at preflight).
-            let profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(
-                market
-                    .wrapper
-                    .get(..constants::ASSET_ORACLE_PROFILE_LEN)
-                    .ok_or(PercolatorError::InvalidAccountLen)?,
-            );
+            // `asset_admin` only: a 32-byte read at its field offset instead of copying the whole
+            // 512-byte profile (CU; the profile was validated at preflight).
+            const ASSET_ADMIN_OFF: usize =
+                core::mem::offset_of!(state::AssetOracleProfileV16, asset_admin);
+            let asset_admin: &[u8] = market
+                .wrapper
+                .get(ASSET_ADMIN_OFF..ASSET_ADMIN_OFF + 32)
+                .ok_or(PercolatorError::InvalidAccountLen)?;
             let taker_is_creator =
-                profile.asset_admin != [0u8; 32] && profile.asset_admin == taker_owner;
+                asset_admin != [0u8; 32].as_slice() && asset_admin == taker_owner.as_slice();
             let taker_before = signed_position_for_asset_view(&group, &account_a, asset_index)?;
             let taker_after = taker_before
                 .checked_add(size_q)
@@ -26100,7 +26167,16 @@ pub mod processor {
             let limits = state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])?;
             let before = signed_position_for_asset_view(&group, &account_b, asset_index)?;
             let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
-            let (floor, cap) = lp_floor_and_cap_q_view(&group, &account_b, asset_index)?;
+            let lp_after_full = before
+                .checked_sub(size_q)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            // Cap only needs the division when the full request would not already fit.
+            let (floor, cap) = lp_floor_and_cap_q_for_target_view(
+                &group,
+                &account_b,
+                asset_index,
+                lp_after_full.unsigned_abs(),
+            )?;
             let headroom_q = if taker_reducing {
                 // A taker's close is never halted or clipped (the post-fill gate exempts it too).
                 size_q.unsigned_abs()
@@ -29722,10 +29798,14 @@ mod p1_kani_proofs {
         if band == 0 && within {
             assert_eq!(exec, reference);
         }
-        // Soundness vs the real-number definition |exec-ref|/ref <= band/1e4.
+        // Soundness: |exec-ref| <= ceil(ref*band/1e4) (the edge rounds out to the next atom) ...
+        let diff = exec.abs_diff(reference) as u128;
         if within {
-            let diff = exec.abs_diff(reference) as u128;
-            assert!(diff * 10_000 <= reference as u128 * band as u128);
+            assert!(diff * 10_000 <= reference as u128 * band as u128 + 9_999);
+        }
+        // ... and completeness: every price inside the real-number band is accepted.
+        if reference != 0 && diff * 10_000 <= reference as u128 * band as u128 {
+            assert!(within);
         }
         // Monotone in band: widening never rejects a fill that was accepted.
         let wider: u16 = kani::any();
@@ -29751,6 +29831,7 @@ mod p1_kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn kani_p1_exposure_cap_monotone_no_overflow() {
         // Bounded (u32 equity / price, u16-range k) so the solver stays tractable: the u128
         // multiply-divide at full u64 width did not finish in 50 min. Overflow saturation is
@@ -29760,8 +29841,17 @@ mod p1_kani_proofs {
         let e2: u32 = kani::any();
         let k1: u16 = kani::any();
         let k2: u16 = kani::any();
-        let price: u32 = kani::any();
-        let (k1, k2, price) = (k1 as u32, k2 as u32, price as u64);
+        // Price drawn from a representative concrete set (symbolic u128 division by a symbolic
+        // divisor is what made this intractable); equity and k stay fully symbolic.
+        let sel: u8 = kani::any();
+        let price: u64 = match sel % 5 {
+            0 => 0,
+            1 => 1,
+            2 => 100,
+            3 => 1_000_000,
+            _ => u32::MAX as u64,
+        };
+        let (k1, k2) = (k1 as u32, k2 as u32);
         kani::assume(e1 <= e2 && k1 <= k2);
         let c1 = p1::lp_exposure_cap_q(e1 as u128, k1, price, 1_000_000);
         let c2 = p1::lp_exposure_cap_q(e2 as u128, k2, price, 1_000_000);
@@ -29783,6 +29873,7 @@ mod p1_kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn kani_p1_exposure_cap_saturates_monotone() {
         let equity: u128 = kani::any();
         let k: u32 = kani::any();
@@ -30057,6 +30148,30 @@ mod p1_kani_proofs {
         assert!(la == fa as u128 && lb == fb as u128 && lz == 0);
         kani::cover!(lp > 0 && ba == owed as u128, "LP credited beyond the base");
         kani::cover!(lp == 0 && ba + bb < owed as u128, "shortfall: everything goes to the base");
+    }
+
+
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn kani_p1_cap_fast_path_matches_division() {
+        let abs_q: u32 = kani::any();
+        let equity: u32 = kani::any();
+        let k: u16 = kani::any();
+        let sel: u8 = kani::any();
+        let price: u64 = match sel % 4 {
+            0 => 1,
+            1 => 100,
+            2 => 1_000_000,
+            _ => u32::MAX as u64,
+        };
+        let fast = p1::exposure_within_cap_fast(abs_q as u128, equity as u128, k as u32, price, 1_000_000);
+        let cap = p1::lp_exposure_cap_q(equity as u128, k as u32, price, 1_000_000);
+        // No overflow at these widths, and the division-free form is exactly `abs <= cap`.
+        assert!(fast.is_some());
+        assert_eq!(fast.unwrap(), (abs_q as u128) <= cap);
+        assert_eq!(p1::exposure_within_cap_fast(1, 1, 1, 0, 1_000_000), None);
+        kani::cover!(fast == Some(true) && abs_q > 0, "within cap");
+        kani::cover!(fast == Some(false), "over cap");
     }
 
 }
