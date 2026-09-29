@@ -752,9 +752,12 @@ fn indep_p3_h1_senior_exit_needs_no_marketauth_or_trader_cooperation() {
     for p in [tp, w.lp] {
         let (pid, seq, ep) = w.env.portfolio_identity(p);
         let m = w.env.market;
+        // P3 e8366978 (F-4 fix): in Resolved mode anyone may deregister an EMPTY portfolio if
+        // optional account [3] is its owner (rent returns there). Older builds ignore [3].
+        let owner = Pubkey::new_from_array(w.env.portfolio_state(p).owner);
         let r = w.send(
             ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
-            vec![AccountMeta::new(stranger.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
+            vec![AccountMeta::new(stranger.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(owner, false)],
             &[&stranger],
         );
         eprintln!("stranger ClosePortfolio -> {:?}", r.as_ref().map_err(|e| code(e)));
