@@ -1232,6 +1232,9 @@ pub mod error {
         /// Crank tag 78 first (on a bound vault with no senior shares it credits the junior),
         /// so the first depositor cannot buy the pre-existing backlog at 1:1.
         VaultLpHarvestPending,
+        /// P3-L2: the vault LP holds inventory and its health certificate is not current, so the
+        /// vault cannot be valued. Prepend a permissionless crank (tag 5) of the vault LP.
+        VaultLpValuationStale,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -15751,6 +15754,7 @@ pub mod processor {
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
+        let mut rent_to_owner = false;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -15783,9 +15787,24 @@ pub mod processor {
             let owner_signed = portfolio.header.owner == closer.key.to_bytes();
             let terminal_marketauth_cleanup =
                 group.header.mode == 1 && live_authority_matches(&cfg.marketauth, closer.key);
-            if !owner_signed && !terminal_marketauth_cleanup {
+            // Sieve F-4 (pre-existing on 6377376a, #377): Resolved-mode Earn redemption needs a
+            // terminal-flat market, so ONE walked-away trader (or a burned marketauth) locked every
+            // Earn depositor. In Resolved mode ANYONE may deregister an EMPTY portfolio, provided
+            // the rent goes back to its OWNER (optional account [3], pinned to header.owner). The
+            // engine's own emptiness predicate (`is_empty_for_dematerialization`) still refuses
+            // any capital/pnl/leg/close-progress or an unfinalized resolved payout receipt, so no
+            // claim can be destroyed.
+            let permissionless_resolved_cleanup = !owner_signed
+                && !terminal_marketauth_cleanup
+                && group.header.mode == 1
+                && accounts
+                    .get(3)
+                    .map(|d| d.key.to_bytes() == portfolio.header.owner)
+                    .unwrap_or(false);
+            if !owner_signed && !terminal_marketauth_cleanup && !permissionless_resolved_cleanup {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            rent_to_owner = permissionless_resolved_cleanup;
             portfolio
                 .validate_with_market(&group.as_view())
                 .map_err(map_v16_error)?;
@@ -15793,7 +15812,13 @@ pub mod processor {
                 .deregister_empty_materialized_portfolio_not_atomic(&portfolio.as_view())
                 .map_err(map_v16_error)?;
         }
-        close_portfolio_account_to_market_slab(portfolio_ai, closer)?;
+        if rent_to_owner {
+            let owner_dest = account(accounts, 3)?;
+            expect_writable(owner_dest)?;
+            close_portfolio_account_to_market_slab(portfolio_ai, owner_dest)?;
+        } else {
+            close_portfolio_account_to_market_slab(portfolio_ai, closer)?;
+        }
         Ok(())
     }
 
@@ -24487,7 +24512,7 @@ pub mod processor {
         // it. This is the only correct split; see lp_vault_design.md §5.2 Note 3.
         let (atoms, principal_portion, earnings_portion) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let (cfg_nav, group) = state::market_view_mut(&mut market_data)?;
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let ledger_data = ledger_ai.try_borrow_data()?;
             let (mut ledger, _) = read_or_new_backing_domain_ledger(
@@ -24521,10 +24546,15 @@ pub mod processor {
             let (atoms_out, principal_out) = if let Some((_, Some(lp_ai), st)) =
                 bound_tail.as_ref()
             {
-                // P3: payout = floor(shares * senior / S), senior = min(V, C). Harvestable fees
-                // are excluded on BOTH sides, exactly as the unbound path excludes them from
-                // `nav` (#411 prices them only into deposits). The LP is valued only when backing
-                // alone does not cover C.
+                // P3-K1: pending (harvestable) LP fees belong to every current holder, so a
+                // redeemer must not leave without its share — and paying it before the crank
+                // would pay out atoms that are not yet in backing. Require the harvest first
+                // (bundle tag 78 before 77 in the same transaction).
+                if lp_vault_harvestable_fee_atoms(&cfg_nav, &group)? != 0 {
+                    return Err(PercolatorError::VaultLpHarvestPending.into());
+                }
+                // P3: payout = floor(shares * senior / S), senior = min(V, C). The LP is valued
+                // only when backing alone does not cover C.
                 let senior_claim = st.senior_claim_atoms;
                 let senior_value = if nav >= senior_claim {
                     senior_claim
@@ -25715,7 +25745,7 @@ pub mod processor {
             )
             .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into());
         }
-        Err(PercolatorError::EngineStale.into())
+        Err(PercolatorError::VaultLpValuationStale.into())
     }
 
     /// Read-only access to a portfolio's engine header, for the NAV-pricing paths (75/77) where

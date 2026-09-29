@@ -1764,3 +1764,243 @@ fn p3_l1_genesis_depositor_cannot_buy_the_fee_backlog() {
     assert_eq!(env.registry_state().total_lp_shares_outstanding, 10_000_000, "1:1 genesis");
     env.assert_conserved("L1 genesis");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Security final pass (Sentinel, 2026-09-29 late): settle-order independence, F-4 resolved
+// cleanup, K1 pending fees, L2 stale valuation.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn trader_close_resolved(&mut self, t: &Trader) -> u64 {
+        let dest = self.token_account(self.mint, t.kp.pubkey(), 0);
+        self.svm.expire_blockhash();
+        let kp = t.kp.insecure_clone();
+        self.send(
+            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            vec![
+                AccountMeta::new(t.kp.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(t.portfolio, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault_token, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(
+                    Pubkey::find_program_address(&[b"nft_registry", self.market.as_ref()], &self.pid).0,
+                    false,
+                ),
+            ],
+            &[&kp],
+        )
+        .expect("trader close resolved");
+        let got = self.tok(dest);
+        self.paid_out += got as u128;
+        got
+    }
+
+    /// Tag 8 by a STRANGER in Resolved mode, rent to the portfolio's owner (F-4 path).
+    fn permissionless_close_portfolio(&mut self, portfolio: Pubkey, owner: Pubkey) -> Result<(), String> {
+        let stranger = Keypair::new();
+        self.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+        let (pid_, seq, epoch) = self.identity(portfolio);
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::ClosePortfolio {
+                portfolio_id: pid_,
+                expected_sequence: seq,
+                position_epoch: epoch,
+            },
+            vec![
+                AccountMeta::new(stranger.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(owner, false),
+            ],
+            &[&stranger],
+        )
+    }
+}
+
+/// Runs a resolved market with a trader who WON against the vault LP, settling the vault LP
+/// either before or after the trader's own resolved close. Returns (junior payout, trader
+/// payout, senior redemption payout, backing nav after both closes).
+fn settle_order_run(settle_first: bool) -> (u64, u64, u64, u128) {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 50_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let t = env.new_trader(10_000_000);
+    env.trade(&t, &lp, 10 * POS).expect("open long vs vault LP");
+    env.move_price(1_100_000, &[lp.portfolio, t.portfolio]);
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let stranger = Keypair::new();
+    // A winner's resolved close is progress-only (payout 0) until its losing counterparty has
+    // settled, so "trader first" means: trader close (progress) -> vault LP settle -> trader close
+    // again. Every call's payout is summed; the comparison is on final outcomes.
+    let mut tr = 0u64;
+    if settle_first {
+        env.settle_resolved(&stranger, lp.portfolio, 0, junior_dest).expect("settle first");
+    } else {
+        tr += env.trader_close_resolved(&t);
+        env.settle_resolved(&stranger, lp.portfolio, 0, junior_dest).expect("settle second");
+    }
+    for _ in 0..3 {
+        let p = env.portfolio(t.portfolio);
+        if p.capital == 0 && p.pnl == 0 {
+            break;
+        }
+        tr += env.trader_close_resolved(&t);
+    }
+    let (junior, trader) = (env.tok(junior_dest), tr);
+    env.paid_out += junior as u128;
+    let tp = env.portfolio(t.portfolio);
+    println!(
+        "settle_first={settle_first}: trader after close cap {} pnl {} bitmap_empty {} receipt {:?}",
+        tp.capital,
+        tp.pnl,
+        percolator::active_bitmap_is_empty(tp.active_bitmap),
+        tp.resolved_payout_receipt
+    );
+    let nav = env.backing_nav();
+    env.assert_conserved("after both resolved closes");
+    // F-4: nobody's signature needed to reach terminal-flat.
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
+    let towner = t.kp.pubkey();
+    env.permissionless_close_portfolio(t.portfolio, towner).expect("cleanup trader");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    let senior = env.earn_execute(&d, Some(lp.portfolio)).expect("resolved redemption");
+    env.assert_conserved("after resolved redemption");
+    (junior, trader, senior, nav)
+}
+
+/// Sentinel settle-order question: tag 101 reads backing at settle time — the outcome must not
+/// depend on whether a winning trader's resolved close runs before or after it.
+#[test]
+fn p3_settle_order_does_not_change_anyones_outcome() {
+    let a = settle_order_run(true);
+    let b = settle_order_run(false);
+    println!("P3 settle-order: settle-first {a:?} | trader-first {b:?}");
+    assert_eq!(a, b, "junior / trader / senior / backing must be order-independent");
+    assert!(a.1 > 10_000_000, "the trader won ({})", a.1);
+    assert_eq!(a.3, 50_000_000, "senior backing untouched by the trader's win");
+}
+
+/// F-4 PoC: before the fix, a trader who never closes (or whose owner key is gone) blocked every
+/// Earn redemption after Resolve (`ExecuteRedemption` -> Custom(21) until terminal-flat). Now a
+/// stranger can CloseResolved (permissionless after the delay) and deregister the empty portfolio.
+#[test]
+fn p3_f4_walked_away_trader_cannot_lock_earn_after_resolve() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    let walked_away = env.new_trader(1_000_000); // funded, never acts again
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("vault LP cleanup");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    // Still locked by the walked-away trader's live portfolio:
+    err_has(&env.earn_execute(&d, Some(lp.portfolio)), PercolatorError::EngineLockActive);
+    // A stranger cannot close a NON-empty portfolio...
+    let wowner = walked_away.kp.pubkey();
+    err_has(
+        &env.permissionless_close_portfolio(walked_away.portfolio, wowner),
+        PercolatorError::EngineLockActive,
+    );
+    // ...nor redirect the rent of an empty one away from its owner.
+    // (the resolved close below is permissionless: owner is not required to sign)
+    let dest = env.token_account(env.mint, wowner, 0);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+        vec![
+            AccountMeta::new_readonly(wowner, false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(walked_away.portfolio, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault_token, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(
+                Pubkey::find_program_address(&[b"nft_registry", env.market.as_ref()], &env.pid).0,
+                false,
+            ),
+        ],
+        &[],
+    )
+    .expect("permissionless resolved close pays the OWNER");
+    env.paid_out += env.tok(dest) as u128;
+    assert_eq!(env.tok(dest), 1_000_000);
+    let thief = Pubkey::new_unique();
+    err_has(&env.permissionless_close_portfolio(walked_away.portfolio, thief), PercolatorError::Unauthorized);
+    let owner_lamports_before = env.svm.get_account(&wowner).map(|a| a.lamports).unwrap_or(0);
+    env.permissionless_close_portfolio(walked_away.portfolio, wowner).expect("cleanup, rent to owner");
+    assert!(env.svm.get_account(&wowner).unwrap().lamports > owner_lamports_before, "rent went to the owner");
+    let paid = env.earn_execute(&d, Some(lp.portfolio)).expect("Earn redeems after permissionless cleanup");
+    println!("P3 F-4: Earn redeemed {paid} after permissionless cleanup");
+    assert!(paid > 0);
+    env.assert_conserved("F-4");
+}
+
+/// K1 PoC: a bound redemption refuses while LP fees are harvestable (the redeemer would leave
+/// without its share of fees it carried), and succeeds once tag 78 has run.
+#[test]
+fn p3_k1_bound_redemption_requires_harvest_first() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.svm.expire_blockhash();
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    err_has(&env.earn_execute(&d, Some(lp.portfolio)), PercolatorError::VaultLpHarvestPending);
+    let c0 = env.vlp().senior_claim_atoms;
+    env.crank_fees(true).expect("harvest");
+    let c1 = env.vlp().senior_claim_atoms;
+    let s = env.registry_state().total_lp_shares_outstanding;
+    let paid = env.earn_execute(&d, Some(lp.portfolio)).expect("redeem after harvest");
+    println!("P3 K1: C {c0} -> {c1} after harvest, paid {paid}");
+    assert!(c1 > c0);
+    assert_eq!(paid as u128, shares * c1 / s, "redeemer gets its share of the harvested fees");
+    env.assert_conserved("K1");
+}
+
+/// L2: when backing alone does not cover C and the vault LP holds inventory with a stale
+/// certificate, the pricing paths return the dedicated VaultLpValuationStale (not a generic
+/// EngineStale) and succeed once the permissionless crank of the vault LP is prepended.
+#[test]
+fn p3_l2_stale_vault_lp_valuation_has_a_clear_error_and_crank_fixes_it() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let t = env.new_trader(10_000_000);
+    env.trade(&t, &lp, 5 * POS).expect("vault LP takes inventory");
+    // STATE POKE (see poke_senior_claim): C above backing so the LP must be valued.
+    poke_senior_claim(&mut env, 12_000_000);
+    // Move the price without cranking the vault LP: its certificate goes stale.
+    let tp = t.portfolio;
+    env.move_price(1_010_000, &[tp]);
+    let d2 = env.new_depositor();
+    err_has(&env.earn_deposit(&d2, 1_000_000, Some(lp.portfolio)), PercolatorError::VaultLpValuationStale);
+    env.svm.expire_blockhash();
+    env.crank(lp.portfolio).expect("prepend the vault LP crank");
+    env.earn_deposit(&d2, 1_000_000, Some(lp.portfolio)).expect("deposit once the vault LP is current");
+    env.assert_conserved("L2");
+}
