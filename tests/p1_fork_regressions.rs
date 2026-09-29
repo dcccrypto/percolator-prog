@@ -28,7 +28,7 @@
 //! behaviour.
 
 use litesvm::LiteSVM;
-use percolator::{SideModeV16, SideV16};
+use percolator::SideModeV16;
 use percolator_prog::{
     constants::KIND_PORTFOLIO,
     ix::Instruction as ProgInstruction,
@@ -58,7 +58,6 @@ const MATCHER_SO_SHA256: &str = "659eaf9dfd90e7253154a621fa98f3664df95179860cbef
 const ASSET: u16 = 0;
 
 // Wrapper error ordinals (PercolatorError -> Custom(n)).
-const E_ENGINE_STALE: u32 = 19;
 const E_LOCK_ACTIVE: u32 = 21;
 const E_INSUFFICIENT_IM: u32 = 49;
 const E_SAME_OWNER: u32 = 67;
@@ -192,7 +191,6 @@ struct Env {
     svm: LiteSVM,
     payer: Keypair,
     slab: Pubkey,
-    which: Bytes,
     label: String,
 }
 
@@ -215,7 +213,6 @@ fn env(fx: &Fixture, which: Bytes) -> Env {
         svm,
         payer,
         slab: fx.slab,
-        which,
         label: format!("{}/{:?}", fx.name, which),
     }
 }
@@ -356,9 +353,6 @@ impl Env {
         (p.capital, p.pnl, p.fee_credits)
     }
 
-    fn req_id(&self) -> u64 {
-        state::next_market_matcher_req_id(&self.data(&self.slab)).unwrap()
-    }
 
     fn dump(&self, fx: &Fixture) {
         let md = self.data(&self.slab);
@@ -397,12 +391,6 @@ impl Env {
     }
 }
 
-fn custom_code(r: &Result<(), TransactionError>) -> Option<u32> {
-    match r {
-        Err(TransactionError::InstructionError(_, InstructionError::Custom(c))) => Some(*c),
-        _ => None,
-    }
-}
 
 fn show(label: &str, o: &Outcome) {
     eprintln!("--- {label}: {:?}", o.0);
@@ -462,6 +450,7 @@ fn short_mode(e: &Env) -> SideModeV16 {
 /// prepend, each asserted to land AND to change state (proof of life):
 ///   * tag 89 ExpireBackingBucket on every LAPSED Fresh bucket (`expiry_slot <= clock`)
 ///   * tag 45 FinalizeResetSide(short) when the short side is ResetPending.
+///
 /// Returns the list of repairs applied, for the report.
 fn apply_live_repairs(e: &mut Env) -> Vec<String> {
     let mut applied = Vec::new();
