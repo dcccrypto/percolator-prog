@@ -643,9 +643,17 @@ fn p1_fork_ansem_self_owned_taker() {
             Bytes::Candidate => {
                 expect_code(&grow, E_SAME_OWNER, "ANSEM candidate grow");
                 assert!(!matcher_invoked(&grow));
-                expect_code(&reduce, E_SAME_OWNER, "ANSEM candidate reduce");
-                assert!(!matcher_invoked(&reduce));
-                assert_eq!(e.svm.get_account(&lp).unwrap().data, reduce_snap.data, "candidate: LP untouched");
+                // Spec change (security review LOW, 2026-09-30): a same-owner / creator taker may
+                // CLOSE (reduce-only) -- the rule used to block exits. This sell only reduces the
+                // taker's long, so it now lands; opening/growing (above) is still refused.
+                let _ = reduce_snap;
+                expect_ok(&reduce, "ANSEM candidate reduce-only close by the creator's trader");
+                assert_eq!(e.pos(&lp), lp_before + unit(), "candidate: reduce-only close moved the LP");
+                assert_eq!(e.pos(&t), -lp_before - unit(), "candidate: reduce-only close moved the taker");
+                // A same-owner request that would FLIP the taker (sell more than its long) is refused.
+                let flip = e.trade_cpi(&t, &lp, -(e.pos(&t) + unit()));
+                expect_code(&flip, E_SAME_OWNER, "ANSEM candidate same-owner flip");
+                assert!(!matcher_invoked(&flip));
             }
         }
     }

@@ -9362,6 +9362,22 @@ pub mod risk_limits_v17 {
         }
     }
 
+    /// Item 2 exemption: a position change is REDUCE-ONLY iff it ends flat, or keeps the same
+    /// side with no larger magnitude (no flip, no growth). Same-owner / creator trades are
+    /// allowed when they only close (security review, LOW: the rule used to block closes).
+    pub fn position_change_reduce_only(before_q: i128, after_q: i128) -> bool {
+        after_q == 0
+            || (before_q != 0
+                && (before_q > 0) == (after_q > 0)
+                && after_q.unsigned_abs() <= before_q.unsigned_abs())
+    }
+
+    /// Item 5 on the routes that cannot clip (BatchTradeCpi, TradeNoCpi, BatchTradeNoCpi): a
+    /// floored LP's requested move is admissible iff it does not grow the LP's magnitude.
+    pub fn floored_lp_move_allowed(before_q: i128, after_q: i128) -> bool {
+        !lp_risk_increasing(before_q, after_q)
+    }
+
     /// Item 3 (second half): protocol side-OI cap. `stored == 0` => the engine's own global
     /// `MAX_OI_SIDE_Q` (no behaviour change until the protocol sets a tighter cap).
     pub fn effective_side_oi_cap_q(stored: u128, engine_max_oi_side_q: u128) -> u128 {
@@ -12101,10 +12117,9 @@ pub mod processor {
         account_a_backing_fee_cap_bps: Option<u16>,
         account_b_backing_fee_cap_bps: Option<u16>,
         max_market_slots: usize,
-        // P1: true on the matcher-routed CPI routes, where account_b is the matcher LP and
-        // the LP exposure cap + floor/auto-halt apply to it. False on TradeNoCpi (both owners
-        // sign; there is no LP role).
-        lp_limits: bool,
+        // P1: which sides are matcher LPs (LP exposure cap + floor/auto-halt apply to them) and
+        // whether this is a matcher-routed CPI trade. See `P1TradeRoles`.
+        roles: P1TradeRoles,
     ) -> ProgramResult {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
@@ -12143,13 +12158,6 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
-            // P1 item 2: no trading against a matcher LP you own. Compared on the portfolio
-            // HEADERS (not the caller-passed keys), so the NFT-holder taker path is judged on
-            // the same fact. Scoped to the matcher-routed CPI routes (`lp_limits`): on
-            // TradeNoCpi both owners sign the fill themselves and there is no LP role.
-            if lp_limits {
-                ensure_distinct_trade_owners(&account_a, &account_b)?;
-            }
             let size_abs = if size_q == i128::MIN || size_q == 0 {
                 return Err(PercolatorError::InvalidInstruction.into());
             } else {
@@ -12161,6 +12169,18 @@ pub mod processor {
                 signed_position_for_asset_view(&group, &account_a, asset_index as usize)?;
             let account_b_position =
                 signed_position_for_asset_view(&group, &account_b, asset_index as usize)?;
+            // P1 item 5, pre-execute: a floored LP side may not grow, on EVERY route (named
+            // `LpFloorHalt` before the engine's own IM gate could answer Custom(49)).
+            p1_pre_execute_floor_check_view(
+                &group,
+                &account_a,
+                &account_b,
+                asset_index as usize,
+                account_a_position,
+                account_b_position,
+                size_q,
+                roles,
+            )?;
             // FIX (ADOPT upstream 06192caa/7a050c25, "canonical zero-move funding
             // accrual", adapted -- Wave-1 S4): settle any owed stationary-premium
             // funding on THIS asset before the engine applies the position change
@@ -12306,15 +12326,17 @@ pub mod processor {
             ensure_trade_side_oi_cap_view(&group, asset_index as usize)?;
             // P1 item 3: protocol per-asset side-OI cap (tag 93), growth-only.
             ensure_protocol_side_oi_cap_view(&group, asset_index as usize, oi_before)?;
-            // P1 items 3 + 5: LP exposure cap and floor/auto-halt on the matcher LP.
-            if lp_limits {
-                ensure_lp_limits_after_fill_view(
-                    &group,
-                    &account_b,
-                    asset_index as usize,
-                    account_b_position,
-                )?;
-            }
+            // P1 items 2, 3, 5 post-fill: LP exposure cap + floor on every LP side (any route),
+            // and the same-owner rule (reduce-only exemption).
+            p1_post_fill_checks_view(
+                &group,
+                &account_a,
+                &account_b,
+                asset_index as usize,
+                account_a_position,
+                account_b_position,
+                roles,
+            )?;
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
             // counterparty-backed liens need this landing-time check; insurance-backed liens
@@ -12631,7 +12653,7 @@ pub mod processor {
             legs,
             max_market_slots,
             None,
-            false,
+            P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
         )
     }
 
@@ -12655,8 +12677,8 @@ pub mod processor {
         // `Some(max_fee_atoms)` for `BatchTradeCpi`, where an external matcher's per-leg returns
         // otherwise decide the charged aggregate unilaterally.
         max_account_a_fee_atoms: Option<u128>,
-        // P1: see `handle_trade_nocpi_zero_copy`'s `lp_limits`.
-        lp_limits: bool,
+        // P1: see `handle_trade_nocpi_zero_copy`'s `roles`.
+        roles: P1TradeRoles,
     ) -> ProgramResult {
         if legs.is_empty() {
             return Err(PercolatorError::EngineNonProgress.into());
@@ -12695,10 +12717,6 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
-            // P1 item 2 (BatchTradeCpi only; see the single-trade executor).
-            if lp_limits {
-                ensure_distinct_trade_owners(&account_a, &account_b)?;
-            }
 
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
@@ -12802,6 +12820,17 @@ pub mod processor {
                             account_b_position,
                             -leg.size_q,
                         )?;
+                // P1 item 5, pre-execute, per leg (see the single-trade executor).
+                p1_pre_execute_floor_check_view(
+                    &group,
+                    &account_a,
+                    &account_b,
+                    asset_index,
+                    account_a_position,
+                    account_b_position,
+                    leg.size_q,
+                    roles,
+                )?;
                 leg_ctx.push((
                     asset_index,
                     oracle_profile,
@@ -12919,10 +12948,10 @@ pub mod processor {
             for (i, request) in requests.iter().enumerate() {
                 ensure_protocol_side_oi_cap_view(&group, request.asset_index, oi_before_legs[i])?;
             }
-            if lp_limits {
-                for ctx in &leg_ctx {
-                    ensure_lp_limits_after_fill_view(&group, &account_b, ctx.0, ctx.5)?;
-                }
+            for ctx in &leg_ctx {
+                p1_post_fill_checks_view(
+                    &group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles,
+                )?;
             }
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
@@ -13199,7 +13228,7 @@ pub mod processor {
             Some(backing_fee_cap_bps),
             Some(backing_fee_cap_bps),
             max_market_slots,
-            false,
+            P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
         )
     }
 
@@ -13901,35 +13930,22 @@ pub mod processor {
         let lp_account_id = matcher_lp_account_id(&delegate);
         let (_, _, max_market_slots_pre, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        ensure_cpi_trade_portfolios_current_before_matcher(
+        // Portfolio-currency preflight + ALL P1 pre-matcher gates in ONE market/portfolio view
+        // pass (CU): item 2 same-owner (taker != LP owner, taker != asset_admin), item 5 floor
+        // halt, item 4 headroom, item 1 band width. A floored LP refuses risk-increasing fills
+        // with `LpFloorHalt`; otherwise the request handed to the matcher is clipped to the LP's
+        // headroom under the exposure cap, so an over-headroom trade becomes a partial or a
+        // ZERO fill instead of reverting in the engine with Custom(49). By default the headroom
+        // travels as the request size itself (matcher 12bd671 rejects non-zero call bytes
+        // 43..67); `matcher_ext_mode = 1` also sends it in the P2 call extension.
+        let p1_pre = p1_cpi_preflight_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
             max_market_slots_pre,
             &[(asset_index, size_q)],
         )?;
-        // P1 item 2 (CPI): the taker may not be the LP's owner (also re-checked in the shared
-        // executor) nor the traded asset's creator (`asset_admin`), before the untrusted
-        // matcher is ever invoked.
-        if account_a_owner == account_b_owner
-            || (oracle_profile_pre.asset_admin != [0u8; 32]
-                && oracle_profile_pre.asset_admin == account_a_owner)
-        {
-            return Err(PercolatorError::SameOwnerTrade.into());
-        }
-        // P1 items 4 + 5: LP headroom. A floored LP refuses risk-increasing fills with
-        // `LpFloorHalt`; otherwise the request handed to the matcher is clipped to the LP's
-        // headroom under the exposure cap, so an over-headroom trade becomes a partial or a
-        // ZERO fill instead of reverting in the engine with Custom(49). The matcher ABI's
-        // reserved bytes 43..67 are NOT used: matcher 12bd671 `MatcherCall::parse` rejects any
-        // non-zero byte there, so the headroom travels as the request size itself.
-        let lp_headroom_q = lp_trade_headroom_before_matcher(
-            market_ai,
-            account_b_ai,
-            max_market_slots_pre,
-            asset_index as usize,
-            size_q,
-        )?;
+        let lp_headroom_q = p1_pre[0].headroom_q;
         let size_q = if size_q.unsigned_abs() > lp_headroom_q {
             // lp_headroom_q < |size_q| <= i128::MAX, so the cast is lossless.
             let clipped = lp_headroom_q as i128;
@@ -13945,15 +13961,11 @@ pub mod processor {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
             return Ok(());
         }
-        let call_ext = {
-            let limits =
-                state::read_asset_risk_limits(&market_ai.try_borrow_data()?, asset_index as usize)?;
-            risk_limits_v17::encode_matcher_call_ext(
-                limits.matcher_ext_mode,
-                oracle_profile_pre.last_good_oracle_slot,
-                lp_headroom_q,
-            )
-        };
+        let call_ext = risk_limits_v17::encode_matcher_call_ext(
+            p1_pre[0].matcher_ext_mode,
+            oracle_profile_pre.last_good_oracle_slot,
+            lp_headroom_q,
+        );
 
         invoke_matcher(
             matcher_prog,
@@ -14001,12 +14013,7 @@ pub mod processor {
         }
         // P1 item 1: `limit_price == 0` no longer means "any price" -- every matcher fill must
         // sit inside the protocol band around the price the matcher was given.
-        ensure_matcher_exec_price_in_band(
-            market_ai,
-            asset_index as usize,
-            ret.exec_price_e6,
-            oracle_price,
-        )?;
+        ensure_matcher_exec_price_in_band(ret.exec_price_e6, oracle_price, p1_pre[0].band_bps)?;
         if ret.exec_size == 0 {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
             return Ok(());
@@ -14049,7 +14056,7 @@ pub mod processor {
             // only the matcher can authorize it, via `backing_fee_cap_bps()` on its CPI return.
             Some(ret.backing_fee_cap_bps()),
             max_market_slots,
-            true,
+            P1TradeRoles::for_cpi(account_a_ai)?,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -14652,19 +14659,6 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
 
-        // P1 item 2 (BatchTradeCpi): taker != LP owner, and taker != any leg asset's creator.
-        if account_a_owner == account_b_owner {
-            return Err(PercolatorError::SameOwnerTrade.into());
-        }
-        {
-            let market_data = market_ai.try_borrow_data()?;
-            for &asset_index in &asset_indices {
-                let profile = state::read_asset_oracle_profile(&market_data, asset_index as usize)?;
-                if profile.asset_admin != [0u8; 32] && profile.asset_admin == account_a_owner {
-                    return Err(PercolatorError::SameOwnerTrade.into());
-                }
-            }
-        }
         let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
 
@@ -14680,26 +14674,17 @@ pub mod processor {
         }
         let (_, _, max_market_slots_pre, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        ensure_cpi_trade_portfolios_current_before_matcher(
+        // Same single-pass P1 preflight as TradeCpi (item 2 same-owner incl. every leg's
+        // asset_admin, item 5 floor halt per leg -> the NAMED `LpFloorHalt` rather than the
+        // engine's Custom(49) from inside the batch execute, band width per leg). No clip -- a
+        // batch is atomic; the post-fill cap check still runs.
+        let p1_pre = p1_cpi_preflight_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
             max_market_slots_pre,
             &cpi_requests,
         )?;
-        // P1 item 5 (BatchTradeCpi): pre-matcher floor/auto-halt per leg, same predicate as
-        // TradeCpi, so a floored LP is refused with the NAMED `LpFloorHalt` (not the engine's
-        // Custom(49) from inside the batch execute) and a flip past flat is refused on both
-        // routes alike. No clip here -- a batch is atomic; the post-fill cap check still runs.
-        for leg in legs {
-            lp_trade_headroom_before_matcher(
-                market_ai,
-                account_b_ai,
-                max_market_slots_pre,
-                leg.asset_index as usize,
-                leg.size_q,
-            )?;
-        }
 
         invoke_matcher_batch(
             matcher_prog,
@@ -14765,12 +14750,7 @@ pub mod processor {
                 }
             }
             // P1 item 1 (BatchTradeCpi), per leg, against that leg's matcher reference price.
-            ensure_matcher_exec_price_in_band(
-                market_ai,
-                leg.asset_index as usize,
-                ret.exec_price_e6,
-                oracle_prices[i],
-            )?;
+            ensure_matcher_exec_price_in_band(ret.exec_price_e6, oracle_prices[i], p1_pre[i].band_bps)?;
             let leg_slippage_atoms =
                 adverse_trade_slippage_atoms(ret.exec_size, ret.exec_price_e6, oracle_prices[i])?;
             aggregate_slippage_atoms = accumulate_with_cap(
@@ -14808,7 +14788,7 @@ pub mod processor {
             &exec_legs,
             max_market_slots,
             Some(max_fee_atoms),
-            true,
+            P1TradeRoles::for_cpi(account_a_ai)?,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -25574,41 +25554,6 @@ pub mod processor {
     /// `TradeCpi`/`BatchTradeCpi` reached the 2N stale-leg settlement cliff even for an asset the
     /// portfolio already holds -- the case the `TradeNoCpi` route has refused since `9cc574ea`.
     /// The function is renamed to upstream's name so `git log -S` finds it on both trees.
-    fn ensure_cpi_trade_portfolios_current_before_matcher(
-        market_ai: &AccountInfo<'_>,
-        account_a_ai: &AccountInfo<'_>,
-        account_b_ai: &AccountInfo<'_>,
-        max_market_slots: usize,
-        cpi_requests: &[(u16, i128)],
-    ) -> ProgramResult {
-        ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
-        ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
-        let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(cpi_requests.len());
-        for &(asset_index, _) in cpi_requests {
-            requests.push(TradeRequestV16 {
-                asset_index: asset_index as usize,
-                size_q: 1,
-                exec_price: 1,
-                fee_bps: 0,
-            });
-        }
-        let mut market_data = market_ai.try_borrow_mut_data()?;
-        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
-        let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
-        let mut account_b_data = account_b_ai.try_borrow_mut_data()?;
-        let account_a =
-            state::portfolio_view_mut_for_market_slots(&mut account_a_data, max_market_slots)?;
-        let account_b =
-            state::portfolio_view_mut_for_market_slots(&mut account_b_data, max_market_slots)?;
-        ensure_cpi_trade_asset_lifecycle_before_matcher(
-            &group,
-            &account_a,
-            &account_b,
-            cpi_requests,
-        )?;
-        ensure_trade_portfolios_current_for_requests_view(&group, &account_a, &account_b, &requests)
-    }
-
     // FIX (ADOPT upstream 3496acf0, "enforce side OI caps with generated public
     // conformance" -- Wave-1 Track-A). The engine's `validate_asset_shape_for_view`
     // asserts `oi_eff_long_q`/`oi_eff_short_q` against `MAX_OI_SIDE_Q`, but that
@@ -25643,26 +25588,128 @@ pub mod processor {
     /// between the matcher call and the engine call, and the matcher could not have quoted
     /// against a price it never saw.)
     fn ensure_matcher_exec_price_in_band(
-        market_ai: &AccountInfo<'_>,
-        asset_index: usize,
         exec_price: u64,
         reference_price: u64,
+        band: u16,
     ) -> ProgramResult {
-        let limits = state::read_asset_risk_limits(&market_ai.try_borrow_data()?, asset_index)?;
-        let band = risk_limits_v17::effective_exec_band_bps(limits.exec_band_bps);
         if !risk_limits_v17::exec_price_within_band(exec_price, reference_price, band) {
             return Err(PercolatorError::ExecPriceOutsideOracleBand.into());
         }
         Ok(())
     }
 
-    /// Item 2. Portfolio owners must differ.
-    fn ensure_distinct_trade_owners(
+    /// P1 roles of the two portfolios in a trade.
+    ///
+    /// * `cpi`: matcher-routed (TradeCpi / BatchTradeCpi); account_b is the matcher LP.
+    /// * `a_is_lp` / `b_is_lp`: the portfolio currently has an ENABLED matcher registration.
+    ///   Security review (MEDIUM, "Sieve"): the LP cap and floor must protect an LP on EVERY
+    ///   route, or its owner (who signs both sides of a TradeNoCpi) bypasses them. Residual:
+    ///   an owner who first disables its matcher (SetMatcherConfig enabled=0) is no longer an
+    ///   LP for these rules -- but then it is also not quoting any taker.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct P1TradeRoles {
+        pub cpi: bool,
+        pub a_is_lp: bool,
+        pub b_is_lp: bool,
+    }
+
+    impl P1TradeRoles {
+        fn for_cpi(account_a_ai: &AccountInfo<'_>) -> Result<Self, ProgramError> {
+            Ok(Self {
+                cpi: true,
+                a_is_lp: portfolio_is_matcher_lp(account_a_ai)?,
+                b_is_lp: true,
+            })
+        }
+        fn for_nocpi(
+            account_a_ai: &AccountInfo<'_>,
+            account_b_ai: &AccountInfo<'_>,
+        ) -> Result<Self, ProgramError> {
+            Ok(Self {
+                cpi: false,
+                a_is_lp: portfolio_is_matcher_lp(account_a_ai)?,
+                b_is_lp: portfolio_is_matcher_lp(account_b_ai)?,
+            })
+        }
+    }
+
+    fn portfolio_is_matcher_lp(ai: &AccountInfo<'_>) -> Result<bool, ProgramError> {
+        let data = ai.try_borrow_data()?;
+        // NOT the matcher sequence: Deposit/Withdraw bump it on every portfolio.
+        Ok(state::read_portfolio_matcher_config(&data)?.enabled() == 1)
+    }
+
+    /// Item 5, pre-execute, every route: a floored LP side may not grow on this asset.
+    /// account_a moves by `+size_q`, account_b by `-size_q` (the executors' convention).
+    #[allow(clippy::too_many_arguments)]
+    fn p1_pre_execute_floor_check_view(
+        group: &state::MarketViewMutV16<'_>,
         account_a: &percolator::PortfolioV16ViewMut<'_>,
         account_b: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        position_a: i128,
+        position_b: i128,
+        size_q: i128,
+        roles: P1TradeRoles,
     ) -> ProgramResult {
-        if account_a.header.owner == account_b.header.owner {
-            return Err(PercolatorError::SameOwnerTrade.into());
+        let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
+        if roles.b_is_lp {
+            let after = position_b.checked_sub(size_q).ok_or_else(overflow)?;
+            let (floor, _) = lp_floor_and_cap_q_view(group, account_b, asset_index)?;
+            if floor && !risk_limits_v17::floored_lp_move_allowed(position_b, after) {
+                return Err(PercolatorError::LpFloorHalt.into());
+            }
+        }
+        if roles.a_is_lp {
+            let after = position_a.checked_add(size_q).ok_or_else(overflow)?;
+            let (floor, _) = lp_floor_and_cap_q_view(group, account_a, asset_index)?;
+            if floor && !risk_limits_v17::floored_lp_move_allowed(position_a, after) {
+                return Err(PercolatorError::LpFloorHalt.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Items 2, 3, 5 post-fill, every route.
+    /// * LP exposure cap + floor on each LP side (`ensure_lp_limits_after_fill_view`).
+    /// * Same-owner (portfolio HEADERS, so the NFT-holder path is judged on the same fact):
+    ///   when the owners are equal and a matcher LP is involved (CPI, or either side an LP),
+    ///   every non-LP side must be reduce-only (on CPI: the taker); if both sides are LPs, both.
+    #[allow(clippy::too_many_arguments)]
+    fn p1_post_fill_checks_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        position_a_before: i128,
+        position_b_before: i128,
+        roles: P1TradeRoles,
+    ) -> ProgramResult {
+        if roles.b_is_lp {
+            ensure_lp_limits_after_fill_view(group, account_b, asset_index, position_b_before)?;
+        }
+        if roles.a_is_lp {
+            ensure_lp_limits_after_fill_view(group, account_a, asset_index, position_a_before)?;
+        }
+        let lp_involved = roles.cpi || roles.a_is_lp || roles.b_is_lp;
+        if lp_involved && account_a.header.owner == account_b.header.owner {
+            let a_after = signed_position_for_asset_view(group, account_a, asset_index)?;
+            let b_after = signed_position_for_asset_view(group, account_b, asset_index)?;
+            let a_reduce = risk_limits_v17::position_change_reduce_only(position_a_before, a_after);
+            let b_reduce = risk_limits_v17::position_change_reduce_only(position_b_before, b_after);
+            let ok = if roles.cpi {
+                a_reduce
+            } else {
+                match (roles.a_is_lp, roles.b_is_lp) {
+                    (true, true) => a_reduce && b_reduce,
+                    (true, false) => b_reduce,
+                    (false, true) => a_reduce,
+                    (false, false) => true,
+                }
+            };
+            if !ok {
+                return Err(PercolatorError::SameOwnerTrade.into());
+            }
         }
         Ok(())
     }
@@ -25755,37 +25802,108 @@ pub mod processor {
         Ok((floor, cap))
     }
 
-    /// Item 4 + 5, TradeCpi pre-matcher: returns the LP's fill headroom (Q) in the direction
-    /// this request moves the LP, or `LpFloorHalt` when the request would grow a floored LP.
-    /// A halted LP can still be traded in its risk-REDUCING direction (headroom = flatten +
-    /// flip-within-cap is not granted; only reduction is -- the floor wins over the cap).
-    fn lp_trade_headroom_before_matcher(
+    /// Per-leg output of `p1_cpi_preflight_before_matcher`.
+    struct P1CpiLegPreflight {
+        /// LP fill headroom (Q) in the direction this leg moves the LP.
+        headroom_q: u128,
+        /// Effective exec-price band (bps) for this leg's asset.
+        band_bps: u16,
+        /// This leg's asset `matcher_ext_mode`.
+        matcher_ext_mode: u8,
+    }
+
+    /// TradeCpi / BatchTradeCpi pre-matcher: the existing portfolio-currency preflight
+    /// (`ensure_cpi_trade_portfolios_current_before_matcher`'s body, unchanged) PLUS every P1
+    /// pre-matcher gate, in ONE market + portfolio view pass (each view construction costs CU):
+    /// * item 2: taker owner != LP owner, and != any leg asset's non-zero `asset_admin`
+    ///   -> `SameOwnerTrade`;
+    /// * item 5: a floored LP may only be reduced -- pure growth -> `LpFloorHalt`; a request
+    ///   reducing THROUGH flat is clipped to flatten (Kani-lane finding P1-K1);
+    /// * item 4: LP headroom under the exposure cap (TradeCpi clips to it);
+    /// * item 1: the leg's effective band.
+    fn p1_cpi_preflight_before_matcher(
         market_ai: &AccountInfo<'_>,
+        account_a_ai: &AccountInfo<'_>,
         account_b_ai: &AccountInfo<'_>,
         max_market_slots: usize,
-        asset_index: usize,
-        size_q: i128,
-    ) -> Result<u128, ProgramError> {
+        cpi_requests: &[(u16, i128)],
+    ) -> Result<Vec<P1CpiLegPreflight>, ProgramError> {
+        ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
+        let mut requests: Vec<TradeRequestV16> = Vec::with_capacity(cpi_requests.len());
+        for &(asset_index, _) in cpi_requests {
+            requests.push(TradeRequestV16 {
+                asset_index: asset_index as usize,
+                size_q: 1,
+                exec_price: 1,
+                fee_bps: 0,
+            });
+        }
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (_cfg, group) = state::market_view_mut(&mut market_data)?;
-        let mut lp_data = account_b_ai.try_borrow_mut_data()?;
-        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
-        let before = signed_position_for_asset_view(&group, &lp, asset_index)?;
-        let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
-        let (floor, cap) = lp_floor_and_cap_q_view(&group, &lp, asset_index)?;
-        if floor {
-            // Only the reducing part (down to flat) is available to a floored LP. A request
-            // that can only GROW the LP (same direction, or LP flat) is refused with the named
-            // halt; a request that reduces THROUGH flat is clipped to flatten (Kani-lane
-            // finding P1-K1: refusing it outright blocked a legitimate reduce).
-            let reducing_room = risk_limits_v17::floored_lp_reducing_room_q(before, lp_delta_sign);
-            if reducing_room == 0 {
-                return Err(PercolatorError::LpFloorHalt.into());
+        let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
+        let mut account_b_data = account_b_ai.try_borrow_mut_data()?;
+        let account_a =
+            state::portfolio_view_mut_for_market_slots(&mut account_a_data, max_market_slots)?;
+        let account_b =
+            state::portfolio_view_mut_for_market_slots(&mut account_b_data, max_market_slots)?;
+        ensure_cpi_trade_asset_lifecycle_before_matcher(
+            &group,
+            &account_a,
+            &account_b,
+            cpi_requests,
+        )?;
+        ensure_trade_portfolios_current_for_requests_view(&group, &account_a, &account_b, &requests)?;
+        // ---- P1 gates ----
+        let owners_equal = account_a.header.owner == account_b.header.owner;
+        let taker_owner = account_a.header.owner;
+        let mut out = Vec::with_capacity(cpi_requests.len());
+        for &(asset_index, size_q) in cpi_requests {
+            let asset_index = asset_index as usize;
+            let market = group
+                .markets
+                .get(asset_index)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            // `asset_admin` only (raw 32-byte read; the profile was validated at preflight).
+            let profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(
+                market
+                    .wrapper
+                    .get(..constants::ASSET_ORACLE_PROFILE_LEN)
+                    .ok_or(PercolatorError::InvalidAccountLen)?,
+            );
+            let taker_is_creator =
+                profile.asset_admin != [0u8; 32] && profile.asset_admin == taker_owner;
+            if owners_equal || taker_is_creator {
+                // Item 2 with the reduce-only exemption: a same-owner / creator taker may only
+                // CLOSE (the requested size may not open, grow or flip the taker).
+                let taker_before = signed_position_for_asset_view(&group, &account_a, asset_index)?;
+                let taker_after = taker_before
+                    .checked_add(size_q)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                if !risk_limits_v17::position_change_reduce_only(taker_before, taker_after) {
+                    return Err(PercolatorError::SameOwnerTrade.into());
+                }
             }
-            let _ = size_q;
-            return Ok(reducing_room);
+            let limits = state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])?;
+            let before = signed_position_for_asset_view(&group, &account_b, asset_index)?;
+            let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
+            let (floor, cap) = lp_floor_and_cap_q_view(&group, &account_b, asset_index)?;
+            let headroom_q = if floor {
+                let room = risk_limits_v17::floored_lp_reducing_room_q(before, lp_delta_sign);
+                if room == 0 {
+                    return Err(PercolatorError::LpFloorHalt.into());
+                }
+                room
+            } else {
+                risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
+            };
+            out.push(P1CpiLegPreflight {
+                headroom_q,
+                band_bps: risk_limits_v17::effective_exec_band_bps(limits.exec_band_bps),
+                matcher_ext_mode: limits.matcher_ext_mode,
+            });
         }
-        Ok(risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap))
+        Ok(out)
     }
 
     fn ensure_trade_side_oi_cap_view(
@@ -29416,13 +29534,16 @@ mod p1_kani_proofs {
 
     #[kani::proof]
     fn kani_p1_exposure_cap_monotone_no_overflow() {
-        // Bounded to u64 equity so the solver stays fast; overflow saturation is covered by the
-        // full-width harness below.
-        let e1: u64 = kani::any();
-        let e2: u64 = kani::any();
-        let k1: u32 = kani::any();
-        let k2: u32 = kani::any();
-        let price: u64 = kani::any();
+        // Bounded (u32 equity / price, u16-range k) so the solver stays tractable: the u128
+        // multiply-divide at full u64 width did not finish in 50 min. Overflow saturation is
+        // covered by the full-width harness below; the Kani lane's exact-floor harness covers
+        // tightness.
+        let e1: u32 = kani::any();
+        let e2: u32 = kani::any();
+        let k1: u16 = kani::any();
+        let k2: u16 = kani::any();
+        let price: u32 = kani::any();
+        let (k1, k2, price) = (k1 as u32, k2 as u32, price as u64);
         kani::assume(e1 <= e2 && k1 <= k2);
         let c1 = p1::lp_exposure_cap_q(e1 as u128, k1, price, 1_000_000);
         let c2 = p1::lp_exposure_cap_q(e2 as u128, k2, price, 1_000_000);
@@ -29618,4 +29739,34 @@ mod p1_kani_proofs {
         kani::cover!(matches!(out, Some(t) if t > 0), "close refused, fees owed");
         kani::cover!(la > lw && iw <= ia, "fold moves a nonzero LP leg");
     }
+
+    #[kani::proof]
+    fn kani_p1_reduce_only_and_floored_move_rules() {
+        let before: i64 = kani::any();
+        let after: i64 = kani::any();
+        let (b, a) = (before as i128, after as i128);
+        let ro = p1::position_change_reduce_only(b, a);
+        // Characterization: reduce-only == ends flat, or same side with no larger magnitude.
+        let expect = a == 0 || (b != 0 && (b > 0) == (a > 0) && a.unsigned_abs() <= b.unsigned_abs());
+        assert_eq!(ro, expect);
+        // Reduce-only never grows risk (so it is also an admissible floored-LP move).
+        if ro {
+            assert!(!p1::lp_risk_increasing(b, a));
+            assert!(p1::floored_lp_move_allowed(b, a));
+        }
+        // A floored LP may never grow.
+        if p1::lp_risk_increasing(b, a) {
+            assert!(!p1::floored_lp_move_allowed(b, a));
+            assert!(!ro);
+        }
+        // Opening from flat is never reduce-only.
+        if b == 0 && a != 0 {
+            assert!(!ro);
+        }
+        kani::cover!(ro && a != 0, "partial close is reduce-only");
+        kani::cover!(ro && a == 0 && b != 0, "full close is reduce-only");
+        kani::cover!(!ro && b != 0 && (b > 0) != (a > 0) && a != 0, "flip is not reduce-only");
+        kani::cover!(!ro && !p1::lp_risk_increasing(b, a), "smaller flip: not reduce-only but not risk-increasing");
+    }
+
 }

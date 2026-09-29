@@ -355,7 +355,11 @@ impl Env {
 
     fn portfolio(&mut self, owner: &Keypair, deposit: u128) -> Pubkey {
         let portfolio = Pubkey::new_unique();
-        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        // Fund the owner once (LiteSVM airdrops reuse one signature, so a second airdrop to the
+        // same key is rejected as AlreadyProcessed).
+        if self.svm.get_balance(&owner.pubkey()).unwrap_or(0) == 0 {
+            self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        }
         self.svm
             .set_account(
                 portfolio,
@@ -1060,4 +1064,86 @@ fn p1_finding_batch_trade_cpi_depleted_lp_growth_reports_lp_floor_halt() {
         "refused either way: nothing mutates"
     );
     assert_err_code(&r, LP_FLOOR_HALT, "batch taker open against a depleted LP");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Security review MEDIUM ("Sieve", 2026-09-30): TradeNoCpi bypassed every P1 LP protection —
+// the LP's owner signs both sides of a bilateral trade. The cap / floor / same-owner rules now
+// apply to any side whose portfolio has an ENABLED matcher (`P1TradeRoles`), on every route.
+// PoC: run this file with `P1_WRAPPER_SO=<6066399f .so>` (== code at eb103309) -> these go RED.
+// ─────────────────────────────────────────────────────────────────────────────
+const SAME_OWNER: &str = "Custom(67)";
+
+#[test]
+fn p1_nocpi_lp_exposure_cap_applies_to_matcher_lp() {
+    let mut env = Env::new();
+    let trader = Keypair::new();
+    let trader_account = env.portfolio(&trader, 1_000_000);
+    let lp = env.lp(1_000);
+    // k = 0.5x -> cap 5 units (engine IM would allow 10), so the wrapper cap is what binds.
+    env.set_risk_limits(5_000, 0, 0);
+    // Proof of life: within cap the bilateral trade lands.
+    env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, 4 * Q)
+        .expect("NoCpi within the LP cap");
+    assert_eq!(env.pos(lp.account), -4 * Q);
+    let keys = [env.market, trader_account, lp.account];
+    let before = env.snapshot(&keys);
+    let r = env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, 2 * Q);
+    assert_err_code(&r, LP_EXPOSURE_CAP_EXCEEDED, "TradeNoCpi grows the matcher LP past its cap");
+    assert_eq!(env.snapshot(&keys), before, "refused NoCpi mutates nothing");
+    // Reducing the LP is always allowed.
+    env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, -2 * Q)
+        .expect("NoCpi reducing the LP");
+    assert_eq!(env.pos(lp.account), -2 * Q);
+}
+
+#[test]
+fn p1_nocpi_lp_floor_halts_growth_allows_reduction() {
+    let mut env = Env::new();
+    let trader = Keypair::new();
+    let trader_account = env.portfolio(&trader, 1_000_000);
+    let lp = env.lp(1_000);
+    env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, 3 * Q)
+        .expect("open LP -3 via NoCpi");
+    env.set_risk_limits(0, 2_000, 0); // floor above equity 1000
+    let keys = [env.market, trader_account, lp.account];
+    let before = env.snapshot(&keys);
+    let r = env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, Q);
+    assert_err_code(&r, LP_FLOOR_HALT, "TradeNoCpi grows a floored matcher LP");
+    assert_eq!(env.snapshot(&keys), before);
+    env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, -Q)
+        .expect("NoCpi reduction of a floored LP");
+    assert_eq!(env.pos(lp.account), -2 * Q);
+}
+
+#[test]
+fn p1_nocpi_same_owner_against_own_lp_only_closes() {
+    let mut env = Env::new();
+    let lp = env.lp(1_000_000);
+    // The LP's owner opens a trader portfolio of its own.
+    let own_trader = env.portfolio(&lp.owner, 1_000_000);
+    // Opening against the own LP via NoCpi is refused (was the bypass).
+    let keys = [env.market, own_trader, lp.account];
+    let before = env.snapshot(&keys);
+    let r = env.trade_nocpi(&lp.owner, own_trader, &lp.owner, lp.account, Q);
+    assert_err_code(&r, SAME_OWNER, "TradeNoCpi own trader vs own matcher LP (open)");
+    assert_eq!(env.snapshot(&keys), before);
+    // Give the own trader a position against an unrelated, non-LP counterparty (allowed: no LP).
+    let other = Keypair::new();
+    let other_account = env.portfolio(&other, 1_000_000);
+    env.trade_nocpi(&lp.owner, own_trader, &other, other_account, 2 * Q)
+        .expect("own trader vs unrelated non-LP portfolio");
+    // Closing (reduce-only) against the own LP is allowed on NoCpi ...
+    env.trade_nocpi(&lp.owner, own_trader, &lp.owner, lp.account, -Q)
+        .expect("reduce-only close against own LP via NoCpi");
+    assert_eq!(env.pos(own_trader), Q);
+    // ... and on TradeCpi (security review LOW: the rule used to block closes).
+    env.trade_cpi(&lp.owner, own_trader, &lp, -Q)
+        .expect("reduce-only close against own LP via TradeCpi");
+    assert_eq!(env.pos(own_trader), 0);
+    // A flip is not a close.
+    let before = env.snapshot(&keys);
+    let r = env.trade_cpi(&lp.owner, own_trader, &lp, -Q);
+    assert_err_code(&r, SAME_OWNER, "TradeCpi same-owner open from flat");
+    assert_eq!(env.snapshot(&keys), before);
 }
