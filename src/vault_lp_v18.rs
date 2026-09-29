@@ -40,7 +40,7 @@ pub fn bps_ceil(x: u128, bps: u16) -> Option<u128> {
         return None;
     }
     let rem = (x % BPS) * b;
-    Some((x / BPS) * b + rem / BPS + u128::from(rem % BPS != 0))
+    Some((x / BPS) * b + rem / BPS + u128::from(!rem.is_multiple_of(BPS)))
 }
 
 // ── Tranche waterfall ────────────────────────────────────────────────────────────────────────

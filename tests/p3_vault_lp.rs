@@ -161,6 +161,7 @@ struct Env {
     paid_out: u128,
 }
 
+#[allow(dead_code)]
 struct Lp {
     portfolio: Pubkey,
     owner_key: Pubkey,
@@ -705,6 +706,7 @@ impl Env {
         )
     }
 
+    #[allow(dead_code)]
     fn convert_pnl(&mut self, lp: Pubkey, amount: u128) -> Result<(), String> {
         let payer_key = self.payer.pubkey();
         self.send(

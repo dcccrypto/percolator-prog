@@ -25060,6 +25060,7 @@ mod p3_vault_lp_skew {
 
     pub(super) const P3_PRICE: u64 = 1_000_000;
 
+    #[allow(dead_code)]
     pub(super) struct P3 {
         pub env: V16CuEnv,
         pub matcher_program: Pubkey,
@@ -25315,7 +25316,7 @@ mod p3_vault_lp_skew {
         let nonprogress = format!("Custom({})", PercolatorError::EngineNonProgress as u32);
         // With nothing to accrue (skew off, mark == index) the engine refuses a crank as
         // NonProgress — that refusal IS the "nothing moved" evidence; anything else is a bug.
-        let mut crank_ok = |p: &mut P3, a: Pubkey, slot: u64| match try_crank_at(p, a, slot) {
+        let crank_ok = |p: &mut P3, a: Pubkey, slot: u64| match try_crank_at(p, a, slot) {
             Ok(_) => {}
             Err(e) if slope == 0 && e.contains(&nonprogress) => {}
             Err(e) => panic!("crank at slot {slot} failed: {}", &e[..e.len().min(200)]),
@@ -25423,7 +25424,7 @@ mod p3_vault_lp_skew {
         let mut p = setup(50_000_000, 50_000_000);
         let admin = p.env.admin.insecure_clone();
         // N_cap = 10 units, step ceiling 50% IMR. Base IMR is 10%.
-        set_risk(&mut p, &admin, 0, 0, 10 * POS_SCALE as u128, 5_000).expect("set lev");
+        set_risk(&mut p, &admin, 0, 0, 10 * POS_SCALE, 5_000).expect("set lev");
         // Trader with $1 of equity: base 10% IMR allows $10 notional (10 units @ $1).
         let (t_owner, t) = trader(&mut p, 1_000_000);
         // 5 units joining the crowd => |LP| = 5 => crowd 50% => step IMR 50% => needs $2.50.

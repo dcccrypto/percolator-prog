@@ -15754,7 +15754,7 @@ pub mod processor {
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
-        let mut rent_to_owner = false;
+        let rent_to_owner: bool;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -26952,7 +26952,7 @@ pub mod processor {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             // ── Principal-only backing withdraw: MIRRORS handle_execute_redemption. ──
-            let (source_acc, bucket_acc) = if domain % 2 == 0 {
+            let (source_acc, bucket_acc) = if domain.is_multiple_of(2) {
                 (
                     &mut group.markets[asset_index].engine.source_credit_long,
                     &mut group.markets[asset_index].engine.backing_long,
