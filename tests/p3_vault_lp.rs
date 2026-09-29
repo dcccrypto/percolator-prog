@@ -2264,3 +2264,103 @@ fn p3_f8_terminal_sweep_pays_exactly_the_surplus_over_c() {
     assert_eq!(senior as u128, 8_000_000 * shares / (shares + 1_000));
     env.assert_conserved("terminal sweep");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Live-market enablement: stake-bound markets have a keyless stake-pool PDA as marketauth
+// (found by the live-state fork run), so tag 94 also accepts the protocol (upgrade
+// authority, ProgramData tail [8]) naming a SIGNING junior owner at [9].
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    /// STATE POKE: the ProgramData account (no instruction creates it; same bytes as tag-85 tests).
+    fn set_program_data_authority(&mut self, authority: &Pubkey) -> Pubkey {
+        let (program_data, _) = Pubkey::find_program_address(
+            &[self.pid.as_ref()],
+            &solana_sdk::bpf_loader_upgradeable::ID,
+        );
+        let mut pd = vec![0u8; 45];
+        pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+        pd[12] = 1;
+        pd[13..45].copy_from_slice(authority.as_ref());
+        self.svm
+            .set_account(
+                program_data,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: pd,
+                    owner: solana_sdk::bpf_loader_upgradeable::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        program_data
+    }
+
+    fn init_vault_lp_protocol(
+        &mut self,
+        protocol: &Keypair,
+        program_data: Pubkey,
+        junior: &Keypair,
+        junior_signs: bool,
+    ) -> Result<Pubkey, String> {
+        let lp = self.new_program_account(self.plen);
+        self.svm.expire_blockhash();
+        let mut signers: Vec<&Keypair> = vec![protocol];
+        if junior_signs {
+            signers.push(junior);
+        }
+        self.send(
+            ProgInstruction::InitVaultLp {
+                junior_floor_bps: 1_000,
+            },
+            vec![
+                AccountMeta::new(protocol.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.registry, false),
+                AccountMeta::new(self.vault_lp, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(self.ledger, false),
+                AccountMeta::new_readonly(self.sibling, false),
+                AccountMeta::new_readonly(program_data, false),
+                AccountMeta::new_readonly(junior.pubkey(), junior_signs),
+            ],
+            &signers,
+        )
+        .map(|_| lp)
+    }
+}
+
+#[test]
+fn p3_init_vault_lp_protocol_path_names_a_signing_junior() {
+    let mut env = Env::new(Params::default());
+    let protocol = Keypair::new();
+    let junior = Keypair::new();
+    let stranger = Keypair::new();
+    for k in [&protocol, &junior, &stranger] {
+        env.svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
+    }
+    let pd = env.set_program_data_authority(&protocol.pubkey());
+    // A stranger presenting the real ProgramData is not its authority.
+    err_has(&env.init_vault_lp_protocol(&stranger, pd, &junior, true), PercolatorError::Unauthorized);
+    // The protocol cannot name a junior who does not sign.
+    err_has(&env.init_vault_lp_protocol(&protocol, pd, &junior, false), PercolatorError::ExpectedSigner);
+    // A spoofed ProgramData (right bytes, wrong address) is refused.
+    let fake_pd = Pubkey::new_unique();
+    let acct = env.svm.get_account(&pd).unwrap();
+    env.svm.set_account(fake_pd, acct).unwrap();
+    assert!(env.init_vault_lp_protocol(&protocol, fake_pd, &junior, true).is_err());
+    // The honest protocol path binds with the named junior; seniors seeded as in the marketauth path.
+    let lp = env.init_vault_lp_protocol(&protocol, pd, &junior, true).expect("protocol bind");
+    assert_eq!(env.vlp().junior_owner, junior.pubkey().to_bytes());
+    assert_eq!(env.vlp().lp_portfolio, lp.to_bytes());
+    // Only that junior drives the tranche: the marketauth is now a stranger to it.
+    let admin = env.admin.insecure_clone();
+    env.svm.expire_blockhash();
+    err_has(&env.junior_deposit_as(&admin, lp, 1_000), PercolatorError::Unauthorized);
+    env.svm.expire_blockhash();
+    env.junior_deposit_as(&junior, lp, 7_000_000).expect("named junior deposits");
+    assert_eq!(env.vlp().junior_deposited_atoms, 7_000_000);
+    env.assert_conserved("protocol-path junior deposit");
+}
