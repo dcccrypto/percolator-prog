@@ -564,9 +564,13 @@ fn p1_lp_floor_halt_refuses_growth_allows_reduction_69() {
     expect_code(w.batch_cpi(&t, tp, &lp, U), E_LP_FLOOR, "batch growing while halted");
     w.trade_cpi(&t, tp, &lp, -U, 0).expect("reducing LP exposure works while halted");
     assert_eq!(w.pos(lp.port), -2 * U);
-    // Flip beyond flat grows the other side -> refused.
-    expect_code(w.trade_cpi(&t, tp, &lp, -3 * U, 0), E_LP_FLOOR, "flip through zero grows LP long");
-    w.trade_cpi(&t, tp, &lp, -2 * U, 0).expect("exact flatten allowed");
+    // Doc (updated with P1-K1, 6066399f): a reducing-direction TradeCpi on a halted LP is
+    // CLIPPED to |p| (flattens the LP) — it must never flip the LP to the other side.
+    w.trade_cpi(&t, tp, &lp, -3 * U, 0).expect("reduce-through-flat is clipped, not refused");
+    assert_eq!(w.pos(lp.port), 0, "clip must stop exactly at flat, never flip the halted LP");
+    // From flat, both directions are pure growth -> 69.
+    expect_code(w.trade_cpi(&t, tp, &lp, -U, 0), E_LP_FLOOR, "growth from flat (LP long) while halted");
+    expect_code(w.trade_cpi(&t, tp, &lp, U, 0), E_LP_FLOOR, "growth from flat (LP short) while halted");
     assert_eq!(w.pos(lp.port), 0);
 }
 
