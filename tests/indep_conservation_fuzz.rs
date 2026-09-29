@@ -1908,3 +1908,127 @@ fn indep_f5_first_earn_depositor_does_not_capture_prevault_fee_backlog() {
         payout - dep as u128
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Coordinator gap 4: permissionless stale resolve as the F-3 escape. The relaunch seed
+// sets a non-zero `permissionless_resolve_stale_slots`. Spec intent (README
+// "Permissionless progress" / ResolveStalePermissionless): once the stamped
+// last_good_oracle_slot is older than stale_slots, ANYONE can resolve, and every user
+// can then close and be paid without the admin.
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl World {
+    fn do_configure_stale_resolve(&mut self, stale_slots: u64, force_close_delay_slots: u64) -> Result<u64, String> {
+        let policy_sequence = self.env.control_sequences(0).permissionless_resolve + 1;
+        let fr = state::read_asset_generation_frontier(&self.env.svm.get_account(&self.env.market).unwrap().data).unwrap();
+        let admin = self.env.admin.insecure_clone();
+        let m = self.env.market;
+        self.send(
+            ProgInstruction::ConfigurePermissionlessResolve { asset_generation_frontier: fr, stale_slots, force_close_delay_slots, policy_sequence },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    fn do_resolve_stale(&mut self) -> Result<u64, String> {
+        let now = self.slot();
+        let m = self.env.market;
+        self.send(ProgInstruction::ResolveStalePermissionless { now_slot: now }, vec![AccountMeta::new(m, false)], &[])
+    }
+
+    /// Permissionless-only close-out: CloseResolved + tag 46 for every portfolio, no admin.
+    /// Returns (users paid in total, users still holding capital/positions).
+    fn permissionless_close_out(&mut self) -> Result<(u128, Vec<usize>), String> {
+        let before: u128 = self.user_token_total();
+        for _ in 0..8 {
+            for u in 0..self.ports.len() {
+                if self.closed[u] {
+                    continue;
+                }
+                let _ = self.do_close_resolved(u);
+                let _ = self.do_claim_topup(u);
+                self.check()?;
+            }
+            let s = self.slot() + 60;
+            self.env.svm.warp_to_slot(s);
+        }
+        let mut stuck = Vec::new();
+        for u in 0..self.ports.len() {
+            let p = self.env.portfolio_state(self.ports[u]);
+            let r = p.resolved_payout_receipt;
+            if p.capital > 0 || p.active_bitmap != percolator::active_bitmap_empty() || (r.present && !r.finalized) {
+                stuck.push(u);
+            }
+        }
+        Ok((self.user_token_total() - before, stuck))
+    }
+
+    fn user_token_total(&self) -> u128 {
+        let owners: Vec<Pubkey> = self.owners.iter().map(|k| k.pubkey()).collect();
+        self.tokens
+            .iter()
+            .filter_map(|k| self.env.svm.get_account(k))
+            .filter_map(|a| TokenAccount::unpack(&a.data).ok())
+            .filter(|t| owners.contains(&t.owner))
+            .map(|t| t.amount as u128)
+            .sum()
+    }
+}
+
+fn f3_frozen_world(stale_slots: u64) -> World {
+    let mut w = World::new(0);
+    w.do_configure_stale_resolve(stale_slots, 100).expect("configure permissionless stale resolve (seed policy)");
+    for op in [
+        Op::TradeCpi { u: 48, size_tenths: 366 },
+        Op::TradeNoCpi { a: 7, b: 90, size_tenths: -214, off_bps: -1908 },
+        Op::Push { delta_bps: -2157 },
+        Op::Push { delta_bps: -1266 },
+    ] {
+        let _ = w.apply(&op);
+        w.check().unwrap();
+    }
+    let _ = w.permissionless_repair(400);
+    let r = w.probe_recovered();
+    assert!(r.is_err(), "vacuity: the F-3 freeze must reproduce before testing its escape");
+    w
+}
+
+/// While the keeper keeps pushing, the frozen F-3 market is NOT stale, so the escape
+/// cannot fire: users stay frozen as long as the keeper is healthy. Records behaviour.
+#[test]
+fn indep_f3_escape_stale_resolve_blocked_while_keeper_pushes() {
+    let mut w = f3_frozen_world(9_000);
+    for _ in 0..500 {
+        let s = w.slot() + 20;
+        w.env.svm.warp_to_slot(s);
+        let _ = w.do_push(w.mark);
+        let _ = w.do_crank(N_USERS);
+    }
+    let r = w.do_resolve_stale();
+    eprintln!("F3-escape (keeper alive, 10,000 slots > stale 9,000): ResolveStalePermissionless -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    assert!(r.is_err(), "a live keeper keeps the market fresh; stale resolve must not fire");
+}
+
+/// The escape: keeper stops pushing; after stale_slots anyone resolves; then every user
+/// is closed out and paid with NO admin action, and token conservation holds.
+#[test]
+fn indep_f3_escape_stale_resolve_unfreezes_and_every_user_is_paid_permissionlessly() {
+    let stale = 9_000;
+    let mut w = f3_frozen_world(stale);
+    let deposited: u128 = w.minted;
+    // Keeper dies. Only permissionless cranks continue.
+    let s = w.slot() + stale + 5;
+    w.env.svm.warp_to_slot(s);
+    let _ = w.do_crank(N_USERS);
+    let r = w.do_resolve_stale();
+    eprintln!("F3-escape: ResolveStalePermissionless -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    r.expect("stale resolve must fire once the oracle is older than stale_slots");
+    w.check().unwrap();
+    assert_eq!(w.env.market_state().1.mode, MarketModeV16::Resolved);
+    let (paid, stuck) = w.permissionless_close_out().unwrap();
+    w.check().unwrap();
+    let (_, g) = w.env.market_state();
+    eprintln!("F3-escape: paid {paid} of {deposited} minted; stuck users {stuck:?}; vault left {} (ins {}, c_tot {})", g.vault, g.insurance, g.c_tot);
+    assert!(stuck.is_empty(), "F3-escape: users {stuck:?} still hold capital/positions/unfinalized receipts after permissionless close-out");
+    assert_eq!(g.c_tot, 0, "all user capital must have been paid out");
+}
