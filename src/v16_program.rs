@@ -9423,21 +9423,25 @@ pub mod risk_limits_v17 {
     }
 
     /// The single LP-gate rule (items 3 + 5), used post-fill on every route:
-    /// 1. a fill that is REDUCE-ONLY for the counterparty (the taker, on CPI) is ALWAYS allowed
-    ///    -- traders' exits are never trapped by the halt or the cap (limits-UI lane finding);
-    /// 2. a fill that does not grow the LP's magnitude is allowed;
-    /// 3. otherwise a floored LP halts, and an LP past its cap is refused.
+    /// 1. a fill that does not grow the LP's magnitude is allowed (so every close that REDUCES
+    ///    the LP always passes);
+    /// 2. otherwise a floored LP halts, and an LP past its cap is refused.
+    ///
+    /// The counterparty's own direction is deliberately NOT an exemption. An e74809b1 variant
+    /// exempted taker-reducing fills (limits-UI lane request: never trap a trader's close); the
+    /// independent-test lane showed that lets anyone dump risk onto a capped or halted LP (open
+    /// 20 units bilaterally between two non-LP wallets, then "close" one side into an LP capped
+    /// at 2 -> the LP holds 10x its cap; the same route grows a halted, depleted LP) -- finding
+    /// F-7 (HIGH). The LP leg's protection wins; the counterparty positions stay in the
+    /// signature so the Kani harness can state the trade-off explicitly.
     pub fn lp_fill_gate(
-        counterparty_before_q: i128,
-        counterparty_after_q: i128,
+        _counterparty_before_q: i128,
+        _counterparty_after_q: i128,
         lp_before_q: i128,
         lp_after_q: i128,
         cap_q: u128,
         floor_breached: bool,
     ) -> LpGate {
-        if position_change_reduce_only(counterparty_before_q, counterparty_after_q) {
-            return LpGate::Allow;
-        }
         if !lp_risk_increasing(lp_before_q, lp_after_q) {
             return LpGate::Allow;
         }
@@ -25870,7 +25874,7 @@ pub mod processor {
         let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
         let a_after = position_a.checked_add(size_q).ok_or_else(overflow)?;
         let b_after = position_b.checked_sub(size_q).ok_or_else(overflow)?;
-        // Counterparty reduce-only (a trader's close) is exempt -- see `lp_fill_gate`.
+        // No counterparty exemption (finding F-7, see `lp_fill_gate`).
         // On the CPI routes account_b's floor was already enforced by
         // `p1_cpi_preflight_before_matcher` with the identical predicate on identical state (the
         // matcher CPI in between cannot write wrapper-owned accounts), so it is not re-derived
@@ -25878,14 +25882,12 @@ pub mod processor {
         if roles.b_is_lp
             && !roles.cpi
             && risk_limits_v17::lp_risk_increasing(position_b, b_after)
-            && !risk_limits_v17::position_change_reduce_only(position_a, a_after)
             && lp_floor_breached_view(group, account_b, asset_index)?
         {
             return Err(PercolatorError::LpFloorHalt.into());
         }
         if roles.a_is_lp
             && risk_limits_v17::lp_risk_increasing(position_a, a_after)
-            && !risk_limits_v17::position_change_reduce_only(position_b, b_after)
             && lp_floor_breached_view(group, account_a, asset_index)?
         {
             return Err(PercolatorError::LpFloorHalt.into());
@@ -26002,9 +26004,7 @@ pub mod processor {
         counterparty_before: i128,
         counterparty_after: i128,
     ) -> ProgramResult {
-        if !risk_limits_v17::lp_risk_increasing(position_before, position_after)
-            || risk_limits_v17::position_change_reduce_only(counterparty_before, counterparty_after)
-        {
+        if !risk_limits_v17::lp_risk_increasing(position_before, position_after) {
             return Ok(());
         }
         let (floor, cap) =
@@ -26087,8 +26087,9 @@ pub mod processor {
 
     /// Per-leg output of `p1_cpi_preflight_before_matcher`.
     struct P1CpiLegPreflight {
-        /// The request only reduces the taker (`position_change_reduce_only`): exempt from the
-        /// LP halt / cap, and attested to the matcher as P2 `TAKER_REDUCING`.
+        /// The request only reduces the taker (`position_change_reduce_only`): attested to the
+        /// matcher as P2 `TAKER_REDUCING` and exempts a same-owner / creator taker from 67. It
+        /// does NOT exempt the fill from the LP halt / cap (finding F-7).
         taker_reducing: bool,
         /// LP fill headroom (Q) in the direction this leg moves the LP.
         headroom_q: u128,
@@ -26186,10 +26187,7 @@ pub mod processor {
                 asset_index,
                 lp_after_full.unsigned_abs(),
             )?;
-            let headroom_q = if taker_reducing {
-                // A taker's close is never halted or clipped (the post-fill gate exempts it too).
-                size_q.unsigned_abs()
-            } else if floor {
+            let headroom_q = if floor {
                 let room = risk_limits_v17::floored_lp_reducing_room_q(before, lp_delta_sign);
                 if room == 0 {
                     return Err(PercolatorError::LpFloorHalt.into());
@@ -29790,6 +29788,7 @@ mod p1_kani_proofs {
     // ═══════════════════════════════════════════════════════════════════════════
 
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn kani_p1_exec_band_check_sound() {
         let exec: u64 = kani::any();
         let reference: u64 = kani::any();
@@ -30089,41 +30088,38 @@ mod p1_kani_proofs {
 
 
     #[kani::proof]
-    fn kani_p1_taker_reducing_never_refused_by_halt_or_cap() {
+    fn kani_p1_lp_gate_refuses_only_lp_growth() {
         let cp_before: i64 = kani::any();
         let cp_after: i64 = kani::any();
         let lp_before: i64 = kani::any();
         let lp_after: i64 = kani::any();
         let cap: u64 = kani::any();
         let floor: bool = kani::any();
-        let v = p1::lp_fill_gate(
-            cp_before as i128,
-            cp_after as i128,
-            lp_before as i128,
-            lp_after as i128,
-            cap as u128,
-            floor,
-        );
+        let (lb, la) = (lp_before as i128, lp_after as i128);
+        let v = p1::lp_fill_gate(cp_before as i128, cp_after as i128, lb, la, cap as u128, floor);
         let taker_reducing = p1::position_change_reduce_only(cp_before as i128, cp_after as i128);
-        // THE property: a fill that only reduces the taker is never refused by halt or cap.
-        if taker_reducing {
+        // A fill that does not grow the LP (every LP-reducing close) is never refused.
+        if !p1::lp_risk_increasing(lb, la) {
             assert_eq!(v, p1::LpGate::Allow);
         }
-        // An LP fill that does not grow the LP is never refused either.
-        if !p1::lp_risk_increasing(lp_before as i128, lp_after as i128) {
-            assert_eq!(v, p1::LpGate::Allow);
-        }
-        // Refusals only happen on taker-risk-increasing fills that grow the LP.
+        // Refusals only on LP growth; halt beats cap; cap refusal means past the cap.
         if v != p1::LpGate::Allow {
-            assert!(!taker_reducing && p1::lp_risk_increasing(lp_before as i128, lp_after as i128));
+            assert!(p1::lp_risk_increasing(lb, la));
+        }
+        if v == p1::LpGate::FloorHalt {
+            assert!(floor);
         }
         if v == p1::LpGate::CapExceeded {
-            assert!(!floor && (lp_after as i128).unsigned_abs() > cap as u128);
+            assert!(!floor && la.unsigned_abs() > cap as u128);
         }
-        kani::cover!(taker_reducing && floor && p1::lp_risk_increasing(lp_before as i128, lp_after as i128), "close through a halted LP allowed");
-        kani::cover!(taker_reducing && (lp_after as i128).unsigned_abs() > cap as u128 && p1::lp_risk_increasing(lp_before as i128, lp_after as i128), "close past the cap allowed");
-        kani::cover!(v == p1::LpGate::FloorHalt, "halt fires on a taker open");
-        kani::cover!(v == p1::LpGate::CapExceeded, "cap fires on a taker open");
+        // F-7: a counterparty "close" that would GROW a halted LP is refused (no dump).
+        if taker_reducing && floor && p1::lp_risk_increasing(lb, la) {
+            assert_eq!(v, p1::LpGate::FloorHalt);
+        }
+        kani::cover!(taker_reducing && floor && p1::lp_risk_increasing(lb, la), "F-7 dump into a halted LP refused");
+        kani::cover!(taker_reducing && !floor && la.unsigned_abs() > cap as u128 && p1::lp_risk_increasing(lb, la), "F-7 dump past the cap refused");
+        kani::cover!(v == p1::LpGate::Allow && !p1::lp_risk_increasing(lb, la) && floor, "LP-reducing fill passes a halted LP");
+        kani::cover!(v == p1::LpGate::Allow && p1::lp_risk_increasing(lb, la), "healthy LP grows within cap");
     }
 
     #[kani::proof]

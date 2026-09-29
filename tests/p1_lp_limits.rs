@@ -1150,11 +1150,12 @@ fn p1_nocpi_same_owner_against_own_lp_only_closes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Limits-UI lane finding (2026-09-30): a TAKER's close must never be trapped by the LP floor
-// halt or the exposure cap, even when the close GROWS the LP (e.g. a trader closing a long
-// while the LP is already long). Rule: a fill that is reduce-only for the taker is always
-// allowed (`risk_limits_v17::lp_fill_gate`; Kani `kani_p1_taker_reducing_never_refused_...`).
-// On 6066399f / 2e7f87de these go RED (Custom(69) / clipped fill).
+// Finding F-7 (independent-test lane, HIGH, introduced by e74809b1): exempting a TAKER's
+// reduce-only close from the LP halt / cap let anyone dump risk onto a capped or halted LP
+// (open bilaterally between two non-LP wallets, then "close" one side into the LP). Rule now:
+// the LP leg's protection always applies -- a close that GROWS a halted LP is refused (69) and
+// one that would take a capped LP past its cap is clipped (TradeCpi) / refused (68); a close
+// that REDUCES the LP always passes. RED on e74809b1 (the dump lands), green here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// LP long 4 (from trader T2), trader T1 long 2 against an unrelated non-LP portfolio.
@@ -1176,37 +1177,40 @@ fn close_through_lp_fixture(env: &mut Env) -> (Keypair, Pubkey, Lp) {
 }
 
 #[test]
-fn p1_taker_close_passes_through_lp_floor_halt() {
+fn p1_f7_close_cannot_dump_risk_into_halted_lp() {
     let mut env = Env::new();
     let (t1, t1_account, lp) = close_through_lp_fixture(&mut env);
     env.set_risk_limits(0, 2_000, 0); // LP floored (equity 1000 <= 2000)
-    // A taker OPEN that grows the halted LP is still refused.
-    let r = env.trade_cpi(&t1, t1_account, &lp, -3 * Q);
-    assert_err_code(&r, LP_FLOOR_HALT, "taker sell past its long (flip) grows the halted LP");
-    // T1 closes its long by selling 2: LP long 4 -> 6 (grows), but the TAKER only reduces.
-    env.trade_cpi(&t1, t1_account, &lp, -2 * Q)
-        .expect("a taker's close is never trapped by the LP halt");
-    assert_eq!(env.pos(t1_account), 0, "taker fully closed");
-    assert_eq!(env.pos(lp.account), 6 * Q, "LP took the close");
+    let keys = [env.market, t1_account, lp.account];
+    let before = env.snapshot(&keys);
+    // T1 "closes" its long (opened against a non-LP) by selling 2: LP long 4 -> 6 would GROW
+    // the halted LP -> refused, nothing moves.
+    let r = env.trade_cpi(&t1, t1_account, &lp, -2 * Q);
+    assert_err_code(&r, LP_FLOOR_HALT, "F-7: a close that grows a halted LP is refused");
+    assert_eq!(env.snapshot(&keys), before);
+    // A close that REDUCES the halted LP still passes: T2-side style (a taker buying from the
+    // long LP reduces it).
+    let t3 = Keypair::new();
+    let t3_account = env.portfolio(&t3, 1_000_000);
+    env.trade_cpi(&t3, t3_account, &lp, Q)
+        .expect("a fill that reduces a halted LP passes");
+    assert_eq!(env.pos(lp.account), 3 * Q);
 }
 
 #[test]
-fn p1_taker_close_passes_through_lp_exposure_cap_unclipped() {
+fn p1_f7_close_cannot_push_lp_past_cap() {
     let mut env = Env::new();
     let (t1, t1_account, lp) = close_through_lp_fixture(&mut env);
-    // k = 0.5x -> cap 5 units; the LP is at 4, the close takes it to 6.
+    // k = 0.5x -> cap 5 units; the LP is at 4, a 2-unit "close" would take it to 6.
     env.set_risk_limits(5_000, 0, 0);
     env.trade_cpi(&t1, t1_account, &lp, -2 * Q)
-        .expect("a taker's close is not clipped by the LP cap");
-    assert_eq!(env.pos(t1_account), 0, "taker fully closed, not clipped to the cap headroom");
-    assert_eq!(env.pos(lp.account), 6 * Q);
-    // A taker OPEN on the over-cap LP is still clipped to zero (no growth past cap).
-    let t3 = Keypair::new();
-    let t3_account = env.portfolio(&t3, 1_000_000);
+        .expect("TradeCpi clips the over-cap part instead of reverting");
+    assert_eq!(env.pos(lp.account), 5 * Q, "LP clipped exactly at its cap");
+    assert_eq!(env.pos(t1_account), Q, "taker closed only what the LP can take");
+    // At the cap, the next such close is a zero fill.
     let nonce = env.req_nonce();
-    env.trade_cpi(&t3, t3_account, &lp, -Q)
-        .expect("over-cap taker open is an Ok zero fill");
-    assert_eq!(env.pos(t3_account), 0);
-    assert_eq!(env.pos(lp.account), 6 * Q);
+    env.trade_cpi(&t1, t1_account, &lp, -Q).expect("zero fill at the cap");
+    assert_eq!(env.pos(t1_account), Q);
+    assert_eq!(env.pos(lp.account), 5 * Q);
     assert_eq!(env.req_nonce(), nonce + 1);
 }
