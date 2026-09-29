@@ -61,7 +61,7 @@ pub const MATCHER_CONTEXT_LEN: usize = 320;
 /// program, so the account does not exist and the (System-owned, empty) PDA is
 /// itself the proof.
 pub fn nft_registry_pda(market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"nft_registry", market.as_ref()], &percolator_prog::id()).0
+    Pubkey::find_program_address(&[b"nft_registry", market.as_ref()], &harness_program_id()).0
 }
 
 /// Sync unit W2-S1b (ADOPT upstream `d57411f8`, "prevent whole-market address
@@ -114,6 +114,16 @@ pub fn has_active_leg_for_asset(account: &PortfolioAccountV16, asset_index: usiz
         .legs
         .iter()
         .any(|leg| leg.active && leg.asset_index as usize == asset_index)
+}
+
+/// Wrapper mount id. INDEP_MAINNET_ID=1 mounts at the mainnet id (ESa89R5…), which the
+/// stake program's Bind/InitPool allowlist (plain build) requires.
+pub fn harness_program_id() -> Pubkey {
+    if std::env::var("INDEP_MAINNET_ID").map_or(false, |v| v == "1") {
+        "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv".parse().unwrap()
+    } else {
+        percolator_prog::id()
+    }
 }
 
 pub fn program_path() -> PathBuf {
@@ -451,7 +461,7 @@ impl V16CuEnv {
 
     pub fn new_with_init_params(params: V16CuMarketParams) -> Self {
         let mut svm = LiteSVM::new();
-        let program_id = percolator_prog::id();
+        let program_id = harness_program_id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
         svm.add_program(program_id, &program_bytes);
         let token_program_bytes = std::fs::read(spl_token_program_path()).expect("read token BPF");

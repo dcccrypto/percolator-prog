@@ -59,6 +59,7 @@ pub enum Op {
     LpDeposit { u: u8, amt: u64 },
     LpCrank { d: u8 },
     LpRedeem { u: u8, frac_bps: u16 },
+    Stake87Accrue,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -111,6 +112,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::LpDeposit { .. } => "lp_deposit75",
         Op::LpCrank { .. } => "lp_crank78",
         Op::LpRedeem { .. } => "lp_redeem76_77",
+        Op::Stake87Accrue => "stake87_accrue12",
     }
 }
 
@@ -130,6 +132,7 @@ pub struct World {
     pub shortfall: u128,
     pub lp_vault: Option<(Pubkey, Pubkey, Pubkey)>,
     pub lp_atas: std::collections::BTreeMap<usize, Pubkey>,
+    pub stake: Option<(Pubkey, Pubkey, Pubkey)>,
 }
 
 impl World {
@@ -202,6 +205,7 @@ impl World {
             shortfall: 0,
             lp_vault: None,
             lp_atas: Default::default(),
+            stake: None,
         };
         // LP = last portfolio: big deposit + passive matcher (kind 0, spread 0).
         let lp_idx = N_USERS;
@@ -217,7 +221,111 @@ impl World {
         if std::env::var("FUZZ_LPVAULT").map_or(true, |v| v != "0") {
             w.create_lp_vault();
         }
+        if std::env::var("FUZZ_STAKE").map_or(false, |v| v == "1") {
+            // Real-staker vs dead-shares-only pools, 50/50 by market key parity.
+            let dead_only = match std::env::var("FUZZ_STAKE_DEAD").ok().as_deref() { Some("1") => true, Some("0") => false, _ => w.env.market.to_bytes()[0] & 1 == 0 };
+            w.setup_stake(if dead_only { 1_000 } else { 1_000 + 5_000_000 });
+        }
         w
+    }
+
+    fn setup_stake(&mut self, total_lp_supply: u64) {
+        let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
+        assert_eq!(self.env.program_id.to_string(), "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv", "FUZZ_STAKE needs INDEP_MAINNET_ID=1");
+        let so = std::env::var("INDEP_STAKE_SO").unwrap_or_else(|_| format!("{}/wt-indep/so/stake-e0ace2c-plain.so", std::env::var("HOME").unwrap()));
+        if self.env.svm.get_account(&stake_id).map_or(true, |a| !a.executable) {
+            self.env.svm.add_program(stake_id, &std::fs::read(&so).expect("stake so"));
+        }
+        let m = self.env.market;
+        let (pool, _) = Pubkey::find_program_address(&[b"stake_pool", m.as_ref()], &stake_id);
+        let (va, va_bump) = Pubkey::find_program_address(&[b"vault_auth", pool.as_ref()], &stake_id);
+        let sv = self.new_token(va, 0);
+        let mut d = vec![0u8; 408];
+        d[0] = 1; d[1] = 255; d[2] = va_bump;
+        d[8..40].copy_from_slice(m.as_ref());
+        d[40..72].copy_from_slice(self.env.admin.pubkey().as_ref());
+        d[72..104].copy_from_slice(self.env.mint.as_ref());
+        d[104..136].copy_from_slice(Pubkey::new_unique().as_ref());
+        d[136..168].copy_from_slice(sv.as_ref());
+        d[176..184].copy_from_slice(&total_lp_supply.to_le_bytes());
+        d[224..256].copy_from_slice(self.env.program_id.as_ref());
+        d[320..328].copy_from_slice(b"SPOOL_V1");
+        d[328] = 4;
+        self.env.svm.set_account(pool, Account { lamports: 1_000_000_000, data: d, owner: stake_id, executable: false, rent_epoch: 0 }).unwrap();
+        let admin = self.env.admin.insecure_clone();
+        let pid = self.env.program_id;
+        let ix = solana_sdk::instruction::Instruction {
+            program_id: stake_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new_readonly(pid, false),
+            ],
+            data: vec![19u8],
+        };
+        self.env.svm.expire_blockhash();
+        send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, &[&admin]).expect("stake Bind (tag 19)");
+        self.stake = Some((pool, va, sv));
+    }
+
+    /// (total_deposited, total_lp_supply, total_fees_earned) — stake state.rs offsets.
+    fn pool_fields(&self) -> Option<(u64, u64, u64)> {
+        let (pool, _, _) = self.stake?;
+        let d = self.env.svm.get_account(&pool)?.data;
+        let rd = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        Some((rd(168), rd(176), rd(256)))
+    }
+
+    fn do_stake87_accrue(&mut self) -> Result<u64, String> {
+        let (pool, _va, sv) = self.stake.ok_or("no stake pool")?;
+        let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
+        let payer = self.env.payer.pubkey();
+        let (m, v, va) = (self.env.market, self.env.vault, self.env.vault_authority);
+        let r87 = self.send(
+            ProgInstruction::WithdrawInsuranceReserveToStake,
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(m, false),
+                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new(sv, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[],
+        );
+        if let Err(e) = &r87 {
+            *self.stats.err.entry(format!("tag87:{:?}", custom_code(e))).or_default() += 1;
+        } else {
+            *self.stats.ok.entry("tag87").or_default() += 1;
+        }
+        let before = self.pool_fields();
+        let ix = solana_sdk::instruction::Instruction {
+            program_id: stake_id,
+            accounts: vec![
+                AccountMeta::new_readonly(payer, true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(sv, false),
+                AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+                AccountMeta::new_readonly(m, false),
+            ],
+            data: vec![12u8],
+        };
+        self.env.svm.expire_blockhash();
+        let r = send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, &[]);
+        if r.is_ok() {
+            if let (Some((_, s0, d0)), Some((_, _, d1))) = (before, self.pool_fields()) {
+                if s0 <= 1_000 && d1 > d0 {
+                    *self.stats.soft.entry("F3_accrue_booked_to_dead_shares").or_default() += 1;
+                    if std::env::var("FUZZ_STRICT_F3").map_or(false, |v| v == "1") {
+                        return Err(format!("I12 F3: AccrueFees booked {} atoms to a dead-shares-only pool", d1 - d0));
+                    }
+                }
+            }
+        }
+        r
     }
 
     fn lp_ledger(&self, d: u16) -> Pubkey {
@@ -881,6 +989,13 @@ impl World {
                 *self.stats.soft.entry("oi_asymmetric").or_default() += 1;
             }
         }
+        // I12b stake pool: booked deposits must be backed by stake-vault tokens.
+        if let (Some((_, _, sv)), Some((dep, _, _))) = (self.stake, self.pool_fields()) {
+            let bal = self.token_amount(&sv);
+            if dep as u128 > bal {
+                return Err(format!("I12b STAKE POOL UNBACKED: total_deposited {dep} > stake vault {bal}"));
+            }
+        }
         // I11 LP-vault share accounting: registry outstanding == LP-mint supply + dead floor.
         if let Some((reg, lmint, _)) = self.lp_vault {
             if let (Some(ra), Some(ma)) = (self.env.svm.get_account(&reg), self.env.svm.get_account(&lmint)) {
@@ -961,6 +1076,15 @@ impl World {
             Op::Finalize { side } => self.do_finalize(side % 2),
             Op::ClaimProtocol => self.do_claim_protocol(),
             Op::ClaimCreator => self.do_claim_creator(),
+            Op::Stake87Accrue => {
+                let r = self.do_stake87_accrue();
+                if let Err(e) = &r {
+                    if e.starts_with("I12") {
+                        return Err(e.clone());
+                    }
+                }
+                r
+            }
             Op::LpDeposit { u, amt } => self.do_lp_deposit(u as usize % N_USERS, amt),
             Op::LpCrank { d } => self.do_lp_crank((d % 2) as u16),
             Op::LpRedeem { u, frac_bps } => self.do_lp_redeem(u as usize % N_USERS, frac_bps),
@@ -1244,7 +1368,8 @@ pub fn gen_op(rng: &mut XorShiftRng) -> Op {
         93..=95 => Op::ClaimProtocol,
         96..=97 => Op::ClaimCreator,
         98 => Op::ClosePortfolio { u },
-        _ => match rng.gen_range(0..3) {
+        _ => match rng.gen_range(0..4) {
+            3 => Op::Stake87Accrue,
             0 => Op::LpDeposit { u, amt: rng.gen_range(1_000..10_000_000) },
             1 => Op::LpCrank { d: rng.gen() },
             _ => Op::LpRedeem { u, frac_bps: rng.gen_range(1..=10_000) },
@@ -2031,4 +2156,24 @@ fn indep_f3_escape_stale_resolve_unfreezes_and_every_user_is_paid_permissionless
     eprintln!("F3-escape: paid {paid} of {deposited} minted; stuck users {stuck:?}; vault left {} (ins {}, c_tot {})", g.vault, g.insurance, g.c_tot);
     assert!(stuck.is_empty(), "F3-escape: users {stuck:?} still hold capital/positions/unfinalized receipts after permissionless close-out");
     assert_eq!(g.c_tot, 0, "all user capital must have been paid out");
+}
+
+/// F3 inside the wrapper flow: fee trades -> tag 87 -> stake AccrueFees on a pool that has
+/// only the 1,000 dead shares. Must not book (stake F3 fix). Needs INDEP_MAINNET_ID=1,
+/// FUZZ_STAKE=1, FUZZ_STAKE_DEAD=1; stake .so via INDEP_STAKE_SO.
+#[test]
+#[ignore]
+fn indep_f3_wrapper_flow_accrue_to_dead_shares_books_nothing() {
+    let mut w = World::new(30);
+    assert!(w.stake.is_some(), "run with INDEP_MAINNET_ID=1 FUZZ_STAKE=1 FUZZ_STAKE_DEAD=1");
+    w.do_trade_nocpi(0, 1, 50 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    w.do_trade_nocpi(0, 1, -50 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("close");
+    let before = w.pool_fields().unwrap();
+    let r = w.do_stake87_accrue();
+    let after = w.pool_fields().unwrap();
+    let sv = w.stake.unwrap().2;
+    eprintln!("F3-wrapper: accrue -> {:?}; pool (deposited, lp) {before:?} -> {after:?}; stake vault {}", r.as_ref().map_err(|e| custom_code(e)), w.token_amount(&sv));
+    w.check().unwrap();
+    assert!(w.token_amount(&sv) > 0, "vacuity: tag 87 must move the staker leg into the stake vault");
+    assert_eq!(after.2, before.2, "F3: AccrueFees booked {} fee atoms to a dead-shares-only pool", after.2 - before.2);
 }
