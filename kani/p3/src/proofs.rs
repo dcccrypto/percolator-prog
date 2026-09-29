@@ -22,6 +22,7 @@ fn b(x: u8) -> u128 {
 // ── Waterfall ────────────────────────────────────────────────────────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_waterfall_conservation_and_junior_first() {
     let v: u64 = kani::any();
     let c: u64 = kani::any();
@@ -44,6 +45,7 @@ fn kani_p3_waterfall_conservation_and_junior_first() {
 // ── Deposit ──────────────────────────────────────────────────────────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_deposit_no_dilution() {
     let amount = b(kani::any());
     let s = b(kani::any());
@@ -69,6 +71,7 @@ fn kani_p3_deposit_no_dilution() {
 // ── Redemption ───────────────────────────────────────────────────────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_redemption_no_dilution() {
     let c = b(kani::any());
     let v = b(kani::any());
@@ -96,6 +99,7 @@ fn kani_p3_redemption_no_dilution() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_redemption_rejects_bad_inputs() {
     let s = u(kani::any());
     let shares = u(kani::any());
@@ -110,6 +114,7 @@ fn kani_p3_redemption_rejects_bad_inputs() {
 // ── Fee split / bps rounding ─────────────────────────────────────────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_fee_split_and_bps_exact() {
     let fee: u64 = kani::any();
     let bps: u16 = kani::any();
@@ -132,6 +137,7 @@ fn kani_p3_fee_split_and_bps_exact() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_effective_senior_claim() {
     let c: u64 = kani::any();
     let h: u64 = kani::any();
@@ -146,6 +152,7 @@ fn kani_p3_effective_senior_claim() {
 // ── Junior withdraw / recall ─────────────────────────────────────────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_junior_withdraw_keeps_floor_and_senior_backing() {
     let v = u(kani::any());
     let c = u(kani::any());
@@ -169,6 +176,7 @@ fn kani_p3_junior_withdraw_keeps_floor_and_senior_backing() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_recall_limit_exact() {
     let c: u64 = kani::any();
     let cover: u64 = kani::any();
@@ -186,6 +194,7 @@ fn kani_p3_recall_limit_exact() {
 // ── Skew funding ─────────────────────────────────────────────────────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_skew_sign_bound_zero() {
     let lp: i16 = kani::any();
     let oi: u16 = kani::any();
@@ -209,6 +218,7 @@ fn kani_p3_skew_sign_bound_zero() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_skew_monotone_in_imbalance() {
     let a: u16 = kani::any();
     let b: u16 = kani::any();
@@ -229,6 +239,7 @@ fn kani_p3_skew_monotone_in_imbalance() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_combine_within_engine_bound() {
     let p: i128 = kani::any();
     let s: i128 = kani::any();
@@ -268,6 +279,7 @@ fn kani_p3_combine_within_engine_bound() {
 //     `p3_skew_funding_identical_on_crank_and_trade_paths`: -60 / +60 on both paths), which is
 //     empirical evidence, not a proof.
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_step_imr_bounds_and_monotone() {
     let x: u16 = kani::any();
     let y: u16 = kani::any();
@@ -287,6 +299,7 @@ fn kani_p3_step_imr_bounds_and_monotone() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_leverage_gate_exact() {
     let equity = u(kani::any());
     let notional = u(kani::any());
@@ -305,6 +318,7 @@ fn kani_p3_leverage_gate_exact() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_conservative_equity() {
     let cap: u64 = kani::any();
     let pnl: i64 = kani::any();
@@ -320,6 +334,7 @@ fn kani_p3_conservative_equity() {
 // ── P3-H2 vault-LP exposure cap / P3-H1 resolved settlement split ──────────────────────────
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_h2_exposure_cap_exact_and_reducing_always_allowed() {
     let before: i16 = kani::any();
     let after: i16 = kani::any();
@@ -340,6 +355,7 @@ fn kani_p3_h2_exposure_cap_exact_and_reducing_always_allowed() {
 }
 
 #[kani::proof]
+#[kani::solver(cadical)]
 fn kani_p3_h1_resolved_split_conserves_and_is_senior_first() {
     let payout: u64 = kani::any();
     let c: u64 = kani::any();

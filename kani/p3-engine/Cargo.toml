@@ -1,0 +1,23 @@
+[package]
+name = "p3-skew-engine-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Non-circular skew-funding conservation: the EXACT production src/vault_lp_v18.rs rate path fed through the REAL engine funding kernel (cfg(kani) shim)."
+
+# Standalone so negative controls rebuild without the wrapper.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+percolator = { path = "../../../percolator", features = ["fork-facade"] }
+
+[features]
+# Negative control: replace the engine kernel output with the pre-#114 flat-A model
+# (f = -/+ fid * ADL_ONE per side). With asymmetric A this must FAIL the zero-sum assertion.
+neg_flat_a = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
