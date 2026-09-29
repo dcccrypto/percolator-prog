@@ -2383,7 +2383,12 @@ pub mod state {
         /// headroom). Flip only once every LP's matcher program on the asset accepts it.
         pub matcher_ext_mode: u8,
         pub _reserved0: u8,
-        pub _reserved: [u8; 24],
+        /// P2 fee channel: protocol maximum on the matcher's `requested_fee_bps` (return flag
+        /// bits 22..31) that TradeCpi will charge the taker and credit to the LP. 0 (default)
+        /// => the channel is OFF (ACCEPTS_FEE_REQUEST is never sent; any requested fee is
+        /// refused). Only effective with `matcher_ext_mode = 1`.
+        pub max_requested_fee_bps: u16,
+        pub _reserved: [u8; 22],
     }
     pub const MATCHER_EXT_MODE_LEGACY: u8 = 0;
     pub const MATCHER_EXT_MODE_V1: u8 = 1;
@@ -2391,7 +2396,8 @@ pub mod state {
 
     pub fn validate_asset_risk_limits(limits: &AssetRiskLimitsV17) -> Result<(), ProgramError> {
         if limits._reserved0 != 0
-            || limits._reserved != [0u8; 24]
+            || limits._reserved != [0u8; 22]
+            || limits.max_requested_fee_bps > crate::risk_limits_v17::MAX_REQUESTED_FEE_BPS
             || limits.matcher_ext_mode > MATCHER_EXT_MODE_V1
             || limits.exec_band_bps > crate::risk_limits_v17::MAX_EXEC_BAND_BPS
             || limits.lp_exposure_k_bps > crate::risk_limits_v17::MAX_LP_EXPOSURE_K_BPS
@@ -6432,6 +6438,8 @@ pub mod ix {
             side_oi_cap_q: u128,
             /// Optional trailing byte on the wire (absent == 0 == legacy matcher call).
             matcher_ext_mode: u8,
+            /// Optional trailing u16 after `matcher_ext_mode` (absent == 0 == fee channel off).
+            max_requested_fee_bps: u16,
         },
         /// UpdateFeeSplit (tag 86) — sets the three fee-split shares.
         /// Gated on `marketauth`. Shares must sum to FEE_SHARE_TOTAL_BPS and
@@ -7026,6 +7034,11 @@ pub mod ix {
                         0
                     } else {
                         read_u8(&mut rest)?
+                    },
+                    max_requested_fee_bps: if rest.is_empty() {
+                        0
+                    } else {
+                        read_u16(&mut rest)?
                     },
                 },
                 86 => Self::UpdateFeeSplit {
@@ -7795,6 +7808,7 @@ pub mod ix {
                     lp_floor_atoms,
                     side_oi_cap_q,
                     matcher_ext_mode,
+                    max_requested_fee_bps,
                 } => {
                     out.push(crate::constants::TAG_SET_ASSET_RISK_LIMITS);
                     push_u16(&mut out, asset_index);
@@ -7802,8 +7816,11 @@ pub mod ix {
                     push_u32(&mut out, lp_exposure_k_bps);
                     push_u128(&mut out, lp_floor_atoms);
                     push_u128(&mut out, side_oi_cap_q);
-                    if matcher_ext_mode != 0 {
+                    if matcher_ext_mode != 0 || max_requested_fee_bps != 0 {
                         out.push(matcher_ext_mode);
+                    }
+                    if max_requested_fee_bps != 0 {
+                        push_u16(&mut out, max_requested_fee_bps);
                     }
                 }
                 Self::UpdateFeeSplit {
@@ -9372,6 +9389,42 @@ pub mod risk_limits_v17 {
                 && after_q.unsigned_abs() <= before_q.unsigned_abs())
     }
 
+    /// Verdict of the LP gate for one fill (items 3 + 5).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LpGate {
+        Allow,
+        FloorHalt,
+        CapExceeded,
+    }
+
+    /// The single LP-gate rule (items 3 + 5), used post-fill on every route:
+    /// 1. a fill that is REDUCE-ONLY for the counterparty (the taker, on CPI) is ALWAYS allowed
+    ///    -- traders' exits are never trapped by the halt or the cap (limits-UI lane finding);
+    /// 2. a fill that does not grow the LP's magnitude is allowed;
+    /// 3. otherwise a floored LP halts, and an LP past its cap is refused.
+    pub fn lp_fill_gate(
+        counterparty_before_q: i128,
+        counterparty_after_q: i128,
+        lp_before_q: i128,
+        lp_after_q: i128,
+        cap_q: u128,
+        floor_breached: bool,
+    ) -> LpGate {
+        if position_change_reduce_only(counterparty_before_q, counterparty_after_q) {
+            return LpGate::Allow;
+        }
+        if !lp_risk_increasing(lp_before_q, lp_after_q) {
+            return LpGate::Allow;
+        }
+        if floor_breached {
+            return LpGate::FloorHalt;
+        }
+        if lp_after_q.unsigned_abs() > cap_q {
+            return LpGate::CapExceeded;
+        }
+        LpGate::Allow
+    }
+
     /// Item 5 on the routes that cannot clip (BatchTradeCpi, TradeNoCpi, BatchTradeNoCpi): a
     /// floored LP's requested move is admissible iff it does not grow the LP's magnitude.
     pub fn floored_lp_move_allowed(before_q: i128, after_q: i128) -> bool {
@@ -9394,18 +9447,90 @@ pub mod risk_limits_v17 {
         after_q <= cap_q || after_q <= before_q
     }
 
-    /// P2 coordination: the 24-byte matcher call extension (call bytes 43..67). Mode 0 =>
+    /// P2 coordination: the 24-byte matcher call extension (call bytes 43..67;
+    /// `~/percolator-ops/ledger/p1-p2-matcher-call-extension-abi-2026-09-30.md`). Mode 0 =>
     /// all-zero legacy bytes (what the deployed matcher 12bd671 requires). Mode 1 => the P2
-    /// `ext_version = 1` block: flags HEADROOM|MARK_SLOT (never ACCEPTS_FEE_REQUEST -- this
-    /// wrapper's `validate_matcher_return` rejects unknown return flags), `mark_slot` at
-    /// [4..12], `lp_headroom_q` (saturated to u64, u64::MAX = unbounded) at [12..20].
-    pub fn encode_matcher_call_ext(mode: u8, mark_slot: u64, lp_headroom_q: u128) -> [u8; 24] {
+    /// `ext_version = 1` block: flags HEADROOM | MARK_SLOT | EXEC_BAND, plus TAKER_REDUCING when
+    /// the wrapper VERIFIED the request only reduces the taker, plus ACCEPTS_FEE_REQUEST when
+    /// the protocol enabled the fee channel; `exec_band_bps` at [2..4], `mark_slot` at [4..12],
+    /// `lp_headroom_q` (saturated to u64, u64::MAX = unbounded) at [12..20].
+    /// Largest `max_requested_fee_bps` the protocol setter accepts (= the matcher's 10-bit
+    /// field maximum, 1023).
+    pub const MAX_REQUESTED_FEE_BPS: u16 = 1023;
+    pub const EXT_FLAG_HEADROOM: u8 = 1 << 0;
+    pub const EXT_FLAG_MARK_SLOT: u8 = 1 << 1;
+    pub const EXT_FLAG_ACCEPTS_FEE_REQUEST: u8 = 1 << 2;
+    pub const EXT_FLAG_TAKER_REDUCING: u8 = 1 << 3;
+    pub const EXT_FLAG_EXEC_BAND: u8 = 1 << 4;
+    /// Matcher return `flags` bits 22..31: `requested_fee_bps` (P2 fee channel).
+    pub const RET_REQUESTED_FEE_SHIFT: u32 = 22;
+    pub const RET_REQUESTED_FEE_MASK: u32 = 0x3ff << RET_REQUESTED_FEE_SHIFT;
+
+    /// P2 fee channel consent: a matcher-requested fee is charged only if the protocol enabled
+    /// the channel for the asset (`protocol_max_bps > 0`), the request is within that maximum,
+    /// and the TAKER-SIGNED `fee_bps` covers base + requested (the taker's own cap), which must
+    /// also stay within the market's `max_trading_fee_bps`. A zero request is always fine.
+    pub fn requested_fee_permitted(
+        requested_bps: u64,
+        base_fee_bps: u64,
+        taker_signed_fee_bps: u64,
+        protocol_max_bps: u16,
+        max_trading_fee_bps: u64,
+    ) -> bool {
+        if requested_bps == 0 {
+            return true;
+        }
+        match base_fee_bps.checked_add(requested_bps) {
+            Some(total) => {
+                protocol_max_bps != 0
+                    && requested_bps <= protocol_max_bps as u64
+                    && total <= taker_signed_fee_bps
+                    && total <= max_trading_fee_bps
+            }
+            None => false,
+        }
+    }
+
+    /// P2 fee channel: split the engine's collected fee (taker `fee_a`, maker-fallback `fee_b`)
+    /// into the part owed to the market's four-way split (`base_owed`, the fee at the base rate)
+    /// and the LP's requested part. The base is covered first, from the taker first; everything
+    /// collected beyond it is the LP's. Returns `(base_from_a, base_from_b, lp_credit)` with
+    /// `base_from_a + base_from_b + lp_credit == fee_a + fee_b` (Kani
+    /// `kani_p1_fee_channel_consent_and_allocation`). `base_owed = u128::MAX` (channel off)
+    /// reproduces the legacy split exactly (`lp_credit = 0`).
+    pub fn allocate_fee_with_lp_request(
+        fee_a: u128,
+        fee_b: u128,
+        base_owed: u128,
+    ) -> (u128, u128, u128) {
+        let base_a = if fee_a < base_owed { fee_a } else { base_owed };
+        let rest = base_owed - base_a;
+        let base_b = if fee_b < rest { fee_b } else { rest };
+        (base_a, base_b, (fee_a - base_a) + (fee_b - base_b))
+    }
+
+    pub fn encode_matcher_call_ext(
+        mode: u8,
+        mark_slot: u64,
+        lp_headroom_q: u128,
+        exec_band_bps: u16,
+        taker_reducing: bool,
+        accepts_fee_request: bool,
+    ) -> [u8; 24] {
         let mut b = [0u8; 24];
         if mode != 1 {
             return b;
         }
         b[0] = 1;
-        b[1] = 0b0000_0011;
+        let mut flags = EXT_FLAG_HEADROOM | EXT_FLAG_MARK_SLOT | EXT_FLAG_EXEC_BAND;
+        if taker_reducing {
+            flags |= EXT_FLAG_TAKER_REDUCING;
+        }
+        if accepts_fee_request {
+            flags |= EXT_FLAG_ACCEPTS_FEE_REQUEST;
+        }
+        b[1] = flags;
+        b[2..4].copy_from_slice(&exec_band_bps.to_le_bytes());
         b[4..12].copy_from_slice(&mark_slot.to_le_bytes());
         let headroom = if lp_headroom_q > u64::MAX as u128 {
             u64::MAX
@@ -11588,6 +11713,7 @@ pub mod processor {
                 lp_floor_atoms,
                 side_oi_cap_q,
                 matcher_ext_mode,
+                max_requested_fee_bps,
             } => handle_set_asset_risk_limits(
                 program_id,
                 accounts,
@@ -11599,7 +11725,8 @@ pub mod processor {
                     exec_band_bps,
                     matcher_ext_mode,
                     _reserved0: 0,
-                    _reserved: [0u8; 24],
+                    max_requested_fee_bps,
+                    _reserved: [0u8; 22],
                 },
             ),
             Instruction::SetProtocolFeeAuthority { new_authority } => {
@@ -12120,6 +12247,9 @@ pub mod processor {
         // P1: which sides are matcher LPs (LP exposure cap + floor/auto-halt apply to them) and
         // whether this is a matcher-routed CPI trade. See `P1TradeRoles`.
         roles: P1TradeRoles,
+        // P2 fee channel (TradeCpi only; 0 elsewhere): the consented matcher-requested fee,
+        // charged to the taker on top of the base fee and credited to account_b (the LP).
+        lp_requested_fee_bps: u64,
     ) -> ProgramResult {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
@@ -12211,7 +12341,7 @@ pub mod processor {
                 .asset
                 .effective_price
                 .get();
-            let fee_bps = hybrid_trade_fee_bps_view(
+            let base_fee_bps = hybrid_trade_fee_bps_view(
                 &cfg,
                 &oracle_profile,
                 &group,
@@ -12220,6 +12350,9 @@ pub mod processor {
                 fee_basis_price,
                 fee_bps,
             )?;
+            let fee_bps = base_fee_bps
+                .checked_add(lp_requested_fee_bps)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             let req = TradeRequestV16 {
                 asset_index: asset_index as usize,
                 // size_q is signed (i128) in the engine; direction is carried by the long/short
@@ -12372,20 +12505,37 @@ pub mod processor {
             // comment used to claim taker-only guarantees exactly one of the two is nonzero;
             // that guarantee, and the proof it rested on, are gone at the linked engine -- see
             // `batch_fee_charge_within_owed`. The arithmetic here never depended on it.)
+            // P2 fee channel: only the fee at the BASE rate goes through the four-way split;
+            // what the engine collected beyond it is the LP's requested fee, credited to the LP
+            // below. With the channel off `base_owed = u128::MAX` and this is the legacy split.
+            let base_owed = if lp_requested_fee_bps == 0 {
+                u128::MAX
+            } else {
+                batch_leg_fee(size_abs, fee_basis_price, base_fee_bps)?
+            };
+            let (split_in_a, split_in_b, lp_fee_credit) =
+                risk_limits_v17::allocate_fee_with_lp_request(outcome.fee_a, outcome.fee_b, base_owed);
             let split_a = policy_v16::split_trade_fee(
-                outcome.fee_a,
+                split_in_a,
                 constants::PROTOCOL_FEE_BPS,
                 cfg.creator_share_bps,
                 cfg.lp_share_bps,
                 cfg.insurance_share_bps,
             )?;
             let split_b = policy_v16::split_trade_fee(
-                outcome.fee_b,
+                split_in_b,
                 constants::PROTOCOL_FEE_BPS,
                 cfg.creator_share_bps,
                 cfg.lp_share_bps,
                 cfg.insurance_share_bps,
             )?;
+            if lp_fee_credit != 0 {
+                // The atoms were moved into `header.insurance` by this very trade's fee charge,
+                // so the unbudgeted pool holds them; pay them to the LP's capital.
+                group
+                    .credit_account_from_insurance_not_atomic(&mut account_b, lp_fee_credit, 0)
+                    .map_err(map_v16_error)?;
+            }
             // Creator-fee-claim change (2026-07-23): the creator leg NO LONGER
             // goes to the domain insurance budget. That budget is the loss
             // backstop the engine draws down via
@@ -13229,6 +13379,7 @@ pub mod processor {
             Some(backing_fee_cap_bps),
             max_market_slots,
             P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
+            0,
         )
     }
 
@@ -13961,10 +14112,17 @@ pub mod processor {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
             return Ok(());
         }
+        // P2 fee channel: only offered when the call extension is on AND the protocol set a
+        // maximum for this asset.
+        let accepts_fee_request =
+            p1_pre[0].matcher_ext_mode == state::MATCHER_EXT_MODE_V1 && p1_pre[0].max_requested_fee_bps != 0;
         let call_ext = risk_limits_v17::encode_matcher_call_ext(
             p1_pre[0].matcher_ext_mode,
             oracle_profile_pre.last_good_oracle_slot,
             lp_headroom_q,
+            p1_pre[0].band_bps,
+            p1_pre[0].taker_reducing,
+            accepts_fee_request,
         );
 
         invoke_matcher(
@@ -13989,10 +14147,21 @@ pub mod processor {
             ],
         )?;
 
-        let ret = {
+        let mut ret = {
             let data = matcher_ctx.try_borrow_data()?;
             matcher_abi::read_matcher_return(&data)?
         };
+        // P2 fee channel: return flag bits 22..31 carry the matcher's `requested_fee_bps`. They
+        // are stripped before the generic validation (which rejects unknown flags). Non-zero
+        // bits when the wrapper did not offer the channel fail closed exactly as before.
+        let requested_fee_bps = u64::from(
+            (ret.flags & risk_limits_v17::RET_REQUESTED_FEE_MASK)
+                >> risk_limits_v17::RET_REQUESTED_FEE_SHIFT,
+        );
+        if requested_fee_bps != 0 && !accepts_fee_request {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        ret.flags &= !risk_limits_v17::RET_REQUESTED_FEE_MASK;
         matcher_abi::validate_matcher_return(
             &ret,
             lp_account_id,
@@ -14001,6 +14170,16 @@ pub mod processor {
             size_q,
             req_id,
         )?;
+        // Taker consent (its signed `fee_bps` must cover base + requested) + protocol maximum.
+        if !risk_limits_v17::requested_fee_permitted(
+            requested_fee_bps,
+            cfg_pre.trade_fee_base_bps,
+            fee_bps,
+            p1_pre[0].max_requested_fee_bps,
+            max_trading_fee_bps,
+        ) {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
         if limit_price != 0 {
             let limit_ok = if size_q > 0 {
                 ret.exec_price_e6 <= limit_price
@@ -14057,6 +14236,7 @@ pub mod processor {
             Some(ret.backing_fee_cap_bps()),
             max_market_slots,
             P1TradeRoles::for_cpi(account_a_ai)?,
+            requested_fee_bps,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -17299,6 +17479,7 @@ pub mod processor {
             || limits.lp_exposure_k_bps > risk_limits_v17::MAX_LP_EXPOSURE_K_BPS
             || limits.side_oi_cap_q > percolator::MAX_OI_SIDE_Q
             || limits.matcher_ext_mode > state::MATCHER_EXT_MODE_V1
+            || limits.max_requested_fee_bps > risk_limits_v17::MAX_REQUESTED_FEE_BPS
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
@@ -25653,17 +25834,18 @@ pub mod processor {
         roles: P1TradeRoles,
     ) -> ProgramResult {
         let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
-        if roles.b_is_lp {
-            let after = position_b.checked_sub(size_q).ok_or_else(overflow)?;
+        let a_after = position_a.checked_add(size_q).ok_or_else(overflow)?;
+        let b_after = position_b.checked_sub(size_q).ok_or_else(overflow)?;
+        // Counterparty reduce-only (a trader's close) is exempt -- see `lp_fill_gate`.
+        if roles.b_is_lp && !risk_limits_v17::position_change_reduce_only(position_a, a_after) {
             let (floor, _) = lp_floor_and_cap_q_view(group, account_b, asset_index)?;
-            if floor && !risk_limits_v17::floored_lp_move_allowed(position_b, after) {
+            if floor && !risk_limits_v17::floored_lp_move_allowed(position_b, b_after) {
                 return Err(PercolatorError::LpFloorHalt.into());
             }
         }
-        if roles.a_is_lp {
-            let after = position_a.checked_add(size_q).ok_or_else(overflow)?;
+        if roles.a_is_lp && !risk_limits_v17::position_change_reduce_only(position_b, b_after) {
             let (floor, _) = lp_floor_and_cap_q_view(group, account_a, asset_index)?;
-            if floor && !risk_limits_v17::floored_lp_move_allowed(position_a, after) {
+            if floor && !risk_limits_v17::floored_lp_move_allowed(position_a, a_after) {
                 return Err(PercolatorError::LpFloorHalt.into());
             }
         }
@@ -25686,10 +25868,24 @@ pub mod processor {
         roles: P1TradeRoles,
     ) -> ProgramResult {
         if roles.b_is_lp {
-            ensure_lp_limits_after_fill_view(group, account_b, asset_index, position_b_before)?;
+            ensure_lp_limits_after_fill_view(
+                group,
+                account_b,
+                account_a,
+                asset_index,
+                position_b_before,
+                position_a_before,
+            )?;
         }
         if roles.a_is_lp {
-            ensure_lp_limits_after_fill_view(group, account_a, asset_index, position_a_before)?;
+            ensure_lp_limits_after_fill_view(
+                group,
+                account_a,
+                account_b,
+                asset_index,
+                position_a_before,
+                position_b_before,
+            )?;
         }
         let lp_involved = roles.cpi || roles.a_is_lp || roles.b_is_lp;
         if lp_involved && account_a.header.owner == account_b.header.owner {
@@ -25752,21 +25948,33 @@ pub mod processor {
     fn ensure_lp_limits_after_fill_view(
         group: &state::MarketViewMutV16<'_>,
         lp: &percolator::PortfolioV16ViewMut<'_>,
+        counterparty: &percolator::PortfolioV16ViewMut<'_>,
         asset_index: usize,
         position_before: i128,
+        counterparty_before: i128,
     ) -> ProgramResult {
         let position_after = signed_position_for_asset_view(group, lp, asset_index)?;
-        if !risk_limits_v17::lp_risk_increasing(position_before, position_after) {
+        let counterparty_after = signed_position_for_asset_view(group, counterparty, asset_index)?;
+        if !risk_limits_v17::lp_risk_increasing(position_before, position_after)
+            || risk_limits_v17::position_change_reduce_only(counterparty_before, counterparty_after)
+        {
             return Ok(());
         }
         let (floor, cap) = lp_floor_and_cap_q_view(group, lp, asset_index)?;
-        if floor {
-            return Err(PercolatorError::LpFloorHalt.into());
+        match risk_limits_v17::lp_fill_gate(
+            counterparty_before,
+            counterparty_after,
+            position_before,
+            position_after,
+            cap,
+            floor,
+        ) {
+            risk_limits_v17::LpGate::Allow => Ok(()),
+            risk_limits_v17::LpGate::FloorHalt => Err(PercolatorError::LpFloorHalt.into()),
+            risk_limits_v17::LpGate::CapExceeded => {
+                Err(PercolatorError::LpExposureCapExceeded.into())
+            }
         }
-        if !risk_limits_v17::lp_exposure_allowed(position_before, position_after, cap) {
-            return Err(PercolatorError::LpExposureCapExceeded.into());
-        }
-        Ok(())
     }
 
     /// `(floor_breached, exposure_cap_q)` for the LP on `asset_index`, from its
@@ -25804,12 +26012,17 @@ pub mod processor {
 
     /// Per-leg output of `p1_cpi_preflight_before_matcher`.
     struct P1CpiLegPreflight {
+        /// The request only reduces the taker (`position_change_reduce_only`): exempt from the
+        /// LP halt / cap, and attested to the matcher as P2 `TAKER_REDUCING`.
+        taker_reducing: bool,
         /// LP fill headroom (Q) in the direction this leg moves the LP.
         headroom_q: u128,
         /// Effective exec-price band (bps) for this leg's asset.
         band_bps: u16,
         /// This leg's asset `matcher_ext_mode`.
         matcher_ext_mode: u8,
+        /// This leg's asset `max_requested_fee_bps` (P2 fee channel; 0 = off).
+        max_requested_fee_bps: u16,
     }
 
     /// TradeCpi / BatchTradeCpi pre-matcher: the existing portfolio-currency preflight
@@ -25873,22 +26086,25 @@ pub mod processor {
             );
             let taker_is_creator =
                 profile.asset_admin != [0u8; 32] && profile.asset_admin == taker_owner;
-            if owners_equal || taker_is_creator {
+            let taker_before = signed_position_for_asset_view(&group, &account_a, asset_index)?;
+            let taker_after = taker_before
+                .checked_add(size_q)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let taker_reducing =
+                risk_limits_v17::position_change_reduce_only(taker_before, taker_after);
+            if (owners_equal || taker_is_creator) && !taker_reducing {
                 // Item 2 with the reduce-only exemption: a same-owner / creator taker may only
                 // CLOSE (the requested size may not open, grow or flip the taker).
-                let taker_before = signed_position_for_asset_view(&group, &account_a, asset_index)?;
-                let taker_after = taker_before
-                    .checked_add(size_q)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                if !risk_limits_v17::position_change_reduce_only(taker_before, taker_after) {
-                    return Err(PercolatorError::SameOwnerTrade.into());
-                }
+                return Err(PercolatorError::SameOwnerTrade.into());
             }
             let limits = state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])?;
             let before = signed_position_for_asset_view(&group, &account_b, asset_index)?;
             let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
             let (floor, cap) = lp_floor_and_cap_q_view(&group, &account_b, asset_index)?;
-            let headroom_q = if floor {
+            let headroom_q = if taker_reducing {
+                // A taker's close is never halted or clipped (the post-fill gate exempts it too).
+                size_q.unsigned_abs()
+            } else if floor {
                 let room = risk_limits_v17::floored_lp_reducing_room_q(before, lp_delta_sign);
                 if room == 0 {
                     return Err(PercolatorError::LpFloorHalt.into());
@@ -25898,9 +26114,11 @@ pub mod processor {
                 risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
             };
             out.push(P1CpiLegPreflight {
+                taker_reducing,
                 headroom_q,
                 band_bps: risk_limits_v17::effective_exec_band_bps(limits.exec_band_bps),
                 matcher_ext_mode: limits.matcher_ext_mode,
+                max_requested_fee_bps: limits.max_requested_fee_bps,
             });
         }
         Ok(out)
@@ -29767,6 +29985,78 @@ mod p1_kani_proofs {
         kani::cover!(ro && a == 0 && b != 0, "full close is reduce-only");
         kani::cover!(!ro && b != 0 && (b > 0) != (a > 0) && a != 0, "flip is not reduce-only");
         kani::cover!(!ro && !p1::lp_risk_increasing(b, a), "smaller flip: not reduce-only but not risk-increasing");
+    }
+
+
+    #[kani::proof]
+    fn kani_p1_taker_reducing_never_refused_by_halt_or_cap() {
+        let cp_before: i64 = kani::any();
+        let cp_after: i64 = kani::any();
+        let lp_before: i64 = kani::any();
+        let lp_after: i64 = kani::any();
+        let cap: u64 = kani::any();
+        let floor: bool = kani::any();
+        let v = p1::lp_fill_gate(
+            cp_before as i128,
+            cp_after as i128,
+            lp_before as i128,
+            lp_after as i128,
+            cap as u128,
+            floor,
+        );
+        let taker_reducing = p1::position_change_reduce_only(cp_before as i128, cp_after as i128);
+        // THE property: a fill that only reduces the taker is never refused by halt or cap.
+        if taker_reducing {
+            assert_eq!(v, p1::LpGate::Allow);
+        }
+        // An LP fill that does not grow the LP is never refused either.
+        if !p1::lp_risk_increasing(lp_before as i128, lp_after as i128) {
+            assert_eq!(v, p1::LpGate::Allow);
+        }
+        // Refusals only happen on taker-risk-increasing fills that grow the LP.
+        if v != p1::LpGate::Allow {
+            assert!(!taker_reducing && p1::lp_risk_increasing(lp_before as i128, lp_after as i128));
+        }
+        if v == p1::LpGate::CapExceeded {
+            assert!(!floor && (lp_after as i128).unsigned_abs() > cap as u128);
+        }
+        kani::cover!(taker_reducing && floor && p1::lp_risk_increasing(lp_before as i128, lp_after as i128), "close through a halted LP allowed");
+        kani::cover!(taker_reducing && (lp_after as i128).unsigned_abs() > cap as u128 && p1::lp_risk_increasing(lp_before as i128, lp_after as i128), "close past the cap allowed");
+        kani::cover!(v == p1::LpGate::FloorHalt, "halt fires on a taker open");
+        kani::cover!(v == p1::LpGate::CapExceeded, "cap fires on a taker open");
+    }
+
+    #[kani::proof]
+    fn kani_p1_fee_channel_consent_and_allocation() {
+        let req: u16 = kani::any();
+        let base: u16 = kani::any();
+        let signed: u16 = kani::any();
+        let pmax: u16 = kani::any();
+        let mmax: u16 = kani::any();
+        let (req, base, signed, mmax) = (req as u64, base as u64, signed as u64, mmax as u64);
+        let ok = p1::requested_fee_permitted(req, base, signed, pmax, mmax);
+        if req != 0 && ok {
+            assert!(pmax != 0 && req <= pmax as u64);
+            assert!(base + req <= signed && base + req <= mmax);
+        }
+        if pmax == 0 && req != 0 {
+            assert!(!ok);
+        }
+        kani::cover!(ok && req > 0, "consented fee request");
+        kani::cover!(!ok && req > 0 && pmax != 0 && base + req > signed, "taker cap refuses");
+        // Allocation conservation.
+        let fa: u64 = kani::any();
+        let fb: u64 = kani::any();
+        let owed: u64 = kani::any();
+        let (ba, bb, lp) = p1::allocate_fee_with_lp_request(fa as u128, fb as u128, owed as u128);
+        assert_eq!(ba + bb + lp, fa as u128 + fb as u128);
+        assert!(ba + bb <= owed as u128);
+        assert!(ba <= fa as u128 && bb <= fb as u128);
+        // Channel off reproduces the legacy split exactly.
+        let (la, lb, lz) = p1::allocate_fee_with_lp_request(fa as u128, fb as u128, u128::MAX);
+        assert!(la == fa as u128 && lb == fb as u128 && lz == 0);
+        kani::cover!(lp > 0 && ba == owed as u128, "LP credited beyond the base");
+        kani::cover!(lp == 0 && ba + bb < owed as u128, "shortfall: everything goes to the base");
     }
 
 }

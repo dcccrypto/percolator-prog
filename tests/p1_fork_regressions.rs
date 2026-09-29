@@ -716,6 +716,7 @@ fn set_lp_floor(e: &mut Env, floor: u128) {
             lp_floor_atoms: floor,
             side_oi_cap_q: 0,
             matcher_ext_mode: 0,
+            max_requested_fee_bps: 0,
         }
         .encode(),
     };

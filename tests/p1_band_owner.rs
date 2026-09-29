@@ -714,6 +714,7 @@ impl Env {
                 lp_floor_atoms: 0,
                 side_oi_cap_q: 0,
                 matcher_ext_mode: 0,
+                max_requested_fee_bps: 0,
             },
             vec![
                 AccountMeta::new(signer.pubkey(), true),
