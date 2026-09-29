@@ -2004,3 +2004,84 @@ fn p3_l2_stale_vault_lp_valuation_has_a_clear_error_and_crank_fixes_it() {
     env.earn_deposit(&d2, 1_000_000, Some(lp.portfolio)).expect("deposit once the vault LP is current");
     env.assert_conserved("L2");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Incident regressions — RECONSTRUCTIONS on the P3 program (not forks of live state: live
+// slabs have no vault LP). Fee rates follow the live markets (fee-flow audit 2026-09-29:
+// COLLECT 5 bps, Murphy 10 bps, TEXTIT 5 bps). Every step is a real instruction.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// R2 — COLLECT / Murphy LP drain. Live: winners pushed the creator-owned matcher LP to 0
+/// capital, after which every open reverted Custom(49) and the market died, with Earn backing
+/// having paid the LP along the way. On P3: the vault LP's exposure is capped at its junior-
+/// funded equity, so as winners drain the junior the market degrades to refusing only
+/// crowd-growing opens (Custom(80), never 49); closes keep working; seniors' backing and C never
+/// move; a junior top-up restores capacity — the market never dies.
+#[test]
+fn p3_r2_collect_murphy_lp_drain_reconstruction() {
+    let mut env = Env::new(Params { fee_bps: 5, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 50_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 5_000_000).expect("junior 5M");
+    let winner = env.new_trader(10_000_000);
+    env.trade(&winner, &lp, 4 * POS).expect("winner opens 4 units (under the 1x cap)");
+    let nav0 = env.backing_nav();
+    let c0 = env.vlp().senior_claim_atoms;
+    // +50%: the vault LP (short 4) loses $2 of its $5 junior.
+    env.move_price(1_500_000, &[lp.portfolio, winner.portfolio]);
+    let lp_state = env.portfolio(lp.portfolio);
+    println!("R2: after +50%: vault LP cap {} pnl {}", lp_state.capital, lp_state.pnl);
+    // A NEW crowd-growing open now exceeds 1x of the drained equity: refused with 80, not 49.
+    let late = env.new_trader(10_000_000);
+    env.svm.expire_blockhash();
+    let r = env.trade(&late, &lp, 2 * POS);
+    println!("R2: late crowd-growing open: {r:?}");
+    err_has(&r, PercolatorError::VaultLpExposureCapExceeded);
+    assert!(!format!("{r:?}").contains("Custom(49)"));
+    // Thin-side / reducing flow keeps working: the winner closes and realizes.
+    env.svm.expire_blockhash();
+    env.trade(&winner, &lp, -4 * POS).expect("winner closes");
+    assert_eq!(env.backing_nav(), nav0, "senior backing did not pay the winners");
+    assert_eq!(env.vlp().senior_claim_atoms, c0, "C unchanged");
+    // Refill: the creator tops the junior up and the market takes risk again.
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior top-up");
+    env.svm.expire_blockhash();
+    env.trade(&late, &lp, 2 * POS).expect("capacity restored after the junior refill");
+    env.assert_conserved("R2");
+}
+
+/// R3 — TEXTIT one-sided death. Live: the LP's lien needed domain-1 (short-side) backing that
+/// was empty/expired, so every trade growing the LP's LONG (i.e. every short) reverted
+/// Custom(21). On P3 the vault LP carries real first-loss capital, so neither side needs a
+/// backing lien to open: with Earn backing ONLY in domain 0, both a long and a short open and
+/// close against the vault LP.
+#[test]
+fn p3_r3_textit_one_sided_reconstruction() {
+    let mut env = Env::new(Params { fee_bps: 5, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 20_000_000, Some(lp.portfolio)).expect("earn (domain 0 only)");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let (_, g) = env.market_state();
+    println!(
+        "R3: backing domain0 fresh={} domain1 fresh={}",
+        g.source_backing_buckets[0].fresh_unliened_backing_num,
+        g.source_backing_buckets[1].fresh_unliened_backing_num
+    );
+    assert!(g.source_backing_buckets[0].fresh_unliened_backing_num > 0, "domain 0 funded");
+    assert_eq!(g.source_backing_buckets[1].fresh_unliened_backing_num, 0, "domain 1 empty, as on TEXTIT");
+    let short = env.new_trader(10_000_000);
+    env.trade(&short, &lp, -5 * POS).expect("SHORT opens (vault LP goes long) with domain 1 empty");
+    let long = env.new_trader(10_000_000);
+    env.svm.expire_blockhash();
+    env.trade(&long, &lp, 3 * POS).expect("long opens too");
+    env.move_price(1_050_000, &[lp.portfolio, short.portfolio, long.portfolio]);
+    env.svm.expire_blockhash();
+    env.trade(&short, &lp, 5 * POS).expect("short closes");
+    env.svm.expire_blockhash();
+    env.trade(&long, &lp, -3 * POS).expect("long closes");
+    env.assert_conserved("R3");
+}
