@@ -1,0 +1,9 @@
+{
+ "wrapper_program": "GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ",
+ "programdata": "BhakuUbpT8H1REzn8MehcYERofsnBaXKx4QpeJTS2ysu",
+ "owner": "BPFLoaderUpgradeab1e11111111111111111111111",
+ "fetch_slot": 505674831,
+ "header_45_b64": "AwAAANsBHR4AAAAAAdjXbgpxhk9phIR1LAgSq7Hug31W9epv16uz7t/WULPA",
+ "upgrade_authority": "FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7",
+ "note": "First 45 bytes (UpgradeableLoaderState::ProgramData header) of the live wrapper ProgramData; the ELF body is NOT included (the wrapper is mounted from the .so)."
+}
