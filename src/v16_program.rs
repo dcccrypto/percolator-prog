@@ -36,6 +36,10 @@ use solana_program::{
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
+/// P3 (2026-09-29): pure math for the vault-owned LP / tranche waterfall / skew funding /
+/// leverage step-down. See `~/percolator-ops/ledger/p3-vault-owned-lp-2026-09-29.md`.
+pub mod vault_lp_v18;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -382,6 +386,55 @@ pub mod constants {
     /// P1: SetAssetRiskLimits -- upgrade-authority-gated (same ProgramData check as tag 85),
     /// never creator/marketauth-settable.
     pub const TAG_SET_ASSET_RISK_LIMITS: u8 = 93;
+
+    // ── P3 vault-owned LP (2026-09-29) ──────────────────────────────────────────────────────
+    //
+    // Per-asset `AssetVaultLpV18` (128 B) lives in the TOP 128 bytes of each asset's fixed
+    // 1024-byte wrapper slot, [896, 1024). Those bytes were all-zero spare headroom; P1's
+    // `AssetRiskLimitsV17` claims [608, 672) and grows upward, so P3 takes the opposite end to
+    // stay disjoint from anything P1 appends. NO LAYOUT CHANGE: `ASSET_ORACLE_WRAPPER_LEN`,
+    // `MARKET_ASSET_SLOT_LEN`, `MARKET_GROUP_OFF` and every existing offset are unchanged.
+    // Zeroed (deployed / fresh) slots read "no vault LP bound, skew funding off, leverage
+    // step-down off", which is exactly today's behaviour.
+    pub const ASSET_VAULT_LP_OFF: usize = 896;
+    pub const ASSET_VAULT_LP_LEN: usize = 128;
+    const _: () = assert!(ASSET_VAULT_LP_OFF + ASSET_VAULT_LP_LEN == ASSET_ORACLE_WRAPPER_LEN);
+    // Disjoint from everything below it: W4-AE-84's epoch lane ends at 608 and P1's
+    // AssetRiskLimitsV17 (64 B) at 672.
+    const _: () = assert!(
+        ASSET_VAULT_LP_OFF >= PROTOCOL_FEE_AUTHORITY_EPOCH_OFF + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN + 64
+    );
+
+    /// P3 vault-LP state account kind (kinds 1-8 are taken; see KIND_CLOSED_MARKET).
+    pub const KIND_VAULT_LP_STATE: u8 = 9;
+    /// `["vault_lp", market]`.
+    pub const VAULT_LP_STATE_SEED: &[u8] = b"vault_lp";
+    pub const VAULT_LP_STATE_VERSION: u8 = 1;
+    /// Index into `LpVaultRegistryV16::_reserved` holding the "vault LP bound" flag. While it
+    /// is 1, every NAV-pricing vault handler REQUIRES the vault-LP accounts (fail closed).
+    pub const VAULT_LP_REGISTRY_BOUND_FLAG_IDX: usize = 0;
+    /// Junior floor, bps of the senior claim, kept while any senior claim exists. The protocol
+    /// minimum is 10%: a creator cannot bind a vault LP with a thinner first-loss buffer.
+    pub const VAULT_LP_MIN_JUNIOR_FLOOR_BPS: u16 = 1_000;
+    pub const VAULT_LP_MAX_JUNIOR_FLOOR_BPS: u16 = 10_000;
+    /// v1 routes the WHOLE LP fee leg to the senior claim. The junior is paid by trading PnL
+    /// and skew funding (plus the separate creator fee leg); a junior fee share would sit in
+    /// backing where the junior cannot reach it (junior exits only through the vault LP).
+    pub const VAULT_LP_SENIOR_FEE_SHARE_BPS: u16 = 10_000;
+    /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
+    /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
+    /// than its equity. The upgrade authority may raise it to at most 5x.
+    pub const VAULT_LP_DEFAULT_MAX_LEV_BPS: u32 = 10_000;
+    pub const VAULT_LP_MAX_LEV_BPS: u32 = 50_000;
+
+    pub const TAG_INIT_VAULT_LP: u8 = 94;
+    pub const TAG_VAULT_LP_SET_MATCHER: u8 = 95;
+    pub const TAG_DEPOSIT_JUNIOR_TRANCHE: u8 = 96;
+    pub const TAG_WITHDRAW_JUNIOR_TRANCHE: u8 = 97;
+    pub const TAG_VAULT_LP_RECALL: u8 = 98;
+    pub const TAG_SET_VAULT_LP_RISK: u8 = 99;
+    pub const TAG_VAULT_LP_CONVERT_PNL: u8 = 100;
+    pub const TAG_VAULT_LP_SETTLE_RESOLVED: u8 = 101;
 
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1140,6 +1193,37 @@ pub mod error {
         /// owed. Claim them (tags 84, 90) and sweep the staker leg (tag 87, which is allowed on
         /// a terminal-empty resolved market) first; nothing is burned.
         CloseSlabFeesOutstanding, // Custom(71)
+        // ── P3 vault-owned LP (2026-09-29). APPENDED; P1's 66..=71 go BEFORE these on
+        // rebase, so the SDK must map by name from the final enum, not by these comments. ──
+        /// InitVaultLp on a vault (or asset) that already has a bound vault LP.
+        VaultLpAlreadyBound,
+        /// A vault-LP instruction on a vault with no bound vault LP.
+        VaultLpNotBound,
+        /// Earn deposit refused: the senior tranche is impaired (vault value < senior claim).
+        /// New money would otherwise buy into a loss the junior did not cover.
+        VaultLpSeniorImpaired,
+        /// Junior withdrawal refused: over the junior surplus minus the floor, or the backing
+        /// pots do not fully cover the senior claim.
+        VaultLpJuniorWithdrawRefused,
+        /// Recall refused: zero, or more than the senior liquidity shortfall.
+        VaultLpRecallRefused,
+        /// A risk-increasing matcher fill against an LP other than the asset's bound vault LP.
+        VaultLpExclusiveCounterparty,
+        /// Leverage step-down: the taker's conservative equity does not cover the crowded-book
+        /// initial-margin requirement for this fill.
+        VaultLpLeverageStepDown,
+        /// CloseLpVault on a vault with a bound vault LP.
+        VaultLpBoundCannotClose,
+        /// P3-H2: a vault-LP fill would leave |vault LP position| * mark above the protocol
+        /// leverage cap on its conservative equity (`AssetVaultLpV18::vault_lp_max_lev_bps`).
+        VaultLpExposureCapExceeded,
+        /// P3-H2: VaultLpSetMatcher with a matcher program the protocol has not approved for
+        /// this asset (tag 99), or with an unbounded (0) max_fill_abs / max_inventory_abs.
+        VaultLpMatcherNotApproved,
+        /// P3-H1: CloseResolved (30) / ClaimResolvedPayoutTopup (46) on a vault LP portfolio.
+        /// Its owner is the registry PDA; use VaultLpSettleResolved (101), which routes the
+        /// payout senior-first into the vault's backing and the residual to the junior owner.
+        VaultLpUseSettleResolved,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -5527,6 +5611,210 @@ pub mod state {
         )
     }
 
+    // ── P3 vault-owned LP state (2026-09-29) ─────────────────────────────────────────────
+
+    /// `["vault_lp", market]` — one per market, beside the LP-vault registry.
+    pub fn derive_vault_lp_state(
+        program_id: &solana_program::pubkey::Pubkey,
+        market_group: &solana_program::pubkey::Pubkey,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::constants::VAULT_LP_STATE_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// P3 vault-LP tranche state. `senior_claim_atoms` (C) is the ONLY number that prices
+    /// Earn shares while the junior is solvent; see `vault_lp_v18::tranche_split`.
+    /// Size: 256 bytes, alignment-safe (`#[repr(C)]` Pod, no implicit padding).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct VaultLpStateV18 {
+        pub market_group: [u8; 32],             // 0..32
+        pub registry: [u8; 32],                 // 32..64
+        pub lp_portfolio: [u8; 32],             // 64..96
+        pub junior_owner: [u8; 32],             // 96..128
+        pub senior_claim_atoms: u128,           // 128..144
+        pub junior_deposited_atoms: u128,       // 144..160
+        pub junior_withdrawn_atoms: u128,       // 160..176
+        pub senior_fee_credited_atoms: u128,    // 176..192
+        pub recalled_atoms: u128,               // 192..208
+        pub asset_index: u16,                   // 208..210
+        pub junior_floor_bps: u16,              // 210..212
+        pub senior_fee_share_bps: u16,          // 212..214
+        pub version: u8,                        // 214
+        pub bump: u8,                           // 215
+        pub _padding: [u8; 8],                  // 216..224
+        pub _reserved: [u8; 32],                // 224..256
+    }
+    const _: () = assert!(core::mem::size_of::<VaultLpStateV18>() == 256);
+
+    pub const fn vault_lp_state_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<VaultLpStateV18>()
+    }
+
+    fn validate_vault_lp_state(st: &VaultLpStateV18) -> Result<(), ProgramError> {
+        if st.version != crate::constants::VAULT_LP_STATE_VERSION
+            || st.market_group == [0u8; 32]
+            || st.registry == [0u8; 32]
+            || st.lp_portfolio == [0u8; 32]
+            || st.junior_owner == [0u8; 32]
+            || st.junior_floor_bps < crate::constants::VAULT_LP_MIN_JUNIOR_FLOOR_BPS
+            || st.junior_floor_bps > crate::constants::VAULT_LP_MAX_JUNIOR_FLOOR_BPS
+            || st.senior_fee_share_bps != crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS
+            || st._padding != [0u8; 8]
+            || st._reserved != [0u8; 32]
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    pub fn init_vault_lp_state(data: &mut [u8], st: &VaultLpStateV18) -> Result<(), ProgramError> {
+        if data.len() < vault_lp_state_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        validate_vault_lp_state(st)?;
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, crate::constants::KIND_VAULT_LP_STATE)?;
+        data.get_mut(HEADER_LEN..vault_lp_state_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(st));
+        Ok(())
+    }
+
+    pub fn read_vault_lp_state(data: &[u8]) -> Result<VaultLpStateV18, ProgramError> {
+        if data.len() < vault_lp_state_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_VAULT_LP_STATE)?;
+        let bytes = data
+            .get(HEADER_LEN..vault_lp_state_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let st: VaultLpStateV18 = bytemuck::pod_read_unaligned(bytes);
+        validate_vault_lp_state(&st)?;
+        Ok(st)
+    }
+
+    pub fn write_vault_lp_state(data: &mut [u8], st: &VaultLpStateV18) -> Result<(), ProgramError> {
+        if data.len() < vault_lp_state_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_VAULT_LP_STATE)?;
+        validate_vault_lp_state(st)?;
+        data.get_mut(HEADER_LEN..vault_lp_state_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(st));
+        Ok(())
+    }
+
+    /// Registry "vault LP bound" flag (`_reserved[VAULT_LP_REGISTRY_BOUND_FLAG_IDX]`). Deployed
+    /// registries read 0 (the bytes were zero-reserved), i.e. unbound — today's behaviour.
+    pub fn registry_vault_lp_bound(reg: &LpVaultRegistryV16) -> Result<bool, ProgramError> {
+        match reg._reserved[crate::constants::VAULT_LP_REGISTRY_BOUND_FLAG_IDX] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ProgramError::InvalidAccountData),
+        }
+    }
+
+    pub fn set_registry_vault_lp_bound(reg: &mut LpVaultRegistryV16) {
+        reg._reserved[crate::constants::VAULT_LP_REGISTRY_BOUND_FLAG_IDX] = 1;
+    }
+
+    /// P3 per-asset vault-LP / skew-funding / leverage-step-down record, stored at
+    /// `constants::ASSET_VAULT_LP_OFF` (896) inside each asset's 1024-byte wrapper slot.
+    /// All-zero = "no vault LP bound, skew off, step-down off".
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct AssetVaultLpV18 {
+        /// The bound vault LP portfolio for this asset (0 = none).
+        pub vault_lp_portfolio: [u8; 32], // 0..32
+        /// Snapshot of the vault LP's signed position on this asset (engine Q), refreshed after
+        /// every fill that touches the vault LP. Traders' aggregate net = -lp_net_q.
+        pub lp_net_q: i128, // 32..48
+        /// Leverage step-down N_cap in Q (0 = step-down off).
+        pub lev_cap_q: u128, // 48..64
+        /// Slot of the last `lp_net_q` refresh.
+        pub lp_net_slot: u64, // 64..72
+        /// Skew funding slope, e9 per slot at 100% imbalance (0 = skew off).
+        pub skew_slope_e9: u64, // 72..80
+        /// Skew funding cap, e9 per slot.
+        pub skew_max_e9: u64, // 80..88
+        /// Step-down ceiling IMR in bps (<= 10_000).
+        pub lev_max_imr_bps: u16, // 88..90
+        /// bit 0: vault LP bound on this asset.
+        pub flags: u8, // 90
+        pub _reserved0: u8, // 91
+        /// P3-H2: protocol cap on the vault LP's exposure, bps of its conservative equity
+        /// (`|pos| * mark <= equity * lev / 10_000`). 0 = `VAULT_LP_DEFAULT_MAX_LEV_BPS` (1x),
+        /// so with the LP funded by the junior, seniors lose only on a >100% gap move.
+        pub vault_lp_max_lev_bps: u32, // 92..96
+        /// P3-H2: the ONLY matcher program tag 95 accepts for this asset's vault LP (0 = none
+        /// approved yet, so no matcher can be set). Upgrade-authority-set via tag 99.
+        pub approved_matcher_program: [u8; 32], // 96..128
+    }
+    const _: () =
+        assert!(core::mem::size_of::<AssetVaultLpV18>() == crate::constants::ASSET_VAULT_LP_LEN);
+
+    pub const ASSET_VAULT_LP_FLAG_BOUND: u8 = 1;
+
+    pub fn validate_asset_vault_lp(v: &AssetVaultLpV18) -> Result<(), ProgramError> {
+        let bound = v.flags & ASSET_VAULT_LP_FLAG_BOUND != 0;
+        if v.flags & !ASSET_VAULT_LP_FLAG_BOUND != 0
+            || v._reserved0 != 0
+            || v.vault_lp_max_lev_bps > crate::constants::VAULT_LP_MAX_LEV_BPS
+            || v.lev_max_imr_bps > 10_000
+            || bound != (v.vault_lp_portfolio != [0u8; 32])
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// Decode from an asset's wrapper-slot bytes (`group.markets[i].wrapper`).
+    pub fn asset_vault_lp_from_wrapper_bytes(wrapper: &[u8]) -> Result<AssetVaultLpV18, ProgramError> {
+        let off = crate::constants::ASSET_VAULT_LP_OFF;
+        let bytes = wrapper
+            .get(off..off + crate::constants::ASSET_VAULT_LP_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let v: AssetVaultLpV18 = bytemuck::pod_read_unaligned(bytes);
+        validate_asset_vault_lp(&v)?;
+        Ok(v)
+    }
+
+    pub fn asset_vault_lp_to_wrapper_bytes(
+        wrapper: &mut [u8],
+        v: &AssetVaultLpV18,
+    ) -> Result<(), ProgramError> {
+        validate_asset_vault_lp(v)?;
+        let off = crate::constants::ASSET_VAULT_LP_OFF;
+        wrapper
+            .get_mut(off..off + crate::constants::ASSET_VAULT_LP_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(v));
+        Ok(())
+    }
+
+    /// Raw-account read (for off-chain decoders and tests; handlers use the view helpers).
+    pub fn read_asset_vault_lp(data: &[u8], asset_index: usize) -> Result<AssetVaultLpV18, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let capacity = market_slot_capacity(data)?;
+        if asset_index >= capacity {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let start = dynamic_slot_offset(asset_index)?;
+        let wrapper = data
+            .get(start..start + crate::constants::ASSET_ORACLE_WRAPPER_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        asset_vault_lp_from_wrapper_bytes(wrapper)
+    }
+
     /// LP Vault backing-domain ledger PDA: `["lp_backing_ledger", market, domain_le]`.
     pub fn derive_lp_backing_ledger(
         program_id: &solana_program::pubkey::Pubkey,
@@ -6576,6 +6864,57 @@ pub mod ix {
             /// share asset-0's lane instead).
             authority_epoch: u64,
         },
+        // ── P3 vault-owned LP (2026-09-29), tags 93..=98 ──────────────────────────────────
+        /// Tag 94, marketauth-gated. Creates the vault-LP state PDA `["vault_lp", market]` and
+        /// a portfolio OWNED BY THE LP-VAULT REGISTRY PDA, binds it as the asset's exclusive
+        /// matcher LP and seeds the senior claim at the vault's current backing NAV.
+        InitVaultLp { junior_floor_bps: u16 },
+        /// Tag 95, UPGRADE-AUTHORITY-gated (P3-H2). SetMatcherConfig + InitMatcherCtx for the
+        /// vault LP (whose owner, a PDA, cannot sign either), with the protocol-approved matcher.
+        VaultLpSetMatcher {
+            expected_sequence: u64,
+            asset_generation_frontier: u64,
+            trade_fee_cap_bps: u16,
+            expiry_slot: u64,
+            kind: u8,
+            trading_fee_bps: u32,
+            base_spread_bps: u32,
+            max_total_bps: u32,
+            impact_k_bps: u32,
+            liquidity_notional_e6: u128,
+            max_fill_abs: u128,
+            max_inventory_abs: u128,
+            fee_to_insurance_bps: u16,
+            skew_spread_mult_bps: u16,
+        },
+        /// Tag 95, junior-owner-gated. SPL -> market vault -> vault LP capital (first loss).
+        DepositJuniorTranche { amount: u128 },
+        /// Tag 96, junior-owner-gated. Vault LP capital -> SPL, only from the junior surplus
+        /// over the floor and only while backing alone covers the senior claim.
+        WithdrawJuniorTranche { amount: u128 },
+        /// Tag 97, permissionless. Vault LP capital -> the vault's backing pot, bounded by the
+        /// senior liquidity shortfall. No SPL moves.
+        VaultLpRecall { amount: u128, target_domain: u16 },
+        /// Tag 98, UPGRADE-AUTHORITY-gated (a creator must not set a rate that pays its own
+        /// junior). Skew funding + leverage step-down parameters for one asset.
+        SetVaultLpRisk {
+            asset_index: u16,
+            skew_slope_e9: u64,
+            skew_max_e9: u64,
+            lev_cap_q: u128,
+            lev_max_imr_bps: u16,
+            vault_lp_max_lev_bps: u32,
+            approved_matcher_program: [u8; 32],
+        },
+        /// Tag 99, permissionless. ConvertReleasedPnl (tag 28) for the vault LP, whose owner
+        /// (a PDA) cannot sign tag 28. Value-neutral for the vault (released PnL -> capital of
+        /// the vault's own portfolio); the engine's own release/backing gate decides the amount.
+        VaultLpConvertPnl { amount: u128 },
+        /// Tag 101, PERMISSIONLESS, Resolved only (P3-H1). Closes the vault LP (topup == 0, the
+        /// CloseResolved step) or claims its resolved top-up (topup == 1, the tag-46 step) and
+        /// splits the payout senior-first: the senior shortfall `C - NAV` is refilled into the
+        /// vault's own backing pot, the residual is paid to the junior owner.
+        VaultLpSettleResolved { topup: u8 },
     }
 
     impl Instruction {
@@ -7058,6 +7397,50 @@ pub mod ix {
                     amount: read_u128(&mut rest)?,
                     asset_index: read_u16(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
+                },
+                94 => Self::InitVaultLp {
+                    junior_floor_bps: read_u16(&mut rest)?,
+                },
+                95 => Self::VaultLpSetMatcher {
+                    expected_sequence: read_u64(&mut rest)?,
+                    asset_generation_frontier: read_u64(&mut rest)?,
+                    trade_fee_cap_bps: read_u16(&mut rest)?,
+                    expiry_slot: read_u64(&mut rest)?,
+                    kind: read_u8(&mut rest)?,
+                    trading_fee_bps: read_u32(&mut rest)?,
+                    base_spread_bps: read_u32(&mut rest)?,
+                    max_total_bps: read_u32(&mut rest)?,
+                    impact_k_bps: read_u32(&mut rest)?,
+                    liquidity_notional_e6: read_u128(&mut rest)?,
+                    max_fill_abs: read_u128(&mut rest)?,
+                    max_inventory_abs: read_u128(&mut rest)?,
+                    fee_to_insurance_bps: read_u16(&mut rest)?,
+                    skew_spread_mult_bps: read_u16(&mut rest)?,
+                },
+                96 => Self::DepositJuniorTranche {
+                    amount: read_u128(&mut rest)?,
+                },
+                97 => Self::WithdrawJuniorTranche {
+                    amount: read_u128(&mut rest)?,
+                },
+                98 => Self::VaultLpRecall {
+                    amount: read_u128(&mut rest)?,
+                    target_domain: read_u16(&mut rest)?,
+                },
+                99 => Self::SetVaultLpRisk {
+                    asset_index: read_u16(&mut rest)?,
+                    skew_slope_e9: read_u64(&mut rest)?,
+                    skew_max_e9: read_u64(&mut rest)?,
+                    lev_cap_q: read_u128(&mut rest)?,
+                    lev_max_imr_bps: read_u16(&mut rest)?,
+                    vault_lp_max_lev_bps: read_u32(&mut rest)?,
+                    approved_matcher_program: read_bytes32(&mut rest)?,
+                },
+                100 => Self::VaultLpConvertPnl {
+                    amount: read_u128(&mut rest)?,
+                },
+                101 => Self::VaultLpSettleResolved {
+                    topup: read_u8(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -7855,6 +8238,84 @@ pub mod ix {
                     push_u128(&mut out, amount);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, authority_epoch);
+                }
+                Self::InitVaultLp { junior_floor_bps } => {
+                    out.push(94);
+                    push_u16(&mut out, junior_floor_bps);
+                }
+                Self::VaultLpSetMatcher {
+                    expected_sequence,
+                    asset_generation_frontier,
+                    trade_fee_cap_bps,
+                    expiry_slot,
+                    kind,
+                    trading_fee_bps,
+                    base_spread_bps,
+                    max_total_bps,
+                    impact_k_bps,
+                    liquidity_notional_e6,
+                    max_fill_abs,
+                    max_inventory_abs,
+                    fee_to_insurance_bps,
+                    skew_spread_mult_bps,
+                } => {
+                    out.push(95);
+                    push_u64(&mut out, expected_sequence);
+                    push_u64(&mut out, asset_generation_frontier);
+                    push_u16(&mut out, trade_fee_cap_bps);
+                    push_u64(&mut out, expiry_slot);
+                    out.push(kind);
+                    push_u32(&mut out, trading_fee_bps);
+                    push_u32(&mut out, base_spread_bps);
+                    push_u32(&mut out, max_total_bps);
+                    push_u32(&mut out, impact_k_bps);
+                    push_u128(&mut out, liquidity_notional_e6);
+                    push_u128(&mut out, max_fill_abs);
+                    push_u128(&mut out, max_inventory_abs);
+                    push_u16(&mut out, fee_to_insurance_bps);
+                    push_u16(&mut out, skew_spread_mult_bps);
+                }
+                Self::DepositJuniorTranche { amount } => {
+                    out.push(96);
+                    push_u128(&mut out, amount);
+                }
+                Self::WithdrawJuniorTranche { amount } => {
+                    out.push(97);
+                    push_u128(&mut out, amount);
+                }
+                Self::VaultLpRecall {
+                    amount,
+                    target_domain,
+                } => {
+                    out.push(98);
+                    push_u128(&mut out, amount);
+                    push_u16(&mut out, target_domain);
+                }
+                Self::SetVaultLpRisk {
+                    asset_index,
+                    skew_slope_e9,
+                    skew_max_e9,
+                    lev_cap_q,
+                    lev_max_imr_bps,
+                    vault_lp_max_lev_bps,
+                    approved_matcher_program,
+                } => {
+                    out.push(99);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, skew_slope_e9);
+                    push_u64(&mut out, skew_max_e9);
+                    push_u128(&mut out, lev_cap_q);
+                    push_u16(&mut out, lev_max_imr_bps);
+                    push_u32(&mut out, vault_lp_max_lev_bps);
+                    out.extend_from_slice(&approved_matcher_program);
+                }
+                Self::VaultLpConvertPnl { amount } => {
+                    out.push(100);
+                    push_u128(&mut out, amount);
+                }
+                Self::VaultLpSettleResolved { topup } => {
+                    out.push(101);
+                    out.push(topup);
                 }
             }
             out
@@ -11792,6 +12253,81 @@ pub mod processor {
                 asset_index,
                 authority_epoch,
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
+            Instruction::InitVaultLp { junior_floor_bps } => {
+                handle_init_vault_lp(program_id, accounts, junior_floor_bps)
+            }
+            Instruction::VaultLpSetMatcher {
+                expected_sequence,
+                asset_generation_frontier,
+                trade_fee_cap_bps,
+                expiry_slot,
+                kind,
+                trading_fee_bps,
+                base_spread_bps,
+                max_total_bps,
+                impact_k_bps,
+                liquidity_notional_e6,
+                max_fill_abs,
+                max_inventory_abs,
+                fee_to_insurance_bps,
+                skew_spread_mult_bps,
+            } => handle_vault_lp_set_matcher(
+                program_id,
+                accounts,
+                VaultLpMatcherParams {
+                    expected_sequence,
+                    asset_generation_frontier,
+                    trade_fee_cap_bps,
+                    expiry_slot,
+                    kind,
+                    trading_fee_bps,
+                    base_spread_bps,
+                    max_total_bps,
+                    impact_k_bps,
+                    liquidity_notional_e6,
+                    max_fill_abs,
+                    max_inventory_abs,
+                    fee_to_insurance_bps,
+                    skew_spread_mult_bps,
+                },
+            ),
+            Instruction::DepositJuniorTranche { amount } => {
+                handle_deposit_junior_tranche(program_id, accounts, amount)
+            }
+            Instruction::WithdrawJuniorTranche { amount } => {
+                handle_withdraw_junior_tranche(program_id, accounts, amount)
+            }
+            Instruction::VaultLpRecall {
+                amount,
+                target_domain,
+            } => handle_vault_lp_recall(program_id, accounts, amount, target_domain),
+            Instruction::SetVaultLpRisk {
+                asset_index,
+                skew_slope_e9,
+                skew_max_e9,
+                lev_cap_q,
+                lev_max_imr_bps,
+                vault_lp_max_lev_bps,
+                approved_matcher_program,
+            } => handle_set_vault_lp_risk(
+                program_id,
+                accounts,
+                VaultLpRiskParams {
+                    asset_index,
+                    skew_slope_e9,
+                    skew_max_e9,
+                    lev_cap_q,
+                    lev_max_imr_bps,
+                    vault_lp_max_lev_bps,
+                    approved_matcher_program,
+                },
+            ),
+            Instruction::VaultLpSettleResolved { topup } => {
+                handle_vault_lp_settle_resolved(program_id, accounts, topup)
+            }
+            Instruction::VaultLpConvertPnl { amount } => {
+                handle_vault_lp_convert_pnl(program_id, accounts, amount)
+            }
         }
     }
 
@@ -14228,6 +14764,13 @@ pub mod processor {
         }
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let vault_lp_pre = vault_lp_capture_pre_fill(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            &[asset_index],
+            max_market_slots,
+        )?;
         handle_trade_nocpi_zero_copy(
             program_id,
             signer_a.key,
@@ -14267,7 +14810,150 @@ pub mod processor {
             P1TradeRoles::for_cpi(account_a_ai)?,
             requested_fee_bps,
         )?;
+        vault_lp_post_fill(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            &vault_lp_pre,
+            max_market_slots,
+        )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+        Ok(())
+    }
+
+    // ── P3 matcher-fill hook (TradeCpi / BatchTradeCpi) ──────────────────────────────────────
+    //
+    // Runs AFTER the shared executor, on the post-trade state, for every traded asset that has
+    // a bound vault LP (`AssetVaultLpV18.flags & BOUND`). Unbound assets cost one 128-byte read.
+    //   1. Exclusive LP: a risk-increasing fill for any `account_b` OTHER than the bound vault
+    //      LP is refused. This is what stops Earn backing paying a creator-owned LP on a P3
+    //      market. Reducing fills stay allowed so a legacy LP can unwind.
+    //   2. Snapshot: `lp_net_q` = the vault LP's post-fill position (skew-funding input).
+    //   3. Leverage step-down: a fill that grows BOTH the vault LP's |inventory| (joins the
+    //      crowd) and the taker's |position| must satisfy the crowded-book IMR on the taker's
+    //      conservative equity (no credit for unrealized positive PnL).
+
+    /// (asset_index, account_b position before, account_a position before), bound assets only.
+    type VaultLpPreFill = Vec<(u16, i128, i128)>;
+
+    fn vault_lp_capture_pre_fill(
+        market_ai: &AccountInfo<'_>,
+        account_a_ai: &AccountInfo<'_>,
+        account_b_ai: &AccountInfo<'_>,
+        assets: &[u16],
+        max_market_slots: usize,
+    ) -> Result<VaultLpPreFill, ProgramError> {
+        let mut out: VaultLpPreFill = Vec::new();
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let mut a_data = account_a_ai.try_borrow_mut_data()?;
+        let mut b_data = account_b_ai.try_borrow_mut_data()?;
+        let a = state::portfolio_view_mut_for_market_slots(&mut a_data, max_market_slots)?;
+        let b = state::portfolio_view_mut_for_market_slots(&mut b_data, max_market_slots)?;
+        for &asset in assets {
+            if out.iter().any(|(x, _, _)| *x == asset) {
+                continue;
+            }
+            let rec = read_asset_vault_lp_from_view(&group, asset as usize)?;
+            if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 {
+                continue;
+            }
+            out.push((
+                asset,
+                signed_position_for_asset_view(&group, &b, asset as usize)?,
+                signed_position_for_asset_view(&group, &a, asset as usize)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn vault_lp_post_fill(
+        market_ai: &AccountInfo<'_>,
+        account_a_ai: &AccountInfo<'_>,
+        account_b_ai: &AccountInfo<'_>,
+        pre: &VaultLpPreFill,
+        max_market_slots: usize,
+    ) -> ProgramResult {
+        if pre.is_empty() {
+            return Ok(());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        let mut a_data = account_a_ai.try_borrow_mut_data()?;
+        let mut b_data = account_b_ai.try_borrow_mut_data()?;
+        let a = state::portfolio_view_mut_for_market_slots(&mut a_data, max_market_slots)?;
+        let b = state::portfolio_view_mut_for_market_slots(&mut b_data, max_market_slots)?;
+        let now_slot = authenticated_market_slot_or_fallback_view(&group);
+        let base_imr = group.header.config.initial_margin_bps.get();
+        for &(asset, lp_before, taker_before) in pre.iter() {
+            let idx = asset as usize;
+            let mut rec = read_asset_vault_lp_from_view(&group, idx)?;
+            let lp_after = signed_position_for_asset_view(&group, &b, idx)?;
+            if account_b_ai.key.to_bytes() != rec.vault_lp_portfolio {
+                if vault_lp_v18::joins_crowd(lp_before, lp_after) {
+                    return Err(PercolatorError::VaultLpExclusiveCounterparty.into());
+                }
+                continue;
+            }
+            rec.lp_net_q = lp_after;
+            rec.lp_net_slot = now_slot;
+            // P3-H2: protocol exposure cap on the vault LP (default 1x its conservative equity,
+            // i.e. the junior's capital), stricter than P1's generic LP cap.
+            {
+                let price = group.markets[idx].engine.asset.effective_price.get();
+                let lp_equity = vault_lp_v18::conservative_equity(
+                    b.header.capital.get(),
+                    b.header.pnl.get(),
+                    b.header.fee_credits.get(),
+                )
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                let lev = if rec.vault_lp_max_lev_bps == 0 {
+                    crate::constants::VAULT_LP_DEFAULT_MAX_LEV_BPS
+                } else {
+                    rec.vault_lp_max_lev_bps
+                };
+                if !vault_lp_v18::vault_lp_exposure_allowed(
+                    lp_before,
+                    lp_after,
+                    lp_equity,
+                    lev,
+                    price,
+                    percolator::POS_SCALE,
+                ) {
+                    return Err(PercolatorError::VaultLpExposureCapExceeded.into());
+                }
+            }
+            if rec.lev_cap_q != 0 && vault_lp_v18::joins_crowd(lp_before, lp_after) {
+                let taker_after = signed_position_for_asset_view(&group, &a, idx)?;
+                if taker_after.unsigned_abs() > taker_before.unsigned_abs() {
+                    let imr = vault_lp_v18::step_imr_bps(
+                        lp_after.unsigned_abs(),
+                        rec.lev_cap_q,
+                        base_imr,
+                        rec.lev_max_imr_bps,
+                    );
+                    if imr > base_imr {
+                        let price = group.markets[idx].engine.asset.effective_price.get();
+                        let notional = vault_lp_v18::notional_atoms(
+                            taker_after.unsigned_abs(),
+                            price,
+                            percolator::POS_SCALE,
+                        )
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                        let equity = vault_lp_v18::conservative_equity(
+                            a.header.capital.get(),
+                            a.header.pnl.get(),
+                            a.header.fee_credits.get(),
+                        )
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                        if !vault_lp_v18::leverage_gate_ok(equity, notional, imr) {
+                            return Err(PercolatorError::VaultLpLeverageStepDown.into());
+                        }
+                    }
+                }
+            }
+            write_asset_vault_lp_to_view(&mut group, idx, &rec)?;
+        }
         Ok(())
     }
 
@@ -14983,6 +15669,14 @@ pub mod processor {
 
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let vault_lp_assets: Vec<u16> = exec_legs.iter().map(|l| l.asset_index).collect();
+        let vault_lp_pre = vault_lp_capture_pre_fill(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            &vault_lp_assets,
+            max_market_slots,
+        )?;
         handle_batch_execute_zero_copy(
             program_id,
             signer_a.key,
@@ -14998,6 +15692,13 @@ pub mod processor {
             max_market_slots,
             Some(max_fee_atoms),
             P1TradeRoles::for_cpi(account_a_ai)?,
+        )?;
+        vault_lp_post_fill(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            &vault_lp_pre,
+            max_market_slots,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -21692,6 +22393,14 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+            // P3-H1: a vault LP (owner = this market's LP-vault registry PDA) must be settled
+            // through VaultLpSettleResolved (101): its owner cannot sign, and a payout to a
+            // registry-owned token account would be stranded there.
+            if portfolio.header.owner
+                == state::derive_lp_vault_registry(program_id, market_ai.key).0.to_bytes()
+            {
+                return Err(PercolatorError::VaultLpUseSettleResolved.into());
+            }
             // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
             let nft = optional_nft_holder_accounts(accounts, 7);
             authorize_owner_or_nft_holder(
@@ -21818,6 +22527,14 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+            // P3-H1: a vault LP (owner = this market's LP-vault registry PDA) must be settled
+            // through VaultLpSettleResolved (101): its owner cannot sign, and a payout to a
+            // registry-owned token account would be stranded there.
+            if portfolio.header.owner
+                == state::derive_lp_vault_registry(program_id, market_ai.key).0.to_bytes()
+            {
+                return Err(PercolatorError::VaultLpUseSettleResolved.into());
+            }
             // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
             let nft = optional_nft_holder_accounts(accounts, 7);
             authorize_owner_or_nft_holder(
@@ -22398,6 +23115,76 @@ pub mod processor {
             cfg_after = cfg;
         }
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
+        // P3: a crank can move the vault LP's position without a fill (liquidation / close
+        // progress). Refresh the skew-funding snapshot whenever the cranked portfolio IS a bound
+        // vault LP, so skew funding never runs on inventory the LP no longer holds.
+        vault_lp_refresh_snapshot(market_ai, portfolio_ai, max_market_slots)?;
+        Ok(())
+    }
+
+    /// P3: re-read `lp_net_q` for every bound asset whose vault LP is `portfolio_ai`. One
+    /// 128-byte record read per active leg; a no-op for every non-vault portfolio.
+    fn vault_lp_refresh_snapshot(
+        market_ai: &AccountInfo<'_>,
+        portfolio_ai: &AccountInfo<'_>,
+        max_market_slots: usize,
+    ) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+        let portfolio =
+            state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+        let key = portfolio_ai.key.to_bytes();
+        let now_slot = authenticated_market_slot_or_fallback_view(&group);
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            slot += 1;
+            let idx = leg.asset_index as usize;
+            if !leg.active || idx >= group.markets.len() {
+                continue;
+            }
+            let mut rec = read_asset_vault_lp_from_view(&group, idx)?;
+            if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 || rec.vault_lp_portfolio != key {
+                continue;
+            }
+            let q = signed_position_for_asset_view(&group, &portfolio, idx)?;
+            if q != rec.lp_net_q {
+                rec.lp_net_q = q;
+                rec.lp_net_slot = now_slot;
+                write_asset_vault_lp_to_view(&mut group, idx, &rec)?;
+            }
+        }
+        // A fully closed vault LP has no active leg left; zero every bound record that still
+        // names it with a nonzero snapshot. Only scanned for a FLAT portfolio (rarely cranked),
+        // so ordinary cranks pay one record read per active leg and nothing more.
+        let flat = percolator::active_bitmap_is_empty(
+            portfolio.header.active_bitmap.map(percolator::V16PodU64::get),
+        );
+        let n = if flat {
+            core::cmp::min(
+                group.markets.len(),
+                group.header.config.max_market_slots.get() as usize,
+            )
+        } else {
+            0
+        };
+        let mut idx = 0usize;
+        while idx < n {
+            let mut rec = read_asset_vault_lp_from_view(&group, idx)?;
+            if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0
+                && rec.vault_lp_portfolio == key
+                && rec.lp_net_q != 0
+                && signed_position_for_asset_view(&group, &portfolio, idx)? == 0
+            {
+                rec.lp_net_q = 0;
+                rec.lp_net_slot = now_slot;
+                write_asset_vault_lp_to_view(&mut group, idx, &rec)?;
+            }
+            idx += 1;
+        }
         Ok(())
     }
 
@@ -22741,6 +23528,23 @@ pub mod processor {
         // always the other; both are pinned by address below, so picking between
         // them here cannot be steered by the caller.
         let target_is_sibling = target_domain != registry.domain;
+        // P3: a bound vault prices Earn shares off the SENIOR tranche, so its vault-LP tail
+        // accounts are REQUIRED (fail closed: omitting them would price off backing alone).
+        // Tail: [11] vault_lp_state (w), [12] vault LP portfolio.
+        let bound_tail = if state::registry_vault_lp_bound(&registry)? {
+            let t = load_bound_vault_lp_tail(
+                program_id,
+                accounts,
+                11,
+                market_ai.key,
+                &registry_pda,
+                true,
+            )?;
+            expect_writable(t.0)?;
+            Some(t)
+        } else {
+            None
+        };
 
         // Market preflight: Live + registry PDA is backing-bucket authority.
         let (cfg, mode, configured_slots, _) =
@@ -22847,12 +23651,41 @@ pub mod processor {
             let nav = nav
                 .checked_add(harvestable)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            percolator::lp_vault::lp_shares_for_deposit(
-                amount,
-                registry.total_lp_shares_outstanding,
-                nav,
-            )
-            .map_err(map_v16_error)?
+            if let Some((_, Some(lp_ai), st)) = bound_tail.as_ref() {
+                // P3: price against the senior tranche, C_eff = C + senior share of the
+                // harvestable leg (same #411 rule as above, applied to the senior claim).
+                let c_eff = vault_lp_v18::effective_senior_claim(
+                    st.senior_claim_atoms,
+                    harvestable,
+                    st.senior_fee_share_bps,
+                )
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                if nav < c_eff {
+                    // Backing alone does not cover the senior: the LP must be valued, and new
+                    // money is refused outright if the senior is impaired.
+                    let lp_value =
+                        with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
+                    let v = nav
+                        .checked_add(lp_value)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    if vault_lp_v18::senior_impaired(v, c_eff) {
+                        return Err(PercolatorError::VaultLpSeniorImpaired.into());
+                    }
+                }
+                vault_lp_v18::senior_shares_for_deposit(
+                    amount,
+                    registry.total_lp_shares_outstanding,
+                    c_eff,
+                )
+                .ok_or(PercolatorError::EngineInvalidConfig)?
+            } else {
+                percolator::lp_vault::lp_shares_for_deposit(
+                    amount,
+                    registry.total_lp_shares_outstanding,
+                    nav,
+                )
+                .map_err(map_v16_error)?
+            }
         };
         // Note 1: never silently mint 0 and absorb the deposit.
         if shares == 0 {
@@ -22988,6 +23821,14 @@ pub mod processor {
                 .checked_add(shares)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+        // ── Phase 6 (P3, bound vaults only): the senior claim grows by exactly the deposit. ──
+        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+            st.senior_claim_atoms = st
+                .senior_claim_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
         }
         Ok(())
     }
@@ -23547,6 +24388,22 @@ pub mod processor {
         };
         expect_writable(source_ledger_ai)?;
         expect_owner(source_ledger_ai, program_id)?;
+        // P3: bound vaults redeem against the SENIOR tranche. Tail: [13] vault_lp_state (w),
+        // [14] vault LP portfolio. Required (fail closed) while the registry is bound.
+        let bound_tail = if state::registry_vault_lp_bound(&registry)? {
+            let t = load_bound_vault_lp_tail(
+                program_id,
+                accounts,
+                13,
+                &market_key,
+                &registry_pda,
+                true,
+            )?;
+            expect_writable(t.0)?;
+            Some(t)
+        } else {
+            None
+        };
 
         // ── Cooldown gate. ──
         let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
@@ -23623,20 +24480,57 @@ pub mod processor {
                 &ledger_data,
                 &sibling_ledger_data,
             )?;
-            let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
-                redemption.shares,
-                registry.total_lp_shares_outstanding,
-                nav,
-            )
-            .map_err(map_v16_error)?;
-            // principal_portion = floor(shares * available_principal / total_shares).
-            // Rounds down — consistent with lp_atoms_for_redemption. Never exceeds atoms_out
-            // because available_principal <= nav.
-            let principal_out = percolator::wide_math::wide_mul_div_floor_u128(
-                redemption.shares,
-                available_principal,
-                registry.total_lp_shares_outstanding,
-            );
+            let (atoms_out, principal_out) = if let Some((_, Some(lp_ai), st)) =
+                bound_tail.as_ref()
+            {
+                // P3: payout = floor(shares * senior / S), senior = min(V, C). Harvestable fees
+                // are excluded on BOTH sides, exactly as the unbound path excludes them from
+                // `nav` (#411 prices them only into deposits). The LP is valued only when backing
+                // alone does not cover C.
+                let senior_claim = st.senior_claim_atoms;
+                let senior_value = if nav >= senior_claim {
+                    senior_claim
+                } else {
+                    let lp_value =
+                        with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
+                    let v = nav
+                        .checked_add(lp_value)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    vault_lp_v18::tranche_split(v, senior_claim).senior
+                };
+                let atoms = vault_lp_v18::senior_atoms_for_redemption(
+                    redemption.shares,
+                    registry.total_lp_shares_outstanding,
+                    senior_value,
+                )
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                // Principal first, never more than the payout: part of the pots' principal can
+                // belong to the junior (e.g. a recall that over-covered after a later loss).
+                let principal = vault_lp_v18::senior_principal_portion(
+                    redemption.shares,
+                    available_principal,
+                    registry.total_lp_shares_outstanding,
+                    atoms,
+                )
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                (atoms, principal)
+            } else {
+                let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
+                    redemption.shares,
+                    registry.total_lp_shares_outstanding,
+                    nav,
+                )
+                .map_err(map_v16_error)?;
+                // principal_portion = floor(shares * available_principal / total_shares).
+                // Rounds down — consistent with lp_atoms_for_redemption. Never exceeds
+                // atoms_out because available_principal <= nav.
+                let principal_out = percolator::wide_math::wide_mul_div_floor_u128(
+                    redemption.shares,
+                    available_principal,
+                    registry.total_lp_shares_outstanding,
+                );
+                (atoms_out, principal_out)
+            };
             let earnings_out = atoms_out
                 .checked_sub(principal_out)
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
@@ -24048,6 +24942,17 @@ pub mod processor {
         // ── Decrement outstanding shares (mirrors the burn). ──
         {
             let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            // P3: the senior claim loses exactly the redeemed pro-rata slice (rounded down, so
+            // the remaining holders' per-share claim never falls). Uses S BEFORE the burn.
+            if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+                st.senior_claim_atoms = vault_lp_v18::senior_claim_after_redemption(
+                    st.senior_claim_atoms,
+                    redemption.shares,
+                    reg.total_lp_shares_outstanding,
+                )
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+            }
             reg.total_lp_shares_outstanding = reg
                 .total_lp_shares_outstanding
                 .checked_sub(redemption.shares)
@@ -24332,6 +25237,22 @@ pub mod processor {
         } else {
             (sibling_ledger_ai, sibling_ledger_bump)
         };
+        // P3: on a bound vault the harvested LP fee leg is credited to the SENIOR claim, so the
+        // vault-LP state is a REQUIRED tail account ([6], writable). Fail closed without it.
+        let bound_tail = if state::registry_vault_lp_bound(&registry)? {
+            let t = load_bound_vault_lp_tail(
+                program_id,
+                accounts,
+                6,
+                &market_key,
+                &registry_pda,
+                false,
+            )?;
+            expect_writable(t.0)?;
+            Some(t)
+        } else {
+            None
+        };
         expect_writable(ledger_ai)?;
         if ledger_ai.data_is_empty() {
             let len = state::backing_domain_ledger_account_len();
@@ -24539,6 +25460,20 @@ pub mod processor {
         // Mirrors `handle_withdraw_protocol_fee`'s unconditional write-back
         // rather than the trade-fee sites' opt-in `cfg_after` pattern.
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
+        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+            let (senior_part, _junior_part) =
+                vault_lp_v18::split_fee(available, st.senior_fee_share_bps)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            st.senior_claim_atoms = st
+                .senior_claim_atoms
+                .checked_add(senior_part)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            st.senior_fee_credited_atoms = st
+                .senior_fee_credited_atoms
+                .checked_add(senior_part)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        }
         Ok(())
     }
 
@@ -24615,6 +25550,11 @@ pub mod processor {
         if registry.total_lp_shares_outstanding > crate::constants::LP_VAULT_MINIMUM_LIQUIDITY {
             return Err(PercolatorError::LpVaultSharesOutstanding.into());
         }
+        // P3: a bound vault owns a live LP portfolio (and possibly the junior's capital);
+        // tearing the registry down would orphan its owner key. Never closable.
+        if state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpBoundCannotClose.into());
+        }
         let market_key = Pubkey::new_from_array(registry.market_group);
         expect_key(market_ai, &market_key)?;
         let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
@@ -24650,6 +25590,1295 @@ pub mod processor {
             .checked_add(reclaim)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         Ok(())
+    }
+
+    // ── P3 vault-owned LP handlers (tags 94..=100, 2026-09-29) ────────────────────────────────
+    //
+    // Design: `~/percolator-ops/ledger/p3-vault-owned-lp-2026-09-29.md`. Pure math lives in
+    // `crate::vault_lp_v18` (Kani / proptest targets); these handlers only gather inputs, bind
+    // accounts, and map refusals onto `PercolatorError`.
+    //
+    // Invariants every handler below preserves:
+    //   I-P3-1  the vault LP portfolio's owner is the registry PDA and never changes (no
+    //           owner-signed path can reach it: a PDA cannot sign a client transaction);
+    //   I-P3-2  senior + junior == V (waterfall conservation, `tranche_split`);
+    //   I-P3-3  `header.vault` moves only with real SPL transfers (junior deposit/withdraw);
+    //           recall is a pure reclassification (engine withdraw -V, backing add +V).
+
+    /// Asset record helpers over the zero-copy market view.
+    fn read_asset_vault_lp_from_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<state::AssetVaultLpV18, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_vault_lp_from_wrapper_bytes(&market.wrapper[..])
+    }
+
+    fn write_asset_vault_lp_to_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        v: &state::AssetVaultLpV18,
+    ) -> ProgramResult {
+        let market = group
+            .markets
+            .get_mut(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_vault_lp_to_wrapper_bytes(&mut market.wrapper[..], v)
+    }
+
+    /// Value of the vault LP portfolio for NAV purposes, in atoms, never negative.
+    ///
+    /// * Current health certificate (valid, oracle/funding/risk/asset-set epochs and active
+    ///   bitmap all match the market): the engine's own `certified_equity` (haircut equity —
+    ///   positive PnL counts only as far as backing covers it).
+    /// * Otherwise, a FLAT LP: `capital + min(pnl, 0) + min(fee_credits, 0)` — no credit for
+    ///   positive PnL that has not been certified.
+    /// * Otherwise (open inventory, stale certificate): `EngineStale`. The caller must crank
+    ///   the vault LP (permissionless tag 5) in the same transaction.
+    fn vault_lp_value_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioAccountV16Account,
+    ) -> Result<u128, ProgramError> {
+        let bitmap = lp.active_bitmap.map(percolator::V16PodU64::get);
+        let cert = lp.health_cert.try_to_runtime().map_err(map_v16_error)?;
+        let cert_current = lp.stale_state == 0
+            && lp.b_stale_state == 0
+            && cert.valid
+            && cert.cert_oracle_epoch == group.header.oracle_epoch.get()
+            && cert.cert_funding_epoch == group.header.funding_epoch.get()
+            && cert.cert_risk_epoch == group.header.risk_epoch.get()
+            && cert.cert_asset_set_epoch == group.header.asset_set_epoch.get()
+            && cert.active_bitmap_at_cert == bitmap;
+        if cert_current {
+            return Ok(if cert.certified_equity <= 0 {
+                0
+            } else {
+                cert.certified_equity as u128
+            });
+        }
+        if percolator::active_bitmap_is_empty(bitmap) {
+            return vault_lp_v18::conservative_equity(
+                lp.capital.get(),
+                lp.pnl.get(),
+                lp.fee_credits.get(),
+            )
+            .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into());
+        }
+        Err(PercolatorError::EngineStale.into())
+    }
+
+    /// Read-only access to a portfolio's engine header, for the NAV-pricing paths (75/77) where
+    /// the vault LP is passed READ-ONLY. Building a `PortfolioV16ViewMut` over a read-only
+    /// account faults at runtime (measured: "Access violation in input section"), so these paths
+    /// must never take a mutable view of it.
+    fn with_portfolio_header_ro<R>(
+        ai: &AccountInfo<'_>,
+        f: impl FnOnce(&percolator::PortfolioAccountV16Account) -> Result<R, ProgramError>,
+    ) -> Result<R, ProgramError> {
+        let data = ai.try_borrow_data()?;
+        let required = HEADER_LEN_RO + constants::PORTFOLIO_STATE_LEN;
+        if data.len() < required {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        state::check_portfolio_kind(&data)?;
+        let hdr = bytemuck::try_from_bytes::<percolator::PortfolioAccountV16Account>(
+            &data[HEADER_LEN_RO..required],
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        f(hdr)
+    }
+    const HEADER_LEN_RO: usize = constants::HEADER_LEN;
+
+    /// Bind a vault-LP state account to `market` (address = the canonical PDA via the stored
+    /// bump, program-owned, KIND_VAULT_LP_STATE, and its market field).
+    fn load_vault_lp_state(
+        program_id: &Pubkey,
+        vault_lp_ai: &AccountInfo<'_>,
+        market_key: &Pubkey,
+    ) -> Result<state::VaultLpStateV18, ProgramError> {
+        expect_owner(vault_lp_ai, program_id)?;
+        let st = state::read_vault_lp_state(&vault_lp_ai.try_borrow_data()?)?;
+        let expected = Pubkey::create_program_address(
+            &[
+                crate::constants::VAULT_LP_STATE_SEED,
+                market_key.as_ref(),
+                &[st.bump],
+            ],
+            program_id,
+        )
+        .map_err(|_| PercolatorError::VaultLpNotBound)?;
+        expect_key(vault_lp_ai, &expected)?;
+        if st.market_group != market_key.to_bytes() {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        Ok(st)
+    }
+
+    /// For the NAV-pricing handlers (75/77/78): the bound vault's tail accounts, bound to the
+    /// registry and to its LP. Returns (vault_lp_ai, lp_ai, state).
+    fn load_bound_vault_lp_tail<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        idx: usize,
+        market_key: &Pubkey,
+        registry_pda: &Pubkey,
+        need_lp: bool,
+    ) -> Result<(&'a AccountInfo<'a>, Option<&'a AccountInfo<'a>>, state::VaultLpStateV18), ProgramError>
+    {
+        let vault_lp_ai = account(accounts, idx)?;
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_key)?;
+        if st.registry != registry_pda.to_bytes() {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let lp_ai = if need_lp {
+            let lp_ai = account(accounts, idx + 1)?;
+            expect_owner(lp_ai, program_id)?;
+            if lp_ai.key.to_bytes() != st.lp_portfolio {
+                return Err(PercolatorError::VaultLpNotBound.into());
+            }
+            Some(lp_ai)
+        } else {
+            None
+        };
+        Ok((vault_lp_ai, lp_ai, st))
+    }
+
+    /// P3 — InitVaultLp (tag 94). marketauth-gated, Live only.
+    ///
+    /// Accounts: 0 marketauth [signer, w] · 1 market [w] · 2 registry [w] · 3 vault_lp_state
+    /// [w] (`["vault_lp", market]`, fresh) · 4 lp_portfolio [w] (program-owned, uninitialised,
+    /// pre-created by the client exactly as for InitPortfolio) · 5 system_program ·
+    /// 6 own ledger · 7 sibling ledger.
+    ///
+    /// Creates a portfolio whose OWNER IS THE REGISTRY PDA, binds it as the asset's exclusive
+    /// matcher LP (`AssetVaultLpV18`), and seeds the senior claim at the vault's current
+    /// backing NAV (+ harvestable fees, all of which belong to today's shareholders), so the
+    /// existing Earn holders are exactly whole and the junior starts at zero.
+    #[inline(never)]
+    fn handle_init_vault_lp<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        junior_floor_bps: u16,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_portfolio_ai = account(accounts, 4)?;
+        let system_program_ai = account(accounts, 5)?;
+        let own_ledger_ai = account(accounts, 6)?;
+        let sibling_ledger_ai = account(accounts, 7)?;
+        expect_signer(admin)?;
+        expect_writable(admin)?;
+        expect_writable(market_ai)?;
+        expect_writable(registry_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(lp_portfolio_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(lp_portfolio_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if !(crate::constants::VAULT_LP_MIN_JUNIOR_FLOOR_BPS
+            ..=crate::constants::VAULT_LP_MAX_JUNIOR_FLOOR_BPS)
+            .contains(&junior_floor_bps)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, market_ai.key);
+        expect_key(registry_ai, &registry_pda)?;
+        if registry.market_group != market_ai.key.to_bytes() {
+            return Err(PercolatorError::LpVaultNotFound.into());
+        }
+        if state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpAlreadyBound.into());
+        }
+        let (own_ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+
+        let (cfg, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if admin.key.to_bytes() != cfg.marketauth {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let asset_index = registry.domain as usize / 2;
+
+        let (vault_lp_pda, vault_lp_bump) = state::derive_vault_lp_state(program_id, market_ai.key);
+        expect_key(vault_lp_ai, &vault_lp_pda)?;
+        if vault_lp_ai.owner != &system_program::ID || !vault_lp_ai.data_is_empty() {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        if state::is_initialized(&lp_portfolio_ai.try_borrow_data()?) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        let required_portfolio_len =
+            state::portfolio_account_len_for_market_slots(max_market_slots)?;
+        if lp_portfolio_ai.data_len() != required_portfolio_len {
+            lp_portfolio_ai.realloc(required_portfolio_len, true)?;
+        }
+
+        let senior_claim = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+            // A vault that is not the backing authority of its own domain can take no deposit
+            // (DepositToLpVault refuses LpVaultAuthorityMismatch); binding an LP to it would
+            // leave the senior side of the waterfall unfundable.
+            let authorities = domain_authorities_from_view(&group, &cfg_v, registry.domain as usize)?;
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
+            let mut rec = read_asset_vault_lp_from_view(&group, asset_index)?;
+            if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0 {
+                return Err(PercolatorError::VaultLpAlreadyBound.into());
+            }
+            let nav = {
+                let own = own_ledger_ai.try_borrow_data()?;
+                let sib = sibling_ledger_ai.try_borrow_data()?;
+                lp_vault_combined_nav_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &own,
+                    &sib,
+                )?
+            };
+            let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
+            // C such that C_eff = C + senior_part(H) = nav + H: everything the vault holds or is
+            // about to harvest belongs to the shareholders who were carrying it before binding.
+            let senior_part = vault_lp_v18::bps_floor(
+                harvestable,
+                crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let senior_claim = nav
+                .checked_add(harvestable)
+                .and_then(|v| v.checked_sub(senior_part))
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+            // Portfolio init — mirrors handle_init_portfolio, with owner = registry PDA.
+            let last_fee_slot = authenticated_market_slot_or_fallback_view(&group);
+            let mut profile0 = read_oracle_profile_from_view(&group, &cfg_v, 0)?;
+            let (portfolio_id, next_portfolio_id) =
+                state::allocate_portfolio_id(profile0.next_portfolio_id)?;
+            state::init_portfolio_account_zero_copy(
+                &mut lp_portfolio_ai.try_borrow_mut_data()?,
+                market_ai.key.to_bytes(),
+                lp_portfolio_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                last_fee_slot,
+                max_market_slots,
+                portfolio_id,
+            )?;
+            {
+                let mut portfolio_data = lp_portfolio_ai.try_borrow_mut_data()?;
+                let portfolio =
+                    state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+                portfolio
+                    .as_view()
+                    .validate_with_market(&group.as_view())
+                    .map_err(map_v16_error)?;
+                group
+                    .register_empty_materialized_portfolio_not_atomic(&portfolio.as_view())
+                    .map_err(map_v16_error)?;
+            }
+            profile0.next_portfolio_id = next_portfolio_id;
+            write_oracle_profile_to_view(&mut group, 0, &profile0)?;
+
+            rec.vault_lp_portfolio = lp_portfolio_ai.key.to_bytes();
+            rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
+            rec.lp_net_q = 0;
+            rec.lp_net_slot = last_fee_slot;
+            write_asset_vault_lp_to_view(&mut group, asset_index, &rec)?;
+            senior_claim
+        };
+
+        let market_bytes = market_ai.key.to_bytes();
+        let bump_bytes = [vault_lp_bump];
+        let seeds: &[&[u8]] = &[
+            crate::constants::VAULT_LP_STATE_SEED,
+            market_bytes.as_ref(),
+            bump_bytes.as_ref(),
+        ];
+        create_pda_account(
+            admin,
+            vault_lp_ai,
+            system_program_ai,
+            state::vault_lp_state_account_len(),
+            program_id,
+            seeds,
+        )?;
+        let st = state::VaultLpStateV18 {
+            market_group: market_bytes,
+            registry: registry_pda.to_bytes(),
+            lp_portfolio: lp_portfolio_ai.key.to_bytes(),
+            junior_owner: admin.key.to_bytes(),
+            senior_claim_atoms: senior_claim,
+            junior_deposited_atoms: 0,
+            junior_withdrawn_atoms: 0,
+            senior_fee_credited_atoms: 0,
+            recalled_atoms: 0,
+            asset_index: asset_index as u16,
+            junior_floor_bps,
+            senior_fee_share_bps: crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
+            version: crate::constants::VAULT_LP_STATE_VERSION,
+            bump: vault_lp_bump,
+            _padding: [0u8; 8],
+            _reserved: [0u8; 32],
+        };
+        state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        state::set_registry_vault_lp_bound(&mut registry);
+        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+        Ok(())
+    }
+
+    /// Matcher parameters for tag 94 (grouped to keep the handler signature sane).
+    pub(crate) struct VaultLpMatcherParams {
+        pub expected_sequence: u64,
+        pub asset_generation_frontier: u64,
+        pub trade_fee_cap_bps: u16,
+        pub expiry_slot: u64,
+        pub kind: u8,
+        pub trading_fee_bps: u32,
+        pub base_spread_bps: u32,
+        pub max_total_bps: u32,
+        pub impact_k_bps: u32,
+        pub liquidity_notional_e6: u128,
+        pub max_fill_abs: u128,
+        pub max_inventory_abs: u128,
+        pub fee_to_insurance_bps: u16,
+        pub skew_spread_mult_bps: u16,
+    }
+
+    /// P3 — VaultLpSetMatcher (tag 95). marketauth-gated, Live only.
+    ///
+    /// SetMatcherConfig (68) + InitMatcherCtx (83) for the vault LP, whose owner (the registry
+    /// PDA) can sign neither. Same shape checks, same sequence / asset-frontier bindings, same
+    /// 78-byte matcher init payload signed by the same delegate PDA.
+    ///
+    /// Accounts: 0 upgrade_authority [signer] · 1 program_data · 2 market · 3 vault_lp_state ·
+    /// 4 lp_portfolio [w] · 5 matcher_prog · 6 matcher_ctx [w] · 7 matcher_delegate.
+    #[inline(never)]
+    fn handle_vault_lp_set_matcher<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        p: VaultLpMatcherParams,
+    ) -> ProgramResult {
+        // P3-H2 (+ P2 fee channel): PROTOCOL ONLY. The matcher context fixes the vault LP's
+        // quote AND its negotiated fee (matcher return bits 22..31), and the creator is the
+        // junior owner and can trade, so the creator must not choose any of it. The context is
+        // also frozen after init for everyone else: matcher tag 5 Configure needs the LP owner's
+        // signature, and the vault LP's owner is the registry PDA, which no client can produce.
+        let upgrade_authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let matcher_prog = account(accounts, 5)?;
+        let matcher_ctx = account(accounts, 6)?;
+        let matcher_delegate = account(accounts, 7)?;
+        expect_signer(upgrade_authority)?;
+        expect_writable(lp_ai)?;
+        expect_writable(matcher_ctx)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        let (program_data_key, _) = derive_program_data_address(program_id);
+        expect_key(program_data_ai, &program_data_key)?;
+        if read_program_data_upgrade_authority(program_data_ai)? != Some(*upgrade_authority.key) {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (_cfg, mode, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let current_slot = authenticated_slot_or_fallback(0);
+        if !state::matcher_capability_config_is_valid(1, p.trade_fee_cap_bps, p.expiry_slot, current_slot)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        {
+            let data = market_ai.try_borrow_data()?;
+            let live_frontier = state::read_market_asset_generation_frontier(&data)?;
+            if live_frontier != p.asset_generation_frontier {
+                return Err(PercolatorError::EngineStale.into());
+            }
+        }
+        let (header, owner) = state::read_portfolio_owner_preflight(&lp_ai.try_borrow_data()?)?;
+        let registry_key = Pubkey::new_from_array(st.registry);
+        if header.market_group_id != market_ai.key.to_bytes()
+            || header.portfolio_account_id != lp_ai.key.to_bytes()
+            || owner != st.registry
+        {
+            return Err(PercolatorError::EngineProvenanceMismatch.into());
+        }
+        if state::read_portfolio_matcher_sequence(&lp_ai.try_borrow_data()?)? != p.expected_sequence {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        if matcher_prog.key == program_id
+            || !matcher_prog.executable
+            || matcher_ctx.executable
+            || matcher_ctx.owner != matcher_prog.key
+            || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // P3-H2: the creator (marketauth) picks neither the program nor unbounded caps. Only the
+        // matcher program the protocol approved for this asset via tag 99 is accepted, and its
+        // fill/inventory caps must be finite (0 means "unlimited" to the matcher). The wrapper's
+        // own vault-LP exposure cap (post-fill) bounds inventory regardless of these values.
+        {
+            let rec = state::read_asset_vault_lp(
+                &market_ai.try_borrow_data()?,
+                st.asset_index as usize,
+            )?;
+            if rec.approved_matcher_program == [0u8; 32]
+                || rec.approved_matcher_program != matcher_prog.key.to_bytes()
+                || p.max_fill_abs == 0
+                || p.max_inventory_abs == 0
+            {
+                return Err(PercolatorError::VaultLpMatcherNotApproved.into());
+            }
+        }
+        ensure_portfolio_storage_for_market_slots(lp_ai, 0)?;
+        let (delegate, bump) = derive_matcher_delegate(
+            program_id,
+            market_ai.key,
+            lp_ai.key,
+            &registry_key,
+            matcher_prog.key,
+            matcher_ctx.key,
+        );
+        expect_key(matcher_delegate, &delegate)?;
+        {
+            let prior_control = state::read_portfolio_matcher_config(&lp_ai.try_borrow_data()?)?.control;
+            let mut mcfg = state::PortfolioMatcherConfigV16 {
+                matcher_program: matcher_prog.key.to_bytes(),
+                matcher_context: matcher_ctx.key.to_bytes(),
+                matcher_delegate: matcher_delegate.key.to_bytes(),
+                control: prior_control,
+            };
+            mcfg.set_enabled(1)?;
+            mcfg.set_trade_fee_cap_bps(p.trade_fee_cap_bps)?;
+            let mut data = lp_ai.try_borrow_mut_data()?;
+            state::write_portfolio_matcher_config(&mut data, &mcfg)?;
+            state::write_portfolio_matcher_expiry(&mut data, p.expiry_slot)?;
+            state::advance_portfolio_matcher_sequence(&mut data, p.expected_sequence)?;
+        }
+
+        let lp_account_id = matcher_lp_account_id(&delegate);
+        let mut cpi_data = [0u8; 78];
+        cpi_data[0] = 2; // MATCHER_INIT_VAMM_TAG
+        cpi_data[1] = p.kind;
+        cpi_data[2..6].copy_from_slice(&p.trading_fee_bps.to_le_bytes());
+        cpi_data[6..10].copy_from_slice(&p.base_spread_bps.to_le_bytes());
+        cpi_data[10..14].copy_from_slice(&p.max_total_bps.to_le_bytes());
+        cpi_data[14..18].copy_from_slice(&p.impact_k_bps.to_le_bytes());
+        cpi_data[18..34].copy_from_slice(&p.liquidity_notional_e6.to_le_bytes());
+        cpi_data[34..50].copy_from_slice(&p.max_fill_abs.to_le_bytes());
+        cpi_data[50..66].copy_from_slice(&p.max_inventory_abs.to_le_bytes());
+        cpi_data[66..68].copy_from_slice(&p.fee_to_insurance_bps.to_le_bytes());
+        cpi_data[68..70].copy_from_slice(&p.skew_spread_mult_bps.to_le_bytes());
+        cpi_data[70..78].copy_from_slice(&lp_account_id.to_le_bytes());
+        let metas = [
+            AccountMeta::new_readonly(*matcher_delegate.key, true),
+            AccountMeta::new(*matcher_ctx.key, false),
+        ];
+        let ix = SolInstruction {
+            program_id: *matcher_prog.key,
+            accounts: metas.to_vec(),
+            data: cpi_data.to_vec(),
+        };
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[
+            b"matcher",
+            market_ai.key.as_ref(),
+            lp_ai.key.as_ref(),
+            registry_key.as_ref(),
+            matcher_prog.key.as_ref(),
+            matcher_ctx.key.as_ref(),
+            &bump_arr,
+        ];
+        invoke_signed(
+            &ix,
+            &[
+                matcher_delegate.clone(),
+                matcher_ctx.clone(),
+                matcher_prog.clone(),
+            ],
+            &[seeds],
+        )
+    }
+
+    /// P3 — DepositJuniorTranche (tag 96). Junior-owner-gated, Live only.
+    ///
+    /// Accounts: 0 junior_owner [signer] · 1 market [w] · 2 vault_lp_state [w] ·
+    /// 3 lp_portfolio [w] · 4 source_token [w] · 5 vault_token [w] · 6 token_program.
+    ///
+    /// The creator's first-loss capital becomes the vault LP's margin. V and the junior rise by
+    /// exactly `amount`; the senior claim is untouched.
+    #[inline(never)]
+    fn handle_deposit_junior_tranche<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let vault_lp_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        let source_token = account(accounts, 4)?;
+        let vault_token = account(accounts, 5)?;
+        let token_program = account(accounts, 6)?;
+        expect_signer(owner)?;
+        expect_writable(market_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(lp_ai)?;
+        expect_writable(source_token)?;
+        expect_writable(vault_token)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+        let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if owner.key.to_bytes() != st.junior_owner {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (cfg, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let mint = primary_collateral_mint(&cfg);
+        let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+        let source_balance = verify_user_token_account(source_token, owner.key, &mint)?;
+        verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+        let amount_u64 = amount_to_u64(amount)?;
+        require_token_balance(source_balance, amount_u64)?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+            let mut lp_data = lp_ai.try_borrow_mut_data()?;
+            let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+            group.deposit_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+        }
+        transfer_tokens(token_program, source_token, vault_token, owner, amount_u64)?;
+        st.junior_deposited_atoms = st
+            .junior_deposited_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        Ok(())
+    }
+
+    /// P3 — WithdrawJuniorTranche (tag 97). Junior-owner-gated, Live only.
+    ///
+    /// Accounts: 0 junior_owner [signer] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
+    /// 4 lp_portfolio [w] · 5 own ledger · 6 sibling ledger · 7 dest_token [w] ·
+    /// 8 vault_token [w] · 9 vault_authority · 10 token_program.
+    ///
+    /// Admitted only if `vault_lp_v18::junior_withdraw_allowed` holds: backing alone covers the
+    /// senior claim (seniors keep their liquidity) AND the junior stays at or above its floor.
+    /// The engine additionally requires the vault LP to be FLAT (no withdrawal from a
+    /// portfolio with inventory), so the junior can never run ahead of a loss on open risk.
+    #[inline(never)]
+    fn handle_withdraw_junior_tranche<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        let owner = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let dest_token = account(accounts, 7)?;
+        let vault_token = account(accounts, 8)?;
+        let vault_authority_ai = account(accounts, 9)?;
+        let token_program = account(accounts, 10)?;
+        expect_signer(owner)?;
+        expect_writable(market_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(lp_ai)?;
+        expect_writable(dest_token)?;
+        expect_writable(vault_token)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+        let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if owner.key.to_bytes() != st.junior_owner {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let registry_pda = Pubkey::new_from_array(st.registry);
+        expect_key(registry_ai, &registry_pda)?;
+        if !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (own_ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        let (cfg, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let (vault_authority, vault_bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+        let vault_balance = verify_withdrawable_token_accounts(
+            dest_token,
+            owner.key,
+            vault_token,
+            &vault_authority,
+            &cfg,
+            false,
+        )?;
+        let amount_u64 = amount_to_u64(amount)?;
+        require_token_balance(vault_balance, amount_u64)?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+            let mut lp_data = lp_ai.try_borrow_mut_data()?;
+            let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+            // Same order as handle_withdraw: crystallize the accrued maintenance fee BEFORE the
+            // value used for the admission check is read.
+            collect_maintenance_fee_before_value_debit_view(&cfg_v, &mut group, &mut lp)?;
+            let nav = {
+                let own = own_ledger_ai.try_borrow_data()?;
+                let sib = sibling_ledger_ai.try_borrow_data()?;
+                lp_vault_combined_nav_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &own,
+                    &sib,
+                )?
+            };
+            let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
+            let cover = nav
+                .checked_add(harvestable)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let c_eff = vault_lp_v18::effective_senior_claim(
+                st.senior_claim_atoms,
+                harvestable,
+                st.senior_fee_share_bps,
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let lp_value = vault_lp_value_atoms(&group, lp.header)?;
+            let v = vault_lp_v18::vault_value(nav, harvestable, lp_value)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if !vault_lp_v18::junior_withdraw_allowed(v, c_eff, cover, amount, st.junior_floor_bps) {
+                return Err(PercolatorError::VaultLpJuniorWithdrawRefused.into());
+            }
+            group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+        }
+        let bump_arr = [vault_bump];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            dest_token,
+            vault_authority_ai,
+            amount_u64,
+            signer_seeds,
+        )?;
+        st.junior_withdrawn_atoms = st
+            .junior_withdrawn_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        Ok(())
+    }
+
+    /// P3 — VaultLpRecall (tag 98). PERMISSIONLESS, Live only.
+    ///
+    /// Accounts: 0 cranker [signer, w] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
+    /// 4 lp_portfolio [w] · 5 own ledger [w] · 6 sibling ledger [w] · 7 system_program.
+    ///
+    /// Moves up to the senior LIQUIDITY shortfall (`C_eff - (NAV + harvestable)`) from the vault
+    /// LP's free capital into the vault's backing pot `target_domain` (either domain of the
+    /// vault's asset). V is unchanged (LP -x, backing +x) and `header.vault` is unchanged; it
+    /// only turns junior-held value back into senior-redeemable backing, so a griefer gains
+    /// nothing and cannot strip LP capital beyond what seniors are owed. The engine refuses the
+    /// LP-side withdrawal while the vault LP holds inventory.
+    #[inline(never)]
+    fn handle_vault_lp_recall<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+        target_domain: u16,
+    ) -> ProgramResult {
+        let cranker = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let system_program_ai = account(accounts, 7)?;
+        expect_signer(cranker)?;
+        expect_writable(cranker)?;
+        expect_writable(market_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(lp_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if amount == 0 {
+            return Err(PercolatorError::VaultLpRecallRefused.into());
+        }
+        let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let registry_pda = Pubkey::new_from_array(st.registry);
+        expect_key(registry_ai, &registry_pda)?;
+        if !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        if target_domain as usize / 2 != registry.domain as usize / 2 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (own_ledger_pda, own_ledger_bump) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, sibling_ledger_bump) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        let (target_ledger_ai, target_ledger_bump) = if target_domain == registry.domain {
+            (own_ledger_ai, own_ledger_bump)
+        } else {
+            (sibling_ledger_ai, sibling_ledger_bump)
+        };
+        expect_writable(target_ledger_ai)?;
+        if target_ledger_ai.data_is_empty() {
+            let len = state::backing_domain_ledger_account_len();
+            let target_domain_bytes = target_domain.to_le_bytes();
+            let bump_bytes = [target_ledger_bump];
+            let seeds: &[&[u8]] = &[
+                crate::constants::LP_BACKING_LEDGER_SEED,
+                market_ai.key.as_ref(),
+                target_domain_bytes.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+            create_pda_account(
+                cranker,
+                target_ledger_ai,
+                system_program_ai,
+                len,
+                program_id,
+                seeds,
+            )?;
+        }
+        expect_owner(target_ledger_ai, program_id)?;
+        let (_, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let domain = target_domain as usize;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+            let authorities = domain_authorities_from_view(&group, &cfg_v, domain)?;
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
+            let nav = {
+                let own = own_ledger_ai.try_borrow_data()?;
+                let sib = sibling_ledger_ai.try_borrow_data()?;
+                lp_vault_combined_nav_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &own,
+                    &sib,
+                )?
+            };
+            let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
+            let cover = nav
+                .checked_add(harvestable)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let c_eff = vault_lp_v18::effective_senior_claim(
+                st.senior_claim_atoms,
+                harvestable,
+                st.senior_fee_share_bps,
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if amount > vault_lp_v18::recall_limit(c_eff, cover) {
+                return Err(PercolatorError::VaultLpRecallRefused.into());
+            }
+            // LP side: engine withdraw (flat-only, margin/equity-checked) — vault -x, c_tot -x.
+            {
+                let mut lp_data = lp_ai.try_borrow_mut_data()?;
+                let mut lp =
+                    state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+                expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+                collect_maintenance_fee_before_value_debit_view(&cfg_v, &mut group, &mut lp)?;
+                group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+            }
+            // Backing side: MIRRORS handle_deposit_to_lp_vault phase 3 (and #413's re-baseline).
+            let mut ledger_data = target_ledger_ai.try_borrow_mut_data()?;
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                &ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                target_domain,
+                &bucket,
+            )?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            let next_vault = group
+                .header
+                .vault
+                .get()
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            add_fresh_counterparty_backing_view(
+                &mut group,
+                domain,
+                amount
+                    .checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            )?;
+            {
+                let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                ledger.last_observed_unavailable_principal_atoms =
+                    backing_unavailable_principal_atoms(&bucket_after)?;
+            }
+            ledger.total_principal_atoms = ledger
+                .total_principal_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            ledger.total_deposited_atoms = ledger
+                .total_deposited_atoms
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            group.header.vault = percolator::V16PodU128::new(next_vault);
+            group.validate_shape().map_err(map_v16_error)?;
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+        }
+        st.recalled_atoms = st
+            .recalled_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        Ok(())
+    }
+
+    /// P3 — VaultLpSettleResolved (tag 101). PERMISSIONLESS, Resolved only (P3-H1).
+    ///
+    /// Accounts: 0 caller [signer, w] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
+    /// 4 lp_portfolio [w] · 5 own ledger [w] · 6 sibling ledger · 7 junior_dest [w] (collateral
+    /// token account owned by `junior_owner`) · 8 vault_token [w] · 9 vault_authority ·
+    /// 10 token_program · 11 system_program.
+    ///
+    /// `topup == 0` runs the engine's resolved close on the vault LP (the tag-30 step);
+    /// `topup == 1` claims its resolved payout top-up (the tag-46 step). The payout `P` is split by
+    /// `vault_lp_v18::resolved_settle_split`: the senior shortfall `C - NAV` goes back into the
+    /// vault's OWN backing pot (registry domain), where Earn holders redeem it through tag 77; the
+    /// residual is paid in SPL to the junior owner. `header.vault` moves only by the junior's SPL.
+    /// During `force_close_delay_slots` only the junior owner may run the close step, mirroring
+    /// tag 30's owner-only window.
+    #[inline(never)]
+    fn handle_vault_lp_settle_resolved<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        topup: u8,
+    ) -> ProgramResult {
+        let caller = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let junior_dest = account(accounts, 7)?;
+        let vault_token = account(accounts, 8)?;
+        let vault_authority_ai = account(accounts, 9)?;
+        let token_program = account(accounts, 10)?;
+        let system_program_ai = account(accounts, 11)?;
+        expect_signer(caller)?;
+        expect_writable(caller)?;
+        expect_writable(market_ai)?;
+        expect_writable(lp_ai)?;
+        expect_writable(own_ledger_ai)?;
+        expect_writable(junior_dest)?;
+        expect_writable(vault_token)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if system_program_ai.key != &system_program::ID || topup > 1 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let registry_pda = Pubkey::new_from_array(st.registry);
+        expect_key(registry_ai, &registry_pda)?;
+        if !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (own_ledger_pda, own_ledger_bump) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        if own_ledger_ai.data_is_empty() {
+            let len = state::backing_domain_ledger_account_len();
+            let domain_bytes = registry.domain.to_le_bytes();
+            let bump_bytes = [own_ledger_bump];
+            let seeds: &[&[u8]] = &[
+                crate::constants::LP_BACKING_LEDGER_SEED,
+                market_ai.key.as_ref(),
+                domain_bytes.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+            create_pda_account(caller, own_ledger_ai, system_program_ai, len, program_id, seeds)?;
+        }
+        expect_owner(own_ledger_ai, program_id)?;
+        let (cfg0, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let (vault_authority, vault_bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+        let junior_owner = Pubkey::new_from_array(st.junior_owner);
+        let vault_balance = verify_withdrawable_token_accounts(
+            junior_dest,
+            &junior_owner,
+            vault_token,
+            &vault_authority,
+            &cfg0,
+            true,
+        )?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        let domain = registry.domain as usize;
+        let to_junior = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 1 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let authenticated_slot = authenticated_market_slot_or_fallback_view(&group);
+            group
+                .advance_resolved_slot_not_atomic(authenticated_slot)
+                .map_err(map_v16_error)?;
+            let payout = {
+                let mut lp_data = lp_ai.try_borrow_mut_data()?;
+                let mut lp =
+                    state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+                expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+                if topup == 0 {
+                    if cfg.force_close_delay_slots != 0
+                        && authenticated_slot.saturating_sub(group.header.resolved_slot.get())
+                            < cfg.force_close_delay_slots
+                        && caller.key != &junior_owner
+                    {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
+                    let insurance_before = group.header.insurance.get();
+                    let outcome = group
+                        .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
+                        .map_err(map_v16_error)?;
+                    let retained = group
+                        .header
+                        .insurance
+                        .get()
+                        .saturating_sub(insurance_before);
+                    credit_maintenance_fee_to_active_market_budgets_view(&cfg, &mut group, retained)?;
+                    match outcome {
+                        percolator::ResolvedCloseOutcomeV16::ProgressOnly => 0,
+                        percolator::ResolvedCloseOutcomeV16::Closed { payout } => payout,
+                    }
+                } else {
+                    group
+                        .claim_resolved_payout_topup_not_atomic(&mut lp)
+                        .map_err(map_v16_error)?
+                }
+            };
+            let nav = {
+                let own = own_ledger_ai.try_borrow_data()?;
+                let sib = sibling_ledger_ai.try_borrow_data()?;
+                lp_vault_combined_nav_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &own,
+                    &sib,
+                )?
+            };
+            let (to_backing, to_junior) =
+                vault_lp_v18::resolved_settle_split(payout, st.senior_claim_atoms, nav);
+            if to_backing != 0 {
+                // Senior-first: the payout already left header.vault inside the engine close;
+                // route the senior part back in as the vault's own backing principal (the same
+                // bucket + ledger sequence as DepositToLpVault phase 3 / VaultLpRecall).
+                let mut ledger_data = own_ledger_ai.try_borrow_mut_data()?;
+                let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+                let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                    &ledger_data,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    &bucket,
+                )?;
+                sync_backing_domain_ledger(&mut ledger, &bucket)?;
+                let next_vault = group
+                    .header
+                    .vault
+                    .get()
+                    .checked_add(to_backing)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                add_fresh_counterparty_backing_view(
+                    &mut group,
+                    domain,
+                    to_backing
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                )?;
+                {
+                    let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                    ledger.last_observed_unavailable_principal_atoms =
+                        backing_unavailable_principal_atoms(&bucket_after)?;
+                }
+                ledger.total_principal_atoms = ledger
+                    .total_principal_atoms
+                    .checked_add(to_backing)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                ledger.total_deposited_atoms = ledger
+                    .total_deposited_atoms
+                    .checked_add(to_backing)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                group.header.vault = percolator::V16PodU128::new(next_vault);
+                write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+            }
+            group.validate_shape().map_err(map_v16_error)?;
+            to_junior
+        };
+        if to_junior != 0 {
+            let amount_u64 = amount_to_u64(to_junior)?;
+            require_token_balance(vault_balance, amount_u64)?;
+            let bump_arr = [vault_bump];
+            let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
+            transfer_tokens_signed(
+                token_program,
+                vault_token,
+                junior_dest,
+                vault_authority_ai,
+                amount_u64,
+                signer_seeds,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// P3 — VaultLpConvertPnl (tag 100). PERMISSIONLESS.
+    ///
+    /// Accounts: 0 caller [signer] · 1 market [w] · 2 vault_lp_state · 3 lp_portfolio [w].
+    /// `with_one_portfolio_view`'s layout puts the portfolio at index 2, so this handler does
+    /// its own view plumbing instead. The engine converts only its RELEASED, backed amount;
+    /// value-neutral for the vault (its own portfolio's PnL becomes its own capital).
+    #[inline(never)]
+    fn handle_vault_lp_convert_pnl<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u128,
+    ) -> ProgramResult {
+        let caller = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let vault_lp_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        expect_signer(caller)?;
+        expect_writable(market_ai)?;
+        expect_writable(lp_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        if amount == 0 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 || permissionless_resolve_matured_now_view(&cfg, &group) {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        let converted = group
+            .convert_released_pnl_to_capital_not_atomic(&mut lp)
+            .map_err(map_v16_error)?;
+        if converted == 0 || converted > amount {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        group.validate_shape().map_err(map_v16_error)?;
+        lp.validate_with_market(&group.as_view()).map_err(map_v16_error)
+    }
+
+    /// P3 — SetVaultLpRisk (tag 99). UPGRADE-AUTHORITY-gated (ProgramData check, as tag 85 and
+    /// P1's tag 92): skew funding pays the vault LP, i.e. the creator's junior, so the creator
+    /// must not be able to set it. Only on an asset with a bound vault LP.
+    ///
+    /// Accounts: 0 upgrade_authority [signer] · 1 program_data · 2 market [w].
+    #[inline(never)]
+    fn handle_set_vault_lp_risk<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        r: VaultLpRiskParams,
+    ) -> ProgramResult {
+        let VaultLpRiskParams {
+            asset_index,
+            skew_slope_e9,
+            skew_max_e9,
+            lev_cap_q,
+            lev_max_imr_bps,
+            vault_lp_max_lev_bps,
+            approved_matcher_program,
+        } = r;
+        let upgrade_authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        expect_signer(upgrade_authority)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        let (program_data_key, _) = derive_program_data_address(program_id);
+        expect_key(program_data_ai, &program_data_key)?;
+        let stored_upgrade_authority = read_program_data_upgrade_authority(program_data_ai)?;
+        if stored_upgrade_authority != Some(*upgrade_authority.key) {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if lev_max_imr_bps > 10_000
+            || (skew_slope_e9 == 0) != (skew_max_e9 == 0)
+            || vault_lp_max_lev_bps > crate::constants::VAULT_LP_MAX_LEV_BPS
+            || approved_matcher_program == program_id.to_bytes()
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        // The engine rejects any funding rate above this bound; a skew cap above it would be
+        // clamped anyway, so refuse it up front rather than store a misleading value.
+        if skew_max_e9 > group.header.config.max_abs_funding_e9_per_slot.get() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let idx = asset_index as usize;
+        if idx >= group.markets.len() || idx >= group.header.config.max_market_slots.get() as usize
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut rec = read_asset_vault_lp_from_view(&group, idx)?;
+        if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        rec.skew_slope_e9 = skew_slope_e9;
+        rec.skew_max_e9 = skew_max_e9;
+        rec.lev_cap_q = lev_cap_q;
+        rec.lev_max_imr_bps = lev_max_imr_bps;
+        rec.vault_lp_max_lev_bps = vault_lp_max_lev_bps;
+        rec.approved_matcher_program = approved_matcher_program;
+        write_asset_vault_lp_to_view(&mut group, idx, &rec)
+    }
+
+    /// Tag 99 parameters (grouped).
+    pub(crate) struct VaultLpRiskParams {
+        pub asset_index: u16,
+        pub skew_slope_e9: u64,
+        pub skew_max_e9: u64,
+        pub lev_cap_q: u128,
+        pub lev_max_imr_bps: u16,
+        pub vault_lp_max_lev_bps: u32,
+        pub approved_matcher_program: [u8; 32],
     }
 
     // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────────────────
@@ -27050,8 +29279,12 @@ pub mod processor {
         } else {
             effective_price
         };
-        policy_v16::premium_funding_rate_e9(active_mark, funding_index, max_abs_rate)
-            .ok_or(PercolatorError::EngineArithmeticOverflow.into())
+        let premium = policy_v16::premium_funding_rate_e9(active_mark, funding_index, max_abs_rate)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // P3 skew funding, combined IDENTICALLY in `funding_rate_from_checkpoint_view` (the
+        // trade-time canonical path) so no route can accrue a different rate than the crank.
+        let skew = vault_lp_skew_rate_e9_view(group, asset_index)?;
+        Ok(vault_lp_v18::combine_funding_rate_e9(premium, skew, max_abs_rate))
     }
 
     /// FIX (ADOPT upstream 06192caa, adapted): activates a due prospective mark
@@ -27261,6 +29494,7 @@ pub mod processor {
         effective_price_before: u64,
         effective_price_after: u64,
         segment_dt: u64,
+        skew_e9: i128,
     ) -> Result<i128, ProgramError> {
         if !oracle_v16::profile_is_price_managed(profile) || max_abs_rate == 0 {
             return Ok(0);
@@ -27287,8 +29521,30 @@ pub mod processor {
         } else {
             effective_price_after
         };
-        policy_v16::premium_funding_rate_e9(active_mark, funding_index, max_abs_rate)
-            .ok_or(PercolatorError::EngineArithmeticOverflow.into())
+        let premium = policy_v16::premium_funding_rate_e9(active_mark, funding_index, max_abs_rate)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok(vault_lp_v18::combine_funding_rate_e9(premium, skew_e9, max_abs_rate))
+    }
+
+    /// P3 skew-funding component for `asset_index` (e9/slot). Zero unless the asset has a bound
+    /// vault LP AND tag 98 set a slope. Callers combine it with the premium rate only on the
+    /// path where the premium itself is computed, so every early "no funding" return stays 0.
+    fn vault_lp_skew_rate_e9_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<i128, ProgramError> {
+        let rec = read_asset_vault_lp_from_view(group, asset_index)?;
+        if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 || rec.skew_slope_e9 == 0 {
+            return Ok(0);
+        }
+        let asset = &group.markets[asset_index].engine.asset;
+        let oi_side = core::cmp::max(asset.oi_eff_long_q.get(), asset.oi_eff_short_q.get());
+        Ok(vault_lp_v18::skew_funding_rate_e9(
+            rec.lp_net_q,
+            oi_side,
+            rec.skew_slope_e9,
+            rec.skew_max_e9,
+        ))
     }
 
     fn price_move_remainder_bps_num_view(profile: &state::AssetOracleProfileV16) -> u16 {
@@ -27370,6 +29626,9 @@ pub mod processor {
         let update_fresh_hybrid_mark = oracle_v16::profile_is_hybrid(&simulated_profile)
             && !oracle_v16::profile_hybrid_soft_stale_matured(&simulated_profile, now_slot);
         let hybrid_mark_start_slot = simulated_profile.last_good_oracle_slot;
+        // P3: constant across the simulated path (the vault-LP snapshot does not move while
+        // accruing), and the same value the permissionless crank path combines.
+        let skew_e9 = vault_lp_skew_rate_e9_view(group, asset_index)?;
         let mut steps = Vec::with_capacity(step_count as usize);
         for _ in 0..step_count {
             advance_funding_mark_checkpoint_view(&mut simulated_profile, simulated_slot);
@@ -27417,6 +29676,7 @@ pub mod processor {
                 effective_price,
                 next_price,
                 1,
+                skew_e9,
             )?;
             steps.push(AccrualStepV16 {
                 effective_price: next_price,

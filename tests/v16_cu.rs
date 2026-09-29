@@ -25046,3 +25046,645 @@ fn v16_attack_withdraw_backing_bucket_live_mode_still_requires_signer() {
     );
     assert_eq!(env.token_amount(beneficiary_dest), 0);
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// P3 (2026-09-29): vault-owned LP — skew funding, leverage step-down, exclusive-LP rule.
+// LiteSVM against the REAL wrapper BPF + REAL percolator-match BPF. Every mechanism is driven
+// by real instructions (CreateLpVault, DepositToLpVault, InitVaultLp, VaultLpSetMatcher,
+// DepositJuniorTranche, SetVaultLpRisk, TradeCpi, PermissionlessCrank). The only harness-level
+// state write is the mocked BPF-upgradeable `ProgramData` account tag 98 authenticates against
+// (exactly as the tag-85 tests above do) — there is no instruction that creates it.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+mod p3_vault_lp_skew {
+    use super::*;
+
+    pub(super) const P3_PRICE: u64 = 1_000_000;
+
+    pub(super) struct P3 {
+        pub env: V16CuEnv,
+        pub matcher_program: Pubkey,
+        pub registry: Pubkey,
+        pub vault_lp_state: Pubkey,
+        pub lp: Pubkey,
+        pub ctx: Pubkey,
+        pub delegate: Pubkey,
+        pub own_ledger: Pubkey,
+        pub sibling_ledger: Pubkey,
+        pub program_data: Pubkey,
+    }
+
+    /// The production risk shape used elsewhere in this file (IMR = MMR = 5%, funding enabled,
+    /// 24 bps/slot price clamp). A hand-rolled variant with IMR 10% exhausted InitMarket's CU
+    /// budget in the solvency-envelope search, so the tests reuse the known-good shape.
+    pub(super) fn p3_params() -> V16CuMarketParams {
+        production_risk_params()
+    }
+
+    fn market_frontier(env: &V16CuEnv) -> u64 {
+        state::read_market_asset_generation_frontier(&env.svm.get_account(&env.market).unwrap().data)
+            .unwrap()
+    }
+
+    pub(super) fn asset_rec(env: &V16CuEnv) -> state::AssetVaultLpV18 {
+        state::read_asset_vault_lp(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap()
+    }
+
+    pub(super) fn position_q(env: &V16CuEnv, portfolio: Pubkey) -> i128 {
+        let acct = env.portfolio_state(portfolio);
+        if !has_active_leg_for_asset(&acct, 0) {
+            return 0;
+        }
+        let leg = active_leg_for_asset(&acct, 0);
+        match leg.side {
+            SideV16::Long => leg.basis_pos_q.unsigned_abs() as i128,
+            SideV16::Short => -(leg.basis_pos_q.unsigned_abs() as i128),
+        }
+    }
+
+    /// Market (AUTH_MARK, funding enabled) + LP vault on domain 0 with one Earn deposit, a
+    /// bound vault LP with `junior` atoms of creator first-loss capital, a passive matcher, and
+    /// a mocked ProgramData (upgrade authority = admin) for tag 98.
+    pub(super) fn setup(earn: u64, junior: u64) -> P3 {
+        let mut env = V16CuEnv::new_with_init_params(p3_params());
+        env.svm.warp_to_slot(1);
+        env.configure_auth_mark_with_cu(1, P3_PRICE);
+        let matcher_program = Pubkey::new_unique();
+        let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+        env.svm.add_program(matcher_program, &matcher_bytes);
+        setup_on(env, matcher_program, earn, junior)
+    }
+
+    pub(super) fn set_risk(
+        p: &mut P3,
+        signer: &Keypair,
+        slope: u64,
+        max: u64,
+        lev_cap_q: u128,
+        lev_max_imr_bps: u16,
+    ) -> Result<u64, String> {
+        let market = p.env.market;
+        let pd = p.program_data;
+        p.env.svm.expire_blockhash();
+        p.env.send(
+            ProgInstruction::SetVaultLpRisk {
+                asset_index: 0,
+                skew_slope_e9: slope,
+                skew_max_e9: max,
+                lev_cap_q,
+                lev_max_imr_bps,
+                vault_lp_max_lev_bps: 0,
+                approved_matcher_program: p.matcher_program.to_bytes(),
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[signer],
+        )
+    }
+
+    pub(super) fn trader(p: &mut P3, capital: u128) -> (Keypair, Pubkey) {
+        let owner = Keypair::new();
+        let acct = p.env.create_portfolio(&owner);
+        p.env.deposit(&owner, acct, capital);
+        (owner, acct)
+    }
+
+    pub(super) fn trade_vs_vault(
+        p: &mut P3,
+        owner: &Keypair,
+        acct: Pubkey,
+        size_q: i128,
+    ) -> Result<u64, String> {
+        let admin = p.env.admin.insecure_clone();
+        let (lp, mp, ctx, del) = (p.lp, p.matcher_program, p.ctx, p.delegate);
+        p.env
+            .try_trade_cpi_with_cu_on_asset(owner, acct, &admin, lp, mp, ctx, del, 0, size_q, 0)
+    }
+
+    pub(super) fn try_crank_at(p: &mut P3, portfolio: Pubkey, slot: u64) -> Result<u64, String> {
+        p.env.svm.warp_to_slot(slot);
+        // Identical crank txs in one slot would otherwise be deduplicated (AlreadyProcessed).
+        p.env.svm.expire_blockhash();
+        let payer = p.env.payer.pubkey();
+        let market = p.env.market;
+        p.env.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[],
+        )
+    }
+
+    pub(super) fn crank_at(p: &mut P3, portfolio: Pubkey, slot: u64) {
+        let r = try_crank_at(p, portfolio, slot);
+        if let Err(e) = r {
+            let (_, g) = p.env.market_state();
+            panic!(
+                "crank of {portfolio} at slot {slot} failed: {} (asset slot_last={} eff={} f_long={})",
+                &e[..e.len().min(160)],
+                g.assets[0].slot_last,
+                g.assets[0].effective_price,
+                g.assets[0].f_long_num
+            );
+        }
+    }
+
+    fn assert_err_code(r: Result<u64, String>, code: PercolatorError, what: &str) {
+        let want = format!("Custom({})", code as u32);
+        let e = r.expect_err(what);
+        assert!(e.contains(&want), "{what}: expected {want} got {e}");
+    }
+
+    // ── tag 98 authorization ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn p3_set_vault_lp_risk_is_upgrade_authority_gated() {
+        let mut p = setup(50_000_000, 20_000_000);
+        // A marketauth-looking stranger (any non-upgrade-authority key) is refused.
+        let stranger = Keypair::new();
+        p.env.ensure_signer_account(stranger.pubkey());
+        assert_err_code(
+            set_risk(&mut p, &stranger, 1_000, 1_000, 0, 0),
+            PercolatorError::Unauthorized,
+            "stranger must not set skew/leverage risk",
+        );
+        // skew cap above the engine's own funding bound is refused up front.
+        let admin = p.env.admin.insecure_clone();
+        assert_err_code(
+            set_risk(&mut p, &admin, 1_000, 1_001, 0, 0),
+            PercolatorError::InvalidInstruction,
+            "skew_max above max_abs_funding must be refused",
+        );
+        set_risk(&mut p, &admin, 1_000, 1_000, 0, 0).expect("upgrade authority sets risk");
+        let rec = asset_rec(&p.env);
+        assert_eq!((rec.skew_slope_e9, rec.skew_max_e9), (1_000, 1_000));
+    }
+
+    #[test]
+    fn p3_set_vault_lp_risk_refuses_unbound_asset() {
+        // Same market shape, but no InitVaultLp: tag 98 must refuse with VaultLpNotBound.
+        let mut env = V16CuEnv::new_with_init_params(p3_params());
+        env.svm.warp_to_slot(1);
+        let admin = env.admin.insecure_clone();
+        let (program_data, _) = Pubkey::find_program_address(
+            &[env.program_id.as_ref()],
+            &solana_sdk::bpf_loader_upgradeable::ID,
+        );
+        let mut pd = vec![0u8; 45];
+        pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+        pd[12] = 1;
+        pd[13..45].copy_from_slice(admin.pubkey().as_ref());
+        env.svm
+            .set_account(
+                program_data,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: pd,
+                    owner: solana_sdk::bpf_loader_upgradeable::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let market = env.market;
+        let r = env.send(
+            ProgInstruction::SetVaultLpRisk {
+                asset_index: 0,
+                skew_slope_e9: 1_000,
+                skew_max_e9: 1_000,
+                lev_cap_q: 0,
+                lev_max_imr_bps: 0,
+                vault_lp_max_lev_bps: 0,
+                approved_matcher_program: Pubkey::new_unique().to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(program_data, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        );
+        assert_err_code(r, PercolatorError::VaultLpNotBound, "unbound asset");
+    }
+
+    // ── snapshot + skew funding ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn p3_fill_against_vault_lp_refreshes_snapshot() {
+        let mut p = setup(50_000_000, 20_000_000);
+        let (t_owner, t) = trader(&mut p, 5_000_000);
+        trade_vs_vault(&mut p, &t_owner, t, 3 * POS_SCALE as i128).expect("long vs vault LP");
+        let rec = asset_rec(&p.env);
+        assert_eq!(position_q(&p.env, p.lp), -3 * POS_SCALE as i128);
+        assert_eq!(
+            rec.lp_net_q,
+            position_q(&p.env, p.lp),
+            "snapshot must equal the vault LP's real post-fill position"
+        );
+    }
+
+    /// Crowded LONG book (vault LP short): after `slots` of accrual the long trader pays and the
+    /// vault LP receives. Returns (trader capital+pnl delta, LP capital+pnl delta, f_long_num).
+    fn skew_run(slope: u64, max: u64, size_q: i128, slots: u64) -> (i128, i128, i128, i128) {
+        let mut p = setup(50_000_000, 20_000_000);
+        let admin = p.env.admin.insecure_clone();
+        set_risk(&mut p, &admin, slope, max, 0, 0).expect("set skew");
+        let (t_owner, t) = trader(&mut p, 5_000_000);
+        trade_vs_vault(&mut p, &t_owner, t, size_q).expect("open vs vault LP");
+        let value = |env: &V16CuEnv, a: Pubkey| {
+            let s = env.portfolio_state(a);
+            s.capital as i128 + s.pnl
+        };
+        let t0 = value(&p.env, t);
+        let l0 = value(&p.env, p.lp);
+        let mut slot = 1u64;
+        // Accrue in max_accrual_dt-sized steps; crank both legs every step so the one-step
+        // settlement lag is flushed by the final double crank.
+        let steps = slots / 10;
+        let nonprogress = format!("Custom({})", PercolatorError::EngineNonProgress as u32);
+        // With nothing to accrue (skew off, mark == index) the engine refuses a crank as
+        // NonProgress — that refusal IS the "nothing moved" evidence; anything else is a bug.
+        let mut crank_ok = |p: &mut P3, a: Pubkey, slot: u64| match try_crank_at(p, a, slot) {
+            Ok(_) => {}
+            Err(e) if slope == 0 && e.contains(&nonprogress) => {}
+            Err(e) => panic!("crank at slot {slot} failed: {}", &e[..e.len().min(200)]),
+        };
+        for _ in 0..steps {
+            slot += 10;
+            p.env.push_auth_mark_with_cu(slot, P3_PRICE);
+            crank_ok(&mut p, t, slot);
+            let lp = p.lp;
+            crank_ok(&mut p, lp, slot);
+        }
+        // Close the whole position against the vault LP: the trade settles BOTH accounts at
+        // the current K/F, so each side's value change is exactly its realized funding (fees are
+        // 0 on this market, and the mark never moved).
+        let (_, g) = p.env.market_state();
+        p.env.svm.expire_blockhash();
+        trade_vs_vault(&mut p, &t_owner, t, -size_q).expect("close vs vault LP");
+        assert_eq!(position_q(&p.env, t), 0, "trader flat after close");
+        assert_eq!(position_q(&p.env, p.lp), 0, "vault LP flat after close");
+        (
+            value(&p.env, t) - t0,
+            value(&p.env, p.lp) - l0,
+            g.assets[0].f_long_num,
+            g.assets[0].f_short_num,
+        )
+    }
+
+    #[test]
+    fn p3_skew_funding_crowded_long_pays_vault_lp() {
+        let (dt, dl, f_long, f_short) = skew_run(1_000, 1_000, 3 * POS_SCALE as i128, 200);
+        std::println!(
+            "P3 skew crowded-long: trader Δ={dt} vaultLP Δ={dl} f_long={f_long} f_short={f_short}"
+        );
+        assert!(f_long < 0 && f_short > 0, "positive rate: longs pay shorts");
+        assert!(dt < 0, "crowded long trader must PAY skew funding, got {dt}");
+        assert!(dl > 0, "thin-side vault LP must RECEIVE skew funding, got {dl}");
+        // Zero-sum up to the engine's conservative per-settlement rounding (floor on both
+        // sides): the LP can never receive more than the trader paid.
+        assert!(dl <= -dt, "funding created value: paid {} received {dl}", -dt);
+        assert!(-dt - dl <= 4, "rounding residue too large: paid {} received {dl}", -dt);
+    }
+
+    #[test]
+    fn p3_skew_funding_flips_with_the_crowd() {
+        // Crowded SHORT (vault LP long): shorts pay, the LP receives.
+        let (dt, dl, f_long, f_short) = skew_run(1_000, 1_000, -3 * POS_SCALE as i128, 200);
+        std::println!(
+            "P3 skew crowded-short: trader Δ={dt} vaultLP Δ={dl} f_long={f_long} f_short={f_short}"
+        );
+        assert!(f_long > 0 && f_short < 0, "negative rate: shorts pay longs");
+        assert!(dt < 0 && dl > 0, "short trader pays ({dt}), vault LP receives ({dl})");
+        assert!(dl <= -dt && -dt - dl <= 4);
+    }
+
+    #[test]
+    fn p3_skew_off_leaves_auth_mark_funding_at_zero() {
+        // No tag 98: AUTH_MARK premium is 0 (mark == index) and skew is off, so nothing moves —
+        // the pre-P3 behaviour is unchanged.
+        let (dt, dl, f_long, f_short) = skew_run(0, 0, 3 * POS_SCALE as i128, 200);
+        assert_eq!((f_long, f_short), (0, 0));
+        assert_eq!((dt, dl), (0, 0));
+    }
+
+    /// Funding realized over one 20-slot interval (= max_accrual_dt) when the interval is
+    /// settled by a CRANK (`permissionless_funding_rate_e9_view`) vs purely by the closing TRADE
+    /// (`canonical_accrual_path_for_target_view` -> `funding_rate_from_checkpoint_view`).
+    fn skew_interval(via_crank: bool) -> (i128, i128) {
+        let mut p = setup(50_000_000, 20_000_000);
+        let admin = p.env.admin.insecure_clone();
+        set_risk(&mut p, &admin, 1_000, 1_000, 0, 0).expect("set skew");
+        let (t_owner, t) = trader(&mut p, 5_000_000);
+        let size = 3 * POS_SCALE as i128;
+        trade_vs_vault(&mut p, &t_owner, t, size).expect("open");
+        let value = |env: &V16CuEnv, a: Pubkey| {
+            let s = env.portfolio_state(a);
+            s.capital as i128 + s.pnl
+        };
+        let (t0, l0) = (value(&p.env, t), value(&p.env, p.lp));
+        p.env.svm.warp_to_slot(21);
+        p.env.push_auth_mark_with_cu(21, P3_PRICE);
+        if via_crank {
+            crank_at(&mut p, t, 21);
+        }
+        p.env.svm.expire_blockhash();
+        trade_vs_vault(&mut p, &t_owner, t, -size).expect("close");
+        (value(&p.env, t) - t0, value(&p.env, p.lp) - l0)
+    }
+
+    #[test]
+    fn p3_skew_funding_identical_on_crank_and_trade_paths() {
+        let crank = skew_interval(true);
+        let trade = skew_interval(false);
+        std::println!("P3 skew path: crank-settled {crank:?} trade-settled {trade:?}");
+        assert!(crank.0 < 0, "funding must accrue on the crank path, got {crank:?}");
+        assert_eq!(
+            crank, trade,
+            "the crank and the trade-time canonical path must realize the same skew funding"
+        );
+    }
+
+    // ── leverage step-down ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn p3_leverage_step_down_refuses_crowding_taker_and_allows_thin_side() {
+        let mut p = setup(50_000_000, 50_000_000);
+        let admin = p.env.admin.insecure_clone();
+        // N_cap = 10 units, step ceiling 50% IMR. Base IMR is 10%.
+        set_risk(&mut p, &admin, 0, 0, 10 * POS_SCALE as u128, 5_000).expect("set lev");
+        // Trader with $1 of equity: base 10% IMR allows $10 notional (10 units @ $1).
+        let (t_owner, t) = trader(&mut p, 1_000_000);
+        // 5 units joining the crowd => |LP| = 5 => crowd 50% => step IMR 50% => needs $2.50.
+        let r = trade_vs_vault(&mut p, &t_owner, t, 5 * POS_SCALE as i128);
+        assert_err_code(
+            r,
+            PercolatorError::VaultLpLeverageStepDown,
+            "crowding taker above stepped IMR",
+        );
+        // 1 unit: crowd 10% => step IMR == base => allowed.
+        trade_vs_vault(&mut p, &t_owner, t, POS_SCALE as i128).expect("small joining trade");
+        // A second taker on the THIN side (short, reduces the vault LP's inventory) keeps base
+        // leverage even though the book is crowded: 5 units short on $1 would be refused if
+        // the step applied (needs $2.50), and is accepted because it does not join the crowd.
+        let (s_owner, s) = trader(&mut p, 1_000_000);
+        let lp_before = position_q(&p.env, p.lp);
+        let r = trade_vs_vault(&mut p, &s_owner, s, -(POS_SCALE as i128));
+        r.expect("thin-side trade keeps base leverage");
+        assert!(position_q(&p.env, p.lp).unsigned_abs() < lp_before.unsigned_abs());
+    }
+
+    // ── exclusive LP ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn p3_exclusive_lp_refuses_growing_another_lp_but_lets_it_unwind() {
+        // Build the market WITHOUT binding first, give a creator-owned LP some inventory, then
+        // bind the vault LP and check the other LP can only shrink.
+        let mut env = V16CuEnv::new_with_init_params(p3_params());
+        env.svm.warp_to_slot(1);
+        env.configure_auth_mark_with_cu(1, P3_PRICE);
+        let matcher_program = Pubkey::new_unique();
+        let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
+        env.svm.add_program(matcher_program, &matcher_bytes);
+        let creator = Keypair::new();
+        let creator_lp = env.create_portfolio(&creator);
+        env.deposit(&creator, creator_lp, 20_000_000);
+        let (c_ctx, c_del, _) = env.init_matcher_context(&creator, matcher_program, creator_lp);
+        let t_owner = Keypair::new();
+        let t = env.create_portfolio(&t_owner);
+        env.deposit(&t_owner, t, 5_000_000);
+        env.try_trade_cpi_with_cu_on_asset(
+            &t_owner, t, &creator, creator_lp, matcher_program, c_ctx, c_del, 0,
+            2 * POS_SCALE as i128, 0,
+        )
+        .expect("pre-bind fill against the creator LP");
+
+        // Now bind a vault LP on the same asset (reuse the setup steps on this env).
+        let p_env = env;
+        let mut p = setup_on(p_env, matcher_program, 50_000_000, 20_000_000);
+        // Growing the creator LP (another long vs it) is refused...
+        let r = p.env.try_trade_cpi_with_cu_on_asset(
+            &t_owner, t, &creator, creator_lp, matcher_program, c_ctx, c_del, 0,
+            POS_SCALE as i128, 0,
+        );
+        assert_err_code(
+            r,
+            PercolatorError::VaultLpExclusiveCounterparty,
+            "growing a non-vault LP on a bound asset",
+        );
+        // ...reducing it (trader sells back) is allowed.
+        p.env
+            .try_trade_cpi_with_cu_on_asset(
+                &t_owner, t, &creator, creator_lp, matcher_program, c_ctx, c_del, 0,
+                -(POS_SCALE as i128), 0,
+            )
+            .expect("unwinding the legacy creator LP stays allowed");
+        // And the vault LP itself takes new risk normally.
+        trade_vs_vault(&mut p, &t_owner, t, POS_SCALE as i128).expect("vault LP fill");
+    }
+
+    /// `setup` on an existing env (used by the exclusive-LP test, which needs pre-bind state).
+    pub(super) fn setup_on(mut env: V16CuEnv, matcher_program: Pubkey, earn: u64, junior: u64) -> P3 {
+        let program_id = env.program_id;
+        let market = env.market;
+        let (registry, _) = state::derive_lp_vault_registry(&program_id, &market);
+        let (lp_mint, _) = state::derive_lp_vault_mint(&program_id, &market);
+        let (own_ledger, _) = state::derive_lp_backing_ledger(&program_id, &market, 0);
+        let (sibling_ledger, _) = state::derive_lp_backing_ledger(&program_id, &market, 1);
+        let admin = env.admin.insecure_clone();
+        env.send(
+            ProgInstruction::CreateLpVault {
+                fee_share_bps: 5_000,
+                redemption_cooldown_slots: 0,
+                oi_reservation_threshold_bps: 0,
+                domain: 0,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new(lp_mint, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect("create lp vault");
+        let earner = Keypair::new();
+        env.ensure_signer_account(earner.pubkey());
+        env.svm.airdrop(&earner.pubkey(), 10_000_000_000).unwrap();
+        let earn_src = env.token_account(earner.pubkey(), earn);
+        let earn_lp_ata = env.token_account_for_mint(lp_mint, earner.pubkey(), 0);
+        let vault = env.vault;
+        env.send(
+            ProgInstruction::DepositToLpVault {
+                amount: earn as u128,
+                domain: 0,
+            },
+            vec![
+                AccountMeta::new(earner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new(lp_mint, false),
+                AccountMeta::new(earn_lp_ata, false),
+                AccountMeta::new(earn_src, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new(own_ledger, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(sibling_ledger, false),
+            ],
+            &[&earner],
+        )
+        .expect("earn deposit");
+        let lp = env.program_account(env.portfolio_account_len);
+        let (vault_lp_state, _) = state::derive_vault_lp_state(&program_id, &market);
+        env.send(
+            ProgInstruction::InitVaultLp {
+                junior_floor_bps: 1_000,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new(vault_lp_state, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(own_ledger, false),
+                AccountMeta::new_readonly(sibling_ledger, false),
+            ],
+            &[&admin],
+        )
+        .expect("init vault lp");
+        // Harness-only state write (no instruction creates a ProgramData account): the mocked
+        // BPF-upgradeable ProgramData (upgrade authority = admin), same bytes as the tag-85 tests.
+        let (program_data, _) = Pubkey::find_program_address(
+            &[program_id.as_ref()],
+            &solana_sdk::bpf_loader_upgradeable::ID,
+        );
+        let mut pd = vec![0u8; 45];
+        pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+        pd[12] = 1;
+        pd[13..45].copy_from_slice(admin.pubkey().as_ref());
+        env.svm
+            .set_account(
+                program_data,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: pd,
+                    owner: solana_sdk::bpf_loader_upgradeable::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        // P3-H2: the protocol (upgrade authority) approves the matcher program BEFORE the
+        // creator can point the vault LP at it (tag 99, all risk knobs off, default 1x cap).
+        env.send(
+            ProgInstruction::SetVaultLpRisk {
+                asset_index: 0,
+                skew_slope_e9: 0,
+                skew_max_e9: 0,
+                lev_cap_q: 0,
+                lev_max_imr_bps: 0,
+                vault_lp_max_lev_bps: 0,
+                approved_matcher_program: matcher_program.to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(program_data, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        )
+        .expect("approve matcher (tag 99)");
+        let ctx = Pubkey::new_unique();
+        let delegate =
+            matcher_delegate_key(&program_id, &market, &lp, &registry, &matcher_program, &ctx);
+        env.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: matcher_program,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (_, expected_sequence, _) = env.portfolio_identity(lp);
+        let frontier = market_frontier(&env);
+        env.send(
+            ProgInstruction::VaultLpSetMatcher {
+                expected_sequence,
+                asset_generation_frontier: frontier,
+                trade_fee_cap_bps: 10_000,
+                expiry_slot: u64::MAX,
+                kind: 0,
+                trading_fee_bps: 0,
+                base_spread_bps: 0,
+                max_total_bps: 100,
+                impact_k_bps: 0,
+                liquidity_notional_e6: 0,
+                max_fill_abs: u128::MAX,
+                max_inventory_abs: u128::MAX,
+                fee_to_insurance_bps: 0,
+                skew_spread_mult_bps: 0,
+            },
+            vec![
+                // P3-H2: tag 95 is signed by the upgrade authority (mocked ProgramData = admin).
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(program_data, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(vault_lp_state, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            &[&admin],
+        )
+        .expect("vault lp set matcher");
+        let junior_src = env.token_account(admin.pubkey(), junior);
+        env.send(
+            ProgInstruction::DepositJuniorTranche {
+                amount: junior as u128,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(vault_lp_state, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new(junior_src, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect("junior deposit");
+        P3 {
+            env,
+            matcher_program,
+            registry,
+            vault_lp_state,
+            lp,
+            ctx,
+            delegate,
+            own_ledger,
+            sibling_ledger,
+            program_data,
+        }
+    }
+}
