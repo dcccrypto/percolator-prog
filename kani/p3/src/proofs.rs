@@ -254,36 +254,19 @@ fn kani_p3_combine_within_engine_bound() {
 /// For a balanced book (q_long == q_short, a_long == a_short) the per-side F increments, each
 /// scaled by that side's size, sum to zero for EVERY rate the wrapper can hand the engine
 /// (`combine_funding_rate_e9` output). Settlement rounding of individual legs is NOT modelled.
-#[kani::proof]
-fn kani_p3_skew_funding_zero_sum_model() {
-    let premium: i16 = kani::any();
-    let lp: i16 = kani::any();
-    let oi: u16 = kani::any();
-    let slope: u16 = kani::any();
-    let cap: u16 = kani::any();
-    let max_abs: u16 = kani::any();
-    let dt: u8 = kani::any();
-    let price: u16 = kani::any();
-    let a: u16 = kani::any();
-    let q: u16 = kani::any();
-    let skew = skew_funding_rate_e9(lp as i128, oi as u128, slope as u64, cap as u64);
-    let rate = combine_funding_rate_e9(premium as i128, skew, max_abs as u64);
-    // engine model
-    let fid = (rate * dt as i128 * price as i128).div_euclid(1_000_000_000);
-    let f_long = -(fid * a as i128);
-    let f_short = fid * a as i128;
-    let long_side = f_long * q as i128;
-    let short_side = f_short * q as i128;
-    assert!(long_side + short_side == 0);
-    // crowded side pays: LP short (lp<0) with no premium => longs' F index falls (they pay)
-    if premium == 0 && lp < 0 && fid != 0 && a > 0 {
-        assert!(f_long < 0 && f_short > 0);
-    }
-    kani::cover!(skew != 0 && fid != 0 && q > 0 && a > 0, "non-trivial transfer");
-}
-
-// ── Leverage step-down ───────────────────────────────────────────────────────────────────
-
+// WITHDRAWN (Sentinel final pass, 2026-09-29): `kani_p3_skew_funding_zero_sum_model` proved
+// zero-sum over a TRANSCRIPTION of the engine's per-side funding formula, i.e. it compared the
+// model with itself — circular. The engine kernel (`kernel_adl_scaled_accrual_index_deltas`) is
+// `pub(crate)` and cannot be called from here without an engine change, so no non-circular Kani
+// proof of skew-funding conservation is claimed. What IS claimed, and where it is proven:
+//   * the wrapper only hands the engine a rate inside `±max_abs_funding_e9_per_slot`
+//     (`kani_p3_combine_within_engine_bound`, covers satisfied);
+//   * sign / bound / zero-at-balance / monotonicity of the skew rate (the `kani_p3_skew_*`
+//     harnesses);
+//   * zero-sum of the transfer is MEASURED end to end through the real engine BPF in LiteSVM
+//     (`p3_skew_funding_crowded_long_pays_vault_lp`: paid 600 == received 600;
+//     `p3_skew_funding_identical_on_crank_and_trade_paths`: -60 / +60 on both paths), which is
+//     empirical evidence, not a proof.
 #[kani::proof]
 fn kani_p3_step_imr_bounds_and_monotone() {
     let x: u16 = kani::any();

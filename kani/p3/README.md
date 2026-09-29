@@ -12,7 +12,7 @@ edited.
   Negative controls: same mutant swap + `cargo test --release --features p3_mutant`.
 
 All Kani proofs are BOUNDED (u16 inputs where a symbolic u128 multiply+divide occurs, u64
-elsewhere). The skew-funding zero-sum harness proves conservation over a transcribed MODEL of
+elsewhere). The former skew-funding zero-sum harness (WITHDRAWN as circular, see proofs.rs) modelled
 the engine formula (`v16.rs@35ddd692` :14777-14782 and :1626-1641), because
 `kernel_adl_scaled_accrual_index_deltas` is `pub(crate)` and not callable from here; per-leg
 settlement rounding is not modelled.
