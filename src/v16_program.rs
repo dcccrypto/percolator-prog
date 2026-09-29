@@ -452,7 +452,7 @@ pub mod constants {
         assert!(PORTFOLIO_MATCHER_SEQUENCE_OFF == PORTFOLIO_ID_OFF + 8);
     const _ASSERT_PORTFOLIO_MATCHER_EXPIRY_OFF: () =
         assert!(PORTFOLIO_MATCHER_EXPIRY_OFF == PORTFOLIO_MATCHER_SEQUENCE_OFF + 8);
-    const _ASSERT_PORTFOLIO_ACCOUNT_LEN_9563: () = assert!(PORTFOLIO_ACCOUNT_LEN == 9563);
+    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_9563: () = assert!(PORTFOLIO_ACCOUNT_LEN == 9563);
     // Bit-layout non-collision (6b627b43's ENABLED_MASK bit0 / TRADE_FEE_CAP bits
     // 50..63 vs this unit's position_epoch bits 1..49): checked against the
     // struct's own consts below (`_ASSERT_POSITION_EPOCH_BIT_LAYOUT_*` in the
@@ -1117,14 +1117,15 @@ pub mod error {
         AssetGenerationMismatch, // Custom(65)
         // ── P1 wrapper safety release (2026-09-29). All APPENDED so no earlier ordinal
         // moves. SDK agent: add 66..=71 to the client error map. ────────────────────────
-        /// Item 1: a fill's execution price (matcher-reported on TradeCpi/BatchTradeCpi,
-        /// caller-supplied on TradeNoCpi/BatchTradeNoCpi) lies outside
-        /// `effective_price +- band` (`risk_limits_v17::exec_price_within_band`). `limit_price
-        /// == 0` no longer means "any price": it means "any price inside the band".
+        /// Item 1: a matcher-reported fill price (TradeCpi / BatchTradeCpi) lies outside
+        /// `reference +- band`, reference = the `oracle_price_e6` the wrapper handed the matcher
+        /// (`risk_limits_v17::exec_price_within_band`). `limit_price == 0` no longer means "any
+        /// price": it means "any price inside the band". TradeNoCpi is not banded (both owners
+        /// sign the price themselves; it settles at the mark either way).
         ExecPriceOutsideOracleBand, // Custom(66)
-        /// Item 2: the taker's portfolio owner equals the counterparty (LP) portfolio owner,
-        /// or -- on the matcher-routed CPI trades -- equals the traded asset's `asset_admin`
-        /// (the market creator). Hygiene only: a second wallet bypasses it.
+        /// Item 2 (TradeCpi / BatchTradeCpi): the taker's portfolio owner equals the matcher
+        /// LP's portfolio owner, or equals the traded asset's `asset_admin` (the market
+        /// creator). Hygiene only: a second wallet bypasses it.
         SameOwnerTrade, // Custom(67)
         /// Item 3: a matcher-routed fill would leave the LP's |position| x mark above
         /// `k x LP initial-margin equity` on the traded asset.
@@ -2376,14 +2377,22 @@ pub mod state {
         pub lp_exposure_k_bps: u32,
         /// Execution-price band (bps of effective price). 0 => `DEFAULT_EXEC_BAND_BPS`.
         pub exec_band_bps: u16,
-        pub _reserved0: [u8; 2],
+        /// P2 coordination: 0 (default) => TradeCpi sends the legacy all-zero call bytes
+        /// 43..67 (required by the deployed matcher 12bd671, which rejects anything else).
+        /// `MATCHER_EXT_MODE_V1` => send the P2 `ext_version = 1` block (mark_slot + LP
+        /// headroom). Flip only once every LP's matcher program on the asset accepts it.
+        pub matcher_ext_mode: u8,
+        pub _reserved0: u8,
         pub _reserved: [u8; 24],
     }
+    pub const MATCHER_EXT_MODE_LEGACY: u8 = 0;
+    pub const MATCHER_EXT_MODE_V1: u8 = 1;
     const _: () = assert!(core::mem::size_of::<AssetRiskLimitsV17>() == ASSET_RISK_LIMITS_LEN);
 
     pub fn validate_asset_risk_limits(limits: &AssetRiskLimitsV17) -> Result<(), ProgramError> {
-        if limits._reserved0 != [0u8; 2]
+        if limits._reserved0 != 0
             || limits._reserved != [0u8; 24]
+            || limits.matcher_ext_mode > MATCHER_EXT_MODE_V1
             || limits.exec_band_bps > crate::risk_limits_v17::MAX_EXEC_BAND_BPS
             || limits.lp_exposure_k_bps > crate::risk_limits_v17::MAX_LP_EXPOSURE_K_BPS
         {
@@ -6421,6 +6430,8 @@ pub mod ix {
             lp_exposure_k_bps: u32,
             lp_floor_atoms: u128,
             side_oi_cap_q: u128,
+            /// Optional trailing byte on the wire (absent == 0 == legacy matcher call).
+            matcher_ext_mode: u8,
         },
         /// UpdateFeeSplit (tag 86) — sets the three fee-split shares.
         /// Gated on `marketauth`. Shares must sum to FEE_SHARE_TOTAL_BPS and
@@ -7011,6 +7022,11 @@ pub mod ix {
                     lp_exposure_k_bps: read_u32(&mut rest)?,
                     lp_floor_atoms: read_u128(&mut rest)?,
                     side_oi_cap_q: read_u128(&mut rest)?,
+                    matcher_ext_mode: if rest.is_empty() {
+                        0
+                    } else {
+                        read_u8(&mut rest)?
+                    },
                 },
                 86 => Self::UpdateFeeSplit {
                     creator_share_bps: read_u16(&mut rest)?,
@@ -7778,6 +7794,7 @@ pub mod ix {
                     lp_exposure_k_bps,
                     lp_floor_atoms,
                     side_oi_cap_q,
+                    matcher_ext_mode,
                 } => {
                     out.push(crate::constants::TAG_SET_ASSET_RISK_LIMITS);
                     push_u16(&mut out, asset_index);
@@ -7785,6 +7802,9 @@ pub mod ix {
                     push_u32(&mut out, lp_exposure_k_bps);
                     push_u128(&mut out, lp_floor_atoms);
                     push_u128(&mut out, side_oi_cap_q);
+                    if matcher_ext_mode != 0 {
+                        out.push(matcher_ext_mode);
+                    }
                 }
                 Self::UpdateFeeSplit {
                     creator_share_bps,
@@ -9347,6 +9367,28 @@ pub mod risk_limits_v17 {
         after_q <= cap_q || after_q <= before_q
     }
 
+    /// P2 coordination: the 24-byte matcher call extension (call bytes 43..67). Mode 0 =>
+    /// all-zero legacy bytes (what the deployed matcher 12bd671 requires). Mode 1 => the P2
+    /// `ext_version = 1` block: flags HEADROOM|MARK_SLOT (never ACCEPTS_FEE_REQUEST -- this
+    /// wrapper's `validate_matcher_return` rejects unknown return flags), `mark_slot` at
+    /// [4..12], `lp_headroom_q` (saturated to u64, u64::MAX = unbounded) at [12..20].
+    pub fn encode_matcher_call_ext(mode: u8, mark_slot: u64, lp_headroom_q: u128) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        if mode != 1 {
+            return b;
+        }
+        b[0] = 1;
+        b[1] = 0b0000_0011;
+        b[4..12].copy_from_slice(&mark_slot.to_le_bytes());
+        let headroom = if lp_headroom_q > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            lp_headroom_q as u64
+        };
+        b[12..20].copy_from_slice(&headroom.to_le_bytes());
+        b
+    }
+
     /// F4: every outstanding fee leg the market still owes someone. `None` on overflow or on a
     /// corrupt `withdrawn > accrued` pair (callers fail closed on `None`).
     pub fn outstanding_fee_legs(
@@ -9363,6 +9405,12 @@ pub mod risk_limits_v17 {
             .checked_add(lp_accrued.checked_sub(lp_withdrawn)?)?
             .checked_add(insurance_reserve_accrued.checked_sub(insurance_reserve_withdrawn)?)?
             .checked_add(creator_claimable_total)
+    }
+
+    /// F4: CloseSlab refuses iff some owed fee atoms are still backed by the unbudgeted
+    /// insurance pool the terminal retirement would burn: `min(outstanding, pool) > 0`.
+    pub fn close_refused_for_fees(outstanding: u128, unbudgeted_pool: u128) -> bool {
+        outstanding.min(unbudgeted_pool) > 0
     }
 
     /// F4 terminal fold: once a resolved market has NO portfolio left (`c_tot == 0`,
@@ -11512,6 +11560,7 @@ pub mod processor {
                 lp_exposure_k_bps,
                 lp_floor_atoms,
                 side_oi_cap_q,
+                matcher_ext_mode,
             } => handle_set_asset_risk_limits(
                 program_id,
                 accounts,
@@ -11521,7 +11570,8 @@ pub mod processor {
                     lp_floor_atoms,
                     lp_exposure_k_bps,
                     exec_band_bps,
-                    _reserved0: [0u8; 2],
+                    matcher_ext_mode,
+                    _reserved0: 0,
                     _reserved: [0u8; 24],
                 },
             ),
@@ -12082,10 +12132,13 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
-            // P1 item 2: no trading against a portfolio you own. Compared on the portfolio
-            // HEADERS (not the caller-passed keys) so every route -- TradeNoCpi, TradeCpi,
-            // and the NFT-holder taker path -- is judged on the same fact.
-            ensure_distinct_trade_owners(&account_a, &account_b)?;
+            // P1 item 2: no trading against a matcher LP you own. Compared on the portfolio
+            // HEADERS (not the caller-passed keys), so the NFT-holder taker path is judged on
+            // the same fact. Scoped to the matcher-routed CPI routes (`lp_limits`): on
+            // TradeNoCpi both owners sign the fill themselves and there is no LP role.
+            if lp_limits {
+                ensure_distinct_trade_owners(&account_a, &account_b)?;
+            }
             let size_abs = if size_q == i128::MIN || size_q == 0 {
                 return Err(PercolatorError::InvalidInstruction.into());
             } else {
@@ -12127,9 +12180,6 @@ pub mod processor {
                 .asset
                 .effective_price
                 .get();
-            // P1 item 1: the fill's execution price must lie inside the protocol band around
-            // the price the position actually settles at (`effective_price`).
-            ensure_exec_price_in_band_view(&group, asset_index as usize, exec_price)?;
             let fee_bps = hybrid_trade_fee_bps_view(
                 &cfg,
                 &oracle_profile,
@@ -12634,8 +12684,10 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
-            // P1 item 2 (batch routes).
-            ensure_distinct_trade_owners(&account_a, &account_b)?;
+            // P1 item 2 (BatchTradeCpi only; see the single-trade executor).
+            if lp_limits {
+                ensure_distinct_trade_owners(&account_a, &account_b)?;
+            }
 
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
@@ -12708,8 +12760,6 @@ pub mod processor {
                     .asset
                     .effective_price
                     .get();
-                // P1 item 1 (batch routes), per leg.
-                ensure_exec_price_in_band_view(&group, asset_index, leg.exec_price)?;
                 let fee_bps_eff = hybrid_trade_fee_bps_view(
                     &cfg,
                     &oracle_profile,
@@ -13884,6 +13934,15 @@ pub mod processor {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
             return Ok(());
         }
+        let call_ext = {
+            let limits =
+                state::read_asset_risk_limits(&market_ai.try_borrow_data()?, asset_index as usize)?;
+            risk_limits_v17::encode_matcher_call_ext(
+                limits.matcher_ext_mode,
+                oracle_profile_pre.last_good_oracle_slot,
+                lp_headroom_q,
+            )
+        };
 
         invoke_matcher(
             matcher_prog,
@@ -13895,6 +13954,7 @@ pub mod processor {
             lp_account_id,
             oracle_price,
             size_q,
+            &call_ext,
             &[
                 b"matcher",
                 market_ai.key.as_ref(),
@@ -13928,6 +13988,14 @@ pub mod processor {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
         }
+        // P1 item 1: `limit_price == 0` no longer means "any price" -- every matcher fill must
+        // sit inside the protocol band around the price the matcher was given.
+        ensure_matcher_exec_price_in_band(
+            market_ai,
+            asset_index as usize,
+            ret.exec_price_e6,
+            oracle_price,
+        )?;
         if ret.exec_size == 0 {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
             return Ok(());
@@ -14672,6 +14740,13 @@ pub mod processor {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
             }
+            // P1 item 1 (BatchTradeCpi), per leg, against that leg's matcher reference price.
+            ensure_matcher_exec_price_in_band(
+                market_ai,
+                leg.asset_index as usize,
+                ret.exec_price_e6,
+                oracle_prices[i],
+            )?;
             let leg_slippage_atoms =
                 adverse_trade_slippage_atoms(ret.exec_size, ret.exec_price_e6, oracle_prices[i])?;
             aggregate_slippage_atoms = accumulate_with_cap(
@@ -17219,6 +17294,7 @@ pub mod processor {
         if limits.exec_band_bps > risk_limits_v17::MAX_EXEC_BAND_BPS
             || limits.lp_exposure_k_bps > risk_limits_v17::MAX_LP_EXPOSURE_K_BPS
             || limits.side_oi_cap_q > percolator::MAX_OI_SIDE_Q
+            || limits.matcher_ext_mode > state::MATCHER_EXT_MODE_V1
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
@@ -17746,6 +17822,107 @@ pub mod processor {
     /// lines): decode the persisted cursor into a scan-start asset index. `0`
     /// (fresh/never-scanned) always means "start of scan" regardless of
     /// `configured_assets`.
+    /// P1 F4 / P1-W1: does asset 0's `insurance_authority` equal the stake-pool `vault_auth`
+    /// PDA that `load_bound_stake_pool` would accept for THIS market? Pure derivation (the pool
+    /// address is itself derived from the market key), so no stake account is needed. A
+    /// non-`devnet` build has no pinned stake program, so tag 87 can never pay: `false`.
+    fn insurance_authority_bound_to_stake_pool(
+        market_key: &Pubkey,
+        insurance_authority: &[u8; 32],
+    ) -> bool {
+        #[cfg(not(feature = "devnet"))]
+        {
+            let _ = (market_key, insurance_authority);
+            false
+        }
+        #[cfg(feature = "devnet")]
+        {
+            let stake_program = crate::constants::STAKE_PROGRAM_ID;
+            let (pool, _) = Pubkey::find_program_address(
+                &[crate::constants::STAKE_POOL_SEED, market_key.as_ref()],
+                &stake_program,
+            );
+            let (vault_authority, _) = Pubkey::find_program_address(
+                &[crate::constants::STAKE_VAULT_AUTHORITY_SEED, pool.as_ref()],
+                &stake_program,
+            );
+            vault_authority.to_bytes() == *insurance_authority
+        }
+    }
+
+    /// P1 F4 / P1-W1: see the call site in `handle_close_slab`. Returns whether anything moved.
+    /// Every move is `risk_limits_v17::fold_lp_leg_into_insurance`-shaped (source leg's
+    /// `withdrawn := accrued`, destination's `accrued += owed`), so the grand total
+    /// `outstanding_fee_legs_view` is conserved exactly (Kani `kani_p1_close_fee_conservation`).
+    fn rebook_orphaned_fee_legs_view(
+        market_key: &Pubkey,
+        cfg: &mut WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+    ) -> Result<bool, ProgramError> {
+        let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
+        let mut moved = false;
+        if cfg.lp_fee_accrued_atoms > cfg.lp_fee_withdrawn_atoms
+            && !lp_vault_funded_backing_domain_present_view(group)?
+        {
+            let (lp_withdrawn, insurance_reserve_accrued) =
+                risk_limits_v17::fold_lp_leg_into_insurance(
+                    cfg.lp_fee_accrued_atoms,
+                    cfg.lp_fee_withdrawn_atoms,
+                    cfg.insurance_reserve_accrued_atoms,
+                )
+                .ok_or_else(overflow)?;
+            cfg.lp_fee_withdrawn_atoms = lp_withdrawn;
+            cfg.insurance_reserve_accrued_atoms = insurance_reserve_accrued;
+            moved = true;
+        }
+        let asset0 = read_oracle_profile_from_view(group, cfg, 0)?;
+        if cfg.insurance_reserve_accrued_atoms > cfg.insurance_reserve_withdrawn_atoms
+            && !insurance_authority_bound_to_stake_pool(market_key, &asset0.insurance_authority)
+        {
+            let (insurance_withdrawn, protocol_accrued) =
+                risk_limits_v17::fold_lp_leg_into_insurance(
+                    cfg.insurance_reserve_accrued_atoms,
+                    cfg.insurance_reserve_withdrawn_atoms,
+                    cfg.protocol_fee_accrued_atoms,
+                )
+                .ok_or_else(overflow)?;
+            cfg.insurance_reserve_withdrawn_atoms = insurance_withdrawn;
+            cfg.protocol_fee_accrued_atoms = protocol_accrued;
+            moved = true;
+        }
+        // Legacy market-wide creator pot: claimable by asset 0's admin (GH#420).
+        if cfg.creator_fee_claimable_atoms != 0 && asset0.asset_admin == [0u8; 32] {
+            cfg.protocol_fee_accrued_atoms = cfg
+                .protocol_fee_accrued_atoms
+                .checked_add(cfg.creator_fee_claimable_atoms as u128)
+                .ok_or_else(overflow)?;
+            cfg.creator_fee_claimable_atoms = 0;
+            moved = true;
+        }
+        let configured_assets =
+            (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        for asset_index in 0..configured_assets {
+            let bytes = group.markets[asset_index]
+                .wrapper
+                .get(..constants::ASSET_ORACLE_PROFILE_LEN)
+                .ok_or(PercolatorError::InvalidAccountLen)?;
+            let mut profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(bytes);
+            if profile.creator_fee_claimable_atoms != 0 && profile.asset_admin == [0u8; 32] {
+                cfg.protocol_fee_accrued_atoms = cfg
+                    .protocol_fee_accrued_atoms
+                    .checked_add(profile.creator_fee_claimable_atoms as u128)
+                    .ok_or_else(overflow)?;
+                profile.creator_fee_claimable_atoms = 0;
+                // Only the u64 counter changes; write the raw bytes back (a configured slot
+                // with a non-zero pot passed validation when that pot accrued).
+                group.markets[asset_index].wrapper[..constants::ASSET_ORACLE_PROFILE_LEN]
+                    .copy_from_slice(bytemuck::bytes_of(&profile));
+                moved = true;
+            }
+        }
+        Ok(moved)
+    }
+
     /// P1 F4: resolved AND no portfolio left -- the only state CloseSlab can proceed from.
     fn terminal_empty_resolved_view(group: &state::MarketViewMutV16<'_>) -> bool {
         group.header.mode == 1
@@ -17960,6 +18137,33 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
 
+        // P1 F4 (+ security review P1-W1): before the "no owed fee leg" refusal below, re-book
+        // every leg that has NO claim path left onto the protocol leg (claimable while
+        // Resolved via tag 84), so the refusal can only ever wait on a leg someone CAN claim:
+        //   * LP leg with no LP-vault-funded domain -> staker leg (as tag 87 does);
+        //   * staker leg whose asset-0 `insurance_authority` is not the derived stake-pool
+        //     `vault_auth` for THIS market (tag 87 would fail forever) -> protocol leg;
+        //   * a creator pot whose `asset_admin` is burned ([0; 32], tag 90 can never be
+        //     signed) -> protocol leg.
+        // Persisted as its own successful step (returns Ok without closing, like the windowed
+        // scan's `ScanProgress`), because the refusal below would otherwise roll it back. Only
+        // reachable on a terminal-empty Resolved market, after the same authority + epoch
+        // checks the close itself performs.
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            expect_live_authority(&cfg.marketauth, admin_dest.key)?;
+            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+            if terminal_empty_resolved_view(&group)
+                && rebook_orphaned_fee_legs_view(market_ai.key, &mut cfg, &mut group)?
+            {
+                group.validate_shape().map_err(map_v16_error)?;
+                drop(group);
+                state::write_wrapper_config(&mut market_data, &cfg)?;
+                return Ok(());
+            }
+        }
+
         let (
             cfg_pre,
             retired_unbudgeted_insurance,
@@ -17990,7 +18194,26 @@ pub mod processor {
             // Refuse until each is claimed: protocol (tag 84) and creator (tag 90) are
             // claimable while Resolved; the LP + staker legs are swept by tag 87 on this
             // terminal-empty state (see `handle_withdraw_insurance_reserve_to_stake`).
-            if outstanding_fee_legs_view(&cfg, &group)? != 0 {
+            //
+            // Refuse only while an owed leg is still BACKED by atoms the retirement would burn:
+            // the fee legs are at-risk claims on the unbudgeted insurance pool (they are not
+            // senior to loss coverage), so if losses already consumed that pool the unbacked
+            // remainder is unpayable by anyone and must not wedge the close forever.
+            let unbudgeted_pool = group
+                .header
+                .insurance
+                .get()
+                .saturating_sub(
+                    group
+                        .header
+                        .source_insurance_credit_reserved_total_atoms
+                        .get(),
+                )
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+            if risk_limits_v17::close_refused_for_fees(
+                outstanding_fee_legs_view(&cfg, &group)?,
+                unbudgeted_pool,
+            ) {
                 return Err(PercolatorError::CloseSlabFeesOutstanding.into());
             }
             let primary_mint = primary_collateral_mint(&cfg);
@@ -25389,24 +25612,21 @@ pub mod processor {
         state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])
     }
 
-    /// Item 1. Reference = the asset's engine `effective_price` (the settlement price, and the
-    /// value TradeCpi hands the matcher as `oracle_price_e6`).
-    fn ensure_exec_price_in_band_view(
-        group: &state::MarketViewMutV16<'_>,
+    /// Item 1 (matcher-routed CPI fills). Reference = the exact `oracle_price_e6` the wrapper
+    /// handed the matcher -- the asset's engine `effective_price` read at preflight, which
+    /// `validate_matcher_return` already requires the matcher to echo back. (Not the
+    /// executor's post-accrual price: accrual may legitimately step the effective price
+    /// between the matcher call and the engine call, and the matcher could not have quoted
+    /// against a price it never saw.)
+    fn ensure_matcher_exec_price_in_band(
+        market_ai: &AccountInfo<'_>,
         asset_index: usize,
         exec_price: u64,
+        reference_price: u64,
     ) -> ProgramResult {
-        let limits = asset_risk_limits_view(group, asset_index)?;
-        let reference = group
-            .markets
-            .get(asset_index)
-            .ok_or(PercolatorError::InvalidInstruction)?
-            .engine
-            .asset
-            .effective_price
-            .get();
+        let limits = state::read_asset_risk_limits(&market_ai.try_borrow_data()?, asset_index)?;
         let band = risk_limits_v17::effective_exec_band_bps(limits.exec_band_bps);
-        if !risk_limits_v17::exec_price_within_band(exec_price, reference, band) {
+        if !risk_limits_v17::exec_price_within_band(exec_price, reference_price, band) {
             return Err(PercolatorError::ExecPriceOutsideOracleBand.into());
         }
         Ok(())
@@ -27058,6 +27278,7 @@ pub mod processor {
         lp_account_id: u64,
         oracle_price_e6: u64,
         req_size: i128,
+        call_ext: &[u8; 24],
         seeds: &[&[u8]],
     ) -> ProgramResult {
         let mut data = [0u8; 67];
@@ -27067,6 +27288,9 @@ pub mod processor {
         data[11..19].copy_from_slice(&lp_account_id.to_le_bytes());
         data[19..27].copy_from_slice(&oracle_price_e6.to_le_bytes());
         data[27..43].copy_from_slice(&req_size.to_le_bytes());
+        // P1: bytes 43..67 -- all-zero (legacy) unless the protocol enabled the P2 call
+        // extension for this asset (`AssetRiskLimitsV17::matcher_ext_mode`).
+        data[43..67].copy_from_slice(call_ext);
 
         let mut metas = Vec::with_capacity(2 + tail.len());
         metas.push(AccountMeta::new_readonly(*matcher_delegate.key, true));
@@ -29100,4 +29324,256 @@ pub mod entrypoint {
 
 pub mod risk {
     pub use percolator::*;
+}
+
+/// P1 (2026-09-29) Kani harnesses for `risk_limits_v17`. Lives in the lib (not
+/// `tests/v16_kani.rs`) because that file no longer compiles against the v18 wire at the
+/// deployed lineage (stale `Instruction` field sets), which blocks `cargo kani --tests`.
+/// Run: `cargo kani --harness kani_p1_<name>`. Every harness carries `kani::cover!`; a
+/// verdict counts only with every cover SATISFIED.
+#[cfg(kani)]
+mod p1_kani_proofs {
+    use crate::risk_limits_v17 as p1;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // P1 wrapper safety release (2026-09-29) -- `percolator_prog::risk_limits_v17`.
+    // Every harness carries `kani::cover!` properties; a SUCCESSFUL verdict counts
+    // only if every cover is SATISFIED (0 covers / UNSATISFIED = vacuous).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[kani::proof]
+    fn kani_p1_exec_band_check_sound() {
+        let exec: u64 = kani::any();
+        let reference: u64 = kani::any();
+        let band: u16 = kani::any();
+        let within = p1::exec_price_within_band(exec, reference, band);
+        // Zero reference never passes (fail closed).
+        if reference == 0 {
+            assert!(!within);
+        }
+        // Exact reference always passes, for every band including 0.
+        if reference != 0 && exec == reference {
+            assert!(within);
+        }
+        // Band 0 admits exactly the reference price.
+        if band == 0 && within {
+            assert_eq!(exec, reference);
+        }
+        // Soundness vs the real-number definition |exec-ref|/ref <= band/1e4.
+        if within {
+            let diff = exec.abs_diff(reference) as u128;
+            assert!(diff * 10_000 <= reference as u128 * band as u128);
+        }
+        // Monotone in band: widening never rejects a fill that was accepted.
+        let wider: u16 = kani::any();
+        if wider >= band && within {
+            assert!(p1::exec_price_within_band(exec, reference, wider));
+        }
+        // Default band is what a zeroed (deployed) slot gets.
+        assert_eq!(p1::effective_exec_band_bps(0), p1::DEFAULT_EXEC_BAND_BPS);
+        assert!(p1::effective_exec_band_bps(band) <= p1::MAX_EXEC_BAND_BPS);
+        kani::cover!(
+            within && exec != reference,
+            "off-reference fill inside band"
+        );
+        kani::cover!(!within && reference != 0, "fill rejected by band");
+        kani::cover!(
+            within && exec > reference,
+            "above-reference fill inside band"
+        );
+        kani::cover!(
+            within && exec < reference,
+            "below-reference fill inside band"
+        );
+    }
+
+    #[kani::proof]
+    fn kani_p1_exposure_cap_monotone_no_overflow() {
+        // Bounded to u64 equity so the solver stays fast; overflow saturation is covered by the
+        // full-width harness below.
+        let e1: u64 = kani::any();
+        let e2: u64 = kani::any();
+        let k1: u32 = kani::any();
+        let k2: u32 = kani::any();
+        let price: u64 = kani::any();
+        kani::assume(e1 <= e2 && k1 <= k2);
+        let c1 = p1::lp_exposure_cap_q(e1 as u128, k1, price, 1_000_000);
+        let c2 = p1::lp_exposure_cap_q(e2 as u128, k2, price, 1_000_000);
+        assert!(c1 <= c2);
+        if price == 0 {
+            assert_eq!(c1, 0);
+        }
+        // Soundness: cap_q * price <= equity * k * POS_SCALE / 1e4 (no over-grant).
+        if price != 0 {
+            let lhs = c1.checked_mul(10_000u128 * price as u128);
+            let rhs = (e1 as u128) * (k1 as u128) * 1_000_000u128;
+            assert!(lhs.is_some() && lhs.unwrap() <= rhs);
+        }
+        kani::cover!(c1 > 0 && c1 < c2, "strictly monotone step");
+        kani::cover!(
+            c1 == 0 && price != 0 && e1 > 0 && k1 > 0,
+            "rounds to zero cap"
+        );
+    }
+
+    #[kani::proof]
+    fn kani_p1_exposure_cap_saturates_monotone() {
+        let equity: u128 = kani::any();
+        let k: u32 = kani::any();
+        let price: u64 = kani::any();
+        kani::assume(price != 0);
+        let cap = p1::lp_exposure_cap_q(equity, k, price, 1_000_000);
+        let bigger = p1::lp_exposure_cap_q(equity.saturating_add(1), k, price, 1_000_000);
+        assert!(cap <= bigger);
+        kani::cover!(cap == u128::MAX, "saturation reachable");
+        kani::cover!(cap < u128::MAX && cap > 0, "non-saturated");
+    }
+
+    #[kani::proof]
+    fn kani_p1_headroom_matches_post_trade_cap() {
+        let before: i64 = kani::any();
+        let cap: u64 = kani::any();
+        let dir_positive: bool = kani::any();
+        let sign: i8 = if dir_positive { 1 } else { -1 };
+        let before = before as i128;
+        let cap = cap as u128;
+        let headroom = p1::lp_fill_headroom_q(before, sign, cap);
+        let d: u64 = kani::any();
+        let d = d as u128;
+        let after_of = |mag: u128| -> i128 {
+            let m = mag as i128;
+            if dir_positive {
+                before + m
+            } else {
+                before - m
+            }
+        };
+        // Every fill within headroom passes the post-trade exposure predicate...
+        if d <= headroom {
+            assert!(p1::lp_exposure_allowed(before, after_of(d), cap));
+        }
+        // ...and the first fill past it fails (tightness).
+        if headroom < (u64::MAX as u128) {
+            assert!(!p1::lp_exposure_allowed(
+                before,
+                after_of(headroom + 1),
+                cap
+            ));
+        }
+        kani::cover!(headroom == 0, "zero headroom (zero-fill)");
+        kani::cover!(
+            headroom > 0 && d <= headroom && d > 0,
+            "partial headroom used"
+        );
+        kani::cover!(
+            before != 0 && (before > 0) != dir_positive && headroom > before.unsigned_abs(),
+            "reduce-through-flip headroom"
+        );
+    }
+
+    #[kani::proof]
+    fn kani_p1_floor_halt_predicate() {
+        let equity: i128 = kani::any();
+        let floor: u128 = kani::any();
+        let before: i64 = kani::any();
+        let after: i64 = kani::any();
+        let increasing = p1::lp_risk_increasing(before as i128, after as i128);
+        let halts = p1::lp_floor_halts(equity, floor, increasing);
+        // A risk-reducing (or flat) fill is never halted.
+        if !increasing {
+            assert!(!halts);
+        }
+        // Exact characterization.
+        let eq_nonneg = if equity <= 0 { 0u128 } else { equity as u128 };
+        assert_eq!(halts, increasing && eq_nonneg <= floor);
+        // Depleted LPs (equity <= 0) are always halted on growth, even with floor 0 (the default).
+        if equity <= 0 && increasing {
+            assert!(p1::lp_floor_halts(equity, 0, true));
+        }
+        // Monotone in floor.
+        let higher: u128 = kani::any();
+        if higher >= floor && halts {
+            assert!(p1::lp_floor_halts(equity, higher, increasing));
+        }
+        kani::cover!(halts, "halt fires");
+        kani::cover!(increasing && !halts, "healthy LP grows");
+        kani::cover!(!increasing && equity <= 0, "depleted LP may still reduce");
+    }
+
+    #[kani::proof]
+    fn kani_p1_side_oi_growth_rule() {
+        let before: u128 = kani::any();
+        let after: u128 = kani::any();
+        let cap: u128 = kani::any();
+        let ok = p1::side_oi_growth_allowed(before, after, cap);
+        if after <= before {
+            assert!(ok);
+        }
+        if after > cap && after > before {
+            assert!(!ok);
+        }
+        let engine_max: u128 = kani::any();
+        let stored: u128 = kani::any();
+        assert!(p1::effective_side_oi_cap_q(stored, engine_max) <= engine_max);
+        kani::cover!(!ok, "growth past cap refused");
+        kani::cover!(ok && after > cap, "over-cap side still shrinks");
+    }
+
+    #[kani::proof]
+    fn kani_p1_close_fee_conservation() {
+        let pa: u64 = kani::any();
+        let pw: u64 = kani::any();
+        let la: u64 = kani::any();
+        let lw: u64 = kani::any();
+        let ia: u64 = kani::any();
+        let iw: u64 = kani::any();
+        let cr: u64 = kani::any();
+        let (pa, pw, la, lw, ia, iw, cr) = (
+            pa as u128, pw as u128, la as u128, lw as u128, ia as u128, iw as u128, cr as u128,
+        );
+        let out = p1::outstanding_fee_legs(pa, pw, la, lw, ia, iw, cr);
+        // Corrupt pairs fail closed.
+        if pw > pa || lw > la || iw > ia {
+            assert!(out.is_none());
+        }
+        if let Some(total) = out {
+            // Exact sum of every owed leg.
+            assert_eq!(total, (pa - pw) + (la - lw) + (ia - iw) + cr);
+            // CloseSlab proceeds only on 0, and 0 means every leg is paid.
+            if total == 0 {
+                assert!(pa == pw && la == lw && ia == iw && cr == 0);
+            }
+        }
+        // Terminal LP -> staker fold conserves the owed total and zeroes the LP leg.
+        if lw <= la {
+            let (lw2, ia2) = p1::fold_lp_leg_into_insurance(la, lw, ia).unwrap();
+            assert_eq!(la - lw2, 0);
+            assert!(ia2 >= ia);
+            if iw <= ia {
+                assert_eq!((la - lw) + (ia - iw), (la - lw2) + (ia2 - iw));
+                // The fold never changes the grand total CloseSlab checks.
+                assert_eq!(
+                    p1::outstanding_fee_legs(pa, pw, la, lw, ia, iw, cr),
+                    p1::outstanding_fee_legs(pa, pw, la, lw2, ia2, iw, cr)
+                );
+            }
+        }
+        // Close predicate: permitted => nothing payable would be burned.
+        let pool: u64 = kani::any();
+        if let Some(total) = out {
+            let refused = p1::close_refused_for_fees(total, pool as u128);
+            if !refused {
+                assert!(total == 0 || pool == 0);
+            } else {
+                assert!(total > 0 && pool > 0);
+            }
+            kani::cover!(
+                !refused && total > 0,
+                "unbacked owed legs do not wedge the close"
+            );
+        }
+        kani::cover!(out == Some(0), "close permitted");
+        kani::cover!(matches!(out, Some(t) if t > 0), "close refused, fees owed");
+        kani::cover!(la > lw && iw <= ia, "fold moves a nonzero LP leg");
+    }
 }
