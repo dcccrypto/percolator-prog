@@ -941,6 +941,12 @@ impl World {
                 }
             }
             self.check()?;
+            // A residual budget atom (rounding) also blocks retirement; take it too.
+            let rest = self.env.market_state().1.insurance_domain_budget_remaining_total;
+            if rest > 0 && self.do_withdraw_terminal_insurance(rest).is_ok() {
+                *self.stats.ok.entry("winddown_withdraw_ins41_residual").or_default() += 1;
+            }
+            self.check()?;
         }
         let legs = self.legs_outstanding();
         if std::env::var("FUZZ_DEBUG").is_ok() {
@@ -1629,4 +1635,44 @@ fn indep_liveness_market_reopens_after_single_bankruptcy() {
         eprintln!("winner u4 reduce short (buy 1 unit from u3): {:?}", w.do_trade_nocpi(4, 3, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)));
     }
     assert!(r.is_ok(), "L2 market cannot reopen permissionlessly after one bankruptcy: {r:?}");
+}
+
+/// F-5: shrunk from fuzz seed 0x78dde6e5fd2a4f41 (fee 30; reproduces on v18.2 and P1 eb103309).
+/// After a bankruptcy + insurance top-up and a COMPLETE wind-down (every portfolio closed,
+/// topups 46, fee claims, tag 41, tag 89), CloseSlab returns Custom(21) forever: an Expired
+/// bucket keeps a nonzero provider_receivable with no remaining claimant. Retirement must stay
+/// reachable (spec §2.4: retirement clears audit-only state atomically).
+#[test]
+fn indep_liveness_closeslab_retires_after_bankruptcy_and_insurance_topup() {
+    let ops = [
+        Op::Withdraw { u: 202, frac_bps: 5924 },
+        Op::Push { delta_bps: -2497 },
+        Op::TradeNoCpi { a: 142, b: 35, size_tenths: 367, off_bps: 1741 },
+        Op::TopUpInsurance { amt: 2_747_414 },
+    ];
+    let mut w = World::new(30);
+    for op in &ops {
+        let _ = w.apply(op);
+        w.check().unwrap();
+    }
+    w.wind_down().unwrap();
+    if !w.is_tombstone() {
+        let (_, g0) = w.env.market_state();
+        let b = g0.insurance_domain_budget_remaining_total;
+        eprintln!("residual budget {b}: tag41 again -> {:?}; domain budgets {:?}", w.do_withdraw_terminal_insurance(b).map_err(|e| custom_code(&e)), g0.insurance_domain_budget);
+        let retired = try_retire(&mut w);
+        if retired {
+            w.check_tokens().unwrap();
+            return;
+        }
+        let (_, g) = w.env.market_state();
+        assert!(
+            retired,
+            "F-5 CloseSlab wedged forever: vault {} ins {} budget {} provider_recv {:?} buckets {:?} (clock {})",
+            g.vault, g.insurance, g.insurance_domain_budget_remaining_total,
+            g.source_credit.iter().map(|c| c.provider_receivable_num).collect::<Vec<_>>(),
+            g.source_backing_buckets.iter().map(|b| (b.status, b.expiry_slot)).collect::<Vec<_>>(), w.slot()
+        );
+    }
+    w.check_tokens().unwrap();
 }
