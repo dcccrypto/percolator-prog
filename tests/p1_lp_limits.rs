@@ -874,10 +874,18 @@ fn p1_lp_floor_halts_growth_but_allows_reduction() {
         .expect("BatchTradeCpi reduction on a floored LP");
     assert_eq!(env.pos(lp.account), -2 * Q);
 
-    // A request past flat (-2 -> +1) would grow the LP on the other side: refused.
-    let r = env.trade_cpi(&taker, taker_account, &lp, -3 * Q);
-    assert_err_code(&r, LP_FLOOR_HALT, "TradeCpi flip past flat on a floored LP");
-    assert_eq!(env.pos(lp.account), -2 * Q);
+    // A request past flat (-2 -> +1) is CLIPPED to flatten on TradeCpi (spec change after the
+    // Kani-lane finding P1-K1: refusing the whole request blocked a legitimate reduction).
+    env.trade_cpi(&taker, taker_account, &lp, -3 * Q)
+        .expect("TradeCpi reduce-through-flat on a floored LP is clipped, not refused");
+    assert_eq!(env.pos(lp.account), 0, "clipped exactly to flat");
+    // From flat, a floored LP can only grow: every direction is halted.
+    let before_flat = env.snapshot(&keys);
+    let r = env.trade_cpi(&taker, taker_account, &lp, -Q);
+    assert_err_code(&r, LP_FLOOR_HALT, "TradeCpi growth from flat on a floored LP");
+    let r = env.trade_cpi(&taker, taker_account, &lp, Q);
+    assert_err_code(&r, LP_FLOOR_HALT, "TradeCpi growth from flat on a floored LP (other side)");
+    assert_eq!(env.snapshot(&keys), before_flat, "halted growth from flat mutates nothing");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

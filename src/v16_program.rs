@@ -9351,6 +9351,17 @@ pub mod risk_limits_v17 {
         risk_increasing && nonneg_equity(equity_init) <= floor_atoms
     }
 
+    /// Item 5, pre-matcher: the room a FLOORED LP has in direction `lp_delta_sign` -- `|before|`
+    /// when the move reduces the LP (opposite sign), else 0 (growth only => halt).
+    pub fn floored_lp_reducing_room_q(before_q: i128, lp_delta_sign: i8) -> u128 {
+        let reduces = (before_q > 0 && lp_delta_sign < 0) || (before_q < 0 && lp_delta_sign > 0);
+        if reduces {
+            before_q.unsigned_abs()
+        } else {
+            0
+        }
+    }
+
     /// Item 3 (second half): protocol side-OI cap. `stored == 0` => the engine's own global
     /// `MAX_OI_SIDE_Q` (no behaviour change until the protocol sets a tighter cap).
     pub fn effective_side_oi_cap_q(stored: u128, engine_max_oi_side_q: u128) -> u128 {
@@ -14680,6 +14691,15 @@ pub mod processor {
         // TradeCpi, so a floored LP is refused with the NAMED `LpFloorHalt` (not the engine's
         // Custom(49) from inside the batch execute) and a flip past flat is refused on both
         // routes alike. No clip here -- a batch is atomic; the post-fill cap check still runs.
+        for leg in legs {
+            lp_trade_headroom_before_matcher(
+                market_ai,
+                account_b_ai,
+                max_market_slots_pre,
+                leg.asset_index as usize,
+                leg.size_q,
+            )?;
+        }
 
         invoke_matcher_batch(
             matcher_prog,
@@ -25754,12 +25774,15 @@ pub mod processor {
         let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
         let (floor, cap) = lp_floor_and_cap_q_view(&group, &lp, asset_index)?;
         if floor {
-            // Only the reducing part (down to flat) is available to a floored LP.
-            let reducing_room = risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, 0);
-            let reducing_room = reducing_room.min(before.unsigned_abs());
-            if size_q.unsigned_abs() > reducing_room {
+            // Only the reducing part (down to flat) is available to a floored LP. A request
+            // that can only GROW the LP (same direction, or LP flat) is refused with the named
+            // halt; a request that reduces THROUGH flat is clipped to flatten (Kani-lane
+            // finding P1-K1: refusing it outright blocked a legitimate reduce).
+            let reducing_room = risk_limits_v17::floored_lp_reducing_room_q(before, lp_delta_sign);
+            if reducing_room == 0 {
                 return Err(PercolatorError::LpFloorHalt.into());
             }
+            let _ = size_q;
             return Ok(reducing_room);
         }
         Ok(risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap))
@@ -29499,7 +29522,22 @@ mod p1_kani_proofs {
         if higher >= floor && halts {
             assert!(p1::lp_floor_halts(equity, higher, increasing));
         }
-        kani::cover!(halts, "halt fires");
+        // P1-K1: the floored pre-gate admits every reducing request (clipped to flatten) and
+    // refuses only pure growth.
+    let dir_pos: bool = kani::any();
+    let sign: i8 = if dir_pos { 1 } else { -1 };
+    let room = p1::floored_lp_reducing_room_q(before as i128, sign);
+    let reduces = (before > 0 && !dir_pos) || (before < 0 && dir_pos);
+    assert_eq!(room > 0, reduces);
+    if reduces {
+        let d: u64 = kani::any();
+        let d = (d as u128).min(room) as i128;
+        let after2 = if dir_pos { before as i128 + d } else { before as i128 - d };
+        assert!(!p1::lp_risk_increasing(before as i128, after2));
+    }
+    kani::cover!(reduces && room > 0, "floored LP may reduce");
+    kani::cover!(!reduces && room == 0, "floored LP growth halted");
+    kani::cover!(halts, "halt fires");
         kani::cover!(increasing && !halts, "healthy LP grows");
         kani::cover!(!increasing && equity <= 0, "depleted LP may still reduce");
     }
