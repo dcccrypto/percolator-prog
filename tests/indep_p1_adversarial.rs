@@ -347,15 +347,21 @@ fn p1_band_default_500_refuses_one_bps_outside_66() {
 /// `|exec−ref|·1e4 ≤ ref·band` is strict integer math, so the fill must be refused.
 #[test]
 fn p1_band_rounding_one_e6_tick_outside_is_refused() {
+    // Revised rule (P1 71da9917, "band edge rounds out one atom"):
+    //   |exec - ref| <= ceil(ref * band / 1e4).
+    // At ref 1_000_001, band 500: ceil(50_000.05) = 50_001.
     let px = 1_000_001u64;
     let mut w = W::new(px, 0);
-    let lp = w.lp(1_000_000_000, 500, 9_000);
+    // A 500 bps matcher quotes ask = ceil(1_000_001*1.05) = 1_050_002 (diff 50_001) and
+    // bid = 950_000 (diff 50_001): exactly on the rounded-out edge -> accepted.
+    let lp_edge = w.lp(1_000_000_000, 500, 9_000);
     let (t, tp) = w.user(100_000_000);
-    // Matcher ask = ceil(1_000_001·10_500/10_000) = 1_050_002; |Δ|·1e4 = 500_010_000 > ref·500 = 500_000_500.
-    let r = w.trade_cpi(&t, tp, &lp, U, 0);
-    expect_code(r, E_BAND, "ask 1 tick beyond the exact band edge");
-    // Bid = floor(1_000_001·9_500/10_000) = 950_000; |Δ|·1e4 = 500_010_000 > 500_000_500 → also outside.
-    expect_code(w.trade_cpi(&t, tp, &lp, -U, 0), E_BAND, "bid 1 tick beyond the band edge");
+    w.trade_cpi(&t, tp, &lp_edge, U, 0).expect("ask on the rounded-out band edge is accepted");
+    w.trade_cpi(&t, tp, &lp_edge, -U, 0).expect("bid on the rounded-out band edge is accepted");
+    // A 501 bps matcher at the same ref: ask diff = ceil(1_000_001*1.0501) - ref = 50_101 > 50_001.
+    let lp_out = w.lp(1_000_000_000, 501, 9_000);
+    expect_code(w.trade_cpi(&t, tp, &lp_out, U, 0), E_BAND, "ask beyond the rounded-out edge");
+    expect_code(w.trade_cpi(&t, tp, &lp_out, -U, 0), E_BAND, "bid beyond the rounded-out edge");
 }
 
 #[test]

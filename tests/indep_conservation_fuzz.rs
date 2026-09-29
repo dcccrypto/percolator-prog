@@ -191,7 +191,7 @@ impl World {
         env.svm.warp_to_slot(1);
         env.configure_auth_mark_for_asset_as_admin(0, 1, INITIAL_MARK);
         if nassets == 2 {
-            env.activate_asset(1, 1, INITIAL_MARK);
+            // With capacity 2, InitMarket already configures slot 1 (activation gives 61).
             env.configure_auth_mark_for_asset_as_admin(1, 1, INITIAL_MARK);
         }
 
@@ -1384,6 +1384,11 @@ impl World {
             let _ = self.do_claim_creator();
             // A CloseSlab scan step can re-credit spent insurance into a domain budget;
             // the insurance authority takes it (tag 41) before the next call.
+            // P1: tag 87 is allowed on a terminal-empty Resolved market; push the staker leg.
+            if self.stake.is_some() {
+                let _ = self.do_stake87_accrue();
+                self.pending_violation = None;
+            }
             let rb = self.env.market_state().1.insurance_domain_budget_remaining_total;
             if rb > 0 && self.do_withdraw_terminal_insurance(rb).is_ok() {
                 *self.stats.ok.entry("winddown_withdraw_ins41_after_scan_recredit").or_default() += 1;
@@ -1881,7 +1886,10 @@ impl World {
     }
 }
 
+/// SUPERSEDED (F-3 triage): demands a fresh open while A != ADL_ONE, which the spec forbids.
+/// Kept as a record; see indep_liveness_fuzz_owner_exits_then_reopen.
 #[test]
+#[ignore]
 fn indep_liveness_fuzz_permissionless_recovery() {
     let seqs = env_u64("FUZZ_LIVE_SEQS", 48);
     let len = env_u64("FUZZ_LEN", 40) as usize;
@@ -1997,7 +2005,10 @@ fn indep_liveness_shrink_one() {
 /// domains, 45 on both sides) the price has caught up, yet a FRESH pair of wallets
 /// cannot open 1 unit at mark. Spec/README: public cranks must make bounded progress,
 /// and no ordinary state may need a privileged operator to reopen the market.
+/// SUPERSEDED (F-3 triage): probes a spec-forbidden fresh attach in the ADL reduce-only
+/// state. See indep_f3_adl_reduce_only_then_owner_exits_reopen_market.
 #[test]
+#[ignore]
 fn indep_liveness_market_reopens_after_single_bankruptcy() {
     let ops = [
         Op::TradeCpi { u: 48, size_tenths: 366 },
@@ -2359,4 +2370,139 @@ fn indep_f9_control_unbound_market_insurance_recoverable_after_stale_resolve() {
     let retired = try_retire(&mut w);
     eprintln!("F-9 control: retired {retired}");
     assert!(retired, "control: unbound market must retire after stale resolve");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F-3 CORRECTED (credit: Anvil's triage, f3-market-freeze-triage-2026-09-30.md,
+// percolator-prog#519 @ dec380a0). While either side has A != ADL_ONE the engine is in
+// the ADL reduce-only state (upstream 6ae709e0): trades may reduce matched risk but MUST
+// NOT attach, flip or enlarge a leg. So a fresh open is correctly refused there. The
+// liveness property is: every holder can exit on its OWN signature (RebalanceReduce, tag
+// 44), after which zero-OI resets restore A = ADL_ONE and the market reopens.
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl World {
+    fn do_rebalance_reduce(&mut self, u: usize, asset: u16, reduce_q: u128) -> Result<u64, String> {
+        let owner = self.owners[u].insecure_clone();
+        let p = self.ports[u];
+        let (pid, _, pep) = self.env.portfolio_identity(p);
+        let m = self.env.market;
+        self.send(
+            ProgInstruction::RebalanceReduce { portfolio_id: pid, position_epoch: pep, asset_index: asset, reduce_q },
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
+            &[&owner],
+        )
+    }
+
+    fn in_adl_reduce_only(&self) -> bool {
+        let (_, g) = self.env.market_state();
+        g.assets.iter().take(self.nassets).any(|a| a.a_long != percolator::ADL_ONE || a.a_short != percolator::ADL_ONE)
+    }
+
+    /// Every holder exits with its own signature (tag 44) on every asset. Returns holders left.
+    fn owner_exits(&mut self, rounds: usize) -> usize {
+        for _ in 0..rounds {
+            let holders: Vec<usize> = (0..self.ports.len()).filter(|&u| !self.closed[u] && !self.is_flat(u)).collect();
+            if holders.is_empty() {
+                return 0;
+            }
+            for u in holders {
+                let s = self.slot() + 1;
+                self.env.svm.warp_to_slot(s);
+                let _ = self.do_push(self.mark);
+                let _ = self.do_crank(u);
+                for a in 0..self.nassets as u16 {
+                    let _ = self.do_rebalance_reduce(u, a, u128::MAX / 4);
+                }
+            }
+            let _ = self.permissionless_repair(3);
+        }
+        (0..self.ports.len()).filter(|&u| !self.closed[u] && !self.is_flat(u)).count()
+    }
+}
+
+/// Spec rule (triage): in the ADL reduce-only state a fresh attach is refused (21), and every
+/// holder can still exit unilaterally; afterwards the market reopens.
+#[test]
+fn indep_f3_adl_reduce_only_then_owner_exits_reopen_market() {
+    let mut w = World::new(0);
+    for op in [
+        Op::TradeCpi { u: 48, size_tenths: 366 },
+        Op::TradeNoCpi { a: 7, b: 90, size_tenths: -214, off_bps: -1908 },
+        Op::Push { delta_bps: -2157 },
+        Op::Push { delta_bps: -1266 },
+    ] {
+        let _ = w.apply(&op);
+        w.check().unwrap();
+    }
+    let _ = w.permissionless_repair(400);
+    assert!(w.in_adl_reduce_only(), "vacuity: scenario must reach the ADL reduce-only state");
+    let a = w.add_user();
+    let b = w.add_user();
+    w.do_deposit(a, 5_000_000).unwrap();
+    w.do_deposit(b, 5_000_000).unwrap();
+    let _ = w.do_crank(a);
+    let _ = w.do_crank(b);
+    assert_eq!(w.do_trade_nocpi(a, b, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)), Err(Some(21)), "spec: no fresh attach while A != ADL_ONE");
+    let left = w.owner_exits(6);
+    assert_eq!(left, 0, "every holder must exit on its own signature (tag 44)");
+    assert!(!w.in_adl_reduce_only(), "zero-OI reset must restore A = ADL_ONE");
+    w.check().unwrap();
+    w.probe_recovered().expect("market reopens after owner exits");
+    w.check().unwrap();
+}
+
+/// Exit-aware liveness fuzz: after any sequence + permissionless repairs, every holder
+/// exits via tag 44 and then the fresh-pair / withdraw probe must pass.
+#[test]
+fn indep_liveness_fuzz_owner_exits_then_reopen() {
+    let seqs = env_u64("FUZZ_LIVE_SEQS", 48);
+    let len = env_u64("FUZZ_LEN", 40) as usize;
+    let seed0 = env_u64("FUZZ_SEED", 0x11fe);
+    let threads = env_u64("FUZZ_THREADS", 4).max(1);
+    let fails = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let adl = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut hs = Vec::new();
+    for t in 0..threads {
+        let (fails, adl) = (fails.clone(), adl.clone());
+        hs.push(std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let mut i = t;
+            while i < seqs {
+                let seed = seed0.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let mut rng = XorShiftRng::seed_from_u64(seed);
+                let fee_bps = [0u64, 5, 30][rng.gen_range(0..3)];
+                let ops: Vec<Op> = (0..len).map(|_| gen_op(&mut rng)).collect();
+                let mut w = World::new(fee_bps);
+                for op in &ops {
+                    let _ = w.apply(op);
+                    if let Err(e) = w.check() {
+                        fails.lock().unwrap().push(format!("seed={seed:#x}: invariant during ops: {e}"));
+                        break;
+                    }
+                }
+                let _ = w.permissionless_repair(400);
+                if w.in_adl_reduce_only() {
+                    adl.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let left = w.owner_exits(6);
+                let r = if left != 0 { Err(format!("{left} holder(s) could not exit via tag 44")) } else { w.probe_recovered() };
+                if let Err(e) = r {
+                    let (_, g) = w.env.market_state();
+                    fails.lock().unwrap().push(format!("seed={seed:#x} fee={fee_bps}: L3 {e} | a {}/{} oi {}/{} sides {:?}/{:?}",
+                        g.assets[0].a_long, g.assets[0].a_short, g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q, g.assets[0].mode_long, g.assets[0].mode_short));
+                }
+                if let Err(e) = w.check() {
+                    fails.lock().unwrap().push(format!("seed={seed:#x}: invariant after exits: {e}"));
+                }
+                i += threads;
+            }
+        }).unwrap());
+    }
+    for h in hs {
+        h.join().expect("thread");
+    }
+    eprintln!("== exit-aware liveness fuzz: {seqs} seqs; {} reached the ADL reduce-only state", adl.load(std::sync::atomic::Ordering::Relaxed));
+    let f = fails.lock().unwrap();
+    assert!(f.is_empty(), "{} unrecoverable sequence(s):\n{}", f.len(), f.join("\n"));
 }
