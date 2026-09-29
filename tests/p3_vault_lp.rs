@@ -2133,6 +2133,9 @@ fn p3_f8_vault_lp_win_reaches_the_junior_at_resolution() {
     let tr = env.trader_close_resolved(&t);
     env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
     let after_settle = env.tok(junior_dest);
+    // The settlement ITSELF must pay the win (no phantom senior shortfall), independent of the
+    // later terminal sweep.
+    assert_eq!(after_settle, 3_900_000, "tag 101 pays principal + win directly");
     // Terminal cleanup (F-4 path), senior exit, then the junior's terminal sweep.
     let registry = env.registry;
     env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
@@ -2240,10 +2243,10 @@ fn p3_f8_terminal_sweep_pays_exactly_the_surplus_over_c() {
     env.resolve();
     let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
     env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+    // Resolved but NOT terminal-flat (the settled vault LP is still materialized): refused.
+    err_has(&env.release_surplus_resolved(&admin, lp.portfolio, 1, junior_dest), PercolatorError::EngineLockActive);
     let registry = env.registry;
     env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
-    // Live-mode sweep would need the LP; Resolved-but-not-terminal is refused (covered by F-4
-    // flow); here the market IS terminal-flat.
     // STATE POKE (see poke_senior_claim): C lowered by 2M, standing in for terminal junior
     // surplus that sits in backing (e.g. a counterparty loss landing after settlement).
     poke_senior_claim(&mut env, 8_000_000);
