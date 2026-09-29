@@ -67,6 +67,7 @@ pub struct Stats {
     pub legs_outstanding_at_close: u128,
     pub winddowns: u64,
     pub closeslab_ok: u64,
+    pub haircut_then_burn: Vec<String>,
 }
 
 impl Stats {
@@ -84,6 +85,7 @@ impl Stats {
         self.legs_outstanding_at_close += o.legs_outstanding_at_close;
         self.winddowns += o.winddowns;
         self.closeslab_ok += o.closeslab_ok;
+        self.haircut_then_burn.extend(o.haircut_then_burn.iter().cloned());
     }
 }
 
@@ -119,6 +121,7 @@ pub struct World {
     pub stats: Stats,
     pub closed: Vec<bool>,
     pub fee_bps: u64,
+    pub shortfall: u128,
 }
 
 impl World {
@@ -188,6 +191,7 @@ impl World {
             stats: Stats::default(),
             closed: vec![false; N_USERS + 1],
             fee_bps,
+            shortfall: 0,
         };
         // LP = last portfolio: big deposit + passive matcher (kind 0, spread 0).
         let lp_idx = N_USERS;
@@ -548,6 +552,26 @@ impl World {
         )
     }
 
+    pub fn do_claim_topup(&mut self, u: usize) -> Result<u64, String> {
+        let owner = self.owners[u].pubkey();
+        let dst = self.new_token(owner, 0);
+        let (m, v, va, p) = (self.env.market, self.env.vault, self.env.vault_authority, self.ports[u]);
+        self.send(
+            ProgInstruction::ClaimResolvedPayoutTopup,
+            vec![
+                AccountMeta::new_readonly(owner, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(p, false),
+                AccountMeta::new(dst, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&m), false),
+            ],
+            &[],
+        )
+    }
+
     pub fn do_resolve(&mut self) -> Result<u64, String> {
         let authority_epoch = self.env.control_sequences(0).authority_epoch;
         let fr = state::read_asset_generation_frontier(
@@ -559,6 +583,24 @@ impl World {
         self.send(
             ProgInstruction::ResolveMarket { asset_generation_frontier: fr, authority_epoch },
             vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    pub fn do_withdraw_terminal_insurance(&mut self, amount: u128) -> Result<u64, String> {
+        let admin = self.env.admin.insecure_clone();
+        let dst = self.new_token(admin.pubkey(), 0);
+        let (m, v, va) = (self.env.market, self.env.vault, self.env.vault_authority);
+        self.send(
+            ProgInstruction::WithdrawInsurance { amount },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(dst, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
             &[&admin],
         )
     }
@@ -816,6 +858,29 @@ impl World {
             let s = self.slot() + 10 * (round + 1);
             self.env.svm.warp_to_slot(s);
         }
+        // Resolved payout top-ups (tag 46, permissionless, pays only the owner's receipt).
+        for _ in 0..3 {
+            for u in 0..=N_USERS {
+                let open_receipt = self
+                    .env
+                    .svm
+                    .get_account(&self.ports[u])
+                    .and_then(|a| state::read_portfolio(&a.data).ok())
+                    .map_or(false, |p| p.resolved_payout_receipt.present && !p.resolved_payout_receipt.finalized);
+                if open_receipt {
+                    match self.do_claim_topup(u) {
+                        Ok(_) => *self.stats.ok.entry("winddown_topup46").or_default() += 1,
+                        Err(e) => {
+                            let code = custom_code(&e).map(|c| c.to_string()).unwrap_or_else(|| e.chars().take(40).collect());
+                            *self.stats.err.entry(format!("winddown_topup46:{code}")).or_default() += 1;
+                        }
+                    }
+                    self.check()?;
+                }
+            }
+            let s = self.slot() + 5;
+            self.env.svm.warp_to_slot(s);
+        }
         let _ = self.do_claim_protocol();
         let _ = self.do_claim_creator();
         self.check()?;
@@ -823,7 +888,25 @@ impl World {
         // the account is empty).
         for u in 0..=N_USERS {
             self.closed[u] = false;
-            if self.do_close_portfolio(u).is_ok() {
+            if std::env::var("FUZZ_DEBUG_CLOSE").is_ok() {
+                if let Some(a) = self.env.svm.get_account(&self.ports[u]) {
+                    if let Ok(pf) = state::read_portfolio(&a.data) {
+                        let r = pf.resolved_payout_receipt;
+                        eprintln!("pre-closeportfolio u{u}: cap {} pnl {} receipt present {} face {} paid {} final {}", pf.capital, pf.pnl, r.present, r.terminal_positive_claim_face, r.paid_effective, r.finalized);
+                    }
+                }
+            }
+            if let Some(pf) = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
+                let r = pf.resolved_payout_receipt;
+                if r.present {
+                    self.shortfall += r.terminal_positive_claim_face.saturating_sub(r.paid_effective);
+                }
+            }
+            let cp = self.do_close_portfolio(u);
+            if std::env::var("FUZZ_DEBUG_CLOSE").is_ok() {
+                eprintln!("   closeportfolio u{u}: {:?}", cp.as_ref().map_err(|e| custom_code(e)));
+            }
+            if cp.is_ok() {
                 *self.stats.ok.entry("winddown_close_portfolio").or_default() += 1;
             } else {
                 self.closed[u] = true; // still skip in aggregates; CloseResolved emptied it
@@ -839,6 +922,26 @@ impl World {
             }
         }
         self.check()?;
+        // Insurance authority takes back the budgeted (topped-up) insurance: tag 41,
+        // resolved + all portfolios closed. Unbudgeted insurance = fee legs stays.
+        let budget = {
+            let g = self.env.market_state().1;
+            // Everything in insurance that is not an owed fee leg belongs to the insurance
+            // authority at terminal (README "WithdrawInsurance (tag 41) unbounded resolved").
+            let legs = self.legs_outstanding();
+            let want = g.insurance.saturating_sub(legs);
+            if std::env::var("FUZZ_INS_BUDGET_ONLY").is_ok() { g.insurance_domain_budget_remaining_total } else { want }
+        };
+        if budget > 0 {
+            match self.do_withdraw_terminal_insurance(budget) {
+                Ok(_) => *self.stats.ok.entry("winddown_withdraw_ins41").or_default() += 1,
+                Err(e) => {
+                    let code = custom_code(&e).map(|c| c.to_string()).unwrap_or_else(|| e.chars().take(40).collect());
+                    *self.stats.err.entry(format!("winddown_withdraw_ins41:{code}")).or_default() += 1;
+                }
+            }
+            self.check()?;
+        }
         let legs = self.legs_outstanding();
         if std::env::var("FUZZ_DEBUG").is_ok() {
             let (cfg, g) = self.env.market_state();
@@ -847,6 +950,7 @@ impl World {
             let _ = cfg;
         }
         let burned_before = self.burned();
+        let vault_before_close = self.token_amount(&self.env.vault);
         let mut r = self.do_close_slab();
         let mut calls = 1;
         for _ in 0..16 {
@@ -855,6 +959,8 @@ impl World {
                 break;
             }
             calls += 1;
+            let _ = self.do_claim_protocol();
+            let _ = self.do_claim_creator();
             if std::env::var("FUZZ_DEBUG").is_ok() {
                 let a = self.env.svm.get_account(&self.env.market).unwrap();
                 eprintln!("closeslab attempt {calls}: prev={:?} len={} kind={} vault_tok={}", r.as_ref().map_err(|e| e.chars().take(300).collect::<String>()), a.data.len(), a.data.get(10).copied().unwrap_or(255), self.token_amount(&self.env.vault));
@@ -881,6 +987,20 @@ impl World {
             if burned > 0 {
                 *self.stats.soft.entry("F4_closeslab_burned_atoms>0").or_default() += 1;
             }
+            let non_leg_burn = burned.saturating_sub(legs);
+            if self.shortfall > 0 && non_leg_burn > 0 {
+                self.stats.haircut_then_burn.push(format!(
+                    "winners short-paid {} atoms at resolution while CloseSlab burned {} non-fee-leg atoms (fee_bps {})",
+                    self.shortfall, non_leg_burn, self.fee_bps
+                ));
+            }
+            // F4 (master plan P1): CloseSlab must never burn an owed fee leg.
+            let non_leg = vault_before_close.saturating_sub(legs);
+            if burned > non_leg && std::env::var("FUZZ_STRICT_F4").map_or(false, |v| v == "1") {
+                return Err(format!(
+                    "I10 F4 CLOSESLAB BURNED FEE LEGS: burned {burned} > non-leg residue {non_leg} (legs owed {legs}, vault {vault_before_close})"
+                ));
+            }
         } else {
             let e = r.unwrap_err();
             let code = custom_code(&e).map(|c| c.to_string()).unwrap_or_else(|| e.chars().take(60).collect());
@@ -892,6 +1012,16 @@ impl World {
                 eprintln!("   logs: {:?}", logs);
             }
             *self.stats.err.entry(format!("winddown_closeslab:{code}")).or_default() += 1;
+            if std::env::var("FUZZ_STRICT_CLOSE").map_or(false, |v| v == "1") {
+                let (_, g) = self.env.market_state();
+                return Err(format!(
+                    "L1 CLOSESLAB WEDGED after full wind-down: code {code}, vault {} ins {} budget {} fresh_backing {} provider_recv {:?} bucket_status {:?} engine_slot {} clock {}",
+                    g.vault, g.insurance, g.insurance_domain_budget_remaining_total, g.source_fresh_backing_total_num,
+                    g.source_credit.iter().map(|c| c.provider_receivable_num).collect::<Vec<_>>(),
+                    g.source_backing_buckets.iter().map(|b| (b.status, b.expiry_slot)).collect::<Vec<_>>(),
+                    g.current_slot, self.slot()
+                ));
+            }
         }
         Ok(())
     }
@@ -1051,6 +1181,7 @@ fn indep_conservation_fuzz_global_invariants() {
     eprintln!("   ok:   {:?}", st.ok);
     eprintln!("   err:  {:?}", st.err);
     eprintln!("   soft: {:?}", st.soft);
+    eprintln!("   haircut_then_burn: {} cases; first: {:?}", st.haircut_then_burn.len(), st.haircut_then_burn.first());
     eprintln!(
         "   winddowns {} closeslab_ok {} burned_at_close {} legs_outstanding_at_close {}",
         st.winddowns, st.closeslab_ok, st.burned_at_close, st.legs_outstanding_at_close
@@ -1061,4 +1192,150 @@ fn indep_conservation_fuzz_global_invariants() {
     }
     let f = failures.lock().unwrap();
     assert!(f.is_empty(), "{} invariant violation(s):\n{}", f.len(), f.join("\n\n"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LIVENESS: resolved-market retirement (spec §2.4 "retirement" + README
+// "Permissionless progress": a public path must either commit progress or return
+// a terminal error; no ordinary state may need a privileged operator forever).
+// Shrunk from fuzz seed 0x1715609f7c74cb56 (3 ops).
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn wedge_prefix(w: &mut World) {
+    for op in [
+        Op::TradeCpi { u: 219, size_tenths: 175 },
+        Op::TradeNoCpi { a: 215, b: 241, size_tenths: -324, off_bps: 2878 },
+        Op::Push { delta_bps: 2295 },
+    ] {
+        let _ = w.apply(&op);
+        w.check().expect("invariants during prefix");
+    }
+    for _ in 0..40 {
+        let s = w.slot() + 5;
+        w.env.svm.warp_to_slot(s);
+        let _ = w.do_push(w.mark);
+        let _ = w.do_crank(N_USERS);
+        let (_, g) = w.env.market_state();
+        if g.assets[0].effective_price == g.assets[0].raw_oracle_target_price {
+            break;
+        }
+    }
+    w.do_resolve().expect("resolve");
+}
+
+fn close_everyone(w: &mut World, warp_before_last: u64) {
+    let mut warped = warp_before_last == 0;
+    for _round in 0..12 {
+        for u in 0..=N_USERS {
+            if w.closed[u] {
+                continue;
+            }
+            let open = w.closed.iter().filter(|c| !**c).count();
+            if open == 1 && !warped {
+                let s = w.slot() + warp_before_last;
+                w.env.svm.warp_to_slot(s);
+                warped = true;
+            }
+            let _ = w.do_close_resolved(u);
+            w.check().expect("invariants while closing");
+            let _ = w.do_close_portfolio(u);
+            w.check().expect("invariants while closing");
+        }
+        if w.closed.iter().all(|c| *c) {
+            break;
+        }
+        let s = w.slot() + 3;
+        w.env.svm.warp_to_slot(s);
+    }
+    assert!(w.closed.iter().all(|c| *c), "vacuity: portfolios not all closed: {:?}", w.closed);
+    let _ = w.do_claim_protocol();
+    let _ = w.do_claim_creator();
+    let budget = w.env.market_state().1.insurance_domain_budget_remaining_total;
+    if budget > 0 {
+        let _ = w.do_withdraw_terminal_insurance(budget);
+    }
+}
+
+/// Every permissionless / authority exit, far in the future. Returns true if retired.
+fn try_retire(w: &mut World) -> bool {
+    for step in [1u64, 1_000, 1_000_000] {
+        let s = w.slot() + step;
+        w.env.svm.warp_to_slot(s);
+        let _ = w.do_expire(0);
+        let _ = w.do_expire(1);
+        let _ = w.do_finalize(0);
+        let _ = w.do_finalize(1);
+        for _ in 0..4 {
+            let _ = w.do_close_slab();
+            if w.is_tombstone() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn indep_liveness_resolved_market_retires_even_if_everyone_closes_before_bucket_expiry() {
+    let mut w = World::new(0);
+    wedge_prefix(&mut w);
+    close_everyone(&mut w, 0);
+    let (_, g) = w.env.market_state();
+    assert_eq!(g.materialized_portfolio_count, 0, "vacuity: every portfolio must be freed");
+    let stranded = w.token_amount(&w.env.vault);
+    let buckets: Vec<_> = g.source_backing_buckets.iter().map(|b| (b.status, b.expiry_slot)).collect();
+    eprintln!("pre-retire: stranded {stranded} buckets {buckets:?} engine_slot {} clock {} recv {:?}", g.current_slot, w.slot(), g.source_credit.iter().map(|c| c.provider_receivable_num).collect::<Vec<_>>());
+    let retired = try_retire(&mut w);
+    w.check_tokens().unwrap();
+    assert!(
+        retired,
+        "L1 WEDGE: resolved, all portfolios closed, market can never retire: {stranded} atoms stranded in \
+         vault (c_tot 0, insurance {}), buckets {buckets:?}, engine slot {} frozen vs clock {}",
+        g.insurance,
+        g.current_slot,
+        w.slot()
+    );
+}
+
+/// Control: same market, but the last CloseResolved waits past the bucket expiry so it
+/// advances the resolved clock (#506). If THIS retires and the test above does not, the
+/// wedge is purely an ordering race that any permissionless closer can trigger.
+#[test]
+fn indep_liveness_control_resolved_market_retires_when_last_close_waits_past_expiry() {
+    let mut w = World::new(0);
+    wedge_prefix(&mut w);
+    close_everyone(&mut w, 400);
+    let before = w.token_amount(&w.env.vault);
+    let burned0 = w.burned();
+    let retired = try_retire(&mut w);
+    w.check_tokens().unwrap();
+    eprintln!("control: retired={retired} vault_before={before} burned={}", w.burned() - burned0);
+    assert!(retired, "control: even the patient ordering cannot retire the market");
+}
+
+/// F4 (master plan P1 fee fix): CloseSlab must not burn unclaimed protocol / creator /
+/// LP / staker fee legs — pay or reserve them first, or refuse to close.
+#[test]
+fn indep_f4_closeslab_never_burns_owed_fee_legs() {
+    let mut w = World::new(30);
+    // Fee-bearing trades, flat afterwards, no price move: no losses, only fee legs.
+    w.do_trade_nocpi(0, 1, 50 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    w.do_trade_nocpi(0, 1, -50 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("close");
+    w.check().unwrap();
+    let legs_live = w.legs_outstanding();
+    assert!(legs_live > 0, "vacuity: trades must accrue fee legs");
+    w.do_resolve().expect("resolve");
+    close_everyone(&mut w, 0);
+    let legs = w.legs_outstanding();
+    let vault = w.token_amount(&w.env.vault);
+    let burned0 = w.burned();
+    let _ = try_retire(&mut w);
+    w.check_tokens().unwrap();
+    let burned = w.burned() - burned0;
+    eprintln!("F4: legs_live {legs_live} legs_at_close {legs} vault {vault} burned {burned} retired {}", w.is_tombstone());
+    let non_leg = vault.saturating_sub(legs);
+    assert!(
+        burned <= non_leg,
+        "I10 F4: CloseSlab burned {burned} atoms while {legs} atoms of fee legs were owed (vault {vault})"
+    );
 }
