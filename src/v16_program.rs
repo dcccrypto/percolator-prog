@@ -365,6 +365,24 @@ pub mod constants {
         PROTOCOL_FEE_AUTHORITY_EPOCH_OFF + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN <= ASSET_ORACLE_WRAPPER_LEN
     );
 
+    /// P1 (2026-09-29): per-asset protocol risk limits (`state::AssetRiskLimitsV17`, 64 B),
+    /// carved from the [608, 1024) spare headroom of EACH asset's fixed 1024-byte wrapper
+    /// slot, immediately after W4-AE-84's asset-0 epoch lane. NO LAYOUT CHANGE:
+    /// `ASSET_ORACLE_WRAPPER_LEN`, `MARKET_ASSET_SLOT_LEN`, `MARKET_GROUP_OFF` and every
+    /// existing field offset are unchanged. Deployed/zeroed slots read all-zero, which every
+    /// field defines as "use the protocol default" (see `risk_limits_v17`), so no migration
+    /// instruction is needed and an in-place upgrade would be safe (the P1 release is still
+    /// planned to ride a re-seed).
+    pub const ASSET_RISK_LIMITS_OFF: usize =
+        PROTOCOL_FEE_AUTHORITY_EPOCH_OFF + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN;
+    pub const ASSET_RISK_LIMITS_LEN: usize = 64;
+    const _: () = assert!(ASSET_RISK_LIMITS_OFF == 608);
+    const _: () = assert!(ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN <= ASSET_ORACLE_WRAPPER_LEN);
+
+    /// P1: SetAssetRiskLimits -- upgrade-authority-gated (same ProgramData check as tag 85),
+    /// never creator/marketauth-settable.
+    pub const TAG_SET_ASSET_RISK_LIMITS: u8 = 93;
+
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
     pub const PORTFOLIO_STATE_LEN: usize = size_of::<PortfolioAccountV16Account>();
@@ -1097,6 +1115,30 @@ pub mod error {
         /// generation from landing against whatever now occupies the same slot.
         /// SDK agent: add `AssetGenerationMismatch = 65` to the client error map.
         AssetGenerationMismatch, // Custom(65)
+        // ── P1 wrapper safety release (2026-09-29). All APPENDED so no earlier ordinal
+        // moves. SDK agent: add 66..=71 to the client error map. ────────────────────────
+        /// Item 1: a fill's execution price (matcher-reported on TradeCpi/BatchTradeCpi,
+        /// caller-supplied on TradeNoCpi/BatchTradeNoCpi) lies outside
+        /// `effective_price +- band` (`risk_limits_v17::exec_price_within_band`). `limit_price
+        /// == 0` no longer means "any price": it means "any price inside the band".
+        ExecPriceOutsideOracleBand, // Custom(66)
+        /// Item 2: the taker's portfolio owner equals the counterparty (LP) portfolio owner,
+        /// or -- on the matcher-routed CPI trades -- equals the traded asset's `asset_admin`
+        /// (the market creator). Hygiene only: a second wallet bypasses it.
+        SameOwnerTrade, // Custom(67)
+        /// Item 3: a matcher-routed fill would leave the LP's |position| x mark above
+        /// `k x LP initial-margin equity` on the traded asset.
+        LpExposureCapExceeded, // Custom(68)
+        /// Item 5: auto-halt. The matcher LP's initial-margin equity is at or below the
+        /// protocol floor, so risk-increasing fills against it are refused (reducing fills and
+        /// closes still work).
+        LpFloorHalt, // Custom(69)
+        /// Item 3: the protocol-set per-asset side-OI cap (tag 93) would be exceeded.
+        ProtocolSideOiCapExceeded, // Custom(70)
+        /// F4: CloseSlab refused because protocol / creator / LP / staker fee legs are still
+        /// owed. Claim them (tags 84, 90) and sweep the staker leg (tag 87, which is allowed on
+        /// a terminal-empty resolved market) first; nothing is burned.
+        CloseSlabFeesOutstanding, // Custom(71)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1152,7 +1194,7 @@ pub mod state {
             PORTFOLIO_MATCHER_EXPIRY_OFF, PORTFOLIO_MATCHER_SEQUENCE_LEN,
             PORTFOLIO_MATCHER_SEQUENCE_OFF, PORTFOLIO_STATE_LEN,
             PROTOCOL_FEE_AUTHORITY_EPOCH_LEN, PROTOCOL_FEE_AUTHORITY_EPOCH_OFF, VERSION,
-            WRAPPER_CONFIG_LEN,
+            WRAPPER_CONFIG_LEN, ASSET_RISK_LIMITS_LEN, ASSET_RISK_LIMITS_OFF,
         },
         error::PercolatorError,
     };
@@ -2313,6 +2355,94 @@ pub mod state {
         data.get_mut(range)
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(bytemuck::bytes_of(&value));
+        Ok(())
+    }
+
+    /// P1 (2026-09-29): per-asset PROTOCOL risk limits. Lives at
+    /// `constants::ASSET_RISK_LIMITS_OFF` (608) inside each asset's 1024-byte wrapper slot --
+    /// previously all-zero spare headroom, so deployed slots read `Default` (all zero), which
+    /// every field defines as "protocol default" (`risk_limits_v17`). Written ONLY by
+    /// `SetAssetRiskLimits` (tag 93, upgrade-authority-gated). Creator/marketauth have no path
+    /// to it.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct AssetRiskLimitsV17 {
+        /// Max effective OI per side (Q). 0 => engine `MAX_OI_SIDE_Q`.
+        pub side_oi_cap_q: u128,
+        /// Auto-halt floor on the matcher LP's initial-margin equity (atoms). 0 => halt only a
+        /// depleted (equity <= 0) LP.
+        pub lp_floor_atoms: u128,
+        /// LP exposure multiplier k (bps of equity). 0 => `1e8 / initial_margin_bps`.
+        pub lp_exposure_k_bps: u32,
+        /// Execution-price band (bps of effective price). 0 => `DEFAULT_EXEC_BAND_BPS`.
+        pub exec_band_bps: u16,
+        pub _reserved0: [u8; 2],
+        pub _reserved: [u8; 24],
+    }
+    const _: () = assert!(core::mem::size_of::<AssetRiskLimitsV17>() == ASSET_RISK_LIMITS_LEN);
+
+    pub fn validate_asset_risk_limits(limits: &AssetRiskLimitsV17) -> Result<(), ProgramError> {
+        if limits._reserved0 != [0u8; 2]
+            || limits._reserved != [0u8; 24]
+            || limits.exec_band_bps > crate::risk_limits_v17::MAX_EXEC_BAND_BPS
+            || limits.lp_exposure_k_bps > crate::risk_limits_v17::MAX_LP_EXPOSURE_K_BPS
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// Decode from an asset's wrapper-slot bytes (the `market.wrapper` slice a
+    /// `MarketViewMutV16` exposes, or the raw account range).
+    pub fn asset_risk_limits_from_wrapper_bytes(
+        wrapper: &[u8],
+    ) -> Result<AssetRiskLimitsV17, ProgramError> {
+        let bytes = wrapper
+            .get(ASSET_RISK_LIMITS_OFF..ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let limits: AssetRiskLimitsV17 = bytemuck::pod_read_unaligned(bytes);
+        validate_asset_risk_limits(&limits)?;
+        Ok(limits)
+    }
+
+    #[inline]
+    fn asset_risk_limits_range(
+        data: &[u8],
+        asset_index: usize,
+    ) -> Result<core::ops::Range<usize>, ProgramError> {
+        let capacity = market_slot_capacity(data)?;
+        if asset_index >= capacity {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let start = dynamic_slot_offset(asset_index)?
+            .checked_add(ASSET_RISK_LIMITS_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(start..start + ASSET_RISK_LIMITS_LEN)
+    }
+
+    pub fn read_asset_risk_limits(
+        data: &[u8],
+        asset_index: usize,
+    ) -> Result<AssetRiskLimitsV17, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = asset_risk_limits_range(data, asset_index)?;
+        let bytes = data.get(range).ok_or(PercolatorError::InvalidAccountLen)?;
+        let limits: AssetRiskLimitsV17 = bytemuck::pod_read_unaligned(bytes);
+        validate_asset_risk_limits(&limits)?;
+        Ok(limits)
+    }
+
+    pub fn write_asset_risk_limits(
+        data: &mut [u8],
+        asset_index: usize,
+        limits: &AssetRiskLimitsV17,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        validate_asset_risk_limits(limits)?;
+        let range = asset_risk_limits_range(data, asset_index)?;
+        data.get_mut(range)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(limits));
         Ok(())
     }
 
@@ -6280,6 +6410,18 @@ pub mod ix {
         SetProtocolFeeAuthority {
             new_authority: [u8; 32],
         },
+        /// P1 SetAssetRiskLimits (tag 93) -- per-asset protocol risk limits
+        /// (`state::AssetRiskLimitsV17`). Gated on the program's BPF upgrade authority
+        /// exactly like tag 85; NOT settable by `marketauth`, `asset_admin` or any
+        /// creator-facing key. Accounts: [0] upgrade authority (signer), [1] ProgramData,
+        /// [2] market (writable). Zero in any field restores that field's protocol default.
+        SetAssetRiskLimits {
+            asset_index: u16,
+            exec_band_bps: u16,
+            lp_exposure_k_bps: u32,
+            lp_floor_atoms: u128,
+            side_oi_cap_q: u128,
+        },
         /// UpdateFeeSplit (tag 86) — sets the three fee-split shares.
         /// Gated on `marketauth`. Shares must sum to FEE_SHARE_TOTAL_BPS and
         /// satisfy the floors (creator <=45%, LP >=40%, insurance >=15%).
@@ -6862,6 +7004,13 @@ pub mod ix {
                 },
                 85 => Self::SetProtocolFeeAuthority {
                     new_authority: read_bytes32(&mut rest)?,
+                },
+                crate::constants::TAG_SET_ASSET_RISK_LIMITS => Self::SetAssetRiskLimits {
+                    asset_index: read_u16(&mut rest)?,
+                    exec_band_bps: read_u16(&mut rest)?,
+                    lp_exposure_k_bps: read_u32(&mut rest)?,
+                    lp_floor_atoms: read_u128(&mut rest)?,
+                    side_oi_cap_q: read_u128(&mut rest)?,
                 },
                 86 => Self::UpdateFeeSplit {
                     creator_share_bps: read_u16(&mut rest)?,
@@ -7622,6 +7771,20 @@ pub mod ix {
                 Self::SetProtocolFeeAuthority { new_authority } => {
                     out.push(85);
                     out.extend_from_slice(&new_authority);
+                }
+                Self::SetAssetRiskLimits {
+                    asset_index,
+                    exec_band_bps,
+                    lp_exposure_k_bps,
+                    lp_floor_atoms,
+                    side_oi_cap_q,
+                } => {
+                    out.push(crate::constants::TAG_SET_ASSET_RISK_LIMITS);
+                    push_u16(&mut out, asset_index);
+                    push_u16(&mut out, exec_band_bps);
+                    push_u32(&mut out, lp_exposure_k_bps);
+                    push_u128(&mut out, lp_floor_atoms);
+                    push_u128(&mut out, side_oi_cap_q);
                 }
                 Self::UpdateFeeSplit {
                     creator_share_bps,
@@ -9014,6 +9177,210 @@ pub mod policy_v16 {
                 && bucket.consumed_liened_backing_num == 0
                 && bucket.impaired_liened_backing_num == 0
                 && bucket.utilization_fee_earnings == 0)
+    }
+}
+
+/// P1 wrapper safety release (2026-09-29, `~/percolator-ops/ledger/p1-safety-release-2026-09-29.md`).
+///
+/// Pure, integer-only predicates behind the five P1 trade-path rules and the F4 CloseSlab
+/// fee-conservation rule. Kept free of `AccountInfo`/syscalls so every one of them is a Kani
+/// target (`tests/v16_kani.rs`, `kani_p1_*`). The processor only gathers inputs and maps a
+/// `false`/`true` onto the matching `PercolatorError` variant.
+///
+/// Units: prices are e6 (the engine's `effective_price`), positions are engine Q
+/// (`percolator::POS_SCALE` = 1e6 per unit), equity/floors are collateral atoms, all bps are
+/// out of 10_000.
+pub mod risk_limits_v17 {
+    pub const BPS_DENOM: u128 = 10_000;
+
+    /// Band applied when a market's per-asset `exec_band_bps` is unset (0). 5%.
+    ///
+    /// Reference price is the engine asset's `effective_price` -- the exact value the wrapper
+    /// already hands the matcher as `oracle_price_e6` and already requires the matcher to
+    /// echo back (`validate_matcher_return`). A passive (kind-0) matcher quotes oracle +-
+    /// spread (single-digit bps); a kind-1 vAMM with impact can go wider on large fills, which
+    /// is exactly what the band exists to refuse.
+    pub const DEFAULT_EXEC_BAND_BPS: u16 = 500;
+    /// Largest band the protocol setter accepts (100%). A band never *widens* past this.
+    pub const MAX_EXEC_BAND_BPS: u16 = 10_000;
+    /// Largest LP exposure multiplier the setter accepts: 1000x equity.
+    pub const MAX_LP_EXPOSURE_K_BPS: u32 = 10_000_000;
+
+    /// Effective band in bps: 0 (unset, which is what every deployed/zeroed slot reads) maps
+    /// to the default; anything above the max is clamped (the setter already refuses it, this
+    /// is defence in depth against a corrupt slot).
+    pub fn effective_exec_band_bps(stored: u16) -> u16 {
+        if stored == 0 {
+            DEFAULT_EXEC_BAND_BPS
+        } else if stored > MAX_EXEC_BAND_BPS {
+            MAX_EXEC_BAND_BPS
+        } else {
+            stored
+        }
+    }
+
+    /// Item 1: `|exec - reference| * 10_000 <= reference * band_bps`.
+    ///
+    /// u64 x 10_000 and u64 x u16 both fit u128, so this cannot overflow. A zero reference
+    /// price is never "within band" (fail closed; callers already reject a zero oracle).
+    pub fn exec_price_within_band(exec_price: u64, reference_price: u64, band_bps: u16) -> bool {
+        if reference_price == 0 {
+            return false;
+        }
+        let diff = exec_price.abs_diff(reference_price) as u128;
+        diff * BPS_DENOM <= (reference_price as u128) * (band_bps as u128)
+    }
+
+    /// Default LP exposure multiplier when unset: the asset's own max leverage,
+    /// `10_000 / initial_margin_bps` expressed in bps (`1e8 / imr_bps`). With this default the
+    /// cap coincides with the IM requirement computed on *initial-margin equity* (capital +
+    /// min(pnl, 0) - fee debt, i.e. with NO credit for unrealized/backed positive PnL), so it is
+    /// never looser than the engine's own IM gate for a single-asset LP and fires (as a clip or
+    /// a named refusal) before the engine would revert with Custom(49).
+    pub fn default_lp_exposure_k_bps(initial_margin_bps: u64) -> u32 {
+        if initial_margin_bps == 0 {
+            return MAX_LP_EXPOSURE_K_BPS;
+        }
+        let k = 100_000_000u64 / initial_margin_bps;
+        if k > MAX_LP_EXPOSURE_K_BPS as u64 {
+            MAX_LP_EXPOSURE_K_BPS
+        } else {
+            k as u32
+        }
+    }
+
+    pub fn effective_lp_exposure_k_bps(stored: u32, initial_margin_bps: u64) -> u32 {
+        if stored == 0 {
+            default_lp_exposure_k_bps(initial_margin_bps)
+        } else if stored > MAX_LP_EXPOSURE_K_BPS {
+            MAX_LP_EXPOSURE_K_BPS
+        } else {
+            stored
+        }
+    }
+
+    /// Item 3: the largest |LP position| (Q) that `|pos| * price / POS_SCALE <= k * equity /
+    /// 10_000` allows, i.e. `floor(equity * k * POS_SCALE / (10_000 * price))`.
+    ///
+    /// Monotone non-decreasing in `equity` and `k_bps`, non-increasing in `price`. On an
+    /// intermediate overflow the cap saturates to `u128::MAX` -- which is still monotone and
+    /// only means "this rule does not bind" (the engine IM gate and the side-OI cap still do);
+    /// it can only happen for equities beyond ~3.4e25 atoms. Zero price => zero cap (fail
+    /// closed).
+    pub fn lp_exposure_cap_q(equity_atoms: u128, k_bps: u32, price_e6: u64, pos_scale: u128) -> u128 {
+        if price_e6 == 0 {
+            return 0;
+        }
+        let den = BPS_DENOM * price_e6 as u128; // <= 1e4 * 1.8e19, fits
+        match equity_atoms
+            .checked_mul(k_bps as u128)
+            .and_then(|v| v.checked_mul(pos_scale))
+        {
+            Some(num) => num / den,
+            None => u128::MAX,
+        }
+    }
+
+    /// Initial-margin-lane equity clamped at zero, as an unsigned amount.
+    pub fn nonneg_equity(equity_init: i128) -> u128 {
+        if equity_init <= 0 {
+            0
+        } else {
+            equity_init as u128
+        }
+    }
+
+    /// A position change `before -> after` *increases the LP's risk* on that asset iff its
+    /// magnitude grows (a flip to a larger opposite position counts; a flip to a smaller one
+    /// does not).
+    pub fn lp_risk_increasing(before_q: i128, after_q: i128) -> bool {
+        after_q.unsigned_abs() > before_q.unsigned_abs()
+    }
+
+    /// Item 3 post-trade predicate: the LP leg is acceptable iff it did not grow the LP's
+    /// exposure, or the grown exposure is within the cap. A reducing fill is ALWAYS allowed
+    /// (an over-cap LP -- e.g. after its equity dropped -- must stay closable).
+    pub fn lp_exposure_allowed(before_q: i128, after_q: i128, cap_q: u128) -> bool {
+        !lp_risk_increasing(before_q, after_q) || after_q.unsigned_abs() <= cap_q
+    }
+
+    /// Item 4: the largest request magnitude (Q) the LP can take in direction `lp_delta_sign`
+    /// (the sign of the LP's position change; the taker's `size_q` is its negation) such that
+    /// `lp_exposure_allowed(before, before + delta, cap)` holds for EVERY `|delta| <=` the
+    /// result, and fails for `|delta| == result + 1` whenever that is representable.
+    ///
+    /// Allowed set is `|before + delta| <= M` with `M = max(cap, |before|)`; moving toward
+    /// (and through) zero first gives `M + |before|`, moving away gives `M - |before|`.
+    pub fn lp_fill_headroom_q(before_q: i128, lp_delta_sign: i8, cap_q: u128) -> u128 {
+        let abs_before = before_q.unsigned_abs();
+        let m = if cap_q > abs_before { cap_q } else { abs_before };
+        let same_direction =
+            before_q == 0 || (before_q > 0 && lp_delta_sign > 0) || (before_q < 0 && lp_delta_sign < 0);
+        if same_direction {
+            m - abs_before
+        } else {
+            m.saturating_add(abs_before)
+        }
+    }
+
+    /// Item 5: auto-halt. A risk-increasing LP fill is refused while the LP's initial-margin
+    /// equity is at or below the protocol floor. `floor = 0` (the default) halts exactly the
+    /// depleted LPs (equity <= 0) that on devnet turned every open into Custom(49)/Custom(21)
+    /// (COLLECT, Murphy). Reducing fills are never halted.
+    pub fn lp_floor_halts(equity_init: i128, floor_atoms: u128, risk_increasing: bool) -> bool {
+        risk_increasing && nonneg_equity(equity_init) <= floor_atoms
+    }
+
+    /// Item 3 (second half): protocol side-OI cap. `stored == 0` => the engine's own global
+    /// `MAX_OI_SIDE_Q` (no behaviour change until the protocol sets a tighter cap).
+    pub fn effective_side_oi_cap_q(stored: u128, engine_max_oi_side_q: u128) -> u128 {
+        if stored == 0 || stored > engine_max_oi_side_q {
+            engine_max_oi_side_q
+        } else {
+            stored
+        }
+    }
+
+    /// Growth-only side-OI rule: a side may end above the cap only if it did not grow (so a
+    /// cap lowered below current OI never traps positions -- they can still close).
+    pub fn side_oi_growth_allowed(before_q: u128, after_q: u128, cap_q: u128) -> bool {
+        after_q <= cap_q || after_q <= before_q
+    }
+
+    /// F4: every outstanding fee leg the market still owes someone. `None` on overflow or on a
+    /// corrupt `withdrawn > accrued` pair (callers fail closed on `None`).
+    pub fn outstanding_fee_legs(
+        protocol_accrued: u128,
+        protocol_withdrawn: u128,
+        lp_accrued: u128,
+        lp_withdrawn: u128,
+        insurance_reserve_accrued: u128,
+        insurance_reserve_withdrawn: u128,
+        creator_claimable_total: u128,
+    ) -> Option<u128> {
+        protocol_accrued
+            .checked_sub(protocol_withdrawn)?
+            .checked_add(lp_accrued.checked_sub(lp_withdrawn)?)?
+            .checked_add(insurance_reserve_accrued.checked_sub(insurance_reserve_withdrawn)?)?
+            .checked_add(creator_claimable_total)
+    }
+
+    /// F4 terminal fold: once a resolved market has NO portfolio left (`c_tot == 0`,
+    /// `materialized_portfolio_count == 0`) and no LP-vault-funded backing domain, the LP leg
+    /// has no possible recipient on this market (tag 78 is Live-only and there are no LP
+    /// shares to credit). Rather than let CloseSlab burn it, it is re-booked onto the insurance
+    /// (staker) leg so the terminal tag-87 sweep pays it to the bound stake pool.
+    ///
+    /// Returns `(lp_withdrawn', insurance_reserve_accrued')`. Conservation (Kani
+    /// `kani_p1_terminal_lp_fold_conserves`): the sum of the two outstanding legs is unchanged
+    /// and the LP leg's outstanding becomes exactly 0. `None` on overflow / corrupt pair.
+    pub fn fold_lp_leg_into_insurance(
+        lp_accrued: u128,
+        lp_withdrawn: u128,
+        insurance_reserve_accrued: u128,
+    ) -> Option<(u128, u128)> {
+        let lp_owed = lp_accrued.checked_sub(lp_withdrawn)?;
+        Some((lp_accrued, insurance_reserve_accrued.checked_add(lp_owed)?))
     }
 }
 
@@ -11139,6 +11506,25 @@ pub mod processor {
                 amount,
                 authority_epoch,
             } => handle_withdraw_protocol_fee(program_id, accounts, amount, authority_epoch),
+            Instruction::SetAssetRiskLimits {
+                asset_index,
+                exec_band_bps,
+                lp_exposure_k_bps,
+                lp_floor_atoms,
+                side_oi_cap_q,
+            } => handle_set_asset_risk_limits(
+                program_id,
+                accounts,
+                asset_index,
+                state::AssetRiskLimitsV17 {
+                    side_oi_cap_q,
+                    lp_floor_atoms,
+                    lp_exposure_k_bps,
+                    exec_band_bps,
+                    _reserved0: [0u8; 2],
+                    _reserved: [0u8; 24],
+                },
+            ),
             Instruction::SetProtocolFeeAuthority { new_authority } => {
                 handle_set_protocol_fee_authority(program_id, accounts, new_authority)
             }
@@ -11654,6 +12040,10 @@ pub mod processor {
         account_a_backing_fee_cap_bps: Option<u16>,
         account_b_backing_fee_cap_bps: Option<u16>,
         max_market_slots: usize,
+        // P1: true on the matcher-routed CPI routes, where account_b is the matcher LP and
+        // the LP exposure cap + floor/auto-halt apply to it. False on TradeNoCpi (both owners
+        // sign; there is no LP role).
+        lp_limits: bool,
     ) -> ProgramResult {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
@@ -11692,6 +12082,10 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
+            // P1 item 2: no trading against a portfolio you own. Compared on the portfolio
+            // HEADERS (not the caller-passed keys) so every route -- TradeNoCpi, TradeCpi,
+            // and the NFT-holder taker path -- is judged on the same fact.
+            ensure_distinct_trade_owners(&account_a, &account_b)?;
             let size_abs = if size_q == i128::MIN || size_q == 0 {
                 return Err(PercolatorError::InvalidInstruction.into());
             } else {
@@ -11733,6 +12127,9 @@ pub mod processor {
                 .asset
                 .effective_price
                 .get();
+            // P1 item 1: the fill's execution price must lie inside the protocol band around
+            // the price the position actually settles at (`effective_price`).
+            ensure_exec_price_in_band_view(&group, asset_index as usize, exec_price)?;
             let fee_bps = hybrid_trade_fee_bps_view(
                 &cfg,
                 &oracle_profile,
@@ -11822,6 +12219,7 @@ pub mod processor {
             // depends on the sign of the caller-supplied size_q, since this
             // single-trade path reorders (a,b) by sign (§1A.3) -- so
             // `taker_is_long_account` must mirror that same reordering.
+            let oi_before = side_oi_snapshot_view(&group, asset_index as usize)?;
             let outcome = if size_q > 0 {
                 group
                     .execute_trade_with_fee_loss_stale_scoped_not_atomic(
@@ -11845,6 +12243,17 @@ pub mod processor {
             // after the engine mutates OI on this trade, before any other post-trade
             // check, so an over-cap post-state aborts the instruction.
             ensure_trade_side_oi_cap_view(&group, asset_index as usize)?;
+            // P1 item 3: protocol per-asset side-OI cap (tag 93), growth-only.
+            ensure_protocol_side_oi_cap_view(&group, asset_index as usize, oi_before)?;
+            // P1 items 3 + 5: LP exposure cap and floor/auto-halt on the matcher LP.
+            if lp_limits {
+                ensure_lp_limits_after_fill_view(
+                    &group,
+                    &account_b,
+                    asset_index as usize,
+                    account_b_position,
+                )?;
+            }
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
             // counterparty-backed liens need this landing-time check; insurance-backed liens
@@ -12161,6 +12570,7 @@ pub mod processor {
             legs,
             max_market_slots,
             None,
+            false,
         )
     }
 
@@ -12184,6 +12594,8 @@ pub mod processor {
         // `Some(max_fee_atoms)` for `BatchTradeCpi`, where an external matcher's per-leg returns
         // otherwise decide the charged aggregate unilaterally.
         max_account_a_fee_atoms: Option<u128>,
+        // P1: see `handle_trade_nocpi_zero_copy`'s `lp_limits`.
+        lp_limits: bool,
     ) -> ProgramResult {
         if legs.is_empty() {
             return Err(PercolatorError::EngineNonProgress.into());
@@ -12222,6 +12634,8 @@ pub mod processor {
             expect_portfolio_view_account_key(&account_b, account_b_ai.key)?;
             expect_portfolio_view_owner(&account_a, account_a_owner_key)?;
             expect_portfolio_view_owner(&account_b, account_b_owner_key)?;
+            // P1 item 2 (batch routes).
+            ensure_distinct_trade_owners(&account_a, &account_b)?;
 
             // Pre-pass: per leg, read its oracle profile, pin the fee basis to the asset mark, and
             // build the SIGNED engine request. Reject duplicate assets (one leg per asset per batch).
@@ -12294,6 +12708,8 @@ pub mod processor {
                     .asset
                     .effective_price
                     .get();
+                // P1 item 1 (batch routes), per leg.
+                ensure_exec_price_in_band_view(&group, asset_index, leg.exec_price)?;
                 let fee_bps_eff = hybrid_trade_fee_bps_view(
                     &cfg,
                     &oracle_profile,
@@ -12404,6 +12820,10 @@ pub mod processor {
             // Taker-only (design §1A.3): batches never reorder -- account_a is
             // always the engine's first (long_account) positional slot for
             // the whole call, and account_a is always the taker (§1A.2).
+            let mut oi_before_legs: Vec<(u128, u128)> = Vec::with_capacity(requests.len());
+            for request in &requests {
+                oi_before_legs.push(side_oi_snapshot_view(&group, request.asset_index)?);
+            }
             let outcome = group
                 .execute_batch_with_fee_loss_stale_scoped_not_atomic(
                     &mut account_a,
@@ -12430,6 +12850,18 @@ pub mod processor {
             // whole batch atomically.
             for request in &requests {
                 ensure_trade_side_oi_cap_view(&group, request.asset_index)?;
+            }
+            // P1 items 3 + 5 (batch routes): protocol side-OI cap per leg, and -- on
+            // BatchTradeCpi -- the LP exposure cap / floor on account_b per leg. A batch is
+            // atomic (every leg must fill), so there is no clip here: an over-headroom batch
+            // is refused with the named error instead of the engine's Custom(49).
+            for (i, request) in requests.iter().enumerate() {
+                ensure_protocol_side_oi_cap_view(&group, request.asset_index, oi_before_legs[i])?;
+            }
+            if lp_limits {
+                for ctx in &leg_ctx {
+                    ensure_lp_limits_after_fill_view(&group, &account_b, ctx.0, ctx.5)?;
+                }
             }
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
@@ -12706,6 +13138,7 @@ pub mod processor {
             Some(backing_fee_cap_bps),
             Some(backing_fee_cap_bps),
             max_market_slots,
+            false,
         )
     }
 
@@ -13414,6 +13847,43 @@ pub mod processor {
             max_market_slots_pre,
             &[(asset_index, size_q)],
         )?;
+        // P1 item 2 (CPI): the taker may not be the LP's owner (also re-checked in the shared
+        // executor) nor the traded asset's creator (`asset_admin`), before the untrusted
+        // matcher is ever invoked.
+        if account_a_owner == account_b_owner
+            || (oracle_profile_pre.asset_admin != [0u8; 32]
+                && oracle_profile_pre.asset_admin == account_a_owner)
+        {
+            return Err(PercolatorError::SameOwnerTrade.into());
+        }
+        // P1 items 4 + 5: LP headroom. A floored LP refuses risk-increasing fills with
+        // `LpFloorHalt`; otherwise the request handed to the matcher is clipped to the LP's
+        // headroom under the exposure cap, so an over-headroom trade becomes a partial or a
+        // ZERO fill instead of reverting in the engine with Custom(49). The matcher ABI's
+        // reserved bytes 43..67 are NOT used: matcher 12bd671 `MatcherCall::parse` rejects any
+        // non-zero byte there, so the headroom travels as the request size itself.
+        let lp_headroom_q = lp_trade_headroom_before_matcher(
+            market_ai,
+            account_b_ai,
+            max_market_slots_pre,
+            asset_index as usize,
+            size_q,
+        )?;
+        let size_q = if size_q.unsigned_abs() > lp_headroom_q {
+            // lp_headroom_q < |size_q| <= i128::MAX, so the cast is lossless.
+            let clipped = lp_headroom_q as i128;
+            if size_q > 0 {
+                clipped
+            } else {
+                -clipped
+            }
+        } else {
+            size_q
+        };
+        if size_q == 0 {
+            state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+            return Ok(());
+        }
 
         invoke_matcher(
             matcher_prog,
@@ -13500,6 +13970,7 @@ pub mod processor {
             // only the matcher can authorize it, via `backing_fee_cap_bps()` on its CPI return.
             Some(ret.backing_fee_cap_bps()),
             max_market_slots,
+            true,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -14102,6 +14573,19 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
 
+        // P1 item 2 (BatchTradeCpi): taker != LP owner, and taker != any leg asset's creator.
+        if account_a_owner == account_b_owner {
+            return Err(PercolatorError::SameOwnerTrade.into());
+        }
+        {
+            let market_data = market_ai.try_borrow_data()?;
+            for &asset_index in &asset_indices {
+                let profile = state::read_asset_oracle_profile(&market_data, asset_index as usize)?;
+                if profile.asset_admin != [0u8; 32] && profile.asset_admin == account_a_owner {
+                    return Err(PercolatorError::SameOwnerTrade.into());
+                }
+            }
+        }
         let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
 
@@ -14225,6 +14709,7 @@ pub mod processor {
             &exec_legs,
             max_market_slots,
             Some(max_fee_atoms),
+            true,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
         Ok(())
@@ -16708,6 +17193,39 @@ pub mod processor {
     /// creator/insurance_authority-facing gate. No global fan-out: a
     /// keeper script iterates markets if a mass rotation is ever needed
     /// (v2 nicety, not a blocker).
+    ///
+    /// P1 SetAssetRiskLimits (tag 93). Same upgrade-authority gate as tag 85
+    /// (`handle_set_protocol_fee_authority`): the signer must be the `upgrade_authority_address`
+    /// recorded in THIS program's ProgramData. Validates ranges, writes the per-asset limits.
+    #[inline(never)]
+    fn handle_set_asset_risk_limits<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        limits: state::AssetRiskLimitsV17,
+    ) -> ProgramResult {
+        let upgrade_authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        expect_signer(upgrade_authority)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        let (program_data_key, _) = derive_program_data_address(program_id);
+        expect_key(program_data_ai, &program_data_key)?;
+        let stored_upgrade_authority = read_program_data_upgrade_authority(program_data_ai)?;
+        if stored_upgrade_authority != Some(*upgrade_authority.key) {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if limits.exec_band_bps > risk_limits_v17::MAX_EXEC_BAND_BPS
+            || limits.lp_exposure_k_bps > risk_limits_v17::MAX_LP_EXPOSURE_K_BPS
+            || limits.side_oi_cap_q > percolator::MAX_OI_SIDE_Q
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)
+    }
+
     #[inline(never)]
     fn handle_set_protocol_fee_authority<'a>(
         program_id: &Pubkey,
@@ -17093,10 +17611,35 @@ pub mod processor {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             // MODE GATE — see the doc comment. Live-only, plus matured-Live.
-            if group.header.mode != 0 {
+            //
+            // P1 F4 exception: a RESOLVED market with NO portfolio left
+            // (`c_tot == 0`, `materialized_portfolio_count == 0`) -- the only state from
+            // which `CloseSlab` can proceed. The drain objections in the doc comment
+            // (Recovery buffer, pre-materialisation Resolved) are about draining insurance
+            // that still covers TRADERS; here there are none, and the alternative is that
+            // `CloseSlab` burns this leg. So the leg is sweepable exactly there, and CloseSlab
+            // refuses (`CloseSlabFeesOutstanding`) until it has been swept.
+            let terminal_empty = terminal_empty_resolved_view(&group);
+            if group.header.mode != 0 && !terminal_empty {
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+            if !terminal_empty {
+                reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+            }
+            // P1 F4: on a terminal-empty market with no LP-vault-funded domain the LP leg has
+            // no recipient left (tag 78 is Live-only; no LP shares to credit), so re-book it
+            // onto this staker leg instead of letting CloseSlab burn it.
+            if terminal_empty && !lp_vault_funded_backing_domain_present_view(&group)? {
+                let (lp_withdrawn, insurance_reserve_accrued) =
+                    risk_limits_v17::fold_lp_leg_into_insurance(
+                        cfg.lp_fee_accrued_atoms,
+                        cfg.lp_fee_withdrawn_atoms,
+                        cfg.insurance_reserve_accrued_atoms,
+                    )
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                cfg.lp_fee_withdrawn_atoms = lp_withdrawn;
+                cfg.insurance_reserve_accrued_atoms = insurance_reserve_accrued;
+            }
 
             // Destination: derived, never caller-chosen. The trust root is the
             // PINNED `constants::STAKE_PROGRAM_ID`, asserted against
@@ -17203,6 +17746,68 @@ pub mod processor {
     /// lines): decode the persisted cursor into a scan-start asset index. `0`
     /// (fresh/never-scanned) always means "start of scan" regardless of
     /// `configured_assets`.
+    /// P1 F4: resolved AND no portfolio left -- the only state CloseSlab can proceed from.
+    fn terminal_empty_resolved_view(group: &state::MarketViewMutV16<'_>) -> bool {
+        group.header.mode == 1
+            && group.header.c_tot.get() == 0
+            && group.header.materialized_portfolio_count.get() == 0
+    }
+
+    /// P1 F4: same "funded AND stamped with the permanent LP-vault sentinel" scan CloseSlab
+    /// uses for its dead-share-floor guard.
+    fn lp_vault_funded_backing_domain_present_view(
+        group: &state::MarketViewMutV16<'_>,
+    ) -> Result<bool, ProgramError> {
+        let configured_domains =
+            v16_domain_count_for_market_slots(group.header.config.max_market_slots.get())
+                .map_err(map_v16_error)?;
+        for domain in 0..configured_domains {
+            let (_, bucket) = backing_domain_parts_view(group, domain)?;
+            let funded = bucket.status != BackingBucketStatusV16::Empty
+                || bucket.fresh_unliened_backing_num > 0
+                || bucket.valid_liened_backing_num > 0
+                || bucket.consumed_liened_backing_num > 0
+                || bucket.impaired_liened_backing_num > 0;
+            if funded && bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// P1 F4: sum of every fee leg still owed (protocol, LP, staker, creator -- the legacy
+    /// market-wide creator pot plus every configured asset's per-asset pot). Overflow or a
+    /// corrupt `withdrawn > accrued` pair fails closed.
+    fn outstanding_fee_legs_view(
+        cfg: &WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+    ) -> Result<u128, ProgramError> {
+        let mut creator_total = cfg.creator_fee_claimable_atoms as u128;
+        let configured_assets = group.header.config.max_market_slots.get() as usize;
+        for asset_index in 0..configured_assets.min(group.markets.len()) {
+            let bytes = group.markets[asset_index]
+                .wrapper
+                .get(..constants::ASSET_ORACLE_PROFILE_LEN)
+                .ok_or(PercolatorError::InvalidAccountLen)?;
+            // Raw read (no `validate_asset_oracle_profile`): a never-configured slot must not
+            // be able to wedge the close; only the u64 counter is consumed.
+            let profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(bytes);
+            creator_total = creator_total
+                .checked_add(profile.creator_fee_claimable_atoms as u128)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        }
+        risk_limits_v17::outstanding_fee_legs(
+            cfg.protocol_fee_accrued_atoms,
+            cfg.protocol_fee_withdrawn_atoms,
+            cfg.lp_fee_accrued_atoms,
+            cfg.lp_fee_withdrawn_atoms,
+            cfg.insurance_reserve_accrued_atoms,
+            cfg.insurance_reserve_withdrawn_atoms,
+            creator_total,
+        )
+        .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+    }
+
     fn terminal_slab_scan_start(
         encoded: u128,
         configured_assets: usize,
@@ -17379,6 +17984,14 @@ pub mod processor {
             if group.header.c_tot.get() != 0 || group.header.materialized_portfolio_count.get() != 0
             {
                 return Err(PercolatorError::EngineLockActive.into());
+            }
+            // P1 F4: never burn an owed fee leg. The terminal retirement below SPL-burns (or
+            // escheats) ALL unbudgeted insurance, and the four fee legs live exactly there.
+            // Refuse until each is claimed: protocol (tag 84) and creator (tag 90) are
+            // claimable while Resolved; the LP + staker legs are swept by tag 87 on this
+            // terminal-empty state (see `handle_withdraw_insurance_reserve_to_stake`).
+            if outstanding_fee_legs_view(&cfg, &group)? != 0 {
+                return Err(PercolatorError::CloseSlabFeesOutstanding.into());
             }
             let primary_mint = primary_collateral_mint(&cfg);
             let vault_balance =
@@ -24759,6 +25372,175 @@ pub mod processor {
     // existing engine state (no new field, no ABI/wire change) immediately after
     // the engine mutates it, so an over-cap post-state aborts the whole
     // instruction atomically.
+    // ═══════════════════════════════════════════════════════════════════
+    // P1 wrapper safety release (2026-09-29) -- trade-path gates. Every
+    // decision is a `risk_limits_v17` pure predicate (Kani-proved); these
+    // helpers only gather the inputs from the zero-copy views.
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn asset_risk_limits_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<state::AssetRiskLimitsV17, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])
+    }
+
+    /// Item 1. Reference = the asset's engine `effective_price` (the settlement price, and the
+    /// value TradeCpi hands the matcher as `oracle_price_e6`).
+    fn ensure_exec_price_in_band_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        exec_price: u64,
+    ) -> ProgramResult {
+        let limits = asset_risk_limits_view(group, asset_index)?;
+        let reference = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        let band = risk_limits_v17::effective_exec_band_bps(limits.exec_band_bps);
+        if !risk_limits_v17::exec_price_within_band(exec_price, reference, band) {
+            return Err(PercolatorError::ExecPriceOutsideOracleBand.into());
+        }
+        Ok(())
+    }
+
+    /// Item 2. Portfolio owners must differ.
+    fn ensure_distinct_trade_owners(
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> ProgramResult {
+        if account_a.header.owner == account_b.header.owner {
+            return Err(PercolatorError::SameOwnerTrade.into());
+        }
+        Ok(())
+    }
+
+    fn side_oi_snapshot_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<(u128, u128), ProgramError> {
+        let asset = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::EngineInvalidLeg)?
+            .engine
+            .asset;
+        Ok((asset.oi_eff_long_q.get(), asset.oi_eff_short_q.get()))
+    }
+
+    /// Item 3 (side OI). Growth-only: a side already above a newly lowered cap may still
+    /// shrink (so positions can always be closed); it may not grow.
+    fn ensure_protocol_side_oi_cap_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        before: (u128, u128),
+    ) -> ProgramResult {
+        let limits = asset_risk_limits_view(group, asset_index)?;
+        let cap = risk_limits_v17::effective_side_oi_cap_q(
+            limits.side_oi_cap_q,
+            percolator::MAX_OI_SIDE_Q,
+        );
+        let after = side_oi_snapshot_view(group, asset_index)?;
+        if !risk_limits_v17::side_oi_growth_allowed(before.0, after.0, cap)
+            || !risk_limits_v17::side_oi_growth_allowed(before.1, after.1, cap)
+        {
+            return Err(PercolatorError::ProtocolSideOiCapExceeded.into());
+        }
+        Ok(())
+    }
+
+    /// Items 3 + 5 on the matcher LP (account_b of a CPI route), post-fill.
+    fn ensure_lp_limits_after_fill_view(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        position_before: i128,
+    ) -> ProgramResult {
+        let position_after = signed_position_for_asset_view(group, lp, asset_index)?;
+        if !risk_limits_v17::lp_risk_increasing(position_before, position_after) {
+            return Ok(());
+        }
+        let (floor, cap) = lp_floor_and_cap_q_view(group, lp, asset_index)?;
+        if floor {
+            return Err(PercolatorError::LpFloorHalt.into());
+        }
+        if !risk_limits_v17::lp_exposure_allowed(position_before, position_after, cap) {
+            return Err(PercolatorError::LpExposureCapExceeded.into());
+        }
+        Ok(())
+    }
+
+    /// `(floor_breached, exposure_cap_q)` for the LP on `asset_index`, from its
+    /// initial-margin-lane equity (capital + min(pnl, 0) - fee debt: NO credit for positive,
+    /// backing-dependent PnL).
+    fn lp_floor_and_cap_q_view(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+    ) -> Result<(bool, u128), ProgramError> {
+        let limits = asset_risk_limits_view(group, asset_index)?;
+        let equity = percolator::fork_facade::account_equity_init_raw(&lp.as_view())
+            .map_err(map_v16_error)?;
+        let floor = risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true);
+        let k = risk_limits_v17::effective_lp_exposure_k_bps(
+            limits.lp_exposure_k_bps,
+            group.header.config.initial_margin_bps.get(),
+        );
+        let price = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        let cap = risk_limits_v17::lp_exposure_cap_q(
+            risk_limits_v17::nonneg_equity(equity),
+            k,
+            price,
+            percolator::POS_SCALE,
+        );
+        Ok((floor, cap))
+    }
+
+    /// Item 4 + 5, TradeCpi pre-matcher: returns the LP's fill headroom (Q) in the direction
+    /// this request moves the LP, or `LpFloorHalt` when the request would grow a floored LP.
+    /// A halted LP can still be traded in its risk-REDUCING direction (headroom = flatten +
+    /// flip-within-cap is not granted; only reduction is -- the floor wins over the cap).
+    fn lp_trade_headroom_before_matcher(
+        market_ai: &AccountInfo<'_>,
+        account_b_ai: &AccountInfo<'_>,
+        max_market_slots: usize,
+        asset_index: usize,
+        size_q: i128,
+    ) -> Result<u128, ProgramError> {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let mut lp_data = account_b_ai.try_borrow_mut_data()?;
+        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        let before = signed_position_for_asset_view(&group, &lp, asset_index)?;
+        let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
+        let (floor, cap) = lp_floor_and_cap_q_view(&group, &lp, asset_index)?;
+        if floor {
+            // Only the reducing part (down to flat) is available to a floored LP.
+            let reducing_room = risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, 0);
+            let reducing_room = reducing_room.min(before.unsigned_abs());
+            if size_q.unsigned_abs() > reducing_room {
+                return Err(PercolatorError::LpFloorHalt.into());
+            }
+            return Ok(reducing_room);
+        }
+        Ok(risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap))
+    }
+
     fn ensure_trade_side_oi_cap_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
