@@ -1440,7 +1440,10 @@ impl World {
             }
             *self.stats.err.entry(format!("winddown_closeslab:{code}")).or_default() += 1;
             let lp_outstanding = self.lp_vault.and_then(|(reg, _, _)| self.env.svm.get_account(&reg)).and_then(|a| state::read_lp_vault_registry(&a.data).ok()).map_or(0, |r| r.total_lp_shares_outstanding);
-            if lp_outstanding > 0 {
+            let bound_budget = self.stake.is_some() && self.env.market_state().1.insurance_domain_budget_remaining_total > 0;
+            if bound_budget {
+                *self.stats.soft.entry("F9_bound_market_insurance_stranded").or_default() += 1;
+            } else if lp_outstanding > 0 {
                 // By design (v16_fork_lp_vault_redeem): the LP-vault dead-share floor blocks CloseSlab.
                 *self.stats.soft.entry("closeslab_blocked_by_lp_vault_shares(by design)").or_default() += 1;
             } else if std::env::var("FUZZ_STRICT_CLOSE").map_or(false, |v| v == "1") {
