@@ -56,6 +56,9 @@ pub enum Op {
     ClaimProtocol,
     ClaimCreator,
     ClosePortfolio { u: u8 },
+    LpDeposit { u: u8, amt: u64 },
+    LpCrank { d: u8 },
+    LpRedeem { u: u8, frac_bps: u16 },
 }
 
 #[derive(Default, Debug, Clone)]
@@ -105,6 +108,9 @@ fn op_name(op: &Op) -> &'static str {
         Op::ClaimProtocol => "claim84",
         Op::ClaimCreator => "claim90",
         Op::ClosePortfolio { .. } => "close_portfolio",
+        Op::LpDeposit { .. } => "lp_deposit75",
+        Op::LpCrank { .. } => "lp_crank78",
+        Op::LpRedeem { .. } => "lp_redeem76_77",
     }
 }
 
@@ -122,6 +128,8 @@ pub struct World {
     pub closed: Vec<bool>,
     pub fee_bps: u64,
     pub shortfall: u128,
+    pub lp_vault: Option<(Pubkey, Pubkey, Pubkey)>,
+    pub lp_atas: std::collections::BTreeMap<usize, Pubkey>,
 }
 
 impl World {
@@ -192,6 +200,8 @@ impl World {
             closed: vec![false; N_USERS + 1],
             fee_bps,
             shortfall: 0,
+            lp_vault: None,
+            lp_atas: Default::default(),
         };
         // LP = last portfolio: big deposit + passive matcher (kind 0, spread 0).
         let lp_idx = N_USERS;
@@ -204,7 +214,141 @@ impl World {
         let (ctx, delegate, _) = w.env.init_matcher_context(&lp_owner, matcher_prog, lp_port);
         w.ctx = ctx;
         w.delegate = delegate;
+        if std::env::var("FUZZ_LPVAULT").map_or(true, |v| v != "0") {
+            w.create_lp_vault();
+        }
         w
+    }
+
+    fn lp_ledger(&self, d: u16) -> Pubkey {
+        state::derive_lp_backing_ledger(&self.env.program_id, &self.env.market, d).0
+    }
+
+    fn create_lp_vault(&mut self) {
+        let pid = self.env.program_id;
+        let m = self.env.market;
+        let reg = state::derive_lp_vault_registry(&pid, &m).0;
+        let mint = state::derive_lp_vault_mint(&pid, &m).0;
+        let esc = state::derive_lp_escrow(&pid, &m).0;
+        let admin = self.env.admin.insecure_clone();
+        self.env.svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+        let r = self.send(
+            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(reg, false),
+                AccountMeta::new(mint, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&admin],
+        );
+        match r {
+            Ok(_) => self.lp_vault = Some((reg, mint, esc)),
+            Err(e) => panic!("CreateLpVault failed in fuzz setup: {}", &e[..e.len().min(400)]),
+        }
+    }
+
+    fn do_lp_deposit(&mut self, u: usize, amt: u64) -> Result<u64, String> {
+        let (reg, lmint, _) = self.lp_vault.ok_or("no lp vault")?;
+        let owner = self.owners[u].insecure_clone();
+        let ata = match self.lp_atas.get(&u) {
+            Some(k) => *k,
+            None => {
+                let k = Pubkey::new_unique();
+                self.env.svm.set_account(k, Account { lamports: 1_000_000_000, data: make_token_data(lmint, owner.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+                self.lp_atas.insert(u, k);
+                k
+            }
+        };
+        let src = self.new_token(owner.pubkey(), amt);
+        let (m, v) = (self.env.market, self.env.vault);
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        self.send(
+            ProgInstruction::DepositToLpVault { amount: amt as u128, domain: 0 },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(reg, false),
+                AccountMeta::new(lmint, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(src, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new(l0, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(l1, false),
+            ],
+            &[&owner],
+        )
+    }
+
+    fn do_lp_crank(&mut self, d: u16) -> Result<u64, String> {
+        let (reg, _, _) = self.lp_vault.ok_or("no lp vault")?;
+        let payer = self.env.payer.pubkey();
+        let m = self.env.market;
+        let (own, sib) = (self.lp_ledger(d), self.lp_ledger(d ^ 1));
+        self.send(
+            ProgInstruction::LpVaultCrankFees { domain: d },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(reg, false),
+                AccountMeta::new(own, false),
+                AccountMeta::new(sib, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[],
+        )
+    }
+
+    fn do_lp_redeem(&mut self, u: usize, frac_bps: u16) -> Result<u64, String> {
+        let (reg, lmint, esc) = self.lp_vault.ok_or("no lp vault")?;
+        let ata = *self.lp_atas.get(&u).ok_or("no lp shares")?;
+        let held = self.token_amount(&ata);
+        if held == 0 {
+            return Err("no lp shares".into());
+        }
+        let shares = (held * frac_bps as u128 / 10_000).max(1);
+        let owner = self.owners[u].insecure_clone();
+        let red = state::derive_lp_redemption(&self.env.program_id, &reg, &owner.pubkey()).0;
+        self.send(
+            ProgInstruction::RequestRedeemLpShares { shares },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(reg, false),
+                AccountMeta::new(lmint, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(esc, false),
+                AccountMeta::new(red, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&owner],
+        )?;
+        let dst = self.new_token(owner.pubkey(), 0);
+        let (m, v, va, payer) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.payer.pubkey());
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        self.send(
+            ProgInstruction::ExecuteRedemption { domain: 0 },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(reg, false),
+                AccountMeta::new(red, false),
+                AccountMeta::new(lmint, false),
+                AccountMeta::new(esc, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new(l0, false),
+                AccountMeta::new(dst, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(l1, false),
+                AccountMeta::new(owner.pubkey(), false),
+            ],
+            &[],
+        )
     }
 
     fn slot(&self) -> u64 {
@@ -737,6 +881,18 @@ impl World {
                 *self.stats.soft.entry("oi_asymmetric").or_default() += 1;
             }
         }
+        // I11 LP-vault share accounting: registry outstanding == LP-mint supply + dead floor.
+        if let Some((reg, lmint, _)) = self.lp_vault {
+            if let (Some(ra), Some(ma)) = (self.env.svm.get_account(&reg), self.env.svm.get_account(&lmint)) {
+                if let (Ok(r), Ok(mi)) = (state::read_lp_vault_registry(&ra.data), Mint::unpack(&ma.data)) {
+                    let supply = mi.supply as u128;
+                    let expect = if r.total_lp_shares_outstanding == 0 { 0 } else { supply + percolator_prog::constants::LP_VAULT_MINIMUM_LIQUIDITY as u128 };
+                    if r.total_lp_shares_outstanding != expect {
+                        return Err(format!("I11 LP SHARES: registry {} != mint supply {} + dead floor", r.total_lp_shares_outstanding, supply));
+                    }
+                }
+            }
+        }
         // Soft (spec §3 says the senior stack may exceed V by design; record it).
         let senior = g
             .c_tot
@@ -805,6 +961,9 @@ impl World {
             Op::Finalize { side } => self.do_finalize(side % 2),
             Op::ClaimProtocol => self.do_claim_protocol(),
             Op::ClaimCreator => self.do_claim_creator(),
+            Op::LpDeposit { u, amt } => self.do_lp_deposit(u as usize % N_USERS, amt),
+            Op::LpCrank { d } => self.do_lp_crank((d % 2) as u16),
+            Op::LpRedeem { u, frac_bps } => self.do_lp_redeem(u as usize % N_USERS, frac_bps),
             Op::ClosePortfolio { u } => {
                 let u = u as usize % N_USERS;
                 if self.closed[u] {
@@ -881,6 +1040,15 @@ impl World {
             let s = self.slot() + 5;
             self.env.svm.warp_to_slot(s);
         }
+        // Earn LP holders redeem everything (76/77 are allowed after resolution per the
+        // LP-vault teardown tests).
+        let holders: Vec<usize> = self.lp_atas.keys().copied().collect();
+        for u in holders {
+            if self.do_lp_redeem(u, 10_000).is_ok() {
+                *self.stats.ok.entry("winddown_lp_redeem").or_default() += 1;
+            }
+            self.check()?;
+        }
         let _ = self.do_claim_protocol();
         let _ = self.do_claim_creator();
         self.check()?;
@@ -933,6 +1101,10 @@ impl World {
             if std::env::var("FUZZ_INS_BUDGET_ONLY").is_ok() { g.insurance_domain_budget_remaining_total } else { want }
         };
         if budget > 0 {
+            if std::env::var("FUZZ_DEBUG_CLOSE").is_ok() {
+                let g = self.env.market_state().1;
+                eprintln!("pre-ins41: ins {} budget_total {} per-domain {:?} spent {:?} legs {} request {budget}", g.insurance, g.insurance_domain_budget_remaining_total, g.insurance_domain_budget, g.insurance_domain_spent, self.legs_outstanding());
+            }
             match self.do_withdraw_terminal_insurance(budget) {
                 Ok(_) => *self.stats.ok.entry("winddown_withdraw_ins41").or_default() += 1,
                 Err(e) => {
@@ -943,8 +1115,15 @@ impl World {
             self.check()?;
             // A residual budget atom (rounding) also blocks retirement; take it too.
             let rest = self.env.market_state().1.insurance_domain_budget_remaining_total;
-            if rest > 0 && self.do_withdraw_terminal_insurance(rest).is_ok() {
-                *self.stats.ok.entry("winddown_withdraw_ins41_residual").or_default() += 1;
+            if rest > 0 {
+                let rr = self.do_withdraw_terminal_insurance(rest);
+                if std::env::var("FUZZ_DEBUG_CLOSE").is_ok() {
+                    let g = self.env.market_state().1;
+                    eprintln!("residual ins41({rest}) -> {:?}; after: ins {} budget {} per-domain {:?}", rr.as_ref().map_err(|e| custom_code(e)), g.insurance, g.insurance_domain_budget_remaining_total, g.insurance_domain_budget);
+                }
+                if rr.is_ok() {
+                    *self.stats.ok.entry("winddown_withdraw_ins41_residual").or_default() += 1;
+                }
             }
             self.check()?;
         }
@@ -967,6 +1146,12 @@ impl World {
             calls += 1;
             let _ = self.do_claim_protocol();
             let _ = self.do_claim_creator();
+            // A CloseSlab scan step can re-credit spent insurance into a domain budget;
+            // the insurance authority takes it (tag 41) before the next call.
+            let rb = self.env.market_state().1.insurance_domain_budget_remaining_total;
+            if rb > 0 && self.do_withdraw_terminal_insurance(rb).is_ok() {
+                *self.stats.ok.entry("winddown_withdraw_ins41_after_scan_recredit").or_default() += 1;
+            }
             if std::env::var("FUZZ_DEBUG").is_ok() {
                 let a = self.env.svm.get_account(&self.env.market).unwrap();
                 eprintln!("closeslab attempt {calls}: prev={:?} len={} kind={} vault_tok={}", r.as_ref().map_err(|e| e.chars().take(300).collect::<String>()), a.data.len(), a.data.get(10).copied().unwrap_or(255), self.token_amount(&self.env.vault));
@@ -1018,7 +1203,11 @@ impl World {
                 eprintln!("   logs: {:?}", logs);
             }
             *self.stats.err.entry(format!("winddown_closeslab:{code}")).or_default() += 1;
-            if std::env::var("FUZZ_STRICT_CLOSE").map_or(false, |v| v == "1") {
+            let lp_outstanding = self.lp_vault.and_then(|(reg, _, _)| self.env.svm.get_account(&reg)).and_then(|a| state::read_lp_vault_registry(&a.data).ok()).map_or(0, |r| r.total_lp_shares_outstanding);
+            if lp_outstanding > 0 {
+                // By design (v16_fork_lp_vault_redeem): the LP-vault dead-share floor blocks CloseSlab.
+                *self.stats.soft.entry("closeslab_blocked_by_lp_vault_shares(by design)").or_default() += 1;
+            } else if std::env::var("FUZZ_STRICT_CLOSE").map_or(false, |v| v == "1") {
                 let (_, g) = self.env.market_state();
                 return Err(format!(
                     "L1 CLOSESLAB WEDGED after full wind-down: code {code}, vault {} ins {} budget {} fresh_backing {} provider_recv {:?} bucket_status {:?} engine_slot {} clock {}",
@@ -1035,7 +1224,7 @@ impl World {
 
 pub fn gen_op(rng: &mut XorShiftRng) -> Op {
     let u = rng.gen::<u8>();
-    match rng.gen_range(0..100) {
+    match rng.gen_range(0..112) {
         0..=9 => Op::Deposit { u, amt: rng.gen_range(1_000..30_000_000) },
         10..=17 => Op::Withdraw { u, frac_bps: rng.gen_range(1..=10_000) },
         18..=33 => Op::TradeNoCpi {
@@ -1054,7 +1243,12 @@ pub fn gen_op(rng: &mut XorShiftRng) -> Op {
         91..=92 => Op::Finalize { side: rng.gen() },
         93..=95 => Op::ClaimProtocol,
         96..=97 => Op::ClaimCreator,
-        _ => Op::ClosePortfolio { u },
+        98 => Op::ClosePortfolio { u },
+        _ => match rng.gen_range(0..3) {
+            0 => Op::LpDeposit { u, amt: rng.gen_range(1_000..10_000_000) },
+            1 => Op::LpCrank { d: rng.gen() },
+            _ => Op::LpRedeem { u, frac_bps: rng.gen_range(1..=10_000) },
+        },
     }
 }
 
@@ -1280,6 +1474,12 @@ fn try_retire(w: &mut World) -> bool {
             // return Ok without closing; claim 84/90 and call again.
             let _ = w.do_claim_protocol();
             let _ = w.do_claim_creator();
+            if let Ok((_, g)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.env.market_state())) {
+                let rb = g.insurance_domain_budget_remaining_total;
+                if rb > 0 {
+                    let _ = w.do_withdraw_terminal_insurance(rb);
+                }
+            }
         }
     }
     false
@@ -1675,4 +1875,36 @@ fn indep_liveness_closeslab_retires_after_bankruptcy_and_insurance_topup() {
         );
     }
     w.check_tokens().unwrap();
+}
+
+/// F5 (fee-flow audit; P1 "optional"): LP fees accrued before the first Earn depositor
+/// must not be captured by that depositor (spec intent: route to insurance). Measures the
+/// capture; fails while the first depositor can walk away with the pre-existing backlog.
+#[test]
+fn indep_f5_first_earn_depositor_does_not_capture_prevault_fee_backlog() {
+    let mut w = World::new(30);
+    for _ in 0..5 {
+        w.do_trade_nocpi(0, 1, 50 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+        w.do_trade_nocpi(0, 1, -50 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("close");
+    }
+    let (cfg, _) = w.env.market_state();
+    let backlog = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+    assert!(backlog > 0, "vacuity: LP fee backlog must exist");
+    let dep: u64 = 1_000_000;
+    w.do_lp_deposit(2, dep).expect("genesis LP deposit");
+    let cr = w.do_lp_crank(0);
+    eprintln!("F5: backlog {backlog}, crank78 -> {:?}", cr.as_ref().map_err(|e| custom_code(e)));
+    w.check().unwrap();
+    let before: u128 = w.tokens.iter().map(|k| w.token_amount(k)).sum::<u128>() - w.token_amount(&w.env.vault);
+    let r = w.do_lp_redeem(2, 10_000);
+    eprintln!("F5: redeem -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    w.check().unwrap();
+    let after: u128 = w.tokens.iter().map(|k| w.token_amount(k)).sum::<u128>() - w.token_amount(&w.env.vault);
+    let payout = after - before;
+    eprintln!("F5: deposited {dep}, redeemed {payout}, captured {}", payout as i128 - dep as i128);
+    assert!(
+        payout <= dep as u128,
+        "F5: first Earn depositor captured {} atoms of pre-deposit LP fees (backlog {backlog})",
+        payout - dep as u128
+    );
 }
