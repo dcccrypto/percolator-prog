@@ -1682,3 +1682,85 @@ fn p3_h2_trader_win_is_paid_by_the_junior_not_the_seniors() {
     assert_eq!(nav1, nav0, "senior backing must not pay the winner while the junior is solvent");
     assert_eq!(lp_loss, trader_gain, "the winner is paid exactly by the vault LP (junior)");
 }
+
+impl Env {
+    fn release_surplus(&mut self, signer: &Keypair, lp: Pubkey, amount: u128, domain: u16) -> Result<(), String> {
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::VaultLpReleaseSurplus {
+                amount,
+                source_domain: domain,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new_readonly(self.registry, false),
+                AccountMeta::new(self.vault_lp, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new(self.ledger, false),
+                AccountMeta::new(self.sibling, false),
+            ],
+            &[&signer.insecure_clone()],
+        )
+    }
+}
+
+/// P3-M1 PoC. Junior value sitting in backing (here: backing above a lowered senior claim) was
+/// unreachable before tag 102. Now the junior pulls exactly the surplus `nav - C` back into the
+/// vault LP, not one atom more, and nobody else can.
+#[test]
+fn p3_m1_junior_backing_surplus_is_releasable_exactly() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    // STATE POKE (see poke_senior_claim): C = 6M against 10M backing => 4M of the backing is
+    // junior value (e.g. after a recall that over-covered and a later loss reversal).
+    poke_senior_claim(&mut env, 6_000_000);
+    let stranger = Keypair::new();
+    env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    err_has(&env.release_surplus(&stranger, lp.portfolio, 1, DOMAIN), PercolatorError::Unauthorized);
+    err_has(&env.release_surplus(&admin, lp.portfolio, 4_000_001, DOMAIN), PercolatorError::VaultLpReleaseRefused);
+    let cap0 = env.portfolio(lp.portfolio).capital;
+    env.release_surplus(&admin, lp.portfolio, 4_000_000, DOMAIN).expect("release the surplus");
+    println!("P3-M1 release: LP capital {} -> {}, backing nav {}", cap0, env.portfolio(lp.portfolio).capital, env.backing_nav());
+    assert_eq!(env.portfolio(lp.portfolio).capital, cap0 + 4_000_000);
+    assert_eq!(env.backing_nav(), 6_000_000, "backing left == C exactly");
+    env.assert_conserved("release surplus");
+    // The junior can now take it out (LP flat, backing still covers C).
+    env.junior_withdraw_as(&admin, lp.portfolio, 4_000_000).expect("junior exits the released value");
+    env.assert_conserved("junior exit after release");
+}
+
+/// P3-L1 PoC. On a bound vault with NO senior shares a harvestable fee backlog must not be
+/// bought 1:1 by the first depositor: genesis is refused while fees are harvestable, the crank
+/// credits the backlog to the junior (not C), and genesis then prices exactly 1:1 with C = amount.
+#[test]
+fn p3_l1_genesis_depositor_cannot_buy_the_fee_backlog() {
+    let mut env = Env::new(Params {
+        fee_bps: 30,
+        ..Params::default()
+    });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.svm.expire_blockhash();
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    let d = env.new_depositor();
+    err_has(&env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)), PercolatorError::VaultLpHarvestPending);
+    env.crank_fees(true).expect("crank with no senior shares credits the junior");
+    let c = env.vlp().senior_claim_atoms;
+    let backlog = env.backing_nav();
+    println!("P3-L1: backlog {backlog} credited to backing, C = {c}");
+    assert!(backlog > 0, "fees were harvested");
+    assert_eq!(c, 0, "no senior claim was created for a backlog no senior paid for");
+    env.release_surplus(&admin, lp.portfolio, backlog, DOMAIN).expect("junior reclaims its backlog");
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("genesis after crank");
+    assert_eq!(env.vlp().senior_claim_atoms, 10_000_000, "genesis C == amount");
+    assert_eq!(env.registry_state().total_lp_shares_outstanding, 10_000_000, "1:1 genesis");
+    env.assert_conserved("L1 genesis");
+}

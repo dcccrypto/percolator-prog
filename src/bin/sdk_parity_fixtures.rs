@@ -141,7 +141,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::ExpireBackingBucket { .. } => "ExpireBackingBucket",
         Instruction::WithdrawCreatorFee { .. } => "WithdrawCreatorFee",
         Instruction::SetAssetRiskLimits { .. } => "SetAssetRiskLimits",
-        // P3 vault-owned LP (2026-09-29), tags 94..=101.
+        // P3 vault-owned LP (2026-09-29), tags 94..=102.
         Instruction::InitVaultLp { .. } => "InitVaultLp",
         Instruction::VaultLpSetMatcher { .. } => "VaultLpSetMatcher",
         Instruction::DepositJuniorTranche { .. } => "DepositJuniorTranche",
@@ -150,6 +150,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::SetVaultLpRisk { .. } => "SetVaultLpRisk",
         Instruction::VaultLpConvertPnl { .. } => "VaultLpConvertPnl",
         Instruction::VaultLpSettleResolved { .. } => "VaultLpSettleResolved",
+        Instruction::VaultLpReleaseSurplus { .. } => "VaultLpReleaseSurplus",
     }
 }
 

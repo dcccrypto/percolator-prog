@@ -1,0 +1,21 @@
+[package]
+name = "p3-vault-lp-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: proves the EXACT production file ../../src/vault_lp_v18.rs (pure, no deps).
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Negative controls: swap in mutants/vault_lp_v18_mutant.rs (same as --cfg p3_mutant).
+p3_mutant = []
+
+[dev-dependencies]
+proptest = "1.4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(p3_mutant)'] }
