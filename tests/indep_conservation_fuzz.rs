@@ -60,6 +60,9 @@ pub enum Op {
     LpCrank { d: u8 },
     LpRedeem { u: u8, frac_bps: u16 },
     Stake87Accrue,
+    TradeNoCpiA1 { a: u8, b: u8, size_tenths: i32 },
+    PushA1 { delta_bps: i32 },
+    BatchNoCpi { a: u8, b: u8, s0: i32, s1: i32 },
 }
 
 #[derive(Default, Debug, Clone)]
@@ -113,6 +116,9 @@ fn op_name(op: &Op) -> &'static str {
         Op::LpCrank { .. } => "lp_crank78",
         Op::LpRedeem { .. } => "lp_redeem76_77",
         Op::Stake87Accrue => "stake87_accrue12",
+        Op::TradeNoCpiA1 { .. } => "trade_nocpi_asset1",
+        Op::PushA1 { .. } => "push_mark_asset1",
+        Op::BatchNoCpi { .. } => "batch_nocpi",
     }
 }
 
@@ -133,11 +139,16 @@ pub struct World {
     pub lp_vault: Option<(Pubkey, Pubkey, Pubkey)>,
     pub lp_atas: std::collections::BTreeMap<usize, Pubkey>,
     pub stake: Option<(Pubkey, Pubkey, Pubkey)>,
+    pub nassets: usize,
+    pub mark1: u64,
+    pub pending_violation: Option<String>,
 }
 
 impl World {
     pub fn new(fee_bps: u64) -> Self {
+        let nassets: usize = std::env::var("FUZZ_ASSETS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 2);
         let params = V16CuMarketParams {
+            max_portfolio_assets: nassets as u16,
             h_max: 50,
             initial_price: INITIAL_MARK,
             min_nonzero_mm_req: 599,
@@ -179,6 +190,10 @@ impl World {
 
         env.svm.warp_to_slot(1);
         env.configure_auth_mark_for_asset_as_admin(0, 1, INITIAL_MARK);
+        if nassets == 2 {
+            env.activate_asset(1, 1, INITIAL_MARK);
+            env.configure_auth_mark_for_asset_as_admin(1, 1, INITIAL_MARK);
+        }
 
         let mut owners = Vec::new();
         let mut ports = Vec::new();
@@ -206,6 +221,9 @@ impl World {
             lp_vault: None,
             lp_atas: Default::default(),
             stake: None,
+            nassets,
+            mark1: INITIAL_MARK,
+            pending_violation: None,
         };
         // LP = last portfolio: big deposit + passive matcher (kind 0, spread 0).
         let lp_idx = N_USERS;
@@ -223,7 +241,7 @@ impl World {
         }
         if std::env::var("FUZZ_STAKE").map_or(false, |v| v == "1") {
             // Real-staker vs dead-shares-only pools, 50/50 by market key parity.
-            let dead_only = match std::env::var("FUZZ_STAKE_DEAD").ok().as_deref() { Some("1") => true, Some("0") => false, _ => w.env.market.to_bytes()[0] & 1 == 0 };
+            let dead_only = match std::env::var("FUZZ_STAKE_DEAD").ok().as_deref() { Some("1") => true, Some("0") => false, _ => w.env.market.to_bytes().iter().fold(0u8, |a, b| a ^ b) & 1 == 0 };
             w.setup_stake(if dead_only { 1_000 } else { 1_000 + 5_000_000 });
         }
         w
@@ -565,6 +583,66 @@ impl World {
         )
     }
 
+    fn market_id_of(&self, asset: usize) -> u64 {
+        state::read_market_trade_preflight(&self.env.svm.get_account(&self.env.market).unwrap().data, asset)
+            .map(|t| t.3)
+            .unwrap_or(0)
+    }
+
+    fn do_trade_nocpi_asset(&mut self, asset: u16, a: usize, b: usize, size_q: i128, exec: u64) -> Result<u64, String> {
+        let oa = self.owners[a].insecure_clone();
+        let ob = self.owners[b].insecure_clone();
+        let (pa, pb) = (self.ports[a], self.ports[b]);
+        let (aid, _, aep) = self.env.portfolio_identity(pa);
+        let (bid, _, bep) = self.env.portfolio_identity(pb);
+        let m = self.env.market;
+        let market_id = self.market_id_of(asset as usize);
+        self.send(
+            ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id: aid, account_a_position_epoch: aep,
+                account_b_portfolio_id: bid, account_b_position_epoch: bep,
+                market_id, asset_index: asset, size_q, exec_price: exec, fee_bps: self.fee_bps, backing_fee_cap_bps: 10_000,
+            },
+            vec![AccountMeta::new(oa.pubkey(), true), AccountMeta::new(ob.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(pa, false), AccountMeta::new(pb, false)],
+            &[&oa, &ob],
+        )
+    }
+
+    fn do_batch_nocpi(&mut self, a: usize, b: usize, s0: i128, s1: i128) -> Result<u64, String> {
+        let oa = self.owners[a].insecure_clone();
+        let ob = self.owners[b].insecure_clone();
+        let (pa, pb) = (self.ports[a], self.ports[b]);
+        let (aid, _, aep) = self.env.portfolio_identity(pa);
+        let (bid, _, bep) = self.env.portfolio_identity(pb);
+        let m = self.env.market;
+        let mut legs = vec![percolator_prog::ix::BatchTradeLeg { market_id: self.market_id_of(0), asset_index: 0, size_q: s0, exec_price: self.mark, fee_bps: self.fee_bps }];
+        if self.nassets == 2 && s1 != 0 {
+            legs.push(percolator_prog::ix::BatchTradeLeg { market_id: self.market_id_of(1), asset_index: 1, size_q: s1, exec_price: self.mark1, fee_bps: self.fee_bps });
+        }
+        self.send(
+            ProgInstruction::BatchTradeNoCpi { account_a_portfolio_id: aid, account_a_position_epoch: aep, account_b_portfolio_id: bid, account_b_position_epoch: bep, legs },
+            vec![AccountMeta::new(oa.pubkey(), true), AccountMeta::new(ob.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(pa, false), AccountMeta::new(pb, false)],
+            &[&oa, &ob],
+        )
+    }
+
+    fn do_push_asset1(&mut self, mark: u64) -> Result<u64, String> {
+        let slot = self.slot();
+        let obs = self.env.control_sequences(1).oracle_observation + 1;
+        let admin = self.env.admin.insecure_clone();
+        let m = self.env.market;
+        let market_id = self.market_id_of(1);
+        let r = self.send(
+            ProgInstruction::PushAuthMark { market_id, asset_index: 1, now_slot: slot, mark_e6: mark, observation_sequence: obs },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        );
+        if r.is_ok() {
+            self.mark1 = mark;
+        }
+        r
+    }
+
     fn do_trade_cpi(&mut self, u: usize, size_q: i128) -> Result<u64, String> {
         let taker = self.owners[u].insecure_clone();
         let pa = self.ports[u];
@@ -632,7 +710,7 @@ impl World {
             last = self.send(
                 ProgInstruction::PermissionlessCrank {
                     now_slot: slot,
-                    observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+                    observations: (0..self.nassets as u16).map(|a| CrankObservationHint { asset_index: a, oracle_accounts: 0 }).collect(),
                 },
                 vec![
                     AccountMeta::new(payer, true),
@@ -729,18 +807,30 @@ impl World {
         let (cfg, _, _, _) = state::read_market_config_mode_and_capacity(&data).unwrap();
         let (_, group) = state::market_view_mut(&mut data).unwrap();
         let n = core::mem::size_of::<state::AssetOracleProfileV16>();
-        let prof: state::AssetOracleProfileV16 =
-            bytemuck::pod_read_unaligned(&group.markets[0].wrapper[..n]);
-        prof.creator_fee_claimable_atoms as u128 + cfg.creator_fee_claimable_atoms as u128
+        let mut t = cfg.creator_fee_claimable_atoms as u128;
+        for a in 0..self.nassets {
+            let prof: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(&group.markets[a].wrapper[..n]);
+            t += prof.creator_fee_claimable_atoms as u128;
+        }
+        t
     }
 
     pub fn do_claim_creator(&mut self) -> Result<u64, String> {
+        let mut last = Err("nothing claimable".to_string());
+        for a in 0..self.nassets {
+            let r = self.do_claim_creator_asset(a);
+            if r.is_ok() || last.is_err() { last = r; }
+        }
+        last
+    }
+
+    pub fn do_claim_creator_asset(&mut self, asset: usize) -> Result<u64, String> {
         let amt = {
             let mut data = self.env.svm.get_account(&self.env.market).unwrap().data;
             let (_, group) = state::market_view_mut(&mut data).unwrap();
             let n = core::mem::size_of::<state::AssetOracleProfileV16>();
             let prof: state::AssetOracleProfileV16 =
-                bytemuck::pod_read_unaligned(&group.markets[0].wrapper[..n]);
+                bytemuck::pod_read_unaligned(&group.markets[asset].wrapper[..n]);
             prof.creator_fee_claimable_atoms as u128
         };
         if amt == 0 {
@@ -748,10 +838,10 @@ impl World {
         }
         let admin = self.env.admin.insecure_clone();
         let dst = self.new_token(admin.pubkey(), 0);
-        let epoch = self.env.control_sequences(0).authority_epoch;
+        let epoch = self.env.control_sequences(asset as u16).authority_epoch;
         let (m, v, va) = (self.env.market, self.env.vault, self.env.vault_authority);
         self.send(
-            ProgInstruction::WithdrawCreatorFee { amount: amt, asset_index: 0, authority_epoch: epoch },
+            ProgInstruction::WithdrawCreatorFee { amount: amt, asset_index: asset as u16, authority_epoch: epoch },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -925,6 +1015,9 @@ impl World {
 
     /// Engine/spec invariants on a live-or-resolved (not closed) market.
     pub fn check(&mut self) -> Result<(), String> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v);
+        }
         self.check_tokens()?;
         if self.is_tombstone() {
             return Ok(());
@@ -984,7 +1077,7 @@ impl World {
                 ));
             }
             let a0 = &g.assets[0];
-            if a0.oi_eff_long_q != a0.oi_eff_short_q {
+            if g.assets.iter().take(self.nassets).any(|a| a.oi_eff_long_q != a.oi_eff_short_q) || a0.oi_eff_long_q != a0.oi_eff_short_q {
                 // Spec §2.4: OI symmetry is required for clears; a matched book is symmetric.
                 *self.stats.soft.entry("oi_asymmetric").or_default() += 1;
             }
@@ -1076,11 +1169,30 @@ impl World {
             Op::Finalize { side } => self.do_finalize(side % 2),
             Op::ClaimProtocol => self.do_claim_protocol(),
             Op::ClaimCreator => self.do_claim_creator(),
+            Op::TradeNoCpiA1 { a, b, size_tenths } => {
+                if self.nassets < 2 { return Err("single asset".into()); }
+                let a = a as usize % (N_USERS + 1);
+                let mut b = b as usize % (N_USERS + 1);
+                if a == b { b = (b + 1) % (N_USERS + 1); }
+                self.do_trade_nocpi_asset(1, a, b, size_tenths as i128 * (POS_SCALE as i128 / 10), self.mark1)
+            }
+            Op::PushA1 { delta_bps } => {
+                if self.nassets < 2 { return Err("single asset".into()); }
+                let m = ((self.mark1 as i128) * (10_000 + delta_bps as i128) / 10_000).max(1_000) as u64;
+                self.do_push_asset1(m)
+            }
+            Op::BatchNoCpi { a, b, s0, s1 } => {
+                let a = a as usize % (N_USERS + 1);
+                let mut b = b as usize % (N_USERS + 1);
+                if a == b { b = (b + 1) % (N_USERS + 1); }
+                let q = POS_SCALE as i128 / 10;
+                self.do_batch_nocpi(a, b, s0 as i128 * q, s1 as i128 * q)
+            }
             Op::Stake87Accrue => {
                 let r = self.do_stake87_accrue();
                 if let Err(e) = &r {
                     if e.starts_with("I12") {
-                        return Err(e.clone());
+                        self.pending_violation = Some(e.clone());
                     }
                 }
                 r
@@ -1348,7 +1460,7 @@ impl World {
 
 pub fn gen_op(rng: &mut XorShiftRng) -> Op {
     let u = rng.gen::<u8>();
-    match rng.gen_range(0..112) {
+    match rng.gen_range(0..124) {
         0..=9 => Op::Deposit { u, amt: rng.gen_range(1_000..30_000_000) },
         10..=17 => Op::Withdraw { u, frac_bps: rng.gen_range(1..=10_000) },
         18..=33 => Op::TradeNoCpi {
@@ -1368,6 +1480,9 @@ pub fn gen_op(rng: &mut XorShiftRng) -> Op {
         93..=95 => Op::ClaimProtocol,
         96..=97 => Op::ClaimCreator,
         98 => Op::ClosePortfolio { u },
+        112..=116 => Op::TradeNoCpiA1 { a: u, b: rng.gen(), size_tenths: rng.gen_range(-400..=400) },
+        117..=119 => Op::PushA1 { delta_bps: rng.gen_range(-2500..=2500) },
+        120..=123 => Op::BatchNoCpi { a: u, b: rng.gen(), s0: rng.gen_range(-300..=300), s1: rng.gen_range(-300..=300) },
         _ => match rng.gen_range(0..4) {
             3 => Op::Stake87Accrue,
             0 => Op::LpDeposit { u, amt: rng.gen_range(1_000..10_000_000) },
@@ -2176,4 +2291,69 @@ fn indep_f3_wrapper_flow_accrue_to_dead_shares_books_nothing() {
     w.check().unwrap();
     assert!(w.token_amount(&sv) > 0, "vacuity: tag 87 must move the staker leg into the stake vault");
     assert_eq!(after.2, before.2, "F3: AccrueFees booked {} fee atoms to a dead-shares-only pool", after.2 - before.2);
+}
+
+/// F-9 candidate: on a stake-BOUND market the asset-0 insurance authority is the stake
+/// pool's vault_auth PDA. The stake program has no CPI for the wrapper's terminal
+/// WithdrawInsurance (tag 41) and its RecoverFlushedInsurance (tag 23 -> wrapper 57) is
+/// Live-only (percolator-stake src/instruction.rs:440-453, src/cpi.rs:915-918). If the market
+/// is resolved by a path that bypasses the stake H-1 gate — ResolveStalePermissionless, the
+/// relaunch's F-3 escape — any insurance domain budget is stranded and CloseSlab is blocked.
+/// Run alone: INDEP_MAINNET_ID=1 ... --ignored indep_f9
+#[test]
+#[ignore]
+fn indep_f9_bound_market_insurance_budget_recoverable_after_stale_resolve() {
+    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    let mut w = World::new(0);
+    w.do_configure_stale_resolve(9_000, 100).expect("stale policy");
+    w.do_topup_insurance(5_000_000).expect("insurance top-up (e.g. staker flush / seed)");
+    w.setup_stake(1_000 + 5_000_000);
+    w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    w.check().unwrap();
+    // Keeper stops; anyone resolves.
+    let s = w.slot() + 9_005;
+    w.env.svm.warp_to_slot(s);
+    let _ = w.do_crank(N_USERS);
+    w.do_resolve_stale().expect("stale resolve");
+    let (_paid, stuck) = w.permissionless_close_out().unwrap();
+    assert!(stuck.is_empty(), "users closed out");
+    for u in 0..w.ports.len() {
+        let _ = w.do_close_portfolio(u);
+    }
+    let (_, g) = w.env.market_state();
+    let budget = g.insurance_domain_budget_remaining_total;
+    let r41 = w.do_withdraw_terminal_insurance(budget);
+    eprintln!("F-9: mat {} budget {budget}; tag 41 by former admin -> {:?}", g.materialized_portfolio_count, r41.as_ref().map_err(|e| custom_code(e)));
+    let ins_auth = state::read_asset_oracle_profile(&w.env.svm.get_account(&w.env.market).unwrap().data, 0).map(|p| Pubkey::new_from_array(p.insurance_authority));
+    eprintln!("F-9: asset0 insurance_authority {:?} (stake vault_auth {:?})", ins_auth, w.stake.map(|s| s.1));
+    let retired = try_retire(&mut w);
+    let vault = if retired { 0 } else { w.token_amount(&w.env.vault) };
+    eprintln!("F-9: retired {retired}; vault left {vault}");
+    w.check_tokens().unwrap();
+    assert!(retired && vault == 0, "F-9: {budget} atoms of insurance budget stranded on a stake-bound market after permissionless resolve; CloseSlab blocked");
+}
+
+/// Control for F-9: identical flow on an UNBOUND market (admin is the insurance authority).
+#[test]
+fn indep_f9_control_unbound_market_insurance_recoverable_after_stale_resolve() {
+    let mut w = World::new(0);
+    w.do_configure_stale_resolve(9_000, 100).expect("stale policy");
+    w.do_topup_insurance(5_000_000).expect("insurance top-up");
+    w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    let s = w.slot() + 9_005;
+    w.env.svm.warp_to_slot(s);
+    let _ = w.do_crank(N_USERS);
+    w.do_resolve_stale().expect("stale resolve");
+    let (_paid, stuck) = w.permissionless_close_out().unwrap();
+    assert!(stuck.is_empty());
+    for u in 0..w.ports.len() {
+        let _ = w.do_close_portfolio(u);
+    }
+    let (_, g) = w.env.market_state();
+    let budget = g.insurance_domain_budget_remaining_total;
+    let r41 = w.do_withdraw_terminal_insurance(budget);
+    eprintln!("F-9 control: mat {} budget {budget}; tag 41 -> {:?}", g.materialized_portfolio_count, r41.as_ref().map_err(|e| custom_code(e)));
+    let retired = try_retire(&mut w);
+    eprintln!("F-9 control: retired {retired}");
+    assert!(retired, "control: unbound market must retire after stale resolve");
 }
