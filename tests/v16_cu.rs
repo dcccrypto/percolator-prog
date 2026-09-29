@@ -9611,6 +9611,23 @@ fn v16_attack_trade_cpi_requires_signed_base_fee_consent() {
 // case: every CPI trade that would actually charge a nonzero backing-domain fee against the
 // LP is rejected until percolator-match is updated to emit a real cap (coordination note for
 // the migration, not implemented here -- percolator-match is out of scope for this unit).
+
+/// P1 (2026-09-29): write `AssetRiskLimitsV17` for `asset_index` directly into the LiteSVM
+/// market account -- the same bytes tag 93 `SetAssetRiskLimits` (upgrade-authority-gated,
+/// tested in `tests/p1_*.rs`) writes. Used ONLY to keep legacy tests exercising their original
+/// subject under an explicitly protocol-configured P1 limit; no legacy assertion is changed.
+fn p1_set_asset_risk_limits(
+    env: &mut V16CuEnv,
+    asset_index: usize,
+    edit: impl FnOnce(&mut percolator_prog::state::AssetRiskLimitsV17),
+) {
+    let mut market = env.svm.get_account(&env.market).unwrap();
+    let mut limits = state::read_asset_risk_limits(&market.data, asset_index).unwrap();
+    edit(&mut limits);
+    state::write_asset_risk_limits(&mut market.data, asset_index, &limits).unwrap();
+    env.svm.set_account(env.market, market).unwrap();
+}
+
 #[test]
 fn v16_attack_trade_cpi_rejects_backing_domain_fee_without_matcher_cap_consent() {
     let mut env = V16CuEnv::new();
@@ -9642,6 +9659,12 @@ fn v16_attack_trade_cpi_rejects_backing_domain_fee_without_matcher_cap_consent()
     let (matcher_ctx, matcher_delegate, _) =
         env.init_matcher_context(&maker_owner, matcher_program, maker_account);
 
+    // P1: the default LP exposure cap (k = 1e8 / IMR = 1x here, on IM-lane equity = the
+    // maker's 100 atoms of capital) would clip this 3-unit request to 1 unit, which needs no
+    // lien -- so the backing-fee path under test would never be reached. Let the protocol allow
+    // 3x exposure (tag 93) so the maker must draw the counterparty-backed lien exactly as before;
+    // the consent guard must still reject the fee.
+    p1_set_asset_risk_limits(&mut env, 0, |l| l.lp_exposure_k_bps = 30_000);
     let market_before = env.svm.get_account(&env.market).unwrap();
     let taker_before = env.svm.get_account(&taker_account).unwrap();
     let maker_before = env.svm.get_account(&maker_account).unwrap();
@@ -9712,6 +9735,8 @@ fn v16_attack_trade_cpi_rejects_backing_domain_fee_without_matcher_cap_consent()
 
     let (matcher_ctx2, matcher_delegate2, _) =
         env2.init_matcher_context(&maker_owner2, matcher_program, maker_account2);
+    // P1: same 3x protocol exposure allowance as the attack leg above (identical setup).
+    p1_set_asset_risk_limits(&mut env2, 0, |l| l.lp_exposure_k_bps = 30_000);
 
     env2.svm.expire_blockhash();
     env2.trade_cpi_with_cu_on_asset(
@@ -11603,6 +11628,12 @@ ProgInstruction::PermissionlessCrank {
         9_000,
         9_000,
     );
+    // P1: the matcher here quotes a 90% passive spread; the default 500-bps exec band would
+    // refuse it (Custom 66). Widen the band to 100% (tag 93 equivalent) so the test keeps
+    // exercising the strict-reduction close it was written for.
+    p1_set_asset_risk_limits(&mut env, 0, |l| {
+        l.exec_band_bps = percolator_prog::risk_limits_v17::MAX_EXEC_BAND_BPS
+    });
     let before_market = env.svm.get_account(&env.market).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
@@ -11746,6 +11777,12 @@ ProgInstruction::PermissionlessCrank {
         9_000,
     );
 
+    // P1: the matcher here quotes a 90% passive spread; the default 500-bps exec band would
+    // refuse it (Custom 66). Widen the band to 100% (tag 93 equivalent) so the test keeps
+    // exercising the strict-reduction close it was written for.
+    p1_set_asset_risk_limits(&mut env, 0, |l| {
+        l.exec_band_bps = percolator_prog::risk_limits_v17::MAX_EXEC_BAND_BPS
+    });
     let before_market = env.svm.get_account(&env.market).unwrap();
     let (_, before_group) = state::read_market(&before_market.data).unwrap();
     let before_probe = env.svm.get_account(&probe).unwrap();
