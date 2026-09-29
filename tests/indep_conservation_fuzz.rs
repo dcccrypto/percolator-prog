@@ -1231,7 +1231,7 @@ impl World {
             return self.check();
         }
         self.check()?;
-        for round in 0..6 {
+        for round in 0..20 {
             for u in 0..=N_USERS {
                 if self.closed[u] {
                     continue;
@@ -1313,7 +1313,17 @@ impl World {
             if cp.is_ok() {
                 *self.stats.ok.entry("winddown_close_portfolio").or_default() += 1;
             } else {
-                self.closed[u] = true; // still skip in aggregates; CloseResolved emptied it
+                // Skip in aggregates only if CloseResolved really emptied it.
+                let empty = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()).map_or(true, |p| p.capital == 0 && p.pnl == 0 && p.active_bitmap == percolator::active_bitmap_empty());
+                self.closed[u] = empty;
+                if !empty && std::env::var("FUZZ_DEBUG_CLOSE").is_ok() {
+                    let pf = self.env.portfolio_state(self.ports[u]);
+                    let (_, g) = self.env.market_state();
+                    let cr = self.do_close_resolved(u);
+                    let crs = cr.as_ref().map_err(|e| e.split("Program log").skip(1).map(|l| l.chars().take(120).collect::<String>()).collect::<Vec<_>>().join(" | ") + &format!(" code {:?}", custom_code(e))).map(|_| ());
+                    eprintln!("  retry close_resolved u{u}: {:?}", crs);
+                    eprintln!("NOT EMPTY after close-out: u{u} cap {} pnl {} legs {:?} receipt {:?}; assets eff/tgt {:?}", pf.capital, pf.pnl, pf.legs.iter().filter(|l| l.active).map(|l| (l.asset_index, l.basis_pos_q)).collect::<Vec<_>>(), (pf.resolved_payout_receipt.present, pf.resolved_payout_receipt.finalized), g.assets.iter().map(|a| (a.effective_price, a.raw_oracle_target_price)).collect::<Vec<_>>());
+                }
             }
         }
         self.check()?;
@@ -2505,4 +2515,56 @@ fn indep_liveness_fuzz_owner_exits_then_reopen() {
     eprintln!("== exit-aware liveness fuzz: {seqs} seqs; {} reached the ADL reduce-only state", adl.load(std::sync::atomic::Ordering::Relaxed));
     let f = fails.lock().unwrap();
     assert!(f.is_empty(), "{} unrecoverable sequence(s):\n{}", f.len(), f.join("\n"));
+}
+
+/// Multi-asset resolved close-out (shrunk from FUZZ_ASSETS=2 seed 0x38454127b0966d17 on
+/// v18.2 and P1 3d337101): after Resolve + every permissionless close path, a user with
+/// capital ~19.9M and positive PnL ~10.3M, no legs and no receipt, is never paid.
+/// Run: FUZZ_ASSETS=2 ... --ignored indep_multi_asset_resolved
+#[test]
+#[ignore]
+fn indep_multi_asset_resolved_closeout_pays_every_user() {
+    assert_eq!(std::env::var("FUZZ_ASSETS").as_deref(), Ok("2"));
+    let ops = [
+        Op::PushA1 { delta_bps: 1350 },
+        Op::TradeNoCpiA1 { a: 9, b: 65, size_tenths: -212 },
+        Op::Push { delta_bps: -1372 },
+        Op::Push { delta_bps: -778 },
+        Op::Warp { n: 17 },
+        Op::Push { delta_bps: 2424 },
+        Op::TradeNoCpi { a: 25, b: 252, size_tenths: -116, off_bps: -1477 },
+        Op::Crank { u: 222 },
+        Op::TradeCpi { u: 120, size_tenths: 243 },
+        Op::Push { delta_bps: 1120 },
+    ];
+    let mut w = World::new(30);
+    for op in &ops {
+        let r = w.apply(op);
+        eprintln!("op {op:?} -> {:?}", r.map_err(|e| custom_code(&e)));
+        w.check().unwrap();
+    }
+    // catch up both assets, then resolve
+    for _ in 0..60 {
+        let s = w.slot() + 5;
+        w.env.svm.warp_to_slot(s);
+        let _ = w.do_push(w.mark);
+        let _ = w.do_push_asset1(w.mark1);
+        let _ = w.do_crank(N_USERS);
+    }
+    w.do_resolve().expect("resolve");
+    for round in 0..8 {
+        for u in 0..w.ports.len() {
+            let r = w.do_close_resolved(u);
+            let t = w.do_claim_topup(u);
+            if round == 7 {
+                let p = w.env.portfolio_state(w.ports[u]);
+                eprintln!("u{u}: close_resolved {:?} topup {:?} cap {} pnl {} legs {} receipt {:?}", r.map_err(|e| custom_code(&e)), t.map_err(|e| custom_code(&e)), p.capital, p.pnl, p.legs.iter().filter(|l| l.active).count(), (p.resolved_payout_receipt.present, p.resolved_payout_receipt.finalized));
+            }
+            w.check().unwrap();
+        }
+        let s = w.slot() + 20;
+        w.env.svm.warp_to_slot(s);
+    }
+    let (_, g) = w.env.market_state();
+    assert_eq!(g.c_tot, 0, "every user's capital must be paid after resolution (c_tot {})", g.c_tot);
 }
