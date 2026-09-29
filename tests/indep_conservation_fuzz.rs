@@ -1270,6 +1270,10 @@ fn try_retire(w: &mut World) -> bool {
             if w.is_tombstone() {
                 return true;
             }
+            // P1 doc: CloseSlab may re-book orphaned legs onto the protocol leg and
+            // return Ok without closing; claim 84/90 and call again.
+            let _ = w.do_claim_protocol();
+            let _ = w.do_claim_creator();
         }
     }
     false
@@ -1329,13 +1333,300 @@ fn indep_f4_closeslab_never_burns_owed_fee_legs() {
     let legs = w.legs_outstanding();
     let vault = w.token_amount(&w.env.vault);
     let burned0 = w.burned();
-    let _ = try_retire(&mut w);
+    let retired = try_retire(&mut w);
     w.check_tokens().unwrap();
     let burned = w.burned() - burned0;
+    assert!(retired, "F4 liveness: with every claim path exercised (84/90 between calls) the market must still retire; legs {legs}");
     eprintln!("F4: legs_live {legs_live} legs_at_close {legs} vault {vault} burned {burned} retired {}", w.is_tombstone());
     let non_leg = vault.saturating_sub(legs);
     assert!(
         burned <= non_leg,
         "I10 F4: CloseSlab burned {burned} atoms while {legs} atoms of fee legs were owed (vault {vault})"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LIVENESS FUZZ (task item 3): after ANY random sequence, the market must be
+// recoverable with ONLY permissionless actions (crank 5, ExpireBackingBucket 89,
+// FinalizeResetSide 45) plus the keeper re-pushing the CURRENT mark — no admin,
+// no user cooperation. "Recovered" = (a) a brand-new pair of wallets can deposit,
+// open 1 unit at mark and close it, and (b) every flat user can withdraw all of
+// its capital. README "Permissionless progress": a public crank must commit
+// bounded progress or return a terminal/recovery error.
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl World {
+    fn add_user(&mut self) -> usize {
+        let k = Keypair::new();
+        let p = self.env.create_portfolio(&k);
+        self.owners.push(k);
+        self.ports.push(p);
+        self.closed.push(false);
+        self.ports.len() - 1
+    }
+
+    fn is_flat(&self, u: usize) -> bool {
+        self.env
+            .svm
+            .get_account(&self.ports[u])
+            .and_then(|a| state::read_portfolio(&a.data).ok())
+            .map_or(true, |p| p.active_bitmap == percolator::active_bitmap_empty())
+    }
+
+    /// Permissionless repair rounds. Returns the codes the repairs hit.
+    fn permissionless_repair(&mut self, rounds: usize) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut done_extra = 0;
+        for r in 0..rounds {
+            // Stop once the effective price has caught the target and 3 extra rounds ran.
+            let (_, g) = self.env.market_state();
+            if g.assets[0].effective_price == g.assets[0].raw_oracle_target_price {
+                done_extra += 1;
+                if done_extra > 3 && r > 3 {
+                    break;
+                }
+            }
+            let s = self.slot() + 20;
+            self.env.svm.warp_to_slot(s);
+            let _ = self.do_push(self.mark);
+            for u in 0..self.ports.len() {
+                if self.closed[u] {
+                    continue;
+                }
+                if let Err(e) = self.do_crank(u) {
+                    seen.push(format!("crank:{:?}", custom_code(&e)));
+                }
+            }
+            for d in 0..2u16 {
+                if std::env::var("INDEP_NO_EXPIRE").is_err() {
+                    let _ = self.do_expire(d);
+                }
+            }
+            for sd in 0..2u8 {
+                let _ = self.do_finalize(sd);
+            }
+        }
+        seen
+    }
+
+    fn probe_recovered(&mut self) -> Result<(), String> {
+        let a = self.add_user();
+        let b = self.add_user();
+        self.do_deposit(a, 5_000_000).map_err(|e| format!("fresh deposit a: {:?}", custom_code(&e)))?;
+        self.do_deposit(b, 5_000_000).map_err(|e| format!("fresh deposit b: {:?}", custom_code(&e)))?;
+        let q = POS_SCALE as i128;
+        self.do_trade_nocpi(a, b, q, self.mark).map_err(|e| format!("fresh open at mark: {:?}", custom_code(&e)))?;
+        self.do_trade_nocpi(a, b, -q, self.mark).map_err(|e| format!("fresh close at mark: {:?}", custom_code(&e)))?;
+        for u in 0..self.ports.len() {
+            if self.closed[u] || !self.is_flat(u) {
+                continue;
+            }
+            let _ = self.do_crank(u);
+            let cap = self.env.portfolio_state(self.ports[u]).capital;
+            if cap > 0 {
+                self.do_withdraw(u, cap)
+                    .map_err(|e| format!("flat user {u} cannot withdraw its {cap} capital: {:?}", custom_code(&e)))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn indep_liveness_fuzz_permissionless_recovery() {
+    let seqs = env_u64("FUZZ_LIVE_SEQS", 48);
+    let len = env_u64("FUZZ_LEN", 40) as usize;
+    let seed0 = env_u64("FUZZ_SEED", 0x11fe);
+    let threads = env_u64("FUZZ_THREADS", 4).max(1);
+    let fails = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let codes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<String, u64>::new()));
+    let mut hs = Vec::new();
+    for t in 0..threads {
+        let (fails, codes) = (fails.clone(), codes.clone());
+        hs.push(std::thread::Builder::new().stack_size(64 << 20).spawn(move || {
+            let mut i = t;
+            while i < seqs {
+                let seed = seed0.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let mut rng = XorShiftRng::seed_from_u64(seed);
+                let fee_bps = [0u64, 5, 30][rng.gen_range(0..3)];
+                let ops: Vec<Op> = (0..len).map(|_| gen_op(&mut rng)).collect();
+                let mut w = World::new(fee_bps);
+                for op in &ops {
+                    let _ = w.apply(op);
+                    if let Err(e) = w.check() {
+                        fails.lock().unwrap().push(format!("seed={seed:#x}: invariant during ops: {e}"));
+                        break;
+                    }
+                }
+                let seen = w.permissionless_repair(400);
+                for c in seen {
+                    *codes.lock().unwrap().entry(c).or_default() += 1;
+                }
+                if let Err(e) = w.probe_recovered() {
+                    let (_, g) = w.env.market_state();
+                    fails.lock().unwrap().push(format!(
+                        "seed={seed:#x} fee={fee_bps}: L2 NOT RECOVERABLE PERMISSIONLESSLY: {e} | mode {:?} hlock {} stress {} loss_stale {} recovery {:?} eff {} target {} buckets {:?} sides {:?}/{:?}",
+                        g.mode, g.bankruptcy_hlock_active, g.threshold_stress_active, g.loss_stale_active, g.recovery_reason,
+                        g.assets[0].effective_price, g.assets[0].raw_oracle_target_price,
+                        g.source_backing_buckets.iter().map(|b| (b.status, b.expiry_slot)).collect::<Vec<_>>(),
+                        g.assets[0].mode_long, g.assets[0].mode_short
+                    ));
+                }
+                if let Err(e) = w.check() {
+                    fails.lock().unwrap().push(format!("seed={seed:#x}: invariant after recovery: {e}"));
+                }
+                i += threads;
+            }
+        }).unwrap());
+    }
+    for h in hs {
+        h.join().expect("thread");
+    }
+    eprintln!("== liveness fuzz: {seqs} seqs; repair-time crank errors: {:?}", codes.lock().unwrap());
+    let f = fails.lock().unwrap();
+    assert!(f.is_empty(), "{} unrecoverable/violating sequence(s):\n{}", f.len(), f.join("\n"));
+}
+
+fn live_fails(fee_bps: u64, ops: &[Op]) -> Option<String> {
+    let mut w = World::new(fee_bps);
+    for op in ops {
+        let _ = w.apply(op);
+    }
+    let _ = w.permissionless_repair(400);
+    w.probe_recovered().err()
+}
+
+fn ddmin_live(fee_bps: u64, ops: Vec<Op>) -> Vec<Op> {
+    let mut cur = ops;
+    let mut n = 2usize;
+    let mut budget = 300;
+    while cur.len() >= 2 && budget > 0 {
+        let chunk = (cur.len() + n - 1) / n;
+        let mut reduced = false;
+        for start in (0..cur.len()).step_by(chunk) {
+            budget -= 1;
+            let mut cand = cur.clone();
+            cand.drain(start..(start + chunk).min(cand.len()));
+            if live_fails(fee_bps, &cand).map_or(false, |e| e.contains("fresh open")) {
+                cur = cand;
+                n = (n - 1).max(2);
+                reduced = true;
+                break;
+            }
+            if budget == 0 {
+                break;
+            }
+        }
+        if !reduced {
+            if n >= cur.len() {
+                break;
+            }
+            n = (n * 2).min(cur.len());
+        }
+    }
+    cur
+}
+
+/// Shrinks one liveness failure given by FUZZ_ONE_SEED (hex) and prints the repro.
+#[test]
+#[ignore]
+fn indep_liveness_shrink_one() {
+    let seed = u64::from_str_radix(std::env::var("FUZZ_ONE_SEED").unwrap().trim_start_matches("0x"), 16).unwrap();
+    let len = env_u64("FUZZ_LEN", 50) as usize;
+    let mut rng = XorShiftRng::seed_from_u64(seed);
+    let fee_bps = [0u64, 5, 30][rng.gen_range(0..3)];
+    let ops: Vec<Op> = (0..len).map(|_| gen_op(&mut rng)).collect();
+    let e = live_fails(fee_bps, &ops).expect("seed does not fail");
+    let min = ddmin_live(fee_bps, ops);
+    eprintln!("SHRUNK fee={fee_bps} ({} ops) err={:?}\n  ops: {min:?}", min.len(), live_fails(fee_bps, &min));
+    let _ = e;
+}
+
+/// Shrunk from liveness-fuzz seed 0xfa8cfc37711c3fb7 (fee 0): two opposite positions,
+/// then the mark falls ~33% in two keeper pushes (10x leverage => the long is bankrupt).
+/// After 400 permissionless repair rounds (8,000 slots; crank every portfolio, 89 on both
+/// domains, 45 on both sides) the price has caught up, yet a FRESH pair of wallets
+/// cannot open 1 unit at mark. Spec/README: public cranks must make bounded progress,
+/// and no ordinary state may need a privileged operator to reopen the market.
+#[test]
+fn indep_liveness_market_reopens_after_single_bankruptcy() {
+    let ops = [
+        Op::TradeCpi { u: 48, size_tenths: 366 },
+        Op::TradeNoCpi { a: 7, b: 90, size_tenths: -214, off_bps: -1908 },
+        Op::Push { delta_bps: -2157 },
+        Op::Push { delta_bps: -1266 },
+    ];
+    let mut w = World::new(0);
+    for op in &ops {
+        let r = w.apply(op);
+        eprintln!("op {op:?} -> {:?}", r.map_err(|e| custom_code(&e)));
+        w.check().unwrap();
+    }
+    let codes = w.permissionless_repair(400);
+    let mut hist = std::collections::BTreeMap::<String, u64>::new();
+    for c in codes { *hist.entry(c).or_default() += 1; }
+    let (_, g) = w.env.market_state();
+    eprintln!("after repair: crank errs {hist:?}; hlock {} mode {:?} eff {} tgt {} oi {}/{} buckets {:?} sides {:?}/{:?} slot {}/{}",
+        g.bankruptcy_hlock_active, g.mode, g.assets[0].effective_price, g.assets[0].raw_oracle_target_price,
+        g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q,
+        g.source_backing_buckets.iter().map(|b| (b.status, b.expiry_slot, b.fresh_unliened_backing_num)).collect::<Vec<_>>(),
+        g.assets[0].mode_long, g.assets[0].mode_short, g.current_slot, w.slot());
+    for (i, sc) in g.source_credit.iter().enumerate() {
+        eprintln!("  domain {i}: credit_rate {} fresh_reserved {} spent {} recv {} liened {} claim_bound {}", sc.credit_rate_num, sc.fresh_reserved_backing_num, sc.spent_backing_num, sc.provider_receivable_num, sc.valid_liened_backing_num, sc.positive_claim_bound_num);
+    }
+    for u in 0..w.ports.len() {
+        let p = w.env.portfolio_state(w.ports[u]);
+        let legs: Vec<_> = p.legs.iter().filter(|l| l.active).map(|l| l.basis_pos_q).collect();
+        eprintln!("  u{u}: cap {} pnl {} reserved {} legs {legs:?} stale {} b_stale {} liq_lock {}", p.capital, p.pnl, p.reserved_pnl, p.stale_state, p.b_stale_state, p.liquidation_lock);
+    }
+    for u in 0..w.ports.len() {
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        eprintln!("  crank u{u}: {:?}", w.do_crank(u).map_err(|e| custom_code(&e)));
+    }
+    let r = w.probe_recovered();
+    if r.is_err() {
+        // Diagnose: is there a PRIVILEGED exit? Backing authority tops up domain 0.
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        let exp = s + 1_000_000;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            w.env.top_up_backing_bucket(0, 5_000_000, exp);
+        }));
+        eprintln!("admin TopUpBackingBucket(domain 0): {}", if res.is_ok() { "ok" } else { "FAILED" });
+        let _ = w.permissionless_repair(5);
+        for u in 0..w.ports.len() {
+            eprintln!("  post-topup crank u{u}: {:?}", w.do_crank(u).map_err(|e| custom_code(&e)));
+        }
+        let a = w.add_user();
+        let b = w.add_user();
+        let _ = w.do_deposit(a, 5_000_000);
+        let _ = w.do_deposit(b, 5_000_000);
+        let q = POS_SCALE as i128;
+        let fo = w.do_trade_nocpi(a, b, q, w.mark);
+        if let Err(e) = &fo {
+            for l in e.split("\", \"") { if l.contains("Program log") || l.contains("failed") { eprintln!("   LOG {}", &l[..l.len().min(300)]); } }
+        }
+        eprintln!("after privileged top-up, fresh open: {:?}", fo.map_err(|e| custom_code(&e)));
+        let (_, g2) = w.env.market_state();
+        eprintln!("   hlock {} stress {} loss_stale {} b_stale_cnt {} stale_cert {} neg_cnt {} pending_barriers {:?} a0 stale_long {} ", g2.bankruptcy_hlock_active, g2.threshold_stress_active, g2.loss_stale_active, g2.b_stale_account_count, g2.stale_certificate_count, g2.negative_pnl_account_count, g2.pending_domain_loss_barriers, g2.assets[0].stored_pos_count_long);
+        let (_, g3) = w.env.market_state();
+        eprintln!("   post-topup domain0 credit_rate {} bucket {:?}", g3.source_credit[0].credit_rate_num, (g3.source_backing_buckets[0].status, g3.source_backing_buckets[0].expiry_slot, g3.source_backing_buckets[0].fresh_unliened_backing_num));
+        let refresh = |w: &mut World, us: &[usize]| {
+            let s = w.slot() + 1;
+            w.env.svm.warp_to_slot(s);
+            let _ = w.do_push(w.mark);
+            for &u in us { let _ = w.do_crank(u); }
+        };
+        refresh(&mut w, &[a, b]);
+        eprintln!("fresh open after refresh: {:?}", w.do_trade_nocpi(a, b, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)));
+        refresh(&mut w, &[4]);
+        eprintln!("winner u4 withdraw 1 atom of capital: {:?}", w.do_withdraw(4, 1).map_err(|e| custom_code(&e)));
+        refresh(&mut w, &[0, 1]);
+        eprintln!("winner u4 convert 1 atom pnl: {:?}", w.do_convert(4, 1).map_err(|e| custom_code(&e)));
+        eprintln!("loser u0 reduce (sell 1 unit to u1): {:?}", w.do_trade_nocpi(1, 0, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)));
+        refresh(&mut w, &[3, 4]);
+        eprintln!("winner u4 reduce short (buy 1 unit from u3): {:?}", w.do_trade_nocpi(4, 3, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)));
+    }
+    assert!(r.is_ok(), "L2 market cannot reopen permissionlessly after one bankruptcy: {r:?}");
 }
