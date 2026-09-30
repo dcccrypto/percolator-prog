@@ -1589,29 +1589,37 @@ fn p3_draw_race_late_entry_pays_post_loss_price() {
 /// reduce; recovery (a junior top-up) restores C FIRST, which lifts the halt.
 #[test]
 fn p3_draw_halt_then_recovery_restores_seniors_first() {
+    const PAUSED: u32 = 89; // VaultLpPausedForSeniorDraw
     let (mut w, _s, (t, tp)) = q1_world(9_000_000, 1_000_000, 1_000_000, 6);
     let _ = w.crank_fees_78();
     assert!(outstanding(&w) > 0, "vacuity: a draw is outstanding");
     let admin = w.env.admin.insecure_clone();
+    // Junior re-funds 2M so the vault LP has equity (P1's floor halt no longer answers first);
+    // no LP-carrying P3 instruction runs yet, so the draw stays outstanding.
+    // A PARTIAL re-fund (500k < the 1,635,213 outstanding): restoration is partial, the halt holds.
+    w.junior_deposit(&admin, 500_000).unwrap();
+    let (t2, tp2) = w.trader(10_000_000);
+    let rg = w.trade_vs_lp(&t2, tp2, U / 10);
     let (_, r97) = w.junior_withdraw(&admin, admin.pubkey(), 1);
     let r102 = w.live_release_102(&admin, 1);
     let r98 = recall(&mut w, 1);
-    eprintln!("HALT 97 {:?} 102 {:?} 98 {:?}", r97.as_ref().map_err(|e| code(e)), r102.as_ref().map_err(|e| code(e)), r98.as_ref().map_err(|e| code(e)));
-    assert!(r97.is_err() && r102.is_err() && r98.is_err(), "junior exits and recall halted while seniors are down");
-    let (t2, tp2) = w.trader(10_000_000);
-    let rg = w.trade_vs_lp(&t2, tp2, U / 10);
-    eprintln!("HALT LP-growing fill -> {:?}", rg.as_ref().map_err(|e| code(e)));
-    assert!(rg.is_err(), "the vault LP may not grow risk while a draw is outstanding");
-    // Recovery: the junior re-funds 2M. The next P3 instruction that carries the vault LP (here a
-    // small senior deposit) restores C by the FULL outstanding 1,635,213 before anything else.
+    eprintln!("HALT 97 {:?} 102 {:?} 98 {:?} fill {:?}", r97.as_ref().map_err(|e| code(e)), r102.as_ref().map_err(|e| code(e)), r98.as_ref().map_err(|e| code(e)), rg.as_ref().map_err(|e| code(e)));
+    assert_eq!(r97.as_ref().err().and_then(|e| code(e)), Some(PAUSED), "97 paused by the draw");
+    assert_eq!(r102.as_ref().err().and_then(|e| code(e)), Some(PAUSED), "102 paused by the draw");
+    assert_eq!(r98.as_ref().err().and_then(|e| code(e)), Some(PAUSED), "98 paused by the draw");
+    assert_eq!(rg.as_ref().err().and_then(|e| code(e)), Some(PAUSED), "vault-LP risk-increasing fill paused by the draw");
+    // Recovery: the junior re-funds the rest; the next P3 instruction that carries the vault LP
+    // (a small senior deposit) restores C by the FULL outstanding before anything else.
     w.junior_deposit(&admin, 2_000_000).unwrap();
-    let lp = w.lp;
-    let _ = w.crank(lp);
     let late = Keypair::new();
     w.earn_deposit_domain(&late, 1_000, true, 0).expect("75 (vault LP writable)");
     eprintln!("RECOVERY: C {} outstanding {}", w.c(), outstanding(&w));
     assert_eq!(w.c(), 10_000_000 + 1_000, "seniors restored first, in full (then the 1,000 deposit)");
     assert_eq!(outstanding(&w), 0, "halt lifted");
+    let rg2 = w.trade_vs_lp(&t2, tp2, U / 10);
+    eprintln!("after recovery LP-growing fill -> {:?}", rg2.as_ref().map_err(|e| code(e)));
+    assert!(rg2.as_ref().err().and_then(|e| code(e)) != Some(PAUSED), "no longer paused");
+    let _ = (t, tp);
     conserved(&w, "recovery");
 }
 
@@ -1624,11 +1632,11 @@ fn p3_draw_recall_never_reopens_a_funded_deficit() {
     let c0 = w.c();
     let r = recall(&mut w, 1);
     eprintln!("RECALL while pending -> {:?}; C {} (booking reverted with the refusal)", r.as_ref().map_err(|e| code(e)), w.c());
-    assert!(r.is_err(), "recall while a draw is pending");
+    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(89), "recall paused while a draw is pending");
     assert_eq!(w.c(), c0, "the refused recall committed nothing");
     let _ = w.crank_fees_78();
     let r = recall(&mut w, 1);
-    assert!(r.is_err(), "recall while a senior draw is outstanding");
+    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(89), "recall paused while a senior draw is outstanding");
     // Junior re-funds 2M; the next LP-carrying instruction restores C first (outstanding 0).
     let admin = w.env.admin.insecure_clone();
     w.junior_deposit(&admin, 2_000_000).unwrap();
@@ -1640,8 +1648,22 @@ fn p3_draw_recall_never_reopens_a_funded_deficit() {
     // LP's own equity.
     let r_over = recall(&mut w, eq + 1);
     eprintln!("RECALL over LP equity {eq} -> {:?}", r_over.as_ref().map_err(|e| code(e)));
-    assert!(r_over.is_err(), "recall beyond the vault LP's equity");
+    assert_eq!(r_over.as_ref().err().and_then(|e| code(e)), Some(76), "recall beyond the vault LP's equity (ordinary cap refusal)");
     conserved(&w, "recall");
+}
+
+/// Gate-100: a LIVE bound redemption larger than the chosen pot can fund answers exactly 88
+/// (VaultLpRedeemNeedsRecall), never a generic counter error — the client's 88 -> recall repair
+/// depends on it.
+#[test]
+fn p3_redeem_from_a_too_small_pot_is_exactly_88() {
+    let (mut w, seniors, _t) = q1_world(9_000_000, 1_000_000, 1_000_000, 2);
+    let (k0, a0) = (seniors[0].0.insecure_clone(), seniors[0].1);
+    let shares = w.tok(&a0) as u128;
+    w.request_redeem(&k0, a0, shares).unwrap();
+    let (_, r) = w.execute_redeem_domain(&k0, 1); // 9M-share senior from the 1M pot
+    eprintln!("88 probe -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(88));
 }
 
 /// B24: after a junior-covered trader win is converted (consuming the vault LP's settled loss

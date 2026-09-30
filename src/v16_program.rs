@@ -1270,6 +1270,11 @@ VaultLpMultiAssetMarket,
         /// holds, because part of the senior value sits in the vault LP's capital. Run
         /// VaultLpRecall (98, permissionless, vault LP flat) first, or redeem fewer shares.
         VaultLpRedeemNeedsRecall,
+        /// P3 senior draw: PAUSED because Earn is covering a vault-LP loss (a senior draw is
+        /// pending or outstanding). Halts the vault LP's risk-increasing fills, junior withdraw
+        /// (97), recall (98) and junior release (102) until the seniors are restored. Appended
+        /// at the END of the enum (no existing code shifts).
+        VaultLpPausedForSeniorDraw,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -15119,7 +15124,7 @@ pub mod processor {
                         vault_lp_v18::DRAW_OP_LP_RISK_INCREASING_FILL,
                     )
                 {
-                    return Err(PercolatorError::VaultLpExposureCapExceeded.into());
+                    return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
                 }
             }
             // P3-H2: protocol exposure cap on the vault LP (default 1x its conservative equity,
@@ -25304,6 +25309,11 @@ pub mod processor {
             // write), so it is not a gate there and is decremented saturating.
             let ledger_gate = !(bound_tail.is_some() && group.header.mode == 1);
             if ledger_gate && principal_portion > ledger.total_principal_atoms {
+                // B24 / gate-100: on a LIVE bound vault the chosen pot cannot fund this payout —
+                // name it (recall or redeem less), before any generic counter error.
+                if bound_tail.is_some() && group.header.mode == 0 {
+                    return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
+                }
                 return Err(PercolatorError::EngineCounterUnderflow.into());
             }
             // Same withdrawability gate as handle_withdraw_backing_bucket
@@ -28126,7 +28136,7 @@ pub mod processor {
             true,
         )?;
         if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_JUNIOR_WITHDRAW_97) {
-            return Err(PercolatorError::VaultLpJuniorWithdrawRefused.into());
+            return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
@@ -28285,6 +28295,9 @@ pub mod processor {
             let r = read_vault_lp_draw_from_view(&g, a)?;
             r.pending_moved_atoms != 0 || r.pending_out_even_atoms != 0 || r.pending_out_odd_atoms != 0
         };
+        if draw_pending_before {
+            return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
+        }
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
         vault_lp_draw_then_book(
             program_id,
@@ -28299,7 +28312,7 @@ pub mod processor {
             true,
         )?;
         if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_RECALL_98) {
-            return Err(PercolatorError::VaultLpRecallRefused.into());
+            return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
         let (_, mode, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
@@ -28769,7 +28782,7 @@ pub mod processor {
             true,
         )?;
         if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_JUNIOR_RELEASE_102) {
-            return Err(PercolatorError::VaultLpReleaseRefused.into());
+            return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
