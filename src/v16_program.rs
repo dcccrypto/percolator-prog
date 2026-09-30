@@ -11597,11 +11597,86 @@ pub mod processor {
         }
     }
 
+    /// P3 (2026-09-30): every Fresh backing pot owned by this market's LP-vault registry carries
+    /// the sentinel expiry `LP_VAULT_BACKING_EXPIRY_SLOT`, so a pot never lapses and never
+    /// forfeits senior principal or the winners' loss backing to the junior pool.
+    ///
+    /// The engine can break that: when a settled loss lands in a vault pot that is EMPTY (never
+    /// funded, or drained by redemptions / the senior draw) it re-opens the pot `Fresh` with its
+    /// own horizon (`fresh_counterparty_backing_expiry_slot`: `current_slot + horizon`). That pot
+    /// then (a) lapsed and was expired by the next resolved close / crank, forfeiting the winners'
+    /// loss backing, so CloseResolved haircut winners while seniors still held C
+    /// (`indep_p3_rt_winner_haircut_at_resolved_close_repro`); (b) tripped `Stale` inside the
+    /// draw's tolerated refresh (seed 0x2344b9addb22aba8); (c) refused every sentinel top-up
+    /// with 21 (seed 0x73e8acf249118b7b). Every instruction therefore re-stamps such a pot on each
+    /// WRITABLE market it is handed, before any engine call can observe the lapse. The later
+    /// expiry only keeps backing live longer: it is the state loss backing already has when it
+    /// joins a funded vault pot. Pure state normalisation: no auth, no value moves, no epoch bump.
+    #[inline(never)]
+    fn restamp_vault_pots_in_writable_markets<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        for ai in accounts.iter() {
+            if !ai.is_writable || ai.owner != program_id {
+                continue;
+            }
+            let Ok(mut data) = ai.try_borrow_mut_data() else {
+                continue;
+            };
+            if data.len() < crate::constants::MIN_MARKET_ACCOUNT_LEN {
+                continue;
+            }
+            let Ok((cfg, mut group)) = state::market_view_mut(&mut data) else {
+                continue;
+            };
+            restamp_vault_pots_view(program_id, ai.key, &cfg, &mut group)?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn restamp_vault_pots_view(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        cfg: &WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+    ) -> ProgramResult {
+        let n = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        let mut registry: Option<[u8; 32]> = None;
+        for d in 0..n.saturating_mul(2) {
+            let (_, bucket) = backing_domain_parts_view(group, d)?;
+            if bucket.status != BackingBucketStatusV16::Fresh
+                || bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+            {
+                continue;
+            }
+            let reg = *registry.get_or_insert_with(|| {
+                state::derive_lp_vault_registry(program_id, market_key).0.to_bytes()
+            });
+            if domain_authorities_from_view(group, cfg, d)?.backing_bucket_authority != reg {
+                continue;
+            }
+            let slot = &mut group.markets[d / 2].engine;
+            let bucket_acc = if d % 2 == 0 { &mut slot.backing_long } else { &mut slot.backing_short };
+            let mut b = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
+            let was = b.expiry_slot;
+            b.expiry_slot = crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT;
+            *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&b);
+            solana_program::log::sol_log(&alloc::format!(
+                "p3_vault_pot_restamp domain={} expiry {}->sentinel",
+                d, was
+            ));
+        }
+        Ok(())
+    }
+
     pub fn process_instruction<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
+        restamp_vault_pots_in_writable_markets(program_id, accounts)?;
         match Instruction::decode(instruction_data)? {
             Instruction::InitMarket {
                 max_portfolio_assets,
@@ -26753,12 +26828,35 @@ pub mod processor {
         let odd = even + 1;
         let d_even_pre = vault_pot_drawable_atoms(group, cfg, &reg, even)?;
         let d_odd_pre = vault_pot_drawable_atoms(group, cfg, &reg, odd)?;
-        // The refresh is the only step allowed to fail softly (nothing is mutated on error, the
-        // engine call is all-or-nothing on its own account view); every later error propagates.
-        let cert = match group.full_account_refresh_not_atomic(lp) {
-            Ok(c) => c,
-            Err(_) if tolerate_refresh_error => return Ok((0, false)),
-            Err(e) => return Err(map_v16_error(e)),
+        // The refresh is the only step allowed to fail softly; every later error propagates.
+        //
+        // P3 resolved-lock fix (2026-09-30): `full_account_refresh_not_atomic` is NOT
+        // all-or-nothing. Its K/F loss settlement consumes the account's source claims one domain
+        // at a time and can return `Stale` (a lapsed Fresh bucket on a LATER domain) or `BStale`
+        // after it has already burned an earlier domain's claim, with the pnl debit not yet
+        // applied. Swallowing that error left the caller running on a TORN market + account view
+        // (seed 0x2344b9addb22aba8: the vault LP kept pnl +79,732 against 26,521 of claims, so
+        // every tag-101 resolved close failed validation with 18 and the market locked). A
+        // tolerated failure therefore restores the exact pre-refresh bytes of the market header,
+        // every asset slot and the vault-LP portfolio, so "tolerated" really means "no effect".
+        let cert = if tolerate_refresh_error {
+            let saved_header: alloc::vec::Vec<u8> = bytemuck::bytes_of(&*group.header).to_vec();
+            let saved_markets: alloc::vec::Vec<u8> = bytemuck::cast_slice::<_, u8>(&*group.markets).to_vec();
+            let saved_lp: alloc::vec::Vec<u8> = bytemuck::bytes_of(&*lp.header).to_vec();
+            match group.full_account_refresh_not_atomic(lp) {
+                Ok(c) => c,
+                Err(_) => {
+                    bytemuck::bytes_of_mut(&mut *group.header).copy_from_slice(&saved_header);
+                    bytemuck::cast_slice_mut::<_, u8>(&mut *group.markets)
+                        .copy_from_slice(&saved_markets);
+                    bytemuck::bytes_of_mut(&mut *lp.header).copy_from_slice(&saved_lp);
+                    return Ok((0, false));
+                }
+            }
+        } else {
+            group
+                .full_account_refresh_not_atomic(lp)
+                .map_err(map_v16_error)?
         };
         let deficit = if cert.certified_equity < 0 {
             cert.certified_equity.unsigned_abs()
@@ -29668,6 +29766,24 @@ pub mod processor {
             || source.spent_backing_num < source.provider_receivable_num
         {
             return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        // P3 resolved-lock fix (2026-09-30, seed 0x73e8acf249118b7b): only the LP-vault registry
+        // paths pass the sentinel expiry (see the S1a note in the domain top-up handler). A vault
+        // pot that seniors drained to Empty can be RE-OPENED by the engine's own loss routing
+        // (`fresh_counterparty_backing_expiry_slot`: `current_slot + horizon`) when a trader's or
+        // the vault LP's settled loss lands there. Vault principal routed back into that pot (the
+        // tag-101 payout, a deposit, a recall, a sibling top-up) then failed the exact-expiry
+        // match below with 21 on every call, so the resolved vault LP never settled and every
+        // senior, winner and the junior were locked. Re-stamp such a pot (Fresh, NOT lapsed) to
+        // the sentinel first: a later expiry only keeps the winners' loss backing live longer
+        // (the same state as loss backing that joins an already-funded vault pot), and a vault
+        // pot must never carry a horizon that would forfeit senior principal on lapse.
+        if expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+            && bucket.status == BackingBucketStatusV16::Fresh
+            && bucket.expiry_slot != expiry_slot
+            && bucket.expiry_slot > group.header.current_slot.get()
+        {
+            bucket.expiry_slot = expiry_slot;
         }
         match bucket.status {
             BackingBucketStatusV16::Empty | BackingBucketStatusV16::Expired => {

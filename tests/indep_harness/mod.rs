@@ -119,6 +119,11 @@ pub fn has_active_leg_for_asset(account: &PortfolioAccountV16, asset_index: usiz
 /// Wrapper mount id. INDEP_MAINNET_ID=1 mounts at the mainnet id (ESa89R5…), which the
 /// stake program's Bind/InitPool allowlist (plain build) requires.
 pub fn harness_program_id() -> Pubkey {
+    // INDEP_PROGRAM_ID=<base58>: mount the wrapper at an arbitrary id (e.g. the fresh devnet id
+    // ETDLAdi… that a --features devnet stake build allowlists).
+    if let Ok(k) = std::env::var("INDEP_PROGRAM_ID") {
+        return k.parse().expect("INDEP_PROGRAM_ID base58");
+    }
     if std::env::var("INDEP_MAINNET_ID").map_or(false, |v| v == "1") {
         "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv".parse().unwrap()
     } else {
@@ -607,7 +612,12 @@ impl V16CuEnv {
     /// prior Deposits/trades/etc. this specific portfolio has already seen in
     /// this test.
     pub fn portfolio_identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
-        let data = self.svm.get_account(&portfolio).unwrap().data;
+        // Runtime-parity GC can DELETE a closed portfolio; an op on it must fail in the program
+        // (not panic the harness), so report a zero identity for a missing/emptied account.
+        let data = match self.svm.get_account(&portfolio) {
+            Some(a) if !a.data.is_empty() => a.data,
+            _ => return (0, 0, 0),
+        };
         (
             state::read_portfolio_id(&data).unwrap(),
             state::read_portfolio_matcher_sequence(&data).unwrap(),
@@ -3676,12 +3686,40 @@ pub fn send_tx(
         svm.latest_blockhash(),
     );
     let r = svm.send_transaction(tx)
-        .map(|meta| meta.compute_units_consumed)
+        .map(|meta| {
+            if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
+                let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
+                if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
+            }
+            meta.compute_units_consumed
+        })
         .map_err(|e| format!("{e:?}"));
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }
+    log_error_sites(&r);
     r
+}
+
+/// Debug aid for instrumented builds: with INDEP_ERR_SITES=1, print the `sol_log_64` error-site
+/// lines ("Program log: 0x<tag>, 0x<line>, ...") of a failed transaction.
+pub fn log_error_sites(r: &Result<u64, String>) {
+    if let Err(e) = r {
+        if std::env::var("INDEP_ERR_SITES").map_or(false, |v| v == "1") {
+            let sites: Vec<String> = e
+                .split("\"")
+                .filter(|l| l.starts_with("Program log: 0x"))
+                .map(|l| {
+                    let v: Vec<u64> = l["Program log: ".len()..]
+                        .split(", ")
+                        .filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                        .collect();
+                    if matches!(v.first(), Some(&0xB1) | Some(&0xB2) | Some(&0xB3)) { format!("{:x}{:?}", v[0], &v[1..]) } else { format!("{:x}@{}", v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)) }
+                })
+                .collect();
+            eprintln!("ERR-SITES {:?}", sites);
+        }
+    }
 }
 
 pub fn send_raw_tx(
@@ -3701,11 +3739,18 @@ pub fn send_raw_tx(
         svm.latest_blockhash(),
     );
     let r = svm.send_transaction(tx)
-        .map(|meta| meta.compute_units_consumed)
+        .map(|meta| {
+            if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
+                let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
+                if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
+            }
+            meta.compute_units_consumed
+        })
         .map_err(|e| format!("{e:?}"));
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }
+    log_error_sites(&r);
     r
 }
 
