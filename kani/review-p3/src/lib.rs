@@ -6,3 +6,5 @@ pub mod vault_lp_v18;
 mod proofs;
 #[cfg(kani)]
 mod proofs_senior_draw;
+#[cfg(kani)]
+mod proofs_recall;
