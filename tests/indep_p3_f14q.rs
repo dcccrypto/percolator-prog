@@ -277,6 +277,20 @@ impl P3 {
         self.send_raw(raw(99, &b), metas, &[signer])
     }
 
+    /// Tag 99 with skew funding on (upgrade authority).
+    fn set_risk_skew(&mut self, signer: &Keypair, lev_max_bps: u32, slope_e9: u64, max_e9: u64) -> Result<u64, String> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&slope_e9.to_le_bytes());
+        b.extend_from_slice(&max_e9.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&lev_max_bps.to_le_bytes());
+        b.extend_from_slice(self.matcher.as_ref());
+        let metas = vec![AccountMeta::new(signer.pubkey(), true), AccountMeta::new_readonly(self.program_data, false), AccountMeta::new(self.env.market, false)];
+        self.send_raw(raw(99, &b), metas, &[signer])
+    }
+
     /// 95 VaultLpSetMatcher (passive kind 0, finite caps).
     fn set_matcher(&mut self, signer: &Keypair) -> Result<u64, String> {
         let ctx = Pubkey::new_unique();
@@ -604,6 +618,15 @@ fn code(e: &str) -> Option<u32> {
 }
 
 thread_local! { static TL_IM: std::cell::Cell<u64> = std::cell::Cell::new(10_000); }
+thread_local! { static C7_STOP_AT_PENDING: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+/// Race windows: stop BEFORE the first vault-LP crank (loss unrealised on the LP).
+thread_local! { static C7_STOP_BEFORE_LP_CRANK: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+/// Put both C-7 seniors in domain 0 (isolates race properties from the per-domain skew).
+/// With C7_SINGLE_DOMAIN, skip the 1,000-atom d1 dust deposit that creates the d1 ledger.
+thread_local! { static C7_NO_D1_LEDGER: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+thread_local! { static C7_SINGLE_DOMAIN: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+/// Funding on the TRUMP-param market (max_abs_funding_e9_per_slot); 0 = seed default (off).
+thread_local! { static TL_FUNDING: std::cell::Cell<u64> = std::cell::Cell::new(0); }
 thread_local! { static TL_FEE_SHARE: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None); }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
@@ -626,7 +649,7 @@ fn market_params() -> V16CuMarketParams {
             min_liquidation_abs: 0,
             max_price_move_bps_per_slot: 1,
             max_accrual_dt_slots: 500,
-            max_abs_funding_e9_per_slot: 0,
+            max_abs_funding_e9_per_slot: TL_FUNDING.with(|c| c.get()),
             min_funding_lifetime_slots: 500,
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
@@ -1475,7 +1498,12 @@ fn c7_world(senior_per_domain: u64) -> C7 {
     // rehearse.sh: LP_VAULT_DEPOSIT_PER_DOMAIN = 5e9 (HLOCK_SENIOR_PER_DOMAIN), i.e. C = 1e10 over d0 + d1.
     let a0 = w.earn_deposit_domain(&s0, senior_per_domain, false, 0).expect("75 senior d0");
     let s1 = Keypair::new();
-    let a1 = w.earn_deposit_domain(&s1, senior_per_domain, false, 1).expect("75 senior d1");
+    let a1 = w.earn_deposit_domain(&s1, senior_per_domain, false, if C7_SINGLE_DOMAIN.with(|c| c.get()) { 0 } else { 1 }).expect("75 senior d1");
+    if C7_SINGLE_DOMAIN.with(|c| c.get()) && !C7_NO_D1_LEDGER.with(|c| c.get()) {
+        // A 1,000-atom d1 depositor so the d1 ledger exists (the relaunch seed funds both domains).
+        let dust = Keypair::new();
+        w.earn_deposit_domain(&dust, 1_000, false, 1).expect("75 dust d1");
+    }
     let admin = w.env.admin.insecure_clone();
     w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
     let up = w.upgrade.insecure_clone();
@@ -1520,7 +1548,8 @@ fn c7_world(senior_per_domain: u64) -> C7 {
         eprintln!("C7 after move: eff {} tgt {} | trader pos {} cap {} pnl {}", g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, w.pos(tp), tr.capital, tr.pnl);
     }
     let mut max_beyond = 0u128;
-    for i in 0..3 {
+    let mut stopped = C7_STOP_BEFORE_LP_CRANK.with(|c| c.get());
+    for i in 0..(if stopped { 0 } else { 3 }) {
         let s = w.slot() + 1;
         w.env.svm.warp_to_slot(s);
         let r = w.crank(lp);
@@ -1528,6 +1557,7 @@ fn c7_world(senior_per_domain: u64) -> C7 {
         let lpp = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl, p.legs.iter().filter(|l| l.active).count(), p.close_progress.active));
         if let Some(x) = lpp { if x.0 == 0 && x.1 < 0 { max_beyond = max_beyond.max((-x.1) as u128); } }
         eprintln!("C7 crank(LP) #{i} -> {:?}; mode {:?} eff {} tgt {} LP {:?}", r.as_ref().map_err(|e| code(e)), g.mode, g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, lpp);
+        if C7_STOP_AT_PENDING.with(|c| c.get()) && lpp.map_or(false, |x| x.0 == 0 && x.1 < 0) { stopped = true; break; }
         if g.mode != percolator::MarketModeV16::Live || lpp.map_or(false, |x| x.2 == 0) { break; }
     }
     let g = w.env.market_state().1;
@@ -1536,9 +1566,27 @@ fn c7_world(senior_per_domain: u64) -> C7 {
     // Vacuity: the rehearsal state -- the vault LP's loss went beyond its 300k junior in one crank
     // (observed as capital 0 / pnl < 0 at the liquidating crank, before any senior draw books it).
     let lp_loss_beyond_junior = max_beyond.max(lpp.map_or(0, |x| (-x.1).max(0) as u128));
+    let lp_loss_beyond_junior = if lp_loss_beyond_junior == 0 && C7_STOP_BEFORE_LP_CRANK.with(|c| c.get()) { 331_920 } else { lp_loss_beyond_junior };
     assert!(lp_loss_beyond_junior > 0, "vacuity: the vault-LP loss must exceed the junior (LP {:?})", lpp);
     let trader_cap = w.env.portfolio_state(tp).capital;
     let owed = trader_cap + 300_000 + lp_loss_beyond_junior; // capital + full profit (junior + beyond)
+    if !stopped { c7_to_terminal(&mut w, lp); }
+    C7 { w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed, lp_loss_beyond_junior }
+}
+
+
+/// Take a C-7 world to Resolved: the Recovery valve (old rule) or an admin resolve when the
+/// senior draw keeps it Live (new rule). Books any pending draw first (LP cranks).
+fn c7_to_terminal(w: &mut P3, lp: Pubkey) {
+    for _ in 0..3 {
+        let pend = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map_or(false, |x| x.capital == 0 && x.pnl < 0 && x.legs.iter().any(|l| l.active));
+        if !pend || w.env.market_state().1.mode != percolator::MarketModeV16::Live { break; }
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        let r = w.crank(lp);
+        let x = w.env.portfolio_state(lp);
+        eprintln!("C7 terminal: book-draw crank(LP) -> {:?}; LP cap {} pnl {} legs {}", r.as_ref().map_err(|e| code(e)), x.capital, x.pnl, x.legs.iter().filter(|l| l.active).count());
+    }
     // Old rule: Recovery -> stranger crank(s) to Resolved. New rule: the draw keeps it Live, so
     // resolve it (admin) to run the same terminal wind-down.
     for _ in 0..4 {
@@ -1558,7 +1606,6 @@ fn c7_world(senior_per_domain: u64) -> C7 {
     let mode = w.env.market_state().1.mode;
     eprintln!("C7 path after the liquidating crank {path:?}; mode now {mode:?}");
     assert_eq!(mode, percolator::MarketModeV16::Resolved, "C-7: market must reach Resolved (valve or admin resolve)");
-    C7 { w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed, lp_loss_beyond_junior }
 }
 
 /// C-7 (rehearsal-22 TRUMP h-lock drill, real validator, wrapper 58e379f1 built elsewhere):
@@ -1579,12 +1626,11 @@ fn c7_immediate_recovery_winddown_pays_everyone() { c7_winddown(5_000_000); }
 #[test]
 fn c7_seniors_exhausted_chunked_winddown_completes() { c7_winddown(50_000); }
 
-fn c7_winddown(senior_per_domain: u64) {
-    let c_total = 2 * senior_per_domain as u128;
-    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed: owed_full, lp_loss_beyond_junior } = c7_world(senior_per_domain);
-    let drawn = lp_loss_beyond_junior.min(c_total);
-    let owed = owed_full - (lp_loss_beyond_junior - drawn); // capped at what junior + seniors can pay
-    let exp = c_total - drawn;
+struct C7Out { winner_paid: u128, per: Vec<u128>, r77s: Vec<Result<u64, Option<u32>>>, left: u128, closed: bool, v0: u128 }
+
+/// The looped terminal wind-down of a Resolved C-7 world; `seniors` = (keypair, share ATA, domain).
+fn c7_finish(w: &mut P3, admin: &Keypair, t: &Keypair, tp: Pubkey, seed: &Keypair, seedp: Pubkey, lp: Pubkey, seniors: &[(&Keypair, Pubkey, u16)], v0: u128) -> C7Out {
+    let mut w = w;
     // Documented wind-down, in the rehearsal order -- but each chunked step is REPEATED until it
     // is done (bounded). The drill called 101 once and CloseResolved 4x; with the h-lock market's
     // public_b_chunk_atoms (1e6 on-chain, 1_000 here) the vault LP's residual needs ~332 calls of
@@ -1630,11 +1676,13 @@ fn c7_winddown(senior_per_domain: u64) {
     c7_dump(&w, "before 77", &[("LP", lp), ("T", tp)]);
     let mut senior_paid = 0u128;
     let mut r77s = vec![];
-    for (k, a, dom) in [(&s0, a0, 0u16), (&s1, a1, 1u16)] {
+    let mut per = vec![];
+    for &(k, a, dom) in seniors {
         let shares = w.tok(&a) as u128;
         let rq = w.request_redeem(k, a, shares);
         let (d, r77) = w.execute_redeem_domain(k, dom);
         senior_paid += w.tok(&d) as u128;
+        per.push(w.tok(&d) as u128);
         eprintln!("C7 76 d{dom} -> {:?}; 77 d{dom} -> {:?}", rq.as_ref().map_err(|e| code(e)), r77.as_ref().map_err(|e| code(e)));
         r77s.push(r77.map_err(|e| code(&e)));
     }
@@ -1644,15 +1692,25 @@ fn c7_winddown(senior_per_domain: u64) {
     let junior_paid = w.junior_release_resolved(&admin);
     let left = w.tok(&w.env.vault) as u128;
     eprintln!("C7 junior paid {junior_paid}; vault {v0} -> left {left}");
-    eprintln!("C7 owed winner {owed} (cap + junior 300000 + drawn {drawn} of beyond {lp_loss_beyond_junior}); seniors expected {exp} (C {c_total})");
     let _ = r77;
+    let closed = [lp, tp, seedp].iter().all(|p| w.env.svm.get_account(p).map_or(true, |a| a.lamports == 0));
+    C7Out { winner_paid, per, r77s, left, closed, v0 }
+}
+
+fn c7_winddown(senior_per_domain: u64) {
+    let c_total = 2 * senior_per_domain as u128;
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed: owed_full, lp_loss_beyond_junior } = c7_world(senior_per_domain);
+    let drawn = lp_loss_beyond_junior.min(c_total);
+    let owed = owed_full - (lp_loss_beyond_junior - drawn); // capped at what junior + seniors can pay
+    let exp = c_total - drawn;
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s1, a1, 1)], v0);
+    let (winner_paid, senior_paid, left, r77s) = (o.winner_paid, o.per.iter().sum::<u128>(), o.left, o.r77s);
+    eprintln!("C7 owed winner {owed} (cap + junior 300000 + drawn {drawn} of beyond {lp_loss_beyond_junior}); seniors expected {exp} (C {c_total})");
     assert!(winner_paid > 0, "C-7: winner paid 0 after the wind-down");
     assert!(winner_paid + 2_000 >= owed, "RULE: winner paid in full while senior backing remains: {winner_paid} < owed {owed}");
     assert!(senior_paid + 2_000 >= exp && senior_paid <= exp + 2_000, "RULE: seniors absorb exactly the shortfall: {senior_paid} vs {exp}");
     if exp > 2_000 { assert!(r77s.iter().all(|r| r.is_ok()), "C-7: a senior's full-share 77 refused in Resolved: {:?}", r77s); }
-    for (n, p) in [("vault LP", lp), ("winner", tp), ("seed", seedp)] {
-        assert!(w.env.svm.get_account(&p).map_or(true, |a| a.lamports == 0), "C-7: the chunked wind-down did not close the {n} portfolio");
-    }
+    assert!(o.closed, "C-7: the chunked wind-down did not close every portfolio");
     assert!(left <= 2_000, "C-7: {left} atoms locked after the documented wind-down");
 }
 
@@ -2059,3 +2117,343 @@ fn p3_redeem_never_panics_with_zero_fee_share() {
         assert!(!panicked, "77 PANICKED (fee_share_bps 0, P3 earnings > 0) in domain {i}");
     }
 }
+
+
+// ═════════════ RACE TESTS (senior draw): who bears the loss when exits/entries race the draw ═════════════
+// World: C-7 shape, BOTH seniors in domain 0 (5M + 5M), 300k junior, loss beyond the junior
+// 331,920 (measured). Fair: each original senior bears half = 165,960; a later entrant bears none.
+// Windows: W0 = after the move, before any vault-LP crank (loss unrealised on the LP);
+//          W1 = after the liquidating crank, draw pending (LP capital 0, pnl < 0).
+
+const RACE_BEYOND: u128 = 331_920;
+
+fn race_world(w0: bool) -> C7 {
+    C7_SINGLE_DOMAIN.with(|c| c.set(true));
+    if w0 { C7_STOP_BEFORE_LP_CRANK.with(|c| c.set(true)); } else { C7_STOP_AT_PENDING.with(|c| c.set(true)); }
+    let c7 = c7_world(5_000_000);
+    C7_SINGLE_DOMAIN.with(|c| c.set(false));
+    C7_STOP_BEFORE_LP_CRANK.with(|c| c.set(false));
+    C7_STOP_AT_PENDING.with(|c| c.set(false));
+    c7
+}
+
+/// Outcome of the same world with NO action in window W (the null control): (winner, s0, s1).
+fn race_null_outcome(w0: bool) -> (u128, u128, u128) {
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, .. } = race_world(w0);
+    c7_to_terminal(&mut w, lp);
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s1, a1, 0)], v0);
+    (o.winner_paid, o.per[0], o.per[1])
+}
+
+fn race_snapshot(w: &P3) -> (u128, u128, u128, i128, u64) {
+    let g = w.env.market_state().1;
+    let pots: u128 = g.source_backing_buckets.iter().take(2).map(|b| b.fresh_unliened_backing_num / percolator::BOUND_SCALE).sum();
+    let lp = w.env.portfolio_state(w.lp);
+    (w.c(), pots, lp.capital, lp.pnl, w.tok(&w.env.vault))
+}
+
+/// D-P3-30 (39b138c8): the permissionless recall returns 0 while any draw is pending, else at most
+/// max(LP equity, 0). In W1 every recall must be refused and move nothing; after the draw books
+/// (LP equity 0) a recall still cannot move value out of the LP.
+#[test]
+fn race_recall_refused_while_draw_pending_then_capped_by_lp_equity() {
+    let C7 { mut w, lp, .. } = race_world(false);
+    let pend = w.env.portfolio_state(lp);
+    assert!(pend.capital == 0 && pend.pnl < 0, "vacuity: draw pending (LP cap {} pnl {})", pend.capital, pend.pnl);
+    let before = race_snapshot(&w);
+    let r0 = w.recall_to(1, 0);
+    let r1 = w.recall_to(1_000, 1);
+    eprintln!("RACE recall while pending: d0 {:?} d1 {:?}", r0.as_ref().map_err(|e| code(e)), r1.as_ref().map_err(|e| code(e)));
+    assert!(r0.is_err() && r1.is_err(), "recall must be refused while a draw is pending");
+    assert_eq!(race_snapshot(&w), before, "a refused recall moves nothing");
+    // Book the draw, then any recall is capped by LP equity (0 here).
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); }
+    let lpb = w.env.portfolio_state(lp);
+    let eq = (lpb.capital as i128 + lpb.pnl).max(0) as u128;
+    let b2 = race_snapshot(&w);
+    let r2 = w.recall_to(1, 0);
+    let a2 = race_snapshot(&w);
+    eprintln!("RACE recall after booking: LP equity {eq}; recall(1) -> {:?}; LP cap {} -> {}", r2.as_ref().map_err(|e| code(e)), b2.2, a2.2);
+    assert!(b2.2 - a2.2.min(b2.2) <= eq, "recall moved {} > LP equity {eq}", b2.2 - a2.2.min(b2.2));
+}
+
+fn race_exit(w0: bool) {
+    let (_, n0, n1) = race_null_outcome(w0);
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, .. } = race_world(w0);
+    // Race property relative to the null control (the absolute loss rule is asserted separately).
+    let fair = n0.max(n1);
+    // s0 races: full redemption inside the window (78 first).
+    let sh = w.tok(&a0) as u128;
+    let rq = w.request_redeem(&s0, a0, sh);
+    let _ = w.crank_fees_78();
+    let (d, r) = w.execute_redeem_domain(&s0, 0);
+    let early = w.tok(&d) as u128;
+    eprintln!("RACE[{}] early exit: 76 {:?} 77 {:?} paid {early} (fair {fair})", if w0 { "W0" } else { "W1" }, rq.as_ref().map_err(|e| code(e)), r.as_ref().map_err(|e| code(e)));
+    if r.is_err() {
+        let red = state::derive_lp_redemption(&w.env.program_id, &w.registry, &s0.pubkey()).0;
+        let (reg_, mint_, esc_) = (w.registry, w.lp_mint, w.escrow);
+        let _ = w.send(ProgInstruction::CancelRedemption, vec![AccountMeta::new(s0.pubkey(), true), AccountMeta::new_readonly(reg_, false), AccountMeta::new(red, false), AccountMeta::new_readonly(mint_, false), AccountMeta::new(a0, false), AccountMeta::new(esc_, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&s0]);
+    }
+    c7_to_terminal(&mut w, lp);
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s1, a1, 0)], v0);
+    let (s0_total, s1_total) = (early + o.per[0], o.per[1]);
+    eprintln!("RACE[{}] s0 total {s0_total} s1 {s1_total} (fair each {fair}); winner {}; left {}", if w0 { "W0" } else { "W1" }, o.winner_paid, o.left);
+    assert!(s0_total <= fair + 2_000, "RACE: the early leaver escaped its share of the loss: {s0_total} > fair {fair}");
+    assert!(s1_total + 2_000 >= n1, "RACE: the stayer was charged the leaver's share: {s1_total} < null {n1}");
+    assert!(o.left <= 5_000, "RACE: {} atoms left (dead shares + the d1 dust depositor)", o.left);
+}
+
+/// A senior racing out in W0 (loss unrealised on the vault LP) must not escape its share.
+#[test]
+fn race_early_exit_before_lp_crank_takes_the_loss() { race_exit(true); }
+/// A senior racing out in W1 (draw pending) must not escape its share.
+#[test]
+fn race_early_exit_while_draw_pending_takes_the_loss() { race_exit(false); }
+
+fn race_entry(w0: bool) {
+    let (_, n0, n1) = race_null_outcome(w0);
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, .. } = race_world(w0);
+    let l = Keypair::new();
+    let r = w.earn_deposit_domain(&l, 5_000_000, true, 0);
+    eprintln!("RACE[{}] late entry 75 (5M, bound) -> {:?}", if w0 { "W0" } else { "W1" }, r.as_ref().map_err(|e| code(e)));
+    let seniors_orig = n0 + n1; // null control (the absolute rule is asserted by the null test)
+    c7_to_terminal(&mut w, lp);
+    let (list, entered): (Vec<(&Keypair, Pubkey, u16)>, bool) = match &r {
+        Ok(la) => (vec![(&s0, a0, 0), (&s1, a1, 0), (&l, *la, 0)], true),
+        Err(_) => (vec![(&s0, a0, 0), (&s1, a1, 0)], false),
+    };
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &list, v0 + if entered { 5_000_000 } else { 0 });
+    let orig: u128 = o.per[0] + o.per[1];
+    eprintln!("RACE[{}] originals {orig} (expected {seniors_orig}); late entrant {:?}; left {}", if w0 { "W0" } else { "W1" }, o.per.get(2), o.left);
+    if entered {
+        assert!(o.per[2] + 2_000 >= 5_000_000, "RACE: the late entrant absorbed pre-entry loss: {} < 5,000,000", o.per[2]);
+    }
+    assert!(orig + 2_000 >= seniors_orig && orig <= seniors_orig + 2_000, "RACE: originals must bear exactly the loss: {orig} vs {seniors_orig}");
+    assert!(o.left <= 5_000, "RACE: {} atoms left (dead shares + the d1 dust depositor)", o.left);
+}
+
+/// A depositor entering in W0 must pay the post-loss price (or be refused).
+#[test]
+fn race_late_entry_before_lp_crank_pays_post_loss_price() { race_entry(true); }
+/// A depositor entering in W1 (draw pending) must pay the post-loss price (or be refused).
+#[test]
+fn race_late_entry_while_draw_pending_pays_post_loss_price() { race_entry(false); }
+
+/// Probe: single-domain seniors (d0 only) + a draw that lands in d1: does the missing sibling
+/// ledger (never created) brick 75/77/78/98, and can a d1 deposit create it?
+/// Seniors only in d0 (no d1 ledger ever created) and a draw that lands in d1: after resolve,
+/// 78 and every 77 must still work. On 39b138c8 they fail InvalidAccountLen (5): the sibling
+/// ledger is read but never created; 75 to d1 is refused (21) in Resolved, so it cannot be made.
+#[test]
+fn p3_draw_into_domain_without_ledger_does_not_brick_the_vault() {
+    C7_NO_D1_LEDGER.with(|c| c.set(true));
+    let C7 { mut w, lp, s0, a0, s1, a1, .. } = race_world(false);
+    C7_NO_D1_LEDGER.with(|c| c.set(false));
+    let l1 = w.ledger1;
+    eprintln!("PROBE ledger1 exists: {:?}", w.env.svm.get_account(&l1).map(|a| a.data.len()));
+    c7_to_terminal(&mut w, lp);
+    let x = Keypair::new();
+    let r = w.earn_deposit_domain(&x, 10_000, true, 1);
+    eprintln!("PROBE (resolved) 75 d1 -> {:?}; ledger1 now {:?}", r.as_ref().map_err(|e| code(e)), w.env.svm.get_account(&l1).map(|a| a.data.len()));
+    let r78 = w.crank_fees_78();
+    let sh = w.tok(&a0) as u128;
+    let _ = w.request_redeem(&s0, a0, sh);
+    let (d, r77) = w.execute_redeem_domain(&s0, 0);
+    eprintln!("PROBE 78 {:?}; 77 d0 {:?} paid {}", r78.as_ref().map_err(|e| code(e)), r77.as_ref().map_err(|e| code(e)), w.tok(&d));
+    let sh1 = w.tok(&a1) as u128;
+    let _ = w.request_redeem(&s1, a1, sh1);
+    let (d1, r77b) = w.execute_redeem_domain(&s1, 0);
+    let paid = w.tok(&d) as u128 + w.tok(&d1) as u128;
+    eprintln!("PROBE second senior 77 {:?}; seniors paid {paid}", r77b.as_ref().map_err(|e| code(e)));
+    assert!(r77.is_ok() && r77b.is_ok(), "seniors bricked after a draw into a domain with no ledger: {:?} / {:?}", r77.as_ref().map_err(|e| code(e)), r77b.as_ref().map_err(|e| code(e)));
+    assert!(paid + 5_000 >= 10_000_000 - RACE_BEYOND, "seniors paid {paid}");
+}
+
+/// Null race control: stop in W1 (draw pending), take NO action in the window, then wind down.
+/// Must equal the un-stopped C-7 outcome: winner paid its full claim, originals bear the loss.
+#[test]
+fn race_null_window_w1_matches_unraced_outcome() {
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed, .. } = race_world(false);
+    c7_to_terminal(&mut w, lp);
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s1, a1, 0)], v0);
+    let orig: u128 = o.per.iter().sum();
+    eprintln!("RACE[null W1] winner {} (owed {owed}); seniors {orig} (expected {}); left {}", o.winner_paid, 10_000_000 - RACE_BEYOND, o.left);
+    assert!(o.winner_paid + 2_000 >= owed, "winner short after an idle W1 window: {} < {owed}", o.winner_paid);
+    assert!(orig + 2_000 >= 10_000_000 - RACE_BEYOND && orig <= 10_000_000 - RACE_BEYOND + 2_000, "seniors {orig}");
+}
+
+
+// ═════════════ SECURITY: the residual relabel must not change a non-draw claimant's payout ═════════════
+// Differential: world X (no vault-LP loss beyond the junior -> no residual, no relabel) vs world Y
+// (identical history, then T wins big -> loss beyond the junior -> senior draw -> residual relabel
+// into the pots). Claimant Z's claim is created BEFORE the divergence and is identical in X and Y;
+// Z's payout must be identical in X and Y (Live convert+withdraw, and Resolved close), Z must be
+// source-attributed before it exits, and T (the liquidation winner of the vault LP) is paid in full.
+// Z kinds: 'trade' (plain trading winner), 'funding' (a thin-side short paid skew + premium funding
+// while flat on price), and the insurance-heavy variant of each (8M insurance topped up first).
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ZKind { Trade, Funding }
+
+struct InsOut { z_claim_pnl: i128, z_entitled: u128, z_paid: u128, z_attributed: bool, t_owed: u128, t_paid: u128, relabel_seen: bool, left: u128, z_funding_gain: i128 }
+
+fn ins_run(y: bool, kind: ZKind, resolved: bool, insurance: u128) -> InsOut {
+    TL_IM.with(|c| c.set(1_000));
+    TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+    if kind == ZKind::Funding { TL_FUNDING.with(|c| c.set(std::env::var("INS_FUNDING").ok().and_then(|v| v.parse().ok()).unwrap_or(100))); }
+    let mut w = P3::new();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    TL_FUNDING.with(|c| c.set(0));
+    w.create_vault();
+    let s0 = Keypair::new();
+    let s1 = Keypair::new();
+    let a0 = w.earn_deposit_domain(&s0, 5_000_000, false, 0).expect("75 d0");
+    let a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 1).expect("75 d1");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
+    let up = w.upgrade.insecure_clone();
+    if kind == ZKind::Funding {
+        w.set_risk_skew(&up, 50_000, 100, 100).unwrap_or_else(|e| panic!("99 skew: {e}"));
+    } else {
+        w.set_risk(&up, 50_000).unwrap_or_else(|e| panic!("99: {e}"));
+    }
+    w.junior_deposit(&admin, 300_000).unwrap_or_else(|e| panic!("96: {e}"));
+    if insurance > 0 { let _ = w.env.top_up_insurance(insurance); }
+    let (z, zp) = w.trader(2_000_000);
+    let (t, tp) = w.trader(2_000_000);
+    let lp = w.lp;
+    let v0 = w.tok(&w.env.vault) as u128;
+    let crank_all = |w: &mut P3| { let _ = w.crank(tp); let _ = w.crank(zp); let _ = w.crank(lp); };
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE); crank_all(&mut w);
+    // Phase 1 (identical in X and Y): T opens long 1.0; Z's claim is built.
+    let _ = w.trade_vs_lp_fee(&t, tp, 1_000_000, 30);
+    let z_cap0 = w.env.portfolio_state(zp).capital;
+    match kind {
+        ZKind::Trade => {
+            let _ = w.trade_vs_lp_fee(&z, zp, 300_000, 30);
+            MARK.with(|c| c.set(PRICE * 106 / 100));
+            for _ in 0..4 { let s = w.slot() + 500; w.env.svm.warp_to_slot(s); w.push(PRICE * 106 / 100); crank_all(&mut w); }
+            let _ = w.trade_vs_lp_fee(&z, zp, -w.pos(zp), 30);
+            // back to 1.0 so X and Y diverge only by T's later move
+            MARK.with(|c| c.set(PRICE));
+            for _ in 0..4 { let s = w.slot() + 500; w.env.svm.warp_to_slot(s); w.push(PRICE); crank_all(&mut w); }
+        }
+        ZKind::Funding => {
+            // Z short (thin side) while T long skews the book; price flat; funding accrues to Z.
+            let _ = w.trade_vs_lp_fee(&z, zp, -100_000, 30);
+            MARK.with(|c| c.set(PRICE));
+            for _ in 0..100 { let s = w.slot() + 500; w.env.svm.warp_to_slot(s); w.push(PRICE); crank_all(&mut w); }
+            let mut tries = 0;
+            loop {
+                let rz = w.trade_vs_lp_fee(&z, zp, -w.pos(zp), 30);
+                tries += 1;
+                eprintln!("INS funding: Z close #{tries} -> {:?} pos now {}", rz.as_ref().map_err(|e| code(e)), w.pos(zp));
+                if rz.is_ok() || tries >= 12 { break; }
+                // permissionless progress between retries: cranks, 45, 89, fresh marks, waits
+                let m = w.env.market;
+                for side in 0..2u8 { let _ = w.send(ProgInstruction::FinalizeResetSide { asset_index: 0, side }, vec![AccountMeta::new(m, false)], &[]); }
+                let s = w.slot() + if tries < 6 { 1 } else { 600 }; w.env.svm.warp_to_slot(s); w.push(PRICE); crank_all(&mut w);
+            }
+            for _ in 0..2 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); crank_all(&mut w); }
+        }
+    }
+    let zs = w.env.portfolio_state(zp);
+    let z_entitled = zs.capital + zs.pnl.max(0) as u128;
+    let zs_pnl = zs.pnl;
+    let z_funding_gain = zs.capital as i128 + zs.pnl - z_cap0 as i128;
+    let z_attributed = zs.pnl <= 0 || zs.source_claim_bound_num.iter().sum::<u128>() > 0;
+    eprintln!("INS[{kind:?} y={y} resolved={resolved} ins={insurance}] Z after phase 1: cap {} pnl {} (entitled {z_entitled}, net vs start {z_funding_gain}); claim bound {:?}", zs.capital, zs.pnl, zs.source_claim_bound_num.iter().map(|x| x / percolator::BOUND_SCALE).collect::<Vec<_>>());
+    // Phase 2: Y only -- T wins +48.6% (C-7 steps), the vault LP loses beyond the junior.
+    if y {
+        let mut m = PRICE;
+        for _ in 0..9 {
+            m = m * 10_450 / 10_000;
+            MARK.with(|c| c.set(m));
+            let s = w.slot() + 520; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(tp);
+        }
+        for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); }
+    }
+    let _ = w.trade_vs_lp_fee(&t, tp, -w.pos(tp), 30);
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); crank_all(&mut w); }
+    let ts = w.env.portfolio_state(tp);
+    let t_owed = ts.capital + ts.pnl.max(0) as u128;
+    let m = w.env.market;
+    let exit = |w: &mut P3, k: &Keypair, p: Pubkey, resolved: bool| -> (u128, bool) {
+        let mut paid = 0u128;
+        let mut relabel = false;
+        if !resolved {
+            // Positive PnL releases over the warm-up (h_min 1,000 slots on the TRUMP params):
+            // keep converting what is released, cranking between, bounded.
+            for _ in 0..60 {
+                let pnl = w.env.portfolio_state(p).pnl;
+                if pnl <= 0 { break; }
+                let (pid, _, pep) = w.env.portfolio_identity(p);
+                let rc = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+                    vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)], &[k]);
+                if std::env::var("INS_TRACE").is_ok() { eprintln!("INS trace convert {pnl} -> {:?}", rc.as_ref().map_err(|e| code(e))); }
+                let s = w.slot() + 250; w.env.svm.warp_to_slot(s); w.push(MARK.with(|c| c.get())); let _ = w.crank(p);
+            }
+            let cap = w.env.portfolio_state(p).capital;
+            let dest = w.token(k.pubkey(), 0);
+            let (pid, seq, _) = w.env.portfolio_identity(p);
+            let rw = w.send(ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: cap },
+                vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(dest, false),
+                     AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false)], &[k]);
+            if std::env::var("INS_TRACE").is_ok() { let st = w.env.portfolio_state(p); eprintln!("INS trace withdraw {cap} -> {:?}; now cap {} pnl {} legs {}", rw.as_ref().map_err(|e| code(e)), st.capital, st.pnl, st.legs.iter().filter(|l| l.active).count()); }
+            paid += w.tok(&dest) as u128;
+        } else {
+            let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
+            for _ in 0..1_000 {
+                let dest = w.token(k.pubkey(), 0);
+                let r = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+                    AccountMeta::new_readonly(k.pubkey(), false), AccountMeta::new(m, false), AccountMeta::new(p, false),
+                    AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[]);
+                let got = w.tok(&dest) as u128;
+                paid += got;
+                if std::env::var("INS_TRACE").is_ok() && (r.is_err() || got > 0) { eprintln!("INS trace CloseResolved -> {:?} got {got}", r.as_ref().map_err(|e| code(e))); }
+                if got > 0 || r.is_err() { break; }
+            }
+        }
+        let _ = &mut relabel;
+        (paid, relabel)
+    };
+    if resolved {
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(MARK.with(|c| c.get()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+        assert_eq!(w.env.market_state().1.mode, percolator::MarketModeV16::Resolved, "vacuity: resolved");
+    }
+    let g = w.env.market_state().1;
+    let relabel_seen = y && g.source_backing_buckets.iter().take(2).any(|b| b.fresh_unliened_backing_num > 0);
+    // Z exits first in Y (the relabel happens at T's convert or already at the draw).
+    let (z_paid, _) = exit(&mut w, &z, zp, resolved);
+    let (t_paid, _) = exit(&mut w, &t, tp, resolved);
+    let _ = (s0, s1, a0, a1, v0);
+    let left = w.tok(&w.env.vault) as u128;
+    eprintln!("INS[{kind:?} y={y} resolved={resolved} ins={insurance}] Z entitled {z_entitled} paid {z_paid} attributed {z_attributed}; T owed {t_owed} paid {t_paid}; vault left {left}");
+    InsOut { z_claim_pnl: zs_pnl, z_entitled, z_paid, z_attributed, t_owed, t_paid, relabel_seen, left, z_funding_gain }
+}
+
+fn ins_check(kind: ZKind, resolved: bool, insurance: u128) {
+    let x = ins_run(false, kind, resolved, insurance);
+    let y = ins_run(true, kind, resolved, insurance);
+    assert_eq!(x.z_entitled, y.z_entitled, "vacuity: Z's claim is identical in X and Y before the divergence");
+    assert!(y.z_entitled > 2_000_000 || kind == ZKind::Funding, "vacuity: Z is a winner (entitled {})", y.z_entitled);
+    // Funding: Z (flat on price) holds a positive funding claim (pnl > 0 after its close; its two
+    // trade fees are charged to capital, so its net vs start can be negative).
+    if kind == ZKind::Funding { assert!(y.z_claim_pnl > 0, "vacuity: Z holds a funding claim (pnl {}; net {})", y.z_claim_pnl, y.z_funding_gain); }
+    assert!(y.z_attributed, "Z's positive claim is not source-attributed");
+    assert!((x.z_paid as i128 - y.z_paid as i128).abs() <= 2, "SECURITY: the relabel changed Z's payout: X {} vs Y {}", x.z_paid, y.z_paid);
+    assert!(y.z_paid + 2 >= y.z_entitled, "Z not paid its entitlement in Y: {} < {}", y.z_paid, y.z_entitled);
+    assert!(y.t_paid + 2_000 >= y.t_owed, "T (the vault LP's liquidation winner) not paid in full: {} < {}", y.t_paid, y.t_owed);
+    let _ = y.relabel_seen;
+}
+
+#[test] fn ins_trade_winner_unchanged_by_relabel_live() { ins_check(ZKind::Trade, false, 0); }
+#[test] fn ins_trade_winner_unchanged_by_relabel_resolved() { ins_check(ZKind::Trade, true, 0); }
+#[test] fn ins_trade_winner_insurance_heavy_unchanged_by_relabel_live() { ins_check(ZKind::Trade, false, 8_000_000); }
+#[test] fn ins_trade_winner_insurance_heavy_unchanged_by_relabel_resolved() { ins_check(ZKind::Trade, true, 8_000_000); }
+#[test] fn ins_funding_winner_unchanged_by_relabel_live() { ins_check(ZKind::Funding, false, 0); }
+#[test] fn ins_funding_winner_unchanged_by_relabel_resolved() { ins_check(ZKind::Funding, true, 0); }
+#[test] fn ins_funding_winner_insurance_heavy_unchanged_by_relabel_live() { ins_check(ZKind::Funding, false, 8_000_000); }
+#[test] fn ins_funding_winner_insurance_heavy_unchanged_by_relabel_resolved() { ins_check(ZKind::Funding, true, 8_000_000); }
