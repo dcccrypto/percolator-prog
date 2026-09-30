@@ -2051,8 +2051,29 @@ impl World {
         self.do_deposit(a, 5_000_000).map_err(|e| format!("fresh deposit a: {:?}", custom_code(&e)))?;
         self.do_deposit(b, 5_000_000).map_err(|e| format!("fresh deposit b: {:?}", custom_code(&e)))?;
         let q = POS_SCALE as i128;
-        self.do_trade_nocpi(a, b, q, self.mark).map_err(|e| format!("fresh open at mark: {:?}", custom_code(&e)))?;
-        self.do_trade_nocpi(a, b, -q, self.mark).map_err(|e| format!("fresh close at mark: {:?}", custom_code(&e)))?;
+        if p3_mode() && self.p3.is_some() {
+            // P3 asset: all trading goes through the vault LP (NoCpi growth is 77 by design).
+            let _ = b;
+            let s = self.slot() + 1;
+            self.env.svm.warp_to_slot(s);
+            let _ = self.do_push(self.mark);
+            let _ = self.do_crank(a);
+            // Size the probe inside the 1x-equity cap: 1% of LP capital in notional.
+            let lp_cap = self.env.svm.get_account(&self.p3.as_ref().unwrap().lp).and_then(|x| state::read_portfolio(&x.data).ok()).map_or(0, |p| p.capital);
+            let q = ((lp_cap / 100).max(1) as i128 * POS_SCALE as i128 / self.mark.max(1) as i128).max(1);
+            if let Err(e) = self.p3_trade_vs_vault_lp(a, q) {
+                let lp = self.p3.as_ref().unwrap().lp;
+                let cap = self.env.svm.get_account(&lp).and_then(|x| state::read_portfolio(&x.data).ok()).map(|p| (p.capital, p.pnl));
+                // 80 VaultLpExposureCapExceeded with a depleted vault LP (1x-equity cap = 0) is the
+                // designed "bounded death" until the junior re-capitalises; report it distinctly.
+                return Err(format!("fresh open vs vault LP: {:?} (vault LP capital/pnl {:?})", custom_code(&e), cap));
+            }
+            self.p3_trade_vs_vault_lp(a, -q).map_err(|e| format!("fresh close vs vault LP: {:?}", custom_code(&e)))?;
+            let _ = q;
+        } else {
+            self.do_trade_nocpi(a, b, q, self.mark).map_err(|e| format!("fresh open at mark: {:?}", custom_code(&e)))?;
+            self.do_trade_nocpi(a, b, -q, self.mark).map_err(|e| format!("fresh close at mark: {:?}", custom_code(&e)))?;
+        }
         for u in 0..self.ports.len() {
             if self.closed[u] || !self.is_flat(u) {
                 continue;
