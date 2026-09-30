@@ -55,14 +55,51 @@ fn raw(tag: u8, body: &[u8]) -> Vec<u8> {
     v
 }
 
+thread_local! {
+    /// Atomic-batch capture: when Some, P3::send/send_raw queue the instruction instead of sending.
+    static CAPTURE: std::cell::RefCell<Option<(Vec<Instruction>, Vec<Keypair>)>> = std::cell::RefCell::new(None);
+    /// (lp matcher-sequence add, taker position-epoch add, lp position-epoch add) for the next TradeCpi.
+    static TRADE_ID_BUMP: std::cell::Cell<(u64, u64, u64)> = std::cell::Cell::new((0, 0, 0));
+}
+
 impl P3 {
+    fn capture_push(ix: Instruction, signers: &[&Keypair]) -> bool {
+        CAPTURE.with(|c| {
+            let mut c = c.borrow_mut();
+            if let Some((ixs, ks)) = c.as_mut() {
+                ixs.push(ix);
+                for k in signers { if !ks.iter().any(|x| x.pubkey() == k.pubkey()) { ks.push(k.insecure_clone()); } }
+                true
+            } else { false }
+        })
+    }
+    fn capture_begin() { CAPTURE.with(|c| *c.borrow_mut() = Some((vec![], vec![]))); }
+    /// Send every captured instruction in ONE transaction (all-or-nothing).
+    fn capture_commit(&mut self) -> Result<u64, String> {
+        let (ixs, ks) = CAPTURE.with(|c| c.borrow_mut().take()).expect("capture_begin first");
+        self.env.svm.expire_blockhash();
+        let payer = self.env.payer.insecure_clone();
+        let touched: Vec<Pubkey> = ixs.iter().flat_map(|i| i.accounts.iter().map(|m| m.pubkey)).collect();
+        let mut all = vec![heap_ix(), cu_ix()];
+        all.extend(ixs);
+        let mut signers: Vec<&Keypair> = vec![&payer];
+        for k in &ks { signers.push(k); }
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(&all, Some(&payer.pubkey()), &signers, self.env.svm.latest_blockhash());
+        let r = self.env.svm.send_transaction(tx).map(|m| m.compute_units_consumed).map_err(|e| format!("{e:?}"));
+        if r.is_ok() { gc_zero_lamport_accounts(&mut self.env.svm, &touched); }
+        log_error_sites(&r);
+        r
+    }
     fn send_raw(&mut self, data: Vec<u8>, metas: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
         self.env.svm.expire_blockhash();
         let ix = Instruction { program_id: self.env.program_id, accounts: metas, data };
+        if Self::capture_push(ix.clone(), signers) { return Ok(0); }
         send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, signers)
     }
     fn send(&mut self, ix: ProgInstruction, metas: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
         self.env.svm.expire_blockhash();
+        let raw_ix = Instruction { program_id: self.env.program_id, accounts: metas.clone(), data: ix.encode() };
+        if Self::capture_push(raw_ix, signers) { return Ok(0); }
         self.env.send(ix, metas, signers)
     }
     fn token(&mut self, owner: Pubkey, amount: u64) -> Pubkey {
@@ -552,6 +589,8 @@ impl P3 {
     fn trade_vs_lp_fee(&mut self, taker: &Keypair, tp: Pubkey, size_q: i128, fee_bps: u64) -> Result<u64, String> {
         let (aid, _, aep) = self.env.portfolio_identity(tp);
         let (bid, bseq, bep) = self.env.portfolio_identity(self.lp);
+        let (ds, da, db) = TRADE_ID_BUMP.with(|c| c.replace((0, 0, 0)));
+        let (aep, bseq, bep) = (aep + da, bseq + ds, bep + db);
         let (m, lp, mp, ctx, del) = (self.env.market, self.lp, self.matcher, self.ctx, self.delegate);
         self.send(
             ProgInstruction::TradeCpi {
@@ -2457,3 +2496,158 @@ fn ins_check(kind: ZKind, resolved: bool, insurance: u128) {
 #[test] fn ins_funding_winner_unchanged_by_relabel_resolved() { ins_check(ZKind::Funding, true, 0); }
 #[test] fn ins_funding_winner_insurance_heavy_unchanged_by_relabel_live() { ins_check(ZKind::Funding, false, 8_000_000); }
 #[test] fn ins_funding_winner_insurance_heavy_unchanged_by_relabel_resolved() { ins_check(ZKind::Funding, true, 8_000_000); }
+
+/// Probe: identity deltas a TradeCpi applies (taker epoch, LP matcher sequence, LP epoch).
+#[test]
+#[ignore]
+fn atomic_probe_trade_identity_deltas() {
+    TL_IM.with(|c| c.set(1_000));
+    TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+    let mut w = P3::new();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    w.create_vault();
+    let s0 = Keypair::new();
+    let _ = w.earn_deposit_domain(&s0, 5_000_000, false, 0).unwrap();
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap();
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap();
+    w.junior_deposit(&admin, 300_000).unwrap();
+    let (a, ap) = w.trader(2_000_000);
+    let lp = w.lp;
+    let i0 = (w.env.portfolio_identity(ap), w.env.portfolio_identity(lp));
+    w.trade_vs_lp_fee(&a, ap, 500_000, 30).unwrap();
+    let i1 = (w.env.portfolio_identity(ap), w.env.portfolio_identity(lp));
+    w.trade_vs_lp_fee(&a, ap, -500_000, 30).unwrap();
+    let i2 = (w.env.portfolio_identity(ap), w.env.portfolio_identity(lp));
+    eprintln!("IDS {:?} -> {:?} -> {:?}", i0, i1, i2);
+}
+
+// ═════════════ ATOMIC ONE-SIGNATURE WITHDRAWAL (redemption cooldown 0) ═════════════
+// UX proposal: seed redemption_cooldown_slots = 0 so a senior can 76 + 77 in ONE transaction.
+// Adversary A is a senior AND a trader. In ONE transaction A does: its own TradeCpi vs the vault
+// LP, a 75 deposit, a 78 harvest, 76 of ALL its shares, 77, and a closing TradeCpi. Victim V is a
+// passive senior. Compared with a control world where A only redeems (76/78/77 in separate
+// transactions), A must not end richer and V must not end poorer: the C cap, draw-before-pricing
+// and the 84 harvest rule must hold inside one transaction.
+
+thread_local! { static NEW_ATA: std::cell::Cell<Option<Pubkey>> = std::cell::Cell::new(None); }
+struct AtomicOut { a_delta: i128, v_paid: u128, tx: Result<u64, Option<u32>>, left: u128 }
+
+/// `window`: 0 = quiet market with harvestable fees pending; 1 = C-7 draw pending (W1).
+fn atomic_world_run(attack: bool, window: u8) -> AtomicOut {
+    // Common world: cooldown 0 (the harness's CreateLpVault uses redemption_cooldown_slots = 0).
+    let (mut w, a, a_ata, v, v_ata, lp, others): (P3, Keypair, Pubkey, Keypair, Pubkey, Pubkey, Vec<(Keypair, Pubkey)>);
+    if window == 1 {
+        let c7 = race_world(false);
+        let C7 { w: w_, t, tp, s0, a0, s1, a1, lp: lp_, .. } = c7;
+        w = w_; a = s0; a_ata = a0; v = s1; v_ata = a1; lp = lp_; others = vec![(t, tp)];
+    } else {
+        TL_IM.with(|c| c.set(1_000));
+        TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+        w = P3::new();
+        TL_FEE_SHARE.with(|c| c.set(None));
+        w.create_vault();
+        a = Keypair::new(); v = Keypair::new();
+        a_ata = w.earn_deposit_domain(&a, 5_000_000, false, 0).unwrap();
+        v_ata = w.earn_deposit_domain(&v, 5_000_000, false, 0).unwrap();
+        let _ = w.earn_deposit_domain(&Keypair::new(), 1_000, false, 1).unwrap(); // d1 ledger exists
+        let admin = w.env.admin.insecure_clone();
+        w.init_vault_lp(&admin, 1_000).unwrap();
+        let up = w.upgrade.insecure_clone();
+        w.set_risk(&up, 50_000).unwrap();
+        w.junior_deposit(&admin, 300_000).unwrap();
+        lp = w.lp;
+        let (o, op) = w.trader(2_000_000);
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE); let _ = w.crank(lp);
+        // Fee-generating round trips by an unrelated trader; no 78 harvest yet (fees pending).
+        for _ in 0..4 { w.trade_vs_lp_fee(&o, op, 800_000, 30).unwrap(); w.trade_vs_lp_fee(&o, op, -800_000, 30).unwrap(); }
+        others = vec![(o, op)];
+    }
+    let _ = others;
+    // A's trader portfolio and token wallet.
+    let (ak, akp) = (a.insecure_clone(), { let p = w.env.create_portfolio(&a); p });
+    let src = w.token(ak.pubkey(), 3_000_000);
+    {
+        let (pid, seq, _) = w.env.portfolio_identity(akp);
+        let (m, vlt) = (w.env.market, w.env.vault);
+        w.send(ProgInstruction::Deposit { portfolio_id: pid, expected_sequence: seq, amount: 1_000_000 },
+            vec![AccountMeta::new(ak.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(akp, false), AccountMeta::new(src, false),
+                 AccountMeta::new(vlt, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&ak]).expect("A trader deposit");
+    }
+    let wealth = |w: &P3| -> i128 {
+        let toks: i128 = w.tokens.iter().filter(|k| w.env.svm.get_account(k).map_or(false, |acc| acc.owner == spl_token::ID))
+            .filter(|k| { use solana_sdk::program_pack::Pack; w.env.svm.get_account(k).and_then(|acc| spl_token::state::Account::unpack(&acc.data).ok()).map_or(false, |t| t.owner == ak.pubkey() && t.mint == w.env.mint) })
+            .map(|k| w.tok(k) as i128).sum();
+        let eq = if w.env.svm.get_account(&akp).map_or(false, |acc| acc.lamports > 0) { let x = w.env.portfolio_state(akp); x.capital as i128 + x.pnl } else { 0 };
+        toks + eq
+    };
+    let shares0 = w.tok(&a_ata) as u128;
+    let w0 = wealth(&w);
+    let m0 = w.minted;
+    let tx;
+    let mut dest_a = Pubkey::default();
+    if attack {
+        P3::capture_begin();
+        let _ = w.trade_vs_lp_fee(&ak, akp, 400_000, 30);                 // own trade before
+        let new_ata = w.earn_deposit_domain(&ak, 1_000_000, true, 0).unwrap(); // 75 deposit (queued)
+        NEW_ATA.with(|c| c.set(Some(new_ata)));
+        let _ = w.crank_fees_78();                                         // 78 harvest
+        let _ = w.request_redeem(&ak, a_ata, shares0);                      // 76 (original shares)
+        let (d, _) = w.execute_redeem_domain(&ak, 0);                      // 77
+        dest_a = d;
+        let _ = w.trade_vs_lp_fee(&ak, akp, -400_000, 30);                // own trade after
+        tx = w.capture_commit();
+    } else {
+        let _ = w.crank_fees_78();
+        let _ = w.request_redeem(&ak, a_ata, shares0);
+        let (d, r) = w.execute_redeem_domain(&ak, 0);
+        dest_a = d;
+        tx = r;
+    }
+    let _ = dest_a;
+    let tx = tx.map_err(|e| code(&e));
+    let w1 = wealth(&w) - (w.minted - m0) as i128; // exclude test-minted deposit sources
+    // Remaining A shares (e.g. the in-tx deposit's) are valued by redeeming them now, then V exits.
+    let rest_ata = NEW_ATA.with(|c| c.take()).unwrap_or(a_ata);
+    eprintln!("ATOMIC after tx: A shares orig {} new {}", w.tok(&a_ata), w.tok(&rest_ata));
+    let rest = w.tok(&rest_ata) as u128 + if rest_ata != a_ata { w.tok(&a_ata) as u128 } else { 0 };
+    let mut rest_paid = 0i128;
+    if rest > 0 && w.tok(&rest_ata) > 0 {
+        let rest = w.tok(&rest_ata) as u128;
+        let _ = w.crank_fees_78();
+        let _ = w.request_redeem(&ak, rest_ata, rest);
+        let (d, r) = w.execute_redeem_domain(&ak, 0);
+        eprintln!("ATOMIC rest redeem {rest} from {rest_ata} -> {:?}", r.as_ref().map_err(|e| code(e)));
+        if r.is_ok() { rest_paid = w.tok(&d) as i128; }
+    }
+    if window == 1 { for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); } }
+    let _ = w.crank_fees_78();
+    let vs = w.tok(&v_ata) as u128;
+    let _ = w.request_redeem(&v, v_ata, vs);
+    let (vd, vr) = w.execute_redeem_domain(&v, 0);
+    let v_paid = if vr.is_ok() { w.tok(&vd) as u128 } else { 0 };
+    let left = w.tok(&w.env.vault) as u128;
+    let a_delta = w1 - w0 + rest_paid;
+    eprintln!("ATOMIC[w{window} attack={attack}] tx {:?}; A wealth delta {a_delta} (tokens+equity; + later redeem of extra shares {rest_paid}); V paid {v_paid} (77 {:?}); vault left {left}", tx, vr.as_ref().map_err(|e| code(e)));
+    AtomicOut { a_delta, v_paid, tx, left }
+}
+
+fn atomic_check(window: u8) {
+    let ctrl = atomic_world_run(false, window);
+    let atk = atomic_world_run(true, window);
+    assert!(ctrl.tx.is_ok(), "vacuity: the control redeem works ({:?})", ctrl.tx);
+    // A's control gain is its redemption; the attack adds a deposit round trip and a flat trade
+    // round trip (fees only), so it can at best equal the control.
+    assert!(atk.a_delta <= ctrl.a_delta + 2, "EXTRACTION: one-tx 76+77 with trades/deposit/harvest beat a plain redeem: {} > {}", atk.a_delta, ctrl.a_delta);
+    assert!(atk.v_paid + 2 >= ctrl.v_paid, "the passive senior lost value to the atomic combo: {} < {}", atk.v_paid, ctrl.v_paid);
+    let _ = (atk.left, ctrl.left);
+}
+
+/// Quiet market, LP fees pending (84 rule), cooldown 0: the atomic combo extracts nothing.
+#[test]
+fn atomic_one_tx_redeem_with_trades_deposit_harvest_extracts_nothing_fees_pending() { atomic_check(0); }
+/// Draw pending (C-7 W1), cooldown 0: the atomic combo extracts nothing (fills halted 89, or
+/// priced after the draw).
+#[test]
+fn atomic_one_tx_redeem_with_trades_deposit_harvest_extracts_nothing_draw_pending() { atomic_check(1); }
