@@ -381,6 +381,84 @@ impl P3 {
         (dest, r)
     }
 
+    /// Resolved tag 78 (bound tail = vault_lp_state). Valid on a terminal-flat Resolved bound
+    /// market (P3 F-14 head): harvests pending LP fees + claim-free residual into the pot.
+    fn crank_fees_78(&mut self) -> Result<u64, String> {
+        let payer = self.env.payer.pubkey();
+        let metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(self.env.market, false),
+            AccountMeta::new(self.registry, false),
+            AccountMeta::new(self.ledger0, false),
+            AccountMeta::new(self.ledger1, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new(self.state_pda, false),
+        ];
+        self.send(ProgInstruction::LpVaultCrankFees { domain: 0 }, metas, &[])
+    }
+
+    /// Permissionless Resolved tag 8 by a stranger: [closer, market, portfolio, owner(=rent)].
+    fn close_portfolio_permissionless(&mut self, p: Pubkey, owner: Pubkey) -> Result<u64, String> {
+        let closer = Keypair::new();
+        self.env.ensure_signer_account(closer.pubkey());
+        let (pid, seq, ep) = self.env.portfolio_identity(p);
+        let m = self.env.market;
+        self.send(
+            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
+            vec![AccountMeta::new(closer.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(owner, false)],
+            &[&closer],
+        )
+    }
+
+    /// Junior's terminal payout: Resolved tag 102 for `physical − C` (junior owner signs; tail
+    /// [7] dest, [8] vault, [9] vault authority, [10] token program). Largest accepted amount
+    /// first, halving; returns the total SPL paid to the junior.
+    fn junior_release_resolved(&mut self, junior: &Keypair) -> u128 {
+        let mut paid = 0u128;
+        let mut amt = self.tok(&self.env.vault) as u128;
+        while amt > 0 {
+            let dest = self.token(junior.pubkey(), 0);
+            let mut b = amt.to_le_bytes().to_vec();
+            b.extend_from_slice(&0u16.to_le_bytes());
+            let metas = vec![
+                AccountMeta::new(junior.pubkey(), true),
+                AccountMeta::new(self.env.market, false),
+                AccountMeta::new_readonly(self.registry, false),
+                AccountMeta::new(self.state_pda, false),
+                AccountMeta::new(self.lp, false),
+                AccountMeta::new(self.ledger0, false),
+                AccountMeta::new(self.ledger1, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.env.vault, false),
+                AccountMeta::new_readonly(self.env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ];
+            if self.send_raw(raw(102, &b), metas, &[junior]).is_ok() {
+                paid += self.tok(&dest) as u128;
+                amt = self.tok(&self.env.vault) as u128;
+                continue;
+            }
+            amt /= 2;
+        }
+        paid
+    }
+
+    /// Keeper terminal sequence after 101 + trader CloseResolved (P3 doc §128): permissionless
+    /// tag 8 of each empty trader (rent to owner) and of the vault LP ([3] = registry), then
+    /// Resolved tag 78. Returns the 78 result.
+    fn terminal_cleanup(&mut self, traders: &[(Pubkey, Pubkey)]) -> Result<u64, String> {
+        for &(tp, owner) in traders {
+            let r = self.close_portfolio_permissionless(tp, owner);
+            eprintln!("   tag8 trader (permissionless) -> {:?}", r.as_ref().map_err(|e| code(e)));
+        }
+        let (lp, reg) = (self.lp, self.registry);
+        let r = self.close_portfolio_permissionless(lp, reg);
+        eprintln!("   tag8 vault LP (permissionless, [3]=registry) -> {:?}", r.as_ref().map_err(|e| code(e)));
+        let r78 = self.crank_fees_78();
+        eprintln!("   resolved tag78 -> {:?}", r78.as_ref().map_err(|e| code(e)));
+        r78
+    }
+
     fn crank(&mut self, p: Pubkey) -> Result<u64, String> {
         let slot = self.slot();
         let payer = self.env.payer.pubkey();
@@ -429,6 +507,38 @@ impl P3 {
                 asset_index: 0,
                 size_q,
                 fee_bps: 0,
+                limit_price: 0,
+                backing_fee_cap_bps: 10_000,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(tp, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(del, false),
+            ],
+            &[taker],
+        )
+    }
+
+    /// Same, with the taker's signed fee consent (>= the market base fee).
+    fn trade_vs_lp_fee(&mut self, taker: &Keypair, tp: Pubkey, size_q: i128, fee_bps: u64) -> Result<u64, String> {
+        let (aid, _, aep) = self.env.portfolio_identity(tp);
+        let (bid, bseq, bep) = self.env.portfolio_identity(self.lp);
+        let (m, lp, mp, ctx, del) = (self.env.market, self.lp, self.matcher, self.ctx, self.delegate);
+        self.send(
+            ProgInstruction::TradeCpi {
+                account_a_portfolio_id: aid,
+                account_a_position_epoch: aep,
+                account_b_portfolio_id: bid,
+                account_b_position_epoch: bep,
+                market_id: 1,
+                account_b_matcher_sequence: bseq,
+                asset_index: 0,
+                size_q,
+                fee_bps,
                 limit_price: 0,
                 backing_fee_cap_bps: 10_000,
             },
@@ -677,17 +787,12 @@ fn run_h1(win_mark: u64, junior: u64) -> (u128, u128, u128, u128) {
         }
         // put shares back for the pro-rata check below if the request escrowed them
     }
-    // marketauth terminal cleanup (tag 8) of the trader and the settled vault LP
-    for p in [tp, w.lp] {
-        let (pid, seq, ep) = w.env.portfolio_identity(p);
-        let m = w.env.market;
-        let r = w.send(
-            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
-            &[&admin],
-        );
-        eprintln!("cleanup ClosePortfolio {} by marketauth -> {:?}", if p == tp { "trader" } else { "vault LP" }, r.as_ref().map_err(|e| code(e)));
-    }
+    // Keeper terminal sequence (P3 doc §128, F-14 head): permissionless tag 8 of the empty
+    // trader and the vault LP, then Resolved tag 78 (terminal-flat). No marketauth involved.
+    let r78 = w.terminal_cleanup(&[(tp, t.pubkey())]);
+    let (_, g) = w.env.market_state();
+    assert_eq!(g.materialized_portfolio_count, 0, "terminal-flat after permissionless cleanup");
+    let _ = r78;
     // seniors redeem in Resolved mode
     let mut senior_out = [0u128; 2];
     for (i, (k, ata)) in [(&s1, atas[0]), (&s2, atas[1])].into_iter().enumerate() {
@@ -702,6 +807,12 @@ fn run_h1(win_mark: u64, junior: u64) -> (u128, u128, u128, u128) {
         });
         senior_out[i] = w.tok(&d) as u128;
     }
+    // Junior's terminal payout AFTER the seniors: Resolved tag 102 for physical − C.
+    let junior_102 = w.junior_release_resolved(&admin);
+    eprintln!("   junior Resolved tag102 paid {junior_102}; vault left {}", w.tok(&w.env.vault));
+    let junior_out = junior_out + junior_102;
+    // No value stranded beyond the 1,000 dead-share atoms (+ rounding).
+    assert!((w.tok(&w.env.vault) as u128) <= 2_000, "value stranded after every exit: vault {}", w.tok(&w.env.vault));
     // token conservation (every atom this test minted is somewhere or burned-accounted: no burns here)
     assert_eq!(w.held(), w.minted, "token conservation broke");
     let senior_total = senior_out[0] + senior_out[1];
@@ -846,17 +957,11 @@ fn run_exit(win_mark: u64, junior: u64, units_req: i128) -> (u128, u128, u128, u
         }
         // put shares back for the pro-rata check below if the request escrowed them
     }
-    // marketauth terminal cleanup (tag 8) of the trader and the settled vault LP
-    for p in [tp, w.lp] {
-        let (pid, seq, ep) = w.env.portfolio_identity(p);
-        let m = w.env.market;
-        let r = w.send(
-            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
-            &[&admin],
-        );
-        eprintln!("cleanup ClosePortfolio {} by marketauth -> {:?}", if p == tp { "trader" } else { "vault LP" }, r.as_ref().map_err(|e| code(e)));
-    }
+    // Keeper terminal sequence (P3 doc §128, F-14 head): permissionless tag 8 of the empty
+    // trader and the vault LP, then Resolved tag 78 (terminal-flat). No marketauth involved.
+    let _ = w.terminal_cleanup(&[(tp, t.pubkey())]);
+    let (_, g) = w.env.market_state();
+    assert_eq!(g.materialized_portfolio_count, 0, "terminal-flat after permissionless cleanup");
     // seniors redeem in Resolved mode
     let mut senior_out = [0u128; 2];
     for (i, (k, ata)) in [(&s1, atas[0]), (&s2, atas[1])].into_iter().enumerate() {
@@ -871,6 +976,11 @@ fn run_exit(win_mark: u64, junior: u64, units_req: i128) -> (u128, u128, u128, u
         });
         senior_out[i] = w.tok(&d) as u128;
     }
+    // Junior's terminal payout AFTER the seniors: Resolved tag 102 for physical − C.
+    let junior_102 = w.junior_release_resolved(&admin);
+    eprintln!("   junior Resolved tag102 paid {junior_102}; vault left {}", w.tok(&w.env.vault));
+    let junior_out = junior_out + junior_102;
+    assert!((w.tok(&w.env.vault) as u128) <= 2_000, "value stranded after every exit: vault {}", w.tok(&w.env.vault));
     // token conservation (every atom this test minted is somewhere or burned-accounted: no burns here)
     assert_eq!(w.held(), w.minted, "token conservation broke");
     // Late settlement attempts: can the junior still collect whatever V - senior remains?
@@ -1071,14 +1181,28 @@ fn p3_tranche_genesis_senior_cannot_capture_fee_backlog() {
     w.set_risk(&up, 0).expect("99");
     w.set_matcher(&up).expect("95");
     w.junior_deposit(&admin, 5_000_000).expect("96");
-    // fee-bearing trades between two traders (NoCpi, base fee via caller fee_bps)
     let (a, pa) = w.trader(20_000_000);
     let (b, pb) = w.trader(20_000_000);
-    for _ in 0..5 {
-        w.env.svm.expire_blockhash();
-        let _ = w.env.try_trade_asset_with_cu(0, &a, pa, &b, pb, 5 * U, PRICE, 30);
-        w.env.svm.expire_blockhash();
-        let _ = w.env.try_trade_asset_with_cu(0, &a, pa, &b, pb, -5 * U, PRICE, 30);
+    // P3-g (F-14 head): NoCpi between two traders that GROWS either side on the bound asset is
+    // refused 77 — the vault LP is the exclusive counterparty.
+    w.env.svm.expire_blockhash();
+    let nocpi = w.env.try_trade_asset_with_cu(0, &a, pa, &b, pb, 5 * U, PRICE, 30);
+    eprintln!("NoCpi growth between traders on the bound asset -> {:?}", nocpi.as_ref().map_err(|e| code(e)));
+    assert_eq!(nocpi.as_ref().err().and_then(|e| code(e)), Some(77), "P3-g: NoCpi growth on a bound asset must be refused 77");
+    // fee-bearing round trips against the vault LP (TradeCpi pins the fee to the market base
+    // fee, so set a 30 bps base; the LP leg (48%) accrues as the backlog)
+    w.env.svm.expire_blockhash();
+    w.env.update_trade_fee_policy_with_cu(30);
+    for i in 0..5 {
+        let lp = w.lp;
+        let _ = w.crank(pa);
+        let _ = w.crank(lp);
+        let r1 = w.trade_vs_lp_fee(&a, pa, U, 30);
+        let _ = w.crank(lp);
+        let r2 = w.trade_vs_lp_fee(&a, pa, -U, 30);
+        if i == 0 {
+            eprintln!("fee round trip vs vault LP -> {:?} / {:?}", r1.as_ref().map_err(|e| code(e)), r2.as_ref().map_err(|e| code(e)));
+        }
     }
     let (cfg, _) = w.env.market_state();
     let backlog = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
@@ -1221,6 +1345,9 @@ fn lp_win_order(order: &str) -> (i128, i128, u128) {
         }
         _ => unreachable!(),
     }
+    // F-14 head: 101 moves no SPL. Keeper terminal sequence, then the junior's Resolved 102.
+    let _ = w.terminal_cleanup(&[(tp, t.pubkey())]);
+    junior_out += w.junior_release_resolved(&admin);
     let vault_left = w.tok(&w.env.vault) as u128;
     eprintln!("order {order}: trader_out {trader_out} junior_out {junior_out} vault_left {vault_left}");
     (20_000_000 - trader_out as i128, junior_out as i128 - 3_000_000, vault_left)
