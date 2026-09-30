@@ -2894,7 +2894,8 @@ fn cooldown_sweep_leaver_before_keeper_push() {
     for &lag in &lags {
         for &cd in &cds {
             let TimingWorld { mut w, a, a_ata, v, v_ata, tp, lp, .. } = timing_world(cd);
-            let target = PRICE * 14_861 / 10_000;
+            let move_bps: u64 = std::env::var("SWEEP_MOVE_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(4_861);
+            let target = PRICE * (10_000 + move_bps) / 10_000;
             let s0 = w.slot();
             let sh = w.tok(&a_ata) as u128;
             let _ = w.request_redeem(&a, a_ata, sh); // leaver files at the spot move
@@ -2922,7 +2923,9 @@ fn cooldown_sweep_leaver_before_keeper_push() {
             let v_paid = timing_redeem(&mut w, &v, v_ata, cd, &mut |_w: &mut P3| {});
             let a_paid = a_paid.unwrap_or(0);
             let eff = w.env.market_state().1.assets[0].effective_price;
-            eprintln!("SWEEP keeper lag {lag:>3} slots | cooldown {cd:>4}: leaver {a_paid} stayer {v_paid} (fair {fair}; leaver advantage {}) eff at end {eff}", a_paid as i128 - fair as i128);
+            // Advantage = half the leaver-stayer gap (0 when both bear the same share); robust to
+            // move sizes whose loss stays inside the junior (then both should get principal back).
+            eprintln!("SWEEP move {move_bps} bps | keeper lag {lag:>3} slots | cooldown {cd:>4}: leaver {a_paid} stayer {v_paid} | leaver advantage {} (vs C-7 fair {}) eff at end {eff}", (a_paid as i128 - v_paid as i128) / 2, a_paid as i128 - fair as i128);
         }
     }
 }
