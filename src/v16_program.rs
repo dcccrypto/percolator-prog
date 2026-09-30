@@ -24325,6 +24325,30 @@ pub mod processor {
                 // => 85, fail closed). A deposit never prices against it: the draw must run
                 // first (pass the vault LP writable, or crank it).
                 let c_eff = vault_lp_live_pricing_claim(&group, lp_ai, c_eff, nav)?;
+                // P3 fairness: an ENTRY is priced as if the pending oracle target were already the
+                // effective price whenever that is better for the vault LP: the recovery it would
+                // realise restores C seniors-first (`vault_lp_recover`, the booking rule) before
+                // the newcomer's shares are minted, so nobody buys in ahead of it.
+                let c_eff = if st.senior_draw_outstanding_atoms != 0 {
+                    let better = with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(&group, h))?.1;
+                    let v_better = nav
+                        .checked_add(better.max(0) as u128)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    let (_, to_seniors) = vault_lp_v18::vault_lp_recover(
+                        vault_lp_v18::DrawLedger {
+                            senior_claim: c_eff,
+                            drawn: st.senior_drawn_atoms,
+                            outstanding: st.senior_draw_outstanding_atoms,
+                            pending: 0,
+                        },
+                        v_better.saturating_sub(c_eff),
+                    );
+                    c_eff
+                        .checked_add(to_seniors)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                } else {
+                    c_eff
+                };
                 if nav < c_eff {
                     // Backing alone does not cover the senior: the LP must be valued, and new
                     // money is refused outright if the senior is impaired.
@@ -25244,14 +25268,34 @@ pub mod processor {
                 } else {
                     vault_lp_live_pricing_claim(&group, lp_ai, senior_claim, nav)?
                 };
+                // P3 fairness: an EXIT is priced as if the pending oracle target were already the
+                // effective price whenever that is worse for the vault LP: the deficit it would
+                // realise (beyond the junior's pot surplus) comes off the claim now, exactly as the
+                // draw would book it (`vault_lp_senior_pricing_claim`, the booking rule).
+                let lp_equity_worse = if resolved {
+                    0
+                } else {
+                    with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(&group, h))?.0
+                };
+                let senior_claim = if lp_equity_worse < 0 {
+                    vault_lp_v18::vault_lp_senior_pricing_claim(
+                        senior_claim,
+                        lp_equity_worse.unsigned_abs(),
+                        nav.saturating_sub(senior_claim),
+                    )
+                } else {
+                    senior_claim
+                };
                 let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
                 let senior_value = if resolved {
                     vault_lp_v18::tranche_split(physical, senior_claim).senior
                 } else if nav >= senior_claim {
                     senior_claim
                 } else {
+                    // P3 fairness: the vault LP's value at the price worse for it.
                     let lp_value =
-                        with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
+                        with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?
+                            .min(lp_equity_worse.max(0) as u128);
                     let v = nav
                         .checked_add(lp_value)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
@@ -27399,6 +27443,87 @@ pub mod processor {
             return Ok(Some((i, true, marker, exhausted)));
         }
         Ok(None)
+    }
+
+    /// P3 fairness (2026-09-30, Earn exit front-run): the vault LP's equity re-valued at the
+    /// price WORSE for the vault (`.0`, used to price a senior EXIT, tag 77) and at the price
+    /// BETTER for the vault (`.1`, used to price a senior ENTRY, tag 75), comparing each leg's
+    /// lagging engine `effective_price` with the pending oracle `raw_oracle_target_price`.
+    ///
+    /// With `max_price_move_bps_per_slot` = 1 the effective price needs ~3,963 slots to follow a
+    /// +48.6% move. A senior who filed 76 on seeing the move could redeem at the stale price
+    /// before eff caught up (leaver +165,895 atoms at every cooldown <= 2,000), and a depositor
+    /// could buy in cheap ahead of a pending recovery. Per active leg (raw `|basis_pos_q|`,
+    /// an upper bound on the ADL-effective quantity, so both bounds are conservative):
+    ///   adverse   = ceil(|q| * max(0, eff - target) / POS_SCALE)   long
+    ///             = ceil(|q| * max(0, target - eff) / POS_SCALE)   short
+    ///   favorable = the same with the opposite sign of (target - eff)
+    ///   worse  = certified_equity - sum(adverse)       (i128, checked)
+    ///   better = certified_equity + sum(favorable)
+    /// `certified_equity` comes from a CURRENT certificate (stale with inventory => 85, as today).
+    /// A flat vault LP has no lag: both bounds are `capital + min(pnl,0) + min(fee_credits,0)`.
+    #[inline(never)]
+    fn vault_lp_equity_lag_bounds_ro(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioAccountV16Account,
+    ) -> Result<(i128, i128), ProgramError> {
+        let bitmap = lp.active_bitmap.map(percolator::V16PodU64::get);
+        if percolator::active_bitmap_is_empty(bitmap) {
+            let e = vault_lp_v18::conservative_equity(lp.capital.get(), lp.pnl.get(), lp.fee_credits.get())
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let e = i128::try_from(e).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+            // conservative_equity floors at 0; a flat insolvent LP is caught by the undrawn check.
+            return Ok((e, e));
+        }
+        let cert = lp.health_cert.try_to_runtime().map_err(map_v16_error)?;
+        let cert_current = lp.stale_state == 0
+            && lp.b_stale_state == 0
+            && cert.valid
+            && cert.cert_oracle_epoch == group.header.oracle_epoch.get()
+            && cert.cert_funding_epoch == group.header.funding_epoch.get()
+            && cert.cert_risk_epoch == group.header.risk_epoch.get()
+            && cert.cert_asset_set_epoch == group.header.asset_set_epoch.get()
+            && cert.active_bitmap_at_cert == bitmap;
+        if !cert_current {
+            return Err(PercolatorError::VaultLpValuationStale.into());
+        }
+        let mut adverse = 0u128;
+        let mut favorable = 0u128;
+        for slot in 0..percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = lp.legs[slot].try_to_runtime().map_err(map_v16_error)?;
+            if !leg.active {
+                continue;
+            }
+            let asset = &group
+                .markets
+                .get(leg.asset_index as usize)
+                .ok_or(PercolatorError::EngineInvalidConfig)?
+                .engine
+                .asset;
+            let eff = asset.effective_price.get();
+            let tgt = asset.raw_oracle_target_price.get();
+            let (adv, fav) = match leg.side {
+                SideV16::Long => (eff.saturating_sub(tgt), tgt.saturating_sub(eff)),
+                SideV16::Short => (tgt.saturating_sub(eff), eff.saturating_sub(tgt)),
+            };
+            let q = leg.basis_pos_q.unsigned_abs();
+            adverse = adverse
+                .checked_add(risk_notional_ceil(q, adv)?)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            favorable = favorable
+                .checked_add(risk_notional_ceil(q, fav)?)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        }
+        let adverse = i128::try_from(adverse).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let favorable = i128::try_from(favorable).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        Ok((
+            cert.certified_equity
+                .checked_sub(adverse)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            cert.certified_equity
+                .checked_add(favorable)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        ))
     }
 
     /// 75/77 Live pricing claim (no timing arbitrage): reads the vault LP's undrawn deficit from

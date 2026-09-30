@@ -2905,3 +2905,111 @@ fn p3_no_d1_ledger_full_winddown_pays_everyone() {
     assert!(o.per.iter().sum::<u128>() + 5_000 >= 10_000_000 - RACE_BEYOND);
     assert!(o.left <= 5_000);
 }
+
+/// Cooldown sweep against the live keeper cadence (percolator-oracle-keeper .env: CC_INTERVAL_MS
+/// 1500 = ~4 slots per push cycle at 400 ms; CC_MARK_WINDOW_MS 8000 median = up to ~20 slots of
+/// mark lag). Model: the leaver sees the spot move at slot s and files 76 at once; the keeper
+/// publishes the new mark N slots later and then pushes + cranks every 4 slots; 77 runs at
+/// s + cooldown. The move is the C-7 deficit move (+48.6%, loss beyond the junior ~331k). Prints
+/// leaver vs stayer payouts per (N, cooldown). COOLDOWN_SWEEP="c1,c2,..", KEEPER_LAG="n1,n2,..".
+#[test]
+#[ignore]
+fn cooldown_sweep_leaver_before_keeper_push() {
+    let cds: Vec<u64> = std::env::var("COOLDOWN_SWEEP").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| vec![20, 50, 150, 600]);
+    let lags: Vec<u64> = std::env::var("KEEPER_LAG").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| vec![4, 12, 24]);
+    let fair = 5_000_000u128 - RACE_BEYOND / 2;
+    for &lag in &lags {
+        for &cd in &cds {
+            let TimingWorld { mut w, a, a_ata, v, v_ata, tp, lp, .. } = timing_world(cd);
+            let target = PRICE * 14_861 / 10_000;
+            let s0 = w.slot();
+            let sh = w.tok(&a_ata) as u128;
+            let _ = w.request_redeem(&a, a_ata, sh); // leaver files at the spot move
+            let mut pushed = false;
+            let mut a_paid = None;
+            let end = s0 + cd.max(lag) + 6_000;
+            let mut s = s0;
+            while s < end {
+                s += 4; // keeper cycle ~1.5 s
+                w.env.svm.warp_to_slot(s);
+                if s >= s0 + lag {
+                    if !pushed { MARK.with(|c| c.set(target)); pushed = true; }
+                    w.env.push_auth_mark_for_asset_as_admin(0, s, target);
+                    let _ = w.crank(tp); let _ = w.crank(lp);
+                } else {
+                    w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
+                }
+                if a_paid.is_none() && s >= s0 + cd {
+                    let _ = w.crank_fees_78();
+                    let (d, r) = w.execute_redeem_domain(&a, 0);
+                    a_paid = Some(if r.is_ok() { w.tok(&d) as u128 } else { eprintln!("SWEEP lag {lag} cd {cd}: 77 -> {:?}", r.as_ref().map_err(|e| code(e))); 0 });
+                }
+            }
+            for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); let _ = w.crank(tp); }
+            let v_paid = timing_redeem(&mut w, &v, v_ata, cd, &mut |_w: &mut P3| {});
+            let a_paid = a_paid.unwrap_or(0);
+            let eff = w.env.market_state().1.assets[0].effective_price;
+            eprintln!("SWEEP keeper lag {lag:>3} slots | cooldown {cd:>4}: leaver {a_paid} stayer {v_paid} (fair {fair}; leaver advantage {}) eff at end {eff}", a_paid as i128 - fair as i128);
+        }
+    }
+}
+
+/// Anvil (P3 fairness, 2026-09-30). One leaver/stayer run at keeper cadence: the leaver files 76
+/// when the spot moves by `move_bps`, the keeper publishes the new mark `lag` slots later and then
+/// pushes + cranks every 4 slots, the leaver's 77 runs at s0 + `cooldown`; the stayer redeems
+/// after eff caught up. With `leave == false` NOBODY races: both redeem after catch-up (the null
+/// control). Returns (leaver-or-first, stayer).
+fn fair_exit_run(move_bps: u64, lag: u64, cooldown: u64, leave: bool) -> (u128, u128) {
+    let TimingWorld { mut w, a, a_ata, v, v_ata, tp, lp, .. } = timing_world(cooldown);
+    let target = PRICE * (10_000 + move_bps) / 10_000;
+    let s0 = w.slot();
+    let sh = w.tok(&a_ata) as u128;
+    if leave { let _ = w.request_redeem(&a, a_ata, sh); }
+    let mut a_paid = None;
+    let end = s0 + cooldown.max(lag) + 6_000;
+    let mut s = s0;
+    let mut pushed = false;
+    while s < end {
+        s += 4;
+        w.env.svm.warp_to_slot(s);
+        if s >= s0 + lag {
+            if !pushed { MARK.with(|c| c.set(target)); pushed = true; }
+            w.env.push_auth_mark_for_asset_as_admin(0, s, target);
+            let _ = w.crank(tp); let _ = w.crank(lp);
+        } else {
+            w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
+        }
+        if leave && a_paid.is_none() && s >= s0 + cooldown {
+            let _ = w.crank_fees_78();
+            let (d, r) = w.execute_redeem_domain(&a, 0);
+            a_paid = Some(if r.is_ok() { w.tok(&d) as u128 } else { eprintln!("FAIR move {move_bps} lag {lag} cd {cooldown}: 77 -> {:?}", r.as_ref().map_err(|e| code(e))); 0 });
+        }
+    }
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); let _ = w.crank(tp); }
+    let a_paid = match a_paid { Some(x) => x, None => timing_redeem(&mut w, &a, a_ata, cooldown, &mut |_w: &mut P3| {}) };
+    let v_paid = timing_redeem(&mut w, &v, v_ata, cooldown, &mut |_w: &mut P3| {});
+    (a_paid, v_paid)
+}
+
+/// ACCEPTANCE (coordinator item 4): at the relaunch cooldown (150 slots, > the ~24-slot keeper
+/// publish lag), for moves of +10%, +25% and +48.6% and keeper lags of 4, 12 and 24 slots, a
+/// senior who files 76 at the spot move gains at most rounding over the null control (nobody
+/// races) and the stayer is never charged the leaver's share. Negative control: the same runs on
+/// a build without the worse-of pricing (221cf006 / 8f2b4ccf) show a leaver advantage of
+/// +165,895 at the +48.6% move.
+#[test]
+fn p3_exit_front_run_leaver_advantage_is_rounding_at_cooldown_150() {
+    let cd = 150u64;
+    let mut worst = 0i128;
+    for &mv in &[1_000u64, 2_500, 4_860] {
+        let (n_a, n_v) = fair_exit_run(mv, 24, cd, false);
+        for &lag in &[4u64, 12, 24] {
+            let (a, v) = fair_exit_run(mv, lag, cd, true);
+            let adv = a as i128 - n_a as i128;
+            let stayer_loss = n_v as i128 - v as i128;
+            eprintln!("FAIR move +{}bps lag {lag:>2} cd {cd}: leaver {a} stayer {v} | null {n_a}/{n_v} | leaver advantage {adv} stayer charged {stayer_loss}", mv);
+            worst = worst.max(adv).max(stayer_loss);
+        }
+    }
+    assert!(worst <= 2_000, "front-run at cooldown 150: leaver advantage / stayer charge up to {worst} atoms");
+}
