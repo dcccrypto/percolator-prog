@@ -4,3 +4,5 @@
 pub mod vault_lp_v18;
 #[cfg(kani)]
 mod proofs;
+#[cfg(kani)]
+mod proofs_senior_draw;
