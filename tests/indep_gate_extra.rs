@@ -1036,6 +1036,7 @@ fn gate_p3_recall_bound_and_unblocks_senior_redemption() {
     }
     let lp_state = w.env.portfolio_state(lp);
     eprintln!("after close: LP cap {} pnl {} flat {} | C {} backing {}", lp_state.capital, lp_state.pnl, lp_state.active_bitmap == percolator::active_bitmap_empty(), w.c(), w.backing());
+    { let ts = w.env.portfolio_state(tp); let g = w.env.market_state().1; eprintln!("after close: trader cap {} pnl {} pos {} | mode {:?} hlock {} | buckets {:?}", ts.capital, ts.pnl, ts.legs.iter().find(|l| l.active).map(|l| l.basis_pos_q).unwrap_or(0), g.mode, g.bankruptcy_hlock_active, g.source_backing_buckets.iter().take(2).map(|b| (b.fresh_unliened_backing_num / percolator::BOUND_SCALE, b.consumed_liened_backing_num / percolator::BOUND_SCALE)).collect::<Vec<_>>()); }
     // Junior refills the LP so value sits in the LP.
     let jr = w.junior_deposit(&admin, 5_000_000);
     eprintln!("junior refill -> {:?}", jr.as_ref().map_err(|e| custom_code(e)));
@@ -1045,9 +1046,27 @@ fn gate_p3_recall_bound_and_unblocks_senior_redemption() {
     if b >= c {
         // Senior isolation held: a >100% loss on the vault-LP short did not touch Earn backing,
         // so there is no shortfall to recall. Pin that, and that recall is refused (76).
-        assert_eq!(b, c, "Earn backing must be untouched by a vault-LP blowout (seniors isolated)");
+        // Old rule (<= 58e379f1): seniors isolated, backing == C. New rule (senior draw, d119eebd+):
+        // the loss beyond the junior is DRAWN from the seniors' pot into the winner's claim domain,
+        // so backing summed over both pots can exceed C (the winner's claim is backed in its own
+        // pot). Either way there is no senior shortfall for a recall to fill (C_eff is marked down
+        // by the draw), so the recall must be refused 76.
+        let tpnl = w.env.portfolio_state(tp).pnl.max(0) as u128;
+        assert!(b == c || b + 2 >= c + tpnl.min(b.saturating_sub(c)), "backing {b} vs C {c}: neither seniors-isolated nor draw-backed winner (trader pnl {tpnl})");
         assert_eq!(w.recall(&stranger, 1, 0).err().and_then(|e| custom_code(&e)), Some(76), "no shortfall -> recall refused 76");
         eprintln!("RECALL-GAP: trading could not create a senior liquidity shortfall (seniors isolated); bound/unblock path not exercised");
+        // Liveness after the draw: the h-lock flag must not outlive the winner's conversion.
+        let hl0 = w.env.market_state().1.bankruptcy_hlock_active;
+        let pnl = w.env.portfolio_state(tp).pnl;
+        if pnl > 0 {
+            let (pid, _, pep) = w.env.portfolio_identity(tp);
+            let m = w.env.market;
+            let rcv = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+                vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[&t]);
+            for _ in 0..4 { let s = w.slot() + 3; w.env.svm.warp_to_slot(s); let _ = w.crank(tp); let _ = w.crank(lp); }
+            let g = w.env.market_state().1;
+            eprintln!("HLOCK-AFTER-DRAW: before convert {hl0}; convert {pnl} -> {:?}; after: hlock {} trader cap {} pnl {}", rcv.as_ref().map_err(|e| custom_code(e)), g.bankruptcy_hlock_active, w.env.portfolio_state(tp).capital, w.env.portfolio_state(tp).pnl);
+        }
         return;
     }
     let shortfall = c - b;
