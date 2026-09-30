@@ -2483,3 +2483,170 @@ fn p3_p2_negotiated_fee_accrues_to_vault_nav_junior_and_is_protocol_bounded() {
     let (r, _, _, _, _) = p2_fee_run(1, 20);
     assert!(r.is_err(), "a request above the protocol max is refused");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// B12 (E2E HIGH, found on 6377376a): terminal insurance recovery (wrapper tag 41, reached by
+// stake tag 29) requires `materialized_portfolio_count == 0`, so ONE abandoned portfolio
+// stranded the stakers' budget forever. Fixed by the F-4 mechanism: in Resolved mode anyone
+// may run the resolved close (pays the OWNER) and then deregister an EMPTY portfolio with
+// tag 8 (rent to the OWNER, account [3] pinned to header.owner). A portfolio with anything
+// left to claim cannot be deregistered by a stranger (engine emptiness predicate).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn materialized_count(&self) -> u64 {
+        self.market_state().1.materialized_portfolio_count
+    }
+
+    fn terminal_insurance_withdraw(&mut self, amount: u128) -> (Result<(), String>, Pubkey) {
+        let admin = self.admin.insecure_clone();
+        let dest = self.token_account(self.mint, admin.pubkey(), 0);
+        self.svm.expire_blockhash();
+        let r = self
+            .send(
+                ProgInstruction::WithdrawInsurance { amount },
+                vec![
+                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                &[&admin],
+            )
+            .map(|_| ());
+        (r, dest)
+    }
+
+    /// Tag 56 TopUpInsuranceDomain by the insurance authority (= marketauth here): the
+    /// stakers' terminal budget stands in for stake FlushToInsurance.
+    fn top_up_insurance_domain0(&mut self, amount: u64) {
+        let admin = self.admin.insecure_clone();
+        let src = self.token_account(self.mint, admin.pubkey(), amount);
+        let data = self.svm.get_account(&self.market).unwrap().data;
+        let market_id = state::read_market_trade_preflight(&data, 0).unwrap().3;
+        let authority_epoch = state::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::TopUpInsuranceDomain {
+                intent_id: 0xB12,
+                market_id,
+                domain: 0,
+                amount: amount as u128,
+                authority_epoch,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(src, false),
+                AccountMeta::new(self.vault_token, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect("tag 56 top up domain-0 insurance");
+        self.paid_in += amount as u128;
+    }
+
+    fn stranger_close_resolved(&mut self, portfolio: Pubkey, owner: Pubkey) -> (Result<(), String>, Pubkey) {
+        let dest = self.token_account(self.mint, owner, 0);
+        self.svm.expire_blockhash();
+        let nft_registry = Pubkey::find_program_address(&[b"nft_registry", self.market.as_ref()], &self.pid).0;
+        let r = self
+            .send(
+                ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+                vec![
+                    AccountMeta::new_readonly(owner, false),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(nft_registry, false),
+                ],
+                &[],
+            )
+            .map(|_| ());
+        (r, dest)
+    }
+}
+
+fn b12_run(bound: bool) {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let admin = env.admin.insecure_clone();
+    let walked_away = env.new_trader(5_000_000);
+    let lp = if bound {
+        let lp = env.bind(1_000);
+        env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+        env.trade(&walked_away, &lp, 20 * POS).expect("open; this trader never acts again");
+        let (_, g) = env.market_state();
+        assert!(g.insurance > 0, "fixture: the trade fee funded insurance");
+        Some(lp)
+    } else {
+        None // P1-only market: the walked-away trader just holds capital
+    };
+    env.top_up_insurance_domain0(500_000);
+    env.resolve();
+    if let Some(lp) = lp {
+    // Settle and deregister the vault LP (P3's own terminal path).
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    for topup in [0u8, 1u8] {
+        let r = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest);
+        println!("P3 B12 settle topup={topup}: {:?}", r.as_ref().map(|_| ()).map_err(|e| &e[..e.len().min(120)]));
+    }
+    let registry = env.registry;
+    let r = env.permissionless_close_portfolio(lp.portfolio, registry);
+    println!("P3 B12 vault LP close: {:?}", r.as_ref().map(|_| ()).map_err(|e| &e[..e.len().min(120)]));
+    }
+    // B12: the abandoned trader's portfolio blocks terminal insurance recovery.
+    let (r, _) = env.terminal_insurance_withdraw(1); // even 1 atom (B12)
+    err_has(&r, PercolatorError::EngineLockActive);
+    assert!(env.materialized_count() >= 1);
+    // A stranger cannot deregister it while it still holds a claim...
+    let wowner = walked_away.kp.pubkey();
+    err_has(
+        &env.permissionless_close_portfolio(walked_away.portfolio, wowner),
+        PercolatorError::EngineLockActive,
+    );
+    // ...runs the resolved close instead (pays the OWNER; loop: progress-only until settled)...
+    let mut paid = 0u64;
+    for _ in 0..4 {
+        let (r, dest) = env.stranger_close_resolved(walked_away.portfolio, wowner);
+        paid += env.tok(dest);
+        if r.is_ok() && env.portfolio(walked_away.portfolio).capital == 0 {
+            break;
+        }
+    }
+    env.paid_out += paid as u128;
+    assert!(paid > 0, "the owner, not the stranger, received the resolved payout");
+    // ...and cannot redirect the rent...
+    err_has(&env.permissionless_close_portfolio(walked_away.portfolio, Pubkey::new_unique()), PercolatorError::Unauthorized);
+    // ...but can deregister the now-empty portfolio with rent to the owner.
+    env.permissionless_close_portfolio(walked_away.portfolio, wowner).expect("dematerialize the empty portfolio");
+    assert_eq!(env.materialized_count(), 0, "materialized_portfolio_count conserved down to 0");
+    let (_, g) = env.market_state();
+    println!(
+        "P3 B12 pre-41: mode {:?} count {} c_tot {} insurance {} vault {}",
+        g.mode, g.materialized_portfolio_count, g.c_tot, g.insurance, g.vault
+    );
+    let (r, dest) = env.terminal_insurance_withdraw(500_000);
+    r.expect("terminal insurance recovery is no longer stranded");
+    let got = env.tok(dest);
+    println!("P3 B12: owner paid {paid}; terminal insurance recovered {got}");
+    assert_eq!(got, 500_000, "the whole stakers' budget is recoverable");
+    env.paid_out += got as u128;
+}
+
+#[test]
+fn p3_b12_abandoned_portfolio_cannot_strand_terminal_insurance() {
+    b12_run(true);
+}
+
+/// Same journey on a market with NO vault LP (P1-only shape): this is the variant that also
+/// runs on the P1 FINAL bytes, where it FAILS at the stranger's tag 8 (Custom 8) — B12.
+#[test]
+fn p3_b12_unbound_market_abandoned_portfolio_cannot_strand_terminal_insurance() {
+    b12_run(false);
+}
