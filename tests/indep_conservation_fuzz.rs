@@ -150,6 +150,8 @@ pub struct World {
     pub nassets: usize,
     pub mark1: u64,
     pub pending_violation: Option<String>,
+    /// Max observed unbacked deficit (capital 0, pnl < 0) per TRADER portfolio (not the vault LP).
+    pub trader_deficit: std::collections::BTreeMap<usize, u128>,
     pub p3: Option<P3Ctx>,
     pub minted_by: std::collections::BTreeMap<Pubkey, u128>,
 }
@@ -235,6 +237,7 @@ impl World {
             nassets,
             mark1: INITIAL_MARK,
             pending_violation: None,
+            trader_deficit: Default::default(),
             p3: None,
             minted_by: Default::default(),
         };
@@ -1150,6 +1153,16 @@ impl World {
 
     /// Engine/spec invariants on a live-or-resolved (not closed) market.
     pub fn check(&mut self) -> Result<(), String> {
+        // Track bankrupt-TRADER deficits (G-1: winners take the engine credit-rate haircut for these).
+        for u in 0..N_USERS {
+            if !self.port_alive(u) { continue; }
+            let x = self.env.portfolio_state(self.ports[u]);
+            if x.capital == 0 && x.pnl < 0 {
+                let d = (-x.pnl) as u128;
+                let e = self.trader_deficit.entry(u).or_insert(0);
+                if d > *e { *e = d; }
+            }
+        }
         if let Some(v) = self.pending_violation.take() {
             return Err(v);
         }
@@ -3588,9 +3601,18 @@ impl World {
         }
         // P3-J (F absorption check): the junior must not be paid while any winner was haircut at
         // the resolved close -- stray pot backing that belongs to unpaid winners never goes to the junior.
+        // Refined (coordinator's G-1 rule): a haircut up to the bankrupt-TRADER deficits is the
+        // engine credit rate (EXPECTED). Only a haircut BEYOND that, with the junior or seniors
+        // receiving value, is a violation (backing owed to winners went to Earn).
         let haircut_atoms = *self.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0) as u128;
-        if haircut_atoms > 2 && junior_received > 0 {
-            return Err(format!("P3-J JUNIOR PAID WHILE WINNERS HAIRCUT: winners burned {haircut_atoms}, junior received {junior_received}"));
+        let deficits: u128 = self.trader_deficit.values().sum();
+        let tol = 10 + 2 * (*self.stats.soft.get("close_resolved_haircut_events").unwrap_or(&0) as u128);
+        if haircut_atoms > 2 {
+            *self.stats.soft.entry(if haircut_atoms <= deficits + tol { "p3j_haircut_within_trader_deficits" } else { "p3j_haircut_beyond_trader_deficits" }).or_default() += 1;
+            if std::env::var("FUZZ_DEBUG_P3J").is_ok() { eprintln!("  P3J haircut {haircut_atoms} trader deficits {:?} (sum {deficits}) junior {junior_received} sout {sout} sin {sin} c_rem {c_rem}", self.trader_deficit); }
+        }
+        if haircut_atoms > deficits + tol && (junior_received > 0 || sout + tol as u128 > sin + credited) {
+            return Err(format!("P3-J EARN PAID WHILE WINNERS HAIRCUT BEYOND TRADER DEFAULTS: winners burned {haircut_atoms}, bankrupt-trader deficits {deficits}, junior received {junior_received}, seniors out {sout} (in {sin} + credited {credited})"));
         }
         // P3-d: after every exit, nothing stranded beyond insurance + remaining senior claim.
         if !self.is_tombstone() {
@@ -4248,4 +4270,20 @@ fn indep_p3_resolved_c_drop_without_redemption_or_draw_repro() {
     let (r, st) = run_seq(30, &ops, true);
     eprintln!("soft {:?}", st.soft);
     r.expect("C drops only through redemptions or a booked senior draw");
+}
+
+/// Shrunk fuzz repro on 592286b4 (seed 0xaf0e4ee806c16058, two-pot, random resolve, fee 0): NO
+/// trader is ever bankrupt (bankrupt-trader deficits 0), yet a winner is haircut 143 atoms at the
+/// resolved close while the junior receives 5,196,536 -- backing owed to a winner goes to Earn
+/// (refined P3-J, class (b)). Run with FUZZ_P3=1 FUZZ_LP_DOMAINS=2 FUZZ_RANDLEN=1 FUZZ_P3_PRECRANK=0
+/// INDEP_CANONICAL_MATCHER=<pinned id> (FUZZ_DEBUG_P3J=1 prints the accounting).
+#[test]
+#[ignore]
+fn indep_p3_winner_haircut_while_junior_paid_no_trader_default_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::P3JuniorDeposit { amt: 2_437_649 }, Op::TradeCpi { u: 152, size_tenths: 377 }, Op::TradeCpi { u: 183, size_tenths: 1 }, Op::Warp { n: 58 },
+        Op::Crank { u: 100 }, Op::TradeCpi { u: 74, size_tenths: -144 }, Op::Push { delta_bps: 639 }];
+    let (r, st) = run_seq(0, &ops, true);
+    eprintln!("soft {:?}", st.soft);
+    r.expect("no winner haircut beyond bankrupt-trader deficits while Earn is paid");
 }
