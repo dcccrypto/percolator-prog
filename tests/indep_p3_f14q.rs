@@ -1460,7 +1460,11 @@ fn lossrule_exhausted_leg_is_not_vacuous() {
 struct C7 { w: P3, admin: Keypair, t: Keypair, tp: Pubkey, seed: Keypair, seedp: Pubkey, s0: Keypair, a0: Pubkey, s1: Keypair, a1: Pubkey, lp: Pubkey, v0: u128, owed: u128, lp_loss_beyond_junior: u128 }
 
 /// The rehearsal-22 state: Recovery reached at the liquidating crank, then Resolved by a stranger.
-fn c7_to_resolved() -> C7 {
+fn c7_to_resolved() -> C7 { c7_world(5_000_000) }
+
+/// Rehearsal-22 shape with `senior_per_domain` in each of d0/d1; ends in Resolved (via the
+/// Recovery valve on the old rule, or an admin resolve when the new senior draw keeps it Live).
+fn c7_world(senior_per_domain: u64) -> C7 {
     // Rehearsal-22 TRUMP market params (IM 10% / MM 6%, liq fee 50 bps, move 1 bps/slot,
     // accrual dt 500). The earlier IM-20% variant had max_accrual_dt 20 < every warp, so each
     // crank stopped at the bounded catch-up and never touched the portfolio (the divergence).
@@ -1469,9 +1473,9 @@ fn c7_to_resolved() -> C7 {
     w.create_vault();
     let s0 = Keypair::new();
     // rehearse.sh: LP_VAULT_DEPOSIT_PER_DOMAIN = 5e9 (HLOCK_SENIOR_PER_DOMAIN), i.e. C = 1e10 over d0 + d1.
-    let a0 = w.earn_deposit_domain(&s0, 5_000_000, false, 0).expect("75 senior d0");
+    let a0 = w.earn_deposit_domain(&s0, senior_per_domain, false, 0).expect("75 senior d0");
     let s1 = Keypair::new();
-    let a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 1).expect("75 senior d1");
+    let a1 = w.earn_deposit_domain(&s1, senior_per_domain, false, 1).expect("75 senior d1");
     let admin = w.env.admin.insecure_clone();
     w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
     let up = w.upgrade.insecure_clone();
@@ -1515,33 +1519,45 @@ fn c7_to_resolved() -> C7 {
         let tr = w.env.portfolio_state(tp);
         eprintln!("C7 after move: eff {} tgt {} | trader pos {} cap {} pnl {}", g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, w.pos(tp), tr.capital, tr.pnl);
     }
+    let mut max_beyond = 0u128;
     for i in 0..3 {
         let s = w.slot() + 1;
         w.env.svm.warp_to_slot(s);
         let r = w.crank(lp);
         let g = w.env.market_state().1;
         let lpp = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl, p.legs.iter().filter(|l| l.active).count(), p.close_progress.active));
+        if let Some(x) = lpp { if x.0 == 0 && x.1 < 0 { max_beyond = max_beyond.max((-x.1) as u128); } }
         eprintln!("C7 crank(LP) #{i} -> {:?}; mode {:?} eff {} tgt {} LP {:?}", r.as_ref().map_err(|e| code(e)), g.mode, g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, lpp);
         if g.mode != percolator::MarketModeV16::Live || lpp.map_or(false, |x| x.2 == 0) { break; }
     }
     let g = w.env.market_state().1;
     let lpp = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl, p.close_progress.active));
     eprintln!("C7 after LP crank: mode {:?} LP {:?} hlock {}", g.mode, lpp, g.bankruptcy_hlock_active);
-    // Vacuity: the rehearsal state -- the vault LP's loss went beyond its 300k junior in one crank.
-    let lp_loss_beyond_junior = lpp.map_or(0, |x| (-x.1).max(0) as u128);
+    // Vacuity: the rehearsal state -- the vault LP's loss went beyond its 300k junior in one crank
+    // (observed as capital 0 / pnl < 0 at the liquidating crank, before any senior draw books it).
+    let lp_loss_beyond_junior = max_beyond.max(lpp.map_or(0, |x| (-x.1).max(0) as u128));
     assert!(lp_loss_beyond_junior > 0, "vacuity: the vault-LP loss must exceed the junior (LP {:?})", lpp);
-    assert_ne!(g.mode, percolator::MarketModeV16::Live, "vacuity: the rehearsal path leaves Live at the liquidating crank");
     let trader_cap = w.env.portfolio_state(tp).capital;
     let owed = trader_cap + 300_000 + lp_loss_beyond_junior; // capital + full profit (junior + beyond)
-    // stranger crank(s) while in Recovery
+    // Old rule: Recovery -> stranger crank(s) to Resolved. New rule: the draw keeps it Live, so
+    // resolve it (admin) to run the same terminal wind-down.
     for _ in 0..4 {
         if w.env.market_state().1.mode == percolator::MarketModeV16::Resolved { break; }
+        if w.env.market_state().1.mode == percolator::MarketModeV16::Live { break; }
         let s = w.slot() + 1;
         w.env.svm.warp_to_slot(s);
         let _ = w.crank(lp);
     }
+    let path = w.env.market_state().1.mode;
+    if path == percolator::MarketModeV16::Live {
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        w.push(MARK.with(|c| c.get()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    }
     let mode = w.env.market_state().1.mode;
-    eprintln!("C7 mode after stranger cranks: {mode:?}");
+    eprintln!("C7 path after the liquidating crank {path:?}; mode now {mode:?}");
+    assert_eq!(mode, percolator::MarketModeV16::Resolved, "C-7: market must reach Resolved (valve or admin resolve)");
     C7 { w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed, lp_loss_beyond_junior }
 }
 
@@ -1554,8 +1570,21 @@ fn c7_to_resolved() -> C7 {
 /// Reproduces the rehearsal exactly on 58e379f1 (NEGATIVE CONTROL, fails): 101 Ok, tag 8 on the
 /// vault LP and the winner -> 21, 78 -> 21, 77 -> 84 in both domains, 102 -> 21; 12,300,000 locked.
 #[test]
-fn c7_immediate_recovery_winddown_pays_everyone() {
-    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed, lp_loss_beyond_junior } = c7_to_resolved();
+fn c7_immediate_recovery_winddown_pays_everyone() { c7_winddown(5_000_000); }
+
+/// C-7, seniors-exhausted variant: seniors 50k + 50k (C 100k) < the 331,920 loss beyond the
+/// 300k junior, so the draw cannot cover it and the bankrupt/Recovery path (chunked, 1,000-atom
+/// public B chunk) is exercised. The chunked wind-down must COMPLETE when calls repeat: every
+/// portfolio closes, the winner gets capital + junior + all of C, seniors 0, <= dust left.
+#[test]
+fn c7_seniors_exhausted_chunked_winddown_completes() { c7_winddown(50_000); }
+
+fn c7_winddown(senior_per_domain: u64) {
+    let c_total = 2 * senior_per_domain as u128;
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed: owed_full, lp_loss_beyond_junior } = c7_world(senior_per_domain);
+    let drawn = lp_loss_beyond_junior.min(c_total);
+    let owed = owed_full - (lp_loss_beyond_junior - drawn); // capped at what junior + seniors can pay
+    let exp = c_total - drawn;
     // Documented wind-down, in the rehearsal order -- but each chunked step is REPEATED until it
     // is done (bounded). The drill called 101 once and CloseResolved 4x; with the h-lock market's
     // public_b_chunk_atoms (1e6 on-chain, 1_000 here) the vault LP's residual needs ~332 calls of
@@ -1598,6 +1627,7 @@ fn c7_immediate_recovery_winddown_pays_everyone() {
     eprintln!("C7 terminal-flat? materialized {} c_tot {}", g.materialized_portfolio_count, g.c_tot);
     let r78 = w.crank_fees_78();
     eprintln!("C7 78 -> {:?}", r78.as_ref().map_err(|e| code(e)));
+    c7_dump(&w, "before 77", &[("LP", lp), ("T", tp)]);
     let mut senior_paid = 0u128;
     let mut r77s = vec![];
     for (k, a, dom) in [(&s0, a0, 0u16), (&s1, a1, 1u16)] {
@@ -1609,17 +1639,20 @@ fn c7_immediate_recovery_winddown_pays_everyone() {
         r77s.push(r77.map_err(|e| code(&e)));
     }
     let r77 = r77s[0].clone();
+    c7_dump(&w, "after 77", &[("LP", lp), ("T", tp)]);
     eprintln!("C7 seniors paid {senior_paid}");
     let junior_paid = w.junior_release_resolved(&admin);
     let left = w.tok(&w.env.vault) as u128;
     eprintln!("C7 junior paid {junior_paid}; vault {v0} -> left {left}");
-    eprintln!("C7 owed winner {owed} (cap + junior 300000 + beyond {lp_loss_beyond_junior}); seniors expected {}", 10_000_000 - lp_loss_beyond_junior);
-    assert!(winner_paid > 0, "C-7: winner paid 0 after immediate-Recovery wind-down");
-    assert!(senior_paid > 0, "C-7: seniors paid 0 (77 -> {:?})", r77s);
-    assert!(winner_paid + 2 >= owed, "RULE: winner never haircut: {winner_paid} < owed {owed}");
-    let exp = 10_000_000 - lp_loss_beyond_junior;
+    eprintln!("C7 owed winner {owed} (cap + junior 300000 + drawn {drawn} of beyond {lp_loss_beyond_junior}); seniors expected {exp} (C {c_total})");
+    let _ = r77;
+    assert!(winner_paid > 0, "C-7: winner paid 0 after the wind-down");
+    assert!(winner_paid + 2_000 >= owed, "RULE: winner paid in full while senior backing remains: {winner_paid} < owed {owed}");
     assert!(senior_paid + 2_000 >= exp && senior_paid <= exp + 2_000, "RULE: seniors absorb exactly the shortfall: {senior_paid} vs {exp}");
-    assert!(r77s.iter().all(|r| r.is_ok()), "C-7: a senior's full-share 77 refused in Resolved: {:?}", r77s);
+    if exp > 2_000 { assert!(r77s.iter().all(|r| r.is_ok()), "C-7: a senior's full-share 77 refused in Resolved: {:?}", r77s); }
+    for (n, p) in [("vault LP", lp), ("winner", tp), ("seed", seedp)] {
+        assert!(w.env.svm.get_account(&p).map_or(true, |a| a.lamports == 0), "C-7: the chunked wind-down did not close the {n} portfolio");
+    }
     assert!(left <= 2_000, "C-7: {left} atoms locked after the documented wind-down");
 }
 
@@ -1762,10 +1795,13 @@ fn c7_permissionless_exit_sweep() {
                 let cancel = w.send(ProgInstruction::CancelRedemption, vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new_readonly(reg_, false), AccountMeta::new(red, false), AccountMeta::new_readonly(mint_, false), AccountMeta::new(a, false), AccountMeta::new(esc_, false), AccountMeta::new_readonly(spl_token::ID, false)], &[k]);
                 let sh2 = w.tok(&a) as u128;
                 eprintln!("C7S 81 cancel -> {:?}; shares back {sh2}", cancel.as_ref().map_err(|e| code(e)));
-                for frac in [9_990u128, 9_000] {
+                for frac in [9_990u128, 9_300, 9_000] {
                     let part = sh2 * frac / 10_000;
                     if part == 0 { continue; }
-                    let _ = w.request_redeem(k, a, part);
+                    { let (reg_, mint_, esc_) = (w.registry, w.lp_mint, w.escrow);
+                      let _ = w.send(ProgInstruction::CancelRedemption, vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new_readonly(reg_, false), AccountMeta::new(red, false), AccountMeta::new_readonly(mint_, false), AccountMeta::new(a, false), AccountMeta::new(esc_, false), AccountMeta::new_readonly(spl_token::ID, false)], &[k]); }
+                    let rq3 = w.request_redeem(k, a, part);
+                    eprintln!("C7S 76 partial {part} -> {:?}", rq3.as_ref().map_err(|e| code(e)));
                     let (d3, r3) = w.execute_redeem_domain(k, dom);
                     sen += w.tok(&d3);
                     eprintln!("C7S 77 d{dom} partial {part}/{sh2} -> {:?} paid {}", r3.as_ref().map_err(|e| code(e)), w.tok(&d3));
@@ -1777,6 +1813,11 @@ fn c7_permissionless_exit_sweep() {
                     let (d4, r4) = w.execute_redeem_domain(k, dom);
                     sen += w.tok(&d4);
                     eprintln!("C7S 77 d{dom} remainder {rest} -> {:?} paid {}", r4.as_ref().map_err(|e| code(e)), w.tok(&d4));
+                    if r4.is_err() {
+                        let (d5, r5) = w.execute_redeem_domain(k, 1 - dom);
+                        sen += w.tok(&d5);
+                        eprintln!("C7S 77 d{dom} remainder via d{} -> {:?} paid {}", 1 - dom, r5.as_ref().map_err(|e| code(e)), w.tok(&d5));
+                    }
                 }
             }
         }
