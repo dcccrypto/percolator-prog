@@ -3525,6 +3525,13 @@ impl World {
                     }
                     let tag = if h > 0 && why.contains("84") { "P3-f(F-12) SENIORS LOCKED BY HARVEST GATE" } else if why.contains("25") { "P3-f(F-14) SENIOR REDEMPTION UNDERFLOW" } else { "P3-f SENIORS LOCKED" };
                     let g = self.env.market_state().1;
+                    let mut s101 = std::collections::BTreeMap::new();
+                    for i in 0..200u32 {
+                        let r = self.p3_settle((i % 2) as u8);
+                        *s101.entry(format!("{:?}", r.as_ref().map(|_| ()).map_err(|e| custom_code(e)))).or_insert(0u32) += 1;
+                        if i % 20 == 19 { let s = self.slot() + 100; self.env.svm.warp_to_slot(s); }
+                    }
+                    if std::env::var("FUZZ_DEBUG_P3").is_ok() { eprintln!("  P3F 101 x200 results {:?}", s101); }
                     let alive_ix: Vec<usize> = (0..=N_USERS).filter(|&u| self.port_alive(u)).collect();
                     let mut closes = Vec::new();
                     for &u in &alive_ix {
@@ -4157,4 +4164,21 @@ fn indep_p3_rt_winner_haircut_at_resolved_close_repro() {
 /// the relaunch seed (LP_VAULT_DEPOSIT_PER_DOMAIN) and users choosing either side's pot.
 fn fuzz_lp_domain(amt: u64) -> u16 {
     if std::env::var("FUZZ_LP_DOMAINS").map_or(false, |v| v == "2") { (amt % 2) as u16 } else { 0 }
+}
+
+/// Shrunk fuzz repro (seed 0x2344b9addb22aba8, random resolve, no pre-crank; passes on 58e379f1,
+/// fails from d119eebd through 221cf006): after Resolve the vault LP keeps a leg with positive pnl
+/// that is not source-attributed, so every 101 fails (18 InvalidLeg at engine v16.rs:2561
+/// validate_positive_pnl_source_attribution; 21 with top-up), the payout snapshot is never
+/// captured, winners' CloseResolved never pays, and seniors/junior are locked (77/78/102 -> 21).
+/// Run with FUZZ_P3=1 FUZZ_RANDLEN=1 FUZZ_P3_PRECRANK=0.
+#[test]
+#[ignore]
+fn indep_p3_resolved_vault_lp_unattributed_pnl_locks_everyone_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::TradeCpi { u: 4, size_tenths: 162 }, Op::Push { delta_bps: 195 }, Op::Warp { n: 57 }, Op::LpDeposit { u: 35, amt: 6_294_509 },
+        Op::Push { delta_bps: -322 }, Op::TradeCpi { u: 44, size_tenths: -246 }, Op::Push { delta_bps: 1021 }, Op::Warp { n: 16 },
+        Op::TradeCpi { u: 181, size_tenths: 311 }, Op::Push { delta_bps: -1606 }];
+    let (r, _st) = run_seq(5, &ops, true);
+    r.expect("resolved wind-down must complete (vault LP settles, winners paid, seniors exit)");
 }
