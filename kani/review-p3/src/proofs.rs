@@ -327,6 +327,8 @@ fn kani_design_p3_10_exposure_gate_full_width() {
         assert_eq!(d, scale);
         assert!(ret.is_some());
         assert!(equity.checked_mul(lev as u128).is_some());
+        // review 7.1 optional pin: the RETURNED notional is what is compared
+        assert!(ret.unwrap() <= equity * lev as u128 / BPS);
     }
     kani::cover!(!grows && equity == 0 && before != 0, "reduce with zero equity allowed");
     kani::cover!(grows && ok, "growth admitted");
