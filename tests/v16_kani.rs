@@ -168,6 +168,8 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
         }
         _ => unreachable!(),
     }
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 /// TB-1b (ADOPT upstream cf0ce5d3/0492ebbc): Deposit/Withdraw now carry a
@@ -896,6 +898,8 @@ fn kani_v16_permissionless_crank_decode_preserves_wire_fields() {
         }
         _ => unreachable!(),
     }
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 // Non-vacuity companion: proves a hint count exceeding `CRANK_OBSERVATION_DECODE_MAX` (16) is
@@ -916,6 +920,8 @@ fn kani_v16_permissionless_crank_rejects_oversized_hint_count() {
     data[9] = n;
 
     assert!(Instruction::decode(&data).is_err());
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 // FIX W3 non-vacuity companion (PRESERVED): proves the OLD (pre-W3, 53-byte, single-asset)
@@ -1957,6 +1963,8 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
 
     let deposit_tag_only = [3u8];
     assert!(Instruction::decode(&deposit_tag_only).is_err());
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 #[kani::proof]
@@ -2454,6 +2462,8 @@ fn kani_e2_auth_reject_not_escrowed() {
         kani::any(),
     );
     assert!(!ok, "non-escrowed (owner != mint-auth PDA) must reject");
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 #[kani::proof]
@@ -2498,6 +2508,8 @@ fn kani_e2_auth_reject_wrong_portfolio() {
         kani::any(),
     );
     assert!(!ok, "an NFT bound to a DIFFERENT portfolio must reject");
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 #[kani::proof]
@@ -2542,6 +2554,8 @@ fn kani_e2_auth_reject_wrong_mint() {
         !ok,
         "holding a DIFFERENT mint (not the bound NFT) must reject"
     );
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 #[kani::proof]
@@ -2564,6 +2578,8 @@ fn kani_e2_auth_reject_wrong_ata_owner() {
         kani::any(),
     );
     assert!(!ok, "a token account NOT owned by the signer must reject");
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 #[kani::proof]
@@ -2585,6 +2601,8 @@ fn kani_e2_auth_reject_amount_not_one() {
         kani::any(),
     );
     assert!(!ok, "amount != 1 (zero, or a fungible balance) must reject");
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 #[kani::proof]
@@ -3337,6 +3355,8 @@ fn kani_fee_split_conserves() {
     .unwrap();
 
     assert!(parts.protocol + parts.creator + parts.lp + parts.insurance == fee as u128);
+    // Sentinel 2026-09-30: vacuity detector for the assume set above (end of the asserted path).
+    kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
 /// No single leg may exceed the whole fee (guards a sign/overflow regression).
