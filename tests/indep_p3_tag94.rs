@@ -31,6 +31,7 @@ struct T {
     state_pda: Pubkey,
     upgrade: Keypair,
     program_data: Pubkey,
+    matcher: Pubkey,
 }
 
 fn pd_bytes(authority: Option<&Pubkey>) -> Vec<u8> {
@@ -61,7 +62,10 @@ impl T {
         env.svm
             .set_account(program_data, Account { lamports: 1_000_000_000, data: pd_bytes(Some(&upgrade.pubkey())), owner: solana_sdk::bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 })
             .unwrap();
-        let mut t = T { env, registry, lp_mint, ledger0, ledger1, state_pda, upgrade, program_data };
+        // 07a1d0eb auto-pin: mount the matcher at the CANONICAL id.
+        let matcher: Pubkey = "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse().unwrap();
+        env.svm.add_program(matcher, &std::fs::read(matcher_program_path()).expect("matcher so"));
+        let mut t = T { env, registry, lp_mint, ledger0, ledger1, state_pda, upgrade, program_data, matcher };
         t.create_vault();
         t
     }
@@ -115,8 +119,20 @@ impl T {
     /// Path A (marketauth).
     fn init_a(&mut self, signer: &Keypair) -> Result<u64, String> {
         let lp = self.fresh_lp();
-        let metas = self.base_metas(&signer.pubkey(), lp);
+        let mut metas = self.base_metas(&signer.pubkey(), lp);
+        if !std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") {
+            metas.extend(self.autopin_tail(lp));
+        }
         self.send(metas, &[signer])
+    }
+
+    /// 07a1d0eb tag 94 tail: [8] canonical matcher, [9] ctx (w, zeroed), [10] delegate.
+    fn autopin_tail(&mut self, lp: Pubkey) -> Vec<AccountMeta> {
+        let ctx = Pubkey::new_unique();
+        self.env.svm.set_account(ctx, Account { lamports: 1_000_000_000, data: vec![0; 320], owner: self.matcher, executable: false, rent_epoch: 0 }).unwrap();
+        let del = Pubkey::find_program_address(&[b"matcher", self.env.market.as_ref(), lp.as_ref(), self.registry.as_ref(), self.matcher.as_ref(), ctx.as_ref()], &self.env.program_id).0;
+        self.env.svm.set_account(del, Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::default(), executable: false, rent_epoch: 0 }).unwrap();
+        vec![AccountMeta::new_readonly(self.matcher, false), AccountMeta::new(ctx, false), AccountMeta::new_readonly(del, false)]
     }
 
     /// Path B. `junior_signs` false puts [9] in as a non-signer (the tx is still signed by the

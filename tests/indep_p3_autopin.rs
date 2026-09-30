@@ -1,17 +1,17 @@
-//! INDEPENDENT SUITE (2026-09-30) — P3 vault-owned LP, from the DESIGN DOC only
-//! (ledger/p3-vault-owned-lp-2026-09-29.md §0 interface, §2 waterfall/flows, §6 H1/H2) and the
-//! security review BLOCKERS (P3-H1 resolved exit, P3-H2 creator free option).
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
 //!
-//! Tags 94..101 are encoded as raw bytes per §0.3 so this file compiles against the BASE host
-//! lib (6377376a). Wrapper .so under test: INDEP_WRAPPER_SO (default ~/wt-indep/p3-so/current.so).
-//! Negative control: any pre-P3 .so (v18.2 / P1) must fail these tests at tag 94.
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
 //!
-//! Properties asserted (design §2.2):
-//!   W1 senior + junior == V; junior > 0 ⇒ senior == C_eff (junior is first loss)
-//!   W2 a trader win against the vault LP moves only the junior while junior > 0 (C unchanged)
-//!   H1 after Resolve seniors can exit; no one extracts more than their NAV share; tokens conserved
-//!   H2 the creator cannot pick/reprice the vault LP's matcher (tags 95/99 upgrade-authority only),
-//!      cannot pull the junior while the LP carries inventory, and never below the floor.
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
+//! (helpers copied from indep_p3_vault_lp.rs)
 #![cfg(not(kani))]
 mod indep_harness;
 
@@ -480,318 +480,192 @@ fn code(e: &str) -> Option<u32> {
 
 /// H2 (a): the creator (marketauth / asset_admin) cannot choose or reprice the vault LP's
 /// matcher or risk params — tags 95 and 99 are upgrade-authority-only (design §2.1, §6 P3-H2).
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P3 FINAL 07a1d0eb — AUTO-PIN AT TAG 94 (design doc line 8 + vault_lp_v18 PIN_* constants):
+// the program approves CANONICAL_VAULT_LP_MATCHER_PROGRAM, keeps the 1x exposure default, and
+// initialises the matcher ctx with the protocol's PIN_* vAMM parameters and price-derived FINITE
+// caps (max_fill $5k, max_inventory $25k). The creator supplies none of these; the market can
+// trade right after tag 94 (+96). Tags 95/99 remain upgrade-authority-only adjustments.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CANONICAL: &str = "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT";
+const PIN_MAX_FILL_USD: u128 = 5_000;
+const ENGINE_MAX_POSITION_ABS_Q: u128 = 100_000_000_000_000;
+
+fn pos_q(w: &P3, p: Pubkey) -> i128 {
+    w.env.portfolio_state(p).legs.iter().find(|l| l.active).map(|l| l.basis_pos_q).unwrap_or(0)
+}
+
+/// Bind the market (74 → 75 senior → 94 auto-pin → 96 junior), NO 95 / NO 99.
+fn autopinned(senior: u64, junior: u64) -> (P3, Keypair) {
+    let s1 = Keypair::new();
+    let mut w = P3::new();
+    w.create_vault();
+    w.earn_deposit(&s1, senior, false).expect("75 senior deposit");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94 auto-pin by marketauth: {e}"));
+    if junior > 0 {
+        w.junior_deposit(&admin, junior).unwrap_or_else(|e| panic!("96: {e}"));
+    }
+    (w, s1)
+}
+
+/// A market trades immediately after tag 94 (+96): no 95/99 activation step.
 #[test]
-fn indep_p3_h2_creator_cannot_set_vault_lp_matcher_or_risk() {
+fn autopin_market_trades_immediately_after_94() {
+    let (mut w, _s) = autopinned(10_000_000, 3_000_000);
+    assert_eq!(w.matcher.to_string(), CANONICAL, "vacuity: bound to the canonical matcher id");
+    let (t, tp) = w.trader(20_000_000);
+    let _ = w.crank(w.lp);
+    let r = w.trade_vs_lp(&t, tp, POS_SCALE as i128);
+    assert!(r.is_ok(), "TradeCpi vs the vault LP right after 94 must fill: {:?}", r.map_err(|e| code(&e)));
+    assert_eq!(pos_q(&w, tp), POS_SCALE as i128, "taker filled 1 unit");
+    assert_eq!(pos_q(&w, w.lp), -(POS_SCALE as i128), "vault LP took the other side");
+}
+
+/// The creator cannot bind a non-canonical matcher: 94 naming any other executable program
+/// in [8] is refused (81 VaultLpMatcherNotApproved), with no state change.
+#[test]
+fn autopin_creator_cannot_bind_non_canonical_matcher() {
+    let s1 = Keypair::new();
+    let mut w = P3::new();
+    w.create_vault();
+    w.earn_deposit(&s1, 10_000_000, false).expect("senior");
+    let other = Pubkey::new_unique();
+    w.env.svm.add_program(other, &std::fs::read(matcher_program_path()).unwrap());
+    let canonical = w.matcher;
+    w.matcher = other; // init_vault_lp uses self.matcher for [8] and the ctx owner
+    let before = (w.env.svm.get_account(&w.env.market).unwrap().data, w.env.svm.get_account(&w.registry).unwrap().data);
+    let admin = w.env.admin.insecure_clone();
+    let r = w.init_vault_lp(&admin, 1_000);
+    eprintln!("94 with non-canonical matcher -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(81), "non-canonical matcher must be refused 81");
+    assert_eq!((w.env.svm.get_account(&w.env.market).unwrap().data, w.env.svm.get_account(&w.registry).unwrap().data), before);
+    assert!(w.env.svm.get_account(&w.state_pda).map_or(true, |a| a.data.iter().all(|b| *b == 0)), "no vault_lp_state created");
+    // Control: the canonical program binds.
+    w.matcher = canonical;
+    w.init_vault_lp(&admin, 1_000).expect("canonical matcher binds");
+}
+
+/// The creator cannot supply caps: tag 94's payload is only the junior floor; any extra bytes
+/// (an attempt to pass creator caps) are refused, and 95 by the creator is refused.
+#[test]
+fn autopin_creator_cannot_pass_or_loosen_caps() {
     let s1 = Keypair::new();
     let mut w = P3::new();
     w.create_vault();
     w.earn_deposit(&s1, 10_000_000, false).expect("senior");
     let admin = w.env.admin.insecure_clone();
-    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
-    let r = w.set_risk(&admin, 50_000);
-    assert!(r.is_err(), "H2: marketauth set tag 99 risk (approved matcher / lev) — must be upgrade-authority only");
+    // 94 with a creator-chosen cap appended (u128 max_fill = u128::MAX).
+    let lp = Pubkey::new_unique();
+    let len = w.env.portfolio_account_len;
+    let pid = w.env.program_id;
+    w.env.svm.set_account(lp, Account { lamports: 1_000_000_000, data: vec![0; len], owner: pid, executable: false, rent_epoch: 0 }).unwrap();
+    w.lp = lp;
+    let ctx = Pubkey::new_unique();
+    w.env.svm.set_account(ctx, Account { lamports: 1_000_000_000, data: vec![0; 320], owner: w.matcher, executable: false, rent_epoch: 0 }).unwrap();
+    let del = Pubkey::find_program_address(&[b"matcher", w.env.market.as_ref(), lp.as_ref(), w.registry.as_ref(), w.matcher.as_ref(), ctx.as_ref()], &pid).0;
+    w.env.svm.set_account(del, Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::default(), executable: false, rent_epoch: 0 }).unwrap();
+    let metas = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new(w.registry, false),
+        AccountMeta::new(w.state_pda, false),
+        AccountMeta::new(lp, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(w.ledger0, false),
+        AccountMeta::new(w.ledger1, false),
+        AccountMeta::new_readonly(w.matcher, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(del, false),
+    ];
+    let mut data = raw(94, &1_000u16.to_le_bytes());
+    data.extend_from_slice(&u128::MAX.to_le_bytes());
+    let r = w.send_raw(data, metas.clone(), &[&admin]);
+    eprintln!("94 with appended creator caps -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(r.is_err(), "tag 94 must not accept creator-supplied cap bytes");
+    // Normal 94, then the creator tries to loosen via 95 -> refused.
+    w.send_raw(raw(94, &1_000u16.to_le_bytes()), metas, &[&admin]).expect("94 auto-pin");
+    w.ctx = ctx;
+    w.delegate = del;
+    let r95 = w.set_matcher(&admin);
+    assert!(r95.is_err(), "creator ran tag 95 (caps/matcher) — must be upgrade-authority only");
+    let r99 = w.set_risk(&admin, 50_000);
+    assert!(r99.is_err(), "creator ran tag 99 (leverage) — must be upgrade-authority only");
+}
+
+/// Pinned caps are FINITE and price-derived: a huge request is clipped to max_fill
+/// ($5k at the bind price), never unlimited, and well below ENGINE_MAX_POSITION_ABS_Q.
+#[test]
+fn autopin_caps_are_finite_and_bind_at_max_fill() {
+    // LP equity >> $5k so the matcher's max_fill (not the 1x exposure cap) is the binding limit.
+    let (mut w, _s) = autopinned(40_000_000_000, 10_000_000_000);
+    let (t, tp) = w.trader(40_000_000_000);
+    let _ = w.crank(w.lp);
+    let huge = (1_000_000 * POS_SCALE) as i128; // $1M request
+    let r = w.trade_vs_lp(&t, tp, huge);
+    eprintln!("huge request -> {:?}; filled {}", r.as_ref().map_err(|e| code(e)), pos_q(&w, tp));
+    let filled = pos_q(&w, tp).unsigned_abs();
+    let max_fill_q = PIN_MAX_FILL_USD * 1_000_000 * POS_SCALE / PRICE as u128; // price e6
+    assert!(filled > 0, "vacuity: the pinned matcher filled something");
+    assert!(filled <= max_fill_q, "fill {filled} exceeds the pinned max_fill {max_fill_q} ($5k)");
+    assert!(filled < ENGINE_MAX_POSITION_ABS_Q, "caps must be finite");
+}
+
+/// The upgrade authority may TIGHTEN within protocol bounds (95 with smaller caps); the creator
+/// cannot. After tightening, fills respect the tighter cap.
+#[test]
+fn autopin_upgrade_authority_can_tighten_creator_cannot() {
+    let (mut w, _s) = autopinned(10_000_000, 3_000_000);
+    let admin = w.env.admin.insecure_clone();
     let up = w.upgrade.insecure_clone();
-    w.set_risk(&up, 0).expect("99 by upgrade authority");
-    let r = w.set_matcher(&admin);
-    assert!(r.is_err(), "H2: marketauth ran tag 95 VaultLpSetMatcher — creator picks the counterparty pricing");
-    let rnd = Keypair::new();
-    w.env.ensure_signer_account(rnd.pubkey());
-    assert!(w.set_matcher(&rnd).is_err(), "random signer ran tag 95");
-    w.set_matcher(&up).expect("95 by upgrade authority");
-    // A non-approved matcher program must be refused even for the upgrade authority.
-    let other = Pubkey::new_unique();
-    let bytes = std::fs::read(matcher_program_path()).unwrap();
-    w.env.svm.add_program(other, &bytes);
-    let saved = w.matcher;
-    w.matcher = other;
+    assert!(w.set_matcher(&admin).is_err(), "creator 95 refused");
+    // set_matcher (helper) pins passive kind-0 with max_fill = 1000 units; as UA that is a
+    // protocol adjustment within bounds.
     let r = w.set_matcher(&up);
-    w.matcher = saved;
-    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(81), "unapproved matcher must be VaultLpMatcherNotApproved(81): {r:?}");
-}
-
-/// W1/W2 + H2 (b): a trader (e.g. the creator's second wallet) wins against the vault LP:
-/// the loss is taken by the junior first; C (senior claim) is unchanged; while the LP carries
-/// inventory the junior cannot be withdrawn; after flattening, never below the floor.
-#[test]
-fn indep_p3_junior_first_loss_and_no_early_junior_exit() {
-    let s1 = Keypair::new();
-    let (mut w, _atas) = P3::bound(&[(&s1, 10_000_000)], 5_000_000, 2_000);
-    let admin = w.env.admin.insecure_clone();
-    let c0 = w.c();
-    assert!(c0 >= 10_000_000 - DEAD && c0 <= 10_000_000, "C must equal senior principal, got {c0}");
-    let lp_cap0 = w.lp_state().capital;
-    assert_eq!(lp_cap0, 5_000_000, "junior deposit lands as vault-LP capital");
-
-    // second wallet goes long 2 units at mark against the vault LP
-    let (t, tp) = w.trader(5_000_000);
-    w.trade_vs_lp(&t, tp, 2 * POS_SCALE as i128).unwrap_or_else(|e| panic!("TradeCpi vs vault LP: {e}"));
-    assert!(w.lp_state().legs.iter().any(|l| l.active), "vault LP must hold inventory");
-
-    // loss becomes KNOWN: mark +20%
-    w.push(1_200_000);
-    let _ = w.crank(tp);
-    let _ = w.crank(w.lp);
-    // creator's free option: exit the junior now, ahead of the known loss
-    let (_d, r) = w.junior_withdraw(&admin, admin.pubkey(), 1);
-    assert!(r.is_err(), "H2: junior withdrew while the vault LP carries a losing position");
-
-    // senior claim unchanged by the trader's gain (junior is first loss)
-    assert_eq!(w.c(), c0, "W2: C moved on a trader win while junior > 0");
-
-    // trader closes (realizes the win against the LP)
-    w.trade_vs_lp(&t, tp, -2 * (POS_SCALE as i128)).unwrap_or_else(|e| panic!("close: {e}"));
-    let _ = w.crank(w.lp);
-    let lp_after = w.lp_state();
-    assert!(!lp_after.legs.iter().any(|l| l.active), "LP flat after trader closes");
-    let junior_now = (lp_after.capital as i128 + lp_after.pnl.min(0)) as u128;
-    assert!(junior_now < 5_000_000, "the win must have been paid by the junior (LP capital {junior_now})");
-    assert_eq!(w.c(), c0, "W2: C unchanged after realized loss");
-
-    // floor: junior may not go below ceil(C_eff * floor_bps / 1e4)
-    let floor = (c0 * 2_000 + 9_999) / 10_000;
-    let over = junior_now - floor + 1;
-    let (_d, r) = w.junior_withdraw(&admin, admin.pubkey(), over);
-    assert!(r.is_err(), "junior withdrew below floor ({over} > {junior_now} - {floor})");
-    if junior_now > floor {
-        let ok_amt = junior_now - floor;
-        let (d, r) = w.junior_withdraw(&admin, admin.pubkey(), ok_amt);
-        r.unwrap_or_else(|e| panic!("junior withdraw down to exactly the floor must work: {e}"));
-        assert_eq!(w.tok(&d) as u128, ok_amt);
-    }
-    // a non-junior signer can never withdraw the junior
-    let thief = Keypair::new();
-    w.env.ensure_signer_account(thief.pubkey());
-    let (_d, r) = w.junior_withdraw(&thief, thief.pubkey(), 1);
-    assert!(r.is_err(), "non-junior signer withdrew junior");
-}
-
-/// H1: after Resolve, the vault-LP portfolio (junior + any senior cover) has an exit, seniors
-/// redeem, and nobody extracts more than their NAV share. Tokens are conserved exactly.
-/// Loss case: the trader win exceeds the junior so seniors take a haircut — the senior payout
-/// must be exactly what the waterfall promises (min(V, C) pro-rata), junior gets 0.
-fn run_h1(win_mark: u64, junior: u64) -> (u128, u128, u128, u128) {
-    let s1 = Keypair::new();
-    let s2 = Keypair::new();
-    let (mut w, atas) = P3::bound(&[(&s1, 6_000_000), (&s2, 4_000_000)], junior, 1_000);
-    let admin = w.env.admin.insecure_clone();
-    let c0 = w.c();
+    eprintln!("95 by upgrade authority -> {:?}", r.as_ref().map_err(|e| code(e)));
+    r.expect("upgrade authority may adjust within bounds");
     let (t, tp) = w.trader(20_000_000);
-    let units = (junior as i128 / PRICE as i128).max(1);
-    w.trade_vs_lp(&t, tp, units * POS_SCALE as i128).unwrap_or_else(|e| panic!("open: {e}"));
-    w.push(win_mark);
-    for _ in 0..3 {
-        let _ = w.crank(tp);
-        let _ = w.crank(w.lp);
-    }
-    w.env.resolve();
-    // trader exits (CloseResolved permissionless, pays owner)
-    let mut trader_out = 0u128;
-    for _ in 0..4 {
-        let d = w.token(t.pubkey(), 0);
-        let (m, v, va) = (w.env.market, w.env.vault, w.env.vault_authority);
-        let r = w.send(
-            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
-            vec![
-                AccountMeta::new_readonly(t.pubkey(), false),
-                AccountMeta::new(m, false),
-                AccountMeta::new(tp, false),
-                AccountMeta::new(d, false),
-                AccountMeta::new(v, false),
-                AccountMeta::new_readonly(va, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(nft_registry_pda(&m), false),
-            ],
-            &[],
-        );
-        trader_out += w.tok(&d) as u128;
-        eprintln!("trader CloseResolved -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
-        let s = w.slot() + 50;
-        w.env.svm.warp_to_slot(s);
-    }
-    // tag 30 (CloseResolved) on the vault LP must be refused (82): it would strand funds in a
-    // registry-PDA-owned ATA (P3-H1 original shape).
-    {
-        let reg = w.registry;
-        let d = w.token(reg, 0);
-        let (m, v, va, lp) = (w.env.market, w.env.vault, w.env.vault_authority, w.lp);
-        let r = w.send(
-            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
-            vec![
-                AccountMeta::new_readonly(reg, false),
-                AccountMeta::new(m, false),
-                AccountMeta::new(lp, false),
-                AccountMeta::new(d, false),
-                AccountMeta::new(v, false),
-                AccountMeta::new_readonly(va, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(nft_registry_pda(&m), false),
-            ],
-            &[],
-        );
-        assert!(r.is_err() && w.tok(&d) == 0, "H1: CloseResolved paid the vault LP into a registry-owned ATA: {r:?}");
-    }
-    // settle the vault LP senior-first (tag 101), repeat until no progress
-    let mut junior_out = 0u128;
-    let mut settled = false;
-    for topup in [0u8, 0, 1, 1] {
-        let (d, r) = w.settle_resolved(admin.pubkey(), topup);
-        junior_out += w.tok(&d) as u128;
-        if r.is_ok() {
-            settled = true;
-        }
-    }
-    assert!(settled, "H1: tag 101 VaultLpSettleResolved never succeeded");
-    for _ in 0..3 {
-        let d = w.token(t.pubkey(), 0);
-        let (m, v, va) = (w.env.market, w.env.vault, w.env.vault_authority);
-        let r = w.send(
-            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
-            vec![
-                AccountMeta::new_readonly(t.pubkey(), false),
-                AccountMeta::new(m, false),
-                AccountMeta::new(tp, false),
-                AccountMeta::new(d, false),
-                AccountMeta::new(v, false),
-                AccountMeta::new_readonly(va, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(nft_registry_pda(&m), false),
-            ],
-            &[],
-        );
-        trader_out += w.tok(&d) as u128;
-        eprintln!("post-settle trader CloseResolved -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
-        let st = w.env.portfolio_state(tp);
-        eprintln!("   trader capital {} pnl {} active {}", st.capital, st.pnl, st.legs.iter().any(|l| l.active));
-    }
-    // Liveness probe: can a senior exit BEFORE marketauth's terminal cleanup? (depends only on
-    // permissionless steps so far: CloseResolved + tag 101)
-    {
-        let shares = w.tok(&atas[1]) as u128;
-        w.request_redeem(&s2, atas[1], shares).expect("request");
-        let (_d, r) = w.execute_redeem(&s2, true);
-        eprintln!("H1-liveness: senior redemption before marketauth ClosePortfolio cleanup -> {:?}", r.as_ref().map_err(|e| code(e)));
-        if r.is_ok() {
-            eprintln!("H1-liveness: seniors can exit without marketauth");
-        }
-        // put shares back for the pro-rata check below if the request escrowed them
-    }
-    // marketauth terminal cleanup (tag 8) of the trader and the settled vault LP
-    for p in [tp, w.lp] {
-        let (pid, seq, ep) = w.env.portfolio_identity(p);
-        let m = w.env.market;
-        let r = w.send(
-            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
-            &[&admin],
-        );
-        eprintln!("cleanup ClosePortfolio {} by marketauth -> {:?}", if p == tp { "trader" } else { "vault LP" }, r.as_ref().map_err(|e| code(e)));
-    }
-    // seniors redeem in Resolved mode
-    let mut senior_out = [0u128; 2];
-    for (i, (k, ata)) in [(&s1, atas[0]), (&s2, atas[1])].into_iter().enumerate() {
-        let shares = w.tok(&ata) as u128;
-        if shares > 0 {
-            w.request_redeem(k, ata, shares).unwrap_or_else(|e| panic!("H1: senior {i} request redeem after resolve: {e}"));
-        }
-        let (d, r) = w.execute_redeem(k, true);
-        r.unwrap_or_else(|e| {
-            let logs: Vec<&str> = e.split("\\\"").filter(|l| l.contains("Program log") || l.contains("failed")).collect();
-            panic!("H1: senior {i} cannot exit after Resolve: code {:?} logs {:?}", code(&e), logs)
-        });
-        senior_out[i] = w.tok(&d) as u128;
-    }
-    // token conservation (every atom this test minted is somewhere or burned-accounted: no burns here)
-    assert_eq!(w.held(), w.minted, "token conservation broke");
-    let senior_total = senior_out[0] + senior_out[1];
-    // no senior beats their NAV share: s1 has 6/10 of shares (both deposits at 1:1)
-    assert!(senior_out[0] * 4 <= senior_out[1] * 6 + 6, "senior 1 got more than pro-rata: {senior_out:?}");
-    assert!(senior_total <= c0, "seniors extracted more than C ({senior_total} > {c0})");
-    eprintln!("H1 win_mark={win_mark} junior={junior}: C={c0} seniors={senior_out:?} junior_out={junior_out} trader_out={trader_out}");
-    (c0, senior_total, junior_out, trader_out)
-}
-
-#[test]
-fn indep_p3_h1_resolved_exit_junior_covers_loss() {
-    // loss 10% of 3 units notional = 300k < junior 3M: seniors whole, junior gets the rest
-    let (c0, seniors, junior_out, _t) = run_h1(1_100_000, 3_000_000);
-    assert!(seniors + 2_000 >= c0, "seniors must be whole when the junior covers the loss: {seniors} vs C {c0}");
-    assert!(junior_out > 0 && junior_out <= 3_000_000, "junior residual {junior_out}");
-}
-
-#[test]
-fn indep_p3_h1_resolved_exit_loss_exceeds_junior() {
-    // junior 1M backing 1 unit; mark x3 => LP loses 2M > junior: seniors absorb the excess
-    let (c0, seniors, junior_out, _t) = run_h1(3_000_000, 1_000_000);
-    assert_eq!(junior_out, 0, "junior must be wiped before seniors take any loss");
-    assert!(seniors <= c0, "seniors paid > C");
-    assert!(seniors + 1_000_000 + 2_000 >= c0, "senior loss must be at most (loss - junior) ~1M: seniors {seniors} C {c0}");
-}
-
-/// H1 liveness (security-review ask: "seniors must be able to exit after Resolve"): using ONLY
-/// permissionless steps (CloseResolved, tag 101) plus the senior's own signature — no
-/// marketauth cleanup, no cooperation from the (paid-out) trader — a senior must be able to
-/// redeem. A walked-away trader leaves an empty materialized portfolio behind.
-#[test]
-fn indep_p3_h1_senior_exit_needs_no_marketauth_or_trader_cooperation() {
-    let s1 = Keypair::new();
-    let (mut w, atas) = P3::bound(&[(&s1, 10_000_000)], 3_000_000, 1_000);
-    let admin = w.env.admin.insecure_clone();
-    let (t, tp) = w.trader(20_000_000);
-    w.trade_vs_lp(&t, tp, POS_SCALE as i128).unwrap();
-    w.push(1_050_000);
-    let _ = w.crank(tp);
     let _ = w.crank(w.lp);
-    w.env.resolve();
-    let close = |w: &mut P3| {
-        let d = w.token(t.pubkey(), 0);
-        let (m, v, va) = (w.env.market, w.env.vault, w.env.vault_authority);
-        let _ = w.send(
-            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
-            vec![
-                AccountMeta::new_readonly(t.pubkey(), false),
-                AccountMeta::new(m, false),
-                AccountMeta::new(tp, false),
-                AccountMeta::new(d, false),
-                AccountMeta::new(v, false),
-                AccountMeta::new_readonly(va, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(nft_registry_pda(&m), false),
-            ],
-            &[],
-        );
-    };
-    close(&mut w);
-    for topup in [0u8, 0, 1] {
-        let _ = w.settle_resolved(admin.pubkey(), topup);
+    w.trade_vs_lp(&t, tp, POS_SCALE as i128).expect("trade after UA re-pin");
+    assert_eq!(pos_q(&w, tp), POS_SCALE as i128);
+}
+
+/// H2 end to end under AUTO-PINNED settings: the creator (junior owner via path A) plus a second
+/// trading wallet cannot profit at the seniors' expense across a size x mark sweep.
+#[test]
+fn autopin_h2_creator_free_option_fails_end_to_end() {
+    for &size in &[3i128, 20, 50] {
+        for &mark in &[700_000u64, 1_300_000, 2_000_000, 3_000_000] {
+            let (mut w, s1) = autopinned(10_000_000, 3_000_000);
+            let _ = s1;
+            let c0 = w.c();
+            let (t, tp) = w.trader(200_000_000); // creator's second wallet
+            let _ = w.crank(w.lp);
+            let r = w.trade_vs_lp(&t, tp, size * POS_SCALE as i128);
+            let filled = pos_q(&w, tp);
+            w.push(mark);
+            for _ in 0..3 {
+                let _ = w.crank(tp);
+                let _ = w.crank(w.lp);
+            }
+            // Trader closes (reduce-only), whatever it can.
+            let _ = w.trade_vs_lp(&t, tp, -filled);
+            let _ = w.crank(tp);
+            let tr = w.env.portfolio_state(tp);
+            let trader_gain = tr.capital as i128 + tr.pnl as i128 - 200_000_000;
+            let c1 = w.c();
+            let st = w.state();
+            let jdep = u128::from_le_bytes(st[160..176].try_into().unwrap());
+            let lp = w.env.portfolio_state(w.lp);
+            let lp_value = lp.capital as i128 + lp.pnl as i128;
+            eprintln!("H2 size {size} mark {mark}: open {:?} filled {filled} trader_gain {trader_gain} C {c0}->{c1} lp_value {lp_value} jdep {jdep}", r.as_ref().map_err(|e| code(e)));
+            let senior_loss = c0 as i128 - c1 as i128;
+            assert!(senior_loss <= DEAD as i128, "seniors lost {senior_loss} (> dead-share rounding) — H2 free option");
+            if senior_loss > 0 {
+                assert!(trader_gain <= 0, "creator's wallet gained {trader_gain} while seniors lost {senior_loss}");
+            }
+        }
     }
-    close(&mut w);
-    // a stranger may try to free the empty portfolios (permissionless reclaim, if any)
-    let stranger = Keypair::new();
-    w.env.ensure_signer_account(stranger.pubkey());
-    for p in [tp, w.lp] {
-        let (pid, seq, ep) = w.env.portfolio_identity(p);
-        let m = w.env.market;
-        // P3 e8366978 (F-4 fix): in Resolved mode anyone may deregister an EMPTY portfolio if
-        // optional account [3] is its owner (rent returns there). Older builds ignore [3].
-        let owner = Pubkey::new_from_array(w.env.portfolio_state(p).owner);
-        let r = w.send(
-            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
-            vec![AccountMeta::new(stranger.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(owner, false)],
-            &[&stranger],
-        );
-        eprintln!("stranger ClosePortfolio -> {:?}", r.as_ref().map_err(|e| code(e)));
-    }
-    let shares = w.tok(&atas[0]) as u128;
-    w.request_redeem(&s1, atas[0], shares).expect("request");
-    let (d, r) = w.execute_redeem(&s1, true);
-    let (_, g) = w.env.market_state();
-    assert!(
-        r.is_ok(),
-        "H1 LIVENESS: senior cannot redeem after Resolve without marketauth ClosePortfolio cleanup \
-         (materialized portfolios {}; err {:?}) — a burned/uncooperative marketauth or a walked-away \
-         trader locks every senior",
-        g.materialized_portfolio_count,
-        r.as_ref().err().map(|e| code(e))
-    );
-    assert!(w.tok(&d) > 0);
 }

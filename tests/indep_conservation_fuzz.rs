@@ -194,7 +194,8 @@ impl World {
             env.svm.set_account(env.market, acct).unwrap();
         }
 
-        let matcher_prog = Pubkey::new_unique();
+        // 07a1d0eb auto-pin: the vault LP's matcher must be the CANONICAL program id.
+        let matcher_prog = if p3_mode() && !p3_legacy_bind() { p3_canonical_matcher() } else { Pubkey::new_unique() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher_prog, &bytes);
 
@@ -2868,6 +2869,16 @@ fn indep_f9_recovery_into_dead_shares_only_pool_is_not_booked_to_dead_shares() {
 // named signing junior owner = the "creator") → 99 → 95 → 96 junior.
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// P3_LEGACY_BIND=1: pre-07a1d0eb flow (94 without the auto-pin tail, then 99 + 95).
+pub fn p3_legacy_bind() -> bool {
+    std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1")
+}
+
+/// CANONICAL_VAULT_LP_MATCHER_PROGRAM (devnet) at 07a1d0eb — the live matcher id.
+pub fn p3_canonical_matcher() -> Pubkey {
+    "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse().unwrap()
+}
+
 pub fn p3_mode() -> bool {
     std::env::var("FUZZ_P3").map_or(false, |v| v == "1")
 }
@@ -2950,6 +2961,17 @@ impl World {
             AccountMeta::new_readonly(program_data, false),
             AccountMeta::new_readonly(junior.pubkey(), true),
         ];
+        // 07a1d0eb auto-pin tail: [8] canonical matcher, [9] ctx (w, zeroed, matcher-owned),
+        // [10] delegate ["matcher", market, lp, registry, matcher, ctx].
+        let pin_ctx = Pubkey::new_unique();
+        self.env.svm.set_account(pin_ctx, Account { lamports: 1_000_000_000, data: vec![0; 320], owner: self.matcher_prog, executable: false, rent_epoch: 0 }).unwrap();
+        let pin_del = Pubkey::find_program_address(&[b"matcher", m.as_ref(), lp.as_ref(), reg.as_ref(), self.matcher_prog.as_ref(), pin_ctx.as_ref()], &pid).0;
+        self.env.svm.set_account(pin_del, Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::default(), executable: false, rent_epoch: 0 }).unwrap();
+        let pin_tail = vec![
+            AccountMeta::new_readonly(self.matcher_prog, false),
+            AccountMeta::new(pin_ctx, false),
+            AccountMeta::new_readonly(pin_del, false),
+        ];
         let up = upgrade.insecure_clone();
         // Path B was REMOVED (user decision 2026-09-30). Default: path A — marketauth binds and
         // becomes the junior owner (the creator). FUZZ_P3_PATH_B=1 keeps the old path for ee29b5ac.
@@ -2961,6 +2983,9 @@ impl World {
             let admin = self.env.admin.insecure_clone();
             let mut ma = metas[..8].to_vec();
             ma[0] = AccountMeta::new(admin.pubkey(), true);
+            if !p3_legacy_bind() {
+                ma.extend(pin_tail.clone());
+            }
             self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), ma, &[&admin]).unwrap_or_else(|e| panic!("94 InitVaultLp path A: {}", &e[..e.len().min(500)]));
             admin
         };
@@ -2975,7 +3000,9 @@ impl World {
         b.extend_from_slice(self.matcher_prog.as_ref());
         let metas = vec![AccountMeta::new(up.pubkey(), true), AccountMeta::new_readonly(program_data, false), AccountMeta::new(m, false)];
         self.p3_send_raw(p3_raw(99, &b), metas, &[&up]).unwrap_or_else(|e| panic!("99 SetVaultLpRisk: {}", &e[..e.len().min(400)]));
-        // 95 VaultLpSetMatcher (passive kind 0, finite caps).
+        // 95 VaultLpSetMatcher (passive kind 0, finite caps) — LEGACY flow only; 07a1d0eb
+        // auto-pins the canonical vAMM at 94 and the market trades right away.
+        let (ctx, delegate) = if !p3_legacy_bind() { (pin_ctx, pin_del) } else {
         let ctx = Pubkey::new_unique();
         self.env.svm.set_account(ctx, Account { lamports: 1_000_000_000, data: vec![0; 320], owner: self.matcher_prog, executable: false, rent_epoch: 0 }).unwrap();
         let delegate = Pubkey::find_program_address(&[b"matcher", m.as_ref(), lp.as_ref(), reg.as_ref(), self.matcher_prog.as_ref(), ctx.as_ref()], &pid).0;
@@ -3009,6 +3036,7 @@ impl World {
             AccountMeta::new_readonly(delegate, false),
         ];
         self.p3_send_raw(p3_raw(95, &b), metas, &[&up]).unwrap_or_else(|e| panic!("95 VaultLpSetMatcher: {}", &e[..e.len().min(400)]));
+        (ctx, delegate) };
         self.p3 = Some(P3Ctx {
             lp, state_pda, junior, upgrade, program_data, ctx, delegate,
             senior_in: genesis, senior_out: 0, n_redeem: 0, c_last: 0, c_may_drop: false, fees_credited0: 0,
@@ -3220,6 +3248,14 @@ impl World {
                 }
                 let _ = self.do_close_resolved(u);
                 let _ = self.do_claim_topup(u);
+                self.check()?;
+            }
+            // Engine sequencing (P3 doc final pass): the vault-LP settle can be progress-only
+            // until counterparties have closed, and vice versa — retry 101 every round.
+            for topup in [0u8, 1] {
+                if self.p3_settle(topup).is_ok() {
+                    *self.stats.ok.entry("p3_settle101_retry").or_default() += 1;
+                }
                 self.check()?;
             }
             let s = self.slot() + 10 * (round + 1);
@@ -3690,4 +3726,42 @@ fn indep_p3_resolve_with_pending_fees_seniors_redeem_and_fees_conserved() {
     w.check_tokens().unwrap();
     r.expect("seniors must redeem after a resolve with pending LP fees, and no value may be stranded (dust <= 2000)");
     assert!(w.minted >= minted);
+}
+
+/// F-12 RESIDUAL on 07a1d0eb (shrunk from the random-resolve P3 fuzz, seed 6161 batch): resolve
+/// with LP fees outstanding and no pre-resolve harvest; the new resolved tag 78 should let seniors
+/// out, but redemption still returns 84. Run: FUZZ_P3=1 FUZZ_P3_PRECRANK=0 --ignored.
+#[test]
+#[ignore]
+fn indep_p3_f12_residual_two_trades_then_resolve() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(30);
+    for op in [Op::TradeCpi { u: 220, size_tenths: -138 }, Op::Warp { n: 40 }, Op::TradeCpi { u: 8, size_tenths: 293 }] {
+        let r = w.apply(&op);
+        eprintln!("op {op:?} -> {:?}", r.map_err(|e| custom_code(&e)));
+        w.check().unwrap();
+    }
+    let lp = w.p3.as_ref().unwrap().lp;
+    let lpst = w.env.portfolio_state(lp);
+    eprintln!("pre-resolve vault LP legs {:?} cap {} pnl {}", lpst.legs.iter().filter(|l| l.active).map(|l| l.basis_pos_q).collect::<Vec<_>>(), lpst.capital, lpst.pnl);
+    let r = w.wind_down();
+    eprintln!("F-12 residual: wind_down -> {r:?}; resolved tag 78 now -> {:?}", w.do_lp_crank(0).map_err(|e| custom_code(&e)));
+    if !w.is_tombstone() {
+        let (_, g) = w.env.market_state();
+        eprintln!("  end state: mode {:?} materialized {} c_tot {} pnl_pos {} oi {}/{} vault LP present {}", g.mode, g.materialized_portfolio_count, g.c_tot, g.pnl_pos_tot, g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q, w.env.svm.get_account(&lp).map_or(false, |a| a.lamports > 0));
+        for u in 0..w.ports.len() {
+            if let Some(pf) = w.env.svm.get_account(&w.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
+                eprintln!("  u{u}: cap {} pnl {} legs {} receipt {:?}", pf.capital, pf.pnl, pf.legs.iter().filter(|l| l.active).count(), (pf.resolved_payout_receipt.present, pf.resolved_payout_receipt.finalized));
+            }
+        }
+        if let Some(pf) = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()) {
+            eprintln!("  vault LP: cap {} pnl {} legs {} receipt {:?}", pf.capital, pf.pnl, pf.legs.iter().filter(|l| l.active).count(), (pf.resolved_payout_receipt.present, pf.resolved_payout_receipt.finalized));
+        }
+        for t in [0u8, 1] {
+            eprintln!("  tag101 settle(topup {t}) now -> {:?}", w.p3_settle(t).map_err(|e| custom_code(&e)));
+        }
+        eprintln!("  tag78 after settle -> {:?}", w.do_lp_crank(0).map_err(|e| custom_code(&e)));
+        eprintln!("  stats err: {:?}", w.stats.err.iter().filter(|(k, _)| k.starts_with("p3") || k.starts_with("lp_")).collect::<Vec<_>>());
+    }
+    r.expect("seniors exit after resolve with pending fees");
 }

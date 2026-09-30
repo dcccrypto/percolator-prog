@@ -626,7 +626,8 @@ mod p3 {
 
         pub fn new() -> Self {
             let mut env = V16CuEnv::new_with_init_params(market_params());
-            let matcher = Pubkey::new_unique();
+            // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
             env.svm.add_program(matcher, &std::fs::read(matcher_program_path()).expect("matcher so"));
             env.svm.warp_to_slot(1);
             env.configure_auth_mark_for_asset_as_admin(0, 1, PX);
@@ -750,7 +751,25 @@ mod p3 {
                 AccountMeta::new(self.ledger0, false),
                 AccountMeta::new(self.ledger1, false),
             ];
-            self.send_raw(raw(94, &floor_bps.to_le_bytes()), metas, &[signer])
+            let mut metas = metas;
+        if !std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") {
+            // 07a1d0eb auto-pin tail: [8] canonical matcher, [9] ctx (w, zeroed, matcher-owned),
+            // [10] delegate ["matcher", market, lp, registry, matcher, ctx].
+            let ctx = Pubkey::new_unique();
+            self.env.svm.set_account(ctx, Account { lamports: 1_000_000_000, data: vec![0; 320], owner: self.matcher, executable: false, rent_epoch: 0 }).unwrap();
+            let delegate = Pubkey::find_program_address(
+                &[b"matcher", self.env.market.as_ref(), self.lp.as_ref(), self.registry.as_ref(), self.matcher.as_ref(), ctx.as_ref()],
+                &self.env.program_id,
+            )
+            .0;
+            self.env.svm.set_account(delegate, Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::default(), executable: false, rent_epoch: 0 }).unwrap();
+            self.ctx = ctx;
+            self.delegate = delegate;
+            metas.push(AccountMeta::new_readonly(self.matcher, false));
+            metas.push(AccountMeta::new(ctx, false));
+            metas.push(AccountMeta::new_readonly(delegate, false));
+        }
+        self.send_raw(raw(94, &floor_bps.to_le_bytes()), metas, &[signer])
         }
 
         pub fn set_risk(&mut self, signer: &Keypair, lev_max_bps: u32) -> Result<u64, String> {
@@ -933,7 +952,7 @@ mod p3 {
             w.init_vault_lp(&admin, floor_bps).unwrap_or_else(|e| panic!("94: {e}"));
             let up = w.upgrade.insecure_clone();
             w.set_risk(&up, 0).unwrap_or_else(|e| panic!("99: {e}"));
-            w.set_matcher(&up).unwrap_or_else(|e| panic!("95: {e}"));
+            if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { w.set_matcher(&up).unwrap_or_else(|e| panic!("95: {e}")); }
             if junior > 0 {
                 w.junior_deposit(&admin, junior).unwrap_or_else(|e| panic!("96: {e}"));
             }
