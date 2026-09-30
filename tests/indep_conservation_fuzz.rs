@@ -170,7 +170,13 @@ impl World {
             max_price_move_bps_per_slot: 20,
             max_accrual_dt_slots: 20,
             trade_fee_base_bps: fee_bps,
-            max_bankrupt_close_lifetime_slots: 100,
+            // Anvil 2026-09-30 (roundtrip fix): INDEP_CLOSE_LIFETIME overrides the bankrupt-close
+            // lifetime, which also sets the counterparty-backing freshness horizon
+            // (max(dt, h_max, lifetime)); used to separate backing expiry from #175 netting.
+            max_bankrupt_close_lifetime_slots: std::env::var("INDEP_CLOSE_LIFETIME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
             max_abs_funding_e9_per_slot: 1_000,
             min_funding_lifetime_slots: 10_000_000,
             ..V16CuMarketParams::default()
