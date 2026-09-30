@@ -29883,32 +29883,9 @@ mod p1_kani_proofs {
         );
     }
 
-    #[kani::proof]
-    #[kani::solver(cadical)]
-    fn kani_p1_exposure_cap_saturates_monotone() {
-        // Full-width equity (saturation needs it); k and price concrete-ish to keep the
-        // 128-bit division tractable.
-        // Equity from representative magnitudes incl. the overflow edge (a symbolic u128
-        // numerator under a 128-bit division did not finish in 40 min).
-        let esel: u8 = kani::any();
-        let equity: u128 = match esel % 6 {
-            0 => 0,
-            1 => 1,
-            2 => 1_000_000,
-            3 => u64::MAX as u128,
-            4 => u128::MAX / 2,
-            _ => u128::MAX - 1,
-        };
-        let ksel: u8 = kani::any();
-        let k: u32 = if ksel % 2 == 0 { 10_000 } else { p1::MAX_LP_EXPOSURE_K_BPS };
-        let psel: u8 = kani::any();
-        let price: u64 = if psel % 2 == 0 { 1 } else { 1_000_000 };
-        let cap = p1::lp_exposure_cap_q(equity, k, price, 1_000_000);
-        let bigger = p1::lp_exposure_cap_q(equity.saturating_add(1), k, price, 1_000_000);
-        assert!(cap <= bigger);
-        kani::cover!(cap == u128::MAX, "saturation reachable");
-        kani::cover!(cap < u128::MAX && cap > 0, "non-saturated");
-    }
+    // (kani_p1_exposure_cap_saturates_monotone removed: it enumerated 24 concrete cases --
+    // a test, not a proof. Superseded by tests/kani_review_p1.rs
+    // kani_review_p1_cap_saturation_full_u128_equity, PR #521.)
 
     #[kani::proof]
     fn kani_p1_headroom_matches_post_trade_cap() {
@@ -29988,6 +29965,9 @@ mod p1_kani_proofs {
         let d = (d as u128).min(room) as i128;
         let after2 = if dir_pos { before as i128 + d } else { before as i128 - d };
         assert!(!p1::lp_risk_increasing(before as i128, after2));
+        // Never flips: a clipped reduce ends on the same side or exactly flat.
+        assert!(after2 == 0 || (after2 > 0) == (before > 0));
+        kani::cover!(after2 == 0 && (d as u128) == room, "reduce-through-flat clipped exactly to flat");
     }
     kani::cover!(reduces && room > 0, "floored LP may reduce");
     kani::cover!(!reduces && room == 0, "floored LP growth halted");
