@@ -227,10 +227,10 @@ fn kani_design_p1_close_never_burns_owed_fees() {
     }
     if let Some((lw2, ia2)) = p1::fold_lp_leg_into_insurance(la, lw, ia) {
         assert_eq!(lw2, la, "LP leg fully folded");
-        if let Some(owed2) = p1::outstanding_fee_legs(pa, pw, la, lw2, ia2, iw, cr) {
-            assert_eq!(owed2, owed, "fold never changes the owed total");
-        }
+        let owed2 = p1::outstanding_fee_legs(pa, pw, la, lw2, ia2, iw, cr);
+        assert!(owed2 == Some(owed), "fold never changes the owed total (and never newly overflows)");
     }
+    kani::cover!(p1::fold_lp_leg_into_insurance(la, lw, ia).is_none() && la >= lw, "insurance overflow in the fold fails closed");
     kani::cover!(!refused && owed > 0 && pool == 0, "owed but unbacked: close allowed, nothing burned");
     kani::cover!(!refused && owed == 0 && pool > 0, "nothing owed: pool retired");
     kani::cover!(refused, "close refused");
@@ -256,6 +256,10 @@ fn kani_design_p1_fee_channel_full_width() {
         let total = base as u128 + req as u128;
         assert!(total <= signed as u128 && total <= mmax as u128);
     }
+    // completeness: every consentable request IS permitted (a refuse-all mutant reds)
+    if req > 0 && pmax != 0 && req <= pmax as u64 && base.checked_add(req).map_or(false, |t| t <= signed && t <= mmax) {
+        assert!(ok);
+    }
     kani::cover!(ok && req > 0, "consented request");
     kani::cover!(!ok && req > 0 && pmax != 0 && req <= pmax as u64 && base as u128 + req as u128 > signed as u128, "taker cap refuses");
     kani::cover!(!ok && base.checked_add(req).is_none(), "overflowing request refused");
@@ -267,59 +271,89 @@ fn kani_design_p1_fee_channel_full_width() {
     assert_eq!(ba + bb + lp, fa + fb, "every collected atom allocated exactly once");
     assert!(ba <= fa && bb <= fb && ba + bb <= owed);
     assert!(ba + bb == owed.min(fa + fb), "base covered first, as far as collected fees allow");
+    assert_eq!(ba, fa.min(owed), "the base is taken from the taker fee first");
     kani::cover!(lp > 0 && ba + bb == owed, "LP credited beyond the base");
     kani::cover!(lp == 0 && ba + bb < owed, "shortfall: all to the base");
     kani::cover!(bb > 0 && ba == fa, "maker fallback covers the base remainder");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// D-P1-08  Division lemma for the cap over the ENGINE domain (equity <= 1e16, k <= 1e7,
-// 0 < price <= 1e12; numerator <= 1e29 never saturates there): `lp_exposure_cap_q` is the exact
-// floor of equity*k*POS_SCALE / (1e4*price): cap*den <= num < cap*den + den. KISSAT (the only
-// solver that clears 128-bit division lemmas on this box). Replaces the u16/u8-k builder
-// harnesses and the 24-case saturation test as evidence for "cap at real k".
+// D-P1-08s / D-P1-09s  Small-width WIRING regressions for the cap (the full-width floor property
+// is L-DIV / L-CAP on paper: `lp_exposure_cap_q` is checked_mul, checked_mul, `/`, and CBMC cannot
+// discharge a 128-bit division miter). pos_scale is a SYMBOLIC parameter so an operand mix-up
+// (e.g. dividing by POS_SCALE instead of multiplying) reds. No release claim rests on these.
 // ─────────────────────────────────────────────────────────────────────────────────────────
 #[kani::proof]
 #[kani::solver(kissat)]
-fn kani_design_p1_cap_exact_floor_engine_domain() {
-    let equity: u128 = kani::any();
-    let k: u32 = kani::any();
-    let price: u64 = kani::any();
-    kani::assume(equity <= MAX_TVL && k <= p1::MAX_LP_EXPOSURE_K_BPS && price > 0 && price <= MAX_PRICE);
-    let cap = p1::lp_exposure_cap_q(equity, k, price, POS_SCALE);
-    let num = equity * (k as u128) * POS_SCALE; // <= 1e29, no overflow
+fn kani_design_p1_08s_cap_floor_small_width() {
+    let equity: u8 = kani::any();
+    let k: u8 = kani::any();
+    let price: u8 = kani::any();
+    let ps: u8 = kani::any();
+    kani::assume(price >= 1 && price <= 15);
+    let cap = p1::lp_exposure_cap_q(equity as u128, k as u32, price as u64, ps as u128);
+    let num = equity as u128 * k as u128 * ps as u128;
     let den = 10_000u128 * price as u128;
-    let cd = cap * den; // cap <= num/den, so cap*den <= num
-    assert!(cd <= num, "never over-grants");
-    assert!(num - cd < den, "never under-grants by a whole unit");
-    kani::cover!(cap > 0 && num % den != 0 && k >= 10_000, "non-exact floor at a real k");
-    kani::cover!(cap == 0 && equity > 0 && k > 0, "positive equity rounds to a zero cap");
+    let cd = cap * den;
+    assert!(cd <= num && num - cd < den);
+    kani::cover!(cap > 0 && num % den != 0, "non-exact floor");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────
-// D-P1-09  The processor's division-free decision agrees with the division form over the engine
-// domain: exposure_within_cap_fast(abs, ..) == Some(abs <= lp_exposure_cap_q(..)). This is the
-// correctness of `lp_floor_and_cap_q_for_target_view` returning u128::MAX on the fast path
-// (v16_program.rs:26072-26079): the post-fill verdict is the same either way. KISSAT.
-// ─────────────────────────────────────────────────────────────────────────────────────────
 #[kani::proof]
 #[kani::solver(kissat)]
-fn kani_design_p1_fast_cap_equals_division_engine_domain() {
-    let abs: u128 = kani::any();
-    let equity: u128 = kani::any();
-    let k: u32 = kani::any();
-    let price: u64 = kani::any();
-    kani::assume(abs <= MAX_POS && equity <= MAX_TVL && k <= p1::MAX_LP_EXPOSURE_K_BPS);
-    kani::assume(price > 0 && price <= MAX_PRICE);
-    let fast = p1::exposure_within_cap_fast(abs, equity, k, price, POS_SCALE);
-    let cap = p1::lp_exposure_cap_q(equity, k, price, POS_SCALE);
-    assert_eq!(fast, Some(abs <= cap));
-    kani::cover!(fast == Some(true) && abs == cap && abs > 0, "exactly at the cap");
-    kani::cover!(fast == Some(false) && abs == cap + 1, "one past the cap");
+fn kani_design_p1_09s_fast_cap_equals_division_small_width() {
+    let abs: u8 = kani::any();
+    let equity: u8 = kani::any();
+    let k: u8 = kani::any();
+    let price: u8 = kani::any();
+    let ps: u8 = kani::any();
+    kani::assume(price >= 1 && price <= 15);
+    let fast = p1::exposure_within_cap_fast(abs as u128, equity as u128, k as u32, price as u64, ps as u128);
+    let cap = p1::lp_exposure_cap_q(equity as u128, k as u32, price as u64, ps as u128);
+    assert_eq!(fast, Some(abs as u128 <= cap));
+    kani::cover!(fast == Some(true) && abs as u128 == cap && abs > 0, "exactly at the cap");
+    kani::cover!(fast == Some(false) && abs as u128 == cap + 1, "one past the cap");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────
-// D-P1-11  `effective_exec_band_bps` is total and exact over every stored u16 (the value the
+// D-P1-11  P1 -> P2 matcher call extension (`encode_matcher_call_ext`, v16_program.rs:9544):
+// mode != 1 is all-zero legacy bytes; mode 1 is the ext_version 1 block with the documented flag
+// bits, band, mark slot and headroom (saturated to u64::MAX), trailing bytes zero.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+#[kani::proof]
+fn kani_design_p1_11_matcher_call_ext_encoding() {
+    let mode: u8 = kani::any();
+    let mark: u64 = kani::any();
+    let head: u128 = kani::any();
+    let band: u16 = kani::any();
+    let tr: bool = kani::any();
+    let fee: bool = kani::any();
+    let b = p1::encode_matcher_call_ext(mode, mark, head, band, tr, fee);
+    if mode != 1 {
+        assert!(b == [0u8; 24], "legacy matcher gets all-zero bytes");
+        return;
+    }
+    assert_eq!(b[0], 1);
+    let mut flags = p1::EXT_FLAG_HEADROOM | p1::EXT_FLAG_MARK_SLOT | p1::EXT_FLAG_EXEC_BAND;
+    if tr { flags |= p1::EXT_FLAG_TAKER_REDUCING; }
+    if fee { flags |= p1::EXT_FLAG_ACCEPTS_FEE_REQUEST; }
+    assert_eq!(b[1], flags);
+    assert_eq!(u16::from_le_bytes([b[2], b[3]]), band);
+    assert_eq!(u64::from_le_bytes(b[4..12].try_into().unwrap()), mark);
+    let h = u64::from_le_bytes(b[12..20].try_into().unwrap());
+    if head > u64::MAX as u128 {
+        assert_eq!(h, u64::MAX, "unbounded headroom saturates, never wraps");
+    } else {
+        assert_eq!(h as u128, head);
+    }
+    assert!(b[20..24] == [0u8; 4]);
+    kani::cover!(head > u64::MAX as u128, "saturated headroom");
+    kani::cover!(tr && !fee, "taker-reducing attested");
+    kani::cover!(fee && head < 1000, "fee channel offered with a finite headroom");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// D-P1-12  `effective_exec_band_bps` is total and exact over every stored u16 (the value the
 // processor feeds D-P1-01's predicate). Folded in from my earlier review file (PASS 1/1 in the
 // P1 builder's partial run on c8ccbf2a); exhaustive over u16, seconds.
 // ─────────────────────────────────────────────────────────────────────────────────────────
