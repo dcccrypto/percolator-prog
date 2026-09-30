@@ -1982,3 +1982,39 @@ fn roundtrip_lock_winner_and_seniors_exit_in_full() {
     assert!(winner + 2 >= owed, "RULE: the winner is paid in full after the round trip: {winner} < {owed}");
     assert!(paid[0] + 1_000 >= 9_000_000 && paid[1] + 1_000 >= 1_000_000, "no senior loss (junior covers the net 10.5M): seniors paid {paid:?}");
 }
+
+/// fee_share_bps = 0 (accepted by tag 74) + a bound vault whose senior value exceeds the floored
+/// principal (after the round trip): ExecuteRedemption must refuse cleanly or pay, never PANIC.
+/// On 58e379f1 it panics: v16_program.rs:24978-24982 mul_div_ceil_u256(earnings, 10_000,
+/// fee_share_bps = 0) -> engine wide_math.rs:1486 "zero denominator" (the comment above it assumes
+/// fee_share 0 implies earnings 0, which the P3 pricing path breaks).
+#[test]
+fn p3_redeem_never_panics_with_zero_fee_share() {
+    TL_FEE_SHARE.with(|c| c.set(Some(0)));
+    let (mut w, seniors, (t, tp), _admin) = rt_world();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    let m = w.env.market;
+    let lp = w.lp;
+    for _ in 0..6 {
+        let r = w.trade_vs_lp_fee(&t, tp, -w.pos(tp), 30);
+        if r.is_ok() { break; }
+        w.catch_up(&[tp, lp], 5);
+    }
+    w.catch_up(&[tp, lp], 10);
+    for _ in 0..3 {
+        let pnl = w.env.portfolio_state(tp).pnl;
+        if pnl <= 0 { break; }
+        let (pid, _, pep) = w.env.portfolio_identity(tp);
+        let _ = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[&t]);
+        w.catch_up(&[tp, lp], 10);
+    }
+    for (i, (k, a)) in seniors.iter().enumerate() {
+        let _ = w.request_redeem(k, *a, 1_000_000);
+        let _ = w.crank_fees_78(); // harvest first (else 84)
+        let (_, r) = w.execute_redeem_domain(k, i as u16);
+        let panicked = r.as_ref().err().map_or(false, |e| e.contains("ProgramFailedToComplete") || e.contains("panicked"));
+        eprintln!("ZFS senior d{i} 77 -> {:?} panicked {panicked}", r.as_ref().map_err(|e| code(e)));
+        assert!(!panicked, "77 PANICKED (fee_share_bps 0, P3 earnings > 0) in domain {i}");
+    }
+}
