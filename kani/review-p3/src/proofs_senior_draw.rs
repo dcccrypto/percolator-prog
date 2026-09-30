@@ -2,7 +2,8 @@
 //! rata, winners never haircut). Design doc §8, entries D-P3-20..27.
 //!
 //! STATUS: NOT COMPILED, NOT INCLUDED IN lib.rs. The next P3 FINAL does not exist yet. These
-//! harnesses are written against the pure-function INTERFACE in §8.1 of the design doc. At
+//! harnesses are written against the pure-function INTERFACE in §8.1 of the design doc
+//! (revised per the hermetic review, doc §10). At
 //! re-target, only the ADAPTER block below changes (names/argument order), then the module is
 //! enabled with `#[cfg(kani)] mod proofs_senior_draw;` in lib.rs. The assertions do not change:
 //! they are the loss rule stated independently of the implementation.
@@ -35,6 +36,23 @@ fn recovery_split(recovery: u128, draw_outstanding: u128) -> (u128, u128) {
 fn halts(draw_outstanding: u128, op: u8) -> bool {
     v::vault_lp_draw_halts(draw_outstanding, op)
 }
+/// Draw state transition (the coordinator REQUIRED the builder's pure `vault_lp_draw_step(state,
+/// deficit)`): the junior surplus is read from the STATE, never re-supplied by the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DS {
+    c: u128,          // senior claim
+    junior: u128,     // junior surplus (V - C)+
+    backing: u128,    // senior-owned backing
+    drawn: u128,      // cumulative drawn for the open deficit
+    deficit: u128,    // cumulative deficit booked
+}
+fn draw_step(s: DS, delta_deficit: u128) -> Option<DS> {
+    let r = v::vault_lp_draw_step(v::VaultDrawState {
+        senior_claim: s.c, junior_surplus: s.junior, owned_backing: s.backing,
+        drawn: s.drawn, deficit: s.deficit,
+    }, delta_deficit)?;
+    Some(DS { c: r.senior_claim, junior: r.junior_surplus, backing: r.owned_backing, drawn: r.drawn, deficit: r.deficit })
+}
 // ────────────────────────────────────────────────────────────────────────────────────────────
 
 /// D-P3-20  Draw bounds: draw <= remaining deficit after the junior, <= owned backing,
@@ -53,44 +71,32 @@ fn kani_design_p3_20_draw_bounded() {
     kani::cover!(x == need && need > 0 && need < b, "full senior share drawn");
     kani::cover!(x == b && b < need, "backing-limited draw");
     kani::cover!(d > 0 && d <= j && x == 0, "junior absorbs the whole deficit");
-}
-
-/// D-P3-21  Conservation: junior cover + senior draw + unfunded remainder == deficit, and the
-/// winners' payout (junior cover + draw) is never less than the deficit whenever the junior
-/// surplus plus owned backing can fund it ("winners never haircut").
-#[kani::proof]
-fn kani_design_p3_21_draw_conserves_and_winners_whole() {
-    let d: u128 = kani::any();
-    let j: u128 = kani::any();
-    let b: u128 = kani::any();
-    let x = draw_amount(d, j, b, 0);
-    let junior_cover = d.min(j);
-    let unfunded = d - junior_cover - x;
-    assert_eq!(junior_cover + x + unfunded, d);
-    if j.checked_add(b).map_or(true, |f| f >= d) {
-        assert_eq!(unfunded, 0, "fundable deficit is paid in full");
+    // (merged from the withdrawn D-P3-21) a deficit the junior + owned backing can fund is paid in full
+    if o == 0 && j.checked_add(b).map_or(true, |f| f >= d) {
+        assert_eq!(d.min(j) + x, d, "fundable deficit fully covered (winners whole while J + B >= D)");
     }
-    kani::cover!(junior_cover > 0 && x > 0 && unfunded == 0, "junior then seniors, paid in full");
-    kani::cover!(unfunded > 0, "backing exhausted: residual reported, not haircut from winners");
+    kani::cover!(o == 0 && j.checked_add(b).map_or(false, |f| f < d), "J + B < D: engine h-lock haircuts winners (claim qualified to J + B >= D)");
 }
 
-/// D-P3-22  Idempotence: a second application for the same deficit, after the first draw is
-/// recorded as outstanding, draws nothing more; and splitting one deficit into two draws draws
-/// the same total as one draw.
+/// D-P3-22  Idempotence / split-invariance under REAL state evolution (`vault_lp_draw_step`):
+/// a zero deficit step is the identity, and booking a deficit in two steps (the junior consumed
+/// by the first is read from the state by the second) equals booking it in one. This is the
+/// harness that sees the "re-supplied original junior surplus" over-draw by J.
 #[kani::proof]
-fn kani_design_p3_22_draw_idempotent_and_split_invariant() {
-    let d: u128 = kani::any();
-    let j: u128 = kani::any();
-    let b: u128 = kani::any();
-    let x1 = draw_amount(d, j, b, 0);
-    let x2 = draw_amount(d, j, b - x1, x1);
-    assert_eq!(x2, 0, "re-running the draw for the same deficit is a no-op");
+fn kani_design_p3_22_draw_step_idempotent_and_split_invariant() {
+    let s = DS { c: kani::any(), junior: kani::any(), backing: kani::any(), drawn: kani::any(), deficit: kani::any() };
+    assert!(draw_step(s, 0) == Some(s), "zero deficit is a no-op");
     let d1: u128 = kani::any();
-    kani::assume(d1 <= d);
-    let a = draw_amount(d1, j, b, 0);
-    let c = draw_amount(d, j, b - a, a);
-    assert_eq!(a + c, x1, "draw in two steps == draw in one");
-    kani::cover!(x1 > 0 && a > 0 && c > 0, "genuinely split draw");
+    let d2: u128 = kani::any();
+    kani::assume(d1.checked_add(d2).is_some());
+    let one = draw_step(s, d1 + d2);
+    let two = draw_step(s, d1).and_then(|m| draw_step(m, d2));
+    if let (Some(a), Some(b)) = (one, two) {
+        assert!(a == b, "two steps == one step");
+    }
+    assert_eq!(one.is_some(), two.is_some(), "fail-closed behaviour identical");
+    kani::cover!(matches!(two, Some(t) if t.drawn > s.drawn) && d1 > 0 && d2 > 0, "genuinely split draw");
+    kani::cover!(d1 > 0 && d1 < s.junior && d2 > s.junior, "first step inside the junior, second spills to seniors");
 }
 
 /// D-P3-23  Senior claim falls by exactly the senior loss = max(0, D − junior surplus) (the
@@ -118,41 +124,30 @@ fn kani_design_p3_23_claim_falls_by_senior_loss() {
     kani::cover!(d > 0 && d <= j, "junior-only loss");
 }
 
-/// D-P3-24  Draw and claim agree: the claim the seniors lose equals the senior share of the
-/// deficit (drawn + unfunded), so no senior value is created or destroyed by the pair of updates.
+/// D-P3-25  Recovery ordering, OWNER RULE (2026-09-30): recovered value restores the seniors up to
+/// their FULL cumulative senior loss (drawn + unfunded = C_before − C_after) before any of it
+/// reaches the junior; conserves.
 #[kani::proof]
-fn kani_design_p3_24_draw_and_claim_consistent() {
-    let c: u128 = kani::any();
+fn kani_design_p3_25_recovery_restores_full_senior_loss_first() {
+    let rec: u128 = kani::any();
+    let c_before: u128 = kani::any();
     let d: u128 = kani::any();
     let j: u128 = kani::any();
-    let b: u128 = kani::any();
-    kani::assume(d.saturating_sub(j) <= c); // loss within the claim (else D-P3-23's saturation)
-    let x = draw_amount(d, j, b, 0);
-    let c2 = claim_after_loss(c, d, j).unwrap();
-    let unfunded = d - d.min(j) - x;
-    assert_eq!(c - c2, x + unfunded);
-    kani::cover!(x > 0 && unfunded == 0, "fully drawn");
-}
-
-/// D-P3-25  Recovery ordering: recovered value restores the seniors (repays the outstanding
-/// draw) before any of it reaches the junior; conserves.
-#[kani::proof]
-fn kani_design_p3_25_recovery_seniors_first() {
-    let rec: u128 = kani::any();
-    let o: u128 = kani::any();
-    let (to_s, to_j) = recovery_split(rec, o);
+    let c_after = claim_after_loss(c_before, d, j).unwrap();
+    let senior_loss = c_before - c_after; // drawn + unfunded
+    let (to_s, to_j) = recovery_split(rec, senior_loss);
     assert_eq!(to_s + to_j, rec);
-    assert_eq!(to_s, rec.min(o));
+    assert_eq!(to_s, rec.min(senior_loss));
     if to_j > 0 {
-        assert_eq!(to_s, o, "junior paid only after the seniors are restored in full");
+        assert_eq!(to_s, senior_loss, "junior paid only after the seniors' FULL loss is restored");
     }
-    kani::cover!(to_s > 0 && to_j > 0, "seniors restored, remainder to junior");
-    kani::cover!(to_j == 0 && rec > 0, "all to seniors");
+    kani::cover!(to_s > 0 && to_j > 0, "seniors restored in full, remainder to junior");
+    kani::cover!(to_j == 0 && rec > 0 && rec < senior_loss, "partial recovery all to seniors");
 }
 
 /// D-P3-26  Halt predicate, from the OWNER'S WRITTEN RULE (coordinator 2026-09-30): while a draw is
-/// outstanding, HALT the vault LP's risk-increasing fills, junior withdraw (tag 97) and junior
-/// release (tag 102); NEVER halt senior deposit (75) or senior redemption (76/77), which stay
+/// outstanding, HALT the vault LP's risk-increasing fills, junior withdraw (tag 97), junior
+/// release (tag 102) and recall (tag 98, owner decision 2026-09-30); NEVER halt senior deposit (75) or senior redemption (76/77), which stay
 /// open because they price at the reduced C with the undrawn deficit priced in (D-P3-28).
 #[kani::proof]
 fn kani_design_p3_26_halt_while_draw_outstanding() {
@@ -162,7 +157,7 @@ fn kani_design_p3_26_halt_while_draw_outstanding() {
     let halted_class = HALTED_OPS.contains(&op);
     let senior_exit_or_entry = NEVER_HALTED_OPS.contains(&op);
     if halted_class {
-        assert_eq!(h, o > 0, "risk-increasing fill / 97 / 102 halt exactly while a draw is outstanding");
+        assert_eq!(h, o > 0, "risk-increasing fill / 97 / 98 / 102 halt exactly while a draw is outstanding");
     }
     if senior_exit_or_entry {
         assert!(!h, "senior deposit and redemption are never halted: seniors can always exit");
@@ -170,17 +165,17 @@ fn kani_design_p3_26_halt_while_draw_outstanding() {
     if o == 0 {
         assert!(!h, "no outstanding draw: the draw rule halts nothing");
     }
-    kani::cover!(h && op == v::VAULT_OP_JUNIOR_RELEASE, "junior release halted during a draw");
-    kani::cover!(!h && o > 0 && op == v::VAULT_OP_SENIOR_REDEEM, "senior redemption open during a draw");
-    kani::cover!(!h && o > 0 && op == v::VAULT_OP_SENIOR_DEPOSIT, "senior deposit open during a draw");
+    kani::cover!(h && op == v::DRAW_OP_JUNIOR_RELEASE, "junior release halted during a draw");
+    kani::cover!(h && op == v::DRAW_OP_RECALL, "recall halted during a draw");
+    kani::cover!(!h && o > 0 && op == v::DRAW_OP_SENIOR_REDEEM, "senior redemption open during a draw");
+    kani::cover!(!h && o > 0 && op == v::DRAW_OP_SENIOR_DEPOSIT, "senior deposit open during a draw");
 }
 /// Adapter (re-target point): tag-level op codes from the owner rule.
-const HALTED_OPS: [u8; 3] = [v::VAULT_OP_RISK_INCREASING_FILL, v::VAULT_OP_JUNIOR_WITHDRAW /* 97 */, v::VAULT_OP_JUNIOR_RELEASE /* 102 */];
-const NEVER_HALTED_OPS: [u8; 3] = [v::VAULT_OP_SENIOR_DEPOSIT /* 75 */, v::VAULT_OP_SENIOR_REDEEM /* 77 */, v::VAULT_OP_SENIOR_REDEEM_ALT /* 76 */];
+const HALTED_OPS: [u8; 4] = [v::DRAW_OP_RISK_INCREASING_FILL, v::DRAW_OP_JUNIOR_WITHDRAW /* 97 */, v::DRAW_OP_RECALL /* 98 */, v::DRAW_OP_JUNIOR_RELEASE /* 102 */];
+const NEVER_HALTED_OPS: [u8; 3] = [v::DRAW_OP_SENIOR_DEPOSIT /* 75 */, v::DRAW_OP_SENIOR_REDEEM /* 77 */, v::DRAW_OP_SENIOR_REDEEM_ALT /* 76 */];
 
-/// D-P3-28  CONDITIONAL on the builder exposing the senior pricing claim as a pure fn
-/// (`vault_lp_senior_pricing_claim(c, undrawn_deficit, junior_surplus)`); otherwise this claim is
-/// LiteSVM-only and the harness is deleted at re-target. Property: tags 75/77 price against a
+/// D-P3-28  REQUIRED (coordinator 2026-09-30: the builder must expose
+/// `vault_lp_senior_pricing_claim` and 75/76/77 must price through it). Property: tags 75/77 price against a
 /// claim that ALREADY nets the undrawn deficit's senior share, i.e. exactly the claim the seniors
 /// will hold once the draw is booked (D-P3-23). So entering before / exiting before the booking
 /// is priced identically to after it: no early-exit and no late-entry arbitrage. Combined with
@@ -265,12 +260,12 @@ fn any_pending() -> DrawState {
     s
 }
 
-/// D-P3-29  Booking is conservation-preserving and idempotent: the move is internal to the vault
+/// D-P3-31  Booking is conservation-preserving and idempotent: the move is internal to the vault
 /// (backing + LP value unchanged), exactly the draw amount leaves the senior-owned backing, C
 /// falls by exactly the senior loss, the pending record is cleared, and booking a booked state
 /// changes nothing (so every one of 75/76/77/78/97/98/101/102 may call it unconditionally).
 #[kani::proof]
-fn kani_design_p3_29_pending_draw_booking_conserves_and_is_idempotent() {
+fn kani_design_p3_31_pending_draw_booking_conserves_and_is_idempotent() {
     let s = any_pending();
     let b = book(s);
     assert_eq!(b.backing_owned + b.lp_value, s.backing_owned + s.lp_value, "draw move is internal");
@@ -287,13 +282,13 @@ fn kani_design_p3_29_pending_draw_booking_conserves_and_is_idempotent() {
     kani::cover!(s.pending && s.pending_deficit > 0 && s.pending_deficit <= s.pending_junior_surplus, "junior-only pending loss");
 }
 
-/// D-P3-30  Pricing between the crank-time draw and its booking equals pricing after booking,
+/// D-P3-32  Pricing between the crank-time draw and its booking equals pricing after booking,
 /// through the NAV cap: senior value = min(V, C) (`tranche_split(..).senior`, the REAL waterfall).
 /// With V already net of the deficit D at crank time and J the junior surplus snapshotted then,
 /// min(V − D, C) == min(V − D, C − max(0, D − J)) for every state: an unbooked draw cannot be
 /// front-run by any P3 instruction that prices off the waterfall.
 #[kani::proof]
-fn kani_design_p3_30_pricing_between_draw_and_booking_equals_after() {
+fn kani_design_p3_32_pricing_between_draw_and_booking_equals_after() {
     let vv: u128 = kani::any(); // vault value at crank time, before the deficit
     let c: u128 = kani::any();
     let d: u128 = kani::any();
@@ -308,4 +303,39 @@ fn kani_design_p3_30_pricing_between_draw_and_booking_equals_after() {
     assert_eq!(v::vault_lp_senior_pricing_claim(c, d, j).min(v_between), senior_after);
     kani::cover!(d > j && j > 0, "loss spills into the seniors while pending");
     kani::cover!(vv < c && d > 0, "already-impaired vault");
+}
+
+/// D-P3-29  (review M-P3-1) Atom conservation of the draw MOVE on the REAL `vault_value`: moving x
+/// atoms from senior-owned backing NAV to LP capital leaves the vault value and the tranche split
+/// unchanged (only the loss moves the split).
+#[kani::proof]
+fn kani_design_p3_29_draw_move_conserves_vault_value() {
+    let nav: u128 = kani::any();
+    let h: u128 = kani::any();
+    let lp: u128 = kani::any();
+    let x: u128 = kani::any();
+    let c: u128 = kani::any();
+    kani::assume(x <= nav && lp.checked_add(x).is_some());
+    let v0 = v::vault_value(nav, h, lp);
+    let v1 = v::vault_value(nav - x, h, lp + x);
+    assert_eq!(v0, v1, "the draw move creates and destroys nothing");
+    if let (Some(a), Some(b)) = (v0, v1) {
+        assert!(v::tranche_split(a, c) == v::tranche_split(b, c));
+    }
+    kani::cover!(x > 0 && v0.is_some(), "real move");
+    kani::cover!(v0.is_none(), "overflowing vault value fails closed both sides");
+}
+
+/// D-P3-30  (review M-P3-4) A draw never enlarges the recall a later (post-draw) tag 98 could make:
+/// recall_limit(C', B − x) <= recall_limit(C, B), because C falls by the senior loss >= x.
+#[kani::proof]
+fn kani_design_p3_30_draw_never_enlarges_recall() {
+    let c: u128 = kani::any();
+    let b: u128 = kani::any();
+    let d: u128 = kani::any();
+    let j: u128 = kani::any();
+    let x = draw_amount(d, j, b, 0);
+    let c2 = claim_after_loss(c, d, j).unwrap();
+    assert!(v::recall_limit(c2, b - x) <= v::recall_limit(c, b));
+    kani::cover!(x > 0 && v::recall_limit(c, b) > 0, "shortfall exists and a draw happens");
 }
