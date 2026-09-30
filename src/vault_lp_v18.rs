@@ -522,6 +522,21 @@ pub fn vault_lp_recover(l: DrawLedger, value_above_c: u128) -> (DrawLedger, u128
     )
 }
 
+/// D-P3-30 recall cap: `min(existing_limit, max(lp_equity, 0))`, and 0 while any draw is pending.
+/// A recall can therefore never take the vault LP's certified equity below zero (never re-opens a
+/// deficit a draw just funded, junior-covered or not).
+pub fn vault_lp_recall_limit(existing_limit: u128, lp_equity: i128, draw_pending: bool) -> u128 {
+    if draw_pending {
+        return 0;
+    }
+    let eq = if lp_equity > 0 { lp_equity as u128 } else { 0 };
+    if existing_limit < eq {
+        existing_limit
+    } else {
+        eq
+    }
+}
+
 /// The draw's state, as the processor holds it at booking time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrawState {
@@ -638,6 +653,11 @@ mod tests {
         let (_, moved2, loss2) = vault_lp_draw_step(st2, 0);
         assert_eq!((moved2, loss2), (0, 0));
         assert!(vault_lp_draw_halts(1, DRAW_OP_RECALL_98));
+        assert_eq!(vault_lp_recall_limit(70, 0, false), 0);
+        assert_eq!(vault_lp_recall_limit(70, 30, false), 30);
+        assert_eq!(vault_lp_recall_limit(20, 30, false), 20);
+        assert_eq!(vault_lp_recall_limit(70, 30, true), 0);
+        assert_eq!(vault_lp_recall_limit(70, -5, false), 0);
         let l = DrawLedger { senior_claim: 10_000_000, drawn: 0, outstanding: 0, pending: 1_635_213 };
         let (l2, loss) = vault_lp_book_pending(l, 0);
         assert_eq!((l2.senior_claim, l2.outstanding, l2.pending, loss), (8_364_787, 1_635_213, 0, 1_635_213));

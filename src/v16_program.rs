@@ -28277,6 +28277,14 @@ pub mod processor {
             )?;
         }
         expect_owner(target_ledger_ai, program_id)?;
+        // D-P3-30: recall is halted while ANY draw is pending (junior-covered or senior).
+        let draw_pending_before = {
+            let mut md = market_ai.try_borrow_mut_data()?;
+            let (_, g) = state::market_view_mut(&mut md)?;
+            let a = st.asset_index as usize;
+            let r = read_vault_lp_draw_from_view(&g, a)?;
+            r.pending_moved_atoms != 0 || r.pending_out_even_atoms != 0 || r.pending_out_odd_atoms != 0
+        };
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
         vault_lp_draw_then_book(
             program_id,
@@ -28334,15 +28342,27 @@ pub mod processor {
                 st.senior_fee_share_bps,
             )
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            if amount > vault_lp_v18::recall_limit(c_eff, cover) {
-                return Err(PercolatorError::VaultLpRecallRefused.into());
-            }
+            let base_limit = vault_lp_v18::recall_limit(c_eff, cover);
             // LP side: engine withdraw (flat-only, margin/equity-checked) — vault -x, c_tot -x.
             {
                 let mut lp_data = lp_ai.try_borrow_mut_data()?;
                 let mut lp =
                     state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
                 expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+                // D-P3-30: a recall may NEVER take the vault LP's certified equity below zero
+                // (it must not re-open a deficit a draw just funded), and none runs while a draw
+                // is pending. Pure rule: `vault_lp_v18::vault_lp_recall_limit`.
+                let cert = group
+                    .full_account_refresh_not_atomic(&mut lp)
+                    .map_err(map_v16_error)?;
+                let limit = vault_lp_v18::vault_lp_recall_limit(
+                    base_limit,
+                    cert.certified_equity,
+                    draw_pending_before,
+                );
+                if amount > limit {
+                    return Err(PercolatorError::VaultLpRecallRefused.into());
+                }
                 collect_maintenance_fee_before_value_debit_view(&cfg_v, &mut group, &mut lp)?;
                 group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
             }
