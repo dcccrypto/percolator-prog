@@ -346,6 +346,57 @@ pub fn resolved_settle_split(payout: u128, senior_claim: u128, backing_nav: u128
     (to_backing, payout - to_backing)
 }
 
+/// P3 auto-pin (2026-09-30 decision): the matcher context tag 94 gives every vault LP. These are
+/// PROTOCOL constants (the creator passes none of them); the upgrade authority may later adjust
+/// within protocol bounds via tags 99/95. Values = the relaunch seed's vAMM defaults.
+pub const PIN_MATCHER_KIND: u8 = 1; // vAMM
+pub const PIN_TRADING_FEE_BPS: u32 = 10;
+pub const PIN_BASE_SPREAD_BPS: u32 = 10;
+pub const PIN_MAX_TOTAL_BPS: u32 = 100;
+pub const PIN_IMPACT_K_BPS: u32 = 50;
+pub const PIN_FEE_TO_INSURANCE_BPS: u16 = 0;
+pub const PIN_SKEW_SPREAD_MULT_BPS: u16 = 1;
+pub const PIN_TRADE_FEE_CAP_BPS: u16 = 10_000;
+pub const PIN_LIQUIDITY_USD: u128 = 250_000;
+pub const PIN_MAX_FILL_USD: u128 = 5_000;
+pub const PIN_MAX_INVENTORY_USD: u128 = 25_000;
+/// Mirror of the engine's `MAX_POSITION_ABS_Q` (this file is dependency-free for Kani); the
+/// wrapper asserts equality at compile time.
+pub const ENGINE_MAX_POSITION_ABS_Q: u128 = 100_000_000_000_000;
+
+/// Price-derived, FINITE matcher caps pinned at bind time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedMatcherCaps {
+    pub liquidity_notional_e6: u128,
+    pub max_fill_abs: u128,
+    pub max_inventory_abs: u128,
+}
+
+/// `usd` of notional at `price_e6` in engine Q (1e6 per unit): `floor(usd * 1e12 / price)`,
+/// clamped to the engine's position bound. `None` when the price is 0 or the result would be
+/// 0 (0 means UNLIMITED to the matcher, so it must never be pinned).
+pub fn usd_to_q_capped(usd: u128, price_e6: u64) -> Option<u128> {
+    if price_e6 == 0 {
+        return None;
+    }
+    let q = usd.checked_mul(1_000_000_000_000)? / price_e6 as u128;
+    let q = core::cmp::min(q, ENGINE_MAX_POSITION_ABS_Q);
+    if q == 0 {
+        None
+    } else {
+        Some(q)
+    }
+}
+
+/// The caps tag 94 pins, from the asset's effective price at bind time.
+pub fn pinned_matcher_caps(price_e6: u64) -> Option<PinnedMatcherCaps> {
+    Some(PinnedMatcherCaps {
+        liquidity_notional_e6: PIN_LIQUIDITY_USD.checked_mul(1_000_000)?,
+        max_fill_abs: usd_to_q_capped(PIN_MAX_FILL_USD, price_e6)?,
+        max_inventory_abs: usd_to_q_capped(PIN_MAX_INVENTORY_USD, price_e6)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +459,20 @@ mod tests {
         assert_eq!(resolved_settle_split(100, 80, 50), (30, 70));
         assert_eq!(resolved_settle_split(10, 80, 50), (10, 0));
         assert_eq!(resolved_settle_split(10, 80, 90), (0, 10));
+    }
+
+    #[test]
+    fn pinned_caps() {
+        // $1: $5k fill = 5,000 units = 5e9 Q; $25k inventory = 2.5e10 Q.
+        let c = pinned_matcher_caps(1_000_000).unwrap();
+        assert_eq!(c.max_fill_abs, 5_000_000_000);
+        assert_eq!(c.max_inventory_abs, 25_000_000_000);
+        assert_eq!(c.liquidity_notional_e6, 250_000_000_000);
+        assert!(pinned_matcher_caps(0).is_none());
+        // tiny price clamps to the engine bound, never 0 / unlimited
+        assert_eq!(pinned_matcher_caps(1).unwrap().max_inventory_abs, ENGINE_MAX_POSITION_ABS_Q);
+        // huge price that would round to 0 fails closed
+        assert!(usd_to_q_capped(5_000, u64::MAX).is_none());
     }
 
     #[test]

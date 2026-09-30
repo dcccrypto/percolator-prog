@@ -714,6 +714,28 @@ fn kani_push_p3_lemma_engine_kernel_scales_funding_per_side() {
     assert_eq!(f_short, fid * a_short as i128);
 }
 
+/// Lemma K, narrowed (the full-width version hit 1800 s): fid is any i32 funding index delta
+/// (the engine's fid for |rate| <= 2^16, dt <= 2^8, price <= 2^8 e6 fits easily), per-side A on
+/// the asymmetric grid k·MIN_A_SIDE, k = 1..=10. Same assertions against the REAL kernel.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_push_p3_lemma_engine_kernel_per_side_grid() {
+    let fid32: i32 = kani::any();
+    let kl: u8 = kani::any();
+    let ks: u8 = kani::any();
+    kani::assume(kl >= 1 && kl <= 10 && ks >= 1 && ks <= 10);
+    let fid = fid32 as i128;
+    let a_long = MIN_A_SIDE * kl as u128;
+    let a_short = MIN_A_SIDE * ks as u128;
+    let r = percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short);
+    kani::cover!(r.is_ok() && kl != ks && fid != 0, "asymmetric A, non-zero funding");
+    let (_kl, _ks, f_long, f_short) = r.unwrap();
+    #[cfg(feature = "neg_flat_a")]
+    let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
+    assert_eq!(f_long, -(fid * a_long as i128));
+    assert_eq!(f_short, fid * a_short as i128);
+}
+
 // ── Solver diagnostics (2026-09-30 03:00): the smallest division lemma, three solvers. ──
 fn diag_body() {
     let a: u8 = kani::any();
