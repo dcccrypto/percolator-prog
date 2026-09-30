@@ -1086,3 +1086,86 @@ fn q2_second_asset_activation_refused_on_bound_market() {
     eprintln!("Q2 permissionless activation on bound market -> {}", if r2.is_ok() { "SUCCEEDED" } else { "refused" });
     assert!(r2.is_err(), "Q2: permissionless activation of a second asset on a bound market must be refused");
 }
+
+// ─────────────── H-lock liveness candidate (coordinator follow-up) ───────────────
+// After a vault-LP loss larger than the junior (+264%), the market sat h-locked with
+// loss_stale and the winner's conversion returned 21 for >1,200 slots. Try every PERMISSIONLESS
+// progress path in escalating phases and record which (if any) clears it within N slots.
+#[test]
+#[ignore]
+fn hlock_after_vault_lp_bankruptcy_permissionless_exits() {
+    let (mut w, _seniors, (t, tp)) = q1_world(9_000_000, 1_000_000, 1_000_000, 6);
+    let lp = w.lp;
+    let m = w.env.market;
+    let status = |w: &P3| {
+        let g = w.env.market_state().1;
+        let tr = w.env.portfolio_state(tp);
+        (g.bankruptcy_hlock_active, g.loss_stale_active, g.threshold_stress_active, tr.pnl, tr.capital, g.current_slot)
+    };
+    let try_convert = |w: &mut P3| -> Option<u32> {
+        let pnl = w.env.portfolio_state(tp).pnl;
+        if pnl <= 0 { return Some(0); }
+        let (pid, _, pep) = w.env.portfolio_identity(tp);
+        let r = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[&t]);
+        r.err().map(|e| code(&e).unwrap_or(u32::MAX))
+    };
+    eprintln!("HLOCK start: (hlock, loss_stale, stress, trader pnl, cap, slot) = {:?}; convert -> {:?}", status(&w), try_convert(&mut w));
+    {
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        let rl = w.crank(lp);
+        let rt = w.crank(tp);
+        let lpp = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok());
+        let g = w.env.market_state().1;
+        eprintln!("HLOCK diag: crank lp -> {:?}, trader -> {:?}; LP {:?}; eff {} tgt {}; a {}/{} oi {}/{} modes {:?}/{:?}; neg {} b_stale {} stale_cert {}",
+            rl.as_ref().map_err(|e| code(e)), rt.as_ref().map_err(|e| code(e)),
+            lpp.map(|p| (p.capital, p.pnl, p.legs.iter().filter(|l| l.active).map(|l| l.basis_pos_q).collect::<Vec<_>>(), p.stale_state, p.b_stale_state, p.close_progress)),
+            g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, g.assets[0].a_long, g.assets[0].a_short, g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q, g.assets[0].mode_long, g.assets[0].mode_short,
+            g.negative_pnl_account_count, g.b_stale_account_count, g.stale_certificate_count);
+    }
+    let mut log = Vec::new();
+    let phases: [(&str, u64); 4] = [("A crank burst (trader+LP every slot)", 2_000), ("B + 45 FinalizeResetSide + 89 Expire each slot", 2_000), ("C keeper refresh: push same mark + crank every 20 slots", 20_000), ("D long wait + crank every 500 slots", 200_000)];
+    for (name, n) in phases {
+        let step = if name.starts_with('C') { 20 } else if name.starts_with('D') { 500 } else { 1 };
+        let mut t0 = 0u64;
+        let mut cleared_at = None;
+        while t0 < n {
+            t0 += step;
+            let s = w.slot() + step;
+            w.env.svm.warp_to_slot(s);
+            if name.starts_with('C') || name.starts_with('D') {
+                let mk = MARK.with(|c| c.get());
+                w.push(mk);
+            }
+            let _ = w.crank(lp);
+            let _ = w.crank(tp);
+            if name.starts_with('B') {
+                for side in 0..2u8 { let _ = w.send(ProgInstruction::FinalizeResetSide { asset_index: 0, side }, vec![AccountMeta::new(m, false)], &[]); }
+                for d in 0..2u16 { let _ = w.send(ProgInstruction::ExpireBackingBucket { domain: d }, vec![AccountMeta::new(m, false)], &[]); }
+            }
+            let st = status(&w);
+            if !st.0 && !st.1 {
+                cleared_at = Some(t0);
+                break;
+            }
+        }
+        let conv = try_convert(&mut w);
+        let line = format!("phase {name}: cleared {:?} (slots), status {:?}, convert -> {:?}", cleared_at, status(&w), conv);
+        eprintln!("HLOCK {line}");
+        log.push(line);
+        if cleared_at.is_some() && conv.map_or(true, |c| c == 0) {
+            break;
+        }
+    }
+    let st = status(&w);
+    eprintln!("HLOCK final: {:?}", st);
+    if st.0 || st.1 {
+        // Privileged escape probe (NOT counted as a permissionless exit): admin ResolveMarket.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+        let g = w.env.market_state().1;
+        eprintln!("HLOCK privileged probe: admin ResolveMarket -> {}; mode {:?} hlock {}", if r.is_ok() { "ok" } else { "FAILED" }, g.mode, g.bankruptcy_hlock_active);
+    }
+    assert!(!st.0 && !st.1, "H-lock/loss_stale never cleared via permissionless paths: {log:?}");
+    assert!(try_convert(&mut w).map_or(true, |c| c == 0), "winner still cannot convert after h-lock cleared");
+}
