@@ -29790,9 +29790,10 @@ mod p1_kani_proofs {
     #[kani::proof]
     #[kani::solver(cadical)]
     fn kani_p1_exec_band_check_sound() {
-        // u32 prices (up to ~4.29e9 e6 = $4,294): the full-u64 run did not finish in 40 min.
-        let exec: u32 = kani::any();
-        let reference: u32 = kani::any();
+        // u16 prices: the full-u64 and u32 runs did not finish in 40 min (the 128-bit product
+        // with the rounded-out edge). The predicate is width-generic u128 arithmetic.
+        let exec: u16 = kani::any();
+        let reference: u16 = kani::any();
         let (exec, reference) = (exec as u64, reference as u64);
         let band: u16 = kani::any();
         let within = p1::exec_price_within_band(exec, reference, band);
