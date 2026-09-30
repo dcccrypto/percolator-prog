@@ -152,6 +152,8 @@ pub struct World {
     pub pending_violation: Option<String>,
     /// Max observed unbacked deficit (capital 0, pnl < 0) per TRADER portfolio (not the vault LP).
     pub trader_deficit: std::collections::BTreeMap<usize, u128>,
+    /// Provisional resolved-close shortfall per user; reduced by later 46 top-ups (net = real haircut).
+    pub provisional_burn: std::collections::BTreeMap<usize, u128>,
     pub p3: Option<P3Ctx>,
     pub minted_by: std::collections::BTreeMap<Pubkey, u128>,
 }
@@ -238,6 +240,7 @@ impl World {
             mark1: INITIAL_MARK,
             pending_violation: None,
             trader_deficit: Default::default(),
+            provisional_burn: Default::default(),
             p3: None,
             minted_by: Default::default(),
         };
@@ -1017,6 +1020,12 @@ impl World {
                         let _ = lp;
                     }
                     *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += burned.min(u64::MAX as u128) as u64;
+                    *self.provisional_burn.entry(u).or_insert(0) += burned;
+                    if std::env::var("FUZZ_RT_TRACE").is_ok() {
+                        let rc = if self.port_alive(u) { let a = self.env.portfolio_state(p); format!("receipt present {} fin {} face {} paid {}", a.resolved_payout_receipt.present, a.resolved_payout_receipt.finalized, a.resolved_payout_receipt.terminal_positive_claim_face, a.resolved_payout_receipt.paid_effective) } else { "portfolio GONE after close".into() };
+                        let g = self.env.market_state().1;
+                        eprintln!("  BURN u{u} {burned}: {rc}; vault LP alive {}; snapshot {} blockers {}", self.p3.as_ref().map_or(false, |c| self.env.svm.get_account(&c.lp).map_or(false, |x| x.lamports > 0)), g.payout_snapshot_captured, g.resolved_payout_blocker_count);
+                    }
                     if self.p3.is_some() {
                         let c = self.p3_c();
                         if c > 3_000 {
@@ -1036,7 +1045,7 @@ impl World {
         let owner = self.owners[u].pubkey();
         let dst = self.new_token(owner, 0);
         let (m, v, va, p) = (self.env.market, self.env.vault, self.env.vault_authority, self.ports[u]);
-        self.send(
+        let r = self.send(
             ProgInstruction::ClaimResolvedPayoutTopup,
             vec![
                 AccountMeta::new_readonly(owner, false),
@@ -1049,7 +1058,18 @@ impl World {
                 AccountMeta::new_readonly(nft_registry_pda(&m), false),
             ],
             &[],
-        )
+        );
+        if std::env::var("FUZZ_RT_TRACE").is_ok() && self.provisional_burn.get(&u).map_or(false, |b| *b > 0) {
+            eprintln!("  TOPUP u{u} -> {:?} paid {}", r.as_ref().map_err(|e| custom_code(e)), self.env.token_amount(dst));
+        }
+        if r.is_ok() {
+            let paid = self.env.token_amount(dst) as u128;
+            if paid > 0 {
+                *self.stats.soft.entry("topup_paid_atoms").or_default() += paid.min(u64::MAX as u128) as u64;
+                if let Some(b) = self.provisional_burn.get_mut(&u) { *b = b.saturating_sub(paid); }
+            }
+        }
+        r
     }
 
     pub fn do_resolve(&mut self) -> Result<u64, String> {
@@ -3467,6 +3487,32 @@ impl World {
             let s = self.slot() + 10 * (round + 1);
             self.env.svm.warp_to_slot(s);
         }
+        // Final permissionless 46 top-up sweep AFTER the last 101 (engine: receipts taken before
+        // the vault LP settled are partial and finalise via 46). FUZZ_P3_OLD_ORDER=1 skips it
+        // (liveness check: seniors must not depend on a stranger's top-up).
+        if !std::env::var("FUZZ_P3_OLD_ORDER").map_or(false, |v| v == "1") {
+            // 101 to Closed: settle, then free the vault LP (tag 8, [3] = registry) so its claim
+            // leaves the resolved-payout denominator; only then do the 46 top-ups finalise.
+            let (reg, _, _) = self.lp_vault.unwrap();
+            for _ in 0..20 {
+                if self.env.svm.get_account(&lp).map_or(true, |x| x.lamports == 0) { break; }
+                for topup in [0u8, 1] { let _ = self.p3_settle(topup); }
+                let (pid, seq, ep) = self.env.portfolio_identity(lp);
+                let (m, payer) = (self.env.market, self.env.payer.insecure_clone());
+                let _ = self.send(ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
+                    vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(lp, false), AccountMeta::new(reg, false)], &[]);
+                self.check()?;
+            }
+            if std::env::var("FUZZ_RT_TRACE").is_ok() { eprintln!("  SWEEP: vault LP closed {}", self.env.svm.get_account(&lp).map_or(true, |x| x.lamports == 0)); }
+            for _ in 0..3 {
+                for u in 0..=N_USERS {
+                    if !self.port_alive(u) { continue; }
+                    let _ = self.do_claim_topup(u);
+                    let _ = self.do_close_resolved(u);
+                    self.check()?;
+                }
+            }
+        }
         // Junior surplus (Resolved, terminal-flat only) — try decreasing amounts.
         let mut amt = self.token_amount(&self.env.vault);
         while amt > 0 {
@@ -3609,7 +3655,9 @@ impl World {
         // Refined (coordinator's G-1 rule): a haircut up to the bankrupt-TRADER deficits is the
         // engine credit rate (EXPECTED). Only a haircut BEYOND that, with the junior or seniors
         // receiving value, is a violation (backing owed to winners went to Earn).
-        let haircut_atoms = *self.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0) as u128;
+        // Net haircut: provisional resolved-close shortfalls minus later 46 top-ups.
+        let haircut_atoms: u128 = self.provisional_burn.values().sum();
+        *self.stats.soft.entry("net_winner_haircut_atoms").or_default() += haircut_atoms.min(u64::MAX as u128) as u64;
         let deficits: u128 = self.trader_deficit.values().sum();
         let tol = 10 + 2 * (*self.stats.soft.get("close_resolved_haircut_events").unwrap_or(&0) as u128);
         if haircut_atoms > 2 {
