@@ -217,3 +217,95 @@ fn kani_design_p3_27_junior_first_then_seniors() {
     }
     kani::cover!(d > before.junior && before.junior > 0, "loss spills through the junior");
 }
+
+// ── Pending → booked draw (design change 2026-09-30) ─────────────────────────────────────────
+// The crank records a PENDING draw in the market's spare per-asset wrapper bytes [832, 896);
+// the C reduction and the ledger are BOOKED on the next P3 instruction (75/76/77/78/97/98/101/
+// 102), and 75/77 book before pricing. The harness state below is the adapter's view of those
+// bytes + the vault fields; `book` is the re-target point for `vault_lp_draw_move`.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DrawState {
+    c: u128,              // senior claim C
+    backing_owned: u128,  // senior-owned backing
+    lp_value: u128,       // vault LP value (already net of the crank-time deficit)
+    pending_deficit: u128,
+    pending_junior_surplus: u128, // junior surplus snapshotted at crank time
+    pending: bool,
+}
+
+/// ADAPTER (re-target point): book a pending draw through the production `vault_lp_draw_move`
+/// (+ `senior_claim_after_draw`, `vault_lp_senior_draw_amount`) exactly as the FINAL's booking
+/// helper composes them. If the FINAL exposes the whole booking as one pure fn, call only that.
+fn book(s: DrawState) -> DrawState {
+    if !s.pending {
+        return s;
+    }
+    let (backing2, lp2) = v::vault_lp_draw_move(
+        s.backing_owned,
+        s.lp_value,
+        s.pending_deficit,
+        s.pending_junior_surplus,
+    );
+    let c2 = claim_after_loss(s.c, s.pending_deficit, s.pending_junior_surplus).unwrap();
+    DrawState { c: c2, backing_owned: backing2, lp_value: lp2, pending_deficit: 0, pending_junior_surplus: 0, pending: false }
+}
+
+fn any_pending() -> DrawState {
+    let s = DrawState {
+        c: kani::any(),
+        backing_owned: kani::any(),
+        lp_value: kani::any(),
+        pending_deficit: kani::any(),
+        pending_junior_surplus: kani::any(),
+        pending: kani::any(),
+    };
+    // no u128 overflow of the vault total (processor uses checked adds)
+    kani::assume(s.backing_owned.checked_add(s.lp_value).is_some());
+    s
+}
+
+/// D-P3-29  Booking is conservation-preserving and idempotent: the move is internal to the vault
+/// (backing + LP value unchanged), exactly the draw amount leaves the senior-owned backing, C
+/// falls by exactly the senior loss, the pending record is cleared, and booking a booked state
+/// changes nothing (so every one of 75/76/77/78/97/98/101/102 may call it unconditionally).
+#[kani::proof]
+fn kani_design_p3_29_pending_draw_booking_conserves_and_is_idempotent() {
+    let s = any_pending();
+    let b = book(s);
+    assert_eq!(b.backing_owned + b.lp_value, s.backing_owned + s.lp_value, "draw move is internal");
+    if s.pending {
+        let x = draw_amount(s.pending_deficit, s.pending_junior_surplus, s.backing_owned, 0);
+        assert_eq!(s.backing_owned - b.backing_owned, x, "exactly the draw leaves the backing");
+        assert_eq!(b.c, s.c.saturating_sub(s.pending_deficit.saturating_sub(s.pending_junior_surplus)));
+        assert!(!b.pending);
+    } else {
+        assert!(b == s, "nothing pending: booking is a no-op");
+    }
+    assert!(book(b) == b, "idempotent");
+    kani::cover!(s.pending && s.backing_owned > b.backing_owned && b.c < s.c, "real draw booked");
+    kani::cover!(s.pending && s.pending_deficit > 0 && s.pending_deficit <= s.pending_junior_surplus, "junior-only pending loss");
+}
+
+/// D-P3-30  Pricing between the crank-time draw and its booking equals pricing after booking,
+/// through the NAV cap: senior value = min(V, C) (`tranche_split(..).senior`, the REAL waterfall).
+/// With V already net of the deficit D at crank time and J the junior surplus snapshotted then,
+/// min(V − D, C) == min(V − D, C − max(0, D − J)) for every state: an unbooked draw cannot be
+/// front-run by any P3 instruction that prices off the waterfall.
+#[kani::proof]
+fn kani_design_p3_30_pricing_between_draw_and_booking_equals_after() {
+    let vv: u128 = kani::any(); // vault value at crank time, before the deficit
+    let c: u128 = kani::any();
+    let d: u128 = kani::any();
+    kani::assume(d <= vv);
+    let j = v::tranche_split(vv, c).junior;
+    let v_between = vv - d;
+    let senior_between = v::tranche_split(v_between, c).senior;
+    let c_booked = claim_after_loss(c, d, j).unwrap();
+    let senior_after = v::tranche_split(v_between, c_booked).senior;
+    assert_eq!(senior_between, senior_after, "NAV cap makes the unbooked draw price-neutral");
+    // and the explicit pricing claim (D-P3-28) agrees with both
+    assert_eq!(v::vault_lp_senior_pricing_claim(c, d, j).min(v_between), senior_after);
+    kani::cover!(d > j && j > 0, "loss spills into the seniors while pending");
+    kani::cover!(vv < c && d > 0, "already-impaired vault");
+}
