@@ -150,23 +150,53 @@ fn kani_design_p3_25_recovery_seniors_first() {
     kani::cover!(to_j == 0 && rec > 0, "all to seniors");
 }
 
-/// D-P3-26  Halt predicate: while any draw is outstanding every halted operation halts, and with
-/// none outstanding nothing is halted by the draw rule.
+/// D-P3-26  Halt predicate, from the OWNER'S WRITTEN RULE (coordinator 2026-09-30): while a draw is
+/// outstanding, HALT the vault LP's risk-increasing fills, junior withdraw (tag 97) and junior
+/// release (tag 102); NEVER halt senior deposit (75) or senior redemption (76/77), which stay
+/// open because they price at the reduced C with the undrawn deficit priced in (D-P3-28).
 #[kani::proof]
 fn kani_design_p3_26_halt_while_draw_outstanding() {
     let o: u128 = kani::any();
     let op: u8 = kani::any();
     let h = halts(o, op);
-    // The halted set is fixed by §8.1 (junior withdraw, senior deposit, senior redemption at a
-    // stale price); `HALTED_OPS` is the adapter's list.
-    let in_set = HALTED_OPS.contains(&op);
-    assert_eq!(h, o > 0 && in_set);
-    kani::cover!(h, "halted while a draw is outstanding");
-    kani::cover!(!h && o > 0, "an unaffected op proceeds during a draw");
-    kani::cover!(!h && o == 0 && in_set, "no draw: nothing halted");
+    let halted_class = HALTED_OPS.contains(&op);
+    let senior_exit_or_entry = NEVER_HALTED_OPS.contains(&op);
+    if halted_class {
+        assert_eq!(h, o > 0, "risk-increasing fill / 97 / 102 halt exactly while a draw is outstanding");
+    }
+    if senior_exit_or_entry {
+        assert!(!h, "senior deposit and redemption are never halted: seniors can always exit");
+    }
+    if o == 0 {
+        assert!(!h, "no outstanding draw: the draw rule halts nothing");
+    }
+    kani::cover!(h && op == v::VAULT_OP_JUNIOR_RELEASE, "junior release halted during a draw");
+    kani::cover!(!h && o > 0 && op == v::VAULT_OP_SENIOR_REDEEM, "senior redemption open during a draw");
+    kani::cover!(!h && o > 0 && op == v::VAULT_OP_SENIOR_DEPOSIT, "senior deposit open during a draw");
 }
-/// Adapter: the op codes §8.1 requires to halt (re-target point).
-const HALTED_OPS: [u8; 3] = [v::VAULT_OP_JUNIOR_WITHDRAW, v::VAULT_OP_SENIOR_DEPOSIT, v::VAULT_OP_SENIOR_REDEEM];
+/// Adapter (re-target point): tag-level op codes from the owner rule.
+const HALTED_OPS: [u8; 3] = [v::VAULT_OP_RISK_INCREASING_FILL, v::VAULT_OP_JUNIOR_WITHDRAW /* 97 */, v::VAULT_OP_JUNIOR_RELEASE /* 102 */];
+const NEVER_HALTED_OPS: [u8; 3] = [v::VAULT_OP_SENIOR_DEPOSIT /* 75 */, v::VAULT_OP_SENIOR_REDEEM /* 77 */, v::VAULT_OP_SENIOR_REDEEM_ALT /* 76 */];
+
+/// D-P3-28  CONDITIONAL on the builder exposing the senior pricing claim as a pure fn
+/// (`vault_lp_senior_pricing_claim(c, undrawn_deficit, junior_surplus)`); otherwise this claim is
+/// LiteSVM-only and the harness is deleted at re-target. Property: tags 75/77 price against a
+/// claim that ALREADY nets the undrawn deficit's senior share, i.e. exactly the claim the seniors
+/// will hold once the draw is booked (D-P3-23). So entering before / exiting before the booking
+/// is priced identically to after it: no early-exit and no late-entry arbitrage. Combined with
+/// the deposit/redemption wiring (D-P3-05/06, same claim as the senior value) and L-DIL.
+#[kani::proof]
+fn kani_design_p3_28_senior_pricing_includes_undrawn_deficit() {
+    let c: u128 = kani::any();
+    let d: u128 = kani::any();
+    let j: u128 = kani::any();
+    let priced = v::vault_lp_senior_pricing_claim(c, d, j);
+    let booked = claim_after_loss(c, d, j).unwrap();
+    assert_eq!(priced, booked, "pre-booking price == post-booking price (timing-neutral)");
+    assert!(priced <= c, "pending loss never priced as a gain");
+    kani::cover!(priced < c && d > j, "pending senior loss priced in");
+    kani::cover!(priced == c && d > 0 && d <= j, "junior-only pending loss: senior price unchanged");
+}
 
 /// D-P3-27  Loss ordering end to end on the REAL waterfall: after a deficit is booked (junior
 /// surplus consumed first, then the senior claim reduced), `tranche_split` of the new state gives
