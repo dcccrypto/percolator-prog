@@ -1652,18 +1652,32 @@ fn p3_draw_recall_never_reopens_a_funded_deficit() {
     conserved(&w, "recall");
 }
 
-/// Gate-100: a LIVE bound redemption larger than the chosen pot can fund answers exactly 88
-/// (VaultLpRedeemNeedsRecall), never a generic counter error — the client's 88 -> recall repair
-/// depends on it.
+/// rehearsal-23 (Live) + gate-100: a senior larger than its chosen pot is funded across BOTH pots
+/// in one instruction; 88 (VaultLpRedeemNeedsRecall) fires ONLY when both pots together cannot
+/// pay (the value really sits in the vault LP).
 #[test]
-fn p3_redeem_from_a_too_small_pot_is_exactly_88() {
+fn p3_live_redeem_spans_both_pots_and_88_only_when_both_short() {
     let (mut w, seniors, _t) = q1_world(9_000_000, 1_000_000, 1_000_000, 2);
     let (k0, a0) = (seniors[0].0.insecure_clone(), seniors[0].1);
-    let shares = w.tok(&a0) as u128;
-    w.request_redeem(&k0, a0, shares).unwrap();
-    let (_, r) = w.execute_redeem_domain(&k0, 1); // 9M-share senior from the 1M pot
-    eprintln!("88 probe -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(88));
+    let sh0 = w.tok(&a0) as u128;
+    w.request_redeem(&k0, a0, sh0).unwrap();
+    let (d0, r0) = w.execute_redeem_domain(&k0, 1); // the 9M-share senior via the 1M pot
+    eprintln!("LIVE both-pots: 77 via d1 -> {:?} paid {}", r0.as_ref().map_err(|e| code(e)), w.tok(&d0));
+    assert!(r0.is_ok(), "a senior larger than its chosen pot is funded across both pots");
+    // STATE POKE: C above what is left in the pots, so the rest of the senior value sits in the
+    // vault LP (both pots together are short) -> exactly 88.
+    {
+        let c_now = w.c();
+        let mut acct = w.env.svm.get_account(&w.state_pda).unwrap();
+        acct.data[16 + 128..16 + 144].copy_from_slice(&(c_now + 500_000).to_le_bytes());
+        w.env.svm.set_account(w.state_pda, acct).unwrap();
+    }
+    let (k1, a1) = (seniors[1].0.insecure_clone(), seniors[1].1);
+    let sh1 = w.tok(&a1) as u128;
+    w.request_redeem(&k1, a1, sh1).unwrap();
+    let (_, r1) = w.execute_redeem_domain(&k1, 1);
+    eprintln!("LIVE both-pots: second senior -> {:?}", r1.as_ref().map_err(|e| code(e)));
+    assert_eq!(r1.as_ref().err().and_then(|e| code(e)), Some(88), "88 only when both pots together are short");
 }
 
 /// B24: after a junior-covered trader win is converted (consuming the vault LP's settled loss
@@ -1699,7 +1713,14 @@ fn c7_world(senior: u64, junior: u64) -> (P3, (Keypair, Pubkey), (Keypair, Pubke
     let mut w = P3::new();
     w.create_vault();
     let s0 = Keypair::new();
-    let a0 = w.earn_deposit_domain(&s0, senior, false, 0).expect("75 senior");
+    let d1_part = C7_D1_SENIOR.with(|c| c.get());
+    let a0 = w.earn_deposit_domain(&s0, senior - d1_part, false, 0).expect("75 senior");
+    if d1_part != 0 {
+        // rehearsal seed: the same senior also backs domain 1 (a second pot deposit).
+        let s1 = s0.insecure_clone();
+        let a1 = w.earn_deposit_domain(&s1, d1_part, false, 1).expect("75 senior d1");
+        C7_A1.with(|c| c.set(a1));
+    }
     let admin = w.env.admin.insecure_clone();
     w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
     let up = w.upgrade.insecure_clone();
@@ -1737,6 +1758,11 @@ fn c7_world(senior: u64, junior: u64) -> (P3, (Keypair, Pubkey), (Keypair, Pubke
     (w, (s0, a0), (t, tp), (admin.insecure_clone(), Pubkey::default()))
 }
 
+thread_local! { static C7_STALE_RESOLVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static C7_A1: std::cell::Cell<Pubkey> = std::cell::Cell::new(Pubkey::default()); }
+thread_local! { static C7_D1_SENIOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+thread_local! { static C7_WINNER_HOLDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) -> (u128, u128, u128, u128) {
     let lp = w.lp;
     let admin = w.env.admin.insecure_clone();
@@ -1763,13 +1789,14 @@ fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) ->
     let m = w.env.market;
     let mut winner = 0u128;
     if mode0 == percolator::MarketModeV16::Live {
-        for _ in 0..6 {
+        let holds = C7_WINNER_HOLDS.with(|c| c.get());
+        for _ in 0..(if holds { 0 } else { 6 }) {
             let p = w.pos(tp);
             if p == 0 { break; }
             let r = w.trade_vs_lp(t, tp, -p);
             if r.is_err() { let _ = w.crank(lp); let _ = w.crank(tp); }
         }
-        for _ in 0..4 {
+        for _ in 0..(if holds { 0 } else { 4 }) {
             let pnl = w.env.portfolio_state(tp).pnl;
             if pnl <= 0 { break; }
             let (pid, _, pep) = w.env.portfolio_identity(tp);
@@ -1778,7 +1805,7 @@ fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) ->
             let _ = w.crank(tp);
         }
         let cap = w.env.portfolio_state(tp).capital;
-        if cap > 0 && w.env.portfolio_state(tp).pnl <= 0 {
+        if !holds && cap > 0 && w.env.portfolio_state(tp).pnl <= 0 {
             let dest = w.token(t.pubkey(), 0);
             let (pid, seq, _) = w.env.portfolio_identity(tp);
             let r = w.send(ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: cap },
@@ -1786,7 +1813,18 @@ fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) ->
                      AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false)], &[t]);
             if r.is_ok() { winner += w.tok(&dest) as u128; }
         }
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+        if C7_STALE_RESOLVE.with(|c| c.get()) {
+            // rehearsal-23 order: nobody resolves; a STRANGER's tag 39 after the stale window.
+            let s = w.slot() + 9_001;
+            w.env.svm.warp_to_slot(s);
+            let now = w.slot();
+            let r = w.send(ProgInstruction::ResolveStalePermissionless { now_slot: now }, vec![AccountMeta::new(m, false)], &[]);
+            eprintln!("C7 stranger tag 39 -> {:?} mode {:?}", r.as_ref().map_err(|e| code(e)), w.env.market_state().1.mode);
+            let s = w.slot() + 10; // past force_close_delay
+            w.env.svm.warp_to_slot(s);
+        } else {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+        }
     }
     // Resolved wind-down, rehearsal order.
     let jo = admin.pubkey();
@@ -1819,10 +1857,41 @@ fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) ->
     let (d, r77) = w.execute_redeem(s0, true);
     let mut senior = w.tok(&d) as u128;
     if r77.is_err() { let (d, r) = w.execute_redeem_domain(s0, 1); senior += w.tok(&d) as u128; eprintln!("C7 77 d1 {:?}", r.as_ref().map_err(|e| code(e))); }
-    eprintln!("C7 77 -> {:?}", r77.as_ref().map_err(|e| code(e)));
+    eprintln!("C7 77 -> {:?}", r77.as_ref().map_err(|e| e.split("Program log:").skip(1).map(|x| x.chars().take(90).collect::<String>()).collect::<Vec<_>>()));
     let junior = w.junior_release_resolved(&admin);
     let left = w.tok(&w.env.vault) as u128;
     (winner, senior, junior, left)
+}
+
+/// rehearsal-23 BASE (real validator, 39b138c8): loss past the junior, inside junior + C; the
+/// winner is paid in full; a STRANGER's tag 39 resolves after the stale window; the wind-down
+/// reaches terminal-flat — and then every senior 77 must still pay the reduced C.
+#[test]
+fn p3_rehearsal23_seniors_exit_after_stranger_stale_resolve() {
+    C7_STALE_RESOLVE.with(|c| c.set(true));
+    C7_WINNER_HOLDS.with(|c| c.set(true)); // rehearsal-23: the winner holds into resolution
+    C7_D1_SENIOR.with(|c| c.set(std::env::var("R23_D1").ok().and_then(|v| v.parse().ok()).unwrap_or(5_000_000)));
+    let (mut w, (s0, a0), (t, tp), _) = c7_world(10_000_000, 300_000);
+    w.env.configure_permissionless_resolve_with_cu(9_000, 5);
+    let (winner, mut senior, junior, mut left) = c7_winddown(&mut w, &s0, a0, &t, tp);
+    // The same senior's second holding (its domain-1 deposit), redeemed via EITHER pot choice.
+    let a1 = C7_A1.with(|c| c.get());
+    let sh1 = w.tok(&a1) as u128;
+    if sh1 > 0 {
+        let _ = w.request_redeem(&s0, a1, sh1);
+        let (d, r) = w.execute_redeem(&s0, true);
+        eprintln!("R23 second holding 77 (d0 choice) -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
+        senior += w.tok(&d) as u128;
+        left = w.tok(&w.env.vault) as u128;
+    }
+    C7_STALE_RESOLVE.with(|c| c.set(false));
+    C7_WINNER_HOLDS.with(|c| c.set(false));
+    C7_D1_SENIOR.with(|c| c.set(0));
+    eprintln!("R23: winner {winner} senior {senior} junior {junior} left {left} drawn {} C {}", drawn(&w), w.c());
+    conserved(&w, "r23");
+    assert!(drawn(&w) > 0, "vacuity: the loss went past the junior");
+    assert!(senior + 2_000 >= 10_000_000 - drawn(&w) - 1_000, "seniors paid the reduced C after resolve: {senior}");
+    assert!(left <= 2_000, "stranded {left}");
 }
 
 /// C-7 (b): senior backing EXHAUSTED (tiny seniors) — whatever path the engine takes (immediate

@@ -25278,6 +25278,23 @@ pub mod processor {
             {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
+            // rehearsal-23: fund the pooled payout across both pots (bound vaults only).
+            if bound_tail.is_some() {
+                let other_ledger_ai = if source_domain == registry.domain {
+                    sibling_ledger_ai
+                } else {
+                    ledger_ai
+                };
+                vault_pot_top_up_from_sibling(
+                    &mut group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    domain,
+                    backing_num,
+                    source_ledger_ai,
+                    other_ledger_ai,
+                )?;
+            }
             let (source_acc, bucket_acc) = if domain % 2 == 0 {
                 (
                     &mut group.markets[asset_index].engine.source_credit_long,
@@ -27295,6 +27312,97 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
         }
         Ok(total)
+    }
+
+    /// rehearsal-23 HIGH: a bound senior is priced on the POOLED backing of both pots but a
+    /// redemption draws from ONE pot, so a senior whose share exceeds a single pot was locked
+    /// (21 Resolved / 88 Live). Top the chosen pot up from its sibling in the same instruction —
+    /// an internal rebalance (the RebalanceLpVaultBacking mechanics): the sibling's fresh idle
+    /// backing (never backing reserved for live winner claims) moves to the chosen pot, ledger
+    /// principal moves with it, `header.vault` nets to 0, no SPL. No-op when the pot suffices or
+    /// either ledger is not writable.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vault_pot_top_up_from_sibling<'a>(
+        group: &mut state::MarketViewMutV16<'_>,
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        to_domain: usize,
+        need_num: u128,
+        to_ledger_ai: &AccountInfo<'a>,
+        from_ledger_ai: &AccountInfo<'a>,
+    ) -> ProgramResult {
+        let (_, to_bucket) = backing_domain_parts_view(group, to_domain)?;
+        let have = if to_bucket.status == BackingBucketStatusV16::Fresh {
+            to_bucket.fresh_unliened_backing_num
+        } else {
+            0
+        };
+        if have >= need_num || !to_ledger_ai.is_writable || !from_ledger_ai.is_writable {
+            return Ok(());
+        }
+        let from_domain = sibling_domain(to_domain as u16) as usize;
+        let (from_source, from_bucket) = backing_domain_parts_view(group, from_domain)?;
+        if from_bucket.status != BackingBucketStatusV16::Fresh {
+            return Ok(());
+        }
+        let from_free = from_bucket
+            .fresh_unliened_backing_num
+            .min(
+                from_source
+                    .fresh_reserved_backing_num
+                    .saturating_sub(from_source.positive_claim_bound_num),
+            )
+            / BOUND_SCALE;
+        let short = (need_num - have).div_ceil(BOUND_SCALE);
+        let x = short.min(from_free);
+        if x == 0 {
+            return Ok(());
+        }
+        vault_pot_principal_decrement(group, from_domain, x)?; // vault -x
+        group.header.vault = percolator::V16PodU128::new(
+            group
+                .header
+                .vault
+                .get()
+                .checked_add(x)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        ); // vault restored: nets 0
+        let expiry = if to_bucket.status == BackingBucketStatusV16::Fresh {
+            to_bucket.expiry_slot
+        } else {
+            crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+        };
+        add_fresh_counterparty_backing_view(
+            group,
+            to_domain,
+            x.checked_mul(BOUND_SCALE)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            expiry,
+        )?;
+        // Ledger principal moves in lockstep (from -x, to +x), re-baselined like a rebalance.
+        for (ai, d, add) in [(from_ledger_ai, from_domain, false), (to_ledger_ai, to_domain, true)] {
+            let mut data = ai.try_borrow_mut_data()?;
+            let (_, b) = backing_domain_parts_view(group, d)?;
+            let (mut l, init) =
+                read_or_new_backing_domain_ledger(&data, market_key, registry_pda, d as u16, &b)?;
+            sync_backing_domain_ledger(&mut l, &b)?;
+            l.total_principal_atoms = if add {
+                l.total_principal_atoms
+                    .checked_add(x)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            } else {
+                l.total_principal_atoms.saturating_sub(x)
+            };
+            l.last_observed_unavailable_principal_atoms = backing_unavailable_principal_atoms(&b)?;
+            write_or_init_backing_domain_ledger(&mut data, &l, init)?;
+        }
+        group.validate_shape().map_err(map_v16_error)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "p3_redeem_pot_top_up from={} to={} atoms={}",
+            from_domain, to_domain, x
+        ));
+        Ok(())
     }
 
     /// Cheap pre-filter: an LP that is flat with non-negative capital+pnl cannot be insolvent;
