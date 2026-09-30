@@ -1,0 +1,14 @@
+[package]
+name = "p3-review-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Sentinel design proofs for P3 FINAL: the EXACT production src/vault_lp_v18.rs (path-included, not copied)."
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
