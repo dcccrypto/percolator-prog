@@ -97,7 +97,7 @@ fn kani_design_p3_23_step_claim_falls_by_funded_senior_draw() {
         assert_eq!(n.senior_claim, s.senior_claim, "junior-only deficit leaves C intact");
     }
     if loss > 0 {
-        assert!(n.junior_surplus == 0 || jc < min(d, s.junior_surplus), "D-P3-27: seniors only after the junior share");
+        assert_eq!(n.junior_surplus, 0, "D-P3-27: seniors lose only after the junior surplus is exhausted");
     }
     kani::cover!(loss > 0 && loss < s.senior_claim, "partial senior loss");
     kani::cover!(n.senior_claim == 0 && s.senior_claim > 0, "seniors wiped");
@@ -181,7 +181,10 @@ fn kani_design_p3_29_draw_move_conserves_vault_value() {
     kani::cover!(x > 0 && v0.is_some(), "real move");
 }
 
-/// D-P3-30  A draw never enlarges the recall a later tag 98 could make:
+/// D-P3-30  NON-GATING CHARACTERIZATION (review §10): after the owner's fix tag 98 calls
+/// `vault_lp_recall_limit`, not the raw `recall_limit`, so this harness is EXPECTED RED on a correct
+/// program and is excluded from the "red = real bug" gate; D-P3-33 is the gate for recall.
+/// A draw never enlarges the recall a later tag 98 could make:
 /// recall_limit(C', B − moved) <= recall_limit(C, B).
 /// PRE-RUN FINDING (design lead, by hand): a JUNIOR-covered move lowers backing without lowering
 /// C, so when backing < C + junior surplus this goes RED — e.g. C=100, J=50, B=80, D=50:
